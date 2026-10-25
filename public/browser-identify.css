@@ -1,0 +1,40 @@
+body {
+  margin: 0;
+  background: #eef0f2;
+  color: #30343b;
+  font:
+    15px/1.7 'Segoe UI',
+    'Microsoft YaHei',
+    sans-serif;
+}
+main {
+  max-width: 620px;
+  margin: 12vh auto;
+  padding: 32px 36px;
+  background: #fff;
+  border: 1px solid #d8dde2;
+  border-top: 4px solid #4d5967;
+  border-radius: 8px;
+}
+h1 {
+  margin: 8px 0 16px;
+  font-size: 28px;
+}
+.eyebrow {
+  color: #6d7784;
+  font-size: 13px;
+}
+.number {
+  padding: 12px 0;
+  border-top: 1px solid #e7e9ec;
+}
+code {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.hint {
+  padding: 14px 18px;
+  background: #f5f7f9;
+  border-radius: 5px;
+  color: #596470;
+}

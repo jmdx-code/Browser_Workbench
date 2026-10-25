@@ -1,0 +1,7 @@
+// Append-only migration 14: version references only, no fabricated source verification or consumption.
+export const taskResourceMigration = [
+  'CREATE TABLE task_resource_bindings(job_id TEXT PRIMARY KEY REFERENCES task_plans(id),combination_id TEXT NOT NULL,resource_revision INTEGER NOT NULL CHECK(resource_revision>0),created_at INTEGER NOT NULL CHECK(created_at>=0),FOREIGN KEY(combination_id,resource_revision) REFERENCES resource_table_versions(combination_id,revision))',
+  "CREATE TRIGGER validate_task_resource_binding BEFORE INSERT ON task_resource_bindings WHEN NOT EXISTS(SELECT 1 FROM task_plans p JOIN task_batches b ON b.id=p.batch_id JOIN resource_table_heads h ON h.combination_id=p.combination_id WHERE p.id=NEW.job_id AND p.combination_id=NEW.combination_id AND p.created_at=NEW.created_at AND p.state='QUEUED' AND h.revision=NEW.resource_revision AND json_extract(b.request,'$.expectedResourceRevision')=NEW.resource_revision AND EXISTS(SELECT 1 FROM json_each(p.snapshot,'$.steps') s WHERE json_extract(s.value,'$.type')='post' AND json_extract(s.value,'$.resourceMode')='table')) BEGIN SELECT RAISE(ABORT,'TASK_RESOURCE_ASSIGNMENT_MISMATCH'); END",
+  "CREATE TRIGGER immutable_task_resource_binding BEFORE UPDATE ON task_resource_bindings BEGIN SELECT RAISE(ABORT,'IMMUTABLE_TASK_RESOURCE_BINDING'); END",
+  "CREATE TRIGGER retain_task_resource_binding BEFORE DELETE ON task_resource_bindings BEGIN SELECT RAISE(ABORT,'RETAIN_TASK_RESOURCE_BINDING'); END",
+].join(';');

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><title>全新桥接 · 隔离验证页</title
+  ><link rel="stylesheet" href="/style.css" />
+  <main>
+    <h1>全新桥接 · 隔离验证页</h1>
+    <section>
+      <label>输入框 <input id="input" aria-label="输入框" /></label
+      ><button id="event-button">事件测试</button><button disabled id="disabled">禁用目标</button
+      ><output id="business-state">初始状态</output>
+      <pre id="events"></pre>
+    </section>
+    <section>
+      <article data-key="A"><button class="like">点赞</button><output>未点赞</output></article>
+      <article data-key="B"><button class="like">点赞</button><output>未点赞</output></article>
+      <button id="replace">替换 B 节点</button><button id="overlay">显示遮挡</button
+      ><button id="route">切换 SPA 路由</button>
+    </section>
+    <div id="cover">
+      <div>遮挡层<button id="dismiss">关闭遮挡</button></div>
+    </div>
+    <section>
+      <iframe src="/frame" title="同源框架"></iframe
+      ><iframe src="http://localhost:18767/frame" title="跨源框架"></iframe>
+    </section>
+    <section>
+      <h2>视频与可见性记录</h2>
+      <div
+        id="player"
+        role="group"
+        aria-label="Video player"
+        style="position: relative; width: 400px"
+      >
+        <video id="video" src="/sample.mp4" muted loop controls width="400"></video>
+      </div>
+      <button id="play">播放视频</button><button id="pause">暂停视频</button>
+      <pre id="media-log"></pre>
+    </section>
+  </main>
+  <script src="/fixture.js"></script>
+</html>

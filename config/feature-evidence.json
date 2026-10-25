@@ -1,0 +1,27 @@
+{
+  "feed": {
+    "implementation": "partial",
+    "verification": "limited",
+    "reason": "0.1.96两份真实首页2分钟→Reels3分钟均完整完成，单独停止不影响另一份；保留主页面。更多语言和长期稳定率仍待统计。"
+  },
+  "video": {
+    "implementation": "partial",
+    "verification": "limited",
+    "reason": "0.1.96两份首页→Reels各完整3分钟通过，单独停止隔离通过；暂停/缓冲不计时。更多语言和长期稳定率仍待统计。"
+  },
+  "marketplace": {
+    "implementation": "partial",
+    "verification": "limited",
+    "reason": "基础浏览及分类价格流程有真实短样本；地区、限制、多语言和并行待验收。"
+  },
+  "post": {
+    "implementation": "partial",
+    "verification": "limited",
+    "reason": "文字、单图、多图、视频与彩贴五项真实发布已全部完成结算，仅自己及AI声明、已用素材跳过继续后续浏览均已验证；历史未决不重发不改写。"
+  },
+  "story": {
+    "implementation": "partial",
+    "verification": "limited",
+    "reason": "好友文字、图片、字幕视频已有实际发布；0.1.97视频由原任务自动完成、标记素材已使用且保留主页。当前仅支持明确好友范围，其他范围及更多布局未验；历史失败不改写。"
+  }
+}

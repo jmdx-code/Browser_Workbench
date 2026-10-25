@@ -1,0 +1,10 @@
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { selectRuntime } from '../infrastructure/runtime-installation.js';
+import { useInstalledDependencies } from '../infrastructure/runtime-dependencies.js';
+const base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const runtime = await selectRuntime(base);
+process.env.WORKBENCH_BASE_ROOT = base;
+process.env.WORKBENCH_RUNTIME_ROOT = runtime;
+useInstalledDependencies(base);
+await import(pathToFileURL(path.join(runtime, 'dist/src/desktop/main.js')).href);

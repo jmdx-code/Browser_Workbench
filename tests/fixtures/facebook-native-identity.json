@@ -1,0 +1,13 @@
+{
+  "provenance": "audit/post-test-content-a8b848f3-29e7-410d-9697-2690dd2a1d84/native-acting-identity-sample.json (selected fields; private metadata excluded)",
+  "request": { "av": "10000000000001" },
+  "response": {
+    "data": {
+      "viewer": {
+        "actor": { "__typename": "User", "id": "10000000000001", "name": "Nway Myint" },
+        "is_lar_acting_as_additional_profile": false
+      }
+    },
+    "extensions": { "is_final": true }
+  }
+}

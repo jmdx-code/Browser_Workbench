@@ -1,0 +1,156 @@
+{
+  "source": "authorized-real-native-UI-publishing; credential fields omitted",
+  "managedExecutorAcceptance": false,
+  "rows": [
+    {
+      "kind": "text",
+      "provenance": "audit/post-test-content-a8b848f3-29e7-410d-9697-2690dd2a1d84/network-text-sample.json",
+      "request": {
+        "name": "ComposerStoryCreateMutation",
+        "av": "10000000000001",
+        "input": {
+          "actor_id": "10000000000001",
+          "message": {
+            "ranges": [],
+            "text": "Browser Workbench 原生接口验证（文字）\n这是一条本人授权的软件发布测试。\n标识：BWAPI-d6075d6f-7dc9-419a-9478-5f88933b7357-1"
+          },
+          "audience": {
+            "privacy": {
+              "allow": [],
+              "base_state": "SELF",
+              "deny": [],
+              "tag_expansion_state": "UNSPECIFIED"
+            }
+          },
+          "attachments": [],
+          "composer_source_surface": "newsfeed",
+          "composer_type": "feed",
+          "publishing_flow": {
+            "supported_flows": ["ASYNC_SILENT", "ASYNC_NOTIF", "FALLBACK"]
+          }
+        }
+      },
+      "response": {
+        "data": {
+          "story_create": {
+            "story_id": "UzpfSTY2MDg1NjQ1Mzc4NTA2MjoxMjIyMDM5OTMxMTI3OTM3ODQ=",
+            "post_id": "122203993112793784",
+            "publishing_flow": "ASYNC_SILENT",
+            "story": null,
+            "feed_story_edge": null
+          }
+        },
+        "extensions": {
+          "is_final": true
+        }
+      }
+    },
+    {
+      "kind": "single",
+      "provenance": "audit/post-test-content-a8b848f3-29e7-410d-9697-2690dd2a1d84/network-single-sample.json",
+      "request": {
+        "name": "ComposerStoryCreateMutation",
+        "av": "10000000000001",
+        "input": {
+          "actor_id": "10000000000001",
+          "message": {
+            "ranges": [],
+            "text": "Browser Workbench 原生接口验证（单图）\n这是一条本人授权的软件发布测试。\n标识：BWAPI-d6075d6f-7dc9-419a-9478-5f88933b7357-2"
+          },
+          "audience": {
+            "privacy": {
+              "allow": [],
+              "base_state": "SELF",
+              "deny": [],
+              "tag_expansion_state": "UNSPECIFIED"
+            }
+          },
+          "attachments": [
+            {
+              "photo": {
+                "id": "122203993178793784"
+              }
+            }
+          ],
+          "composer_source_surface": "newsfeed",
+          "composer_type": "feed",
+          "publishing_flow": {
+            "supported_flows": ["ASYNC_SILENT", "ASYNC_NOTIF", "FALLBACK"]
+          }
+        }
+      },
+      "response": {
+        "data": {
+          "story_create": {
+            "story_id": "UzpfSTY2MDg1NjQ1Mzc4NTA2MjoxMjIyMDM5OTMzNDY3OTM3ODQ=",
+            "post_id": "122203993346793784",
+            "publishing_flow": "ASYNC_SILENT",
+            "story": null,
+            "feed_story_edge": null
+          }
+        },
+        "extensions": {
+          "is_final": true
+        }
+      }
+    },
+    {
+      "kind": "video",
+      "provenance": "audit/post-test-content-a8b848f3-29e7-410d-9697-2690dd2a1d84/network-video-sample.json",
+      "request": {
+        "name": "ComposerStoryCreateMutation",
+        "av": "10000000000001",
+        "input": {
+          "actor_id": "10000000000001",
+          "message": {
+            "ranges": [],
+            "text": "Browser Workbench 原生接口验证（视频）\n这是一条本人授权的软件发布测试。\n标识：BWAPI-d6075d6f-7dc9-419a-9478-5f88933b7357-4"
+          },
+          "audience": {
+            "privacy": {
+              "allow": [],
+              "base_state": "SELF",
+              "deny": [],
+              "tag_expansion_state": "UNSPECIFIED"
+            }
+          },
+          "attachments": [
+            {
+              "video": {
+                "audio_descriptions": null,
+                "id": "2092087444732127",
+                "additional_video_metadata": {
+                  "translatedAudioMetadata": []
+                },
+                "notify_when_processed": true,
+                "transcriptions": null,
+                "was_created_via_unified_video_flow": {
+                  "was_created_via_unified_video_flow": true
+                }
+              }
+            }
+          ],
+          "composer_source_surface": "timeline",
+          "composer_type": "profile",
+          "publishing_flow": {
+            "supported_flows": ["ASYNC_SILENT", "ASYNC_NOTIF", "FALLBACK"]
+          }
+        }
+      },
+      "response": {
+        "data": {
+          "story_create": {
+            "story_id": "UzpfSTY2MDg1NjQ1Mzc4NTA2MjoxMjIyMDM5OTM5NDY3OTM3ODQ=",
+            "post_id": "122203993946793784",
+            "publishing_flow": "ASYNC_NOTIF",
+            "story": null,
+            "timeline_feed_units_edge": null
+          }
+        },
+        "extensions": {
+          "is_final": true
+        }
+      }
+    }
+  ]
+}

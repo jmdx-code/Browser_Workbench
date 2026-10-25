@@ -1,0 +1,8 @@
+{
+  "feed": true,
+  "video": true,
+  "marketplace": true,
+  "post": true,
+  "story": true,
+  "friends": true
+}

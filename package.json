@@ -1,0 +1,101 @@
+{
+  "name": "browser-workbench",
+  "productName": "Browser Workbench",
+  "version": "0.1.131",
+  "private": true,
+  "type": "module",
+  "main": "dist/src/desktop/bootstrap.js",
+  "workbenchEngine": {
+    "electron": "44.9.3"
+  },
+  "engines": {
+    "node": ">=24.19.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:release": "node scripts/build.mjs && node scripts/build-release-bundle.mjs",
+    "test": "node scripts/test.mjs",
+    "check": "node scripts/check.mjs",
+    "start": "node dist/src/server.js",
+    "desktop": "electron .",
+    "package:dir": "electron-builder --dir",
+    "package:win": "electron-builder --win nsis",
+    "format": "prettier --write src tests scripts docs *.json *.ts",
+    "smoke:desktop": "node scripts/desktop-smoke.mjs",
+    "smoke:feed": "node scripts/facebook-feed-projection-fixture.mjs"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.11",
+    "luxon": "3.7.2",
+    "playwright-core": "1.64.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "ws": "8.22.0",
+    "yauzl": "3.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.1.0",
+    "@types/luxon": "3.7.6",
+    "@types/node": "24.0.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.1",
+    "@types/yauzl": "2.10.3",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "44.9.3",
+    "electron-builder": "26.15.3",
+    "esbuild": "0.28.2",
+    "prettier": "3.9.9",
+    "typescript": "5.9.3",
+    "vite": "8.3.4",
+    "yazl": "3.3.1"
+  },
+  "overrides": {
+    "global-agent": "4.1.3"
+  },
+  "build": {
+    "appId": "local.browser.workbench",
+    "productName": "Browser Workbench",
+    "asar": true,
+    "asarUnpack": [
+      "dist/src/infrastructure/persistence-worker-bundle.mjs"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "web/**",
+      "public/**",
+      "config/**",
+      "!config/publication-acceptance-scope.json",
+      "package.json",
+      "!dist/tests/**",
+      "!dist/extension/**"
+    ],
+    "extraResources": [
+      {
+        "from": "extension-build",
+        "to": "extension",
+        "filter": [
+          "**/*",
+          "!**/*.map"
+        ]
+      },
+      {
+        "from": "docs/MEDIA_RUNTIME.md",
+        "to": "media-runtime/NOTICE.md"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": "nsis",
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

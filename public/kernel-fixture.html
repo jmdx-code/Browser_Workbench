@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>工作台执行内核隔离验证</title>
+  </head>
+  <body>
+    <h1>工作台执行内核隔离验证</h1>
+    <p>这里只操作本机测试页，不执行 Facebook 任务。</p>
+    <button id="counter">测试点击</button><output id="count">0</output>
+    <button id="delayed">显示延迟目标</button>
+    <div id="dynamic"></div>
+    <label>测试文件<input type="file" id="files" multiple /></label
+    ><output id="file-count">0</output>
+    <output id="file-report" data-state="empty"></output>
+    <iframe title="同源框架" name="same-frame" src="/kernel-frame"></iframe>
+    <iframe title="跨源框架" name="cross-frame" src="http://localhost:18767/kernel-frame"></iframe>
+    <script src="/kernel-fixture.js"></script>
+  </body>
+</html>

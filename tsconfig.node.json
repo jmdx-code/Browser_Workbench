@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "lib": ["ES2023", "DOM"],
+    "types": ["node", "chrome"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.cts", "extension/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["src/renderer"]
+}

@@ -1,0 +1,17 @@
+Browser Workbench kernel relay protocol adaptation
+
+The tab/CDP protocol translation in src/infrastructure/kernel-relay-model.ts
+follows the design of Microsoft's Playwright BrowserModel:
+https://github.com/microsoft/playwright/blob/606ecd8b34bac100db32561b6278ffd76e5eb3cd/packages/playwright-core/src/tools/mcp/browserModel.ts
+
+Copyright (c) Microsoft Corporation.
+Licensed under the Apache License, Version 2.0; see playwright-relay-LICENSE.txt.
+
+Workbench changes: strict JSON contracts, owned-tab and child-session scope,
+private loopback SDK endpoint, fail-closed browser/method/file policy,
+connection-generation and lease fences, bounded stop confirmation and
+uncertain-input evidence. The SDK itself is installed unmodified.
+
+The separately installed playwright-core package includes its own license
+and third-party notices. These notices do not imply that Microsoft endorses
+or has validated Browser Workbench or its Facebook task implementation.

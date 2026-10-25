@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><title>浏览器工作台 · 连接状态</title>
+  <h1>浏览器工作台桥接</h1>
+  <p>连接当前浏览器资料与本机软件，只操作专用任务标签页。</p>
+  <p>固定本机端口18767自动连接，无需配对码；重连后先核对原控制状态。</p>
+  <button id="connect">重新连接本机端口</button>
+  <button id="stop">立即停止</button>
+  <p id="state">正在读取连接状态…</p>
+  <p id="details"></p>
+  <p>日常任务请在本地软件中设置。当前版本仅包含已验证的基础控制能力，完整任务组合仍在开发。</p>
+  <p>停止会阻止后续输入；已经派发的动作需要核对。</p>
+  <script type="module" src="options.js"></script>
+</html>

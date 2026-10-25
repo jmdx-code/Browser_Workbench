@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Workbench Bridge",
+  "version": "0.3.54",
+  "minimum_chrome_version": "125",
+  "permissions": ["debugger", "storage", "alarms", "scripting", "tabGroups"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "https://www.facebook.com/*"],
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "浏览器工作台连接状态",
+    "default_popup": "options.html"
+  },
+  "options_page": "options.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:18767"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsL46SWLLZnI57HlOQhbkb1R5K17GKLucUDhoerCiVtCcTqlnzWtkailg/e4gsyG8DSXB6rPpC0PdeXBXtt2FOSszukEM196Uk8fR2qjwEvnh1Tscy8UV8RKvQskON/v8CrYYEDQ17H0XxzOj+ZTq3mYZcMrqTIIsg6Y1QGfyCJX5Puy8TlQaVlM+opko8c8Rvgw/w1dYAiost3tl5P7jKi6HGDdt4fV7MeTBuCSxSmnK1FF1L3vdy2+EDS4LkM4+0UzOrLiiHIhGYpqWK+OMezJuErpFnkhsRiJOtuTGTckVJx0M41ZSloGRmJ2BJangb1aJzb6Q1oAYbWceCwfTCwIDAQAB"
+}

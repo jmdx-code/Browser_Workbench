@@ -1,0 +1,17 @@
+export const taskMigration = [
+  'CREATE TABLE task_batches(id TEXT PRIMARY KEY,request TEXT NOT NULL,created_at INTEGER NOT NULL)',
+  `CREATE TABLE task_plans(id TEXT PRIMARY KEY,batch_id TEXT NOT NULL REFERENCES task_batches(id),profile_id TEXT NOT NULL,combination_id TEXT NOT NULL,version INTEGER NOT NULL,account_id TEXT,snapshot TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('QUEUED','RUNNING','PAUSING','PAUSED','STOPPING','STOPPED','REVIEW','COMPLETED','FAILED')),reason TEXT NOT NULL,control_mode TEXT CHECK(control_mode IN ('pause','stop')),control_request_id TEXT,control_confirmed INTEGER NOT NULL DEFAULT 0,round INTEGER NOT NULL CHECK(round>0),position INTEGER NOT NULL CHECK(position>=0),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,FOREIGN KEY(combination_id,version) REFERENCES combination_versions(combination_id,version))`,
+  "CREATE UNIQUE INDEX one_live_plan_per_profile ON task_plans(profile_id) WHERE state NOT IN ('STOPPED','COMPLETED','FAILED')",
+  'CREATE TABLE task_account_locks(account_id TEXT PRIMARY KEY,job_id TEXT NOT NULL UNIQUE REFERENCES task_plans(id))',
+  "CREATE TABLE task_steps(id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES task_plans(id),round INTEGER NOT NULL,position INTEGER NOT NULL,spec TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('PENDING','ACTIVE','COMPLETED')),progress TEXT NOT NULL,UNIQUE(job_id,round,position))",
+  "CREATE TABLE task_outbox(id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES task_plans(id),step_id TEXT NOT NULL REFERENCES task_steps(id),action TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED','VERIFIED','FAILED','UNKNOWN','CANCELLED')),receipt TEXT,checkpoint_applied INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)",
+  "CREATE UNIQUE INDEX one_pending_operation_per_job ON task_outbox(job_id) WHERE status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED','UNKNOWN')",
+  'CREATE TABLE task_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL REFERENCES task_plans(id),type TEXT NOT NULL,detail TEXT NOT NULL,created_at INTEGER NOT NULL)',
+  'CREATE TABLE scheduler_settings(id INTEGER PRIMARY KEY CHECK(id=1),max_concurrent_profiles INTEGER NOT NULL CHECK(max_concurrent_profiles BETWEEN 1 AND 50))',
+  'CREATE INDEX task_queue_order ON task_plans(state,created_at)',
+  'CREATE INDEX task_event_order ON task_events(job_id,sequence)',
+  'INSERT INTO scheduler_settings VALUES(1,2)',
+  "CREATE TRIGGER immutable_task_snapshot BEFORE UPDATE OF batch_id,profile_id,combination_id,version,snapshot,created_at ON task_plans BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_TASK_SNAPSHOT'); END",
+  "CREATE TRIGGER immutable_step_order BEFORE UPDATE OF job_id,round,position,spec ON task_steps BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_STEP_ORDER'); END",
+  "CREATE TRIGGER immutable_operation BEFORE UPDATE OF id,job_id,step_id,action,created_at ON task_outbox BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_OPERATION'); END",
+].join(';');

@@ -1,0 +1,25 @@
+// Migration20 rebuilds only the publication uniqueness key. Existing publications and
+// all foreign-key links stay intact; changing the active generation never erases evidence.
+export const materialUsageMigration = [
+  "CREATE TABLE material_usage_policy(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL CHECK(generation>=0),last_cleared_at INTEGER,file_policy TEXT NOT NULL CHECK(file_policy IN ('retain','archive-test')))",
+  "INSERT INTO material_usage_policy VALUES(1,0,NULL,'retain')",
+  'CREATE TABLE material_usage_resets(id TEXT PRIMARY KEY,request TEXT NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL)',
+  "CREATE TRIGGER immutable_material_usage_reset BEFORE UPDATE ON material_usage_resets BEGIN SELECT RAISE(ABORT,'IMMUTABLE_MATERIAL_USAGE_RESET'); END",
+  "CREATE TRIGGER retain_material_usage_reset BEFORE DELETE ON material_usage_resets BEGIN SELECT RAISE(ABORT,'RETAIN_MATERIAL_USAGE_RESET'); END",
+  'DROP TRIGGER material_terminal_evidence_required',
+  'CREATE TABLE publication_usage_new(attempt_id TEXT PRIMARY KEY REFERENCES material_attempt_verdicts(attempt_id),account_id TEXT NOT NULL,fingerprint TEXT NOT NULL REFERENCES material_contents(fingerprint),post_id TEXT NOT NULL,created_at INTEGER NOT NULL,usage_generation INTEGER NOT NULL DEFAULT 0 CHECK(usage_generation>=0),usage_source_key TEXT NOT NULL,UNIQUE(account_id,post_id))',
+  "INSERT INTO publication_usage_new(attempt_id,account_id,fingerprint,post_id,created_at,usage_source_key) SELECT p.attempt_id,p.account_id,p.fingerprint,p.post_id,p.created_at,CASE WHEN json_type(i.body,'$.resource') IS NOT NULL THEN 'resource:'||json_extract(i.body,'$.resource.combinationId')||':'||json_extract(i.body,'$.resource.row') ELSE 'directory:'||lower(json_extract(i.body,'$.directory'))||':'||lower(json_extract(i.body,'$.snapshot.source')) END FROM material_publications p JOIN material_post_intents i USING(attempt_id)",
+  'DROP TABLE material_publications',
+  'ALTER TABLE publication_usage_new RENAME TO material_publications',
+  'CREATE INDEX material_publication_content ON material_publications(fingerprint,usage_generation)',
+  'CREATE INDEX material_publication_source_use ON material_publications(usage_source_key,usage_generation)',
+  'DROP INDEX one_active_material_per_content',
+  "ALTER TABLE material_reservations ADD COLUMN usage_source_key TEXT NOT NULL DEFAULT ''",
+  'ALTER TABLE material_reservations ADD COLUMN allow_repeat INTEGER NOT NULL DEFAULT 0 CHECK(allow_repeat IN (0,1))',
+  "UPDATE material_reservations SET usage_source_key=(SELECT CASE WHEN json_type(i.body,'$.resource') IS NOT NULL THEN 'resource:'||json_extract(i.body,'$.resource.combinationId')||':'||json_extract(i.body,'$.resource.row') ELSE 'directory:'||lower(json_extract(i.body,'$.directory'))||':'||lower(json_extract(i.body,'$.snapshot.source')) END FROM material_post_intents i WHERE i.attempt_id=material_reservations.attempt_id)",
+  "CREATE UNIQUE INDEX one_active_material_per_resource ON material_reservations(usage_source_key) WHERE state IN ('RESERVED','REVIEW') AND allow_repeat=0",
+  "CREATE TRIGGER immutable_material_publications BEFORE UPDATE ON material_publications BEGIN SELECT RAISE(ABORT,'IMMUTABLE_POST_RECORD'); END",
+  "CREATE TRIGGER retain_material_publications BEFORE DELETE ON material_publications BEGIN SELECT RAISE(ABORT,'RETAIN_POST_RECORD'); END",
+  "CREATE TRIGGER material_terminal_evidence_required BEFORE UPDATE OF state ON material_reservations WHEN NEW.state IN ('PUBLISHED','NOT_PUBLISHED') BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM material_attempt_verdicts v WHERE v.attempt_id=NEW.attempt_id AND v.outcome=NEW.state) THEN RAISE(ABORT,'MATERIAL_TERMINAL_EVIDENCE_REQUIRED') WHEN NEW.state='PUBLISHED' AND NOT EXISTS(SELECT 1 FROM material_publications p WHERE p.attempt_id=NEW.attempt_id AND p.fingerprint=NEW.fingerprint) THEN RAISE(ABORT,'MATERIAL_PUBLICATION_REQUIRED') WHEN NEW.state='NOT_PUBLISHED' AND EXISTS(SELECT 1 FROM material_publications WHERE attempt_id=NEW.attempt_id) THEN RAISE(ABORT,'MATERIAL_PUBLICATION_VERDICT_CONFLICT') END; END",
+  "INSERT INTO workspace_execution_contracts VALUES('material-use-records',1)",
+].join(';');
