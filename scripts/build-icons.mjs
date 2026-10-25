@@ -11,7 +11,10 @@ for (const size of [...sizes, 512]) {
   canvas.getContext('2d').drawImage(source, 0, 0, size, size);
   const png = canvas.toBuffer('image/png');
   if (size === 512) await writeFile('public/app-icon.png', png);
-  else images.push(png);
+  else {
+    images.push(png);
+    if ([16, 32, 48, 128].includes(size)) await writeFile(`build/icon-${size}.png`, png);
+  }
 }
 const header = Buffer.alloc(6 + sizes.length * 16);
 header.writeUInt16LE(1, 2);

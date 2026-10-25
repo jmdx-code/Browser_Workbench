@@ -1,10 +1,18 @@
 import { z } from 'zod';
+const httpOrHttpsUrl = z.string().refine((value) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}, 'URL 必须使用 HTTP 或 HTTPS 协议');
 export const UpdateConfig = z
   .object({
     githubRepo: z
       .string()
       .trim()
-      .regex(/^(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?$/),
+      .regex(/^(?:(?!\.{1,2}\/)[A-Za-z0-9_.-]+\/(?!\.{1,2}$)[A-Za-z0-9_.-]+)?$/),
     autoCheck: z.boolean().default(true),
   })
   .strict();
@@ -27,10 +35,10 @@ export const AvailableUpdate = z.object({
   extensionVersion: z.string().nullable(),
   publishedAt: z.string().nullable(),
   notes: z.string(),
-  downloadUrl: z.string(),
+  downloadUrl: z.union([z.literal(''), httpOrHttpsUrl]),
   sha256: z.string().nullable(),
   requiresInstaller: z.boolean(),
-  releaseUrl: z.string(),
+  releaseUrl: httpOrHttpsUrl,
 });
 export type UpdateRelease = z.infer<typeof AvailableUpdate>;
 export const SoftwareUpdateStatus = z.object({

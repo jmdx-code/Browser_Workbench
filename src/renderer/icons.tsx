@@ -175,10 +175,31 @@ export const IconCheckList = (p: P) => (
     <path d="M4 7l1.5 1.5L8 6M4 13l1.5 1.5L8 12M4 19l1.5 1.5L8 18M11 7h9M11 13h9M11 19h9" />
   </Icon>
 );
-export const IconBrand = (p: P) => (
-  <Icon {...p} strokeWidth={2.3}>
-    <path d="M5 21h7M7 19l3-7 5-5m2-.7L19 5l3 1.5M17 8l2 2 3-1.5" />
-    <circle cx="10" cy="12" r="2.4" fill="currentColor" stroke="none" />
-    <circle cx="15.5" cy="6.5" r="1.9" />
-  </Icon>
+export const IconBrand = ({ size = 20, ...rest }: P) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 1024 1024"
+    fill="none"
+    aria-hidden="true"
+    focusable="false"
+    {...rest}
+  >
+    <rect x="48" y="48" width="928" height="928" rx="224" fill="#2563eb" />
+    <path d="M 280.8 439.7 L 449.2 490.3 L 296 976 H 100 Z" fill="#ffffff" />
+    <circle cx="365" cy="465" r="170" fill="#ffffff" />
+    <circle cx="365" cy="465" r="124" fill="#2563eb" />
+    <path d="M 404.2 543.8 L 725.0 380.1 L 675.0 279.9 L 325.8 386.2 Z" fill="#ffffff" />
+    <circle cx="365" cy="465" r="88" fill="#ffffff" />
+    <circle cx="365" cy="465" r="42" fill="#2563eb" />
+    <circle cx="700" cy="330" r="62" fill="#2563eb" />
+    <path
+      d="M 767.4 383.3 A 86 86 0 1 1 739.4 253.6"
+      fill="none"
+      stroke="#ffffff"
+      strokeWidth="52"
+      strokeLinecap="round"
+    />
+    <circle cx="700" cy="330" r="32" fill="#ffffff" />
+  </svg>
 );

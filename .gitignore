@@ -9,6 +9,7 @@ audit/
 *.log
 .env
 .env.*
+!.env.example
 *.sqlite
 *.sqlite-*
 *.db

@@ -403,6 +403,14 @@ test('empty update source stays silent; busy tasks prevent download and restart'
   });
   assert.equal((await service.status()).error, null);
   assert.equal((await service.status()).availableUpdate, null);
+  await assert.rejects(
+    service.configure({ githubRepo: '../evil', autoCheck: true }),
+    /Invalid|格式/,
+  );
+  await assert.rejects(
+    service.configure({ githubRepo: 'owner/..', autoCheck: true }),
+    /Invalid|格式/,
+  );
   await service.configure({ githubRepo: 'owner/repo', autoCheck: true });
   await assert.rejects(service.apply(), /TASKS_ACTIVE/);
   assert.equal(installs, 0);

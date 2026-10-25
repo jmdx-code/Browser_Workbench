@@ -73,6 +73,13 @@ export async function extractRuntimeArchive(archive: string, destination: string
     zip.readEntry();
   });
 }
+const allowedGithubHosts = new Set([
+  'github.com',
+  'api.github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+  'codeload.github.com',
+]);
 const Release = z.object({
   tag_name: z.string(),
   body: z.string().nullable().optional(),
@@ -97,6 +104,23 @@ export class SoftwareUpdateBackend {
   private get fetcher() {
     return this.options.fetch ?? fetch;
   }
+  private validateUrl(raw: string) {
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw Error('UPDATE_URL_INVALID');
+    }
+    const isCustomTestEndpoint = Boolean(this.options.apiBase || this.options.fetch);
+    if (isCustomTestEndpoint) {
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
+        throw Error('UPDATE_URL_PROTOCOL_REJECTED');
+      return parsed.href;
+    }
+    if (parsed.protocol !== 'https:' || !allowedGithubHosts.has(parsed.hostname.toLowerCase()))
+      throw Error('UPDATE_URL_HOST_REJECTED');
+    return parsed.href;
+  }
   async readConfig() {
     for (const file of [
       path.join(this.options.dataDir, 'update-config.json'),
@@ -117,7 +141,8 @@ export class SoftwareUpdateBackend {
     await rename(file + '.tmp', file);
   }
   private async response(url: string) {
-    const response = await this.fetcher(url, {
+    const validatedUrl = this.validateUrl(url);
+    const response = await this.fetcher(validatedUrl, {
       headers: { 'User-Agent': 'Browser-Workbench-Updater', Accept: 'application/vnd.github+json' },
       signal: AbortSignal.timeout(15000),
     });
@@ -130,16 +155,19 @@ export class SoftwareUpdateBackend {
   }
   async check(repo: string) {
     this.candidate = undefined;
+    const validRepo = UpdateConfig.shape.githubRepo.parse(repo);
+    if (!validRepo) throw Error('UPDATE_REPO_INVALID');
     const release = Release.parse(
       await (
         await this.response(
           (this.options.apiBase ?? 'https://api.github.com') +
             '/repos/' +
-            repo +
+            validRepo +
             '/releases/latest',
         )
       ).json(),
     );
+    const releaseUrl = this.validateUrl(release.html_url);
     const manifestAsset = release.assets.find((a) => a.name === 'release-manifest.json');
     const manifest = manifestAsset
       ? ReleaseManifest.parse(
@@ -154,16 +182,17 @@ export class SoftwareUpdateBackend {
     )
       return null;
     const zip = release.assets.find((a) => a.name === 'workbench-hot-update.zip');
+    const downloadUrl = zip ? this.validateUrl(zip.browser_download_url) : '';
     const result: UpdateRelease = {
       softwareVersion,
       extensionVersion,
       publishedAt: manifest?.publishedAt ?? release.published_at ?? null,
       notes: manifest?.notes ?? release.body ?? '',
-      downloadUrl: zip?.browser_download_url ?? '',
+      downloadUrl,
       sha256: manifest?.sha256 ?? null,
       requiresInstaller:
         !zip || !manifest || manifest.engineFingerprint !== (await this.fingerprint()),
-      releaseUrl: release.html_url,
+      releaseUrl,
     };
     if (manifest) this.candidate = { release: result, manifest };
     return result;

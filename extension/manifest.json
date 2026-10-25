@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Workbench Bridge",
-  "version": "0.3.54",
+  "version": "0.3.55",
   "minimum_chrome_version": "125",
   "permissions": ["debugger", "storage", "alarms", "scripting", "tabGroups"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "https://www.facebook.com/*"],
@@ -11,7 +11,19 @@
   },
   "action": {
     "default_title": "浏览器工作台连接状态",
-    "default_popup": "options.html"
+    "default_popup": "options.html",
+    "default_icon": {
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
   },
   "options_page": "options.html",
   "content_security_policy": {

@@ -733,7 +733,8 @@ chrome.windows.onRemoved.addListener(() => {
     })
     .catch(() => {});
 });
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (sender.id !== chrome.runtime.id || sender.tab) return false;
   void (async () => {
     await ready;
     if (msg.type === 'CONNECT') {

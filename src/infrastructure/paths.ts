@@ -12,9 +12,19 @@ export async function syncProductExtensionDirectory(
   targetDir = productExtensionDirectory(),
 ) {
   const names = ['worker.js', 'options.js', 'options.html', 'manifest.json'];
+  const optionalIcons = ['icon-16.png', 'icon-32.png', 'icon-48.png', 'icon-128.png'];
   const files = await Promise.all(
     names.map(async (name) => ({ name, bytes: await readFile(path.join(sourceDir, name)) })),
   );
+  for (const name of optionalIcons) {
+    const bytes = await readFile(path.join(sourceDir, name)).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+        return null;
+      },
+    );
+    if (bytes) files.push({ name, bytes });
+  }
   const manifest = JSON.parse(files[3]?.bytes.toString('utf8') ?? '{}') as { version?: string };
   if (!manifest.version || !/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(manifest.version))
     throw Error('EXTENSION_MANIFEST_INVALID');

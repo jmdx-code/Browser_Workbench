@@ -23,4 +23,6 @@ await build({
 });
 for (const file of ['manifest.json', 'options.html'])
   await copyFile('extension/' + file, 'extension-build/' + file);
+for (const size of [16, 32, 48, 128])
+  await copyFile(`build/icon-${size}.png`, `extension-build/icon-${size}.png`);
 console.log('Formal bridge built; fixed ID: ' + id);
