@@ -2,7 +2,7 @@
 
 基于 Electron、TypeScript、React 与浏览器扩展的本地任务工作台。
 
-当前软件版本 **0.1.131**，桥接插件 **0.3.54**。支持浏览器分组与批量管理、任务组合、任务记录、发帖素材矩阵、小组邀请，以及软件和插件更新。
+当前软件版本 **0.1.132**，桥接插件 **0.3.54**。支持浏览器分组与批量管理、任务组合、任务记录、发帖素材矩阵、小组邀请，以及软件和插件更新。
 
 ## 安装使用
 
@@ -36,7 +36,7 @@ npm run build:release
 npm run package:win -- --publish never
 ```
 
-推送与 package.json 匹配的版本标签（如 `v0.1.131`），GitHub Actions 会检查工程、构建并上传安装包、热更新ZIP和校验清单。也可手动运行 Release 工作流。
+推送与 package.json 匹配的版本标签（如 `v0.1.132`），GitHub Actions 会检查工程、构建并上传安装包、热更新ZIP和校验清单。也可手动运行 Release 工作流。
 
 客户端默认更新源为 `jmdx-code/Browser_Workbench`。引擎/依赖指纹兼容时使用固定 runtime 热更新；不兼容时下载安装包。详见 [更新说明](docs/SOFTWARE_UPDATES.md) 与 [架构概览](docs/PUBLIC_ARCHITECTURE.md)。
 
