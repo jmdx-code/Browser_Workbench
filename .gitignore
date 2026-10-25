@@ -17,6 +17,7 @@ audit/
 *.pem
 *.key
 *.mp4
+!/public/sample.mp4
 *.mov
 *.webm
 *.zip
