@@ -19,6 +19,7 @@ import { assertArchiveSourcesAvailable } from './material-archive-source-protect
 import { ResourceMaterialPostIntent } from '../shared/material-index.js';
 import { AttemptVerdict } from '../shared/material-post.js';
 import { summarizeResourceUsage, type ResourceUsageFact } from '../domain/resource-usage.js';
+import { historicalArchiveTestEnabled } from './material-usage-store.js';
 
 export class SqliteResourceTableRepository implements ResourceTableRepository {
   private usageCache: {
@@ -27,6 +28,52 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
     values: ResourceUsageSummaryValue[];
   } | null = null;
   constructor(private readonly db: DatabaseSync) {}
+  private consumed(combinationId: string, row: ResourceRowValue) {
+    return Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM material_publications p JOIN material_post_intents i USING(attempt_id)
+      WHERE p.usage_source_key=? AND p.usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1)
+      AND coalesce(json_extract(i.body,'$.allowRepeat'),0)=0 LIMIT 1`,
+        )
+        .get('resource:' + combinationId + ':' + JSON.stringify(row)),
+    );
+  }
+  private append(
+    combinationId: string,
+    revision: number,
+    rows: ResourceRowValue[],
+    now = Date.now(),
+  ) {
+    this.db
+      .prepare('INSERT INTO resource_table_versions VALUES(?,?,?,?)')
+      .run(combinationId, revision, JSON.stringify(rows), now);
+    this.db
+      .prepare(
+        'INSERT INTO resource_table_heads VALUES(?,?) ON CONFLICT(combination_id) DO UPDATE SET revision=excluded.revision',
+      )
+      .run(combinationId, revision);
+    this.usageCache = null;
+  }
+  removePublishedRow(combinationId: string, consumed: ResourceRowValue, now: number) {
+    const current = this.read(combinationId);
+    const rows = current.rows.filter(
+      (row) => row.id !== consumed.id && JSON.stringify(row) !== JSON.stringify(consumed),
+    );
+    if (rows.length !== current.rows.length)
+      this.append(combinationId, current.revision + 1, rows, now);
+  }
+  pruneConsumedRows() {
+    if (historicalArchiveTestEnabled(this.db)) return;
+    transaction(this.db, () => {
+      for (const head of this.db.prepare('SELECT combination_id FROM resource_table_heads').all()) {
+        const current = this.read(String(head.combination_id));
+        const rows = current.rows.filter((row) => !this.consumed(current.combinationId, row));
+        if (rows.length !== current.rows.length)
+          this.append(current.combinationId, current.revision + 1, rows);
+      }
+    });
+  }
   readVersion(combinationId: string, revision: number) {
     z.uuid().parse(combinationId);
     z.number().int().positive().parse(revision);
@@ -73,19 +120,41 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
   }
   save(combinationId: string, expectedRevision: number, input: ResourceRowValue[]) {
     const value = SaveResourceTable.parse({ combinationId, expectedRevision, rows: input });
-    const rows = validateResourceRows(value.rows);
+    let rows = validateResourceRows(value.rows);
     return transaction(this.db, () => {
       const current = this.read(value.combinationId);
       assertArchiveSourcesAvailable(
         this.db,
         rows.flatMap((row) => row.media.filter((m) => m.kind === 'local').map((m) => m.source)),
       );
-      if (current.revision !== value.expectedRevision)
-        throw new ProductError(
-          'RESOURCE_REVISION_CONFLICT',
-          '资源表已在其他窗口修改，当前内容保留；请重新打开核对',
-          409,
-        );
+      if (current.revision !== value.expectedRevision) {
+        let merged = false;
+        if (
+          !historicalArchiveTestEnabled(this.db) &&
+          current.revision > value.expectedRevision &&
+          value.expectedRevision > 0
+        ) {
+          const base = this.readVersion(combinationId, value.expectedRevision);
+          const keys = new Set(current.rows.map((row) => JSON.stringify(row)));
+          const removed = base.rows.filter((row) => !keys.has(JSON.stringify(row)));
+          if (
+            removed.length > 0 &&
+            JSON.stringify(base.rows.filter((row) => keys.has(JSON.stringify(row)))) ===
+              JSON.stringify(current.rows) &&
+            removed.every((row) => this.consumed(combinationId, row))
+          ) {
+            const ids = new Set(removed.map((row) => row.id));
+            rows = rows.filter((row) => !ids.has(row.id));
+            merged = true;
+          }
+        }
+        if (!merged)
+          throw new ProductError(
+            'RESOURCE_REVISION_CONFLICT',
+            '资源表已在其他窗口修改，当前内容保留；请重新打开核对',
+            409,
+          );
+      }
       const revision = current.revision + 1;
       this.db
         .prepare('INSERT INTO resource_table_versions VALUES(?,?,?,?)')

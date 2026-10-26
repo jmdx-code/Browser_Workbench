@@ -16,6 +16,15 @@ export function decidePostAILabel(
   const opened = applied('OPEN_AI_LABEL'),
     changed = applied('SET_AI_LABEL');
   const confirmed = applied('CONFIRM_AI_LABEL');
+  if (
+    setting === 'off' &&
+    !opened &&
+    !changed &&
+    !confirmed &&
+    reading.phase !== 'settings' &&
+    reading.value !== true
+  )
+    return { kind: 'ready' as const };
   const action = (purpose: AILabelPurpose) => ({
     kind: 'action' as const,
     purpose,

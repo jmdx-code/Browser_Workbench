@@ -163,6 +163,12 @@ if (!process.versions.electron) {
         assert.equal(s.items[0].name, 'Pure Name');
         assert.equal(s.sendButton.index, 1);
         assert.equal(s.sendButton.disabled, true);
+        const marked = await win.webContents.executeJavaScript(
+          `({recipient: document.querySelector('[data-wb-recipient-id]')?.getAttribute('data-wb-recipient-id'), send: document.querySelectorAll('[data-wb-group-send-btn="1"]').length, close: document.querySelectorAll('[data-wb-group-close-btn="1"]').length})`,
+        );
+        assert.equal(marked.recipient, s.items[0].id);
+        assert.equal(marked.send, 1);
+        assert.equal(marked.close, 1);
         assert.equal(s.closeButton.index, 2);
         assert.deepEqual(s.recipients.map((r) => r.id).sort(), ['987654322', '987654323']);
         checks.push('structural-dialog-' + label);

@@ -920,10 +920,10 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
                   assertCurrent,
                   {
                     scrollFallback: () =>
-                      page.locator(selector).click({ timeout: 10_000, noWaitAfter: true }),
+                      page.locator(selector).click({ timeout: 5_000, noWaitAfter: true }),
                   },
                 );
-              else await page.locator(selector).click({ timeout: 10_000, noWaitAfter: true });
+              else await page.locator(selector).click({ timeout: 5_000, noWaitAfter: true });
             } else await this.connection.navigateBoundPage(operation.binding, action, page.url());
           } else if (action.kind === 'browseScroll') {
             const surface = facebookBrowseSurface(action.url);
@@ -999,7 +999,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
                 action.url,
                 assertCurrent,
                 {
-                  scrollFallback: () => page.locator(action.css).click({ timeout: 15_000 }),
+                  scrollFallback: () => page.locator(action.css).click({ timeout: 5_000 }),
                 },
               );
             } catch (error) {
@@ -1022,7 +1022,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
                 ),
               });
             // Locator click moves the real pointer itself; a separate pre-move duplicates input.
-            if (action.kind === 'typeText') await locator.fill(action.text, { timeout: 15_000 });
+            if (action.kind === 'typeText') await locator.fill(action.text, { timeout: 5_000 });
             else if (
               submission?.link.purpose === 'OPEN_COMPOSER' &&
               step.spec.type === 'post' &&
@@ -1035,7 +1035,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
               const enabled = await locator.isEnabled();
               await assertTarget();
               if (!visible || !enabled) throw Error('FACEBOOK_COMPOSER_ENTRY_UNAVAILABLE');
-              await locator.press('Enter', { timeout: 15_000 });
+              await locator.press('Enter', { timeout: 5_000 });
             } else if (
               submission &&
               ['OPEN_AUDIENCE', 'CONFIRM_AUDIENCE', 'OPEN_BACKGROUND', 'SET_BACKGROUND'].includes(
@@ -1047,12 +1047,12 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
               await assertTarget();
               if (!visible || !enabled)
                 throw Error('FACEBOOK_POST_CONFIGURATION_TARGET_UNAVAILABLE');
-              await locator.press('Enter', { timeout: 15_000 });
+              await locator.press('Enter', { timeout: 5_000 });
             } else if (step.spec.type !== 'post')
               await clickFacebookNativeTarget(page, action.target, page.url(), assertCurrent, {
-                scrollFallback: () => locator.click({ timeout: 15_000 }),
+                scrollFallback: () => locator.click({ timeout: 5_000 }),
               });
-            else await locator.click({ timeout: 15_000 });
+            else await locator.click({ timeout: 5_000 });
           }
         },
         assertCurrent,

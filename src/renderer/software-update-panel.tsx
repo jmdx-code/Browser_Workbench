@@ -1,3 +1,4 @@
+import { copyTextToClipboard } from './clipboard.js';
 import { useCallback, useEffect, useState } from 'react';
 import type { UpdateStatus } from '../shared/software-update.js';
 import { api } from './api.js';
@@ -82,7 +83,7 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
           disabled={busy || !status}
           onClick={() =>
             void action(async () => {
-              await navigator.clipboard.writeText(status?.extensionDirectory ?? '');
+              await copyTextToClipboard(status?.extensionDirectory ?? '');
               return '已复制固定插件路径';
             })
           }

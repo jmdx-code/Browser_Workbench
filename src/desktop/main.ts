@@ -401,9 +401,21 @@ async function boot() {
   window.webContents.on('will-navigate', (event, target) => {
     if (new URL(target).origin !== origin) event.preventDefault();
   });
-  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) =>
-    callback(false),
+  const allowedClipboardPermissions = new Set(['clipboard-sanitized-write', 'clipboard-read']);
+  window.webContents.session.setPermissionCheckHandler(
+    (_contents, permission, requestingOrigin) =>
+      requestingOrigin === origin && allowedClipboardPermissions.has(permission),
   );
+  window.webContents.session.setPermissionRequestHandler((contents, permission, callback) => {
+    let validOrigin = false;
+    try {
+      validOrigin =
+        contents === window?.webContents && new URL(contents.getURL()).origin === origin;
+    } catch {
+      validOrigin = false;
+    }
+    callback(validOrigin && allowedClipboardPermissions.has(permission));
+  });
   let closeRequest: string | null = null;
   let closeTimer: NodeJS.Timeout | null = null;
   let closeChoicePending = false;

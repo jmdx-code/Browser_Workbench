@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { postAILabelSetting } from '../src/domain/material-post.js';
+import { postAILabelSetting, requiresNativePostBackground } from '../src/domain/material-post.js';
 import type { PostIntent } from '../src/shared/material-index.js';
 import { emptyResourceRow } from '../src/domain/resource-table.js';
 import { randomUUID } from 'node:crypto';
@@ -169,6 +169,9 @@ class NodeFixture {
   getAttribute(name: string) {
     return this.attributes.get(name) ?? null;
   }
+  setAttribute(name: string, value: string) {
+    this.attributes.set(name, value);
+  }
   querySelectorAll(css: string) {
     return this.nodes.get(css) ?? [];
   }
@@ -217,6 +220,16 @@ test('bounded AI projection distinguishes unique native composer, settings, disa
     assert.equal(read().ready, false);
     document.readyState = 'complete';
     assert.equal(read().value, false);
+    for (const label of ['AI 标签已关闭', 'AI 標籤已關閉']) {
+      opener.attributes.set('aria-label', label);
+      assert.equal(read().value, false);
+      assert.equal(read().phase, 'composer');
+    }
+    opener.attributes.set('aria-label', 'AI 標籤已開啟');
+    assert.equal(read().value, true);
+    root.nodes.set('[role="button"]', []);
+    assert.equal(read().value, false);
+    root.nodes.set('[role="button"]', [opener]);
     opener.disabled = true;
     assert.equal(read().openCSS, null);
     root.nodes.set('[role="dialog"][aria-label="Labeling your content"]', [heading]);
@@ -240,6 +253,32 @@ test('bounded AI projection distinguishes unique native composer, settings, disa
       else Reflect.deleteProperty(globalThis, key);
     }
   }
+});
+
+test('AI off without controls passes only before any configuration action; known on still needs an action', () => {
+  assert.equal(
+    decidePostAILabel(
+      'off',
+      { ...composer, phase: 'ambiguous', value: null, openCSS: null },
+      () => false,
+    ).kind,
+    'ready',
+  );
+  assert.throws(() =>
+    decidePostAILabel('off', { ...composer, phase: 'ambiguous', value: null }, () => true),
+  );
+  assert.equal(decidePostAILabel('off', { ...composer, value: true }, () => false).kind, 'action');
+});
+
+test('native colored post background is limited to 120 Unicode characters and four lines', () => {
+  const intent = (text: string, media: unknown[] = []) =>
+    ({ resource: { row: { background: 'color', media } }, snapshot: { text } }) as PostIntent;
+  assert.equal(requiresNativePostBackground(intent('文'.repeat(120))), true);
+  assert.equal(requiresNativePostBackground(intent('😀'.repeat(121))), false);
+  assert.equal(requiresNativePostBackground(intent('a\nb\nc\nd')), true);
+  assert.equal(requiresNativePostBackground(intent('a\nb\nc\nd\ne')), false);
+  assert.equal(requiresNativePostBackground(intent('长文'.repeat(200))), false);
+  assert.equal(requiresNativePostBackground(intent('短文', [{}])), false);
 });
 
 test('single-post row AI overrides step defaults, including explicit preserve-current; old rows inherit', () => {

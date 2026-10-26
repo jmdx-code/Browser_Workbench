@@ -51,6 +51,81 @@ import { dispatchedPost, postReceipt, deliverPostNotices } from './fixtures/mate
 import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
 
 const noop = () => {};
+
+for (const allowRepeat of [false, true])
+  test(`production publication removes only non-repeat resource rows (repeat=${allowRepeat})`, async () =>
+    fixture(async (store, _file, _dir, db) => {
+      db.exec("UPDATE material_usage_policy SET file_policy='retain' WHERE id=1");
+      const own = row('生产成功资源');
+      const { combination, assigned, profiles } = await plans(store, [own], 1, allowRepeat);
+      const catalog = (await prepare(store).prepare(assigned[0]!.id, randomUUID(), noop)).catalog;
+      const input = await simulatedActor(
+        store,
+        db,
+        assigned[0]!.id,
+        profiles[0]!.account.id,
+        catalog.id,
+      );
+      const held = await store.materials.reserveNextResource(input),
+        request = { ...input, sourceId: held.intent.sourceId };
+      const op = await dispatchedPost(store, request);
+      await store.materialPosts.verify(await postReceipt(store, request, op));
+      assert.equal(store.resourceTables.read(combination.id).rows.length, allowRepeat ? 1 : 0);
+      assert.equal(store.resourceTables.readVersion(combination.id, 1).rows.length, 1);
+      if (!allowRepeat)
+        assert.equal(
+          store.resourceTables.usageSummaries().find((s) => s.combinationId === combination.id)
+            ?.remaining,
+          0,
+        );
+    }));
+
+test('production stale rows prune and old editor save merges only consumed removals', async () =>
+  fixture(async (store, _file, _dir, db) => {
+    db.exec("UPDATE material_usage_policy SET file_policy='retain' WHERE id=1");
+    const own = row('已消费'),
+      remaining = row('保留'),
+      added = row('新资源');
+    const { combination, assigned, profiles } = await plans(store, [own, remaining]);
+    const catalog = (await prepare(store).prepare(assigned[0]!.id, randomUUID(), noop)).catalog;
+    const input = await simulatedActor(
+      store,
+      db,
+      assigned[0]!.id,
+      profiles[0]!.account.id,
+      catalog.id,
+    );
+    const held = await store.materials.reserveNextResource(input),
+      request = { ...input, sourceId: held.intent.sourceId };
+    const op = await dispatchedPost(store, request);
+    await store.materialPosts.verify(await postReceipt(store, request, op));
+    const oldRows = store.resourceTables.readVersion(combination.id, 1).rows;
+    db.prepare('INSERT INTO resource_table_versions VALUES(?,?,?,?)').run(
+      combination.id,
+      3,
+      JSON.stringify(oldRows),
+      Date.now(),
+    );
+    db.prepare('UPDATE resource_table_heads SET revision=3 WHERE combination_id=?').run(
+      combination.id,
+    );
+    store.resourceTables.pruneConsumedRows();
+    assert.deepEqual(
+      store.resourceTables.read(combination.id).rows.map((r) => r.id),
+      [remaining.id],
+    );
+    assert.equal(store.resourceTables.read(combination.id).revision, 4);
+    const saved = store.resourceTables.save(combination.id, 3, [...oldRows, added]);
+    assert.deepEqual(
+      saved.rows.map((r) => r.id),
+      [remaining.id, added.id],
+    );
+    store.resourceTables.save(combination.id, 5, [{ ...remaining, text: '人工修改' }, added]);
+    assert.throws(
+      () => store.resourceTables.save(combination.id, 5, [remaining, added]),
+      /资源表已在其他窗口修改/,
+    );
+  }));
 test('colored table resource uses original background operations and independent effects before text; ACK never becomes a plain post or consumes the resource', async () =>
   fixture(async (store, _file, _dir, db) => {
     const saved = { ...row('生成彩贴正文'), background: 'color' as const };
@@ -439,11 +514,14 @@ async function simulatedActor(
     proof,
   };
 }
-const prepare = (store: WorkspaceStore) =>
+const prepare = (store: WorkspaceStore, nativeBackground = false) =>
   new ResourceMaterialPreparation(
     store.tasks.resources,
     new FilesystemResourceMaterialVerifier(),
     store.materials,
+    undefined,
+    undefined,
+    nativeBackground,
   );
 const count = (db: DatabaseSync, table: string) =>
   Number(db.prepare('SELECT count(*) AS n FROM ' + table).get()?.n);
@@ -1227,7 +1305,10 @@ test('story reservation skips post-only resources and prevents a multi-image pos
     const image = path.join(dir, 'generated-story.png');
     await writeFile(image, png);
     const multi = { ...row('多图', [image, image]), purpose: 'story' as const };
-    const text = { ...row('单条文字快拍'), purpose: 'both' as const };
+    const text = { ...row('单条文字快拍'), background: 'color' as const, purpose: 'both' as const };
+    db.prepare(
+      "DELETE FROM workspace_execution_contracts WHERE name='post-native-background'",
+    ).run();
     const { assigned, profiles } = await plans(
       store,
       [row('帖子'), multi, text],
@@ -1236,7 +1317,8 @@ test('story reservation skips post-only resources and prevents a multi-image pos
       undefined,
       'story',
     );
-    const catalog = (await prepare(store).prepare(assigned[0]!.id, randomUUID(), noop)).catalog;
+    const catalog = (await prepare(store, true).prepare(assigned[0]!.id, randomUUID(), noop))
+      .catalog;
     const input = await simulatedActor(
       store,
       db,
@@ -1249,6 +1331,8 @@ test('story reservation skips post-only resources and prevents a multi-image pos
       async () => await store.materials.reserve({ ...input, sourceId: multiSource.id }),
       /STORY_MULTI_MEDIA/,
     );
+    const textSource = catalog.sources.find((source) => source.origin.row.id === text.id)!;
+    await store.materials.reserve({ ...input, sourceId: textSource.id });
     const held = await store.materials.reserveNextResource(input);
     assert.equal(ResourceMaterialPostIntent.parse(held.intent).resource.row.id, text.id);
     assert.equal(count(db, 'material_publications'), 0);

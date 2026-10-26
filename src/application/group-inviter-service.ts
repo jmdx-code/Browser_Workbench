@@ -532,6 +532,23 @@ export class GroupInviterService {
                 },
               });
             } catch (err) {
+              if (
+                err instanceof ProductError &&
+                err.code === 'GROUP_INVITER_GROUP_UNINVITABLE' &&
+                pending.length > 0
+              ) {
+                run.profileStatus.set(profileId, err.message);
+                devDiag.record({
+                  level: 'INFO',
+                  category: 'GROUP_INVITER',
+                  event: 'GROUP_INVITER_GROUP_SKIPPED',
+                  profileId,
+                  reason: err.code,
+                  data: { runId: run.id, groupId: group.groupId },
+                });
+                await sleep(1000);
+                continue;
+              }
               run.failedProfiles.add(profileId);
               if (err instanceof Error && err.message === 'GROUP_INVITER_STOP_UNCONFIRMED') {
                 run.unconfirmedStops.add(profileId);

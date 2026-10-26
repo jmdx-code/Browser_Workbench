@@ -272,6 +272,7 @@ test('mutation response after old three-second cutoff still confirms without fal
         variables: JSON.stringify(variables),
       }).toString(),
   };
+  assert.equal(observer.hasSettled(), false);
   events.emit('request', request);
   const timer = setTimeout(
     () =>
@@ -298,6 +299,7 @@ test('mutation response after old three-second cutoff still confirms without fal
     });
     assert.equal(confirmed.size, 30);
     assert.equal(fallback, 0);
+    assert.equal(observer.hasSettled(), true);
   } finally {
     clearTimeout(timer);
     await observer.close();

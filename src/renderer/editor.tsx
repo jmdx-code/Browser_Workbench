@@ -9,7 +9,6 @@ import {
 } from '../shared/contracts.js';
 import { api } from './api.js';
 import { DraftSession } from './draft-session.js';
-import { MaterialPreflight } from './material-preflight.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 
 import { marketplaceCategories } from '../shared/marketplace-categories.js';
@@ -22,6 +21,16 @@ const stepNames = {
 };
 export interface EditorHandle {
   persist(): Promise<boolean>;
+}
+export function normalizeCombinationResources(value: Combination): Combination {
+  return {
+    ...value,
+    steps: value.steps.map((step) =>
+      step.type === 'post'
+        ? { ...step, resourceMode: 'table' as const, resourceDirectory: '' }
+        : step,
+    ),
+  };
 }
 function newPostStep(id: string, destination: 'post' | 'story' = 'post'): Step {
   return {
@@ -63,7 +72,6 @@ export function Editor({
   onClose,
   notify,
   ref,
-  selectedProfiles,
   onResources,
   resourceUsage,
   resourceUsageLoaded,
@@ -79,7 +87,7 @@ export function Editor({
   resourceUsageLoaded: boolean;
 }) {
   const [value, setValue] = useState<Combination>(
-    initial?.draft ?? initial?.saved ?? newCombination(),
+    normalizeCombinationResources(initial?.draft ?? initial?.saved ?? newCombination()),
   );
   const [revision, setRevision] = useState(initial.revision);
   const [dirty, setDirty] = useState(false);
@@ -128,7 +136,7 @@ export function Editor({
       setManualSaveRequired(choice !== 'remote');
       if (choice === 'remote') {
         generation.current++;
-        setValue(row.draft ?? row.saved ?? newCombination());
+        setValue(normalizeCombinationResources(row.draft ?? row.saved ?? newCombination()));
         dirtyRef.current = false;
         setDirty(false);
       }
@@ -143,7 +151,7 @@ export function Editor({
   }
   function change(next: Combination) {
     generation.current++;
-    setValue(next);
+    setValue(normalizeCombinationResources(next));
     setAutoSaveFailed(false);
     setDirty(true);
     dirtyRef.current = true;
@@ -202,10 +210,13 @@ export function Editor({
     const savingGeneration = generation.current;
     setBusy(true);
     try {
-      const parsed = (publish ? CombinationSchema : CombinationDraftSchema).safeParse(value);
+      const parsed = (publish ? CombinationSchema : CombinationDraftSchema).safeParse(
+        normalizeCombinationResources(value),
+      );
       if (!parsed.success)
         throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
-      const draft = dirtyRef.current ? await session.current.write(parsed.data) : { revision };
+      const draft =
+        dirtyRef.current || publish ? await session.current.write(parsed.data) : { revision };
       const saved = publish ? await api.publish(initial.id, draft.revision) : draft;
       if (publish) session.current.acceptPublishedRevision(saved.revision);
       setRevision(saved.revision);
@@ -233,7 +244,7 @@ export function Editor({
     setBusy(true);
     const savingGeneration = generation.current;
     try {
-      const draft = CombinationDraftSchema.parse(value);
+      const draft = CombinationDraftSchema.parse(normalizeCombinationResources(value));
       const saved = await session.current.write(draft);
       setRevision(saved.revision);
       if (generation.current === savingGeneration) {
@@ -327,6 +338,20 @@ export function Editor({
           <button onClick={() => add('post')}>＋ 随机发帖</button>
         </div>
       </div>
+      {value.steps.some((step) => step.type === 'post') && (
+        <div className="combo-resource-bar">
+          <div className="combo-resource-info">
+            <strong>本组合发帖 / 快拍资源表</strong>
+            <span>
+              本组合内所有「随机发帖」与「发布快拍」子任务共用此表；未勾选重复使用时，发布成功后自动从表中移除。
+            </span>
+          </div>
+          <button type="button" className="resource-settings-button" onClick={onResources}>
+            📋 设置发帖资源…（可用 {resourceUsageLoaded ? (resourceUsage?.remaining ?? 0) : '…'}{' '}
+            条）
+          </button>
+        </div>
+      )}
       <div className="step-list">
         {value.steps.map((step, index) => (
           <article className={'step step-' + step.type} key={step.id}>
@@ -613,56 +638,6 @@ export function Editor({
               </div>
             ) : (
               <div className="post-fields">
-                <div className="post-resource-field">
-                  <label>
-                    发帖素材
-                    <select
-                      aria-label="素材来源"
-                      value={step.resourceMode ?? 'directory'}
-                      onChange={(e) =>
-                        stepChange(step.id, {
-                          resourceMode: e.target.value === 'table' ? 'table' : 'directory',
-                          resourceDirectory: '',
-                        })
-                      }
-                    >
-                      <option value="table">组合资源表</option>
-                      <option value="directory">原素材目录</option>
-                    </select>
-                  </label>
-                  {step.resourceMode === 'table' ? (
-                    <button className="resource-settings-button" onClick={onResources}>
-                      📋 设置发帖资源…（可用{' '}
-                      {resourceUsageLoaded ? (resourceUsage?.remaining ?? 0) : '…'} 条）
-                    </button>
-                  ) : (
-                    <label>
-                      资源目录
-                      <input
-                        value={step.resourceDirectory}
-                        placeholder="选择素材目录"
-                        onChange={(e) => stepChange(step.id, { resourceDirectory: e.target.value })}
-                      />
-                      {window.workbenchDesktop && (
-                        <button
-                          onClick={() =>
-                            void window.workbenchDesktop
-                              ?.chooseMaterialDirectory()
-                              .then((directory) => {
-                                if (directory)
-                                  stepChange(step.id, { resourceDirectory: directory });
-                              })
-                              .catch((error: unknown) =>
-                                notify(error instanceof Error ? error.message : '目录选择失败'),
-                              )
-                          }
-                        >
-                          选择目录…
-                        </button>
-                      )}
-                    </label>
-                  )}
-                </div>
                 <label>
                   {step.destination === 'story' ? '每个账号快拍数' : '每个账号发帖数'}
                   <div className="unit-field">
@@ -700,54 +675,17 @@ export function Editor({
                     </option>
                   </select>
                 </label>
-                {step.destination !== 'story' && step.resourceMode !== 'table' && (
-                  <label>
-                    AI 声明
-                    <select
-                      aria-label="AI 声明"
-                      value={step.aiLabel ?? 'preserve-current'}
-                      onChange={(event) =>
-                        stepChange(step.id, {
-                          aiLabel:
-                            event.target.value === 'on'
-                              ? 'on'
-                              : event.target.value === 'off'
-                                ? 'off'
-                                : 'preserve-current',
-                        })
-                      }
-                    >
-                      <option value="preserve-current">保持 Facebook 当前设置</option>
-                      <option value="on">开启</option>
-                      <option value="off">关闭</option>
-                    </select>
-                  </label>
-                )}
-                <p className="field-hint">
-                  默认跳过已使用资源 ·
-                  原文件位置不变。勾选允许重复，或在设置中清空使用记录后可再次使用。
-                </p>
                 <label className="check-label">
                   <input
                     type="checkbox"
                     checked={step.allowRepeat}
                     onChange={(event) => stepChange(step.id, { allowRepeat: event.target.checked })}
                   />
-                  允许重复使用素材（包括同一账号）
+                  允许重复使用素材（发布成功不从资源表移除）
                 </label>
                 <p className="field-hint">
-                  {step.destination === 'story'
-                    ? '仅领取用途为快拍或两者通用的资源。每行一条快拍；多张图片请分行。'
-                    : '仅领取用途为帖子或两者通用的资源。'}
+                  共用上方「本组合发帖 / 快拍资源表」；未勾选重复使用时，发布成功后自动从表中清理。
                 </p>
-                {step.resourceMode !== 'table' && (
-                  <MaterialPreflight
-                    directory={step.resourceDirectory}
-                    selectedProfiles={selectedProfiles}
-                    count={step.count}
-                    allowRepeat={step.allowRepeat}
-                  />
-                )}
               </div>
             )}
           </article>

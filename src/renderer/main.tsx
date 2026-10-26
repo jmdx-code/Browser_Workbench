@@ -1,3 +1,4 @@
+import { copyTextToClipboard } from './clipboard.js';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Profile, SavedCombination } from '../shared/contracts.js';
@@ -243,6 +244,29 @@ function App() {
           >
             记录问题现场
           </button>
+          <button
+            className="btn btn-sm"
+            title={
+              updates.status?.extensionDirectory
+                ? `点击复制固定插件目录：${updates.status.extensionDirectory}`
+                : '点击复制浏览器扩展（固定插件目录）路径'
+            }
+            onClick={() => {
+              void (async () => {
+                try {
+                  const dir =
+                    updates.status?.extensionDirectory ||
+                    (await api.softwareUpdateStatus()).extensionDirectory;
+                  await copyTextToClipboard(dir);
+                  setMessage(`已复制固定插件路径：${dir}`);
+                } catch (err) {
+                  setMessage(err instanceof Error ? err.message : '复制插件路径失败');
+                }
+              })();
+            }}
+          >
+            复制插件路径
+          </button>
           <span
             className={'connection-status' + (error ? ' is-error' : onlineCount ? ' is-on' : '')}
             title={error ? '控制服务连接待刷新' : '已连接的浏览器 / 全部浏览器'}
@@ -435,7 +459,11 @@ function App() {
                       const usesTable = row.saved?.steps.some(
                         (step) => step.type === 'post' && step.resourceMode === 'table',
                       );
-                      const revision = resourceSummaries?.find(
+                      const latestSummaries = usesTable
+                        ? await api.resourceSummaries()
+                        : resourceSummaries;
+                      if (usesTable) setResourceSummaries(latestSummaries);
+                      const revision = latestSummaries?.find(
                         (value) => value.combinationId === row.id,
                       )?.revision;
                       if (usesTable && !revision) throw Error('请先保存并读取发帖资源');
@@ -536,18 +564,7 @@ function App() {
                     void (async () => {
                       try {
                         const text = formatCombinationForClipboard(row);
-                        try {
-                          await navigator.clipboard.writeText(text);
-                        } catch {
-                          const area = document.createElement('textarea');
-                          area.value = text;
-                          area.style.position = 'fixed';
-                          area.style.opacity = '0';
-                          document.body.appendChild(area);
-                          area.select();
-                          document.execCommand('copy');
-                          document.body.removeChild(area);
-                        }
+                        await copyTextToClipboard(text);
                         const name = (row.saved ?? row.draft)?.name || '未命名组合';
                         setMessage(
                           `已将任务组合「${name}」复制到剪贴板，可发给他人或点击“导入组合”创建副本`,
@@ -750,11 +767,13 @@ function App() {
           onClose={() => setSchedule(null)}
           onSubmit={async (timing) => {
             const usesTable = schedule.row.saved?.steps.some(
-                (step) => step.type === 'post' && step.resourceMode === 'table',
-              ),
-              revision = resourceSummaries?.find(
-                (value) => value.combinationId === schedule.row.id,
-              )?.revision;
+              (step) => step.type === 'post' && step.resourceMode === 'table',
+            );
+            const latestSummaries = usesTable ? await api.resourceSummaries() : resourceSummaries;
+            if (usesTable) setResourceSummaries(latestSummaries);
+            const revision = latestSummaries?.find(
+              (value) => value.combinationId === schedule.row.id,
+            )?.revision;
             if (usesTable && !revision) throw Error('请先保存并读取发帖资源');
             const result = await tasks.start({
               combinationId: schedule.row.id,

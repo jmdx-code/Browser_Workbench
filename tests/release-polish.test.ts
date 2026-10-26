@@ -71,6 +71,28 @@ function browser(
   };
 }
 
+test('uninvitable group continues to the next group without failing the profile', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const profileId = randomUUID(),
+    second = { ...group, groupId: '9876543210' },
+    attempts: string[] = [];
+  const service = new GroupInviterService(
+    repository({ listGroups: () => [group, second] }),
+    browser(async (_id, g) => {
+      attempts.push(g.groupId);
+      if (attempts.length === 1)
+        throw new ProductError('GROUP_INVITER_GROUP_UNINVITABLE', '小组待审核', 409);
+    }),
+  );
+  await service.start({ profileIds: [profileId], groupIds: [group.groupId, second.groupId] });
+  await flush();
+  assert.equal(attempts.length, 1);
+  t.mock.timers.tick(1000);
+  await flush();
+  assert.deepEqual(new Set(attempts), new Set([group.groupId, second.groupId]));
+  assert.equal((await service.state()).profileCounts[profileId]?.status, '已完成');
+});
+
 test('mobile verification ends this profile run as restricted without retrying or advancing groups', async () => {
   const profileId = randomUUID();
   let attempts = 0;

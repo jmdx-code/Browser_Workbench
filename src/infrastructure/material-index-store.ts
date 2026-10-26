@@ -366,14 +366,14 @@ export class SqliteMaterialIndexRepository implements MaterialIndexRepository {
         if (step.spec.destination === 'story' && origin.row.media.length > 1)
           throw Error('RESOURCE_STORY_MULTI_MEDIA_REQUIRES_SEPARATE_ROWS');
         if (
+          step.spec.destination !== 'story' &&
           origin.row.background === 'color' &&
           !origin.row.media.length &&
-          (step.spec.destination === 'story' ||
-            this.db
-              .prepare(
-                "SELECT version FROM workspace_execution_contracts WHERE name='post-native-background'",
-              )
-              .get()?.version !== 1)
+          this.db
+            .prepare(
+              "SELECT version FROM workspace_execution_contracts WHERE name='post-native-background'",
+            )
+            .get()?.version !== 1
         )
           throw Error('RESOURCE_BACKGROUND_EXECUTOR_REQUIRED');
         if (source.snapshot.text.length > BROWSER_TEXT_INPUT_LIMIT)

@@ -19,6 +19,7 @@ export interface InvitationButton {
 export interface InvitationMenuItem {
   index: number;
   fingerprint: string;
+  preferred?: boolean;
 }
 export interface GroupInvitationState {
   url: string;
@@ -42,8 +43,21 @@ export interface GroupInvitationState {
   relay?: { available: boolean; edgeCount: number; groupId: string | null };
 }
 
-// This entire projection runs synchronously in the current page. It never writes to DOM or Relay.
+// Synchronous read projection; controlled DOM markers identify the observed controls. Relay is read-only.
 export function projectGroupInvitationState(selector = inviteDialogSelector): GroupInvitationState {
+  document
+    .querySelectorAll(
+      '[data-wb-recipient-id],[data-wb-group-send-btn],[data-wb-group-close-btn],[data-wb-group-invite-menuitem]',
+    )
+    .forEach((el) => {
+      for (const attribute of [
+        'data-wb-recipient-id',
+        'data-wb-group-send-btn',
+        'data-wb-group-close-btn',
+        'data-wb-group-invite-menuitem',
+      ])
+        el.removeAttribute(attribute);
+    });
   type RecordValue = Record<string, unknown>;
   const record = (v: unknown): v is RecordValue => !!v && typeof v === 'object';
   const uid = (v: unknown): v is string => typeof v === 'string' && /^\d{5,25}$/.test(v);
@@ -127,6 +141,8 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       if (f.name.includes('CometListCellStrict_DEPRECATED') && typeof f.props.headline === 'string')
         name ??= f.props.headline.trim();
     }
+    if (uid(id) && el.getAttribute('role') === 'checkbox')
+      el.setAttribute('data-wb-recipient-id', id);
     return {
       id,
       invited,
@@ -287,6 +303,13 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
   const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
   const menuItems = menus.map((el, index) => ({
     index,
+    preferred:
+      reference(el) !== null ||
+      chain(el, 24).some((f) => {
+        const feature =
+          f.name + ' ' + (typeof f.props.actionType === 'string' ? f.props.actionType : '');
+        return /InviteFriends|InviteMember/i.test(feature) && !/Link|Share|Copy/i.test(feature);
+      }),
     fingerprint: JSON.stringify(
       chain(el, 20)
         .filter((f) => !/^(div|span|a)$/.test(f.name) && f.name)
@@ -298,6 +321,10 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     ),
   }));
   const primaryButton = primary.length === 1 ? primary[0] : undefined;
+  primaryButton?.el.setAttribute('data-wb-group-send-btn', '1');
+  close?.el.setAttribute('data-wb-group-close-btn', '1');
+  const preferredMenu = menuItems.find((entry) => entry.preferred);
+  if (preferredMenu) menus[preferredMenu.index]?.setAttribute('data-wb-group-invite-menuitem', '1');
   const cookie = document.cookie.match(/(?:^|;\s*)c_user=(\d{5,25})/);
   const scriptId = Array.from(document.scripts)
     .map((s) => s.textContent ?? '')
@@ -372,7 +399,14 @@ export function groupInvitationEffect(
   const atGroup = url.pathname.split('/')[1] === 'groups' && url.pathname.split('/')[2] === groupId;
   if (!atGroup) return false;
   if (label === 'enter-group') return true;
-  if (label === 'join-group') return state.joined;
+  if (label === 'join-group')
+    return (
+      state.joined ||
+      state.dialogCount > 0 ||
+      (Boolean(value) &&
+        typeof value === 'object' &&
+        (value as { joinedOrRequested?: boolean }).joinedOrRequested === true)
+    );
   if (label === 'close-join-popup') return state.dialogCount === 0;
   if (label === 'open-invite-modal') return state.dialog || state.menu;
   if (label === 'click-invite-menuitem') return state.dialog;

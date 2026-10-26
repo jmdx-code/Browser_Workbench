@@ -155,7 +155,7 @@ export class FacebookPlanMaterialCatalogs {
         undefined,
         undefined,
         // A shared catalog is destination-neutral. Reservation and the executor still
-        // reject unsupported story backgrounds; the first consumer must not erase post rows.
+        // apply destination-specific rules; the first consumer must not erase post rows.
         true,
       );
       const result = await preparation.prepare(execution.plan.id, randomUUID(), guard);

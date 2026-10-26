@@ -1,3 +1,4 @@
+import { copyTextToClipboard } from './clipboard.js';
 import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
 import type { ResourceRowValue, ResourceTableValue } from '../shared/resource-table.js';
 import {
@@ -372,7 +373,7 @@ export function ResourceTableEditor({
   }
   async function copyTable() {
     try {
-      await navigator.clipboard.writeText(
+      await copyTextToClipboard(
         formatResourceCellsForClipboard(preparedRows(), 0, rows.length - 1, 0, 4),
       );
     } catch {

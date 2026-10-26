@@ -25,10 +25,13 @@ import {
   nativeBackgroundCSS,
 } from '../shared/facebook-background.js';
 
+export const NATIVE_COLOR_BACKGROUND_MAX_CHARS = 120;
 export const requiresNativePostBackground = (intent: PostIntent) =>
   'resource' in intent &&
   intent.resource.row.background === 'color' &&
-  !intent.resource.row.media.length;
+  !intent.resource.row.media.length &&
+  [...intent.snapshot.text.trim()].length <= NATIVE_COLOR_BACKGROUND_MAX_CHARS &&
+  intent.snapshot.text.split('\n').length <= 4;
 
 export const postAILabelSetting = (
   intent: PostIntent,
@@ -90,15 +93,19 @@ export function validatePostAction(
         ? [
             '[role="button"][aria-label="AI label off"]',
             '[role="button"][aria-label="AI label on"]',
+            '[role="button"][data-wb-ai-label-open="1"]',
           ]
         : purpose === 'SET_AI_LABEL'
           ? [facebookAILabelSwitch]
-          : ['[role="button"]'];
+          : ['[data-wb-ai-label-confirm="1"]', '[role="button"]'];
     if (
       action.kind !== 'click' ||
       action.target.scope !== facebookAILabelScope ||
       !allowed.includes(action.target.css) ||
-      action.target.text !== (purpose === 'CONFIRM_AI_LABEL' ? 'Got it' : undefined)
+      action.target.text !==
+        (purpose === 'CONFIRM_AI_LABEL' && action.target.css === '[role="button"]'
+          ? 'Got it'
+          : undefined)
     )
       throw Error('POST_AI_LABEL_TARGET_MISMATCH');
   } else if (purpose === 'OPEN_BACKGROUND' || purpose === 'SET_BACKGROUND') {

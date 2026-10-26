@@ -240,7 +240,7 @@ export async function collectInvitationConfirmations(input: {
     if (confirmed.size === selected.size || now() >= deadline) break;
     const moved = await input.scroll(state);
     stagnant = moved || fresh.length ? 0 : stagnant + 1;
-    if (stagnant >= 4) break;
+    if (stagnant >= 2) break;
     await wait();
   } while (now() < deadline);
   return confirmed;
@@ -373,10 +373,11 @@ export function observeInvitationGraphQL(
     endSubmission: () => {
       submitting = false;
     },
+    hasSettled: () => mutationSettled,
     confirmations: async () => {
       if (!confirmationWaited) {
         confirmationWaited = true;
-        const deadline = Date.now() + 15000;
+        const deadline = Date.now() + 6000;
         while (!mutationSettled && Date.now() < deadline) await sleep(50);
       }
       return [...confirmed];
@@ -1001,11 +1002,30 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       if (!(await inviteButton()) && (await joinBtnLoc.count()) > 0) {
         await callbacks.setProfileStatus(profileId, `加入小组 · ${group.groupName.slice(0, 12)}`);
         await this.execBoundOp(conn, boundAccountId, 'join-group', async () => {
-          await joinBtnLoc.scrollIntoViewIfNeeded();
-          await sleep(300);
-          await joinBtnLoc.click({ timeout: 5000 });
+          await clickControl(
+            joinBtnLoc,
+            async () => !(await inviteButton()) && (await joinBtnLoc.isVisible()),
+          );
+          const deadline = Date.now() + 4000;
+          do {
+            guard();
+            const state = await readGroupInvitationState(page, guard);
+            if (state.verificationRequired)
+              throw new ProductError(
+                'GROUP_INVITER_VERIFICATION_REQUIRED',
+                '受限 · 需要手机验证或操作受限',
+                409,
+              );
+            if (
+              Boolean(await inviteButton()) ||
+              !(await joinBtnLoc.isVisible()) ||
+              state.dialogCount > 0
+            )
+              break;
+            await sleep(250);
+          } while (Date.now() < deadline);
+          return { joinedOrRequested: true };
         });
-        await sleep(3500);
 
         const popupCloseCoords = await page.evaluate(() => {
           const isVis = (el: Element | null) => {
@@ -1038,12 +1058,15 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           await this.execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
             await page.mouse.click(popupCloseCoords.x, popupCloseCoords.y);
           });
-          await sleep(1500);
         }
       }
 
       if (!(await inviteButton())) {
-        throw Error(`小组待审核或不可邀请 · ${group.groupName.slice(0, 10)}`);
+        throw new ProductError(
+          'GROUP_INVITER_GROUP_UNINVITABLE',
+          `小组待审核或不可邀请 · ${group.groupName.slice(0, 10)}`,
+          409,
+        );
       }
 
       // Open the same native invitation entry on subsequent result reads.
@@ -1095,14 +1118,17 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                       e.index === previousEntry.index &&
                       e.fingerprint === previousEntry.fingerprint,
                   )
-              : entries[0];
+              : (entries.find((e) => e.preferred) ?? entries[0]);
             if (!entry) throw Error('GROUP_INVITER_INVITE_MENU_CHANGED');
             menuEntry = entry;
             const choose = async () => {
-              const button = page
-                .locator('[role="menuitem"]')
-                .filter({ visible: true })
-                .nth(entry.index);
+              const marked = page
+                .locator('[role="menuitem"][data-wb-group-invite-menuitem="1"]')
+                .first();
+              const button =
+                entry.preferred && (await marked.count())
+                  ? marked
+                  : page.locator('[role="menuitem"]').filter({ visible: true }).nth(entry.index);
               await clickControl(button, async () => {
                 const current = await readGroupInvitationState(page, guard);
                 if (current.dialog) return false;
@@ -1175,20 +1201,25 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                   async () => {
                     const state = await readGroupInvitationState(page, guard);
                     if (
-                      state.items[candidate.index]?.id !== candidate.friendId ||
-                      state.items[candidate.index]?.checked
+                      !state.items.some((item) => item.id === candidate.friendId) ||
+                      state.items.find((item) => item.id === candidate.friendId)?.checked
                     )
                       throw Error('GROUP_INVITER_RECIPIENT_CHANGED');
-                    const cbLoc = dialogLocator(state)
-                      .locator('[role="checkbox"]')
-                      .nth(candidate.index);
+                    const marked = dialogLocator(state)
+                      .locator(`[role="checkbox"][data-wb-recipient-id="${candidate.friendId}"]`)
+                      .first();
+                    const cbLoc = (await marked.count())
+                      ? marked
+                      : dialogLocator(state).locator('[role="checkbox"]').nth(candidate.index);
                     await clickControl(cbLoc, async () => {
                       const current = await readGroupInvitationState(page, guard);
-                      if (current.items[candidate.index]?.id !== candidate.friendId)
+                      if (!current.items.some((item) => item.id === candidate.friendId))
                         throw Error('GROUP_INVITER_RECIPIENT_CHANGED');
-                      return !current.items[candidate.index]?.checked;
+                      return !current.items.find((item) => item.id === candidate.friendId)?.checked;
                     });
-                    await sleep(300);
+                    if (await cbLoc.evaluate((el) => el.getAttribute('aria-checked') === 'true'))
+                      return candidate.friendId;
+                    await sleep(150);
                     return (await cbLoc.evaluate(
                       (el) => el.getAttribute('aria-checked') === 'true',
                     ))
@@ -1211,7 +1242,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             );
           }
 
-          await sleep(randInt(550, 1150));
+          await sleep(randInt(250, 500));
         } else {
           if (candidate.totalCheckboxes <= lastCheckboxTotal) {
             stagnantScrolls++;
@@ -1219,13 +1250,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             stagnantScrolls = 0;
           }
           lastCheckboxTotal = candidate.totalCheckboxes;
-          if (stagnantScrolls >= 3) break;
+          if (stagnantScrolls >= 2) break;
 
           guard();
           const scrolled = await scrollInvitationList(page, reading);
 
           if (!scrolled) break;
-          await sleep(1000);
+          await sleep(500);
         }
       }
 
@@ -1282,11 +1313,21 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                 });
               }
               await callbacks.setProfileStatus(profileId, `发送 ${selectedBatch.length} 份邀请`);
-              await dialogLocator(before)
-                .locator('[role="button"],button')
-                .nth(before.sendButton.index)
-                .click({ timeout: 5000 });
-              const closedDeadline = Date.now() + 15000;
+              const markedSend = dialogLocator(before)
+                .locator('[data-wb-group-send-btn="1"]')
+                .first();
+              const sendButton = (await markedSend.count())
+                ? markedSend
+                : dialogLocator(before)
+                    .locator('[role="button"],button')
+                    .nth(before.sendButton.index);
+              await sendButton.evaluate((el) =>
+                el.scrollIntoView({ block: 'center', inline: 'center' }),
+              );
+              await sleep(100);
+              await sendButton.click({ timeout: 5000 });
+              const sentAt = Date.now();
+              const closedDeadline = sentAt + 6000;
               let closed = false;
               while (Date.now() < closedDeadline) {
                 guard();
@@ -1301,6 +1342,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                   closed = true;
                   break;
                 }
+                if (observation.hasSettled() && Date.now() - sentAt >= 800) break;
                 await sleep(250);
               }
               observation.endSubmission();
@@ -1339,6 +1381,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                   persist,
                   confirmed,
                   guard,
+                  budgetMs: 6000,
                 });
               let fallbackReopens = 0,
                 reloads = 0;
@@ -1346,7 +1389,8 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                 selectedIds,
                 confirmed,
                 persist,
-                graphql: closed ? observation.confirmations : async () => [],
+                graphql:
+                  closed || observation.hasSettled() ? observation.confirmations : async () => [],
                 assertCurrent: async () => {
                   guard();
                   const current = await readGroupInvitationState(page, guard);
@@ -1364,18 +1408,12 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                     );
                 },
                 fallback: async () => {
-                  if (closed) {
+                  if (observation.hasSettled() && confirmed.size > 0) return;
+                  if (confirmed.size === 0) {
                     try {
                       fallbackReopens++;
                       await openDialog(false);
                       await collect();
-                      if (confirmed.size === 0) {
-                        reloads++;
-                        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                        fallbackReopens++;
-                        await openDialog(false);
-                        await collect();
-                      }
                     } catch (e) {
                       if (
                         e instanceof ProductError &&
@@ -1394,7 +1432,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                         },
                       });
                     }
-                  } else await collect();
+                  }
                 },
               });
               return {
@@ -1456,10 +1494,16 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           await this.execBoundOp(conn, boundAccountId, 'close-invite-modal', async () => {
             const latest = await readGroupInvitationState(page, guard);
             if (!latest.dialog || !latest.closeButton) return;
-            await dialogLocator(latest)
-              .locator('[role="button"],button')
-              .nth(latest.closeButton.index)
-              .click({ timeout: 5000 });
+            const marked = dialogLocator(latest).locator('[data-wb-group-close-btn="1"]').first();
+            const button = (await marked.count())
+              ? marked
+              : dialogLocator(latest)
+                  .locator('[role="button"],button')
+                  .nth(latest.closeButton.index);
+            await clickControl(
+              button,
+              async () => (await readGroupInvitationState(page, guard)).dialog,
+            );
           });
         }
       }

@@ -1663,3 +1663,34 @@ small,
   max-height: 280px;
   overflow: auto;
 }
+
+.combo-resource-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  margin: 12px 0;
+  background: var(--panel, #fff);
+  border: 1px solid #dce0e6;
+  border-radius: 10px;
+  flex-wrap: wrap;
+}
+.combo-resource-info {
+  display: flex;
+  flex: 1;
+  min-width: 220px;
+  flex-direction: column;
+  gap: 6px;
+}
+.combo-resource-info span {
+  color: #7c8490;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.combo-resource-bar .resource-settings-button {
+  width: auto;
+  flex: none;
+  margin-top: 0;
+}

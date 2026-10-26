@@ -340,6 +340,7 @@ export class WorkspaceStore implements WorkspaceRepository {
         "CREATE TABLE IF NOT EXISTS profile_account_cache(profile_id TEXT PRIMARY KEY,account_state TEXT NOT NULL DEFAULT 'unknown',account_id TEXT,account_name TEXT,avatar_url TEXT,avatar_updated_at INTEGER NOT NULL DEFAULT 0)",
       );
       const store = new WorkspaceStore(db);
+      store.resourceTables.pruneConsumedRows();
       // Initialize only a new database. Existing user choices survive reopen
       // and upgrades; the running installation can be changed through Settings.
       if (version === 0)

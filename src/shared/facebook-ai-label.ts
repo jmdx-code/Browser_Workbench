@@ -4,7 +4,8 @@ import { FACEBOOK_COMPOSER_SCOPE } from './facebook-ui.js';
 export const PostAILabelSetting = z.enum(['preserve-current', 'on', 'off']);
 export type AILabelSetting = z.infer<typeof PostAILabelSetting>;
 export const facebookAILabelScope = FACEBOOK_COMPOSER_SCOPE;
-export const facebookAILabelSwitch = '[role="switch"][aria-label="Add AI label"]';
+export const facebookAILabelSwitch =
+  '[role="switch"][data-wb-ai-label-switch="1"],[role="switch"][aria-label="Add AI label"]';
 export const facebookAILabelReading = z
   .object({
     url: z.string().max(2048),
@@ -32,5 +33,5 @@ export function aiLabelTarget(purpose: AILabelPurpose, reading: AILabelReading) 
   }
   return purpose === 'SET_AI_LABEL'
     ? { scope: facebookAILabelScope, css: facebookAILabelSwitch }
-    : { scope: facebookAILabelScope, css: '[role="button"]', text: 'Got it' };
+    : { scope: facebookAILabelScope, css: '[data-wb-ai-label-confirm="1"]' };
 }

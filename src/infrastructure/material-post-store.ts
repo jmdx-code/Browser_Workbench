@@ -29,6 +29,7 @@ import {
 } from './material-post-guards.js';
 import { transaction } from './sqlite-transaction.js';
 import { cancelNeverDispatchedPost } from './material-post-cancellation.js';
+import { SqliteResourceTableRepository } from './resource-table-store.js';
 import {
   currentMaterialUsageAccounts,
   historicalArchiveTestEnabled,
@@ -279,6 +280,17 @@ export class SqliteMaterialPostRepository implements MaterialPostRepository {
                 intent.snapshot.source,
                 'resource' in intent ? intent.resource : undefined,
               ),
+            );
+          if (
+            !historicalArchiveTestEnabled(this.db) &&
+            !intent.allowRepeat &&
+            'resource' in intent &&
+            intent.resource
+          )
+            new SqliteResourceTableRepository(this.db).removePublishedRow(
+              intent.resource.combinationId,
+              intent.resource.row,
+              now,
             );
           if (historicalArchiveTestEnabled(this.db)) {
             const archive = ArchiveRequest.parse({
