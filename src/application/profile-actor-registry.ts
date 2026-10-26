@@ -486,6 +486,14 @@ export class ProfileActorRegistry {
       const completed = await this.tasks.get(jobId);
       if (completed.controlMode === mode) return completed;
     }
+    const canStopWithoutOwner =
+      terminal(before.state) ||
+      (before.state === 'REVIEW' && before.controlConfirmed) ||
+      (['QUEUED', 'PAUSED'].includes(before.state) &&
+        this.tasks.unresolved &&
+        !(await this.tasks.unresolved(jobId)));
+    if (!this.entries.has(before.profileId) && !canStopWithoutOwner)
+      throw Error('ACTOR_STOP_OWNER_REQUIRED');
     const plan = await this.tasks.requestControl(jobId, mode, reason);
     if (terminal(plan.state) || plan.state === 'PAUSED' || plan.controlConfirmed) return plan;
     const entry = this.entries.get(plan.profileId);

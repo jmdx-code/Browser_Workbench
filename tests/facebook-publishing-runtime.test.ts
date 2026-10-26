@@ -269,8 +269,8 @@ test('explicit stop interrupts an unready parent transport without forging task 
       assert.equal(await runtime.canRecoverConnectionForEnding(profileId), true);
       assert.equal(await runtime.canRecoverConnectionForEnding(randomUUID()), false);
       await workspace.tasks.recoverOnStartup();
-      assert.equal((await workspace.tasks.get(plan.id)).state, 'REVIEW');
-      assert.equal(await runtime.canRecoverConnectionForEnding(profileId), true);
+      assert.equal((await workspace.tasks.get(plan.id)).state, 'STOPPED');
+      assert.equal(await runtime.canRecoverConnectionForEnding(profileId), false);
       assert.deepEqual(
         sent.map((message) => (message as { type: string }).type),
         ['STOP'],

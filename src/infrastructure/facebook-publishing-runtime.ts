@@ -48,6 +48,9 @@ export class FacebookPublishingRuntime {
   hasActiveExecution(): boolean {
     return this.runtime.hasActiveExecution();
   }
+  hasOwner(profileId: string): boolean {
+    return this.runtime.registry.hasOwner(profileId);
+  }
   private readonly timingControls = new Map<string, Promise<void>>();
   readonly runtime: AdmittedTaskRuntime;
   readonly adapters: FacebookPublishingAdapters;
@@ -478,6 +481,13 @@ export class FacebookPublishingRuntime {
   }
   private async controlPlan(planId: string, command: TaskCommand['command']) {
     const plan = await this.store.tasks.get(planId);
+    if (command === 'stop') {
+      const stopped = await this.ending.stopOffline(
+        plan.id,
+        this.runtime.registry.hasOwner(plan.profileId),
+      );
+      if (stopped) return stopped;
+    }
     if (command !== 'resume') await this.store.tasks.cancelStepContinuation(planId);
     if (command === 'resume') {
       if (taskTimingEligibility(plan.timing, Date.now(), plan.timingReleased === true) !== 'OPEN')

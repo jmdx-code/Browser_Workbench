@@ -146,6 +146,26 @@ test('semantic versions, prerelease ordering and empty source configuration', ()
   assert.equal(UpdateConfig.safeParse({ githubRepo: 'https://github.com/a/b' }).success, false);
 });
 
+test('older software and equal software with equal or older extension never prompt an update', async () =>
+  fixture(async (f) => {
+    for (const [softwareVersion, extensionVersion, expected] of [
+      ['2.0.0', '0.3.1', false],
+      ['1.1.0', '0.3.56', false],
+      ['1.1.0', '0.3.55', false],
+      ['1.1.0', '0.3.54', true],
+      ['1.0.0', '0.3.99', true],
+    ] as const) {
+      const backend = new SoftwareUpdateBackend({
+        root: f.base,
+        dataDir: f.dir,
+        softwareVersion,
+        extensionVersion,
+        apiBase: f.origin,
+      });
+      assert.equal((await backend.check('owner/repo')) !== null, expected);
+    }
+  }));
+
 test('packaged metadata keeps engine fingerprint after electron-builder strips devDependencies', () => {
   const source = {
     dependencies: { zod: '4.6.7' },

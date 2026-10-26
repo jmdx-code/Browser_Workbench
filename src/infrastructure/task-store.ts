@@ -732,7 +732,7 @@ export class SqliteTaskRepository implements TaskRepository {
       return this.get(id); // Keep the original account lock and all native tab evidence.
     });
   }
-  private unresolved(id: string) {
+  unresolved(id: string) {
     return (
       Boolean(
         this.db
@@ -892,6 +892,13 @@ export class SqliteTaskRepository implements TaskRepository {
           this.state(plan.id, 'PAUSED', 'SCHEDULE_MISSED_ON_RESTART');
           continue; // Never catch up missed publishing on boot.
         }
+        if (
+          (this.blockingOperations(plan.id).some((op) => op.status !== 'PREPARED') ||
+            ['STOPPING', 'PAUSING'].includes(plan.state) ||
+            ['SOFTWARE_RESTART_UNCERTAIN', 'STOP_CONFIRMATION_REQUIRED'].includes(plan.reason)) &&
+          this.stopOfflineBrowse(plan.id, 'SOFTWARE_RESTART_BROWSE_CANCELLED')
+        )
+          continue;
         this.db
           .prepare(
             "UPDATE material_reservations SET state='REVIEW',reason='SOFTWARE_RESTART',updated_at=? WHERE job_id=? AND state='RESERVED'",
@@ -926,6 +933,57 @@ export class SqliteTaskRepository implements TaskRepository {
           this.unlock(plan.id);
         }
       }
+    });
+  }
+  stopOfflineBrowse(id: string, reason = 'OFFLINE_BROWSE_CANCELLED'): Plan | null {
+    return transaction(this.db, () => {
+      const plan = this.get(id);
+      if (terminal(plan.state)) return plan;
+      if (
+        this.db
+          .prepare(
+            "SELECT 1 FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
+          )
+          .get(id)
+      )
+        return null;
+      const pending = this.blockingOperations(id).filter((op) => op.status !== 'PREPARED');
+      if (
+        pending.some(
+          (op) =>
+            (op.action.kind !== 'browseScroll' && !this.isRegisteredReelAdvance(op)) ||
+            postLink(this.db, op.id),
+        )
+      )
+        return null;
+      this.cancelStepContinuation(id);
+      this.cancelPrepared(id);
+      for (const op of pending) {
+        // Cancellation concerns inert browsing only, not proof that scrolling never happened.
+        // Reuse NOT_APPLIED delivery so a later reconnect can retire the original journal entry.
+        if (op.binding) {
+          const receipt = {
+            binding: op.binding,
+            evidence: { reason, offlineBrowseCancelled: true },
+          };
+          this.settle(op.id, 'NOT_APPLIED', receipt);
+          this.settlements.ensureSettled(op.binding, 'NOT_APPLIED', receipt);
+        } else this.settle(op.id, 'NOT_APPLIED', { reason, offlineBrowseCancelled: true });
+      }
+      this.db
+        .prepare(
+          "UPDATE task_plans SET control_mode='stop',control_request_id=NULL,control_confirmed=1 WHERE id=?",
+        )
+        .run(id);
+      this.db
+        .prepare(
+          "UPDATE task_tab_state SET state='LOST',context=NULL,reason='ENDED_OWNERSHIP_RELEASED',revision=revision+1,updated_at=? WHERE job_id=? AND state NOT IN ('CLOSED','RELEASED','LOST')",
+        )
+        .run(this.dependencies.now(), id);
+      this.state(id, 'STOPPED', reason);
+      this.unlock(id);
+      this.event(id, 'OFFLINE_BROWSE_CANCELLED', { operations: pending.map((op) => op.id) });
+      return this.get(id);
     });
   }
   private operation(id: string): Operation {

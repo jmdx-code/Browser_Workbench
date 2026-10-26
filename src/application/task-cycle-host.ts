@@ -16,6 +16,9 @@ export class TaskCycleHost implements TaskCycleRuntime {
   async profiles() {
     return await this.registry.profiles();
   }
+  hasOwner(profileId: string) {
+    return this.registry.hasOwner(profileId);
+  }
   async schedulingProfiles() {
     return await this.registry.schedulingProfiles();
   }

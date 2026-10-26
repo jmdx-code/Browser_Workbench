@@ -57,6 +57,9 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
   hasActiveExecution(): boolean {
     return this.opening.size > 0 || this.startupCount > 0 || this.registry.hasOwners();
   }
+  hasOwner(profileId: string) {
+    return this.registry.hasOwner(profileId);
+  }
   async profiles() {
     return await mapAsync(await this.inventory(), async (raw) => {
       const privateProfile =

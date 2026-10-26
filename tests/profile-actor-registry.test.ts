@@ -763,7 +763,7 @@ test('persisted control cannot be rebound to a new lease, reopened storage does 
       assert.equal(reopened.tasks.get(plan.id).state, 'STOPPING');
       assert.equal(reopened.taskControls.list()[0]?.receipt, null);
       reopened.tasks.recoverOnStartup();
-      assert.equal(reopened.tasks.get(plan.id).state, 'REVIEW');
+      assert.equal(reopened.tasks.get(plan.id).state, 'STOPPED');
       const { jobId: _job, mode: _mode, ...stop } = binding;
       assert.throws(
         () => reopened.taskControls.confirm(binding, { ...stop, state: 'stopped' }),

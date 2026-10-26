@@ -224,7 +224,7 @@ test('restart cancels automatic successor even after original step ending finish
     await store.tasks.finishEnd(r.jobId, f.stop);
     await store.tasks.recoverOnStartup();
     assert.equal(await store.tasks.stepEnding(r.jobId), null);
-    assert.equal((await store.tasks.get(r.jobId)).state, 'REVIEW');
+    assert.equal((await store.tasks.get(r.jobId)).state, 'STOPPED');
     await assert.rejects(
       async () => await store.tasks.finishStepContinuation(r.jobId),
       /NOT_CONFIRMED/,

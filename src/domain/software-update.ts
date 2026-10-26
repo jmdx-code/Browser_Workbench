@@ -1,4 +1,8 @@
 import type { Awaitable } from './persistence.js';
+import type { Plan } from '../shared/task-contracts.js';
+export function taskBlocksSoftwareUpdate(state: Plan['state'], online: boolean, hasOwner: boolean) {
+  return state === 'RUNNING' || (['PAUSING', 'STOPPING'].includes(state) && (online || hasOwner));
+}
 import type {
   UpdateConfiguration,
   UpdateRelease,

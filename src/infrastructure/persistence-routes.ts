@@ -188,6 +188,8 @@ export const persistenceRoutes = new Set([
   'workspace.tasks.reconcileRuntime',
   'workspace.tasks.recordsPage',
   'workspace.tasks.recoverOnStartup',
+  'workspace.tasks.stopOfflineBrowse',
+  'workspace.tasks.unresolved',
   'workspace.tasks.releaseErroredPausedPlans',
   'workspace.tasks.releaseScheduled',
   'workspace.tasks.requestControl',

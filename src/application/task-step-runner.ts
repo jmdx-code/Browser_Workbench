@@ -155,10 +155,12 @@ export class TaskStepRunner {
     return plans
       .filter(
         (p) =>
-          ['RUNNING', 'QUEUED', 'PAUSING', 'STOPPING'].includes(p.state) ||
-          (p.state === 'REVIEW' &&
-            !p.controlConfirmed &&
-            !p.reason.startsWith('INITIAL_SESSION_FAILED:')),
+          ['RUNNING', 'QUEUED'].includes(p.state) ||
+          ((this.runtime.hasOwner?.(p.profileId) ?? true) &&
+            (['PAUSING', 'STOPPING'].includes(p.state) ||
+              (p.state === 'REVIEW' &&
+                !p.controlConfirmed &&
+                !p.reason.startsWith('INITIAL_SESSION_FAILED:')))),
       )
       .map((plan) => {
         const previous = this.cycles.get(plan.profileId);

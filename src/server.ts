@@ -1,5 +1,6 @@
 import { mediaRuntimeComponent } from './infrastructure/media-runtime-component.js';
 import { SoftwareUpdateService } from './application/software-update-service.js';
+import { taskBlocksSoftwareUpdate } from './domain/software-update.js';
 import { SoftwareUpdateBackend } from './infrastructure/software-update-backend.js';
 import { ExtensionUpdates } from './infrastructure/extension-updates.js';
 import {
@@ -622,12 +623,17 @@ try {
         productExtensionDirectory(),
         async (id) =>
           groupInviterService.isProfileRunning(id) ||
-          (await repository.tasks.hasProfilePlanInStates(id, [
-            'QUEUED',
-            'RUNNING',
-            'PAUSING',
-            'STOPPING',
-          ])),
+          (
+            await repository.tasks.plansForProfile(id, ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'])
+          ).some(
+            (p) =>
+              p.state === 'QUEUED' ||
+              taskBlocksSoftwareUpdate(
+                p.state,
+                core.peers.get(id)?.online === true,
+                publishingRuntime?.hasOwner(id) === true,
+              ),
+          ),
         async (peer) => {
           await mainKernel?.releaseIdleForExtension(peer);
         },
@@ -648,7 +654,11 @@ try {
               groupInviterService.hasActiveExecution() ||
               publishingRuntime?.hasActiveExecution() ||
               (await repository.tasks.livePlans()).some((p) =>
-                ['RUNNING', 'PAUSING', 'STOPPING'].includes(p.state),
+                taskBlocksSoftwareUpdate(
+                  p.state,
+                  core.peers.get(p.profileId)?.online === true,
+                  publishingRuntime?.hasOwner(p.profileId) === true,
+                ),
               )
             )
               throw new ProductError(

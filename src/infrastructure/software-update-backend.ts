@@ -176,9 +176,10 @@ export class SoftwareUpdateBackend {
       : null;
     const softwareVersion = manifest?.softwareVersion ?? release.tag_name.replace(/^v/, '');
     const extensionVersion = manifest?.extensionVersion ?? null;
+    if (semverCompare(softwareVersion, this.options.softwareVersion) < 0) return null;
     if (
-      semverCompare(softwareVersion, this.options.softwareVersion) <= 0 &&
-      (!extensionVersion || extensionVersion === this.options.extensionVersion)
+      semverCompare(softwareVersion, this.options.softwareVersion) === 0 &&
+      (!extensionVersion || semverCompare(extensionVersion, this.options.extensionVersion) <= 0)
     )
       return null;
     const zip = release.assets.find((a) => a.name === 'workbench-hot-update.zip');

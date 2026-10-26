@@ -31,16 +31,22 @@ export class TaskEndingCoordinator {
       .catch(() => {});
     return work;
   }
+  async stopOffline(planId: string, hasOwner: boolean): Promise<Plan | null> {
+    const plan = await this.store.tasks.get(planId);
+    if (hasOwner || this.core.peers.get(plan.profileId)?.online) return null;
+    return await this.store.tasks.stopOfflineBrowse(planId);
+  }
   private async run(planId: string): Promise<Plan> {
     const plan = await this.store.tasks.get(planId);
     if (terminal(plan.state)) {
       await this.reconcileClosedTabs(plan);
       return plan;
     }
+    const peer = this.core.peers.get(plan.profileId);
+    if (!peer?.online) throw Error('任务正在结束，等待浏览器连接并确认控制停止');
     const endingId = await this.store.tasks.requestEnd(planId);
     const proofs = (await this.store.taskTabs.forPlan(plan.id)).map((row) => row.proof);
-    const peer = this.core.peers.get(plan.profileId);
-    if (!peer?.online || !peer.synced || peer.phase !== 'PAUSED')
+    if (!peer.synced || peer.phase !== 'PAUSED')
       throw Error('任务正在结束，等待浏览器连接并确认控制停止');
     if (!peer.capabilities?.includes('kernel-unknown-end-v1'))
       throw Error('结束未决任务需要更新桥接插件');

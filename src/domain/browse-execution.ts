@@ -31,6 +31,7 @@ export interface BrowseStepExecutor {
   ): Promise<Verdict>;
 }
 export interface TaskCycleRuntime extends TaskBrowserPort {
+  hasOwner?(profileId: string): boolean;
   supportsControlRelease?(profileId: string): boolean;
   profile?(
     profileId: string,

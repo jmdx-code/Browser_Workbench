@@ -82,6 +82,8 @@ export interface TaskRepository {
   resume(id: string): Awaitable<Plan>;
   releaseErroredPausedPlans?(profileIds: readonly string[]): Awaitable<number>;
   recoverOnStartup(preserveFutureSchedules?: boolean): Awaitable<void>;
+  unresolved?(id: string): Awaitable<boolean>;
+  stopOfflineBrowse?(id: string, reason?: string): Awaitable<Plan | null>;
   prepareOperation(
     id: string,
     stepId: string,

@@ -769,8 +769,8 @@ test('old control confirmations and repeated uncertainty cannot release a newer 
     assert.equal((await store.tasks.get(second.id)).state, 'STOPPED');
   });
 });
-test('restart while waiting for stop retains its lock and rejects the previous control request', async () => {
-  await fixture(async (store) => {
+test('restart of a stopping plan with no pending side effects releases its lock and rejects the old control request', async () => {
+  await fixture(async (store, file) => {
     const runtime = profiles(2),
       a = runtime[0],
       b = runtime[1];
@@ -782,16 +782,21 @@ test('restart while waiting for stop retains its lock and rejects the previous c
     const stopping = await store.tasks.requestControl(plan.id, 'pause');
     assert.ok(stopping.controlRequestId);
     await store.tasks.recoverOnStartup();
-    assert.equal((await store.tasks.get(plan.id)).state, 'REVIEW');
-    assert.equal(await store.tasks.claimNext(runtime, supported), null);
-    const latest = await store.tasks.requestControl(plan.id, 'pause');
-    assert.ok(latest.controlRequestId);
+    assert.equal((await store.tasks.get(plan.id)).state, 'STOPPED');
+    const locks = new DatabaseSync(file);
+    try {
+      assert.equal(
+        locks.prepare('SELECT COUNT(*) n FROM task_account_locks WHERE job_id=?').get(plan.id)?.n,
+        0,
+      );
+    } finally {
+      locks.close();
+    }
     await assert.rejects(
       async () => await store.tasks.confirmControl(plan.id, stopping.controlRequestId ?? ''),
-      /过期/,
+      /没有待确认/,
     );
-    await confirmControl(store, plan.id);
-    assert.equal((await store.tasks.get(plan.id)).state, 'PAUSED');
+    assert.equal((await store.tasks.get(plan.id)).controlConfirmed, true);
   });
 });
 test('a second controller fails on occupied port before recovering or creating either database', async () => {
