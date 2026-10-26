@@ -2477,63 +2477,64 @@ code {
   margin: 0;
   font-size: var(--fs-xs);
 }
-.group-inviter-input-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 280px;
-  overflow-y: auto;
-  padding: 2px;
-}
-.group-inviter-input-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(200px, 1.5fr) 32px;
-  gap: 8px;
-  align-items: center;
-}
-.group-inviter-input-row.is-head {
-  font-size: var(--fs-xs);
-  font-weight: 700;
-  color: var(--text-3);
-  padding: 0 4px;
-}
-.group-inviter-input-row input {
-  height: 32px;
-  padding: 0 10px;
-  border: 1px solid var(--line-strong);
+.group-inviter-grid-scroll {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
+}
+.group-inviter-matrix {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
   font-size: var(--fs-sm);
+}
+.group-inviter-matrix th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface-2);
+  font-size: var(--fs-xs);
+  text-align: left;
+  padding: 8px;
+}
+.group-inviter-matrix td,
+.group-inviter-matrix th {
+  border: 1px solid var(--line);
+}
+.group-inviter-matrix td:first-child,
+.group-inviter-matrix th:first-child {
+  text-align: center;
+  color: var(--text-3);
+}
+.group-inviter-matrix input {
+  width: 100%;
+  height: 34px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  box-shadow: none;
+}
+.group-inviter-matrix input:focus {
+  box-shadow: inset 0 0 0 2px var(--brand);
+  background: var(--surface-2);
+}
+.group-inviter-matrix td:last-child {
+  text-align: center;
 }
 .group-inviter-modal-tools {
   display: flex;
-  justify-content: flex-start;
-}
-.group-inviter-bulk-details {
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  padding: 8px 12px;
-  background: var(--surface-2);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   font-size: var(--fs-xs);
+  color: var(--text-3);
 }
-.group-inviter-bulk-details summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--text-2);
-}
-.group-inviter-bulk-box {
-  margin-top: 8px;
+.group-inviter-modal-tools > div {
   display: flex;
-  flex-direction: column;
   gap: 8px;
-}
-.group-inviter-bulk-box textarea {
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--r-sm);
-  font-family: var(--mono);
-  font-size: var(--fs-xs);
-  resize: vertical;
 }
 .group-inviter-add-modal .modal-actions {
   display: flex;

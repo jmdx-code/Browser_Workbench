@@ -3,54 +3,19 @@ import type { GroupInviterState, InviterGroupRow } from '../shared/group-inviter
 import { selectionState, toggleSet } from './selection.js';
 import { IconClose, IconPlay, IconPlus, IconSearch, IconStop } from './icons.js';
 
-interface DraftGroupEntry {
-  key: string;
-  groupId: string;
-  groupName: string;
-}
-
+import {
+  applyGroupGridPaste,
+  extractGroupId,
+  isGroupGridPaste,
+  type DraftGroupEntry,
+} from './group-inviter-grid.js';
+export { applyGroupGridPaste, extractGroupId } from './group-inviter-grid.js';
 function makeDraftRow(groupId = '', groupName = ''): DraftGroupEntry {
   return {
     key: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     groupId,
     groupName,
   };
-}
-
-function parsePastedGroupLines(raw: string): Array<{ groupId: string; groupName: string }> {
-  const results: Array<{ groupId: string; groupName: string }> = [];
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    // Priority 1: Tab-separated (Excel / spreadsheet copy-paste)
-    if (line.includes('\t')) {
-      const [first, ...rest] = line.split('\t');
-      const groupId = (first ?? '').trim();
-      const groupName = rest.join(' ').trim();
-      if (groupId && groupName) {
-        results.push({ groupId, groupName });
-        continue;
-      }
-    }
-    // Priority 2: Comma or pipe separated when first token looks like an ID
-    const commaMatch = /^([A-Za-z0-9._-]+)\s*[,，|]\s*(.+)$/.exec(line);
-    if (commaMatch && commaMatch[1] && commaMatch[2]) {
-      results.push({
-        groupId: commaMatch[1].trim(),
-        groupName: commaMatch[2].trim(),
-      });
-      continue;
-    }
-    // Priority 3: Whitespace separated where first token is group ID
-    const spaceMatch = /^([A-Za-z0-9._-]+)\s+(.+)$/.exec(line);
-    if (spaceMatch && spaceMatch[1] && spaceMatch[2]) {
-      results.push({
-        groupId: spaceMatch[1].trim(),
-        groupName: spaceMatch[2].trim(),
-      });
-    }
-  }
-  return results;
 }
 
 function HeaderCheck({
@@ -134,12 +99,9 @@ export function GroupInviterPage({
   const [searchQuery, setSearchQuery] = useState('');
   const [invitesInput, setInvitesInput] = useState<number>(state?.invitesPerGroup ?? 30);
   const [addingModalOpen, setAddingModalOpen] = useState(false);
-  const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() => [
-    makeDraftRow(),
-    makeDraftRow(),
-    makeDraftRow(),
-  ]);
-  const [bulkPasteText, setBulkPasteText] = useState('');
+  const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
+    Array.from({ length: 5 }, () => makeDraftRow()),
+  );
   const [formError, setFormError] = useState('');
   const [submittingAdd, setSubmittingAdd] = useState(false);
 
@@ -172,56 +134,44 @@ export function GroupInviterPage({
   const totalInvitedAcrossGroups = groups.reduce((sum, item) => sum + item.totalInvitedCount, 0);
 
   function openAddModal() {
-    setDraftRows([makeDraftRow(), makeDraftRow(), makeDraftRow()]);
-    setBulkPasteText('');
+    setDraftRows(Array.from({ length: 5 }, () => makeDraftRow()));
     setFormError('');
     setAddingModalOpen(true);
   }
 
-  function handlePasteIntoTable(index: number, event: React.ClipboardEvent<HTMLInputElement>) {
+  function handlePasteIntoTable(
+    index: number,
+    column: 0 | 1,
+    event: React.ClipboardEvent<HTMLInputElement>,
+  ) {
     const text = event.clipboardData.getData('text/plain');
-    if (!text.includes('\n') && !text.includes('\t')) return;
-    const parsed = parsePastedGroupLines(text);
-    if (!parsed.length) return;
+    if (!isGroupGridPaste(text, column)) return;
     event.preventDefault();
-    setDraftRows((prev) => {
-      const next = [...prev];
-      parsed.forEach((item, offset) => {
-        const targetIdx = index + offset;
-        const existing = next[targetIdx];
-        if (existing) {
-          next[targetIdx] = {
-            ...existing,
-            groupId: item.groupId,
-            groupName: item.groupName,
-          };
-        } else {
-          next.push(makeDraftRow(item.groupId, item.groupName));
-        }
-      });
-      return next;
-    });
+    setDraftRows((prev) => applyGroupGridPaste(prev, index, column, text, makeDraftRow));
   }
-
-  function applyBulkPasteToRows() {
-    const parsed = parsePastedGroupLines(bulkPasteText);
-    if (!parsed.length) {
-      setFormError('未能从粘贴内容中识别出「小组ID + 小组名字」格式，请确认每行包含两列数据。');
-      return;
+  function moveCell(index: number, column: 0 | 1, event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+    const delta =
+      event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' || event.key === 'Enter' ? 1 : 0;
+    if (!delta) return;
+    event.preventDefault();
+    const target = index + delta;
+    if (target < 0) return;
+    if (target >= draftRows.length) {
+      if (event.key !== 'Enter') return;
+      setDraftRows((prev) => [...prev, makeDraftRow()]);
     }
-    setFormError('');
-    setDraftRows((prev) => {
-      const nonEmpty = prev.filter((item) => item.groupId.trim() || item.groupName.trim());
-      return [...nonEmpty, ...parsed.map((item) => makeDraftRow(item.groupId, item.groupName))];
-    });
-    setBulkPasteText('');
+    requestAnimationFrame(() =>
+      document
+        .querySelector<HTMLInputElement>(`[data-group-row="${target}"][data-group-col="${column}"]`)
+        ?.focus(),
+    );
   }
-
   async function submitAddGroups(event: React.FormEvent) {
     event.preventDefault();
     const collected: Array<{ groupId: string; groupName: string }> = [];
     for (const row of draftRows) {
-      const groupId = row.groupId.trim();
+      const groupId = extractGroupId(row.groupId);
       const groupName = row.groupName.trim();
       if (!groupId && !groupName) continue;
       if (!groupId || !groupName) {
@@ -233,14 +183,6 @@ export function GroupInviterPage({
         return;
       }
       collected.push({ groupId, groupName });
-    }
-    if (bulkPasteText.trim()) {
-      const parsedFromBulk = parsePastedGroupLines(bulkPasteText);
-      if (!parsedFromBulk.length) {
-        setFormError('批量粘贴框内容无法解析为「小组ID 小组名字」两列格式');
-        return;
-      }
-      collected.push(...parsedFromBulk);
     }
     if (!collected.length) {
       setFormError('请至少输入一行小组数据');
@@ -481,76 +423,104 @@ export function GroupInviterPage({
               支持逐行输入「小组 ID」和「小组名字」两列数据，也支持从 Excel
               或文本直接多行粘贴。保存后会自动拉取小组头像。
             </p>
-            <div className="group-inviter-input-grid" role="table" aria-label="添加小组两列表格">
-              <div className="group-inviter-input-row is-head" role="row">
-                <span role="columnheader">小组 ID</span>
-                <span role="columnheader">小组名字</span>
-                <span role="columnheader" aria-label="操作" />
-              </div>
-              {draftRows.map((row, idx) => (
-                <div className="group-inviter-input-row" role="row" key={row.key}>
-                  <input
-                    type="text"
-                    placeholder="例如：3017439278594998"
-                    aria-label={`第 ${idx + 1} 行小组 ID`}
-                    value={row.groupId}
-                    onPaste={(event) => handlePasteIntoTable(idx, event)}
-                    onChange={(event) => {
-                      const val = event.target.value;
-                      setDraftRows((prev) =>
-                        prev.map((item, i) => (i === idx ? { ...item, groupId: val } : item)),
-                      );
-                    }}
-                  />
-                  <input
-                    type="text"
-                    placeholder="例如：ယေရှုခရစ်တော်သည် သခင်ဖြစ်တော်မူ၏။"
-                    aria-label={`第 ${idx + 1} 行小组名字`}
-                    value={row.groupName}
-                    onPaste={(event) => handlePasteIntoTable(idx, event)}
-                    onChange={(event) => {
-                      const val = event.target.value;
-                      setDraftRows((prev) =>
-                        prev.map((item, i) => (i === idx ? { ...item, groupName: val } : item)),
-                      );
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="btn btn-icon btn-ghost"
-                    title="移除此行"
-                    aria-label={`移除第 ${idx + 1} 行`}
-                    disabled={draftRows.length <= 1}
-                    onClick={() => setDraftRows((prev) => prev.filter((_, i) => i !== idx))}
-                  >
-                    <IconClose size={14} />
-                  </button>
-                </div>
-              ))}
+            <div className="group-inviter-grid-scroll">
+              <table className="group-inviter-matrix" role="table" aria-label="添加小组两列表格">
+                <colgroup>
+                  <col style={{ width: 40 }} />
+                  <col style={{ width: '38%' }} />
+                  <col style={{ width: 'calc(62% - 76px)' }} />
+                  <col style={{ width: 36 }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>A · 小组 ID</th>
+                    <th>B · 小组名字</th>
+                    <th aria-label="操作" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {draftRows.map((row, idx) => (
+                    <tr key={row.key}>
+                      <td>{idx + 1}</td>
+                      {([0, 1] as const).map((column) => (
+                        <td key={column}>
+                          <input
+                            disabled={submittingAdd}
+                            data-group-row={idx}
+                            data-group-col={column}
+                            aria-label={`第 ${idx + 1} 行小组${column === 0 ? ' ID' : '名字'}`}
+                            placeholder={column === 0 ? '小组 ID 或链接' : '小组名字'}
+                            value={column === 0 ? row.groupId : row.groupName}
+                            onPaste={(event) => handlePasteIntoTable(idx, column, event)}
+                            onKeyDown={(event) => moveCell(idx, column, event)}
+                            onBlur={() => {
+                              if (column === 0)
+                                setDraftRows((prev) =>
+                                  prev.map((r, i) =>
+                                    i === idx ? { ...r, groupId: extractGroupId(r.groupId) } : r,
+                                  ),
+                                );
+                            }}
+                            onChange={(event) => {
+                              const text = event.target.value;
+                              setDraftRows((prev) =>
+                                prev.map((r, i) =>
+                                  i === idx
+                                    ? { ...r, [column === 0 ? 'groupId' : 'groupName']: text }
+                                    : r,
+                                ),
+                              );
+                            }}
+                          />
+                        </td>
+                      ))}
+                      <td>
+                        <button
+                          type="button"
+                          className="btn btn-icon btn-ghost"
+                          aria-label={`删除第 ${idx + 1} 行`}
+                          disabled={submittingAdd}
+                          onClick={() =>
+                            setDraftRows((prev) =>
+                              prev.length === 1 && prev[0]
+                                ? [{ ...prev[0], groupId: '', groupName: '' }]
+                                : prev.filter((_, i) => i !== idx),
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
             <div className="group-inviter-modal-tools">
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => setDraftRows((prev) => [...prev, makeDraftRow()])}
-              >
-                <IconPlus size={13} /> 添加一行
-              </button>
-            </div>
-            <details className="group-inviter-bulk-details">
-              <summary>批量多行粘贴（每行：小组ID + 制表符/空格/逗号 + 小组名字）</summary>
-              <div className="group-inviter-bulk-box">
-                <textarea
-                  rows={4}
-                  placeholder={'3017439278594998\tယေရှုခရစ်တော်သည် သခင်ဖြစ်တော်မူ၏။'}
-                  value={bulkPasteText}
-                  onChange={(event) => setBulkPasteText(event.target.value)}
-                />
-                <button type="button" className="btn btn-sm" onClick={applyBulkPasteToRows}>
-                  解析并填入上方表格
+              <div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={submittingAdd}
+                  onClick={() => setDraftRows((prev) => [...prev, makeDraftRow()])}
+                >
+                  ＋ 新增一行
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={submittingAdd}
+                  onClick={() => setDraftRows(Array.from({ length: 5 }, () => makeDraftRow()))}
+                >
+                  清空表格
                 </button>
               </div>
-            </details>
+              <span>
+                已填有效小组{' '}
+                {draftRows.filter((row) => row.groupId.trim() && row.groupName.trim()).length} 个
+              </span>
+            </div>
             {formError && (
               <p className="error-note" role="alert">
                 {formError}

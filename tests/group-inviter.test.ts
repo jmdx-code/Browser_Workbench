@@ -7,6 +7,77 @@ import { randomUUID } from 'node:crypto';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { buildStaggeredGroupQueues } from '../src/application/group-inviter-service.js';
 import type { InviterGroupRow } from '../src/shared/group-inviter.js';
+import { extractGroupId, applyGroupGridPaste } from '../src/renderer/group-inviter-grid.js';
+
+test('group grid extracts numeric IDs and slugs from Facebook URLs without altering plain IDs', () => {
+  assert.equal(
+    extractGroupId(' https://www.facebook.com/groups/3017439278594998/ '),
+    '3017439278594998',
+  );
+  assert.equal(extractGroupId('facebook.com/groups/my_group_slug?ref=share'), 'my_group_slug');
+  assert.equal(extractGroupId(' 123456 '), '123456');
+  assert.equal(extractGroupId('https://example.com/groups/123'), 'https://example.com/groups/123');
+});
+
+test('single-row two-column paste works from either column and keeps a complete multilingual name', () => {
+  let id = 0;
+  const create = (groupId = '', groupName = '') => ({ key: String(++id), groupId, groupName });
+  const name = 'ယေရှုခရစ်တော်သည် သခင်ဖြစ်တော်မူ၏။';
+  for (const column of [0, 1] as const)
+    for (const separator of ['\t', ',', '，', '|', '    ']) {
+      const result = applyGroupGridPaste(
+        [create()],
+        0,
+        column,
+        '3017439278594998' + separator + name,
+        create,
+      );
+      assert.equal(result[0]?.groupId, '3017439278594998');
+      assert.equal(result[0]?.groupName, name);
+    }
+});
+
+test('multiline grid paste appends rows; separate single columns preserve each other and names containing spaces', () => {
+  let id = 0;
+  const create = (groupId = '', groupName = '') => ({ key: String(++id), groupId, groupName });
+  const original = [create('old', 'Old name')];
+  const names = applyGroupGridPaste(original, 0, 1, '\nFirst group name\n第二个小组\n', create);
+  assert.equal(names[0]?.groupId, 'old');
+  assert.equal(names[0]?.groupName, 'First group name');
+  assert.equal(names.length, 2);
+  const ids = applyGroupGridPaste(
+    names,
+    0,
+    0,
+    'https://www.facebook.com/groups/12345/\n67890',
+    create,
+  );
+  assert.deepEqual(
+    ids.map((r) => [r.groupId, r.groupName]),
+    [
+      ['12345', 'First group name'],
+      ['67890', '第二个小组'],
+    ],
+  );
+  const pairs = applyGroupGridPaste(
+    ids,
+    1,
+    1,
+    '\nfacebook.com/groups/my_group_slug?ref=share\tNew name\n45678\tAnother name\n',
+    create,
+  );
+  assert.deepEqual(
+    pairs.slice(1).map((r) => [r.groupId, r.groupName]),
+    [
+      ['my_group_slug', 'New name'],
+      ['45678', 'Another name'],
+    ],
+  );
+  assert.deepEqual(
+    original.map((r) => [r.groupId, r.groupName]),
+    [['old', 'Old name']],
+  );
+});
 
 async function withStore(run: (store: WorkspaceStore) => Promise<void> | void) {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-group-inviter-'));
