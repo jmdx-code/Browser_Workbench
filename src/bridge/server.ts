@@ -416,8 +416,18 @@ export async function startBridgeServer(options: BridgeServerOptions) {
     let authenticationPending = false;
     let recoveryId: string | undefined;
     let lastPong = Date.now();
-    const liveness = setInterval(async () => {
-      if (peer && Date.now() - lastPong > LEASE_MS) {
+    let lastLivenessCheckAt = Date.now(),
+      livenessPending = false;
+    const liveness = setInterval(() => {
+      const now = Date.now(),
+        loopGapMs = now - lastLivenessCheckAt;
+      lastLivenessCheckAt = now;
+      if (loopGapMs > 1800) return;
+      if (!peer || now - lastPong <= LEASE_MS || livenessPending) return;
+      livenessPending = true;
+      setImmediate(() => {
+        livenessPending = false;
+        if (!peer || ws.readyState !== WebSocket.OPEN || Date.now() - lastPong <= LEASE_MS) return;
         const silentMs = Date.now() - lastPong;
         peer.transportFailure = 'HEARTBEAT_TIMEOUT';
         devDiag.record({
@@ -428,9 +438,9 @@ export async function startBridgeServer(options: BridgeServerOptions) {
           reason: 'HEARTBEAT_TIMEOUT',
           data: { epoch: peer.epoch, silentMs, leaseMs: LEASE_MS },
         });
-        await core.disconnect(peer);
+        void core.disconnect(peer).catch(() => {});
         ws.terminate();
-      }
+      });
     }, 1000);
     const authTimer = setTimeout(() => ws.close(1008, 'AUTH_TIMEOUT'), 5000);
     ws.on('error', (error) => {
@@ -459,6 +469,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
     ws.on('message', async (raw) => {
       try {
         const m = JSON.parse(raw.toString());
+        if (peer && m && typeof m === 'object' && typeof m.type === 'string') lastPong = Date.now();
         if (!peer) {
           if (authenticationPending) throw Error('AUTH_IN_PROGRESS');
           authenticationPending = true;
@@ -711,16 +722,32 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       }
     });
   });
-  const heartbeat = setInterval(async () => {
-    await kernel?.tick();
+  let tickInFlight = false;
+  const heartbeat = setInterval(() => {
     for (const p of core.peers.values())
       if (p.online)
         try {
           p.send({ type: 'HEARTBEAT', connectionEpoch: p.epoch, leaseMs: LEASE_MS });
         } catch {
-          await core.disconnect(p);
+          void core.disconnect(p).catch(() => {});
         }
-  }, 1000);
+    if (!tickInFlight) {
+      tickInFlight = true;
+      void Promise.resolve()
+        .then(() => kernel?.tick())
+        .catch((error: unknown) => {
+          devDiag.record({
+            level: 'WARN',
+            category: 'BRIDGE_WS',
+            event: 'KERNEL_TICK_ERROR',
+            reason: error instanceof Error ? error.message.slice(0, 200) : 'KERNEL_TICK_ERROR',
+          });
+        })
+        .finally(() => {
+          tickInFlight = false;
+        });
+    }
+  }, 1500);
   try {
     if (!server.listening)
       await new Promise<void>((resolve, reject) => {

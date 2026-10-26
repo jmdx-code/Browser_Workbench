@@ -475,6 +475,33 @@ export class TaskStepRunner {
           return this.result(plan, 'WAITING', 'OPERATION_UNRESOLVED');
         const intent = (await this.intents.get(pending.id)).intent,
           binding = pending.binding;
+        const resumableBrowseTimeout =
+          intent.kind === 'like' ||
+          (intent.kind === 'auxiliary' &&
+            (['activateTab', 'browsePlay', 'browseNavigate'].includes(pending.action.kind) ||
+              (pending.action.kind === 'click' &&
+                pending.action.target.css === FACEBOOK_REEL_NEXT_CSS &&
+                pending.action.target.scope === undefined &&
+                pending.action.target.text === undefined)));
+        const dispatchReceipt = pending.receipt;
+        const dispatchEvidence =
+          dispatchReceipt && typeof dispatchReceipt === 'object' && !Array.isArray(dispatchReceipt)
+            ? dispatchReceipt.evidence
+            : undefined;
+        if (
+          dispatchEvidence &&
+          typeof dispatchEvidence === 'object' &&
+          'resultCode' in dispatchEvidence &&
+          dispatchEvidence.resultCode === 'TARGET_UNAVAILABLE_BEFORE_INPUT'
+        ) {
+          await this.dispatcher.verify({ binding, evidence: dispatchEvidence }, 'NOT_APPLIED');
+          await this.tasks.noteRunningWait?.(plan.id, 'TARGET_UNAVAILABLE_BEFORE_INPUT');
+          return this.result(
+            await this.tasks.get(plan.id),
+            'WAITING',
+            'TARGET_UNAVAILABLE_BEFORE_INPUT',
+          );
+        }
         const verificationStartedAt = this.clock.nowMilliseconds();
         const verdict = BrowseVerdict.parse(
           await executor.verify(
@@ -641,6 +668,12 @@ export class TaskStepRunner {
             await this.tasks.noteRunningWait?.(plan.id, verdict.reason);
             return this.result(await this.tasks.get(plan.id), 'WAITING', verdict.reason);
           }
+          if (resumableBrowseTimeout) {
+            await this.dispatcher.verify(verdict.receipt, 'NOT_APPLIED');
+            this.samples.delete(plan.profileId);
+            await this.tasks.noteRunningWait?.(plan.id, timeoutReason);
+            return this.result(await this.tasks.get(plan.id), 'WAITING', timeoutReason);
+          }
           await this.tasks.markBoundUnknown(binding, timeoutReason, verdict.receipt);
           await this.runtime.control(plan.id, 'pause', timeoutReason);
           return this.result(await this.tasks.get(plan.id), 'BUSINESS_UNKNOWN', timeoutReason);
@@ -676,6 +709,17 @@ export class TaskStepRunner {
               },
             });
             this.samples.delete(plan.profileId);
+            return this.result(await this.tasks.get(plan.id), 'WAITING', verdict.reason);
+          }
+          if (
+            resumableBrowseTimeout &&
+            ['FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT', 'BROWSE_EFFECT_TIMEOUT'].includes(
+              verdict.reason,
+            )
+          ) {
+            await this.dispatcher.verify(verdict.receipt, 'NOT_APPLIED');
+            this.samples.delete(plan.profileId);
+            await this.tasks.noteRunningWait?.(plan.id, verdict.reason);
             return this.result(await this.tasks.get(plan.id), 'WAITING', verdict.reason);
           }
           await this.tasks.markBoundUnknown(binding, verdict.reason, verdict.receipt);

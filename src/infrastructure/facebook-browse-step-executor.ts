@@ -726,7 +726,11 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
         page.visible &&
         facebookBrowseSurface(page.url) === this.type &&
         sameContent &&
-        page.likeTarget?.liked === true
+        (page.likeTarget?.liked === true ||
+          (this.type === 'video' &&
+            page.likeTarget &&
+            intent.observedLikeCount < 10_000 &&
+            page.likeTarget.likeCount === intent.observedLikeCount + 1))
       ) {
         this.likeVerifyWaits.delete(operation.id);
         return {
@@ -744,12 +748,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       const since = prevWait?.operationId === operation.id ? prevWait.since : at;
       if (!prevWait || prevWait.operationId !== operation.id)
         this.likeVerifyWaits.set(operation.id, { operationId: operation.id, since });
-      if (
-        page.ready &&
-        !page.blocked &&
-        page.visible &&
-        (!sameContent || !page.likeTarget || at - since >= 3500)
-      ) {
+      if (page.ready && !page.blocked && page.visible && (!sameContent || at - since >= 3500)) {
         this.likeVerifyWaits.delete(operation.id);
         return { outcome: 'NOT_APPLIED', receipt: likeReceipt };
       }

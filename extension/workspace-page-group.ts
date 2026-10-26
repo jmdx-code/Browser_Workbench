@@ -105,7 +105,7 @@ export class WorkspacePageGroup {
           // Group only the exactly registered main, never matching names or arbitrary tabs.
           groupId = await chrome.tabs.group({ tabIds: [proof.tabId] });
           check();
-          await chrome.tabGroups.update(groupId, { title: 'Browser Workbench', color: 'grey' });
+          await chrome.tabGroups.update(groupId, { title: '浏览器工作台', color: 'grey' });
           check();
         }
         const observed = await this.current(proof, check);
@@ -137,7 +137,7 @@ export class WorkspacePageGroup {
         if (groupId === undefined) {
           groupId = await chrome.tabs.group({ tabIds: [proof.tabId] });
           check();
-          await chrome.tabGroups.update(groupId, { title: 'Browser Workbench', color: 'grey' });
+          await chrome.tabGroups.update(groupId, { title: '浏览器工作台', color: 'grey' });
           check();
         }
         const observed = await this.current(proof, check);

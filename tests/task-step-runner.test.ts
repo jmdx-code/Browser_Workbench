@@ -474,7 +474,7 @@ test('unknown or mismatched business result preserves account lock and never inc
   }
 });
 
-test('acknowledged activation waits at most thirty seconds without resending; recovery verifies original action and expiry preserves UNKNOWN', async () => {
+test('acknowledged activation waits at most thirty seconds without resending; recovery verifies it and expiry settles not applied while browsing continues', async () => {
   for (const resume of ['verified', 'pending', 'malformed', 'timeout']) {
     await settlementFixture(async (store, file) => {
       const h = await browseHarness(store, 1, {
@@ -533,16 +533,17 @@ test('acknowledged activation waits at most thirty seconds without resending; re
       h.clock.at = 40000;
       await h.runner.advance(plan.id);
       if (resume === 'malformed') {
-        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'UNKNOWN');
+        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'FAILED');
+        assert.equal((await store.tasks.get(plan.id)).state, 'RUNNING');
         return;
       }
       assert.equal((await store.tasks.get(plan.id)).reason, reason);
       h.clock.at = resume === 'timeout' ? 70000 : 69000;
       const resumed = await h.runner.advance(plan.id);
       if (resume === 'timeout') {
-        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'UNKNOWN');
+        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'FAILED');
         assert.equal(resumed.reason, 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT');
-        assert.equal((await store.tasks.get(plan.id)).state, 'REVIEW');
+        assert.equal((await store.tasks.get(plan.id)).state, 'RUNNING');
         assert.equal(h.inputs.get(plan.profileId), 1);
         assert.equal((await store.tasks.steps(plan.id))[0]?.progress.effectiveMilliseconds, 0);
         return;
@@ -568,7 +569,8 @@ test('acknowledged activation waits at most thirty seconds without resending; re
         assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'ACKNOWLEDGED');
         h.clock.at += 2000;
         await h.runner.advance(plan.id);
-        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'UNKNOWN');
+        assert.equal((await store.tasks.operations(plan.id))[0]?.status, 'FAILED');
+        assert.equal((await store.tasks.get(plan.id)).state, 'RUNNING');
       }
       assert.equal(h.inputs.get(plan.profileId), 1);
       assert.equal((await store.tasks.steps(plan.id))[0]?.progress.effectiveMilliseconds, 0);
@@ -576,7 +578,7 @@ test('acknowledged activation waits at most thirty seconds without resending; re
   }
 });
 
-test('browse timeout preserves only its final independent read before control stops, without resending or crediting it', async () => {
+test('browse auxiliary timeout preserves its final independent read and continues without resending or crediting it', async () => {
   await settlementFixture(async (store, file) => {
     const h = await browseHarness(store),
       plan = await h.claim(),
@@ -602,12 +604,12 @@ test('browse timeout preserves only its final independent read before control st
     }
     await h.runner.advance(plan.id);
     const saved = (await store.tasks.operations(plan.id))[0];
-    assert.equal(saved?.status, 'UNKNOWN');
+    assert.equal(saved?.status, 'FAILED');
     assert.deepEqual(saved?.receipt, {
       binding: saved?.binding,
-      reason: 'BROWSE_EFFECT_TIMEOUT',
-      observation: { pending },
+      evidence: { pending },
     });
+    assert.equal((await store.tasks.get(plan.id)).state, 'RUNNING');
     assert.equal((await store.tasks.steps(plan.id))[0]?.progress.effectiveMilliseconds, 0);
     assert.equal(h.inputs.get(plan.profileId), 1);
   });

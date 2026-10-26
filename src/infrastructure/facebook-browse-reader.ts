@@ -76,7 +76,7 @@ export const FacebookBrowsePage = z
         ended: z.boolean(),
         timeSeconds: z.number().finite().nonnegative(),
         durationSeconds: z.number().finite().positive().nullable().optional(),
-        playbackRate: z.number().min(0.25).max(4),
+        playbackRate: z.number().min(0).max(4),
       })
       .strict()
       .nullable(),
@@ -534,6 +534,21 @@ export function projectFacebookBrowsePage() {
         );
       })
     : [];
+  const canHitCenter = (el: Element, rect = el.getBoundingClientRect()) => {
+    const x = Math.round(rect.left + rect.width / 2),
+      y = Math.round(rect.top + rect.height / 2);
+    if (
+      rect.top < 60 ||
+      rect.bottom > innerHeight - 16 ||
+      x < 0 ||
+      x >= innerWidth ||
+      y < 0 ||
+      y >= innerHeight
+    )
+      return false;
+    const hit = document.elementFromPoint(x, y);
+    return Boolean(hit && (hit === el || el.contains(hit)));
+  };
   const nextReelCSS = '[data-wb-reel-next="1"]';
   for (const el of Array.from(document.querySelectorAll('[data-wb-reel-next]')))
     el.removeAttribute('data-wb-reel-next');
@@ -572,7 +587,8 @@ export function projectFacebookBrowsePage() {
   if (
     nextButton &&
     nextButton.getAttribute('aria-disabled') !== 'true' &&
-    !nextButton.hasAttribute('disabled')
+    !nextButton.hasAttribute('disabled') &&
+    canHitCenter(nextButton)
   )
     nextButton.setAttribute('data-wb-reel-next', '1');
   const friendsRoute = /^\/friends(?:\/requests)?\/?$/.test(location.pathname);
@@ -639,8 +655,10 @@ export function projectFacebookBrowsePage() {
       if (btnRect.top < 72 || btnRect.bottom > innerHeight - 24) {
         firstConfirmButton.scrollIntoView({ block: 'center' });
       }
-      firstConfirmButton.setAttribute('data-wb-friend-confirm', '1');
-      friendConfirmCSS = '[data-wb-friend-confirm="1"]';
+      if (canHitCenter(firstConfirmButton)) {
+        firstConfirmButton.setAttribute('data-wb-friend-confirm', '1');
+        friendConfirmCSS = '[data-wb-friend-confirm="1"]';
+      }
       let card: Element | null = firstConfirmButton.parentElement;
       let href = '';
       for (let d = 0; card && card !== friendNav && d < 8; d++, card = card.parentElement) {
@@ -934,14 +952,12 @@ export function projectFacebookBrowsePage() {
   } | null = null;
   const reactionFrame = (el: Element) =>
     frames(el).find((f) => f.name.includes('CometUFIReactButtonBase.react'));
-  const reactionIcon = (el: Element) =>
-    Array.from(el.querySelectorAll('svg,img')).some((icon) =>
-      frames(icon, 12).some(
-        (f) =>
-          f.name.includes('FBNucleusLikeOutline24Icon.react') ||
-          f.name.includes('CometReactionIcon.react'),
-      ),
-    );
+  const reactionIcons = (el: Element) =>
+    Array.from(el.querySelectorAll('svg,img,[data-visualcompletion="css-img"]'))
+      .flatMap((icon) => frames(icon, 28))
+      .filter(
+        (f) => /^FBNucleusLike.*Icon\.react$/.test(f.name) || f.name === 'CometReactionIcon.react',
+      );
   const feedbackEvidence = (el: Element) => {
     const chain = frames(el, 100),
       feedback = reactionFrame(el)?.props.feedback;
@@ -960,11 +976,18 @@ export function projectFacebookBrowsePage() {
         if (!record(source) || typeof source.get !== 'function') continue;
         const data: unknown = Reflect.apply(source.get, source, [feedback.__id]);
         if (!record(data)) continue;
-        const key = [
-          'viewer_feedback_reaction_info(use_default_actor:false)',
-          'viewer_feedback_reaction_info',
-        ].find((k) => Object.hasOwn(data, k));
-        const liked = key === undefined ? undefined : data[key] !== null && data[key] !== undefined;
+        const props = reactionFrame(el)?.props;
+        const liked =
+          Object.keys(data).some(
+            (key) =>
+              (key === 'viewer_feedback_reaction_info' ||
+                key.startsWith('viewer_feedback_reaction_info(')) &&
+              data[key] !== null &&
+              data[key] !== undefined,
+          ) ||
+          props?.selected === true ||
+          props?.isSelected === true ||
+          props?.pressed === true;
         const connection = data.reactors;
         const reactors: unknown =
           record(connection) && typeof connection.__ref === 'string'
@@ -992,8 +1015,37 @@ export function projectFacebookBrowsePage() {
     if (!likeBtn && reelSurface) {
       const candidates = Array.from(
         likeScopeRoot.querySelectorAll('[role="button"],button'),
-      ).filter((el) => visibleArea(el) > 0 && !!reactionFrame(el) && reactionIcon(el));
-      if (candidates.length === 1) likeBtn = candidates[0] ?? null;
+      ).filter((el) => visibleArea(el) > 0 && !!reactionFrame(el) && reactionIcons(el).length > 0);
+      if (video && candidates.length > 1) {
+        const vr = video.getBoundingClientRect();
+        const sharesCard = (el: Element) => {
+          for (
+            let parent = video.parentElement;
+            parent && parent !== main;
+            parent = parent.parentElement
+          ) {
+            if (
+              Array.from(parent.querySelectorAll('video')).filter((v) => visibleArea(v) > 0)
+                .length > 1
+            )
+              break;
+            if (parent.contains(el)) return true;
+          }
+          return false;
+        };
+        candidates.sort((a, b) => {
+          const distance = (el: Element) => {
+            const r = el.getBoundingClientRect(),
+              y = r.top + r.height / 2;
+            return (
+              Math.max(vr.top - y, y - vr.bottom, 0) * 10000 +
+              Math.abs(y - (vr.top + vr.bottom) / 2)
+            );
+          };
+          return Number(sharesCard(b)) - Number(sharesCard(a)) || distance(a) - distance(b);
+        });
+      }
+      likeBtn = candidates[0] ?? null;
     }
     if (!likeBtn) {
       likeBtn =
@@ -1016,18 +1068,33 @@ export function projectFacebookBrowsePage() {
           btnLabel,
         ) || /unlike|remove\s+like|取消赞|取消讚|已赞|已讚/i.test(btnLabel);
       const colorProbe = adLike ?? likeBtn;
-      const rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(
-        getComputedStyle(colorProbe).color || '',
-      );
-      const colorLiked = rgbMatch
-        ? Math.max(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) -
-            Math.min(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) >=
-          45
-        : false;
+      const colorLiked = [colorProbe, colorProbe.querySelector('svg,span,i')].some((el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        return [style.color, style.fill].some((color) => {
+          const rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(color || '');
+          return (
+            !!rgbMatch &&
+            Math.max(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) -
+              Math.min(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) >=
+              45
+          );
+        });
+      });
       const nativeFeedback = feedbackEvidence(likeBtn);
-      const liked =
-        nativeFeedback?.liked ??
-        (likeBtn.hasAttribute('aria-pressed') ? ariaPressed : labelLiked || colorLiked);
+      const filledIcon = reactionIcons(likeBtn).some(
+        (f) =>
+          /^FBNucleusLikeFilled.*Icon\.react$/.test(f.name) || f.name === 'CometReactionIcon.react',
+      );
+      const props = reactionFrame(likeBtn)?.props;
+      const domLiked =
+        ariaPressed ||
+        labelLiked ||
+        colorLiked ||
+        props?.selected === true ||
+        props?.isSelected === true ||
+        props?.pressed === true;
+      const liked = filledIcon || nativeFeedback?.liked === true || domLiked;
       let likeCSS: typeof FACEBOOK_BROWSE_LIKE_CSS | null = null;
       if (
         likeBtn.getAttribute('aria-disabled') !== 'true' &&
@@ -1039,7 +1106,8 @@ export function projectFacebookBrowsePage() {
           br.top >= 60 &&
           br.bottom <= innerHeight - 16 &&
           br.left >= 0 &&
-          br.right <= innerWidth
+          br.right <= innerWidth &&
+          canHitCenter(likeBtn, br)
         ) {
           likeBtn.setAttribute('data-wb-browse-like', '1');
           likeCSS = '[data-wb-browse-like="1"]';
@@ -1146,7 +1214,8 @@ export function projectFacebookBrowsePage() {
       nextButton &&
       visibleArea(nextButton) > 0 &&
       nextButton.getAttribute('aria-disabled') !== 'true' &&
-      !nextButton.hasAttribute('disabled')
+      !nextButton.hasAttribute('disabled') &&
+      canHitCenter(nextButton)
         ? nextReelCSS
         : null,
     ...(friendRequestsRoute
@@ -1213,7 +1282,12 @@ export function projectFacebookBrowsePage() {
             ended: video.ended,
             timeSeconds: Math.max(0, video.currentTime),
             ...(videoDurationSeconds !== null ? { durationSeconds: videoDurationSeconds } : {}),
-            playbackRate: video.playbackRate,
+            playbackRate:
+              Number.isFinite(video.playbackRate) &&
+              video.playbackRate >= 0 &&
+              video.playbackRate <= 4
+                ? video.playbackRate
+                : 1,
           }
         : null,
   };

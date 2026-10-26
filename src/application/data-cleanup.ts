@@ -108,11 +108,12 @@ export class DataCleanupService {
       while (deleted < ticket.count) {
         const n = await this.repository.removeBatch(
           ticket.selection.scope,
-          Math.min(250, ticket.count - deleted),
+          Math.min(100, ticket.count - deleted),
         );
         deleted += n;
         this.progressValue.current = deleted;
-        if (n < 250) break;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (n < 100) break;
       }
       return {
         deleted,
@@ -127,14 +128,28 @@ export class DataCleanupService {
   async automatic() {
     if (this.busy || this.resetting) return;
     const settings = await this.repository.settings();
-    if (settings.historyRetentionDays === null && !settings.automaticLogs) return;
+    if (
+      settings.historyRetentionDays === null &&
+      settings.historyMaxCount == null &&
+      !settings.automaticLogs
+    )
+      return;
     this.assertIdle();
     this.busy = true;
     try {
-      if (settings.historyRetentionDays !== null)
-        await this.repository.removeBatch({
-          before: Date.now() - settings.historyRetentionDays * 86400000,
-        });
+      if (settings.historyRetentionDays !== null || settings.historyMaxCount != null) {
+        const scope = {
+          ...(settings.historyRetentionDays !== null
+            ? { before: Date.now() - settings.historyRetentionDays * 86400000 }
+            : {}),
+          ...(settings.historyMaxCount != null ? { keepLatestRuns: settings.historyMaxCount } : {}),
+        };
+        let removed: number;
+        do {
+          removed = await this.repository.removeBatch(scope, 100);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        } while (removed === 100);
+      }
       if (settings.automaticLogs) {
         const files = await this.logs.preview(Date.now() - settings.logRetentionDays * 86400000);
         if (files.length) await this.logs.remove(files);

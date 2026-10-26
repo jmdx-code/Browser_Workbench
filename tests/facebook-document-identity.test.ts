@@ -181,7 +181,7 @@ test('browse scope accepts the current single User menu on watch without relaxin
   }
 });
 
-test('current-post projection accepts a retained home document, but rejects conflicting or duplicate native records', () => {
+test('current-post projection deduplicates matching actors but rejects conflicts and partial records', () => {
   for (const mode of ['conflict', 'duplicate-menu', 'duplicate-composer', 'partial'] as const) {
     const f = documentFixture((entries) => {
       if (mode === 'duplicate-menu') entries.push(structuredClone(entries[0]));
@@ -208,13 +208,16 @@ test('current-post projection accepts a retained home document, but rejects conf
       }
     });
     try {
-      assert.equal(projectFacebookDocumentIdentity('post-current').actor, null);
+      assert.equal(
+        projectFacebookDocumentIdentity('post-current').actor?.accountId ?? null,
+        mode.startsWith('duplicate') ? sample.request.av : null,
+      );
     } finally {
       f.close();
     }
   }
 });
-test('preloaded partial, errored, additional or conflicting actors and duplicate queries never grant identity', () => {
+test('preloaded invalid actors never grant identity while identical repeated queries are deduplicated', () => {
   for (const mutation of [
     (f: ReturnType<typeof documentFixture>) => {
       f.menu.extensions.is_final = false;
@@ -245,7 +248,7 @@ test('preloaded partial, errored, additional or conflicting actors and duplicate
     entries.push(entries[0]);
   });
   try {
-    assert.equal(projectFacebookDocumentIdentity().actor, null);
+    assert.equal(projectFacebookDocumentIdentity().actor?.accountId, sample.request.av);
   } finally {
     f.close();
   }
@@ -279,6 +282,30 @@ function storyEntries() {
   };
   return { first, patch, final, rows: [record(first), record(patch), record(final)], record };
 }
+
+test('long-lived SPA accepts repeated matching actor records past 20000 modules but rejects a late distinct name', () => {
+  for (const conflict of [false, true]) {
+    const f = documentFixture((entries) => {
+      const menu = structuredClone(entries[0]),
+        composer = structuredClone(entries[1]);
+      entries.push(...Array.from({ length: 21000 }, () => ['UnrelatedModule']));
+      entries.push(menu, composer);
+      if (conflict) {
+        const other = JSON.parse(JSON.stringify(menu));
+        other[3][1].__bbox.result.data.viewer.actor.name = 'Different actor name';
+        entries.push(other);
+      }
+    });
+    try {
+      assert.equal(
+        projectFacebookDocumentIdentity('browse').actor?.accountId ?? null,
+        conflict ? null : sample.request.av,
+      );
+    } finally {
+      f.close();
+    }
+  }
+});
 
 test('observed suspense story creator requires completed matching me/actor/menu and a unique visible creation shell', () => {
   for (const scenario of [
@@ -377,7 +404,11 @@ test('software story reads accept observed versioned Relay module names without 
       entries.splice(1, 1, ...story.rows);
       for (const row of entries as unknown[][])
         row[0] = 'RelayPrefetchedStreamCache@45aabeb6562624847421d6f4ae4605c5';
-      if (conflict) entries.push(structuredClone(entries[0]));
+      if (conflict) {
+        const changed = JSON.parse(JSON.stringify(entries[0]));
+        changed[3][1].__bbox.result.data.viewer.actor.id = '99';
+        entries.push(changed);
+      }
     });
     try {
       globalThis.location.href = 'https://www.facebook.com/stories/create/';

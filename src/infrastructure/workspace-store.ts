@@ -5,6 +5,8 @@ import {
   SqliteDataCleanup,
   dataCleanupMigration,
   physicalHistoryCleanupMigration,
+  cleanupQuotaMigration,
+  cleanupIndexesMigration,
 } from './data-cleanup-store.js';
 import type { SynchronousRepository } from '../domain/persistence.js';
 import { taskRecordMigration } from './task-record-migration.js';
@@ -125,6 +127,8 @@ const migrations = [
   profileTaskResultMigration,
   groupInviterConfirmationMigration,
   physicalHistoryCleanupMigration,
+  cleanupQuotaMigration,
+  cleanupIndexesMigration,
 ];
 export const workspaceSchemaVersion = migrations.length;
 
@@ -301,7 +305,14 @@ export class WorkspaceStore implements WorkspaceRepository {
         if (rebuild) db.exec('PRAGMA foreign_keys=OFF');
         db.exec('BEGIN IMMEDIATE');
         try {
-          db.exec(sql);
+          if (
+            sql !== cleanupQuotaMigration ||
+            !db
+              .prepare('PRAGMA table_info(data_cleanup_settings)')
+              .all()
+              .some((column) => column.name === 'history_max_count')
+          )
+            db.exec(sql);
           if (rebuild && db.prepare('PRAGMA foreign_key_check').all().length)
             throw Error('MATERIAL_USAGE_MIGRATION_FOREIGN_KEY_FAILED');
           db.exec('PRAGMA user_version=' + (next + 1));

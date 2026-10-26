@@ -745,6 +745,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       | { selector: string; target: { url: string; timeOrigin: number; href: string | null } }
       | undefined;
     const pressedSettingsKeys = new Set<string>();
+    const pendingMouseReleaseButtons = new Set<string>();
     let wheelStart: ReturnType<typeof BrowseWheelStart.parse> | undefined;
     const assertTarget = async (activationPreparation = false) => {
       await assertCurrent();
@@ -817,298 +818,341 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       );
       return { binding: result.binding, evidence: { sdkReturned: true, ownedTab: proof } };
     }
-    const result = await this.connection.execute(
-      operation.binding,
-      async () => {
-        const playbackSatisfied = (error: unknown) =>
-          action.kind === 'browsePlay' &&
-          error instanceof Error &&
-          error.message === 'FACEBOOK_BROWSE_PLAY_ALREADY_RUNNING';
-        try {
-          await assertTarget(true);
-        } catch (error) {
-          if (!playbackSatisfied(error)) throw error;
-          await assertCurrent();
-          return;
-        }
-        const submission = await post();
-        if (submission?.link.purpose === 'SUBMIT') {
-          if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
-          await this.materialInputs.submission.prepare(
-            page,
-            operation,
-            submission,
-            assertCurrent,
-            async () => {
-              // Network responses may arrive after the input ACK. This is a read guard, never an
-              // input guard: it retains the same actor/proof/step and original pending operation.
-              await this.authority.assertIdentity(this.context.accountId);
-              const current = await this.current(),
-                plan = await this.tasks.get(this.plan.id);
-              const pending = await this.operation(operation.id);
-              const owned = (await this.tabs.forPlan(this.plan.id)).find((tab) =>
-                sameTabProof(tab.proof, proof),
-              );
-              const active = (await this.tasks.steps(this.plan.id)).find(
-                (step) => step.id === operation.stepId,
-              );
-              if (
-                !current ||
-                !sameExecution(current, operation.binding) ||
-                plan.state !== 'RUNNING' ||
-                plan.accountId !== operation.binding.accountId ||
-                active?.status !== 'ACTIVE' ||
-                active.position !== plan.position ||
-                !pending?.binding ||
-                !sameBinding(pending.binding, operation.binding) ||
-                !['DISPATCHING', 'ACKNOWLEDGED'].includes(pending.status) ||
-                owned?.state !== 'READY' ||
-                !owned.context ||
-                !sameExecution(owned.context, current)
-              )
-                throw Error('ORIGINAL_PENDING_POST_OBSERVATION_REVOKED');
-            },
-            () => this.connection.enablePostNetworkObservation(operation.binding, assertCurrent),
-          );
-          await assertTarget();
-        }
-        if (action.kind === 'typeText') {
-          if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
-          await this.materialInputs.source.check(operation.binding, assertCurrent);
-          await assertTarget();
-        }
-        if (
-          this.visiblePointer &&
-          action.kind !== 'activateTab' &&
-          action.kind !== 'browseNavigate' &&
-          action.kind !== 'browseScroll'
-        ) {
-          await page.evaluate(installAutomationPointer);
-          await assertTarget();
-        }
-        if (action.kind === 'activateTab') await page.bringToFront();
-        else if (action.kind === 'browseNavigate') {
-          // Establish native presentation before navigation can enter a loading/
-          // verification wait. A later wheel is not guaranteed to happen: a covered
-          // destination may otherwise never become ready enough to request one.
-          if (step.spec.type !== 'post') {
-            await page.bringToFront();
-            await assertCurrent();
-          }
-          const selector =
-            !submission ||
-            (submission.link.purpose === 'PREPARE_HOME' &&
-              page.url() === 'https://www.facebook.com/')
-              ? null
-              : (facebookBrowseNavigationSelector(action.url) ??
-                (submission.link.purpose === 'PREPARE_STORY'
-                  ? facebookStoryNavigationSelector(action.url, page.url())
-                  : null));
-          const target = selector
-            ? await readFacebookBrowseNavigation(page, selector, assertCurrent)
-            : null;
-          if (selector && target) {
-            if (step.spec.type === 'post') await page.bringToFront();
-            browseNavigation = { selector, target };
-            if (step.spec.type !== 'post')
-              await clickFacebookNativeTarget(page, { css: selector }, page.url(), assertCurrent, {
-                scrollFallback: () =>
-                  page.locator(selector).click({ timeout: 10_000, noWaitAfter: true }),
-              });
-            else await page.locator(selector).click({ timeout: 10_000, noWaitAfter: true });
-          } else await this.connection.navigateBoundPage(operation.binding, action, page.url());
-        } else if (action.kind === 'browseScroll') {
-          const surface = facebookBrowseSurface(action.url);
-          const feed = surface === 'feed';
-          const fastScroll = surface === 'feed' || surface === 'marketplace' || surface === 'video';
-          // A visible feed/marketplace page needs no repeated tab activation. This negative decision
-          // grants no input: the original native guard still checks each mouse write.
-          const alreadyVisible =
-            fastScroll && (await page.evaluate(() => document.visibilityState === 'visible'));
-          await assertCurrent();
-          if (alreadyVisible !== true || this.connection.taskRendering) await page.bringToFront();
-          const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-          if (!fastScroll) await assertTarget();
-          await assertCurrent();
-          if (fastScroll) {
-            await assertCurrent();
-            await page.mouse.move(viewport.width / 2, viewport.height / 2);
-          } else
-            await this.movePointer(page, viewport.width / 2, viewport.height / 2, assertCurrent);
-          let humanScroll = surface === 'marketplace';
-          if (feed) {
-            const before = await readFacebookBrowsePage(page, assertCurrent);
-            // Every actual Input is freshly checked by the original native resource gate.
-            // The read itself needs cancellation/context guards, not a duplicate full read.
-            await assertCurrent();
-            if (before.url !== action.url || before.timeOrigin !== action.timeOrigin)
-              throw Error('FACEBOOK_WHEEL_START_DOCUMENT_CHANGED');
-            humanScroll = before.recommendedDwellMs !== undefined;
-            wheelStart = BrowseWheelStart.parse({
-              version: 2,
-              url: before.url,
-              timeOrigin: before.timeOrigin,
-              scrollY: before.scrollY,
-              anchor:
-                before.contentKey && before.contentPosition
-                  ? {
-                      contentId: createHash('sha256').update(before.contentKey).digest('hex'),
-                      position: before.contentPosition,
-                    }
-                  : null,
-            });
-          }
-          const tickCount = Math.max(1, Math.min(12, Math.ceil(Math.abs(action.deltaY) / 90)));
-          const weights: number[] = fastScroll
-            ? [1]
-            : Array.from({ length: tickCount }, () => 1 / tickCount);
-          let remainingDelta = action.deltaY;
-          for (let index = 0; index < weights.length; index++) {
-            await assertCurrent();
-            const stepDelta =
-              index + 1 === weights.length
-                ? remainingDelta
-                : Math.round(action.deltaY * (weights[index] ?? 1));
-            remainingDelta -= stepDelta;
-            await page.mouse.wheel(0, stepDelta);
-            appliedScrollDelta += stepDelta;
-            if (index + 1 < weights.length)
-              await new Promise<void>((resolve) =>
-                setTimeout(resolve, humanScroll ? Math.round(38 + Math.random() * 44) : 35),
-              );
-          }
-        } else if (action.kind === 'browsePlay') {
-          await page.bringToFront();
+    const result = await this.connection
+      .execute(
+        operation.binding,
+        async () => {
+          const playbackSatisfied = (error: unknown) =>
+            action.kind === 'browsePlay' &&
+            error instanceof Error &&
+            error.message === 'FACEBOOK_BROWSE_PLAY_ALREADY_RUNNING';
           try {
-            await assertTarget();
-            await clickFacebookNativeTarget(page, { css: action.css }, action.url, assertCurrent, {
-              scrollFallback: () => page.locator(action.css).click({ timeout: 15_000 }),
-            });
+            await assertTarget(true);
           } catch (error) {
             if (!playbackSatisfied(error)) throw error;
             await assertCurrent();
+            return;
           }
-        } else if (action.kind === 'click' || action.kind === 'typeText') {
-          // Read-only bootstrap keeps its page in the background. Real SDK actionability
-          // waits for painted/stable frames: activate only the original owned page, inside
-          // this bound operation and through the same native purpose/identity guards.
-          await page.bringToFront();
-          await assertTarget();
-          let locator = action.target.scope
-            ? page.locator(action.target.scope).locator(action.target.css)
-            : page.locator(action.target.css);
-          if (action.target.text !== undefined)
-            locator = locator.filter({
-              hasText: new RegExp(
-                '^' + action.target.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$',
-              ),
-            });
-          // Locator click moves the real pointer itself; a separate pre-move duplicates input.
-          if (action.kind === 'typeText') await locator.fill(action.text, { timeout: 15_000 });
-          else if (
-            submission?.link.purpose === 'OPEN_COMPOSER' &&
-            step.spec.type === 'post' &&
-            step.spec.destination !== 'story'
-          ) {
-            // The verified HOME entry is a focusable role=button. Keyboard activation avoids
-            // the page's pointer overlays without force-clicking through them. This is only
-            // OPEN: submit/advance retain normal pointer actionability and input guards.
-            const visible = await locator.isVisible();
-            const enabled = await locator.isEnabled();
+          const submission = await post();
+          if (submission?.link.purpose === 'SUBMIT') {
+            if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
+            await this.materialInputs.submission.prepare(
+              page,
+              operation,
+              submission,
+              assertCurrent,
+              async () => {
+                // Network responses may arrive after the input ACK. This is a read guard, never an
+                // input guard: it retains the same actor/proof/step and original pending operation.
+                await this.authority.assertIdentity(this.context.accountId);
+                const current = await this.current(),
+                  plan = await this.tasks.get(this.plan.id);
+                const pending = await this.operation(operation.id);
+                const owned = (await this.tabs.forPlan(this.plan.id)).find((tab) =>
+                  sameTabProof(tab.proof, proof),
+                );
+                const active = (await this.tasks.steps(this.plan.id)).find(
+                  (step) => step.id === operation.stepId,
+                );
+                if (
+                  !current ||
+                  !sameExecution(current, operation.binding) ||
+                  plan.state !== 'RUNNING' ||
+                  plan.accountId !== operation.binding.accountId ||
+                  active?.status !== 'ACTIVE' ||
+                  active.position !== plan.position ||
+                  !pending?.binding ||
+                  !sameBinding(pending.binding, operation.binding) ||
+                  !['DISPATCHING', 'ACKNOWLEDGED'].includes(pending.status) ||
+                  owned?.state !== 'READY' ||
+                  !owned.context ||
+                  !sameExecution(owned.context, current)
+                )
+                  throw Error('ORIGINAL_PENDING_POST_OBSERVATION_REVOKED');
+              },
+              () => this.connection.enablePostNetworkObservation(operation.binding, assertCurrent),
+            );
             await assertTarget();
-            if (!visible || !enabled) throw Error('FACEBOOK_COMPOSER_ENTRY_UNAVAILABLE');
-            await locator.press('Enter', { timeout: 15_000 });
-          } else if (
-            submission &&
-            ['OPEN_AUDIENCE', 'CONFIRM_AUDIENCE', 'OPEN_BACKGROUND', 'SET_BACKGROUND'].includes(
-              submission.link.purpose,
-            )
-          ) {
-            const visible = await locator.isVisible(),
-              enabled = await locator.isEnabled();
+          }
+          if (action.kind === 'typeText') {
+            if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
+            await this.materialInputs.source.check(operation.binding, assertCurrent);
             await assertTarget();
-            if (!visible || !enabled) throw Error('FACEBOOK_POST_CONFIGURATION_TARGET_UNAVAILABLE');
-            await locator.press('Enter', { timeout: 15_000 });
-          } else if (step.spec.type !== 'post')
-            await clickFacebookNativeTarget(page, action.target, page.url(), assertCurrent, {
-              scrollFallback: () => locator.click({ timeout: 15_000 }),
-            });
-          else await locator.click({ timeout: 15_000 });
-        }
-      },
-      assertCurrent,
-      this.failure,
-      async (command) => {
-        await assertCurrent();
-        if (command.target.tabId !== proof.tabId) throw Error('FACEBOOK_MANAGED_TARGET_CHANGED');
-        const original = await post();
-        const key =
-          original &&
-          command.method === 'Input.dispatchKeyEvent' &&
-          [
-            'OPEN_COMPOSER',
-            'OPEN_AUDIENCE',
-            'CONFIRM_AUDIENCE',
-            'OPEN_BACKGROUND',
-            'SET_BACKGROUND',
-          ].includes(original.link.purpose)
-            ? JSON.stringify([
-                command.target,
-                command.params.code ?? null,
-                command.params.key ?? null,
-                command.params.windowsVirtualKeyCode ?? null,
-                command.params.nativeVirtualKeyCode ?? null,
-              ])
-            : null;
-        if (
-          key &&
-          command.params.type === 'keyUp' &&
-          pressedSettingsKeys.has(key) &&
-          this.authority.refreshIdentity &&
-          this.materialInputs?.composer.assertRelease &&
-          original
-        ) {
-          // Complete this operation's already-approved key press. The UI may now show its
-          // effect, so the old button's precondition is no longer the release condition.
-          await this.authority.refreshIdentity(page, assertCurrent);
-          await assertCurrent();
-          await post();
-          await this.materialInputs.composer.assertRelease(page, action, original, assertCurrent);
-          await assertCurrent();
-          await post();
-          pressedSettingsKeys.delete(key);
-          return;
-        }
-        await assertTarget(command.method === 'Page.bringToFront');
-        if (browseNavigation) {
-          const target = await readFacebookBrowseNavigation(
-            page,
-            browseNavigation.selector,
-            assertCurrent,
-          );
+          }
           if (
-            !target ||
-            target.url !== browseNavigation.target.url ||
-            target.timeOrigin !== browseNavigation.target.timeOrigin ||
-            target.href !== browseNavigation.target.href
+            this.visiblePointer &&
+            action.kind !== 'activateTab' &&
+            action.kind !== 'browseNavigate' &&
+            action.kind !== 'browseScroll'
+          ) {
+            await page.evaluate(installAutomationPointer);
+            await assertTarget();
+          }
+          if (action.kind === 'activateTab') await page.bringToFront();
+          else if (action.kind === 'browseNavigate') {
+            // Establish native presentation before navigation can enter a loading/
+            // verification wait. A later wheel is not guaranteed to happen: a covered
+            // destination may otherwise never become ready enough to request one.
+            if (step.spec.type !== 'post') {
+              await page.bringToFront();
+              await assertCurrent();
+            }
+            const selector =
+              !submission ||
+              (submission.link.purpose === 'PREPARE_HOME' &&
+                page.url() === 'https://www.facebook.com/')
+                ? null
+                : (facebookBrowseNavigationSelector(action.url) ??
+                  (submission.link.purpose === 'PREPARE_STORY'
+                    ? facebookStoryNavigationSelector(action.url, page.url())
+                    : null));
+            const target = selector
+              ? await readFacebookBrowseNavigation(page, selector, assertCurrent)
+              : null;
+            if (selector && target) {
+              if (step.spec.type === 'post') await page.bringToFront();
+              browseNavigation = { selector, target };
+              if (step.spec.type !== 'post')
+                await clickFacebookNativeTarget(
+                  page,
+                  { css: selector },
+                  page.url(),
+                  assertCurrent,
+                  {
+                    scrollFallback: () =>
+                      page.locator(selector).click({ timeout: 10_000, noWaitAfter: true }),
+                  },
+                );
+              else await page.locator(selector).click({ timeout: 10_000, noWaitAfter: true });
+            } else await this.connection.navigateBoundPage(operation.binding, action, page.url());
+          } else if (action.kind === 'browseScroll') {
+            const surface = facebookBrowseSurface(action.url);
+            const feed = surface === 'feed';
+            const fastScroll =
+              surface === 'feed' || surface === 'marketplace' || surface === 'video';
+            // A visible feed/marketplace page needs no repeated tab activation. This negative decision
+            // grants no input: the original native guard still checks each mouse write.
+            const alreadyVisible =
+              fastScroll && (await page.evaluate(() => document.visibilityState === 'visible'));
+            await assertCurrent();
+            if (alreadyVisible !== true || this.connection.taskRendering) await page.bringToFront();
+            const viewport = await page.evaluate(() => ({
+              width: innerWidth,
+              height: innerHeight,
+            }));
+            if (!fastScroll) await assertTarget();
+            await assertCurrent();
+            if (fastScroll) {
+              await assertCurrent();
+              await page.mouse.move(viewport.width / 2, viewport.height / 2);
+            } else
+              await this.movePointer(page, viewport.width / 2, viewport.height / 2, assertCurrent);
+            let humanScroll = surface === 'marketplace';
+            if (feed) {
+              const before = await readFacebookBrowsePage(page, assertCurrent);
+              // Every actual Input is freshly checked by the original native resource gate.
+              // The read itself needs cancellation/context guards, not a duplicate full read.
+              await assertCurrent();
+              if (before.url !== action.url || before.timeOrigin !== action.timeOrigin)
+                throw Error('FACEBOOK_WHEEL_START_DOCUMENT_CHANGED');
+              humanScroll = before.recommendedDwellMs !== undefined;
+              wheelStart = BrowseWheelStart.parse({
+                version: 2,
+                url: before.url,
+                timeOrigin: before.timeOrigin,
+                scrollY: before.scrollY,
+                anchor:
+                  before.contentKey && before.contentPosition
+                    ? {
+                        contentId: createHash('sha256').update(before.contentKey).digest('hex'),
+                        position: before.contentPosition,
+                      }
+                    : null,
+              });
+            }
+            const tickCount = Math.max(1, Math.min(12, Math.ceil(Math.abs(action.deltaY) / 90)));
+            const weights: number[] = fastScroll
+              ? [1]
+              : Array.from({ length: tickCount }, () => 1 / tickCount);
+            let remainingDelta = action.deltaY;
+            for (let index = 0; index < weights.length; index++) {
+              await assertCurrent();
+              const stepDelta =
+                index + 1 === weights.length
+                  ? remainingDelta
+                  : Math.round(action.deltaY * (weights[index] ?? 1));
+              remainingDelta -= stepDelta;
+              await page.mouse.wheel(0, stepDelta);
+              appliedScrollDelta += stepDelta;
+              if (index + 1 < weights.length)
+                await new Promise<void>((resolve) =>
+                  setTimeout(resolve, humanScroll ? Math.round(38 + Math.random() * 44) : 35),
+                );
+            }
+          } else if (action.kind === 'browsePlay') {
+            await page.bringToFront();
+            try {
+              await assertTarget();
+              await clickFacebookNativeTarget(
+                page,
+                { css: action.css },
+                action.url,
+                assertCurrent,
+                {
+                  scrollFallback: () => page.locator(action.css).click({ timeout: 15_000 }),
+                },
+              );
+            } catch (error) {
+              if (!playbackSatisfied(error)) throw error;
+              await assertCurrent();
+            }
+          } else if (action.kind === 'click' || action.kind === 'typeText') {
+            // Read-only bootstrap keeps its page in the background. Real SDK actionability
+            // waits for painted/stable frames: activate only the original owned page, inside
+            // this bound operation and through the same native purpose/identity guards.
+            await page.bringToFront();
+            await assertTarget();
+            let locator = action.target.scope
+              ? page.locator(action.target.scope).locator(action.target.css)
+              : page.locator(action.target.css);
+            if (action.target.text !== undefined)
+              locator = locator.filter({
+                hasText: new RegExp(
+                  '^' + action.target.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$',
+                ),
+              });
+            // Locator click moves the real pointer itself; a separate pre-move duplicates input.
+            if (action.kind === 'typeText') await locator.fill(action.text, { timeout: 15_000 });
+            else if (
+              submission?.link.purpose === 'OPEN_COMPOSER' &&
+              step.spec.type === 'post' &&
+              step.spec.destination !== 'story'
+            ) {
+              // The verified HOME entry is a focusable role=button. Keyboard activation avoids
+              // the page's pointer overlays without force-clicking through them. This is only
+              // OPEN: submit/advance retain normal pointer actionability and input guards.
+              const visible = await locator.isVisible();
+              const enabled = await locator.isEnabled();
+              await assertTarget();
+              if (!visible || !enabled) throw Error('FACEBOOK_COMPOSER_ENTRY_UNAVAILABLE');
+              await locator.press('Enter', { timeout: 15_000 });
+            } else if (
+              submission &&
+              ['OPEN_AUDIENCE', 'CONFIRM_AUDIENCE', 'OPEN_BACKGROUND', 'SET_BACKGROUND'].includes(
+                submission.link.purpose,
+              )
+            ) {
+              const visible = await locator.isVisible(),
+                enabled = await locator.isEnabled();
+              await assertTarget();
+              if (!visible || !enabled)
+                throw Error('FACEBOOK_POST_CONFIGURATION_TARGET_UNAVAILABLE');
+              await locator.press('Enter', { timeout: 15_000 });
+            } else if (step.spec.type !== 'post')
+              await clickFacebookNativeTarget(page, action.target, page.url(), assertCurrent, {
+                scrollFallback: () => locator.click({ timeout: 15_000 }),
+              });
+            else await locator.click({ timeout: 15_000 });
+          }
+        },
+        assertCurrent,
+        this.failure,
+        async (command) => {
+          await assertCurrent();
+          if (command.target.tabId !== proof.tabId) throw Error('FACEBOOK_MANAGED_TARGET_CHANGED');
+          const mouseButton = String(command.params.button ?? 'left');
+          if (
+            command.method === 'Input.dispatchMouseEvent' &&
+            command.params.type === 'mouseReleased' &&
+            pendingMouseReleaseButtons.delete(mouseButton)
+          ) {
+            // Release only this operation's approved press. Retain the outer input gate's
+            // current context/lease/STOP checks, without re-reading the old target.
+            await assertCurrent();
+            return;
+          }
+          const original = await post();
+          const key =
+            original &&
+            command.method === 'Input.dispatchKeyEvent' &&
+            [
+              'OPEN_COMPOSER',
+              'OPEN_AUDIENCE',
+              'CONFIRM_AUDIENCE',
+              'OPEN_BACKGROUND',
+              'SET_BACKGROUND',
+            ].includes(original.link.purpose)
+              ? JSON.stringify([
+                  command.target,
+                  command.params.code ?? null,
+                  command.params.key ?? null,
+                  command.params.windowsVirtualKeyCode ?? null,
+                  command.params.nativeVirtualKeyCode ?? null,
+                ])
+              : null;
+          if (
+            key &&
+            command.params.type === 'keyUp' &&
+            pressedSettingsKeys.has(key) &&
+            this.authority.refreshIdentity &&
+            this.materialInputs?.composer.assertRelease &&
+            original
+          ) {
+            // Complete this operation's already-approved key press. The UI may now show its
+            // effect, so the old button's precondition is no longer the release condition.
+            await this.authority.refreshIdentity(page, assertCurrent);
+            await assertCurrent();
+            await post();
+            await this.materialInputs.composer.assertRelease(page, action, original, assertCurrent);
+            await assertCurrent();
+            await post();
+            pressedSettingsKeys.delete(key);
+            return;
+          }
+          await assertTarget(command.method === 'Page.bringToFront');
+          if (browseNavigation) {
+            const target = await readFacebookBrowseNavigation(
+              page,
+              browseNavigation.selector,
+              assertCurrent,
+            );
+            if (
+              !target ||
+              target.url !== browseNavigation.target.url ||
+              target.timeOrigin !== browseNavigation.target.timeOrigin ||
+              target.href !== browseNavigation.target.href
+            )
+              throw Error('FACEBOOK_NATIVE_NAVIGATION_TARGET_CHANGED');
+          }
+          const submission = await post();
+          if (submission?.link.purpose === 'SUBMIT') {
+            if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
+            await this.materialInputs.submission.assert(page, operation, submission, assertCurrent);
+          }
+          if (key && ['keyDown', 'rawKeyDown'].includes(String(command.params.type))) {
+            if (pressedSettingsKeys.size >= 16) throw Error('POST_SETTINGS_KEY_SEQUENCE_LIMIT');
+            pressedSettingsKeys.add(key);
+          }
+          if (
+            command.method === 'Input.dispatchMouseEvent' &&
+            command.params.type === 'mousePressed'
           )
-            throw Error('FACEBOOK_NATIVE_NAVIGATION_TARGET_CHANGED');
-        }
-        const submission = await post();
-        if (submission?.link.purpose === 'SUBMIT') {
-          if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
-          await this.materialInputs.submission.assert(page, operation, submission, assertCurrent);
-        }
-        if (key && ['keyDown', 'rawKeyDown'].includes(String(command.params.type))) {
-          if (pressedSettingsKeys.size >= 16) throw Error('POST_SETTINGS_KEY_SEQUENCE_LIMIT');
-          pressedSettingsKeys.add(key);
-        }
-      },
-    );
+            pendingMouseReleaseButtons.add(mouseButton);
+        },
+        ['feed', 'video', 'marketplace', 'friends'].includes(step.spec.type),
+      )
+      .finally(() => pendingMouseReleaseButtons.clear());
     // SDK completion is an input acknowledgement only; the business observer must verify it.
     return {
       binding: result.binding,
-      evidence: { sdkReturned: true, ownedTab: proof, ...(wheelStart ? { wheelStart } : {}) },
+      evidence: {
+        sdkReturned: !result.targetUnavailableBeforeInput,
+        ownedTab: proof,
+        ...(result.targetUnavailableBeforeInput
+          ? { resultCode: 'TARGET_UNAVAILABLE_BEFORE_INPUT' }
+          : {}),
+        ...(wheelStart ? { wheelStart } : {}),
+      },
     };
   }
   private async stopOwned(input: StopBinding, retry: boolean) {

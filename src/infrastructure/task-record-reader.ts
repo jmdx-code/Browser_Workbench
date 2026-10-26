@@ -45,7 +45,8 @@ function dependency(low: number | null, high: number | null): [number | null, nu
  * plan.updatedAt dependencies, so legacy fallback rows never need a whole-history JS rebuild. */
 export class TaskRecordReader {
   private backfilling = false;
-  private responseCache: { key: string; value: TaskRecordsResponse } | null = null;
+  private readonly responseCache = new Map<string, TaskRecordsResponse>();
+  private cacheToken: string | null = null;
   private readonly epoch = randomUUID();
   constructor(
     private readonly db: DatabaseSync,
@@ -200,10 +201,23 @@ export class TaskRecordReader {
     if (this.db.prepare('SELECT 1 FROM task_record_dirty LIMIT 1').get())
       transaction(this.db, () => this.flush());
     const state = this.token();
-    const key = state === null ? null : state + JSON.stringify([request, profiles]);
-    if (key && this.responseCache?.key === key) return structuredClone(this.responseCache.value);
+    if (state === null || state !== this.cacheToken) {
+      this.responseCache.clear();
+      this.cacheToken = state;
+    }
+    const key = JSON.stringify([request, profiles]);
+    const cached = state === null ? undefined : this.responseCache.get(key);
+    if (cached) {
+      this.responseCache.delete(key);
+      this.responseCache.set(key, cached);
+      return structuredClone(cached);
+    }
     const value = readSnapshot(this.db, () => this.readPage(request, profiles));
-    if (key) this.responseCache = { key, value: structuredClone(value) };
+    if (state !== null) {
+      this.responseCache.set(key, structuredClone(value));
+      if (this.responseCache.size > 8)
+        this.responseCache.delete(this.responseCache.keys().next().value ?? '');
+    }
     return value;
   }
   private readPage(
@@ -211,6 +225,7 @@ export class TaskRecordReader {
     profiles: readonly RecordProfile[],
   ) {
     const scope = JSON.stringify([
+      request.groupBy ?? '',
       request.profileId ?? '',
       request.status,
       request.query ?? '',
@@ -293,6 +308,123 @@ export class TaskRecordReader {
       params.push(JSON.stringify(matches));
     }
     const base = ' FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id WHERE ';
+    if (request.groupBy === 'run') {
+      // Match whole runs first, then return every visible step in each matching run.
+      // Do not paginate/filter individual steps before assembling the report card.
+      const cte = `WITH matching AS (SELECT DISTINCT r.job_id,r.round ${base}${where}),
+        runs AS (SELECT r.job_id,r.round,count(*) AS step_count,max(${sort}) AS sort_time,max(r.created_at) AS created_at,
+          max(${running}) AS running,
+          min(r.status='COMPLETED') AS completed,
+          max(${failed} OR (p.state='FAILED' AND r.round=p.round)) AS failed,
+          max(${review}) AS review
+          FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id
+          JOIN matching m ON m.job_id=r.job_id AND m.round=r.round
+          GROUP BY r.job_id,r.round)`;
+      const runParams = [...params, offline];
+      const predicate = request.status === 'all' ? '1=1' : request.status + '=1';
+      const result = this.db
+        .prepare(
+          `${cte},
+        counts AS (SELECT count(*) AS all_count,coalesce(sum(running),0) AS running_count,
+          coalesce(sum(completed),0) AS completed_count,coalesce(sum(failed),0) AS failed_count,
+          coalesce(sum(review),0) AS review_count FROM runs),
+        page AS (SELECT * FROM runs WHERE ${predicate}
+          ${cursor ? 'AND (sort_time,created_at,round,0,job_id)<(?,?,?,?,?)' : ''}
+          ORDER BY sort_time DESC,created_at DESC,round DESC,job_id DESC LIMIT ?)
+        SELECT counts.*,page.* FROM counts LEFT JOIN page ON 1=1
+        ORDER BY page.sort_time DESC,page.created_at DESC,page.round DESC,page.job_id DESC`,
+        )
+        .all(...runParams, ...(cursor?.keys ?? []), request.limit + 1);
+      const countRow = result[0];
+      const counts = {
+        all: Number(countRow?.all_count ?? 0),
+        running: Number(countRow?.running_count ?? 0),
+        completed: Number(countRow?.completed_count ?? 0),
+        failed: Number(countRow?.failed_count ?? 0),
+        review: Number(countRow?.review_count ?? 0),
+      };
+      const runs = result.filter((r) => r.job_id !== null);
+      const pageRuns: typeof runs = [];
+      let candidateSteps = 0;
+      for (const run of runs.slice(0, request.limit)) {
+        if (candidateSteps + Number(run.step_count) > 200) {
+          if (!pageRuns.length)
+            throw new ProductError(
+              'RECORD_DETAIL_REQUIRED',
+              '单次任务超过页面预算，请查看任务详情',
+              413,
+            );
+          break;
+        }
+        candidateSteps += Number(run.step_count);
+        pageRuns.push(run);
+      }
+      const byRun = new Map<string, TaskRecord[]>();
+      if (pageRuns.length) {
+        const batch = this.db
+          .prepare(
+            `SELECT r.job_id,r.round,r.payload,${started} AS start_time,${finished} AS finish_time,p.state,p.reason,p.updated_at
+          FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id
+          JOIN json_each(?) selected ON r.job_id=json_extract(selected.value,'$[0]') AND r.round=json_extract(selected.value,'$[1]')
+          ORDER BY r.position`,
+          )
+          .all(JSON.stringify(pageRuns.map((r) => [r.job_id, r.round])));
+        for (const r of batch) {
+          const key = `${String(r.job_id)}:${Number(r.round)}`;
+          const rows = byRun.get(key) ?? [];
+          rows.push({
+            ...(JSON.parse(String(r.payload)) as TaskRecord),
+            startedAt: r.start_time === null ? null : Number(r.start_time),
+            finishedAt: r.finish_time === null ? null : Number(r.finish_time),
+            planState: r.state as TaskRecord['planState'],
+            planReason: String(r.reason),
+            planUpdatedAt: Number(r.updated_at),
+          });
+          byRun.set(key, rows);
+        }
+      }
+      const records: TaskRecord[] = [];
+      let bytes = 0;
+      let consumed = 0;
+      for (const run of pageRuns) {
+        const rows = byRun.get(`${String(run.job_id)}:${Number(run.round)}`) ?? [];
+        const size = Buffer.byteLength(JSON.stringify(rows));
+        if (records.length + rows.length > 200 || bytes + size > 240000) {
+          if (!records.length)
+            throw new ProductError(
+              'RECORD_DETAIL_REQUIRED',
+              '单次任务超过页面预算，请查看任务详情',
+              413,
+            );
+          break;
+        }
+        records.push(...rows);
+        bytes += size;
+        consumed++;
+      }
+      const last = runs[consumed - 1];
+      const keys: Cursor['keys'] | null = last
+        ? [
+            Number(last.sort_time),
+            Number(last.created_at),
+            Number(last.round),
+            0,
+            String(last.job_id),
+          ]
+        : null;
+      return TaskRecords.parse({
+        viewVersion: version,
+        records,
+        counts,
+        total: counts[request.status],
+        nextCursor:
+          runs.length > consumed && keys
+            ? Buffer.from(JSON.stringify({ v: 1, version, keys, signature: sign(keys) })).toString(
+                'base64url',
+              )
+            : null,
+      });
+    }
     const count = (
       predicate: string,
       candidate: string,

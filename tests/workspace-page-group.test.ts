@@ -33,7 +33,12 @@ test('main group uses exact proof, survives worker replacement and never adopts 
       },
     },
     debugger: { getTargets: async () => [{ type: 'page', tabId: 11, id: targetId }] },
-    tabGroups: { update: async () => ({}) },
+    tabGroups: {
+      update: async (_id: number, options: { title: string; color: string }) => {
+        assert.deepEqual(options, { title: '浏览器工作台', color: 'grey' });
+        return {};
+      },
+    },
   } as unknown as typeof chrome;
   try {
     const group = new WorkspacePageGroup();
@@ -135,7 +140,12 @@ test('forceBindMain rebinds workspace main page to a newly chosen tab including 
         { type: 'page', tabId: 22, id: 'user-target-22' },
       ],
     },
-    tabGroups: { update: async () => ({}) },
+    tabGroups: {
+      update: async (_id: number, options: { title: string; color: string }) => {
+        assert.deepEqual(options, { title: '浏览器工作台', color: 'grey' });
+        return {};
+      },
+    },
   } as unknown as typeof chrome;
   try {
     const group = new WorkspacePageGroup();

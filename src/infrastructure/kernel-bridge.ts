@@ -120,6 +120,7 @@ class KernelRpcSession {
   identityFence: (() => Awaitable<void>) | undefined;
   readonly methods = new Set<string>();
   readonly methodCounts = new Map<string, number>();
+  nativeInputCount = 0;
   readonly trace: { at: number; event: string }[] = [];
   private mutationRequested = false;
   get hasRequestedMutation() {
@@ -374,6 +375,16 @@ class KernelRpcSession {
         }
         this.methods.add(method);
         this.methodCounts.set(method, (this.methodCounts.get(method) ?? 0) + 1);
+        if (
+          (method === 'Input.dispatchMouseEvent' &&
+            ['mousePressed', 'mouseReleased', 'mouseWheel'].includes(String(params.type))) ||
+          (method === 'Input.dispatchKeyEvent' &&
+            ['keyDown', 'rawKeyDown', 'keyUp', 'char'].includes(String(params.type))) ||
+          method === 'Input.insertText' ||
+          method === 'DOM.setFileInputFiles' ||
+          method === 'Page.navigate'
+        )
+          this.nativeInputCount++;
         return await this.request({ kind: 'send', ...command });
       },
     };
@@ -2409,6 +2420,7 @@ export class KernelBridge implements KernelBridgeHooks {
         inputFence?: () => Awaitable<void>,
         failureStop?: (reason: string) => Promise<void>,
         resourceGuard?: NativeInputGuard,
+        allowTargetMiss = false,
       ) => {
         if (facebook?.readonlyIdentity) throw Error('FACEBOOK_IDENTITY_READONLY_INPUT_REJECTED');
         const binding = DispatchBinding.parse(input);
@@ -2423,6 +2435,7 @@ export class KernelBridge implements KernelBridgeHooks {
         session.activeBinding = binding;
         session.inputFence = inputFence;
         session.resourceGuard = resourceGuard;
+        const inputCountBefore = session.nativeInputCount;
         try {
           const begin = await session.request({ kind: 'beginOperation', binding });
           const record = KernelOperationRecord.parse(begin.record);
@@ -2455,8 +2468,35 @@ export class KernelBridge implements KernelBridgeHooks {
             !sameExecution(latest, binding)
           )
             throw Error('KERNEL_OPERATION_ACK_REJECTED');
-          return { value, binding: returned };
+          return { value, binding: returned, targetUnavailableBeforeInput: false };
         } catch (error) {
+          if (
+            allowTargetMiss &&
+            session.nativeInputCount === inputCountBefore &&
+            error instanceof Error &&
+            /(?:^|:\s*)(?:FACEBOOK_NATIVE_CLICK_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_LIKE_TARGET_CHANGED|FACEBOOK_REEL_NEXT_TARGET_CHANGED|FACEBOOK_FRIEND_CONFIRM_TARGET_CHANGED|FACEBOOK_BROWSE_PLAY_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_DOCUMENT_OR_TARGET_CHANGED|FACEBOOK_WHEEL_START_DOCUMENT_CHANGED)\b/.test(
+              error.message,
+            )
+          ) {
+            await inputFence?.();
+            const latest = await context(binding.accountId);
+            if (!latest || !sameExecution(latest, binding))
+              throw Error('KERNEL_BOUND_EXECUTION_UNAVAILABLE');
+            const result = await finishKernelOperation(
+              () => session.request({ kind: 'finishOperation', binding }),
+              async () => {
+                await inputFence?.();
+                const current = await context(binding.accountId);
+                if (!current || !sameExecution(current, binding))
+                  throw Error('KERNEL_BOUND_EXECUTION_UNAVAILABLE');
+              },
+            );
+            const returned = DispatchBinding.parse(result.binding);
+            if (result.acknowledged !== true || !sameBinding(returned, binding))
+              throw Error('KERNEL_OPERATION_ACK_REJECTED');
+            session.record('target-unavailable-before-input:' + error.message);
+            return { value: undefined as T, binding: returned, targetUnavailableBeforeInput: true };
+          }
           // Keep the SDK actionability log for the private owner before the short control
           // reason is persisted. A timeout can occur before any input was dispatched.
           session.executionFailure = {

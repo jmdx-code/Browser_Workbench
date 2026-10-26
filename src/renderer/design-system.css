@@ -2669,3 +2669,168 @@ code {
   max-height: min(45vh, 360px);
   overflow-y: auto;
 }
+
+/* Run-level records retain status and results even beside the detail drawer. */
+.records-table .run-record-row {
+  grid-template-columns:
+    36px minmax(100px, 1fr) 106px minmax(150px, 1.6fr) minmax(100px, 1.2fr)
+    100px;
+  gap: 10px;
+  padding: 12px;
+}
+.records-table .run-record-row > span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.run-record-row small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.records-table .run-record-row .run-step-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.run-step-pill {
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 5px;
+  line-height: 1.5;
+}
+.run-record-row .cell-note {
+  display: flex !important;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.run-record-row .cell-time {
+  font-size: 11px;
+}
+.run-record-row .cell-time button {
+  margin-top: 5px;
+}
+.record-cleanup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+.record-diagnostic-collapse {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.record-diagnostic-collapse > summary {
+  color: var(--text-3);
+}
+.task-history-steps > div {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+.task-history-steps > div > small {
+  flex-basis: 100%;
+}
+.task-history-heading h3 {
+  flex: 1;
+  margin: 0;
+}
+.drawer-head:has(+ .drawer-body .task-history) {
+  justify-content: flex-end;
+  min-height: 44px;
+}
+@media (max-width: 1100px) {
+  .records-table .run-record-row {
+    grid-template-columns: 36px minmax(0, 1fr) 110px;
+  }
+  .records-table .run-record-row > span:nth-child(4),
+  .records-table .run-record-row > span:nth-child(5),
+  .records-table .run-record-row > span:nth-child(6) {
+    grid-column: 2 / 4;
+  }
+  .records-table .run-record-row.records-header > span:nth-child(n + 4) {
+    display: none;
+  }
+}
+
+.record-browser-avatar {
+  display: flex !important;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.record-browser-avatar .avatar,
+.task-history-heading > .avatar {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+}
+.record-browser-avatar > span:last-child {
+  min-width: 0;
+}
+.record-retention-controls,
+.record-retention-controls label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.record-retention-controls {
+  gap: 12px;
+  font-size: 12px;
+}
+.record-retention-controls input {
+  width: 86px;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+.record-cleanup-toolbar {
+  padding: 10px 0;
+}
+
+.records-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.records-toolbar-row .status-tabs,
+.records-toolbar-row .record-cleanup-actions {
+  margin: 0;
+}
+.records-toolbar-row .status-tabs {
+  gap: 5px;
+}
+.records-toolbar-row .record-cleanup-actions {
+  gap: 6px;
+}
+.records-toolbar-row .record-cleanup-actions input[type='date'] {
+  width: 124px;
+  padding: 5px;
+  font-size: 11px;
+}
+.record-cleanup-toolbar .record-retention-controls {
+  margin-top: 8px;
+  padding: 7px 0;
+  gap: 7px;
+  color: var(--text-3);
+  font-size: 11px;
+  border-top: 1px solid var(--line);
+}
+.record-cleanup-toolbar .record-retention-controls input {
+  width: 72px;
+  padding: 4px 6px;
+  font-size: 11px;
+}
+.record-selection-delete {
+  color: var(--err);
+  background: var(--err-soft);
+  border-color: var(--err);
+}

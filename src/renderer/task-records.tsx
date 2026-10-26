@@ -1,26 +1,20 @@
-import { CleanupDialog, RecordCleanupActions } from './data-cleanup-panel.js';
+import { RecordCleanupActions } from './data-cleanup-panel.js';
 import { useEffect, useRef, useState } from 'react';
 import type { z } from 'zod';
 import type { Profile } from '../shared/contracts.js';
 import type { TaskRecord, TaskRuntimeOverview } from '../shared/task-contracts.js';
 import type { Inspection } from '../shared/profile-inspection.js';
-import { attentionPlans, taskAlertReason, taskReasonDescription } from './task-alerts.js';
-import { taskTimingLabel } from '../shared/task-timing.js';
-import { TaskProgressView } from './task-progress.js';
-import { TEST_COMBINATION_NOTE } from '../shared/task-tests.js';
+import { attentionPlans, taskReasonDescription } from './task-alerts.js';
+import { groupTaskRecords, endedTask } from '../domain/task-run-records.js';
+import { runSummary, stepResultLabel } from './task-record-summary.js';
 import { api, ApiError } from './api.js';
+import { ProfileAvatar } from './profile-avatar.js';
+import { inspectionAvatarURL } from './inspection-presentation.js';
 import { IconClose, IconDownload, IconSearch } from './icons.js';
 
 declare const __WORKBENCH_VERSION__: string;
 
 type Filter = 'all' | 'running' | 'completed' | 'failed' | 'attention';
-const stepNames = {
-  feed: '浏览首页',
-  video: '浏览 Reels',
-  post: '发布内容',
-  marketplace: '浏览商城',
-  friends: '接受好友请求',
-};
 export const planStatus: Record<string, { label: string; tone: string }> = {
   QUEUED: { label: '排队中', tone: 'queue' },
   RUNNING: { label: '执行中', tone: 'run' },
@@ -46,54 +40,6 @@ function span(ms: number) {
   if (minutes < 60) return minutes + ' 分钟';
   return Math.floor(minutes / 60) + ' 小时' + (minutes % 60 ? ' ' + (minutes % 60) + ' 分' : '');
 }
-// Main line: when it started (or was planned). Sub line: how long it took / has been running.
-function stepTime(row: TaskRecord, now: number) {
-  if (row.startedAt === null)
-    return {
-      main: '—',
-      sub: '未开始',
-      title: '任务创建于 ' + new Date(row.planCreatedAt).toLocaleString(),
-    };
-  if (row.finishedAt !== null)
-    return {
-      main: shortTime(row.startedAt),
-      sub: '用时 ' + span(row.finishedAt - row.startedAt),
-      title: `${new Date(row.startedAt).toLocaleString()} → ${new Date(row.finishedAt).toLocaleString()}`,
-    };
-  return {
-    main: shortTime(row.startedAt),
-    sub: row.status === 'ACTIVE' ? '已进行 ' + span(now - row.startedAt) : '未结束',
-    title: new Date(row.startedAt).toLocaleString() + ' 开始',
-  };
-}
-function isCurrentPlanStep(
-  row: TaskRecord,
-  plan?: z.infer<typeof TaskRuntimeOverview>['plans'][number],
-) {
-  return (
-    row.status === 'ACTIVE' ||
-    (row.status === 'PENDING' &&
-      !['STOPPED', 'COMPLETED', 'FAILED'].includes(row.planState) &&
-      (plan ? row.round === plan.round && row.position === plan.position : row.position === 0))
-  );
-}
-function stepStatusBadge(
-  row: TaskRecord,
-  isCurrent: boolean,
-  isAttention: boolean,
-): { label: string; tone: string } {
-  if (row.status === 'COMPLETED') return { label: '已完成', tone: 'ok' };
-  if (row.status === 'FAILED') return { label: '失败', tone: 'err' };
-  if (row.status === 'SKIPPED') return { label: '已跳过', tone: 'warn' };
-  if (isCurrent) {
-    if (isAttention || row.planState === 'REVIEW')
-      return { label: planStatus[row.planState]?.label ?? '需处理', tone: 'warn' };
-    return planStatus[row.planState] ?? { label: '执行中', tone: 'run' };
-  }
-  if (['STOPPED', 'COMPLETED', 'FAILED'].includes(row.planState))
-    return { label: '未执行', tone: 'idle' };
-  return { label: '待执行', tone: 'queue' };
-}
 export function TaskRecordsPage({
   runtime,
   profiles,
@@ -109,14 +55,46 @@ export function TaskRecordsPage({
   loaded: boolean;
   filterId: string | null;
   onClearFilter: () => void;
-  onOpen: (profileId: string, planId: string) => void;
+  onOpen: (profileId: string, planId: string, round: number) => void;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [deleting, setDeleting] = useState<string | null>(null);
-  const afterDelete = () => {
+  const deleting = useRef(new Set<string>());
+  const afterDelete = (deletedStepIds?: Iterable<string>) => {
     setSelected(new Set());
-    setRows([]);
+    if (deletedStepIds) {
+      const removed = new Set(deletedStepIds);
+      setRows((previous) => previous.filter((row) => !removed.has(row.stepId)));
+    }
     setRetry((v) => v + 1);
+  };
+  useEffect(() => {
+    const handle = (event: Event) =>
+      afterDelete((event as CustomEvent<{ stepIds?: string[] }>).detail?.stepIds);
+    window.addEventListener('task-records-deleted', handle);
+    return () => window.removeEventListener('task-records-deleted', handle);
+  }, []);
+  const quickDelete = async (ids: string[]) => {
+    if (ids.some((id) => deleting.current.has(id))) return;
+    for (const id of ids) deleting.current.add(id);
+    const removed = new Set(ids);
+    const previous = rowsRef.current.filter((row) => removed.has(row.stepId));
+    setRows((rows) => rows.filter((row) => !removed.has(row.stepId)));
+    try {
+      const preview = await api.cleanupPreview({ kind: 'records', scope: { stepIds: ids } });
+      if (!preview.eligible) throw Error('记录状态已变化，请重新读取后再删除');
+      const result = await api.cleanupExecute(preview.token);
+      if (result.protected) throw Error('部分记录状态已变化，已重新读取');
+      window.dispatchEvent(new CustomEvent('task-records-deleted', { detail: { stepIds: ids } }));
+    } catch (error) {
+      setRows((rows) => {
+        const known = new Set(rows.map((r) => r.stepId));
+        return [...rows, ...previous.filter((r) => !known.has(r.stepId))];
+      });
+      setLoadError(error instanceof Error ? error.message : '删除失败，请重试');
+      setRetry((v) => v + 1);
+    } finally {
+      for (const id of ids) deleting.current.delete(id);
+    }
   };
   const [filter, setFilter] = useState<Filter>('all');
   const [query, setQuery] = useState('');
@@ -145,7 +123,7 @@ export function TaskRecordsPage({
   const rowsRef = useRef<TaskRecord[]>([]);
   rowsRef.current = rows;
   const plans = runtime?.plans ?? [];
-  const byPlan = new Map(plans.map((plan) => [plan.id, plan]));
+  const byInspection = new Map(inspections.map((i) => [i.profileId, i]));
   const byProfile = new Map(profiles.map((profile) => [profile.id, profile]));
   const attention = new Set(attentionPlans(plans, profiles).map((plan) => plan.id));
   const apiStatus = filter === 'attention' ? 'review' : filter;
@@ -166,7 +144,7 @@ export function TaskRecordsPage({
   const [recordsKey, setRecordsKey] = useState(runtimeKey);
   const latestKey = useRef(runtimeKey);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const stateKey = plans.map((p) => `${p.id}:${p.state}`).join('|');
+  const stateKey = plans.map((p) => `${p.id}:${p.state}:${p.round}:${p.position}`).join('|');
   const previousStateKey = useRef(stateKey);
   useEffect(() => {
     latestKey.current = runtimeKey;
@@ -175,14 +153,17 @@ export function TaskRecordsPage({
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
       refreshTimer.current = null;
       setRecordsKey(runtimeKey);
+    } else if (filter === 'completed' || filter === 'failed') {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
     } else if (!refreshTimer.current) {
-      // At most 250ms, even while progress/reason changes continuously.
+      // Progress refreshes at most once per 1500ms; transitions refresh immediately.
       refreshTimer.current = setTimeout(() => {
         refreshTimer.current = null;
         setRecordsKey(latestKey.current);
-      }, 250);
+      }, 1500);
     }
-  }, [runtimeKey, stateKey]);
+  }, [runtimeKey, stateKey, filter]);
   useEffect(
     () => () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
@@ -205,6 +186,7 @@ export function TaskRecordsPage({
           ...(filterId ? { profileId: filterId } : {}),
           status: apiStatus,
           ...(query.trim() ? { query: query.trim() } : {}),
+          groupBy: 'run',
           limit: 100,
         },
         controller.signal,
@@ -226,16 +208,18 @@ export function TaskRecordsPage({
           viewRef.current !== res.viewVersion ||
           previous.length <= res.records.length
         ) {
-          setRows(res.records);
+          setRows(res.records.filter((r) => !deleting.current.has(r.stepId)));
           setNextCursor(res.nextCursor);
         } else {
           // Keep pages the user already loaded: refresh rows in place, prepend new ones.
           const fresh = new Map(res.records.map((row) => [row.stepId, row]));
           const known = new Set(previous.map((row) => row.stepId));
-          setRows([
-            ...res.records.filter((row) => !known.has(row.stepId)),
-            ...previous.map((row) => fresh.get(row.stepId) ?? row),
-          ]);
+          setRows(
+            [
+              ...res.records.filter((row) => !known.has(row.stepId)),
+              ...previous.map((row) => fresh.get(row.stepId) ?? row),
+            ].filter((r) => !deleting.current.has(r.stepId)),
+          );
         }
         viewRef.current = res.viewVersion;
         setLoadError('');
@@ -263,6 +247,7 @@ export function TaskRecordsPage({
         status: apiStatus,
         ...(query.trim() ? { query: query.trim() } : {}),
         cursor: nextCursor,
+        groupBy: 'run',
         limit: 100,
       });
       if (currentScope.current !== scopeKey) return;
@@ -275,7 +260,6 @@ export function TaskRecordsPage({
     } catch (failure) {
       if (failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED') {
         viewRef.current = undefined;
-        setRows([]);
         setNextCursor(null);
         setRetry((value) => value + 1);
         setLoadError('记录已变化，正在重新读取。');
@@ -285,6 +269,10 @@ export function TaskRecordsPage({
     }
   }
 
+  const groups = groupTaskRecords(rows);
+  const eligibleIds = groups
+    .filter((g) => endedTask(g.rows[0]?.planState ?? ''))
+    .flatMap((g) => g.rows.map((r) => r.stepId));
   const filtered = filterId ? byProfile.get(filterId) : undefined;
   async function exportRows() {
     if (exporting || !rows.length) return;
@@ -298,6 +286,7 @@ export function TaskRecordsPage({
           status: apiStatus,
           ...(query.trim() ? { query: query.trim() } : {}),
           ...(cursor ? { cursor } : {}),
+          groupBy: 'run',
           limit: 200,
         });
         allRecords.push(...res.records);
@@ -394,31 +383,27 @@ export function TaskRecordsPage({
         </div>
       </div>
       <RecordCleanupActions
+        filters={
+          <div className="status-tabs" role="tablist">
+            {tabs.map(([key, label]) => (
+              <button
+                key={key}
+                role="tab"
+                aria-selected={filter === key}
+                className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
+                onClick={() => setFilter(key)}
+              >
+                {label}
+                <span>{counts[key]}</span>
+              </button>
+            ))}
+          </div>
+        }
         stepIds={[...selected]}
+        selectedCount={groups.filter((g) => g.rows.every((r) => selected.has(r.stepId))).length}
         {...(filterId ? { profileId: filterId } : {})}
         onDone={afterDelete}
       />
-      {deleting && (
-        <CleanupDialog
-          selection={{ kind: 'records', scope: { stepIds: [deleting] } }}
-          onClose={() => setDeleting(null)}
-          onDone={afterDelete}
-        />
-      )}
-      <div className="status-tabs" role="tablist">
-        {tabs.map(([key, label]) => (
-          <button
-            key={key}
-            role="tab"
-            aria-selected={filter === key}
-            className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
-            onClick={() => setFilter(key)}
-          >
-            {label}
-            <span>{counts[key]}</span>
-          </button>
-        ))}
-      </div>
       {loadError && (
         <p className="records-notice" role="status">
           {loadError}
@@ -438,182 +423,152 @@ export function TaskRecordsPage({
         </div>
       ) : (
         <div className="records-table" role="table">
-          <div className="records-row records-header" role="row">
+          <div className="records-row run-record-row records-header" role="row">
             <span role="columnheader">
               <input
                 type="checkbox"
-                aria-label="选择当前已加载的已结束记录（最多1000条）"
-                checked={
-                  rows.some((r) => ['COMPLETED', 'FAILED', 'STOPPED'].includes(r.planState)) &&
-                  rows
-                    .filter((r) => ['COMPLETED', 'FAILED', 'STOPPED'].includes(r.planState))
-                    .slice(0, 1000)
-                    .every((r) => selected.has(r.stepId))
-                }
+                aria-label="选择当前已加载的已结束任务"
+                checked={eligibleIds.length > 0 && eligibleIds.every((id) => selected.has(id))}
                 onChange={(e) =>
-                  setSelected(
-                    e.target.checked
-                      ? new Set(
-                          rows
-                            .filter((r) => ['COMPLETED', 'FAILED', 'STOPPED'].includes(r.planState))
-                            .slice(0, 1000)
-                            .map((r) => r.stepId),
-                        )
-                      : new Set(),
-                  )
+                  setSelected(e.target.checked ? new Set(eligibleIds.slice(0, 1000)) : new Set())
                 }
-              />{' '}
-              时间
+              />
             </span>
-            <span role="columnheader">浏览器</span>
-            <span role="columnheader">任务</span>
-            <span role="columnheader">状态</span>
-            <span role="columnheader">说明</span>
+            <span role="columnheader">浏览器 / 任务组合</span>
+            <span role="columnheader">整体状态</span>
+            <span role="columnheader">步骤执行明细</span>
+            <span role="columnheader">成果与说明</span>
+            <span role="columnheader">时间与操作</span>
           </div>
-          {rows.map((row, index) => {
+          {groups.map((group) => {
+            const row = group.rows[0];
+            if (!row) return null;
             const profile = byProfile.get(row.profileId);
-            const plan = byPlan.get(row.planId);
-            const inspection = inspections.find((item) => item.profileId === row.profileId);
-            const fbId =
-              (inspection?.state === 'OBSERVED' ? inspection.account.id : null) ??
-              profile?.account.id;
-            const isCurrent = isCurrentPlanStep(row, plan);
-            const isAttention =
-              isCurrent && (attention.has(row.planId) || row.planState === 'REVIEW');
-            const status = stepStatusBadge(row, isCurrent, isAttention);
-            const test =
-              plan?.snapshot.note.startsWith(TEST_COMBINATION_NOTE) ||
-              row.combinationName.startsWith('单项测试 · ');
-            const name = row.combinationName.replace('单项测试 · ', '');
-            const stepLabel = row.destination === 'story' ? '发布快拍' : stepNames[row.type];
-            const stepCount = plan?.snapshot.steps.length;
-            const continued = index > 0 && rows[index - 1]?.planId === row.planId;
-            const time = stepTime(row, now);
-            const reason =
-              row.status === 'FAILED' || row.status === 'SKIPPED'
-                ? row.outcome
-                  ? taskReasonDescription(row.outcome.reason)
-                  : null
-                : isCurrent && plan
-                  ? plan.state === 'STOPPED'
-                    ? taskReasonDescription(plan.reason)
-                    : plan.reason || isAttention || plan.state === 'FAILED'
-                      ? taskAlertReason(plan, profile)
-                      : null
-                  : row.outcome
-                    ? taskReasonDescription(row.outcome.reason)
-                    : null;
-            const hasProgress =
-              !reason &&
-              (row.progress.revision > 0 ||
-                (row.status === 'ACTIVE' && row.planState === 'RUNNING'));
+            const inspection = byInspection.get(row.profileId);
+            const state =
+              attention.has(row.planId) && !endedTask(row.planState) ? 'REVIEW' : group.state;
+            const status = planStatus[state] ?? planStatus.QUEUED;
+            const ids = group.rows.map((r) => r.stepId);
+            const ended = endedTask(row.planState);
+            const reason = row.planReason ? taskReasonDescription(row.planReason)?.summary : null;
+            const time = group.startedAt ?? row.planCreatedAt;
             return (
               <div
+                className={'records-row run-record-row tone-' + status?.tone}
+                role="row"
+                key={group.key}
                 tabIndex={0}
+                onClick={() => onOpen(row.profileId, row.planId, row.round)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && event.target === event.currentTarget)
-                    onOpen(row.profileId, row.planId);
+                    onOpen(row.profileId, row.planId, row.round);
                 }}
-                className={
-                  'records-row tone-' + status.tone + (continued ? ' is-continued' : ' is-first')
-                }
-                role="row"
-                key={row.stepId}
-                onClick={() => onOpen(row.profileId, row.planId)}
-                title="查看详情与操作"
               >
-                <span role="cell" className="cell-time" title={time.title}>
-                  <label onClick={(e) => e.stopPropagation()}>
-                    <input
-                      type="checkbox"
-                      aria-label={
-                        '选择记录 ' +
-                        row.combinationName +
-                        ' 第' +
-                        row.round +
-                        '轮 ' +
-                        (row.position + 1)
-                      }
-                      disabled={
-                        !['COMPLETED', 'FAILED', 'STOPPED'].includes(row.planState) ||
-                        (!selected.has(row.stepId) && selected.size >= 1000)
-                      }
-                      checked={selected.has(row.stepId)}
-                      onChange={(e) =>
-                        setSelected((previous) => {
-                          const next = new Set(previous);
-                          if (e.target.checked) next.add(row.stepId);
-                          else next.delete(row.stepId);
-                          return next;
-                        })
-                      }
-                    />{' '}
-                    <strong>{time.main}</strong>
-                  </label>
-                  <small>{time.sub}</small>
+                <span role="cell" onClick={(e) => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    aria-label={'选择任务 ' + row.combinationName + ' 第' + row.round + '轮'}
+                    disabled={
+                      !ended ||
+                      (!ids.every((id) => selected.has(id)) &&
+                        selected.size + ids.filter((id) => !selected.has(id)).length > 1000)
+                    }
+                    checked={ids.every((id) => selected.has(id))}
+                    onChange={(e) =>
+                      setSelected((previous) => {
+                        const next = new Set(previous);
+                        for (const id of ids) {
+                          if (e.target.checked) next.add(id);
+                          else next.delete(id);
+                        }
+                        return next;
+                      })
+                    }
+                  />
                 </span>
-                <span role="cell" className="cell-browser">
-                  {!continued && (
-                    <>
-                      <strong>{profile?.browserName ?? profile?.alias ?? '已移除的浏览器'}</strong>
-                      {fbId && <code className="fb-id">{fbId}</code>}
-                    </>
-                  )}
-                </span>
-                <span role="cell" className="cell-task">
-                  {!continued && (
-                    <strong>
-                      {test && <em className="tag">测试</em>}
-                      {name}
-                    </strong>
-                  )}
-                  <span className="step-line">
-                    <i
-                      className={
-                        'type-dot type-' + (row.destination === 'story' ? 'story' : row.type)
-                      }
-                    />
-                    <span className="step-name">{stepLabel}</span>
-                    <span className="step-pos">
-                      {row.round > 1 || (!!plan && plan.snapshot.loop.mode !== 'finite')
-                        ? `第${row.round}轮 · `
-                        : ''}
-                      {row.position + 1}
-                      {stepCount ? '/' + stepCount : ''}
-                    </span>
+                <span role="cell" className="cell-browser record-browser-avatar">
+                  <ProfileAvatar
+                    url={profile ? inspectionAvatarURL(profile, inspection, true) : null}
+                    online={Boolean(profile?.online)}
+                  />
+                  <span>
+                    <strong>{profile?.browserName ?? profile?.alias ?? '已移除的浏览器'}</strong>
+                    <small>
+                      {row.combinationName}
+                      {row.round > 1 ? ` · 第 ${row.round} 轮` : ''}
+                    </small>
+                    <small className="fb-id">
+                      {inspection?.state === 'OBSERVED'
+                        ? inspection.account.id
+                        : profile?.account.id}
+                    </small>
                   </span>
                 </span>
                 <span role="cell">
-                  <span className={'pill pill-' + status.tone}>
-                    <i />
-                    {status.label}
+                  <span className={'pill pill-' + status?.tone}>
+                    {state === 'FAILED'
+                      ? '执行异常'
+                      : state === 'REVIEW'
+                        ? '需处理'
+                        : status?.label}
                   </span>
+                  {state === 'STOPPED' && (
+                    <small>
+                      完成 {group.completed}/{ids.length}
+                    </small>
+                  )}
+                </span>
+                <span role="cell" className="run-step-pills">
+                  {group.rows.map((step) => {
+                    const tone =
+                      step.status === 'COMPLETED'
+                        ? 'ok'
+                        : step.status === 'FAILED'
+                          ? 'err'
+                          : step.status === 'ACTIVE' && !ended
+                            ? 'run'
+                            : 'idle';
+                    return (
+                      <span
+                        key={step.stepId}
+                        className={'run-step-pill pill-' + tone}
+                        title={stepResultLabel(step)}
+                      >
+                        {stepResultLabel(step)}
+                      </span>
+                    );
+                  })}
                 </span>
                 <span role="cell" className="cell-note">
-                  {['COMPLETED', 'FAILED', 'STOPPED'].includes(row.planState) && (
+                  {(state === 'STOPPED' || state === 'FAILED') && (
+                    <strong>
+                      {state === 'STOPPED'
+                        ? `手动停止（已完成 ${group.completed}/${ids.length} 项）`
+                        : (reason ?? '执行异常，请查看步骤原因')}
+                    </strong>
+                  )}
+                  <span>{runSummary(group.rows)}</span>
+                </span>
+                <span role="cell" className="cell-time">
+                  <time title={new Date(time).toLocaleString()}>{shortTime(time)}</time>
+                  <small>
+                    {group.startedAt === null
+                      ? '未开始'
+                      : '用时 ' +
+                        span(
+                          (group.finishedAt ?? (ended ? row.planUpdatedAt : now)) - group.startedAt,
+                        )}
+                  </small>
+                  {ended && (
                     <button
                       className="btn btn-sm"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setDeleting(row.stepId);
+                        void quickDelete(ids);
                       }}
                     >
                       删除
                     </button>
-                  )}
-                  {reason ? (
-                    <span title={reason.next}>{reason.summary}</span>
-                  ) : hasProgress ? (
-                    <TaskProgressView
-                      type={row.type}
-                      progress={row.progress}
-                      budget={row.budget}
-                      compact
-                    />
-                  ) : row.status === 'ACTIVE' && row.planState === 'QUEUED' && plan?.timing ? (
-                    taskTimingLabel(plan.timing)
-                  ) : (
-                    <span className="muted">—</span>
                   )}
                 </span>
               </div>
@@ -621,7 +576,7 @@ export function TaskRecordsPage({
           })}
           <div className="records-foot">
             <span>
-              已显示 {rows.length} / {total} 条
+              已显示 {groups.length} / {total} 次任务
             </span>
             {nextCursor && (
               <button
@@ -631,7 +586,7 @@ export function TaskRecordsPage({
               >
                 {loadingMore
                   ? '正在加载…'
-                  : `再显示 ${Math.min(100, Math.max(1, total - rows.length))} 条`}
+                  : `再显示 ${Math.min(100, Math.max(1, total - groups.length))} 次任务`}
               </button>
             )}
           </div>

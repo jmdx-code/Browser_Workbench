@@ -49,7 +49,11 @@ function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [view, setView] = useState<View>({ kind: 'home' });
   const [recordFilter, setRecordFilter] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ profileId: string; planId: string } | null>(null);
+  const [detail, setDetail] = useState<{
+    profileId: string;
+    planId: string;
+    round?: number;
+  } | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const updates = useSoftwareUpdate();
   const [updateMenu, setUpdateMenu] = useState(false),
@@ -606,7 +610,7 @@ function App() {
                 loaded={!!tasks.runtime}
                 filterId={recordFilter}
                 onClearFilter={() => setRecordFilter(null)}
-                onOpen={(profileId, planId) => setDetail({ profileId, planId })}
+                onOpen={(profileId, planId, round) => setDetail({ profileId, planId, round })}
               />
             )}
             {view.kind === 'group-inviter' && (
@@ -691,6 +695,7 @@ function App() {
         <RecordDetailDrawer
           profile={detailProfile}
           planId={detail.planId}
+          round={detail.round}
           plan={plans.find((plan) => plan.id === detail.planId)}
           workspace={workspace}
           inspection={inspections.rows.find((row) => row.profileId === detail.profileId)}

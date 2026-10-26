@@ -1,3 +1,4 @@
+import { groupTaskRecords } from '../domain/task-run-records.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { mapAsync, flatMapAsync } from '../shared/async-collections.js';
 import {
@@ -363,6 +364,61 @@ export class TaskService {
       failed: queryFiltered.filter(isFailed).length,
       review: queryFiltered.filter(isReview).length,
     };
+    if (request.groupBy === 'run') {
+      const matching = new Set(queryFiltered.map(({ row }) => `${row.planId}:${row.round}`));
+      const groups = groupTaskRecords(allRows.map((x) => x.row)).filter((g) => matching.has(g.key));
+      const meta = new Map(allRows.map((x) => [x.row.stepId, x]));
+      const matches = (g: (typeof groups)[number], status: typeof request.status) => {
+        if (status === 'completed') return g.rows.every((r) => r.status === 'COMPLETED');
+        if (status === 'failed')
+          return g.rows.some((r) => {
+            const item = meta.get(r.stepId);
+            return (
+              (item && isFailed(item)) ||
+              (r.planState === 'FAILED' && plans.find((p) => p.id === r.planId)?.round === r.round)
+            );
+          });
+        if (status === 'running' || status === 'review')
+          return g.rows.some((r) => {
+            const item = meta.get(r.stepId);
+            return !!item && (status === 'running' ? isRunning(item) : isReview(item));
+          });
+        return true;
+      };
+      const runCounts = {
+        all: groups.length,
+        running: groups.filter((g) => matches(g, 'running')).length,
+        completed: groups.filter((g) => matches(g, 'completed')).length,
+        failed: groups.filter((g) => matches(g, 'failed')).length,
+        review: groups.filter((g) => matches(g, 'review')).length,
+      };
+      const filtered = groups.filter((g) => matches(g, request.status));
+      const offset = request.cursor ? Math.max(0, Number.parseInt(request.cursor, 10) || 0) : 0;
+      const rows: TaskRecord[] = [];
+      let used = 0;
+      for (const g of filtered.slice(offset, offset + request.limit)) {
+        if (
+          rows.length + g.rows.length > 200 ||
+          JSON.stringify([...rows, ...g.rows]).length > 80000
+        ) {
+          if (!rows.length)
+            throw new ProductError(
+              'RECORD_DETAIL_REQUIRED',
+              '单次任务超过页面预算，请查看任务详情',
+              413,
+            );
+          break;
+        }
+        rows.push(...g.rows);
+        used++;
+      }
+      return TaskRecords.parse({
+        records: rows,
+        total: filtered.length,
+        counts: runCounts,
+        nextCursor: offset + used < filtered.length ? String(offset + used) : null,
+      });
+    }
     const statusFiltered = queryFiltered
       .filter((item) => {
         if (request.status === 'running') return isRunning(item);
@@ -387,7 +443,21 @@ export class TaskService {
     const all = (await this.repository.plansForProfile(request.profileId)).sort(
       (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
     );
-    const plans = all.slice(0, 50);
+    const hidden = new Set((await this.repository.hiddenRecordIds?.()) ?? []);
+    const visible: typeof all = [];
+    for (const plan of all) {
+      if (['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state) && hidden.size) {
+        const steps = await this.repository.steps(plan.id, plan.round);
+        if (steps.length && steps.every((step) => hidden.has(step.id))) continue;
+      }
+      visible.push(plan);
+    }
+    // Explicit forensic lookup is retained only when no visible history remains.
+    if (!visible.length && request.planId) {
+      const explicit = all.find((p) => p.id === request.planId);
+      if (explicit) visible.push(explicit);
+    }
+    const plans = visible.slice(0, 50);
     const selected = request.planId ? plans.find((plan) => plan.id === request.planId) : plans[0];
     if (request.planId && !selected)
       throw new ProductError(
@@ -397,6 +467,17 @@ export class TaskService {
       );
     const operations = selected ? await this.repository.operations(selected.id) : [];
     const events = selected ? await this.repository.events(selected.id) : [];
+    const selectedSteps = selected
+      ? await this.repository.steps(selected.id, request.round ?? selected.round)
+      : [];
+    const times = new Map(
+      selected
+        ? projectTaskRecords(selected, selectedSteps, operations, events).map(({ row }) => [
+            row.stepId,
+            row,
+          ])
+        : [],
+    );
     // Read the original ledger. Raw input content, bindings and receipts are not UI evidence.
     return TaskHistory.parse({
       profileId: request.profileId,
@@ -417,7 +498,7 @@ export class TaskService {
       })),
       selectedPlanId: selected?.id ?? null,
       steps: selected
-        ? (await this.repository.steps(selected.id, selected.round)).map((step) => ({
+        ? selectedSteps.map((step) => ({
             id: step.id,
             round: step.round,
             position: step.position,
@@ -428,6 +509,8 @@ export class TaskService {
               ? { destination: step.spec.destination }
               : {}),
             progress: step.progress,
+            startedAt: times.get(step.id)?.startedAt ?? null,
+            finishedAt: times.get(step.id)?.finishedAt ?? null,
             budget:
               step.spec.type === 'post'
                 ? { kind: 'posts', count: step.spec.count }
@@ -460,7 +543,7 @@ export class TaskService {
           createdAt: event.createdAt,
         })),
       truncated: {
-        plans: all.length > 50,
+        plans: visible.length > 50,
         operations: operations.length > 100,
         events: events.length > 100,
       },

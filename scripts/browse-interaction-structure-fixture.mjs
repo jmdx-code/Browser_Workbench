@@ -30,6 +30,9 @@ if (!process.versions.electron) {
       webPreferences: { offscreen: true, backgroundThrottling: false, sandbox: true },
     });
     const checks = [];
+    win.webContents.on('console-message', (event) => {
+      if (event.level === 'error') console.error(event.message);
+    });
     const timeout = setTimeout(() => app.exit(1), 40000);
     try {
       await win.webContents.session.protocol.handle(
@@ -88,7 +91,7 @@ if (!process.versions.electron) {
       assert.equal((await read()).blocked, false);
       checks.push('hidden-modal-does-not-block');
       await load('/friends/requests/');
-      await js(`document.querySelector('main').innerHTML='<nav role="navigation"><div id="card"><a href="/profile.php?id=123456789">Pure name</a><button id="confirm">ยืนยัน</button><button id="delete">ลบ</button></div><button id="other">ยืนยัน</button></nav>';
+      await js(`document.querySelector('main').innerHTML='<nav role="navigation" style="padding-top:100px"><div id="card"><a href="/profile.php?id=123456789">Pure name</a><button id="confirm">ยืนยัน</button><button id="delete">ลบ</button></div><button id="other">ยืนยัน</button></nav>';
  const row={name:'FriendingCometListItemWithButtons.react',props:{user:{id:'123456789',friendship_status:'INCOMING_REQUEST'}}};const group={name:'FDSButtonGroup.react',props:{primary:{type:'primary',testid:'confirm_button'},secondary:{type:'secondary',testid:'ignore_button'}}};
  attach(document.querySelector('#confirm'),[{name:'FDSButton.react',props:{type:'primary'}},group,row]);attach(document.querySelector('#delete'),[{name:'FDSButton.react',props:{type:'secondary'}},group,row]);attach(document.querySelector('#other'),[{name:'FDSButton.react',props:{type:'primary'}}]);`);
       let v = await read();
@@ -120,6 +123,58 @@ if (!process.versions.electron) {
       );
       assert.equal((await read()).likeTarget.liked, true);
       checks.push('native-reacted-state-overrides-stale-dom-label');
+      await js(
+        `feedback['viewer_feedback_reaction_info(use_default_actor:false)']=null;document.querySelector('#like').setAttribute('aria-pressed','true')`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('stale-null-relay-does-not-hide-dom-pressed-state');
+      await js(
+        `document.querySelector('#like').setAttribute('aria-pressed','false');feedback['viewer_feedback_reaction_info(use_default_actor:true)']={__ref:'reaction'}`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('all-reaction-info-keys-checked-past-stale-null-key');
+      await js(
+        `delete feedback['viewer_feedback_reaction_info(use_default_actor:true)'];document.querySelector('#like').__reactFiber$fixture.memoizedProps.selected=true`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('native-button-selected-prop-counts-with-stale-relay');
+      await js(
+        `document.querySelector('#like').__reactFiber$fixture.memoizedProps.selected=false;document.querySelector('#like svg').style.fill='rgb(20,100,230)'`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('colored-child-icon-fill-is-read');
+      await js(
+        `document.querySelector('#like svg').style.fill='rgb(0,0,0)';document.querySelector('#like').insertAdjacentHTML('beforeend','<i id="deepIcon" data-visualcompletion="css-img"></i>');attach(document.querySelector('#deepIcon'),[...Array.from({length:18},(_,i)=>({name:'Wrapper'+i})),{name:'FBNucleusLikeFilled24Icon.react'}])`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('css-img-icon-and-deeper-fiber-chain-are-read');
+      await js(`document.querySelector('#deepIcon').remove()`);
+      await js(
+        `attach(document.querySelector('#like svg'),[{name:'FBNucleusLikeFilled24Icon.react'}]);feedback['viewer_feedback_reaction_info(use_default_actor:false)']=null`,
+      );
+      assert.equal((await read()).likeTarget.liked, true);
+      checks.push('filled-like-icon-is-authoritative-even-with-stale-unreacted-store');
+      await js(
+        `document.body.insertAdjacentHTML('beforeend','<div id="cover" style="position:fixed;inset:60px 0 0;z-index:9999;background:transparent"></div>')`,
+      );
+      v = await read();
+      assert.equal(v.likeTarget?.css ?? null, null);
+      assert.equal(v.likeTarget?.liked, true);
+      assert.equal(v.likeTarget?.likeCount, 1234);
+      assert.equal(v.nextReelCSS, null);
+      assert.equal(
+        await value(`document.querySelector('[data-wb-browse-like],[data-wb-reel-next]') === null`),
+        true,
+      );
+      checks.push('covered-like-and-next-have-no-native-click-markers');
+      checks.push('covered-like-still-exposes-state-and-count-for-verification');
+      await js(
+        `document.querySelector('#cover').remove();document.querySelector('main').style.position='fixed';document.querySelector('main').style.inset='0';document.querySelector('main').innerHTML='<section id="active" style="position:absolute;top:80px;height:240px"><video width="320" height="240" muted></video><button id="activeLike" style="position:absolute;left:340px;top:50px"><svg></svg>1000</button></section><section id="other" style="position:absolute;top:350px;height:240px"><video width="320" height="120"></video><button id="otherLike" style="position:absolute;left:340px;top:50px"><svg></svg>2000</button></section><button id="next" aria-disabled="true">next</button>';for(const id of ['activeLike','otherLike']) { attach(document.getElementById(id),[{name:'CometUFIReactButtonBase.react',props:{feedback:{__id:'fb'}}}]);attach(document.querySelector('#'+id+' svg'),[{name:'FBNucleusLikeOutline24Icon.react'}]); } const activeVideo=document.querySelector('#active video');activeVideo.srcObject=canvas.captureStream(15);activeVideo.play()`,
+      );
+      await new Promise((r) => setTimeout(r, 300));
+      await read();
+      assert.equal(await value(`document.querySelector('[data-wb-browse-like]').id`), 'activeLike');
+      checks.push('two-reel-cards-select-active-video-reaction');
       await js(`document.querySelector('#next').setAttribute('aria-disabled','true')`);
       assert.equal((await read()).nextReelCSS, null);
       checks.push('disabled-next-not-authorized');
@@ -149,6 +204,7 @@ if (!process.versions.electron) {
       );
       console.log(JSON.stringify({ passed: true, checks }));
     } catch (e) {
+      console.error(JSON.stringify({ completedChecks: checks }));
       console.error(e);
       await fs.writeFile(path.join(out, 'structure-failure.txt'), String(e));
       process.exitCode = 1;

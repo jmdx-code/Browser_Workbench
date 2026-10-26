@@ -35,6 +35,188 @@ const page = (): BrowsePage => ({
   video: null,
 });
 
+test('Reels like verification preserves the full window through missing or unreacted frames and accepts later state or bounded exact count growth', async () =>
+  fixture(
+    'video',
+    async (f) => {
+      f.reading.url = 'https://www.facebook.com/reel/123/';
+      f.reading.contentKey = 'same-reel';
+      f.reading.video = {
+        css: 'video',
+        source: 'stream',
+        paused: false,
+        buffering: false,
+        ended: false,
+        timeSeconds: 3,
+        playbackRate: 1,
+      };
+      const action = {
+        kind: 'click' as const,
+        tabId: f.h.proofs.get(f.execution.plan.profileId)!.tabId,
+        documentEpoch: 0,
+        routeEpoch: 0,
+        target: { css: FACEBOOK_BROWSE_LIKE_CSS },
+      };
+      const intent: Intent = {
+        kind: 'like',
+        contentId: createHash('sha256')
+          .update(f.reading.url + '|100|same-reel')
+          .digest('hex'),
+        observedLikeCount: 900,
+        observedLiked: false,
+        proof: f.h.proofs.get(f.execution.plan.profileId)!,
+        documentEpoch: 0,
+        routeEpoch: 0,
+      };
+      const op = operation(f, action);
+      delete f.reading.likeTarget;
+      assert.equal((await f.executor.verify(f.execution, op, intent, () => {})).outcome, 'WAIT');
+      f.h.clock.at = 3000;
+      f.reading.likeTarget = {
+        css: null,
+        liked: false,
+        likeCount: 900,
+        sponsored: false,
+        text: '',
+      };
+      assert.equal((await f.executor.verify(f.execution, op, intent, () => {})).outcome, 'WAIT');
+      f.h.clock.at = 3400;
+      f.reading.likeTarget.liked = true;
+      assert.equal(
+        (await f.executor.verify(f.execution, op, intent, () => {})).outcome,
+        'VERIFIED',
+      );
+      const missing = operation(f, action);
+      f.h.clock.at = 4000;
+      delete f.reading.likeTarget;
+      assert.equal(
+        (await f.executor.verify(f.execution, missing, intent, () => {})).outcome,
+        'WAIT',
+      );
+      f.h.clock.at = 7499;
+      assert.equal(
+        (await f.executor.verify(f.execution, missing, intent, () => {})).outcome,
+        'WAIT',
+      );
+      f.h.clock.at = 7500;
+      assert.equal(
+        (await f.executor.verify(f.execution, missing, intent, () => {})).outcome,
+        'NOT_APPLIED',
+      );
+      f.reading.likeTarget = {
+        css: null,
+        liked: false,
+        likeCount: 901,
+        sponsored: false,
+        text: '',
+      };
+      assert.equal(
+        (await f.executor.verify(f.execution, operation(f, action), intent, () => {})).outcome,
+        'VERIFIED',
+      );
+      f.reading.likeTarget.likeCount = 10001;
+      assert.equal(
+        (
+          await f.executor.verify(
+            f.execution,
+            operation(f, action),
+            { ...intent, observedLikeCount: 10000 },
+            () => {},
+          )
+        ).outcome,
+        'WAIT',
+      );
+      f.reading.contentKey = 'different-reel';
+      f.reading.likeTarget.likeCount = 901;
+      assert.equal(
+        (await f.executor.verify(f.execution, operation(f, action), intent, () => {})).outcome,
+        'NOT_APPLIED',
+      );
+    },
+    1,
+  ));
+
+test('hidden activation times out as not applied after 30 seconds and leaves the daily plan running', async () =>
+  fixture('feed', async (f) => {
+    const plan = f.execution.plan,
+      step = f.execution.step,
+      proof = f.h.proofs.get(plan.profileId)!;
+    f.reading.visible = false;
+    const id = randomUUID();
+    await f.h.store.browseIntents.prepare(
+      plan.id,
+      step.id,
+      id,
+      { kind: 'activateTab', tabId: proof.tabId },
+      { kind: 'auxiliary', purpose: 'activate', proof, documentEpoch: 0, routeEpoch: 0 },
+    );
+    const runner = new TaskStepRunner(
+      f.h.store.tasks,
+      f.h.store.browseIntents,
+      f.h.store.taskTabs,
+      f.h.host,
+      [f.executor],
+      f.h.clock,
+      randomUUID,
+    );
+    await runner.advance(plan.id);
+    assert.equal((await f.h.store.tasks.findOperation!(plan.id, id))?.status, 'ACKNOWLEDGED');
+    assert.equal((await runner.advance(plan.id)).status, 'WAITING');
+    f.h.clock.at = 30000;
+    const result = await runner.advance(plan.id);
+    assert.equal(result.status, 'WAITING');
+    assert.equal(result.reason, 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT');
+    assert.equal((await f.h.store.tasks.findOperation!(plan.id, id))?.status, 'FAILED');
+    assert.equal((await f.h.store.tasks.get(plan.id)).state, 'RUNNING');
+    assert.equal((await f.h.store.tasks.steps(plan.id))[0]?.progress.effectiveMilliseconds, 0);
+  }));
+
+test('pre-input target miss settles as not applied and the same browse plan continues to completion', async () =>
+  fixture('feed', async (f) => {
+    const port = f.h.ports.get(f.execution.plan.profileId)!;
+    const send = port.sendGuarded.bind(port);
+    let missed = false;
+    port.sendGuarded = async (op, guard) => {
+      const receipt = await send(op, guard);
+      if (!missed) {
+        missed = true;
+        return {
+          ...receipt,
+          evidence: { resultCode: 'TARGET_UNAVAILABLE_BEFORE_INPUT', sdkReturned: false },
+        };
+      }
+      if (op.action.kind === 'browseScroll') f.reading.scrollY = op.action.fromY + op.action.deltaY;
+      return receipt;
+    };
+    const runner = new TaskStepRunner(
+      f.h.store.tasks,
+      f.h.store.browseIntents,
+      f.h.store.taskTabs,
+      f.h.host,
+      [f.executor],
+      f.h.clock,
+      randomUUID,
+    );
+    let sawNotApplied = false;
+    for (
+      let i = 0;
+      i < 160 && (await f.h.store.tasks.get(f.execution.plan.id)).state === 'RUNNING';
+      i++
+    ) {
+      f.h.clock.at = i * 1000;
+      await runner.advance(f.execution.plan.id);
+      const operations = await f.h.store.tasks.operations(f.execution.plan.id);
+      assert.ok(
+        operations.every((op) => op.status !== 'UNKNOWN'),
+        JSON.stringify({ i, operations, plan: await f.h.store.tasks.get(f.execution.plan.id) }),
+      );
+      sawNotApplied ||= operations.some((op) => op.status === 'FAILED');
+    }
+    assert.equal(missed, true);
+    assert.equal(sawNotApplied, true);
+    assert.equal((await f.h.store.tasks.get(f.execution.plan.id)).state, 'COMPLETED');
+  }));
+
 test('a claimed plan waits for the startup pool instead of failing or pausing, then continues on the next tick', async () =>
   fixture('feed', async (f) => {
     const observe = f.h.host.observe.bind(f.h.host),

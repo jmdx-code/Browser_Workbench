@@ -46,7 +46,7 @@ export function projectFacebookDocumentIdentity(
     if (++scripts > 1024) return empty();
     const text = script.textContent ?? '';
     bytes += new TextEncoder().encode(text).byteLength;
-    if (bytes > 8 * 1024 * 1024) return empty();
+    if (bytes > 24 * 1024 * 1024) return empty();
     if (text.length > 1024 * 1024) {
       if (
         /adp_Comet(?:SettingsDropdownTrigger|FeedInlineComposer)QueryRelayPreloader_/.test(text) ||
@@ -70,7 +70,7 @@ export function projectFacebookDocumentIdentity(
       const entries = top?.[3]?.[0]?.__bbox?.require;
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
-        if (++modules > 20000) return empty();
+        if (++modules > 60000) return empty();
         if (
           entry?.[0] !== 'RelayPrefetchedStreamCache' &&
           !(
@@ -171,8 +171,10 @@ export function projectFacebookDocumentIdentity(
         const selected: Actor = { __typename: 'User', id: actor.id, name: actor.name };
         if (match[1] === 'SettingsDropdownTrigger') {
           if (viewer.is_lar_acting_as_additional_profile !== false) return empty();
-          menu.push(selected);
-        } else composer.push(selected);
+          if (!menu.some((a) => a.id === selected.id && a.name === selected.name))
+            menu.push(selected);
+        } else if (!composer.some((a) => a.id === selected.id && a.name === selected.name))
+          composer.push(selected);
       }
     }
   }

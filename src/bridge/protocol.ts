@@ -11,7 +11,7 @@ export {
 } from '../shared/browser-actions.js';
 export const VERSION = 2;
 
-export const LEASE_MS = 4500;
+export const LEASE_MS = 10_000;
 export type Status =
   | 'PREPARED'
   | 'DISPATCHING'

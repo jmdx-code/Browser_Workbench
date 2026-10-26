@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { CleanupDialog } from './data-cleanup-panel.js';
+import { endedTask } from '../domain/task-run-records.js';
+import { runSummary, stepName } from './task-record-summary.js';
 import type { History, TaskCommand } from '../shared/task-contracts.js';
 import { api } from './api.js';
 import { ArchiveManagementPanel } from './archive-management.js';
@@ -43,13 +46,6 @@ const actions: Record<string, string> = {
   mediaClick: '点击媒体',
   windowState: '调整窗口',
 };
-const steps = {
-  video: '浏览 Reels',
-  feed: '浏览首页',
-  post: '发布内容',
-  marketplace: '浏览商城',
-  friends: '接受好友请求',
-};
 const events: Record<string, string> = {
   ...states,
   ASSIGNED: '已分配任务',
@@ -83,8 +79,16 @@ export function TaskHistoryPanel({
   initialPlanId,
   busy,
   onCommand,
+  browserName,
+  avatar,
+  diagnosticContent,
+  initialRound,
 }: {
   profileId: string;
+  browserName?: string;
+  avatar?: ReactNode;
+  diagnosticContent?: (requiresReview: boolean) => ReactNode;
+  initialRound?: number;
   initialPlanId?: string;
   busy?: boolean;
   onCommand?: (command: TaskCommand['command'], plans: TaskCommand['plans']) => void;
@@ -93,6 +97,18 @@ export function TaskHistoryPanel({
   const [selected, setSelected] = useState<string | null>(initialPlanId ?? null);
   const [revision, setRevision] = useState(0);
   const [error, setError] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [round, setRound] = useState(initialRound);
+  useEffect(() => {
+    const refresh = () => {
+      setSelected(null);
+      setRound(undefined);
+      setHistory(null);
+      setRevision((v) => v + 1);
+    };
+    window.addEventListener('task-records-deleted', refresh);
+    return () => window.removeEventListener('task-records-deleted', refresh);
+  }, []);
   const [loading, setLoading] = useState(true);
   const [exportNotice, setExportNotice] = useState('');
   useEffect(() => {
@@ -104,7 +120,7 @@ export function TaskHistoryPanel({
       pending = true;
       setLoading(true);
       try {
-        const value = await api.taskHistory(profileId, selected, controller.signal);
+        const value = await api.taskHistory(profileId, selected, controller.signal, round);
         if (value.profileId !== profileId || (selected && value.selectedPlanId !== selected))
           throw Error('TASK_HISTORY_SCOPE_CHANGED');
         if (!controller.signal.aborted) {
@@ -131,15 +147,29 @@ export function TaskHistoryPanel({
       clearInterval(timer);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, [profileId, selected, revision]);
+  }, [profileId, selected, revision, round]);
   const plan = history?.plans.find((row) => row.id === history.selectedPlanId);
+  const starts = history?.steps.flatMap((s) => (s.startedAt == null ? [] : [s.startedAt])) ?? [];
+  const finishes =
+    history?.steps.flatMap((s) => (s.finishedAt == null ? [] : [s.finishedAt])) ?? [];
+  const startedAt = starts.length ? Math.min(...starts) : null;
+  const finishedAt =
+    finishes.length &&
+    ((plan && endedTask(plan.state)) ||
+      history?.steps.every((s) => ['COMPLETED', 'FAILED', 'SKIPPED'].includes(s.status)))
+      ? Math.max(...finishes)
+      : null;
   const unresolved = history?.operations.filter((op) => op.status === 'UNKNOWN') ?? [];
   const controlPending =
     !!plan && ['PAUSING', 'STOPPING'].includes(plan.state) && !plan.controlConfirmed;
   return (
     <section className="task-history" aria-label="业务任务记录" aria-busy={loading}>
       <div className="task-history-heading">
-        <h3>业务任务</h3>
+        {avatar}
+        <h3>
+          {browserName ?? '浏览器'}
+          {plan ? ' · ' + plan.name : ' · 任务记录'}
+        </h3>
         <button
           disabled={loading || !history || !!error}
           onClick={() => {
@@ -176,31 +206,73 @@ export function TaskHistoryPanel({
       )}
       {!!history?.plans.length && (
         <>
-          <label className="task-history-select">
-            查看任务
-            <select
-              value={selected ?? ''}
-              onChange={(event) => setSelected(event.target.value || null)}
-            >
-              <option value="">最新任务</option>
-              {history.plans.map((row) => (
-                <option key={row.id} value={row.id}>
-                  {row.name} · {new Date(row.createdAt).toLocaleString()} · {states[row.state]}
-                </option>
-              ))}
-            </select>
-          </label>
+          {history.plans.length > 1 && (
+            <label className="task-history-select">
+              切换历史任务
+              <select
+                value={selected ?? ''}
+                onChange={(event) => {
+                  setSelected(event.target.value || null);
+                  setRound(undefined);
+                }}
+              >
+                <option value="">最新任务</option>
+                {history.plans.map((row) => (
+                  <option key={row.id} value={row.id}>
+                    {row.name} · {new Date(row.createdAt).toLocaleString()} · {states[row.state]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {plan && (
             <>
               <div className="task-history-summary">
-                <strong>{plan.name}</strong>
-                <span className={'badge ' + (plan.state === 'REVIEW' ? 'orange' : 'gray')}>
+                <span
+                  className={
+                    'badge ' +
+                    (plan.state === 'COMPLETED'
+                      ? 'green'
+                      : plan.state === 'FAILED'
+                        ? 'red'
+                        : plan.state === 'REVIEW'
+                          ? 'orange'
+                          : 'gray')
+                  }
+                >
                   {states[plan.state]}
                 </span>
                 <span>
-                  版本 {plan.version} · 第 {plan.round} 轮 · 第 {plan.position + 1} 项
+                  第 {history.steps[0]?.round ?? plan.round} 轮 · {runSummary(history.steps)}
                 </span>
               </div>
+              <p className="muted">
+                {startedAt === null
+                  ? '尚未开始 · 创建于 ' + new Date(plan.createdAt).toLocaleString()
+                  : new Date(startedAt).toLocaleString() +
+                    ' → ' +
+                    (finishedAt === null ? '尚未结束' : new Date(finishedAt).toLocaleString()) +
+                    ' · 用时 ' +
+                    Math.max(0, Math.round(((finishedAt ?? Date.now()) - startedAt) / 60000)) +
+                    ' 分钟'}
+              </p>
+              {endedTask(plan.state) && (
+                <button className="btn btn-sm" onClick={() => setDeleting(true)}>
+                  删除此条任务记录
+                </button>
+              )}
+              {deleting && (
+                <CleanupDialog
+                  selection={{
+                    kind: 'records',
+                    scope: { stepIds: history.steps.map((s) => s.id) },
+                  }}
+                  onClose={() => setDeleting(false)}
+                  onDone={() => {
+                    setDeleting(false);
+                  }}
+                />
+              )}
               {plan.timing && <p className="muted">{taskTimingLabel(plan.timing)}</p>}
               {plan.reason && (
                 <details className="task-history-reason">
@@ -212,7 +284,7 @@ export function TaskHistoryPanel({
                   <code>{plan.reason}</code>
                 </details>
               )}
-              {onCommand && (
+              {onCommand && !endedTask(plan.state) && (
                 <div className="task-history-heading" aria-label="当前任务控制">
                   <button
                     disabled={busy || !['RUNNING', 'QUEUED', 'PAUSING'].includes(plan.state)}
@@ -283,14 +355,12 @@ export function TaskHistoryPanel({
                     : '可以停止并结束本次任务；确认当前控制已停后释放浏览器，保留原内容的必要防重复保护。未确认结果不自动重发。'}
                 </p>
               )}
-              <ArchiveManagementPanel key={plan.id} profileId={profileId} planId={plan.id} />
-              <h4>本轮子任务</h4>
+              <h4>步骤执行成绩单</h4>
               <div className="task-history-steps">
                 {history.steps.map((step) => (
                   <div key={step.id}>
                     <span>
-                      {step.position + 1}.{' '}
-                      {step.destination === 'story' ? '发布快拍' : steps[step.type]}
+                      {step.position + 1}. {stepName(step)}
                     </span>
                     <span>
                       {step.status === 'COMPLETED'
@@ -300,19 +370,40 @@ export function TaskHistoryPanel({
                           : step.status === 'SKIPPED'
                             ? '已跳过'
                             : step.status === 'ACTIVE'
-                              ? '当前任务'
-                              : '等待执行'}
+                              ? endedTask(plan.state)
+                                ? '已停止'
+                                : '进行中'
+                              : endedTask(plan.state)
+                                ? '未执行'
+                                : '等待执行'}
                     </span>
                     <small>
+                      目标{' '}
+                      {step.budget?.kind === 'time'
+                        ? `${step.budget.milliseconds / 60000} 分钟`
+                        : step.budget?.kind === 'posts'
+                          ? `${step.budget.count} 条`
+                          : step.budget?.kind === 'friends'
+                            ? step.budget.count === null
+                              ? '全部好友'
+                              : `${step.budget.count} 人`
+                            : '—'}{' '}
+                      → 实际
                       <TaskProgressView
                         type={step.type}
                         progress={step.progress}
                         budget={step.budget}
                       />
                     </small>
+                    {step.status === 'PENDING' && endedTask(plan.state) && (
+                      <small>未开始执行（任务已结束）</small>
+                    )}
                     {step.outcome && (
-                      <small>
+                      <small className={step.status === 'FAILED' ? 'task-history-warning' : ''}>
                         {taskReasonDescription(step.outcome.reason)?.summary ?? step.outcome.reason}
+                        {taskReasonDescription(step.outcome.reason)?.next && (
+                          <span> · {taskReasonDescription(step.outcome.reason)?.next}</span>
+                        )}
                         {step.outcome.kind === 'FAILED' && step.outcome.businessResult === 'UNKNOWN'
                           ? ' · 发布结果未确认，原内容不会自动重发'
                           : ''}
@@ -321,35 +412,45 @@ export function TaskHistoryPanel({
                   </div>
                 ))}
               </div>
-              <details open={unresolved.length > 0}>
-                <summary>
-                  操作记录 · {history.operations.length} 条
-                  {history.truncated.operations ? '（最近100条）' : ''}
-                </summary>
-                <div className="task-history-operations">
-                  {history.operations.map((op) => (
-                    <div key={op.id}>
-                      <time>{new Date(op.updatedAt).toLocaleString()}</time>
-                      <span>{actions[op.kind] ?? op.kind}</span>
-                      <span>{states[op.status] ?? op.status}</span>
-                    </div>
-                  ))}
-                </div>
-                {!history.operations.length && <p className="muted">尚未派发操作。</p>}
-              </details>
-              <details>
-                <summary>
-                  状态变化 · {history.events.length} 条
-                  {history.truncated.events ? '（最近100条）' : ''}
-                </summary>
-                <div className="task-history-operations">
-                  {history.events.map((event) => (
-                    <div key={event.sequence}>
-                      <time>{new Date(event.createdAt).toLocaleString()}</time>
-                      <span>{events[event.type] ?? event.type}</span>
-                    </div>
-                  ))}
-                </div>
+              <details className="record-diagnostic-collapse" open={unresolved.length > 0}>
+                <summary>高级诊断日志（开发与排障用）</summary>
+                {unresolved.length > 0 && (
+                  <p className="task-history-warning">
+                    有 {unresolved.length} 个 UNKNOWN 操作待核对。
+                  </p>
+                )}
+                {diagnosticContent?.(unresolved.length > 0)}
+                <ArchiveManagementPanel key={plan.id} profileId={profileId} planId={plan.id} />
+                <details>
+                  <summary>
+                    操作记录 · {history.operations.length} 条
+                    {history.truncated.operations ? '（最近100条）' : ''}
+                  </summary>
+                  <div className="task-history-operations">
+                    {history.operations.map((op) => (
+                      <div key={op.id}>
+                        <time>{new Date(op.updatedAt).toLocaleString()}</time>
+                        <span>{actions[op.kind] ?? op.kind}</span>
+                        <span>{states[op.status] ?? op.status}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {!history.operations.length && <p className="muted">尚未派发操作。</p>}
+                </details>
+                <details>
+                  <summary>
+                    状态变化 · {history.events.length} 条
+                    {history.truncated.events ? '（最近100条）' : ''}
+                  </summary>
+                  <div className="task-history-operations">
+                    {history.events.map((event) => (
+                      <div key={event.sequence}>
+                        <time>{new Date(event.createdAt).toLocaleString()}</time>
+                        <span>{events[event.type] ?? event.type}</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
               </details>
             </>
           )}

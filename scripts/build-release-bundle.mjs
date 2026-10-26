@@ -1,11 +1,31 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFile, readdir, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, readdir, mkdir, writeFile, copyFile, access } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { ZipFile } from 'yazl';
 import { engineFingerprint, sha256 } from '../dist/src/infrastructure/runtime-installation.js';
 import { ReleaseManifest } from '../dist/src/shared/software-update.js';
+export async function copyInstallerAliases(
+  root = process.cwd(),
+  output = path.join(root, 'release'),
+  required = true,
+) {
+  const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+  const installer = path.join(
+    output,
+    `${pkg.productName ?? 'Browser Workbench'} Setup ${pkg.version}.exe`,
+  );
+  try {
+    await access(installer);
+  } catch (error) {
+    if (!required && error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const aliases = [`Browser.Workbench.Setup.${pkg.version}.exe`, 'Browser.Workbench.Setup.exe'];
+  for (const alias of aliases) await copyFile(installer, path.join(output, alias));
+  return aliases;
+}
 export async function buildReleaseBundle(
   root = process.cwd(),
   output = path.join(root, 'release'),
@@ -51,6 +71,7 @@ export async function buildReleaseBundle(
     files,
   });
   await writeFile(path.join(output, 'release-manifest.json'), JSON.stringify(manifest, null, 2));
+  await copyInstallerAliases(root, output, false);
   console.log(
     JSON.stringify({
       zipPath,
@@ -62,5 +83,8 @@ export async function buildReleaseBundle(
   );
   return manifest;
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
-  await buildReleaseBundle();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv.includes('--installer-aliases'))
+    console.log(JSON.stringify({ installerAliases: await copyInstallerAliases() }));
+  else await buildReleaseBundle();
+}

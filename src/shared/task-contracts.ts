@@ -117,7 +117,9 @@ export const TaskOverview = z
     plans: z.array(TaskPlan),
   })
   .strict();
-export const TaskHistoryRequest = z.object({ profileId: Id, planId: Id.optional() }).strict();
+export const TaskHistoryRequest = z
+  .object({ profileId: Id, planId: Id.optional(), round: z.number().int().positive().optional() })
+  .strict();
 // Public display budget follows the persisted step instance, including shuffled rounds.
 // Optional for older controller responses and historical exports; never an input grant.
 export const TaskStepBudget = z.discriminatedUnion('kind', [
@@ -165,6 +167,8 @@ export const TaskHistory = z
           type: z.enum(['video', 'feed', 'post', 'marketplace', 'friends']),
           destination: z.enum(['post', 'story']).optional(),
           budget: TaskStepBudget.optional(),
+          startedAt: z.number().nullable().optional(),
+          finishedAt: z.number().nullable().optional(),
         })
         .strict(),
     ),
@@ -318,6 +322,7 @@ export const TaskRuntimeOverview = TaskOverview.extend({
 }).strict();
 export const TaskRecordsRequest = z
   .object({
+    groupBy: z.literal('run').optional(),
     profileId: Id.optional(),
     status: z.enum(['all', 'running', 'completed', 'failed', 'review']).default('all'),
     query: z.string().max(100).optional(),

@@ -247,6 +247,13 @@ test('every feed scroll input gets one fresh atomic actor/document fence; hidden
     if (failure && failure !== 'window-original' && failure !== 'hidden-prepare-cap')
       await assert.rejects(check);
     else await check;
-    assert.equal(reads, failure.startsWith('window-') && failure !== 'window-original' ? 1 : 2);
+    assert.equal(
+      reads,
+      failure.startsWith('window-') && failure !== 'window-original'
+        ? 1
+        : failure === 'document'
+          ? 3
+          : 2,
+    );
   }
 });

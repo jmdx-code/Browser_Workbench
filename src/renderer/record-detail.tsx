@@ -1,3 +1,5 @@
+import { ProfileAvatar } from './profile-avatar.js';
+import { inspectionAvatarURL } from './inspection-presentation.js';
 import { useEffect } from 'react';
 import type { Profile, Workspace } from '../shared/contracts.js';
 import type { Plan, TaskCommand } from '../shared/task-contracts.js';
@@ -13,6 +15,7 @@ import { IconClose, IconEdit, IconLayers } from './icons.js';
 export function RecordDetailDrawer({
   profile,
   planId,
+  round,
   plan,
   workspace,
   inspection,
@@ -28,6 +31,7 @@ export function RecordDetailDrawer({
 }: {
   profile: Profile | undefined;
   planId: string;
+  round?: number | undefined;
   plan: Plan | undefined;
   workspace: Workspace;
   inspection: Inspection | undefined;
@@ -49,7 +53,10 @@ export function RecordDetailDrawer({
     return () => document.removeEventListener('keydown', key);
   }, [onClose]);
   const attention = plan && attentionPlans([plan], workspace.profiles).length > 0;
-  const reason = plan && (attention || plan.reason) ? taskAlertReason(plan, profile) : null;
+  const reason =
+    plan && !['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state) && attention
+      ? taskAlertReason(plan, profile)
+      : null;
   const bridge = workspace.records.filter((row) => row.profileId === profile?.id);
   return (
     <div
@@ -58,13 +65,6 @@ export function RecordDetailDrawer({
     >
       <aside className="drawer drawer-wide" aria-label="任务详情">
         <header className="drawer-head">
-          <div>
-            <h2>{profile?.browserName ?? profile?.alias ?? '浏览器'}</h2>
-            <p className="muted">
-              {plan ? plan.snapshot.name + ' · v' + plan.version : '任务详情'}
-              {profile?.account.id ? ' · ' + profile.account.id : ''}
-            </p>
-          </div>
           {profile && (
             <button className="btn btn-sm" onClick={() => onRename(profile)}>
               <IconEdit size={14} /> 别名
@@ -96,9 +96,36 @@ export function RecordDetailDrawer({
           )}
           {profile ? (
             <TaskHistoryPanel
-              key={profile.id + ':' + planId}
+              key={profile.id + ':' + planId + ':' + (round ?? '')}
               profileId={profile.id}
               initialPlanId={planId}
+              {...(round ? { initialRound: round } : {})}
+              browserName={profile.browserName ?? profile.alias}
+              avatar={
+                <ProfileAvatar
+                  url={inspectionAvatarURL(profile, inspection, inspectionAvailable)}
+                  online={Boolean(profile.online)}
+                />
+              }
+              diagnosticContent={(requiresReview) => (
+                <>
+                  <details className="drawer-section" open={requiresReview}>
+                    <summary>原生结果核对</summary>
+                    <NativeReviewPanel key={'native-' + profile.id} profile={profile} />
+                  </details>
+                  <details className="drawer-section">
+                    <summary>桥接记录 · {bridge.length}</summary>
+                    <p className="muted">桥接回执不代表业务完成。</p>
+                    {bridge.map((row) => (
+                      <article className="record" key={row.kind + row.id}>
+                        <time>{new Date(row.updatedAt).toLocaleString()}</time>
+                        <span>{resultNames[row.status] ?? row.status}</span>
+                        <p>{row.summary}</p>
+                      </article>
+                    ))}
+                  </details>
+                </>
+              )}
               busy={busy}
               onCommand={onCommand}
             />
@@ -117,28 +144,6 @@ export function RecordDetailDrawer({
                 onRead={onReadInspections}
                 onCheck={() => onCheck([profile.id])}
               />
-            </details>
-          )}
-          {profile && (
-            <details className="drawer-section">
-              <summary>原生结果核对</summary>
-              <NativeReviewPanel key={'native-' + profile.id} profile={profile} />
-            </details>
-          )}
-          {profile && (
-            <details className="drawer-section">
-              <summary>桥接记录 · {bridge.length}</summary>
-              <p className="muted">以下记录来自桥接验证，不代表 Facebook 业务完成。</p>
-              <div className="record-list">
-                {bridge.map((row) => (
-                  <article className="record" key={row.kind + row.id}>
-                    <time>{new Date(row.updatedAt).toLocaleString()}</time>
-                    <span className="pill pill-idle">{resultNames[row.status] ?? row.status}</span>
-                    <p>{row.summary}</p>
-                  </article>
-                ))}
-                {!bridge.length && <p className="muted">暂无桥接记录</p>}
-              </div>
             </details>
           )}
         </div>

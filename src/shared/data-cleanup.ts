@@ -3,10 +3,14 @@ export const RecordCleanupScope = z
   .object({
     stepIds: z.array(z.uuid()).min(1).max(1000).optional(),
     before: z.number().int().nonnegative().safe().optional(),
+    keepLatestRuns: z.number().int().min(0).max(100000).optional(),
     profileId: z.uuid().optional(),
   })
   .strict()
-  .refine((v) => (v.stepIds !== undefined) !== (v.before !== undefined), '请选择记录或截止日期');
+  .refine(
+    (v) => (v.stepIds !== undefined) !== (v.before !== undefined || v.keepLatestRuns !== undefined),
+    '请选择记录、截止日期或保留条数',
+  );
 export const CleanupSelection = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('records'), scope: RecordCleanupScope }).strict(),
   z
@@ -35,6 +39,7 @@ export const CleanupSettings = z
   .object({
     revision: z.number().int().nonnegative(),
     historyRetentionDays: z.number().int().min(1).max(3650).nullable(),
+    historyMaxCount: z.number().int().min(1).max(100000).nullable().optional(),
     automaticLogs: z.boolean(),
     logRetentionDays: z.number().int().min(1).max(90),
   })
@@ -43,6 +48,7 @@ export const SaveCleanupSettings = z
   .object({
     expectedRevision: z.number().int().nonnegative(),
     historyRetentionDays: CleanupSettings.shape.historyRetentionDays,
+    historyMaxCount: CleanupSettings.shape.historyMaxCount,
     automaticLogs: z.boolean().default(false),
   })
   .strict();

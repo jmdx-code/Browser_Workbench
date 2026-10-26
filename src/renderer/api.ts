@@ -506,16 +506,22 @@ export const api = {
     ),
   taskOverview: async (signal?: AbortSignal) =>
     TaskOverview.parse(await request('/tasks', undefined, signal)),
-  taskHistory: async (profileId: string, planId: string | null, signal: AbortSignal) =>
+  taskHistory: async (
+    profileId: string,
+    planId: string | null,
+    signal: AbortSignal,
+    round?: number,
+  ) =>
     TaskHistory.parse(
       await request(
         '/tasks/history',
-        { profileId, ...(planId ? { planId } : {}) },
+        { profileId, ...(planId ? { planId } : {}), ...(round ? { round } : {}) },
         AbortSignal.any([signal, AbortSignal.timeout(10000)]),
       ),
     ),
   taskRecords: async (
     input: {
+      groupBy?: 'run';
       profileId?: string;
       status?: 'all' | 'running' | 'completed' | 'failed' | 'review';
       query?: string;

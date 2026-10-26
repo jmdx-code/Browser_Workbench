@@ -16,6 +16,60 @@ import { DataCleanupService } from '../src/application/data-cleanup.js';
 import { TaskService } from '../src/application/task-service.js';
 import { settlementFixture, prepareBound } from './fixtures/settlement.js';
 
+for (const mode of ['execute', 'automatic'] as const)
+  test('cleanup yields real I/O between 100-step synchronous batches: ' + mode, async () => {
+    const store = await WorkspaceStore.open(':memory:');
+    const maximums: number[] = [];
+    const observations: { current: number; total: number; running: boolean }[] = [];
+    let left = 320;
+    const service = new DataCleanupService(
+      {
+        settings: () => ({ ...store.dataCleanup.settings(), historyMaxCount: 1 }),
+        saveSettings: (input) => store.dataCleanup.saveSettings(input),
+        preview: () => ({ eligible: left, protected: 0, bytes: 0 }),
+        removeBatch: (_scope, maximum = 250) => {
+          maximums.push(maximum);
+          if (maximums.length > 1)
+            assert.equal(
+              observations.length,
+              maximums.length - 1,
+              'previous I/O callback must run before next synchronous batch',
+            );
+          setImmediate(() => observations.push(service.progress()));
+          const n = Math.min(maximum, left);
+          left -= n;
+          return n;
+        },
+        assertResettable: () => {},
+        compact: () => ({ completed: true }),
+      },
+      { preview: async () => [], remove: async () => ({ deleted: 0, bytes: 0, protected: 0 }) },
+      undefined,
+      async () => {},
+      () => {},
+    );
+    try {
+      if (mode === 'execute') {
+        const preview = await service.preview({
+          kind: 'records',
+          scope: { before: Date.now() + 1 },
+        });
+        const result = await service.execute({ token: preview.token, confirm: true });
+        assert.equal(result.deleted, 320);
+        assert.deepEqual(
+          observations.map((p) => p.current),
+          [100, 200, 300, 320],
+        );
+        assert.ok(observations.every((p) => p.running && p.total === 320));
+      } else await service.automatic();
+      assert.equal(left, 0);
+      assert.ok(maximums.every((n) => n <= 100));
+      assert.equal(observations.length, 4);
+    } finally {
+      store.close();
+    }
+  });
+
 test('record cleanup removes only ended display rows and preserves original UNKNOWN, receipts and paging semantics', async () => {
   await settlementFixture(async (store) => {
     const f = prepareBound(store);
@@ -47,6 +101,7 @@ test('record cleanup removes only ended display rows and preserves original UNKN
       original.map((o) => [o.id, o.status, o.receipt]),
     );
     assert.equal(store.tasks.get(f.plan.id).state, 'FAILED');
+    assert.deepEqual((await service.history({ profileId: f.profile.id })).plans, []);
     if (before.nextCursor)
       await assert.rejects(service.records({ limit: 1, cursor: before.nextCursor }), /记录已变化/);
     assert.equal(store.dataCleanup.settings().historyRetentionDays, null);

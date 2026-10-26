@@ -109,6 +109,13 @@ export class WindowLayoutService {
           exhausted: false,
         };
         this.recoveries.set(profileId, attempt);
+        if (
+          (attempt.exhausted || attempt.positions.length >= 3) &&
+          Date.now() - attempt.lastMoveAt >= 15_000
+        ) {
+          attempt.positions = [];
+          attempt.exhausted = false;
+        }
         const peers = [...this.managed].filter(([id]) => id !== profileId).map(([, w]) => w);
         // After one nearby trial, try a different screen region, not two more
         // offsets beneath the same covering window.

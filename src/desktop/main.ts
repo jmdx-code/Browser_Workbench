@@ -54,6 +54,7 @@ function finishShutdown() {
 }
 const smokeFile = process.env.WORKBENCH_SMOKE_OUT;
 app.setName('Browser Workbench');
+if (process.platform === 'win32') app.setAppUserModelId('浏览器工作台');
 if (process.env.WORKBENCH_SMOKE_USER_DATA)
   app.setPath('userData', process.env.WORKBENCH_SMOKE_USER_DATA);
 if (!app.requestSingleInstanceLock({ version: softwareVersion })) {
@@ -218,7 +219,7 @@ async function boot() {
         .filter(Boolean)
         .join('，');
       try {
-        new Notification({ title: 'Browser Workbench', body }).show();
+        new Notification({ title: '浏览器工作台', body }).show();
       } catch {
         /* Desktop notifications are optional. */
       }

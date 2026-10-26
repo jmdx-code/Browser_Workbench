@@ -18,6 +18,7 @@ export const dropPhysicalCleanupSchema = [
   ['retain_task_control_binding', 'task_control_bindings', 'RETAIN_TASK_CONTROL_BINDING'],
   ['retain_task_control_receipt', 'task_control_receipts', 'RETAIN_TASK_CONTROL_RECEIPT'],
   ['retain_task_tab_proof', 'task_tab_ownership', 'RETAIN_TASK_TAB_PROOF'],
+  ['retain_task_resource_binding', 'task_resource_bindings', 'RETAIN_TASK_RESOURCE_BINDING'],
 ]
   .map(
     ([name, table, error]) =>
@@ -226,5 +227,17 @@ export function assertSchemaDefinitionPreserved(
     const suffix =
       ", confirmation TEXT NOT NULL DEFAULT 'CONFIRMED' CHECK(confirmation IN ('PENDING','CONFIRMED')), operation_id TEXT";
     assert.deepEqual({ ...actual, sql: String(actual.sql).replace(suffix, '') }, { ...definition });
+  } else if (definition.name === 'data_cleanup_settings') {
+    assert.ok(actual);
+    assert.deepEqual(
+      {
+        ...actual,
+        sql: String(actual.sql).replace(
+          ', history_max_count INTEGER CHECK(history_max_count BETWEEN 1 AND 100000)',
+          '',
+        ),
+      },
+      definition,
+    );
   } else assert.deepEqual(actual, definition);
 }

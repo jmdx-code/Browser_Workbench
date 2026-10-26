@@ -47,6 +47,70 @@ import { KernelNativeReview } from '../src/infrastructure/kernel-native-review.j
 import { kernelRequiresOperation } from '../src/shared/kernel-policy.js';
 import { projectFacebookBrowsePage } from '../src/infrastructure/facebook-browse-reader.js';
 
+test('Playwright-prefixed target change during bringToFront settles before any native input without stopping the browse plan', async () => {
+  const h = await harness();
+  try {
+    const session = await KernelManagedFacebookSession.open(
+      h.kernel,
+      h.peer,
+      h.plan,
+      h.authority,
+      h.workspace.tasks,
+      h.workspace.taskTabs,
+    );
+    const registry = new ProfileActorRegistry(
+      () => [h.profile],
+      h.workspace.tasks,
+      h.workspace.tasks.settlements,
+      h.workspace.taskControls,
+      h.workspace.taskTabs,
+      randomUUID,
+    );
+    await registry.attach(session);
+    await registry.observe(h.profile.id);
+    const step = h.workspace.tasks.steps(h.plan.id)[0]!,
+      tab = h.workspace.taskTabs.forPlan(h.plan.id)[0]!;
+    const op = h.workspace.tasks.prepareOperation(h.plan.id, step.id, randomUUID(), {
+      kind: 'click',
+      tabId: tab.proof.tabId,
+      documentEpoch: 0,
+      routeEpoch: 0,
+      target: { css: '[data-wb-browse-like="1"]' },
+    });
+    let targetReads = 0;
+    h.authority.assertTarget = async () => {
+      if (++targetReads >= 2) throw Error('FACEBOOK_BROWSE_LIKE_TARGET_CHANGED');
+    };
+    const dispatcher = new TaskDispatcher(h.workspace.tasks, registry);
+    await dispatcher.flushOne(h.profile.id);
+    const current = h.workspace.tasks.findOperation(h.plan.id, op.id)!;
+    assert.equal(current.status, 'ACKNOWLEDGED');
+    assert.equal(
+      h.commands.some((command) => command.startsWith('Input.')),
+      false,
+    );
+    assert.match(JSON.stringify(current.receipt), /TARGET_UNAVAILABLE_BEFORE_INPUT/);
+    assert.ok(
+      h.kernel
+        .diagnostics(h.profile.id)
+        .some((row) =>
+          /target-unavailable-before-input:page\.bringToFront:.*FACEBOOK_BROWSE_LIKE_TARGET_CHANGED/.test(
+            row.event,
+          ),
+        ),
+    );
+    assert.ok(current.binding);
+    await dispatcher.verify(
+      { binding: current.binding, evidence: { resultCode: 'TARGET_UNAVAILABLE_BEFORE_INPUT' } },
+      'NOT_APPLIED',
+    );
+    assert.equal(h.workspace.tasks.findOperation(h.plan.id, op.id)?.status, 'FAILED');
+    assert.equal(h.workspace.tasks.get(h.plan.id).state, 'RUNNING');
+  } finally {
+    await h.close();
+  }
+});
+
 test('home wheel performs one preparation check and one fresh target check per actual native write', async () => {
   const h = await harness();
   try {

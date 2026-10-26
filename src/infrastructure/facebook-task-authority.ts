@@ -157,7 +157,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     await assertCurrent();
     if (!this.owned || this.owned.page !== page)
       throw Error('FACEBOOK_OWNED_IDENTITY_PAGE_REQUIRED');
-    try {
+    return this.readWithRetry(async () => {
       const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
       const reader =
         step?.spec.type === 'post' &&
@@ -177,24 +177,20 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       });
       await this.assertLive();
       await assertCurrent();
-      if (current.actor.accountId !== this.bootstrap.actor.accountId)
+      if (
+        current.actor.accountId !== this.bootstrap.actor.accountId ||
+        current.actor.name !== this.bootstrap.actor.name
+      )
         throw Error('FACEBOOK_NATIVE_ACCOUNT_CHANGED');
       this.bootstrap.actor.checkedAt = this.now();
-    } catch (error) {
-      const reason = error instanceof Error ? (error.message.split('\n')[0] ?? '') : '';
-      this.revocationReason ??= /^[A-Z][A-Z0-9_:|.-]{0,199}$/.test(reason)
-        ? reason
-        : 'FACEBOOK_IDENTITY_READ_FAILED';
-      this.revoked = true;
-      throw error;
-    }
+    });
   }
   async readBrowsePage(page: Page, guard: () => Awaitable<void>, inputFence = false) {
     await this.assertLive();
     await guard();
     if (!this.owned || this.owned.page !== page)
       throw Error('FACEBOOK_OWNED_IDENTITY_PAGE_REQUIRED');
-    try {
+    return this.readWithRetry(async () => {
       const sample = await readCurrentFacebookBrowseSample(
         page,
         async () => {
@@ -204,16 +200,36 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         inputFence,
       );
       if (inputFence && !sample.actor) throw Error('FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED');
-      if (sample.actor && sample.actor.accountId !== this.bootstrap.actor.accountId)
+      if (
+        sample.actor &&
+        (sample.actor.accountId !== this.bootstrap.actor.accountId ||
+          sample.actor.name !== this.bootstrap.actor.name)
+      )
         throw Error('FACEBOOK_NATIVE_ACCOUNT_CHANGED');
       return sample.page;
-    } catch (error) {
-      const reason = error instanceof Error ? (error.message.split('\n')[0] ?? '') : '';
-      this.revocationReason ??= /^[A-Z][A-Z0-9_:|.-]{0,199}$/.test(reason)
-        ? reason
-        : 'FACEBOOK_BROWSE_READ_FAILED';
-      this.revoked = true;
-      throw error;
+    });
+  }
+  private async readWithRetry<T>(read: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.assertLive();
+        return await read();
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : '';
+        if (/^FACEBOOK_NATIVE_ACCOUNT_(?:CHANGED|MISMATCH)$/.test(reason)) {
+          this.revocationReason = reason;
+          this.revoked = true;
+          throw error;
+        }
+        const transient =
+          error instanceof Error &&
+          (error.name === 'ZodError' ||
+            /IDENTITY_UNCONFIRMED|SAMPLE_DOCUMENT_CHANGED|Execution context was destroyed|Cannot find context/.test(
+              reason,
+            ));
+        if (attempt > 0 || !transient) throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      }
     }
   }
   private async timingAllowsOriginalOperation(action: Action) {

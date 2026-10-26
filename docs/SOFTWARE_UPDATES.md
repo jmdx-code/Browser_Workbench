@@ -23,6 +23,10 @@ Windows 默认路径：
 
 本地构建：`npm run build:release`。产物为 `release/workbench-hot-update.zip` 与 `release/release-manifest.json`。Windows完整安装包使用 `npm run package:win -- --publish never`。
 
+`npm run release:bundle` 一次生成热更新包、完整安装包和两个下载别名：`Browser.Workbench.Setup.<版本>.exe`、`Browser.Workbench.Setup.exe`。新版 Release 同时提供这两个别名，永久最新安装包入口为 `/releases/latest/download/Browser.Workbench.Setup.exe`。v0.1.134 的原安装包链接作为兼容入口覆盖为0.1.140内容；旧链接文件名保留134，安装程序内部版本仍为140。
+
+软件与插件对用户显示为“浏览器工作台”；productName、可执行文件名及原数据/runtime/extension目录保持“Browser Workbench”，显示名称变更不迁移数据。
+
 工作流使用内置 GITHUB_TOKEN（contents: write），无需另配发布密钥。首次安装必须使用带新启动器的基础安装包；旧安装包没有本次启动器，不能仅靠放置 runtime 目录获得升级能力。
 
 ## 热更新边界

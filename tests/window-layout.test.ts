@@ -168,7 +168,7 @@ test('candidate positions use nearest distance and permit overlap', () => {
   assert.equal(new Set(candidates.map((r) => `${r.x}:${r.y}`)).size, candidates.length);
 });
 
-test('three failed positions are bounded despite native frame changes; only real visibility resets recovery', async () => {
+test('three failed positions are bounded within a recovery round despite native frame changes; visibility resets it', async () => {
   const f = fixture(1),
     id = f.ids[0]!;
   await f.service.command({ action: 'configure', settings: enabled });
@@ -196,6 +196,32 @@ test('three failed positions are bounded despite native frame changes; only real
   assert.deepEqual((await f.service.snapshot()).recovery, []);
   await f.service.recover(id, () => {});
   assert.equal(f.moves.length, 5);
+});
+
+test('exhausted window recovery stays bounded before 15 seconds and automatically starts another round after cooldown', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const f = fixture(1),
+    id = f.ids[0]!;
+  await f.service.command({ action: 'configure', settings: enabled });
+  await f.service.arrange(id);
+  for (let i = 0; i < 3; i++) await f.service.recover(id, () => {});
+  await assert.rejects(
+    f.service.recover(id, () => {}),
+    /RECOVERY_EXHAUSTED/,
+  );
+  const moves = f.moves.length;
+  now += 14999;
+  await assert.rejects(
+    f.service.recover(id, () => {}),
+    /RECOVERY_EXHAUSTED/,
+  );
+  assert.equal(f.moves.length, moves);
+  now++;
+  await f.service.recover(id, () => {});
+  assert.equal(f.moves.length, moves + 1);
+  assert.equal((await f.service.snapshot()).recovery[0]?.moves, 1);
+  assert.equal((await f.service.snapshot()).recovery[0]?.state, 'AWAITING_VISIBILITY');
 });
 
 test('disable clears recovery without moving or restoring any window', async () => {

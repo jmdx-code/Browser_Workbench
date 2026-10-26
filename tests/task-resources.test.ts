@@ -48,6 +48,39 @@ const combination = (table = true): Combination => ({
   loop: { mode: 'finite', rounds: 2 },
 });
 const textRow = (text: string) => ({ ...emptyResourceRow(randomUUID()), text });
+
+test('ended resource-table plans can be physically cleaned without losing the original resource version', async () =>
+  fixture(async (store, file) => {
+    const saved = store.createCombination(combination());
+    store.resourceTables.save(saved.id, 0, [textRow('原始素材保留')]);
+    const runtime = profiles(1);
+    const plan = store.tasks.assign(
+      {
+        requestId: randomUUID(),
+        combinationId: saved.id,
+        version: saved.version,
+        expectedResourceRevision: 1,
+        profileIds: runtime.map((p) => p.id),
+      },
+      runtime,
+    )[0];
+    assert.ok(plan);
+    store.tasks.requestControl(plan.id, 'stop');
+    const steps = store.tasks.steps(plan.id);
+    assert.equal(store.dataCleanup.removeBatch({ stepIds: steps.map((s) => s.id) }), steps.length);
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      assert.equal(
+        db.prepare('SELECT count(*) n FROM task_resource_bindings WHERE job_id=?').get(plan.id)?.n,
+        0,
+      );
+      assert.equal(db.prepare('SELECT count(*) n FROM task_plans WHERE id=?').get(plan.id)?.n, 0);
+      assert.equal(store.resourceTables.readVersion(saved.id, 1).rows[0]?.text, '原始素材保留');
+      assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    } finally {
+      db.close();
+    }
+  }));
 async function fixture(run: (store: WorkspaceStore, file: string) => Promise<void> | void) {
   const dir = await mkdtemp(path.join(tmpdir(), 'wb-task-resources-')),
     file = path.join(dir, 'workspace.sqlite');
