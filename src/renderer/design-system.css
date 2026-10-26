@@ -2835,3 +2835,66 @@ code {
   background: var(--err-soft);
   border-color: var(--err);
 }
+
+.group-inviter-matrix {
+  user-select: none;
+}
+.group-inviter-matrix td.in-range {
+  background: #e8f1ff;
+}
+.group-inviter-matrix td.active-anchor {
+  position: relative;
+  box-shadow: inset 0 0 0 2px var(--brand, #3275e9);
+  z-index: 1;
+}
+.group-inviter-matrix th button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: inherit;
+  padding: 0;
+  cursor: pointer;
+  font-weight: inherit;
+}
+.group-inviter-matrix .group-row-number {
+  text-align: center;
+  background: var(--surface-2);
+  color: var(--text-3);
+  cursor: cell;
+  font-weight: 400;
+}
+.group-inviter-matrix td[role='gridcell'] {
+  padding: 0;
+  cursor: cell;
+}
+.group-cell-value {
+  height: 34px;
+  line-height: 34px;
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.group-inviter-selection-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: var(--fs-xs);
+}
+.group-inviter-selection-toolbar > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.group-inviter-selection-toolbar > div:first-child {
+  justify-content: space-between;
+  color: var(--text-3);
+}
+.group-inviter-grid-scroll:focus {
+  outline: none;
+}
+.group-inviter-matrix thead th {
+  z-index: 2;
+}

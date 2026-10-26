@@ -7,7 +7,113 @@ import { randomUUID } from 'node:crypto';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { buildStaggeredGroupQueues } from '../src/application/group-inviter-service.js';
 import type { InviterGroupRow } from '../src/shared/group-inviter.js';
-import { extractGroupId, applyGroupGridPaste } from '../src/renderer/group-inviter-grid.js';
+import {
+  extractGroupId,
+  applyGroupGridPaste,
+  parseGroupClipboard,
+  clearGroupGridRange,
+  deleteGroupGridRows,
+  formatGroupGridRangeForClipboard,
+} from '../src/renderer/group-inviter-grid.js';
+
+const multilineGroupNames = [
+  'ဘုရားသခင်ဟာ ကျွန်ုပ်တို့ရဲ့ ခွန်အား ဖြစ်ပါတယ်။',
+  'နာကျင်မှု ကင်းမဲ့သော ဘဝ',
+  'သခင်ယေရှု၏မေတ္တာစကားဝိုင်း',
+  'ဘုရားသခင်၏ ကောင်းချီးမင်္ဂလာများ',
+  'ယေရှုခရစ်တော်၌ ငြိမ်းချမ်းခြင်း',
+];
+const multilineGroupIds = [
+  '536757636094932',
+  '1214231079609464',
+  '899194495400720',
+  '1486049828718193',
+  '535334879184323',
+];
+const excelQuotedMultilineSample = multilineGroupIds
+  .map((id, i) => id + '\t"' + multilineGroupNames[i] + '\n"')
+  .join('\r\n');
+
+test('real Burmese quoted multiline TSV stays five aligned rows from A, B or separately pasted columns', () => {
+  let id = 0;
+  const create = (groupId = '', groupName = '') => ({ key: String(++id), groupId, groupName });
+  const expected = multilineGroupIds.map((groupId, i) => [groupId, multilineGroupNames[i]]);
+  assert.deepEqual(parseGroupClipboard(excelQuotedMultilineSample), expected);
+  for (const col of [0, 1] as const) {
+    const rows = applyGroupGridPaste([create()], 0, col, excelQuotedMultilineSample, create);
+    assert.equal(rows.length, 5);
+    assert.deepEqual(
+      rows.map((r) => [r.groupId, r.groupName]),
+      expected,
+    );
+  }
+  const ids = applyGroupGridPaste([create()], 0, 0, multilineGroupIds.join('\r\n'), create);
+  const split = applyGroupGridPaste(
+    ids,
+    0,
+    1,
+    multilineGroupNames.map((name) => '"' + name + '\n"').join('\r\n'),
+    create,
+  );
+  assert.equal(split.length, 5);
+  assert.deepEqual(
+    split.map((r) => [r.groupId, r.groupName]),
+    expected,
+  );
+  for (const row of split)
+    assert.ok(
+      !row.groupName.startsWith('"') &&
+        !row.groupName.endsWith('"') &&
+        !/[\r\n]/.test(row.groupName),
+    );
+});
+
+test('group clipboard unescapes quotes, folds internal CRLF, trims empty borders and tolerates unclosed plain text', () => {
+  assert.deepEqual(parseGroupClipboard('\r\n\t\r\n123\t"hello ""friend""\r\n there"\r\n'), [
+    ['123', 'hello "friend" there'],
+  ]);
+  assert.deepEqual(parseGroupClipboard('"unfinished\ntext'), [['unfinished text']]);
+});
+
+test('group range clearing, deletion, TSV copy and single-value multirow fill are immutable', () => {
+  let id = 0;
+  const create = (groupId = '', groupName = '') => ({ key: String(++id), groupId, groupName });
+  const rows = [create('123', 'first'), create('456', 'second'), create('789', 'third')];
+  assert.deepEqual(
+    clearGroupGridRange(rows, 1, 2, 1, 1).map((r) => [r.groupId, r.groupName]),
+    [
+      ['123', 'first'],
+      ['456', ''],
+      ['789', ''],
+    ],
+  );
+  assert.deepEqual(
+    clearGroupGridRange(rows, 0, 1, 0, 0).map((r) => r.groupId),
+    ['', '', '789'],
+  );
+  assert.deepEqual(
+    clearGroupGridRange(rows, 0, 1, 0, 1).map((r) => [r.groupId, r.groupName]),
+    [
+      ['', ''],
+      ['', ''],
+      ['789', 'third'],
+    ],
+  );
+  assert.equal(deleteGroupGridRows(rows, 0, 1, create)[0]?.groupId, '789');
+  assert.deepEqual(
+    deleteGroupGridRows(rows, 0, 2, create).map((r) => [r.groupId, r.groupName]),
+    [['', '']],
+  );
+  assert.equal(formatGroupGridRangeForClipboard(rows, 0, 1, 0, 1), '123\tfirst\n456\tsecond');
+  assert.deepEqual(
+    applyGroupGridPaste(rows, 0, 1, 'same', create, 2, 1).map((r) => r.groupName),
+    ['same', 'same', 'same'],
+  );
+  assert.deepEqual(
+    rows.map((r) => r.groupName),
+    ['first', 'second', 'third'],
+  );
+});
 
 test('group grid extracts numeric IDs and slugs from Facebook URLs without altering plain IDs', () => {
   assert.equal(

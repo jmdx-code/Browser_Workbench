@@ -1,12 +1,439 @@
+import { copyTextToClipboard } from './clipboard.js';
 import { useEffect, useRef, useState } from 'react';
 import type { GroupInviterState, InviterGroupRow } from '../shared/group-inviter.js';
 import { selectionState, toggleSet } from './selection.js';
 import { IconClose, IconPlay, IconPlus, IconSearch, IconStop } from './icons.js';
 
+type GridColumn = 0 | 1;
+type GridRange = { r1: number; c1: GridColumn; r2: number; c2: GridColumn };
+type GridEdit = { r: number; c: GridColumn; value: string };
+
+function GroupDraftGrid({
+  rows,
+  onChange,
+  disabled,
+  onError,
+}: {
+  rows: DraftGroupEntry[];
+  onChange: (rows: DraftGroupEntry[]) => void;
+  disabled: boolean;
+  onError: (message: string) => void;
+}) {
+  const [range, setRange] = useState<GridRange>({ r1: 0, c1: 0, r2: 0, c2: 0 });
+  const rangeRef = useRef(range),
+    rowsRef = useRef(rows),
+    gridRef = useRef<HTMLDivElement>(null);
+  const [undo, setUndo] = useState<DraftGroupEntry[][]>([]);
+  const [editing, setEditing] = useState<GridEdit | null>(null);
+  const editingRef = useRef<GridEdit | null>(null),
+    dragging = useRef<'cells' | 'rows' | null>(null);
+  const bounds = {
+    minRow: Math.min(range.r1, range.r2),
+    maxRow: Math.max(range.r1, range.r2),
+    minCol: Math.min(range.c1, range.c2) as GridColumn,
+    maxCol: Math.max(range.c1, range.c2) as GridColumn,
+  };
+  const focusGrid = () => requestAnimationFrame(() => gridRef.current?.focus());
+  function select(next: GridRange) {
+    rangeRef.current = next;
+    setRange(next);
+  }
+  function editRows(next: DraftGroupEntry[], remember = true) {
+    if (JSON.stringify(next) === JSON.stringify(rowsRef.current)) return;
+    const previous = rowsRef.current.map((row) => ({ ...row }));
+    if (remember) setUndo((prev) => [...prev, previous].slice(-10));
+    rowsRef.current = next;
+    onChange(next);
+  }
+  function finishEdit(advance = false) {
+    const current = editingRef.current;
+    if (!current) return;
+    editingRef.current = null;
+    setEditing(null);
+    let next = rowsRef.current.map((row, r) =>
+      r === current.r
+        ? {
+            ...row,
+            [current.c === 0 ? 'groupId' : 'groupName']:
+              current.c === 0 ? extractGroupId(current.value) : current.value,
+          }
+        : row,
+    );
+    if (advance && current.r === next.length - 1) next = [...next, makeDraftRow()];
+    editRows(next);
+    if (advance) select({ r1: current.r + 1, c1: current.c, r2: current.r + 1, c2: current.c });
+  }
+  function startEdit(r: number, c: GridColumn, value?: string) {
+    if (disabled) return;
+    finishEdit();
+    const row = rowsRef.current[r];
+    if (!row) return;
+    select({ r1: r, c1: c, r2: r, c2: c });
+    const next = { r, c, value: value ?? (c === 0 ? row.groupId : row.groupName) };
+    editingRef.current = next;
+    setEditing(next);
+  }
+  function beginRange(r: number, c: GridColumn, shift: boolean, mode: 'cells' | 'rows') {
+    if (disabled) return;
+    finishEdit();
+    dragging.current = mode;
+    const old = rangeRef.current;
+    select({
+      r1: shift ? old.r1 : r,
+      c1: mode === 'rows' ? 0 : shift ? old.c1 : c,
+      r2: r,
+      c2: mode === 'rows' ? 1 : c,
+    });
+    focusGrid();
+  }
+  function extendRange(r: number, c: GridColumn) {
+    if (!dragging.current) return;
+    select({ ...rangeRef.current, r2: r, c2: dragging.current === 'rows' ? 1 : c });
+  }
+  useEffect(() => {
+    const end = () => {
+      dragging.current = null;
+    };
+    window.addEventListener('pointerup', end);
+    return () => window.removeEventListener('pointerup', end);
+  }, []);
+  function clearSelection() {
+    finishEdit();
+    editRows(
+      clearGroupGridRange(
+        rowsRef.current,
+        bounds.minRow,
+        bounds.maxRow,
+        bounds.minCol,
+        bounds.maxCol,
+      ),
+    );
+    focusGrid();
+  }
+  function deleteRows(minRow = bounds.minRow, maxRow = bounds.maxRow) {
+    finishEdit();
+    const next = deleteGroupGridRows(rowsRef.current, minRow, maxRow, makeDraftRow);
+    editRows(next);
+    const r = Math.min(minRow, next.length - 1);
+    select({ r1: r, c1: 0, r2: r, c2: 1 });
+    focusGrid();
+  }
+  function undoEdit() {
+    const previous = undo.at(-1);
+    if (!previous) return;
+    editingRef.current = null;
+    setEditing(null);
+    editRows(previous, false);
+    setUndo(undo.slice(0, -1));
+    const r = Math.min(rangeRef.current.r1, previous.length - 1);
+    select({ r1: r, c1: rangeRef.current.c1, r2: r, c2: rangeRef.current.c1 });
+    focusGrid();
+  }
+  function pasteGrid(text: string) {
+    editingRef.current = null;
+    setEditing(null);
+    editRows(
+      applyGroupGridPaste(
+        rowsRef.current,
+        bounds.minRow,
+        bounds.minCol,
+        text,
+        makeDraftRow,
+        bounds.maxRow,
+        bounds.maxCol,
+      ),
+    );
+    focusGrid();
+  }
+  function gridKey(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (disabled || editingRef.current || event.nativeEvent.isComposing || event.keyCode === 229)
+      return;
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+      event.preventDefault();
+      undoEdit();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+      event.preventDefault();
+      void copyTextToClipboard(
+        formatGroupGridRangeForClipboard(
+          rowsRef.current,
+          bounds.minRow,
+          bounds.maxRow,
+          bounds.minCol,
+          bounds.maxCol,
+        ),
+      ).catch((error) => onError(error instanceof Error ? error.message : '复制失败'));
+      return;
+    }
+    if (event.key === 'Delete' || event.key === 'Backspace') {
+      event.preventDefault();
+      clearSelection();
+      return;
+    }
+    if (event.key === 'Enter' || event.key === 'F2') {
+      event.preventDefault();
+      startEdit(range.r1, range.c1);
+      return;
+    }
+    const deltas: Record<string, [number, number]> = {
+      ArrowUp: [-1, 0],
+      ArrowDown: [1, 0],
+      ArrowLeft: [0, -1],
+      ArrowRight: [0, 1],
+    };
+    const delta = deltas[event.key];
+    if (delta) {
+      event.preventDefault();
+      const old = rangeRef.current,
+        r = Math.max(
+          0,
+          Math.min(rowsRef.current.length - 1, (event.shiftKey ? old.r2 : old.r1) + delta[0]),
+        ),
+        c = Math.max(0, Math.min(1, (event.shiftKey ? old.c2 : old.c1) + delta[1])) as GridColumn;
+      select(event.shiftKey ? { ...old, r2: r, c2: c } : { r1: r, c1: c, r2: r, c2: c });
+      return;
+    }
+    if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      startEdit(range.r1, range.c1, event.key);
+    }
+  }
+  return (
+    <>
+      <div className="group-inviter-selection-toolbar">
+        <div>
+          <span>
+            当前选区：{bounds.minCol === 0 ? 'A' : 'B'}
+            {bounds.minRow + 1}:{bounds.maxCol === 0 ? 'A' : 'B'}
+            {bounds.maxRow + 1}（{bounds.maxRow - bounds.minRow + 1}行×
+            {bounds.maxCol - bounds.minCol + 1}列）
+          </span>
+          <span>
+            已填有效小组 {rows.filter((row) => row.groupId.trim() && row.groupName.trim()).length}{' '}
+            个
+          </span>
+        </div>
+        <div>
+          <button type="button" className="btn btn-sm" disabled={disabled} onClick={clearSelection}>
+            清空选区 (Del)
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={disabled}
+            onClick={() => deleteRows()}
+          >
+            删除所涉整行
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={disabled || !undo.length}
+            onClick={undoEdit}
+          >
+            撤销 (Ctrl+Z)
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={disabled}
+            onClick={() => {
+              finishEdit();
+              editRows([...rowsRef.current, makeDraftRow()]);
+            }}
+          >
+            ＋ 新增一行
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={disabled}
+            onClick={() => {
+              editingRef.current = null;
+              setEditing(null);
+              editRows(Array.from({ length: 5 }, () => makeDraftRow()));
+              select({ r1: 0, c1: 0, r2: 0, c2: 0 });
+            }}
+          >
+            清空表格
+          </button>
+        </div>
+      </div>
+      <div
+        ref={gridRef}
+        className="group-inviter-grid-scroll"
+        tabIndex={0}
+        aria-label="小组表格选区"
+        onKeyDown={gridKey}
+        onPaste={(event) => {
+          if (disabled || editingRef.current) return;
+          event.preventDefault();
+          pasteGrid(event.clipboardData.getData('text/plain'));
+        }}
+        onCopy={(event) => {
+          if (editingRef.current) return;
+          event.preventDefault();
+          event.clipboardData.setData(
+            'text/plain',
+            formatGroupGridRangeForClipboard(
+              rowsRef.current,
+              bounds.minRow,
+              bounds.maxRow,
+              bounds.minCol,
+              bounds.maxCol,
+            ),
+          );
+        }}
+      >
+        <table className="group-inviter-matrix" role="table" aria-label="添加小组两列表格">
+          <colgroup>
+            <col style={{ width: 40 }} />
+            <col style={{ width: '38%' }} />
+            <col style={{ width: 'calc(62% - 76px)' }} />
+            <col style={{ width: 36 }} />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>
+                <button
+                  type="button"
+                  aria-label="选择全部单元格"
+                  onClick={() => {
+                    finishEdit();
+                    select({ r1: 0, c1: 0, r2: rows.length - 1, c2: 1 });
+                    focusGrid();
+                  }}
+                >
+                  #
+                </button>
+              </th>
+              {([0, 1] as const).map((c) => (
+                <th key={c}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      finishEdit();
+                      select({ r1: 0, c1: c, r2: rows.length - 1, c2: c });
+                      focusGrid();
+                    }}
+                  >
+                    {c === 0 ? 'A · 小组 ID' : 'B · 小组名字'}
+                  </button>
+                </th>
+              ))}
+              <th aria-label="操作" />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, r) => (
+              <tr key={row.key}>
+                <th
+                  className="group-row-number"
+                  onPointerDown={(event) => {
+                    if (event.button !== 0) return;
+                    event.preventDefault();
+                    beginRange(r, 0, event.shiftKey, 'rows');
+                  }}
+                  onPointerEnter={() => extendRange(r, 1)}
+                >
+                  {r + 1}
+                </th>
+                {([0, 1] as const).map((c) => {
+                  const isEditing = editing?.r === r && editing.c === c,
+                    inRange =
+                      r >= bounds.minRow &&
+                      r <= bounds.maxRow &&
+                      c >= bounds.minCol &&
+                      c <= bounds.maxCol;
+                  return (
+                    <td
+                      key={c}
+                      role="gridcell"
+                      data-group-row={r}
+                      data-group-col={c}
+                      aria-selected={inRange}
+                      className={
+                        (inRange ? 'in-range ' : '') +
+                        (range.r1 === r && range.c1 === c ? 'active-anchor' : '')
+                      }
+                      onPointerDown={(event) => {
+                        if (event.button !== 0 || isEditing) return;
+                        event.preventDefault();
+                        beginRange(r, c, event.shiftKey, 'cells');
+                      }}
+                      onPointerEnter={() => extendRange(r, c)}
+                      onDoubleClick={() => startEdit(r, c)}
+                    >
+                      {isEditing ? (
+                        <input
+                          autoFocus
+                          disabled={disabled}
+                          aria-label={`第 ${r + 1} 行小组${c === 0 ? ' ID' : '名字'}`}
+                          value={editing.value}
+                          onChange={(event) => {
+                            const next = { r, c, value: event.target.value };
+                            editingRef.current = next;
+                            setEditing(next);
+                          }}
+                          onBlur={() => finishEdit()}
+                          onPaste={(event) => {
+                            const text = event.clipboardData.getData('text/plain');
+                            if (!isGroupGridPaste(text, c)) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            pasteGrid(text);
+                          }}
+                          onKeyDown={(event) => {
+                            event.stopPropagation();
+                            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              finishEdit(true);
+                              focusGrid();
+                            } else if (event.key === 'Escape') {
+                              event.preventDefault();
+                              editingRef.current = null;
+                              setEditing(null);
+                              focusGrid();
+                            }
+                          }}
+                        />
+                      ) : (
+                        <div className="group-cell-value">
+                          {(c === 0 ? row.groupId : row.groupName) || ' '}
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
+                <td>
+                  <button
+                    type="button"
+                    className="btn btn-icon btn-ghost"
+                    aria-label={`删除第 ${r + 1} 行`}
+                    disabled={disabled}
+                    onClick={() => deleteRows(r, r)}
+                  >
+                    ×
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
 import {
   applyGroupGridPaste,
   extractGroupId,
   isGroupGridPaste,
+  clearGroupGridRange,
+  deleteGroupGridRows,
+  formatGroupGridRangeForClipboard,
   type DraftGroupEntry,
 } from './group-inviter-grid.js';
 export { applyGroupGridPaste, extractGroupId } from './group-inviter-grid.js';
@@ -139,34 +566,6 @@ export function GroupInviterPage({
     setAddingModalOpen(true);
   }
 
-  function handlePasteIntoTable(
-    index: number,
-    column: 0 | 1,
-    event: React.ClipboardEvent<HTMLInputElement>,
-  ) {
-    const text = event.clipboardData.getData('text/plain');
-    if (!isGroupGridPaste(text, column)) return;
-    event.preventDefault();
-    setDraftRows((prev) => applyGroupGridPaste(prev, index, column, text, makeDraftRow));
-  }
-  function moveCell(index: number, column: 0 | 1, event: React.KeyboardEvent<HTMLInputElement>) {
-    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-    const delta =
-      event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' || event.key === 'Enter' ? 1 : 0;
-    if (!delta) return;
-    event.preventDefault();
-    const target = index + delta;
-    if (target < 0) return;
-    if (target >= draftRows.length) {
-      if (event.key !== 'Enter') return;
-      setDraftRows((prev) => [...prev, makeDraftRow()]);
-    }
-    requestAnimationFrame(() =>
-      document
-        .querySelector<HTMLInputElement>(`[data-group-row="${target}"][data-group-col="${column}"]`)
-        ?.focus(),
-    );
-  }
   async function submitAddGroups(event: React.FormEvent) {
     event.preventDefault();
     const collected: Array<{ groupId: string; groupName: string }> = [];
@@ -423,104 +822,12 @@ export function GroupInviterPage({
               支持逐行输入「小组 ID」和「小组名字」两列数据，也支持从 Excel
               或文本直接多行粘贴。保存后会自动拉取小组头像。
             </p>
-            <div className="group-inviter-grid-scroll">
-              <table className="group-inviter-matrix" role="table" aria-label="添加小组两列表格">
-                <colgroup>
-                  <col style={{ width: 40 }} />
-                  <col style={{ width: '38%' }} />
-                  <col style={{ width: 'calc(62% - 76px)' }} />
-                  <col style={{ width: 36 }} />
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>A · 小组 ID</th>
-                    <th>B · 小组名字</th>
-                    <th aria-label="操作" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {draftRows.map((row, idx) => (
-                    <tr key={row.key}>
-                      <td>{idx + 1}</td>
-                      {([0, 1] as const).map((column) => (
-                        <td key={column}>
-                          <input
-                            disabled={submittingAdd}
-                            data-group-row={idx}
-                            data-group-col={column}
-                            aria-label={`第 ${idx + 1} 行小组${column === 0 ? ' ID' : '名字'}`}
-                            placeholder={column === 0 ? '小组 ID 或链接' : '小组名字'}
-                            value={column === 0 ? row.groupId : row.groupName}
-                            onPaste={(event) => handlePasteIntoTable(idx, column, event)}
-                            onKeyDown={(event) => moveCell(idx, column, event)}
-                            onBlur={() => {
-                              if (column === 0)
-                                setDraftRows((prev) =>
-                                  prev.map((r, i) =>
-                                    i === idx ? { ...r, groupId: extractGroupId(r.groupId) } : r,
-                                  ),
-                                );
-                            }}
-                            onChange={(event) => {
-                              const text = event.target.value;
-                              setDraftRows((prev) =>
-                                prev.map((r, i) =>
-                                  i === idx
-                                    ? { ...r, [column === 0 ? 'groupId' : 'groupName']: text }
-                                    : r,
-                                ),
-                              );
-                            }}
-                          />
-                        </td>
-                      ))}
-                      <td>
-                        <button
-                          type="button"
-                          className="btn btn-icon btn-ghost"
-                          aria-label={`删除第 ${idx + 1} 行`}
-                          disabled={submittingAdd}
-                          onClick={() =>
-                            setDraftRows((prev) =>
-                              prev.length === 1 && prev[0]
-                                ? [{ ...prev[0], groupId: '', groupName: '' }]
-                                : prev.filter((_, i) => i !== idx),
-                            )
-                          }
-                        >
-                          ×
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="group-inviter-modal-tools">
-              <div>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={submittingAdd}
-                  onClick={() => setDraftRows((prev) => [...prev, makeDraftRow()])}
-                >
-                  ＋ 新增一行
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={submittingAdd}
-                  onClick={() => setDraftRows(Array.from({ length: 5 }, () => makeDraftRow()))}
-                >
-                  清空表格
-                </button>
-              </div>
-              <span>
-                已填有效小组{' '}
-                {draftRows.filter((row) => row.groupId.trim() && row.groupName.trim()).length} 个
-              </span>
-            </div>
+            <GroupDraftGrid
+              rows={draftRows}
+              onChange={setDraftRows}
+              disabled={submittingAdd}
+              onError={setFormError}
+            />
             {formError && (
               <p className="error-note" role="alert">
                 {formError}
