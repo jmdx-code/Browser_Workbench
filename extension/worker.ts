@@ -20,6 +20,7 @@ import { BridgeCommandQueue } from '../src/application/bridge-command-queue.js';
 import { heartbeatLeaseDeadline } from '../src/shared/bridge-heartbeat.js';
 import { ProfileHeartbeat } from '../src/application/profile-heartbeat.js';
 import { ReconnectBackoff } from '../src/shared/reconnect-backoff.js';
+import { revealBrowserWindow } from './reveal-browser-window.js';
 const journal = new Journal(chrome.storage.local);
 type Owned = {
   tabId: number;
@@ -610,6 +611,24 @@ async function connect() {
             if (deadline === null) throw Error('HEARTBEAT_REJECTED');
             leaseUntil = deadline;
             heartbeat.pulse();
+          } else if (m.type === 'REVEAL_BROWSER_WINDOW') {
+            const requestEpoch = epoch;
+            void revealBrowserWindow().then(
+              (result) =>
+                send({
+                  type: 'BROWSER_WINDOW_REVEALED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  ...result,
+                }),
+              (error) =>
+                send({
+                  type: 'BROWSER_WINDOW_REVEALED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+            );
           } else if (m.type === 'KERNEL_REQUEST') {
             // Do not await a long Runtime call here: STOP must remain processable.
             kernel.receive(m);

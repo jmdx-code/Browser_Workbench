@@ -743,44 +743,8 @@ try {
           repository.tasks,
           async (profileId) => {
             const peer = core.peers.get(profileId);
-            const active = (await repository.tasks.plansForProfile(profileId, ['RUNNING']))[0];
-            const proof = active
-              ? (await repository.taskTabs.forPlan(active.id)).find((row) => row.state === 'READY')
-                  ?.proof
-              : await repository.tasks.retainedTaskPage(profileId);
             if (!peer || !mainKernel) return null;
-            try {
-              // A released historical page may belong to an earlier browser session.
-              if (!active && peer.capabilities?.includes('kernel-workspace-main-proof-v1'))
-                return await mainKernel.revealRegisteredFacebookPage(peer);
-              if (!proof) return null;
-              return await mainKernel.revealOwnedFacebookPage(peer, proof);
-            } catch (error) {
-              const nativeCode =
-                error instanceof Error &&
-                /^(WORKSPACE_REVEAL_[A-Z_]+|KERNEL_[A-Z_]+)$/.test(error.message)
-                  ? error.message
-                  : 'WORKSPACE_REVEAL_UNAVAILABLE';
-              const code =
-                nativeCode === 'KERNEL_PROFILE_NOT_IDLE'
-                  ? 'WORKSPACE_REVEAL_CHANNEL_BUSY'
-                  : nativeCode;
-              console.error(
-                JSON.stringify({
-                  event: 'WORKSPACE_REVEAL_FAILED',
-                  profileId,
-                  code,
-                  trace: mainKernel.diagnostics(profileId).slice(-16),
-                }),
-              );
-              throw new ProductError(
-                code,
-                code === 'WORKSPACE_REVEAL_CHANNEL_BUSY'
-                  ? '控制通道正在建立或检查，请稍后显示原主页面'
-                  : '主工作页暂不能显示，请查看连接状态和具体原因',
-                409,
-              );
-            }
+            return mainKernel.revealRegisteredFacebookPage(peer);
           },
           async (profileId, preferActiveTab = true) => {
             const peer = core.peers.get(profileId);

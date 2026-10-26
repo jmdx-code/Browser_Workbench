@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "浏览器工作台",
-  "version": "0.3.56",
+  "version": "0.3.57",
   "minimum_chrome_version": "125",
   "permissions": ["debugger", "storage", "alarms", "scripting", "tabGroups"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "https://www.facebook.com/*"],

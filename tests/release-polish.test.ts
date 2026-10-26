@@ -284,7 +284,7 @@ test('unconfirmed native stop retains profile until explicit successful retry', 
   assert.equal((await service.state()).running, false);
 });
 
-test('actual adapter refuses old pending operations without sending any resolution or connecting', async () => {
+test('actual adapter attempts orphan cleanup but refuses to connect if the native inventory still reports pending operations', async () => {
   const profileId = randomUUID();
   let connects = 0,
     notifications = 0;
@@ -329,7 +329,7 @@ test('actual adapter refuses old pending operations without sending any resoluti
     }),
     /待核对/,
   );
-  assert.equal(notifications, 0);
+  assert.equal(notifications, 1);
   assert.equal(connects, 0);
 });
 

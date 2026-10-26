@@ -520,7 +520,7 @@ export class KernelBridge implements KernelBridgeHooks {
       peer.phase !== 'PAUSED'
     )
       throw Error('WORKSPACE_CLEANUP_SESSION_RECHECK_REQUIRED');
-    const inventory = await endInvitationSetupOperations(this, peer);
+    const inventory = await endInvitationSetupOperations(this, peer, undefined, true);
     if (inventory.operations.some(kernelOperationPending))
       throw Error('WORKSPACE_CLEANUP_OPERATION_PENDING');
     const idle = this.idlePages.get(peer.profileId);
@@ -605,11 +605,7 @@ export class KernelBridge implements KernelBridgeHooks {
     }
   }
   async revealRegisteredFacebookPage(peer: Peer) {
-    const inventory = await this.withSummary(peer, (port) => port.inventory());
-    if (inventory.operations.some(kernelOperationPending))
-      throw Error('WORKSPACE_REVEAL_SESSION_RECHECK_REQUIRED');
-    if (!inventory.workspaceMain) return null;
-    return this.revealOwnedFacebookPage(peer, inventory.workspaceMain);
+    return this.core.revealBrowserWindow(peer.profileId);
   }
   async revealOwnedFacebookPage(
     peer: Peer,

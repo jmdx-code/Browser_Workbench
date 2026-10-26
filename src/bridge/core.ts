@@ -31,6 +31,47 @@ export type Peer = {
   capabilities?: string[];
 };
 export class Core {
+  private readonly windowRequests = new Map<
+    string,
+    {
+      peer: Peer;
+      finish: (result: { tabId?: number; focused?: boolean; error?: string }) => void;
+    }
+  >();
+  revealBrowserWindow(
+    profileId: string,
+  ): Promise<{ profileId: string; tabId: number; focused: true }> {
+    const peer = this.peers.get(profileId);
+    if (!peer?.online) throw Error('BROWSER_OFFLINE');
+    if (!peer.capabilities?.includes('browser-window-reveal-v1'))
+      throw Error('WORKSPACE_REVEAL_EXTENSION_UPDATE_REQUIRED');
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish({ error: 'WORKSPACE_REVEAL_TIMEOUT' }), 5000);
+      const finish = (result: { tabId?: number; focused?: boolean; error?: string }) => {
+        clearTimeout(timer);
+        this.windowRequests.delete(requestId);
+        if (result.error || !result.tabId || result.focused !== true)
+          reject(Error(result.error ?? 'WORKSPACE_REVEAL_UNCONFIRMED'));
+        else resolve({ profileId, tabId: result.tabId, focused: true });
+      };
+      this.windowRequests.set(requestId, { peer, finish });
+      try {
+        peer.send({ type: 'REVEAL_BROWSER_WINDOW', requestId, connectionEpoch: peer.epoch });
+      } catch (error) {
+        finish({ error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+  windowRevealed(
+    peer: Peer,
+    requestId: string,
+    result: { tabId?: number; focused?: boolean; error?: string },
+  ) {
+    const pending = this.windowRequests.get(requestId);
+    if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online)
+      pending.finish(result);
+  }
   peers = new Map<string, Peer>();
   private readonly kernelOwners = new Map<string, string>();
   private readonly queuedIntents = new Map<string, number>();

@@ -23,18 +23,20 @@ export async function endInvitationSetupOperations(
   kernel: KernelBridge,
   peer: Peer,
   guard: () => Awaitable<void> = () => {},
+  includeOrphans = false,
 ) {
   await guard();
   let inventory = await kernel.withSummary(peer, (port) => port.inventory());
   await guard();
   for (const operation of inventory.operations.filter(kernelOperationPending)) {
     if (
-      !['UNKNOWN', 'ACKNOWLEDGED'].includes(operation.state) ||
-      !setupLabels.some(
-        (label) =>
-          operation.binding.actionDigest ===
-          invitationDigest(label, operation.binding.accountId, operation.binding.operationId),
-      )
+      !includeOrphans &&
+      (!['UNKNOWN', 'ACKNOWLEDGED'].includes(operation.state) ||
+        !setupLabels.some(
+          (label) =>
+            operation.binding.actionDigest ===
+            invitationDigest(label, operation.binding.accountId, operation.binding.operationId),
+        ))
     )
       continue;
     await guard();
@@ -46,7 +48,9 @@ export async function endInvitationSetupOperations(
           .update(
             JSON.stringify({
               binding: operation.binding,
-              reason: 'Non-submit invitation setup ended before workspace reuse',
+              reason: includeOrphans
+                ? 'Idle orphan operation ended; business result remains unknown'
+                : 'Non-submit invitation setup ended before workspace reuse',
             }),
           )
           .digest('hex'),

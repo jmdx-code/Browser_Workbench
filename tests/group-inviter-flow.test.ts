@@ -210,6 +210,7 @@ async function verify(states: GroupInvitationState[]) {
     jobId: randomUUID(),
     stepId: randomUUID(),
     stopId: randomUUID(),
+    pendingSetup: new Map(),
   });
   const call = Reflect.get(adapter, 'execBoundOp') as Function;
   const promise = call.call(
@@ -378,6 +379,7 @@ test('hidden invitation page is activated once and verified before input continu
     jobId: randomUUID(),
     stepId: randomUUID(),
     stopId: randomUUID(),
+    pendingSetup: new Map(),
   });
   await Reflect.get(adapter, 'execBoundOp').call(
     adapter,
@@ -449,6 +451,7 @@ test('native mobile identity verification stops before input or reservation', as
     jobId: randomUUID(),
     stepId: randomUUID(),
     stopId: randomUUID(),
+    pendingSetup: new Map(),
   });
   await assert.rejects(
     Reflect.get(adapter, 'execBoundOp').call(

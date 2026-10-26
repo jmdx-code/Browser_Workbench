@@ -505,8 +505,29 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     check();
     const state = await this.journal.snapshot();
     check();
-    if (state.operations.some((row) => row.state !== 'RECONCILED' && !row.disposition))
-      throw Error('WORKSPACE_CLEANUP_OPERATION_PENDING');
+    if (this.currentOperation()) throw Error('WORKSPACE_CLEANUP_OPERATION_ACTIVE');
+    for (const row of state.operations.filter(
+      (row) => row.state !== 'RECONCILED' && !row.disposition,
+    )) {
+      check();
+      if (row.state === 'DISPATCHING')
+        await this.journal.finish(row.binding, 'UNKNOWN', 'IDLE_WORKSPACE_CLEANUP');
+      await this.journal.endUnknown(row.binding, {
+        id: crypto.randomUUID(),
+        outcome: 'ENDED_UNKNOWN',
+        evidenceDigest: Array.from(
+          new Uint8Array(
+            await crypto.subtle.digest(
+              'SHA-256',
+              new TextEncoder().encode(
+                JSON.stringify({ reason: 'Idle workspace cleanup', binding: row.binding }),
+              ),
+            ),
+          ),
+          (x) => x.toString(16).padStart(2, '0'),
+        ).join(''),
+      });
+    }
     const [windows, allTabs, initialTargets] = await Promise.all([
       typeof chrome.windows?.getAll === 'function'
         ? chrome.windows.getAll({ populate: true, windowTypes: ['normal'] })

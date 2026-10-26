@@ -127,7 +127,6 @@ export function Sidebar({
   const [groupName, setGroupName] = useState('');
   const [creating, setCreating] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null);
-  const [aliasing, setAliasing] = useState<Profile | null>(null);
   const [deleting, setDeleting] = useState<{ id: string; name: string } | null>(null);
   const [deletingProfiles, setDeletingProfiles] = useState<{
     ids: string[];
@@ -287,7 +286,6 @@ export function Sidebar({
                   : '运行中';
     const tooltip = [
       displayName + (observedName ? ' · ' + observedName : ''),
-      '别名：' + profile.alias,
       '连接：' + (phaseNames[profile.phase] ?? profile.phase),
       'FB 状态：' + inspectionText,
       ...(!plan && lastResult && lastStatus
@@ -326,7 +324,7 @@ export function Sidebar({
       {
         label: '显示浏览器窗口',
         icon: <IconWindow />,
-        disabled: busy || !profile.online || !onShow || (!!plan && plan.state !== 'RUNNING'),
+        disabled: !profile.online || !onShow,
         title: profile.online ? '显示这份浏览器的工作页面' : '未连接，请先手动打开浏览器',
         onSelect: () => onShow?.(profile.id),
       },
@@ -352,7 +350,6 @@ export function Sidebar({
               : `未清理：${res.skippedBusy} 个忙碌，${res.skippedOffline} 个离线`;
           }),
       },
-      { label: '修改别名', icon: <IconEdit />, onSelect: () => setAliasing(profile) },
       ...(plan && ['RUNNING', 'QUEUED'].includes(plan.state) && onTaskCommand
         ? [
             { separator: true } as MenuItem,
@@ -835,17 +832,6 @@ export function Sidebar({
           onSubmit={async (name) => {
             await api.renameGroup(renaming.id, name);
             await mutate(async () => undefined);
-          }}
-        />
-      )}
-      {aliasing && (
-        <NameDialog
-          title="浏览器别名"
-          initial={aliasing.alias}
-          onClose={() => setAliasing(null)}
-          onSubmit={async (alias) => {
-            await api.rename(aliasing.id, alias);
-            await mutate(async () => '别名已保存');
           }}
         />
       )}

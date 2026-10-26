@@ -1031,7 +1031,15 @@ test('consolidateWorkspace adopts the active user Facebook tab as workspaceMain 
       'facebook-task',
       () => true,
     );
+    const orphan = binding(profileId);
+    await journal.begin(orphan);
     const result = await backend.consolidateWorkspace(true);
+    assert.equal(
+      (await journal.snapshot()).operations.find(
+        (op) => op.binding.operationId === orphan.operationId,
+      )?.disposition?.outcome,
+      'ENDED_UNKNOWN',
+    );
     assert.equal(result.proof.tabId, 202);
     assert.equal(result.proof.targetId, 'target-202');
     assert.equal(result.url, 'https://www.facebook.com/friends');

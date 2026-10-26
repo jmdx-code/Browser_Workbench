@@ -1,4 +1,8 @@
-import { invitationDigest, prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
+import {
+  invitationDigest,
+  prepareFacebookWorkspace,
+  endInvitationSetupOperations,
+} from './facebook-workspace-preparation.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { randomUUID, createHash } from 'node:crypto';
@@ -17,7 +21,7 @@ import {
   readGroupInvitationState,
   inviteDialogSelector,
 } from './group-inviter-effects.js';
-import type { Page, Request, Response } from 'playwright-core';
+import type { Page, Request, Response, Locator } from 'playwright-core';
 import type { Binding } from '../shared/task-execution.js';
 import type { GroupInvitationState, InvitationMenuItem } from './group-inviter-effects.js';
 
@@ -26,6 +30,31 @@ type Connection = Awaited<ReturnType<KernelBridge['connectFacebook']>>;
 const randInt = (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1));
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export async function clickInvitationControl(
+  button: Locator,
+  validateFallback: () => Promise<boolean>,
+) {
+  await button.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }));
+  await sleep(150);
+  try {
+    await button.click({ timeout: 4000 });
+  } catch (error) {
+    if (!(error instanceof Error) || !/timeout|intercept|outside.*viewport/i.test(error.message))
+      throw error;
+    if (!(await validateFallback())) return;
+    await button.evaluate((el) => {
+      if (
+        !(el instanceof HTMLElement) ||
+        !el.isConnected ||
+        el.getAttribute('aria-disabled') === 'true' ||
+        (el instanceof HTMLButtonElement && el.disabled)
+      )
+        throw Error('GROUP_INVITER_CONTROL_UNAVAILABLE');
+      HTMLElement.prototype.click.call(el);
+    });
+  }
+}
 
 export function mountedInvitationSelectionMatches(
   state: GroupInvitationState,
@@ -407,6 +436,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       stepId: string;
       stopId: string;
       pendingSubmission?: Binding;
+      pendingSetup: Map<string, Binding>;
     }
   >();
   private readonly stopping = new Map<string, { connection: Connection; requestId: string }>();
@@ -636,6 +666,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     };
     await fence();
     await prepare?.(binding.operationId);
+    if (label !== 'send-group-invites') scope.pendingSetup.set(operationId, binding);
     const res = await conn.execute(
       binding,
       async () => {
@@ -764,6 +795,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         .update(JSON.stringify({ binding, label, observed, value: res.value }))
         .digest('hex'),
     });
+    scope.pendingSetup.delete(operationId);
     return res.value;
   }
 
@@ -798,6 +830,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     guard();
     await callbacks.setProfileStatus(profileId, `正在连接 · ${group.groupName.slice(0, 12)}`);
 
+    await endInvitationSetupOperations(kernel, peer, guard, true);
     const prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard);
     guard();
     if (prepared.inventory.operations.some(kernelOperationPending))
@@ -844,6 +877,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         jobId: randomUUID(),
         stepId: randomUUID(),
         stopId: stopRequestId,
+        pendingSetup: new Map(),
       });
 
       const effectiveAccountId = boundAccountId;
@@ -896,9 +930,30 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             '受限 · 需要手机验证或操作受限',
             409,
           );
+        const marked = page.locator('[data-wb-group-invite-btn="1"]').first();
+        if (await marked.count()) return marked;
         return state.inviteButtonIndex === undefined
           ? null
           : page.locator('[role="button"],button').nth(state.inviteButtonIndex);
+      };
+
+      const clickControl = async (button: Locator, validate?: () => Promise<boolean>) => {
+        guard();
+        await clickInvitationControl(button, async () => {
+          guard();
+          const current = await readGroupInvitationState(page, guard);
+          if (current.verificationRequired)
+            throw new ProductError(
+              'GROUP_INVITER_VERIFICATION_REQUIRED',
+              '受限 · 需要手机验证或操作受限',
+              409,
+            );
+          if (!atGroup() || current.accountId !== boundAccountId)
+            throw Error('GROUP_INVITER_CURRENT_GROUP_CHANGED');
+          if (validate && !(await validate())) return false;
+          guard();
+          return true;
+        });
       };
 
       // The URL can arrive before React mounts the group's actions.
@@ -1006,7 +1061,10 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         const click = async () => {
           const button = await inviteButton();
           if (!button) throw Error('GROUP_INVITER_INVITE_ENTRY_REQUIRED');
-          await button.click({ timeout: 15000 });
+          await clickControl(
+            button,
+            async () => !(await readGroupInvitationState(page, guard)).dialog,
+          );
         };
         if (!state.dialog) {
           if (bound) await this.execBoundOp(conn, boundAccountId, 'open-invite-modal', click);
@@ -1041,11 +1099,17 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             if (!entry) throw Error('GROUP_INVITER_INVITE_MENU_CHANGED');
             menuEntry = entry;
             const choose = async () => {
-              await page
+              const button = page
                 .locator('[role="menuitem"]')
                 .filter({ visible: true })
-                .nth(entry.index)
-                .click({ timeout: 5000 });
+                .nth(entry.index);
+              await clickControl(button, async () => {
+                const current = await readGroupInvitationState(page, guard);
+                if (current.dialog) return false;
+                if (current.menuItems?.[entry.index]?.fingerprint !== entry.fingerprint)
+                  throw Error('GROUP_INVITER_INVITE_MENU_CHANGED');
+                return true;
+              });
             };
             if (bound)
               await this.execBoundOp(conn, boundAccountId, 'click-invite-menuitem', choose);
@@ -1118,9 +1182,12 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                     const cbLoc = dialogLocator(state)
                       .locator('[role="checkbox"]')
                       .nth(candidate.index);
-                    await cbLoc.scrollIntoViewIfNeeded();
-                    await sleep(200);
-                    await cbLoc.click({ timeout: 5000 });
+                    await clickControl(cbLoc, async () => {
+                      const current = await readGroupInvitationState(page, guard);
+                      if (current.items[candidate.index]?.id !== candidate.friendId)
+                        throw Error('GROUP_INVITER_RECIPIENT_CHANGED');
+                      return !current.items[candidate.index]?.checked;
+                    });
                     await sleep(300);
                     return (await cbLoc.evaluate(
                       (el) => el.getAttribute('aria-checked') === 'true',
@@ -1402,6 +1469,26 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       const requestId = stopRequestId;
       try {
         await conn.close(requestId);
+        for (const binding of this.scopes.get(conn)?.pendingSetup.values() ?? []) {
+          const inventory = await kernel.withSummary(peer, (port) => port.inventory());
+          if (
+            !inventory.operations.some(
+              (op) => op.binding.operationId === binding.operationId && kernelOperationPending(op),
+            )
+          )
+            continue;
+          await kernel.withSummary(peer, (port) =>
+            port.notify(binding, {
+              id: randomUUID(),
+              outcome: 'ENDED_UNKNOWN',
+              evidenceDigest: invitationDigest(
+                'Non-submit setup ended',
+                boundAccountId,
+                binding.operationId,
+              ),
+            }),
+          );
+        }
         const pending = this.scopes.get(conn)?.pendingSubmission;
         if (pending)
           await kernel.withSummary(peer, (port) =>

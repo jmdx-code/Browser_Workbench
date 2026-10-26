@@ -275,11 +275,15 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
         ),
     );
   const pageButtons = Array.from(document.querySelectorAll('[role="button"],button'));
+  document
+    .querySelectorAll('[data-wb-group-invite-btn]')
+    .forEach((el) => el.removeAttribute('data-wb-group-invite-btn'));
   const invite = pageButtons.findIndex(
     (el) =>
       visible(el) &&
       chain(el, 24).some((f) => f.name.includes('GroupsCometHeaderInviteMemberAddButton')),
   );
+  if (invite >= 0) pageButtons[invite]?.setAttribute('data-wb-group-invite-btn', '1');
   const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
   const menuItems = menus.map((el, index) => ({
     index,

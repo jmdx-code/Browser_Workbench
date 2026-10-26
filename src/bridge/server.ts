@@ -613,6 +613,17 @@ export async function startBridgeServer(options: BridgeServerOptions) {
             .strict()
             .parse(m);
           await core.reply(peer, result as Reply);
+        } else if (m.type === 'BROWSER_WINDOW_REVEALED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const reply = z
+            .object({
+              requestId: z.string().uuid(),
+              tabId: z.number().int().positive().optional(),
+              focused: z.boolean().optional(),
+              error: z.string().max(500).optional(),
+            })
+            .parse(m);
+          core.windowRevealed(peer, reply.requestId, reply);
         } else if (m.type === 'LOCAL_STOP') {
           await core.stop(peer.profileId);
         } else if (['STOPPED', 'RESUMED', 'SYNC_STATE'].includes(m.type)) {

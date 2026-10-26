@@ -370,43 +370,22 @@ test('idle main display uses native ownership without SDK, attachment, creation 
   }
 });
 
-test('idle display resolves the current native main instead of an earlier released page', async () => {
+test('explicit display uses independent window presentation even without a registered task proof', async () => {
   const f = await fixture();
   try {
-    f.peer.capabilities?.push('kernel-owned-page-reveal-v1', 'facebook-task-kernel-v1');
-    assert.equal(await f.kernel.revealRegisteredFacebookPage(f.peer), null);
-    assert.deepEqual(f.requests, ['open', 'inventory', 'stop']);
-    f.requests.length = 0;
-    const proof = {
-      profileId: f.id,
-      browserSessionEpoch: f.inventory.browserSessionEpoch,
-      ownershipId: randomUUID(),
-      tabId: 77,
-      targetId: 'current-browser-main',
-    };
-    f.inventory.workspaceMain = proof;
-    f.inventory.tabs.push({
-      ownershipId: proof.ownershipId,
-      proof,
-      state: 'READY',
-      url: 'https://www.facebook.com/',
-      reason: '',
+    let reveals = 0;
+    Reflect.set(Reflect.get(f.kernel, 'core'), 'revealBrowserWindow', async (id: string) => {
+      assert.equal(id, f.id);
+      reveals++;
+      return { profileId: id, tabId: 77, focused: true as const };
     });
     assert.deepEqual(await f.kernel.revealRegisteredFacebookPage(f.peer), {
       profileId: f.id,
       tabId: 77,
       focused: true,
     });
-    assert.deepEqual(f.requests, [
-      'open',
-      'inventory',
-      'stop',
-      'open',
-      'inventory',
-      'adopt',
-      'revealOwnedPage',
-      'stop',
-    ]);
+    assert.equal(reveals, 1);
+    assert.deepEqual(f.requests, []);
   } finally {
     await f.close();
   }

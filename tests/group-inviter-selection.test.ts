@@ -86,7 +86,12 @@ for (const failure of ['cancel-after-selection', 'reserve-error'])
     let cancelled = false,
       closed = 0,
       reservations = 0;
-    const locator = { first: () => locator, nth: () => locator, isVisible: async () => true };
+    const locator = {
+      first: () => locator,
+      count: async () => 1,
+      nth: () => locator,
+      isVisible: async () => true,
+    };
     const state = {
       url: `https://www.facebook.com/groups/${groupId}/`,
       accountId,

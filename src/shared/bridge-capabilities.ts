@@ -35,6 +35,7 @@ export const bridgeCapabilities = [
   'workspace-main-group-v1',
   'kernel-stopped-main-reobserve-v1',
   'kernel-owned-page-reveal-v1',
+  'browser-window-reveal-v1',
   'kernel-workspace-main-proof-v1',
   'kernel-workspace-cleanup-v1',
   'kernel-background-presentation-v1',
@@ -53,6 +54,7 @@ export function bridgeHelloCapabilities(supported: unknown) {
         'task-window-passive-layout-v1',
         'kernel-direct-operation-files-v1',
         'kernel-control-release-v1',
+        'browser-window-reveal-v1',
       ].includes(value) ||
         (Array.isArray(supported) && supported.includes(value))) &&
       (value !== 'task-presentation-recovery-v1' || recovery) &&

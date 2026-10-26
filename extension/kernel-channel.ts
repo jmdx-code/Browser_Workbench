@@ -529,6 +529,11 @@ export class ExtensionKernelChannel {
           request.connectionEpoch !== this.context().epoch
         )
           throw Error('KERNEL_END_STOP_UNCONFIRMED');
+        const orphan = (await this.journal.snapshot()).operations.find(
+          (row) => row.binding.operationId === request.binding.operationId,
+        );
+        if (orphan?.state === 'DISPATCHING')
+          await this.journal.finish(request.binding, 'UNKNOWN', 'IDLE_ORPHAN_ENDED');
         await this.journal.endUnknown(request.binding, request.disposition);
         return KernelJsonObject.parse({
           ended: true,
