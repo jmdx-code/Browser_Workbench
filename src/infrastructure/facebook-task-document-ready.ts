@@ -3,7 +3,11 @@ import type { KernelExecutor } from '../application/kernel-executor.js';
 import { KernelJsonObject } from '../shared/kernel-protocol.js';
 import { sameFacebookNativeResultUrl } from '../shared/facebook-result-route.js';
 import { FacebookBrowseURL } from '../shared/browser-actions.js';
-import { facebookMarketplaceUnavailableURL } from '../shared/facebook-browse-route.js';
+import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
+import {
+  classifyFacebookAbnormalUrl,
+  facebookMarketplaceUnavailableURL,
+} from '../shared/facebook-browse-route.js';
 
 export const FACEBOOK_TASK_DOCUMENT_READ =
   'JSON.stringify({url:location.href,ready:document.readyState})';
@@ -36,16 +40,22 @@ export async function awaitFacebookTaskDocument(
       scope: 'home' | 'initial-blank' | 'other';
       ready: string;
       url?: string;
-    }) => void;
+    }) => Awaitable<void>;
     expectedUrl?: string;
     retainedPage?: boolean;
+    allowTargetBrowseUrl?: boolean;
   } = {},
 ) {
   const now = options.now ?? Date.now,
     wait = options.wait ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 200))),
     started = now(),
     expectedUrl = options.expectedUrl ?? 'https://www.facebook.com/';
+  const allowedBrowseRoute =
+    options.allowTargetBrowseUrl === true &&
+    kernelFacebookReadURL(expectedUrl) &&
+    !classifyFacebookAbnormalUrl(expectedUrl);
   if (
+    !allowedBrowseRoute &&
     ![
       'https://www.facebook.com/',
       'https://www.facebook.com/post/create',
@@ -78,6 +88,9 @@ export async function awaitFacebookTaskDocument(
       const scope =
         typeof document.url === 'string' &&
         (sameFacebookNativeResultUrl(document.url, expectedUrl) ||
+          (options.allowTargetBrowseUrl === true &&
+            kernelFacebookReadURL(document.url) &&
+            !classifyFacebookAbnormalUrl(document.url)) ||
           (options.retainedPage === true &&
             (FacebookBrowseURL.safeParse(document.url).success ||
               facebookMarketplaceUnavailableURL(document.url) ||
@@ -91,12 +104,17 @@ export async function awaitFacebookTaskDocument(
           : document.url === 'about:blank' && !homeSeen
             ? 'initial-blank'
             : 'other';
-      options.observe?.({
+      const currentUrl = typeof document.url === 'string' ? document.url : '';
+      await options.observe?.({
         scope,
         ready: typeof document.ready === 'string' ? document.ready : 'unknown',
-        url: typeof document.url === 'string' ? document.url : '',
+        url: currentUrl,
       });
-      if (scope === 'other') throw Error('FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED');
+      if (scope === 'other') {
+        const abnormal = classifyFacebookAbnormalUrl(currentUrl);
+        if (abnormal) throw Error(abnormal);
+        throw Error('FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED');
+      }
 
       if (scope === 'home') homeSeen = true;
       // The SDK needs a parsed document, not every third-party subresource's load event.

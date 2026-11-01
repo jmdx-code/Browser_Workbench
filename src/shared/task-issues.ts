@@ -71,6 +71,22 @@ const reasons: Record<string, { summary: string; next: string }> = {
   },
   USER_STOP: { summary: '用户请求停止任务', next: '以浏览器停止确认为准；原操作不会重放。' },
   USER_PAUSE: { summary: '用户请求暂停任务', next: '确认暂停后继续，保留原版本、顺序和进度。' },
+  SOFTWARE_RESTART_STOPPED: {
+    summary: '软件重启，未完成任务已自动结束',
+    next: '保留已完成的步骤进度与记录；不会自动重放中断操作。',
+  },
+  SOFTWARE_RESTART_BROWSE_CANCELLED: {
+    summary: '软件重启，未完成任务已自动结束',
+    next: '保留已完成的步骤进度与记录；不会自动重放中断操作。',
+  },
+  BROWSER_OFFLINE_STOPPED: {
+    summary: '浏览器已关闭或离线超时，任务自动结束',
+    next: '保留已完成的步骤进度与记录；重新打开浏览器后可安排新任务。',
+  },
+  OFFLINE_BROWSE_CANCELLED: {
+    summary: '浏览器离线，任务已结束',
+    next: '保留已完成的步骤进度与记录；不会自动重放中断操作。',
+  },
   SOFTWARE_RESTART: {
     summary: '软件重启后任务已暂停',
     next: '先核对浏览器和任务记录；不会自动重放中断操作。',

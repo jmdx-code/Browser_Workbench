@@ -41,6 +41,8 @@ const group = {
   groupId: '1234567890',
   groupName: 'Test group',
   avatarUrl: null,
+  folderId: null,
+  sortOrder: 0,
   totalInvitedCount: 0,
   createdAt: 1,
   updatedAt: 1,

@@ -21,6 +21,7 @@ import {
   readGroupInvitationState,
   inviteDialogSelector,
 } from './group-inviter-effects.js';
+import { parseTargetMetadataFromHtml, resolveBumperTargetMetadata } from './group-bumper-avatar.js';
 import type { Page, Request, Response, Locator } from 'playwright-core';
 import type { Binding } from '../shared/task-execution.js';
 import type { GroupInvitationState, InvitationMenuItem } from './group-inviter-effects.js';
@@ -251,18 +252,31 @@ async function scrollInvitationList(page: Page, state: GroupInvitationState) {
   return page.evaluate((index) => {
     const d = document.querySelectorAll('[role="dialog"]')[index];
     if (!d) return false;
-    const candidates = [d, ...Array.from(d.querySelectorAll('div'))];
-    const scroller = candidates.find((el) => {
+    const allDivs = [d, ...Array.from(d.querySelectorAll('div'))];
+    const scrollable = allDivs.filter((el) => {
       const s = getComputedStyle(el);
       return (
-        /auto|scroll/.test(s.overflowY) &&
-        el.scrollHeight > el.clientHeight &&
-        !!el.querySelector('[role="checkbox"]')
+        (/auto|scroll/.test(s.overflowY) || el.scrollHeight > el.clientHeight + 4) &&
+        el.clientHeight > 0 &&
+        el.scrollHeight > el.clientHeight
       );
     });
+    const withItems = scrollable.filter((el) =>
+      Boolean(el.querySelector('[role="checkbox"],[role="listitem"],[role="row"]')),
+    );
+    const pool = withItems.length > 0 ? withItems : scrollable;
+    pool.sort((a, b) => {
+      const cbDiff =
+        b.querySelectorAll('[role="checkbox"]').length -
+        a.querySelectorAll('[role="checkbox"]').length;
+      if (cbDiff !== 0) return cbDiff;
+      return b.scrollHeight - b.clientHeight - (a.scrollHeight - a.clientHeight);
+    });
+    const scroller = pool[0];
     if (!scroller) return false;
     const before = scroller.scrollTop;
     scroller.scrollTop += Math.max(100, scroller.clientHeight * 0.75);
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
     return scroller.scrollTop !== before;
   }, state.dialogIndex);
 }
@@ -473,57 +487,34 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     group: InviterGroupRow,
     allowIdleBrowser: boolean,
   ): Promise<string | null> {
-    const crawled = await this.crawlGroupAvatarViaHttp(group.groupId);
-    if (crawled) return crawled;
-    if (allowIdleBrowser) {
-      return this.fetchGroupAvatarViaIdleBrowser(group);
-    }
-    return null;
+    const meta = await this.resolveGroupMetadata(group, allowIdleBrowser);
+    return meta.avatarUrl ?? null;
   }
 
-  private async crawlGroupAvatarViaHttp(groupId: string): Promise<string | null> {
-    const urls = [
-      `https://www.facebook.com/groups/${encodeURIComponent(groupId)}/`,
-      `https://mbasic.facebook.com/groups/${encodeURIComponent(groupId)}/`,
-    ];
-    for (const url of urls) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 6000);
-        try {
-          const res = await fetch(url, {
-            headers: {
-              'User-Agent':
-                'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-              Accept: 'text/html,application/xhtml+xml',
-            },
-            signal: controller.signal,
-          });
-          if (!res.ok) continue;
-          const html = await res.text();
-          const ogMatch =
-            html.match(/property=["']og:image["'][^>]*content=["']([^"']+)["']/i)?.[1] ??
-            html.match(/content=["']([^"']+)["'][^>]*property=["']og:image["']/i)?.[1];
-          if (ogMatch && ogMatch.startsWith('https://')) {
-            return ogMatch.replace(/&amp;/g, '&');
-          }
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch {
-        // Try next URL
-      }
+  async resolveGroupMetadata(
+    group: InviterGroupRow,
+    allowIdleBrowser: boolean,
+  ): Promise<{ groupName?: string | null; avatarUrl?: string | null }> {
+    const httpMeta = await resolveBumperTargetMetadata('groups', group.groupId);
+    let groupName = httpMeta.name;
+    let avatarUrl = httpMeta.avatarUrl;
+    if ((!groupName || !avatarUrl) && allowIdleBrowser) {
+      const idleMeta = await this.fetchGroupMetadataViaIdleBrowser(group);
+      groupName ??= idleMeta.groupName ?? null;
+      avatarUrl ??= idleMeta.avatarUrl ?? null;
     }
-    return null;
+    return { groupName, avatarUrl };
   }
 
-  private async fetchGroupAvatarViaIdleBrowser(group: InviterGroupRow): Promise<string | null> {
+  private async fetchGroupMetadataViaIdleBrowser(
+    group: InviterGroupRow,
+  ): Promise<{ groupName: string | null; avatarUrl: string | null }> {
     const kernel = this.getKernel();
     const core = this.getCore();
-    if (!kernel || !core) return null;
+    if (!kernel || !core) return { groupName: null, avatarUrl: null };
 
     const peer = [...core.peers.values()].find((p) => p.online && p.synced && p.phase === 'PAUSED');
-    if (!peer) return null;
+    if (!peer) return { groupName: null, avatarUrl: null };
 
     try {
       const inv = await kernel.withSummary(peer, (port) => port.inventory());
@@ -532,11 +523,11 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         (inv.workspaceMain &&
           readyTabs.find((t) => t.proof?.ownershipId === inv.workspaceMain?.ownershipId)?.proof) ||
         readyTabs[0]?.proof;
-      if (!mainProof) return null;
+      if (!mainProof) return { groupName: null, avatarUrl: null };
 
       const accountId = await this.getProfileAccountId(peer.profileId);
       if (!accountId || !/^\d{5,25}$/.test(accountId) || (await this.isProfileBusy(peer.profileId)))
-        return null;
+        return { groupName: null, avatarUrl: null };
       const conn = await kernel.connectFacebook(
         peer,
         accountId,
@@ -549,24 +540,48 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       const activeProof = conn.proof || mainProof;
       try {
         const page = conn.browser.contexts()[0]?.pages()[0];
-        if (!page) return null;
-        const existingImg = await page.evaluate((gid) => {
+        if (!page) return { groupName: null, avatarUrl: null };
+        const evaluated = await page.evaluate(async (gid) => {
           const cover = document.querySelector(
             'a[aria-label="Cover photo"] img, a[aria-label="封面照片"] img',
           );
-          if (location.href.includes(`/groups/${gid}`) && cover) {
-            return cover.getAttribute('src');
+          let avatarUrl: string | null = null;
+          let groupName: string | null = null;
+          if (location.href.includes(`/groups/${gid}`)) {
+            avatarUrl = cover?.getAttribute('src') ?? null;
+            groupName =
+              document.querySelector('main h1, [role="main"] h1')?.textContent?.trim() ?? null;
+          } else {
+            const link = document.querySelector(`a[href*="/groups/${gid}"]`);
+            const img = link?.querySelector('img, svg image');
+            avatarUrl =
+              img?.getAttribute('src') ||
+              img?.getAttribute('xlink:href') ||
+              img?.getAttribute('href') ||
+              null;
           }
-          const link = document.querySelector(`a[href*="/groups/${gid}"]`);
-          const img = link?.querySelector('img, svg image');
-          return (
-            img?.getAttribute('src') ||
-            img?.getAttribute('xlink:href') ||
-            img?.getAttribute('href') ||
-            null
-          );
+          let html = '';
+          if (!avatarUrl || !groupName) {
+            try {
+              const res = await fetch(
+                `https://www.facebook.com/groups/${encodeURIComponent(gid)}/`,
+                {
+                  credentials: 'include',
+                  headers: { Accept: 'text/html,application/xhtml+xml' },
+                },
+              );
+              if (res.ok) html = (await res.text()).slice(0, 260000);
+            } catch {}
+          }
+          return { avatarUrl, groupName, html };
         }, group.groupId);
-        return existingImg;
+        const parsed = evaluated.html
+          ? parseTargetMetadataFromHtml(evaluated.html, 'groups', group.groupId)
+          : { name: null, avatarUrl: null };
+        return {
+          groupName: evaluated.groupName || parsed.name,
+          avatarUrl: evaluated.avatarUrl || parsed.avatarUrl,
+        };
       } finally {
         await conn.close();
         if (activeProof) {
@@ -574,7 +589,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         }
       }
     } catch {
-      return null;
+      return { groupName: null, avatarUrl: null };
     }
   }
 
@@ -904,16 +919,32 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         });
       }
 
-      // Step 2: Capture cover / avatar on the group page if still missing
-      const coverSrc = await page
+      // Step 2: Capture cover / avatar and title on the group page if still missing
+      const pageMeta = await page
         .evaluate(() => {
           const img = document.querySelector(
             'a[aria-label="Cover photo"] img, a[aria-label="封面照片"] img, [role="main"] img[data-imgperflogname="profileCoverPhoto"]',
           );
-          return img?.getAttribute('src') || null;
+          const h1 = document.querySelector('main h1, [role="main"] h1')?.textContent?.trim();
+          return {
+            coverSrc: img?.getAttribute('src') || null,
+            groupTitle: h1 || null,
+          };
         })
-        .catch(() => null);
-      if (coverSrc && coverSrc.startsWith('https://')) {
+        .catch(() => ({ coverSrc: null, groupTitle: null }));
+      const coverSrc =
+        typeof pageMeta === 'string'
+          ? pageMeta
+          : pageMeta && typeof pageMeta === 'object'
+            ? pageMeta.coverSrc
+            : null;
+      const groupTitle = pageMeta && typeof pageMeta === 'object' ? pageMeta.groupTitle : null;
+      if (this.repo.updateGroupMetadata && (coverSrc || groupTitle)) {
+        await this.repo.updateGroupMetadata(group.groupId, {
+          avatarUrl: coverSrc?.startsWith('https://') ? coverSrc : null,
+          groupName: groupTitle,
+        });
+      } else if (coverSrc && coverSrc.startsWith('https://')) {
         await this.repo.updateGroupAvatar(group.groupId, coverSrc);
       }
 
@@ -957,12 +988,62 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         });
       };
 
+      const dismissNonInvitePopupIfNeeded = async () => {
+        const popupCloseCoords = await page
+          .evaluate(() => {
+            const isVis = (el: Element | null) => {
+              if (!el) return false;
+              const r = el.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0) return false;
+              const s = getComputedStyle(el);
+              return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) > 0;
+            };
+            const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
+              (d) =>
+                isVis(d) &&
+                !/notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') || '') &&
+                !d.querySelector('[role="checkbox"]'),
+            );
+            for (const d of dialogs) {
+              const closeBtn = Array.from(
+                d.querySelectorAll(
+                  '[role="button"][aria-label="Close"], [role="button"][aria-label="关闭"], [role="button"][aria-label="關閉"]',
+                ),
+              ).find(isVis);
+              const continueBtn = Array.from(d.querySelectorAll('[role="button"],button')).find(
+                (el) =>
+                  isVis(el) &&
+                  /^(?:继续|繼續|Continue|知道了|Got\s*it)$/i.test(
+                    (el.getAttribute('aria-label') || el.textContent || '')
+                      .replace(/\s+/g, ' ')
+                      .trim(),
+                  ),
+              );
+              const targetBtn = closeBtn ?? continueBtn;
+              if (targetBtn) {
+                const r = targetBtn.getBoundingClientRect();
+                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+              }
+            }
+            return null;
+          })
+          .catch(() => null);
+
+        if (popupCloseCoords) {
+          await this.execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
+            await page.mouse.click(popupCloseCoords.x, popupCloseCoords.y);
+          });
+        }
+      };
+
       // The URL can arrive before React mounts the group's actions.
       const groupReadyDeadline = Date.now() + 15000;
       while (!(await (await inviteButton())?.isVisible()) && !(await joinBtnLoc.isVisible())) {
         guard();
         if (!atGroup())
           throw new ProductError('GROUP_INVITER_GROUP_CHANGED', '小组页面已跳转，未继续邀请', 409);
+        await dismissNonInvitePopupIfNeeded();
+        if ((await (await inviteButton())?.isVisible()) || (await joinBtnLoc.isVisible())) break;
         if (Date.now() >= groupReadyDeadline) {
           const controls = await page.evaluate(() => ({
             url: location.href,
@@ -1027,38 +1108,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           return { joinedOrRequested: true };
         });
 
-        const popupCloseCoords = await page.evaluate(() => {
-          const isVis = (el: Element | null) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return false;
-            const s = getComputedStyle(el);
-            return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) > 0;
-          };
-          const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
-            (d) =>
-              isVis(d) &&
-              !/notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') || ''),
-          );
-          for (const d of dialogs) {
-            const closeBtn = Array.from(
-              d.querySelectorAll(
-                '[role="button"][aria-label="Close"], [role="button"][aria-label="关闭"], [role="button"][aria-label="關閉"]',
-              ),
-            ).find(isVis);
-            if (closeBtn) {
-              const r = closeBtn.getBoundingClientRect();
-              return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-            }
-          }
-          return null;
-        });
-
-        if (popupCloseCoords) {
-          await this.execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
-            await page.mouse.click(popupCloseCoords.x, popupCloseCoords.y);
-          });
-        }
+        await dismissNonInvitePopupIfNeeded();
       }
 
       if (!(await inviteButton())) {
@@ -1157,13 +1207,31 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       const alreadyInvitedIds = await this.repo.getInvitedFriendIdsForGroup(group.groupId);
       const seenInModal = new Set<string>();
       const selectedBatch: Array<{ friendId: string; friendName: string }> = [];
+      const alreadyInvitedSkippedSet = new Set<string>();
+      const memberOrInvitedSkippedSet = new Set<string>();
       let stagnantScrolls = 0;
+      let unscrolledStreak = 0;
       let lastCheckboxTotal = 0;
+      let lastSignature = '';
+      let lastItemsCount = 0;
+      let lastValidIdCount = 0;
 
       while (selectedBatch.length < invitesPerGroup && !callbacks.isCancelled(profileId)) {
         const reading = await readGroupInvitationState(page, guard);
         guard();
         if (!reading.dialog) break;
+        lastItemsCount = reading.items.length;
+        lastValidIdCount = 0;
+        for (const row of reading.items) {
+          if (row.id && row.name) lastValidIdCount++;
+          if (row.id) {
+            if (row.invited || row.member || row.disabled) memberOrInvitedSkippedSet.add(row.id);
+            else if (alreadyInvitedIds.has(row.id)) alreadyInvitedSkippedSet.add(row.id);
+          }
+        }
+        const currentSignature = reading.items
+          .map((i) => `${i.id ?? ''}:${i.checked ? 1 : 0}`)
+          .join('|');
         const index = reading.items.findIndex(
           (item) =>
             item.id &&
@@ -1186,6 +1254,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
 
         if (candidate.index >= 0) {
           stagnantScrolls = 0;
+          unscrolledStreak = 0;
           seenInModal.add(candidate.friendId);
 
           const checkedNow = await this.selectRecipient(
@@ -1244,20 +1313,47 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
 
           await sleep(randInt(250, 500));
         } else {
-          if (candidate.totalCheckboxes <= lastCheckboxTotal) {
-            stagnantScrolls++;
-          } else {
+          if (
+            lastSignature !== '' &&
+            (currentSignature !== lastSignature || candidate.totalCheckboxes > lastCheckboxTotal)
+          ) {
             stagnantScrolls = 0;
+            unscrolledStreak = 0;
+          } else {
+            stagnantScrolls++;
           }
-          lastCheckboxTotal = candidate.totalCheckboxes;
-          if (stagnantScrolls >= 2) break;
+          lastSignature = currentSignature;
+          lastCheckboxTotal = Math.max(lastCheckboxTotal, candidate.totalCheckboxes);
+          if (stagnantScrolls >= 8) break;
 
           guard();
           const scrolled = await scrollInvitationList(page, reading);
 
-          if (!scrolled) break;
-          await sleep(500);
+          if (!scrolled) {
+            unscrolledStreak++;
+            if (unscrolledStreak >= 2) break;
+          } else {
+            unscrolledStreak = 0;
+          }
+          await sleep(700);
         }
+      }
+
+      if (selectedBatch.length === 0 && !callbacks.isCancelled(profileId)) {
+        devDiag.record({
+          category: 'GROUP_INVITER',
+          event: 'GROUP_INVITER_NO_CANDIDATE_BREAKDOWN',
+          profileId,
+          reason: `groupId=${group.groupId}`,
+          data: {
+            groupId: group.groupId,
+            itemsCount: lastItemsCount,
+            validIdCount: lastValidIdCount,
+            alreadyInvitedSkipped: alreadyInvitedSkippedSet.size,
+            memberOrInvitedSkipped: memberOrInvitedSkippedSet.size,
+            stagnantScrolls,
+          },
+        });
       }
 
       // One native submit; confirmed recipients are committed as soon as observed.

@@ -3,9 +3,9 @@ import { SettlementReceipt, sameNotice } from '../shared/settlement.js';
 export class SettlementNotifier {
   private readonly active = new Set<string>();
   constructor(private readonly repository: SettlementRepository) {}
-  async flushOne(port: SettlementPort): Promise<boolean> {
+  async flushOne(port: SettlementPort, options?: { kind?: 'BUSINESS' | 'END' }): Promise<boolean> {
     if (this.active.has(port.profileId)) return false;
-    const notice = await this.repository.claim(port.profileId);
+    const notice = await this.repository.claim(port.profileId, ...(options ? [options] : []));
     if (!notice) return false;
     if (!notice.claimToken) throw Error('NOTICE_CLAIM_MISSING');
     this.active.add(port.profileId);

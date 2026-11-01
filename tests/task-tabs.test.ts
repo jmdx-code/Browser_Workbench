@@ -351,7 +351,8 @@ test('explicit recovery invalidates input context, exact proof confirmation does
   await fixture(async (store) => {
     const { plan, proof, context } = await setup(store);
     await store.taskTabs.register(plan.id, proof, context);
-    await store.tasks.recoverOnStartup();
+    const paused = await store.tasks.requestControl(plan.id, 'pause');
+    assert.ok(paused.controlRequestId);
     await store.taskTabs.recoverOnStartup();
     const pending = await store.taskTabs.get(proof.ownershipId);
     assert.equal(pending.state, 'RECHECK_REQUIRED');
@@ -359,6 +360,8 @@ test('explicit recovery invalidates input context, exact proof confirmation does
     assert.deepEqual(pending.proof, proof);
     const fresh = { ...context, connectionEpoch: randomUUID(), leaseId: randomUUID() };
     await store.taskTabs.confirmObserved(proof.ownershipId, pending.revision, proof, fresh);
+    assert.equal((await store.tasks.get(plan.id)).state, 'PAUSING');
+    await store.tasks.confirmControl(plan.id, paused.controlRequestId);
     assert.equal((await store.tasks.get(plan.id)).state, 'PAUSED');
     await store.tasks.resume(plan.id);
     await store.tasks.claimNext([setupRuntime(proof.profileId)], new Set(['video']));
@@ -657,5 +660,29 @@ test('schema 3 to latest backs up before migration and preserves existing plan, 
     } finally {
       migrated.close();
     }
+  });
+});
+
+test('register automatically supersedes stale RECHECK_REQUIRED or previous-session tab for the same jobId', async () => {
+  await fixture(async (store) => {
+    const { plan, proof, context } = await setup(store);
+    await store.taskTabs.register(plan.id, proof, context);
+    await store.taskTabs.requireRecheck(proof.ownershipId, 0, 'BROWSE_SELF_HEAL');
+    const reconnectedContext: ExecutionSession = {
+      ...context,
+      connectionEpoch: randomUUID(),
+      leaseId: randomUUID(),
+    };
+    const nextProof: TabProof = {
+      ...proof,
+      ownershipId: randomUUID(),
+      tabId: 49,
+      targetId: 'self-healed-target',
+    };
+    const nextTab = await store.taskTabs.register(plan.id, nextProof, reconnectedContext);
+    assert.equal(nextTab.state, 'READY');
+    const oldTab = await store.taskTabs.get(proof.ownershipId, plan.id);
+    assert.equal(oldTab.state, 'RELEASED');
+    assert.equal(oldTab.reason, 'SUPERSEDED_BY_NEW_OWNED_TAB');
   });
 });

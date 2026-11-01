@@ -66,11 +66,34 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
   };
-  let rootFibers: Map<Element, RecordValue> | undefined;
+  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
+    __wbReactRootNodesV1?: WeakMap<Element, RecordValue>;
+    __wbInvitationScriptUserV1?: { timeOrigin: number; id: string | null };
+  };
+  const rootFibers = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, RecordValue>());
+  let rootScanned = false;
+  const currentRootFiber = (node: RecordValue | undefined): RecordValue | undefined => {
+    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
+      let root: unknown = candidate;
+      for (let depth = 0; record(root) && depth < 256; depth++) {
+        if (!root.return) {
+          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
+          break;
+        }
+        root = root.return;
+      }
+    }
+    return undefined;
+  };
   const rootFiber = (el: Element) => {
     // Some current React builds expose only __reactContainer$, not per-node Fiber keys.
-    if (!rootFibers) {
-      rootFibers = new Map();
+    const cached = currentRootFiber(rootFibers.get(el));
+    if (cached) {
+      rootFibers.set(el, cached);
+      return cached;
+    }
+    if (!rootScanned) {
+      rootScanned = true;
       const seen = new Set<unknown>(),
         stack: unknown[] = [];
       for (const host of Array.from(document.querySelectorAll('*')))
@@ -129,7 +152,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       name: string | undefined,
       invited = false,
       member = false;
-    for (const f of chain(el, 12)) {
+    for (const f of chain(el, 28)) {
       const user = f.props['user$key'];
       const candidate = record(user) ? (user.id ?? user.__id) : null;
       if (uid(candidate)) {
@@ -140,6 +163,16 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       }
       if (f.name.includes('CometListCellStrict_DEPRECATED') && typeof f.props.headline === 'string')
         name ??= f.props.headline.trim();
+      if (
+        f.name.includes('FDSListCellPressable') &&
+        typeof f.props['aria-label'] === 'string' &&
+        f.props['aria-label'].trim()
+      )
+        name ??= f.props['aria-label'].trim();
+    }
+    if (!name) {
+      const aria = el.getAttribute('aria-label')?.trim();
+      if (aria) name = aria;
     }
     if (uid(id) && el.getAttribute('role') === 'checkbox')
       el.setAttribute('data-wb-recipient-id', id);
@@ -159,7 +192,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       (reference(d) !== null ||
         Array.from(d.querySelectorAll('[role="checkbox"]')).some(
           (el) =>
-            chain(el, 12).some((f) =>
+            chain(el, 28).some((f) =>
               f.name.includes('GroupsCometInviteFriendsSearchFriendItem'),
             ) || readRecipient(el).id !== null,
         )),
@@ -169,7 +202,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
   const recipients = new Map<string, InvitationRecipient>();
   for (const el of Array.from(
     dialog?.querySelectorAll(
-      '[role="listitem"],[role="row"],[role="button"][aria-disabled="true"]',
+      '[role="listitem"],[role="row"],[role="button"][aria-disabled="true"],[role="checkbox"][aria-disabled="true"],[aria-disabled="true"]',
     ) ?? [],
   )) {
     const row = readRecipient(el);
@@ -326,13 +359,26 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
   const preferredMenu = menuItems.find((entry) => entry.preferred);
   if (preferredMenu) menus[preferredMenu.index]?.setAttribute('data-wb-group-invite-menuitem', '1');
   const cookie = document.cookie.match(/(?:^|;\s*)c_user=(\d{5,25})/);
-  const scriptId = Array.from(document.scripts)
-    .map((s) => s.textContent ?? '')
-    .join('\n')
-    .match(/"USER_ID":"(\d{5,25})"/);
+  let scriptUserId: string | null = null;
+  if (!cookie?.[1]) {
+    const timeOrigin = performance.timeOrigin;
+    const cached = cacheHost.__wbInvitationScriptUserV1;
+    if (cached?.timeOrigin === timeOrigin && cached.id) scriptUserId = cached.id;
+    else {
+      for (const script of Array.from(document.scripts)) {
+        const match = /"USER_ID":"(\d{5,25})"/.exec(script.textContent ?? '');
+        if (match?.[1]) {
+          scriptUserId = match[1];
+          break;
+        }
+      }
+      // A miss may be a still-loading document; retry it next time.
+      cacheHost.__wbInvitationScriptUserV1 = { timeOrigin, id: scriptUserId };
+    }
+  }
   return {
     url: location.href,
-    accountId: cookie?.[1] ?? scriptId?.[1] ?? null,
+    accountId: cookie?.[1] ?? scriptUserId,
     visible: document.visibilityState === 'visible',
     ready: document.readyState !== 'loading',
     dialog: !!dialog,

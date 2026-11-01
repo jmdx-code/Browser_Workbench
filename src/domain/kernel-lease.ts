@@ -4,43 +4,60 @@ import { KernelStamp, type KernelStamp as Stamp } from '../shared/kernel-protoco
 export class KernelLease {
   private stamp: Stamp | undefined;
   private revision = 0;
+  private revoked = false;
   constructor(
     readonly profileId: string,
     readonly connectionEpoch: string,
     private readonly now: () => number = Date.now,
-    private readonly maxLeaseMs = 12_000,
+    private readonly maxLeaseMs = 300_000,
   ) {}
   grant(value: unknown): Stamp {
     const next = KernelStamp.parse(value);
+    if (next.profileId !== this.profileId) throw Error('KERNEL_LEASE_REJECTED:profile_mismatch');
+    if (next.connectionEpoch !== this.connectionEpoch)
+      throw Error('KERNEL_LEASE_REJECTED:epoch_mismatch');
     if (
-      next.profileId !== this.profileId ||
-      next.connectionEpoch !== this.connectionEpoch ||
-      next.generation !== this.revision ||
-      next.expiresAt <= this.now() ||
-      next.expiresAt > this.now() + this.maxLeaseMs ||
-      (this.stamp && (this.stamp.leaseId !== next.leaseId || next.expiresAt < this.stamp.expiresAt))
+      this.stamp &&
+      next.leaseId === this.stamp.leaseId &&
+      next.generation < this.stamp.generation
     )
-      throw Error('KERNEL_LEASE_REJECTED');
-    this.stamp = next;
-    return { ...next };
+      throw Error('KERNEL_LEASE_REJECTED:generation_regression');
+    if (!this.stamp && this.revoked && next.generation < this.revision)
+      throw Error('KERNEL_LEASE_REJECTED:revoked_revision');
+    const now = this.now();
+    this.revision = Math.max(this.revision, next.generation);
+    const expiresAt = Math.min(
+      Math.max(next.expiresAt, now + 60_000, this.stamp?.expiresAt ?? 0),
+      now + this.maxLeaseMs,
+    );
+    this.revoked = false;
+    this.stamp = {
+      ...next,
+      generation: this.revision,
+      expiresAt,
+    };
+    return { ...this.stamp };
   }
   check(expected?: Stamp): Stamp {
     const current = this.stamp;
     if (
       !current ||
-      current.expiresAt <= this.now() ||
-      current.generation !== this.revision ||
       (expected &&
-        (expected.profileId !== current.profileId ||
-          expected.connectionEpoch !== current.connectionEpoch ||
+        (expected.profileId !== this.profileId ||
+          expected.connectionEpoch !== this.connectionEpoch ||
           expected.leaseId !== current.leaseId ||
-          expected.generation !== current.generation))
+          expected.generation > current.generation))
     )
       throw Error('KERNEL_FENCED');
+    if (current.expiresAt <= this.now()) {
+      this.stamp = { ...current, expiresAt: this.now() + 60_000 };
+      return { ...this.stamp };
+    }
     return { ...current };
   }
   revoke(): void {
     this.stamp = undefined;
+    this.revoked = true;
     this.revision++;
   }
   get generation(): number {

@@ -1,3 +1,6 @@
+import { ensureTargetColumns } from './target-list-store.js';
+import { mergedAvatar } from './group-bumper-store.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { transaction } from './sqlite-transaction.js';
@@ -30,6 +33,37 @@ export function ensureGroupInviterSchema(db: DatabaseSync): void {
       'INSERT OR IGNORE INTO group_inviter_settings(id, invites_per_group) VALUES(1, 30)',
     ].join('; '),
   );
+  ensureTargetColumns(db, 'group_inviter_groups');
+  syncLocalAvatarsFromBumper(db);
+}
+
+export function syncLocalAvatarsFromBumper(db: DatabaseSync): void {
+  const hasBumperTable = Boolean(
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
+      .get(),
+  );
+  if (!hasBumperTable) return;
+  const rows = db
+    .prepare(
+      `SELECT i.group_id, i.avatar_url AS inviter_avatar, b.avatar_url AS bumper_avatar
+         FROM group_inviter_groups i
+         JOIN group_bumper_groups b ON b.group_id = i.group_id`,
+    )
+    .all() as Array<{
+    group_id: string;
+    inviter_avatar: string | null;
+    bumper_avatar: string | null;
+  }>;
+  const update = db.prepare('UPDATE group_inviter_groups SET avatar_url=? WHERE group_id=?');
+  for (const row of rows) {
+    if (isLocalAvatar(row.bumper_avatar) && !isLocalAvatar(row.inviter_avatar)) {
+      const merged = mergedAvatar(row.inviter_avatar, row.bumper_avatar);
+      if (merged && merged !== row.inviter_avatar) {
+        update.run(merged, String(row.group_id));
+      }
+    }
+  }
 }
 
 export class SqliteGroupInviterRepository {
@@ -62,7 +96,7 @@ export class SqliteGroupInviterRepository {
   listGroups(): InviterGroupRow[] {
     const rows = this.db
       .prepare(
-        `SELECT g.group_id, g.group_name, g.avatar_url, g.created_at, g.updated_at,
+        `SELECT g.group_id, g.group_name, g.avatar_url, g.created_at, g.updated_at, g.folder_id,g.sort_order,
                 COALESCE(c.cnt, 0) AS total_invited_count
            FROM group_inviter_groups g
            LEFT JOIN (
@@ -70,12 +104,14 @@ export class SqliteGroupInviterRepository {
                FROM group_inviter_logs WHERE confirmation='CONFIRMED'
               GROUP BY group_id
            ) c ON c.group_id = g.group_id
-          ORDER BY g.created_at DESC, g.group_id ASC`,
+          ORDER BY g.sort_order ASC,g.created_at DESC,g.group_id ASC`,
       )
       .all();
 
     return rows.map((row) =>
       InviterGroupRow.parse({
+        folderId: row.folder_id == null ? null : String(row.folder_id),
+        sortOrder: Number(row.sort_order),
         groupId: String(row.group_id),
         groupName: String(row.group_name),
         avatarUrl: row.avatar_url === null ? null : String(row.avatar_url),
@@ -91,25 +127,55 @@ export class SqliteGroupInviterRepository {
     const now = Date.now();
     return transaction(this.db, () => {
       const stmt = this.db.prepare(
-        `INSERT INTO group_inviter_groups(group_id, group_name, avatar_url, created_at, updated_at)
-         VALUES(?, ?, NULL, ?, ?)
+        `INSERT INTO group_inviter_groups(group_id, group_name, avatar_url, created_at, updated_at,folder_id,sort_order)
+         VALUES(?, ?, NULL, ?, ?,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM group_inviter_groups))
          ON CONFLICT(group_id) DO UPDATE SET
-           group_name = excluded.group_name,
+           group_name = CASE WHEN excluded.group_name = excluded.group_id AND group_inviter_groups.group_name <> '' THEN group_inviter_groups.group_name ELSE excluded.group_name END,
            updated_at = excluded.updated_at`,
       );
       for (const item of parsed.items) {
-        stmt.run(item.groupId, item.groupName, now, now);
+        const effectiveName = item.groupName.trim() || item.groupId;
+        stmt.run(item.groupId, effectiveName, now, now, item.folderId ?? null);
       }
       return this.listGroups();
     });
   }
 
+  updateGroupMetadata(
+    groupId: string,
+    metadata: { groupName?: string | null; avatarUrl?: string | null },
+  ): void {
+    const current = this.db
+      .prepare('SELECT group_name, avatar_url FROM group_inviter_groups WHERE group_id=?')
+      .get(groupId) as { group_name?: string; avatar_url?: string | null } | undefined;
+    if (!current) return;
+    const curName = String(current.group_name ?? '');
+    const curAvatar = current.avatar_url == null ? null : String(current.avatar_url);
+    const nextName =
+      metadata.groupName?.trim() && (!curName || curName === groupId)
+        ? metadata.groupName.trim()
+        : curName || groupId;
+    const nextAvatar = mergedAvatar(curAvatar, metadata.avatarUrl);
+    this.db
+      .prepare(
+        'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
+      )
+      .run(nextName, nextAvatar, Date.now(), groupId);
+  }
+
   updateGroupAvatar(groupId: string, avatarUrl: string): void {
     const trimmed = avatarUrl.trim();
     if (!trimmed) return;
+    const existing = this.db
+      .prepare('SELECT avatar_url FROM group_inviter_groups WHERE group_id=?')
+      .get(groupId) as { avatar_url?: string | null } | undefined;
+    if (!existing) return;
+    const curAvatar = existing.avatar_url == null ? null : String(existing.avatar_url);
+    const nextAvatar = mergedAvatar(curAvatar, trimmed);
+    if (!nextAvatar || nextAvatar === curAvatar) return;
     this.db
       .prepare('UPDATE group_inviter_groups SET avatar_url=?, updated_at=? WHERE group_id=?')
-      .run(trimmed, Date.now(), groupId);
+      .run(nextAvatar, Date.now(), groupId);
   }
 
   deleteGroups(input: unknown): number {

@@ -15,6 +15,8 @@ const group = {
   groupId: '1234567890',
   groupName: '测试小组',
   avatarUrl: null,
+  folderId: null,
+  sortOrder: 0,
   totalInvitedCount: 0,
   createdAt: 1,
   updatedAt: 1,

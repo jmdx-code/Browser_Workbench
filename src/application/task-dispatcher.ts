@@ -8,6 +8,7 @@ import {
   type Binding,
   type ExecutionReceipt,
 } from '../shared/task-execution.js';
+import { isRecoverableBrowseFault } from '../shared/browse-execution.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 // Lifecycle owner enables this only after identity and every requested executor are ready.
 export class TaskDispatcher {
@@ -112,7 +113,25 @@ export class TaskDispatcher {
             reason,
           });
           // Input may have reached the browser; never resend or unlock on transport failure.
-          await this.repository.markBoundUnknown(binding, reason);
+          if (
+            this.repository.settleTransientBrowseOperations &&
+            (operation.action.kind === 'browseNavigate' ||
+              operation.action.kind === 'browseScroll' ||
+              operation.action.kind === 'browsePlay' ||
+              operation.action.kind === 'activateTab' ||
+              operation.action.kind === 'click' ||
+              /(?:^|:\s*)FACEBOOK_(?:NAVIGATION_|BROWSE_)/.test(reason)) &&
+            reason !== 'ACTOR_INPUT_FENCED' &&
+            isRecoverableBrowseFault(reason)
+          ) {
+            const settled = await this.repository.settleTransientBrowseOperations(
+              binding.jobId,
+              reason,
+            );
+            if (!settled) await this.repository.markBoundUnknown(binding, reason);
+          } else {
+            await this.repository.markBoundUnknown(binding, reason);
+          }
         } finally {
           this.active.delete(profile.id);
         }
@@ -130,7 +149,13 @@ export class TaskDispatcher {
   ): Promise<void> {
     const parsed = BoundReceipt.parse(receipt);
     if (!(await this.current(parsed.binding))) {
-      await this.repository.markBoundUnknown(parsed.binding, 'EXECUTION_CONTEXT_CHANGED');
+      const settled = await this.repository.settleTransientBrowseOperations?.(
+        parsed.binding.jobId,
+        'EXECUTION_CONTEXT_CHANGED',
+      );
+      if (!settled) {
+        await this.repository.markBoundUnknown(parsed.binding, 'EXECUTION_CONTEXT_CHANGED');
+      }
       throw Error('EXECUTION_CONTEXT_CHANGED');
     }
     await this.repository.settleBound(parsed, outcome, progress);

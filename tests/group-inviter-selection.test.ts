@@ -175,6 +175,8 @@ for (const failure of ['cancel-after-selection', 'reserve-error'])
         groupId,
         groupName: 'Fixture',
         avatarUrl: null,
+        folderId: null,
+        sortOrder: 0,
         totalInvitedCount: 0,
         createdAt: 1,
         updatedAt: 1,

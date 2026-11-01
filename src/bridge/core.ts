@@ -8,6 +8,8 @@ import {
   type Command,
   type Action,
   type JournalEntry,
+  type WindowBounds,
+  type WindowDisplayBounds,
 } from './protocol.js';
 import type { BridgeStorePort as Store } from '../infrastructure/persistence-port.js';
 export type Phase =
@@ -25,6 +27,8 @@ export type Peer = {
   phase: Phase;
   synced: boolean;
   controlId?: string;
+  lastStopRequestId?: string;
+  lastStoppedRequestId?: string;
   error?: string;
   transportFailure?: string;
   extensionVersion?: string;
@@ -69,22 +73,315 @@ export class Core {
     result: { tabId?: number; focused?: boolean; error?: string },
   ) {
     const pending = this.windowRequests.get(requestId);
+    if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online) {
+      if (!result.error && result.tabId && result.focused === true) {
+        peer.profileWindowFocused = true;
+        peer.focusedWindowAt = Date.now();
+      }
+      pending.finish(result);
+    }
+  }
+  private readonly cleanupTabRequests = new Map<
+    string,
+    {
+      peer: Peer;
+      finish: (result: {
+        keptTabId?: number;
+        closedTabIds?: number[];
+        remainingTabCount?: number;
+        error?: string;
+      }) => void;
+    }
+  >();
+  cleanupExtraTabs(
+    profileId: string,
+    preferActiveTab = true,
+  ): Promise<{
+    profileId: string;
+    keptTabId: number;
+    closedTabIds: number[];
+    remainingTabCount: number;
+  }> {
+    const peer = this.peers.get(profileId);
+    if (!peer?.online) throw Error('BROWSER_OFFLINE');
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish({ error: 'WORKSPACE_CLEANUP_TIMEOUT' }), 8000);
+      const finish = (result: {
+        keptTabId?: number;
+        closedTabIds?: number[];
+        remainingTabCount?: number;
+        error?: string;
+      }) => {
+        clearTimeout(timer);
+        this.cleanupTabRequests.delete(requestId);
+        if (result.error || !result.keptTabId)
+          reject(Error(result.error ?? 'WORKSPACE_CLEANUP_TABS_UNCONFIRMED'));
+        else
+          resolve({
+            profileId,
+            keptTabId: result.keptTabId,
+            closedTabIds: result.closedTabIds ?? [],
+            remainingTabCount: result.remainingTabCount ?? 1,
+          });
+      };
+      this.cleanupTabRequests.set(requestId, { peer, finish });
+      try {
+        peer.send({
+          type: 'CLEANUP_EXTRA_TABS',
+          requestId,
+          connectionEpoch: peer.epoch,
+          preferActiveTab,
+        });
+      } catch (error) {
+        finish({ error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+  extraTabsCleaned(
+    peer: Peer,
+    requestId: string,
+    result: {
+      keptTabId?: number;
+      closedTabIds?: number[];
+      remainingTabCount?: number;
+      error?: string;
+    },
+  ) {
+    const pending = this.cleanupTabRequests.get(requestId);
     if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online)
       pending.finish(result);
   }
+  private readonly inspectWindowRequests = new Map<
+    string,
+    {
+      peer: Peer;
+      finish: (result: {
+        windowId?: number;
+        tabId?: number;
+        focused?: boolean;
+        lastFocusedAt?: number;
+        state?: string;
+        bounds?: WindowBounds;
+        contentInsets?: { left: number; top: number; right: number; bottom: number };
+        displays?: WindowDisplayBounds[];
+        error?: string;
+      }) => void;
+    }
+  >();
+  inspectBrowserWindow(profileId: string): Promise<{
+    profileId: string;
+    windowId: number;
+    tabId: number;
+    focused: boolean;
+    lastFocusedAt?: number;
+    state: string;
+    bounds: WindowBounds;
+    contentInsets: { left: number; top: number; right: number; bottom: number };
+    displays: WindowDisplayBounds[];
+  }> {
+    const peer = this.peers.get(profileId);
+    if (!peer?.online) return Promise.reject(Error('WINDOW_LAYOUT_PROFILE_OFFLINE'));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish({ error: 'WINDOW_LAYOUT_TIMEOUT' }), 4000);
+      const finish = (result: {
+        windowId?: number;
+        tabId?: number;
+        focused?: boolean;
+        lastFocusedAt?: number;
+        state?: string;
+        bounds?: WindowBounds;
+        contentInsets?: { left: number; top: number; right: number; bottom: number };
+        displays?: WindowDisplayBounds[];
+        error?: string;
+      }) => {
+        clearTimeout(timer);
+        this.inspectWindowRequests.delete(requestId);
+        if (result.error || result.windowId === undefined || !result.bounds)
+          reject(Error(result.error ?? 'WINDOW_LAYOUT_UNCONFIRMED'));
+        else
+          resolve({
+            profileId,
+            windowId: result.windowId,
+            tabId: result.tabId ?? 1,
+            focused: Boolean(result.focused),
+            ...(typeof result.lastFocusedAt === 'number' && result.lastFocusedAt > 0
+              ? { lastFocusedAt: result.lastFocusedAt }
+              : {}),
+            state: result.state ?? 'normal',
+            bounds: result.bounds,
+            contentInsets: result.contentInsets ?? { left: 16, top: 104, right: 16, bottom: 16 },
+            displays: result.displays ?? [],
+          });
+      };
+      this.inspectWindowRequests.set(requestId, { peer, finish });
+      try {
+        peer.send({
+          type: 'INSPECT_BROWSER_WINDOW',
+          requestId,
+          connectionEpoch: peer.epoch,
+        });
+      } catch (error) {
+        finish({ error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+  browserWindowInspected(
+    peer: Peer,
+    requestId: string,
+    result: {
+      windowId?: number;
+      tabId?: number;
+      focused?: boolean;
+      lastFocusedAt?: number;
+      state?: string;
+      bounds?: WindowBounds;
+      contentInsets?: { left: number; top: number; right: number; bottom: number };
+      displays?: WindowDisplayBounds[];
+      error?: string;
+    },
+  ) {
+    const pending = this.inspectWindowRequests.get(requestId);
+    if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online) {
+      if (!result.error) {
+        if (
+          typeof result.lastFocusedAt === 'number' &&
+          result.lastFocusedAt > (peer.focusedWindowAt ?? 0)
+        ) {
+          peer.focusedWindowAt = result.lastFocusedAt;
+        }
+        if (result.focused === true) {
+          peer.profileWindowFocused = true;
+          peer.focusedWindowAt = Math.max(peer.focusedWindowAt ?? 0, Date.now());
+        }
+      }
+      pending.finish(result);
+    }
+  }
+  private readonly positionWindowRequests = new Map<
+    string,
+    {
+      peer: Peer;
+      finish: (result: {
+        windowId?: number;
+        tabId?: number;
+        focused?: boolean;
+        state?: string;
+        bounds?: WindowBounds;
+        contentInsets?: { left: number; top: number; right: number; bottom: number };
+        error?: string;
+      }) => void;
+    }
+  >();
+  positionBrowserWindow(
+    profileId: string,
+    bounds: WindowBounds,
+    focus = false,
+  ): Promise<{
+    profileId: string;
+    windowId: number;
+    tabId: number;
+    focused: boolean;
+    state: string;
+    bounds: WindowBounds;
+    contentInsets: { left: number; top: number; right: number; bottom: number };
+  }> {
+    const peer = this.peers.get(profileId);
+    if (!peer?.online) return Promise.reject(Error('WINDOW_LAYOUT_PROFILE_OFFLINE'));
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish({ error: 'WINDOW_LAYOUT_TIMEOUT' }), 4000);
+      const finish = (result: {
+        windowId?: number;
+        tabId?: number;
+        focused?: boolean;
+        state?: string;
+        bounds?: WindowBounds;
+        contentInsets?: { left: number; top: number; right: number; bottom: number };
+        error?: string;
+      }) => {
+        clearTimeout(timer);
+        this.positionWindowRequests.delete(requestId);
+        if (result.error || result.windowId === undefined || !result.bounds)
+          reject(Error(result.error ?? 'WINDOW_LAYOUT_MOVE_UNCONFIRMED'));
+        else
+          resolve({
+            profileId,
+            windowId: result.windowId,
+            tabId: result.tabId ?? 1,
+            focused: Boolean(result.focused),
+            state: result.state ?? 'normal',
+            bounds: result.bounds,
+            contentInsets: result.contentInsets ?? { left: 16, top: 104, right: 16, bottom: 16 },
+          });
+      };
+      this.positionWindowRequests.set(requestId, { peer, finish });
+      try {
+        peer.send({
+          type: 'POSITION_BROWSER_WINDOW',
+          requestId,
+          connectionEpoch: peer.epoch,
+          bounds,
+          focus,
+        });
+      } catch (error) {
+        finish({ error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+  browserWindowPositioned(
+    peer: Peer,
+    requestId: string,
+    result: {
+      windowId?: number;
+      tabId?: number;
+      focused?: boolean;
+      state?: string;
+      bounds?: WindowBounds;
+      contentInsets?: { left: number; top: number; right: number; bottom: number };
+      error?: string;
+    },
+  ) {
+    const pending = this.positionWindowRequests.get(requestId);
+    if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online) {
+      if (!result.error && result.focused === true) {
+        peer.profileWindowFocused = true;
+        peer.focusedWindowAt = Date.now();
+      }
+      pending.finish(result);
+    }
+  }
   peers = new Map<string, Peer>();
   private readonly kernelOwners = new Map<string, string>();
+  private readonly kernelStopRequests = new Map<string, string>();
   private readonly queuedIntents = new Map<string, number>();
+  hasPendingControlOrOperation(profileId: string): boolean {
+    return (
+      !!this.queuedIntents.get(profileId) ||
+      this.controls.has(profileId) ||
+      this.stoppingControllers.has(profileId) ||
+      [...this.pending.values()].some((entry) => entry.peer.profileId === profileId)
+    );
+  }
   async reloadExtension(profileId: string): Promise<{ requested: boolean; reason?: string }> {
     const peer = this.peers.get(profileId);
     const unresolved = await this.store.unresolved(profileId);
+    const idle = peer?.synced && peer.phase === 'PAUSED';
+    const recovering =
+      peer?.phase === 'RECOVERING' &&
+      !this.controls.has(profileId) &&
+      [
+        'SYNC_CONFIRMATION_TIMEOUT',
+        'STOP_CONFIRMATION_TIMEOUT',
+        'KERNEL_STOP_UNCONFIRMED',
+      ].includes(peer.error ?? '');
     if (
       !peer ||
       !this.current(peer) ||
-      !peer.synced ||
-      peer.phase !== 'PAUSED' ||
+      (!idle && !recovering) ||
       this.kernelOwners.has(profileId) ||
-      this.queuedIntents.get(profileId) ||
+      this.hasPendingControlOrOperation(profileId) ||
       unresolved.length
     )
       return { requested: false, reason: 'BUSY_OR_OFFLINE' };
@@ -106,9 +403,23 @@ export class Core {
       throw new BridgeError('KERNEL_PROFILE_NOT_IDLE');
     this.kernelOwners.set(peer.profileId, owner);
   }
+  bindFixtureStopRequest(peer: Peer, owner: string, requestId: string): void {
+    if (!this.hasFixtureKernelOwner(peer, owner)) throw new BridgeError('KERNEL_OWNER_CHANGED');
+    this.kernelStopRequests.set(owner, requestId);
+  }
   releaseFixtureKernel(peer: Peer, owner: string): void {
-    if (this.peers.get(peer.profileId) === peer && this.kernelOwners.get(peer.profileId) === owner)
+    if (
+      this.peers.get(peer.profileId) === peer &&
+      this.kernelOwners.get(peer.profileId) === owner
+    ) {
       this.kernelOwners.delete(peer.profileId);
+      this.kernelStopRequests.delete(owner);
+    }
+  }
+  hasFixtureKernelOwner(peer: Peer, owner: string): boolean {
+    return (
+      this.peers.get(peer.profileId) === peer && this.kernelOwners.get(peer.profileId) === owner
+    );
   }
   private queues = new Map<string, Promise<void>>();
   private pending = new Map<
@@ -116,6 +427,7 @@ export class Core {
     { peer: Peer; resolve: () => void; timer: NodeJS.Timeout; action: Action }
   >();
   private controls = new Map<string, NodeJS.Timeout>();
+  readonly stoppingControllers = new Map<string, NodeJS.Timeout>();
   constructor(
     readonly store: Store,
     private timeoutMs = 12000,
@@ -142,29 +454,42 @@ export class Core {
     const timer = this.controls.get(peer.profileId);
     if (timer) clearTimeout(timer);
     this.controls.delete(peer.profileId);
+    this.stoppingControllers.delete(peer.profileId);
   }
-  private control(peer: Peer, type: 'SYNC' | 'STOP' | 'RESUME') {
+  private control(peer: Peer, type: 'SYNC' | 'STOP' | 'RESUME', preferredRequestId?: string) {
     this.clearControl(peer);
-    peer.controlId = randomUUID();
+    peer.controlId = preferredRequestId ?? randomUUID();
     peer.error = undefined;
     const requestId = peer.controlId;
-    this.controls.set(
-      peer.profileId,
-      setTimeout(() => {
-        if (this.current(peer) && peer.controlId === requestId) {
-          peer.paused = true;
-          peer.synced = false;
-          peer.phase = 'RECOVERING';
-          peer.error = type + '_CONFIRMATION_TIMEOUT';
-        }
-      }, this.timeoutMs),
-    );
+    const timer = setTimeout(() => {
+      if (this.current(peer) && peer.controlId === requestId) {
+        if (this.controls.get(peer.profileId) !== timer) return;
+        this.controls.delete(peer.profileId);
+        if (this.stoppingControllers.get(peer.profileId) === timer)
+          this.stoppingControllers.delete(peer.profileId);
+        peer.paused = true;
+        peer.synced = false;
+        peer.phase = 'RECOVERING';
+        peer.error = type + '_CONFIRMATION_TIMEOUT';
+      }
+    }, this.timeoutMs);
+    this.controls.set(peer.profileId, timer);
+    if (type === 'STOP') this.stoppingControllers.set(peer.profileId, timer);
     try {
       peer.send({ type, requestId, connectionEpoch: peer.epoch });
     } catch {
       void this.disconnect(peer).catch(() => {});
     }
     return { accepted: true, requestId, state: peer.phase };
+  }
+  controlUnconfirmed(peer: Peer, requestId: string, reason = 'KERNEL_STOP_UNCONFIRMED'): boolean {
+    if (!this.current(peer) || peer.controlId !== requestId) return false;
+    this.clearControl(peer);
+    peer.paused = true;
+    peer.synced = false;
+    peer.phase = 'RECOVERING';
+    peer.error = reason;
+    return true;
   }
   async sync(peer: Peer) {
     if (!this.current(peer)) throw new BridgeError('OFFLINE');
@@ -209,6 +534,8 @@ export class Core {
     peer.paused = true;
     peer.synced = false;
     peer.phase = 'OFFLINE';
+    const kernelOwner = this.kernelOwners.get(peer.profileId);
+    if (kernelOwner) this.kernelStopRequests.delete(kernelOwner);
     this.kernelOwners.delete(peer.profileId);
     await this.store.cancelPrepared(peer.profileId);
     for (const [id, p] of this.pending)
@@ -250,13 +577,19 @@ export class Core {
     peer.paused = false;
     return true;
   }
-  async stop(profileId: string) {
+  async stop(profileId: string, preferredRequestId?: string) {
     const p = this.peers.get(profileId);
     if (!p?.online) throw new BridgeError('OFFLINE');
     if (p.phase === 'STOPPING') return { accepted: true, requestId: p.controlId, state: p.phase };
     p.paused = true;
     p.phase = 'STOPPING';
-    const physicalStop = this.control(p, 'STOP');
+    const owner = this.kernelOwners.get(profileId);
+    const physicalStop = this.control(
+      p,
+      'STOP',
+      preferredRequestId ?? (owner ? this.kernelStopRequests.get(owner) : undefined),
+    );
+    p.lastStopRequestId = physicalStop.requestId;
     await this.store.cancelPrepared(profileId);
     for (const [id, pending] of this.pending)
       if (pending.peer === p)
@@ -272,6 +605,7 @@ export class Core {
     if (!this.current(peer) || peer.phase !== 'STOPPING' || peer.controlId !== requestId)
       return false;
     this.clearControl(peer);
+    peer.lastStoppedRequestId = requestId;
     peer.paused = true;
     peer.phase = !peer.synced || unresolved.length ? 'RECOVERING' : 'PAUSED';
     return true;

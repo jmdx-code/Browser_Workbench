@@ -1,3 +1,4 @@
+import { isErroredPausedPlan } from '../shared/task-issues.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { filterAsync, mapAsync, everyAsync } from '../shared/async-collections.js';
 import { randomUUID } from 'node:crypto';
@@ -47,6 +48,12 @@ export type FacebookExecutionAcceptance = Partial<Record<TaskFeatureId | 'friend
 export class FacebookPublishingRuntime {
   hasActiveExecution(): boolean {
     return this.runtime.hasActiveExecution();
+  }
+  hasExecutionOrOpening(profileId: string): boolean {
+    return this.runtime.hasExecutionOrOpening(profileId);
+  }
+  clearStartupBackoff(profileId: string): void {
+    this.runtime.clearStartupBackoff(profileId);
   }
   hasOwner(profileId: string): boolean {
     return this.runtime.registry.hasOwner(profileId);
@@ -176,6 +183,9 @@ export class FacebookPublishingRuntime {
       randomUUID,
       profileInventory,
     );
+    this.runtime.setStartupSlotFreedHook(() => {
+      void this.tick().catch(() => {});
+    });
     this.runner = new TaskStepRunner(
       store.tasks,
       store.browseIntents,
@@ -407,6 +417,7 @@ export class FacebookPublishingRuntime {
         409,
       );
     await this.store.tasks.releaseErroredPausedPlans(request.profileIds);
+    for (const profileId of request.profileIds) this.runtime.clearStartupBackoff(profileId);
     return await this.store.tasks.assign(request, await this.runtime.profiles());
   }
   async capabilities() {
@@ -503,6 +514,7 @@ export class FacebookPublishingRuntime {
       if (reason) throw new ProductError('COMBINATION_EXECUTOR_UNAVAILABLE', reason, 409);
       // Resume the original immutable version and progress. Original SQL rejects REVIEW,
       // unknown operations and held material; admission will recheck identity before input.
+      this.runtime.clearStartupBackoff(plan.profileId);
       return await this.store.tasks.resume(plan.id);
     }
     if (
@@ -581,6 +593,8 @@ export class FacebookPublishingRuntime {
       .catch(() => {});
     return work;
   }
+  private readonly offlineSince = new Map<string, number>();
+  private readonly offlineReviewed = new Map<string, number>();
   private async tickOnce(): Promise<CycleResult[]> {
     // Construction/startup cannot claim or reconcile business plans before acceptance.
     if (this.closed) return Promise.resolve([]);
@@ -641,7 +655,105 @@ export class FacebookPublishingRuntime {
         })
         .catch(() => {});
     }
-    return Promise.resolve((await this.available()) ? await this.runner.poll() : []);
+    for (const plan of await this.store.tasks.livePlans())
+      this.updateOfflineSinceForPlan(plan, Date.now());
+    let pollError: unknown;
+    let failed = false;
+    let results: CycleResult[] = [];
+    try {
+      results = (await this.available()) ? await this.runner.poll() : [];
+    } catch (error) {
+      failed = true;
+      pollError = error;
+    }
+    await this.reconcileOfflinePlans();
+    if (failed) throw pollError;
+    return results;
+  }
+  private updateOfflineSinceForPlan(plan: Plan, nowMs: number): number | null {
+    const peer = this.core.peers.get(plan.profileId);
+    if (
+      (peer?.online === true && peer.browserWindowCount !== 0) ||
+      (plan.state === 'QUEUED' &&
+        plan.timing &&
+        !plan.timingReleased &&
+        taskTimingEligibility(plan.timing, nowMs) === 'WAIT') ||
+      (plan.state === 'PAUSED' && plan.reason === 'SCHEDULE_WINDOW_CLOSED')
+    ) {
+      this.offlineSince.delete(plan.profileId);
+      return null;
+    }
+    let since = this.offlineSince.get(plan.profileId);
+    if (since === undefined) {
+      since = nowMs;
+      this.offlineSince.set(plan.profileId, since);
+    }
+    return since;
+  }
+  private async reconcileOfflinePlans(): Promise<void> {
+    if (this.closed) return;
+    let plans: Plan[];
+    try {
+      plans = await this.store.tasks.livePlans();
+    } catch {
+      return;
+    }
+    const nowMs = Date.now();
+    const activeProfiles = new Set(plans.map((plan) => plan.profileId));
+    const activePlans = new Set(plans.map((plan) => plan.id));
+    for (const plan of plans) {
+      try {
+        const disconnectedAt = this.updateOfflineSinceForPlan(plan, nowMs);
+        if (disconnectedAt === null) {
+          this.offlineReviewed.delete(plan.id);
+          continue;
+        }
+        if (this.runtime.hasInFlightExecution(plan.profileId)) continue;
+        if (plan.state === 'REVIEW' && this.offlineReviewed.get(plan.id) === plan.updatedAt)
+          continue;
+        const peer = this.core.peers.get(plan.profileId);
+        const windowClosed = peer !== undefined && peer.browserWindowCount === 0;
+        const preExistingErroredPause =
+          isErroredPausedPlan(plan) && plan.updatedAt < disconnectedAt;
+        if (!windowClosed && !preExistingErroredPause && nowMs - disconnectedAt < 15_000) continue;
+        const reason =
+          preExistingErroredPause && peer === undefined
+            ? plan.reason || 'BROWSER_OFFLINE_STOPPED'
+            : 'BROWSER_OFFLINE_STOPPED';
+        const canStopOffline = () => {
+          const current = this.core.peers.get(plan.profileId);
+          return (
+            !this.closed &&
+            !(current?.online === true && current.browserWindowCount !== 0) &&
+            !this.runtime.hasInFlightExecution(plan.profileId)
+          );
+        };
+        const stopped = await this.ending.stopOffline(plan.id, false, reason, {
+          expectedUpdatedAt: plan.updatedAt,
+          reviewIfBlocked: true,
+          canStopOffline,
+        });
+        if (stopped) {
+          this.offlineReviewed.delete(plan.id);
+          if (canStopOffline()) {
+            this.runtime.clearReopeningIfIdle(plan.profileId);
+            this.runtime.clearStartupBackoff(plan.profileId);
+          }
+        } else {
+          const latest = await this.store.tasks.get(plan.id);
+          if (latest.state === 'REVIEW') this.offlineReviewed.set(plan.id, latest.updatedAt);
+        }
+      } catch {
+        /* A failed account cannot block the other offline plans. */
+      }
+    }
+    for (const id of this.offlineSince.keys()) {
+      const peer = this.core.peers.get(id);
+      if (!activeProfiles.has(id) || (peer?.online === true && peer.browserWindowCount !== 0))
+        this.offlineSince.delete(id);
+    }
+    for (const id of this.offlineReviewed.keys())
+      if (!activePlans.has(id)) this.offlineReviewed.delete(id);
   }
   private async recoverEndings(profileId: string): Promise<void> {
     for (const peer of this.core.peers.values()) {
@@ -689,6 +801,8 @@ export class FacebookPublishingRuntime {
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true;
+    this.offlineSince.clear();
+    this.offlineReviewed.clear();
     this.lastSlowRead.clear();
     this.lastBrowseInterval.clear();
     this.closing = (async () => {

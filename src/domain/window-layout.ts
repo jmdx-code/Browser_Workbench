@@ -125,3 +125,107 @@ export function overlappingWindowPositions(
       (a.x - rect.x) ** 2 + (a.y - rect.y) ** 2 - ((b.x - rect.x) ** 2 + (b.y - rect.y) ** 2),
   );
 }
+
+export function displayForRect(
+  rect: Rect,
+  displays: readonly LayoutScreen[],
+): LayoutScreen | undefined {
+  if (!displays.length) return undefined;
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  const containing = displays.find(
+    (d) =>
+      cx >= d.workArea.x &&
+      cx <= d.workArea.x + d.workArea.width &&
+      cy >= d.workArea.y &&
+      cy <= d.workArea.y + d.workArea.height,
+  );
+  if (containing) return containing;
+  let best = displays[0];
+  let bestDist = Infinity;
+  for (const d of displays) {
+    const dx = Math.max(d.workArea.x - cx, 0, cx - (d.workArea.x + d.workArea.width));
+    const dy = Math.max(d.workArea.y - cy, 0, cy - (d.workArea.y + d.workArea.height));
+    const dist = dx * dx + dy * dy;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = d;
+    }
+  }
+  return best;
+}
+
+export function normalizeTaskWindowSize(
+  display: LayoutScreen,
+  referenceRect?: Rect,
+): { width: number; height: number } {
+  const a = display.workArea;
+  const margin = 24;
+  const hardMaxWidth = Math.max(100, a.width - margin);
+  const hardMaxHeight = Math.max(100, a.height - margin);
+  const minWidth = Math.min(hardMaxWidth, Math.max(760, Math.floor(a.width * 0.44)));
+  const maxWidth = Math.min(
+    hardMaxWidth,
+    Math.max(minWidth, Math.min(1140, Math.floor(a.width * 0.58))),
+  );
+  const minHeight = Math.min(hardMaxHeight, Math.max(520, Math.floor(a.height * 0.52)));
+  const maxHeight = Math.min(
+    hardMaxHeight,
+    Math.max(minHeight, Math.min(780, Math.floor(a.height * 0.66))),
+  );
+  const defaultWidth = Math.min(maxWidth, Math.max(minWidth, Math.floor(a.width * 0.5)));
+  const defaultHeight = Math.min(maxHeight, Math.max(minHeight, Math.floor(a.height * 0.6)));
+  if (!referenceRect) {
+    return { width: defaultWidth, height: defaultHeight };
+  }
+  const fitted = fitTaskWindow(referenceRect, display);
+  return {
+    width: Math.min(maxWidth, Math.max(minWidth, fitted.width)),
+    height: Math.min(maxHeight, Math.max(minHeight, fitted.height)),
+  };
+}
+
+export function gridCascadeSlotRect(
+  slotIndex: number,
+  size: { width: number; height: number },
+  display: LayoutScreen,
+  step: number,
+): Rect {
+  const a = display.workArea;
+  const margin = 12;
+  const width = Math.min(size.width, Math.max(100, a.width - margin * 2));
+  const height = Math.min(size.height, Math.max(100, a.height - margin * 2));
+  const availX = Math.max(0, a.width - margin * 2 - width);
+  const availY = Math.max(0, a.height - margin * 2 - height);
+  const stepX = Math.max(24, step * 3);
+  const stepY = Math.max(28, step * 4);
+  // 每一斜列从上到下最多排 rowsPerCol 个窗口（至少 2 个，最多 10 个），确保每个窗口垂直方向都错开 stepY
+  const rowsPerCol =
+    availY >= stepY ? Math.max(2, Math.min(10, Math.floor(availY / stepY) + 1)) : 1;
+  const index = Math.max(0, slotIndex);
+  const row = index % rowsPerCol;
+  const colGroup = Math.floor(index / rowsPerCol);
+  // 每一大列之间的水平跨度，使多列斜向阶梯在屏幕上均匀展开
+  const colStrideX = Math.max(stepX * 3, Math.min(220, Math.floor(availX / 3) || stepX * 3));
+  const maxColSpan = Math.max(1, availX - (rowsPerCol - 1) * stepX);
+  const groupOffsetX = availX > 0 ? (colGroup * colStrideX) % (maxColSpan + colStrideX) : 0;
+  const rawX = a.x + margin + groupOffsetX + row * stepX;
+  const rawY = a.y + margin + row * stepY;
+  const x = Math.max(a.x + margin, Math.min(a.x + a.width - margin - width, rawX));
+  const y = Math.max(a.y + margin, Math.min(a.y + a.height - margin - height, rawY));
+  return { x, y, width, height };
+}
+
+export function arrangeTaskWindowsInOrder(
+  ids: readonly string[],
+  display: LayoutScreen,
+  step: number,
+  referenceRect?: Rect,
+): Map<string, Rect> {
+  const size = normalizeTaskWindowSize(display, referenceRect);
+  const result = new Map<string, Rect>();
+  ids.forEach((id, i) => {
+    result.set(id, gridCascadeSlotRect(i, size, display, step));
+  });
+  return result;
+}

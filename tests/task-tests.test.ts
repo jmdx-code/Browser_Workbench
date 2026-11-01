@@ -88,6 +88,7 @@ test('unloaded or unsupported modules and invalid settings cannot create a combi
       id: randomUUID(),
       alias: '生成',
       groupId: null,
+      order: 0,
       online: true,
       synced: true,
       phase: 'PAUSED',

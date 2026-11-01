@@ -2,12 +2,16 @@ import { WorkspaceMainPage, type MainPage } from '../src/shared/workspace-page.j
 import { type TabProof } from '../src/shared/kernel-state.js';
 
 const key = 'workbenchWorkspaceMainPageV1';
-const sameProof = (a: TabProof, b: TabProof) =>
-  a.ownershipId === b.ownershipId &&
-  a.profileId === b.profileId &&
-  a.browserSessionEpoch === b.browserSessionEpoch &&
-  a.tabId === b.tabId &&
-  a.targetId === b.targetId;
+const sameProof = (a: TabProof | null | undefined, b: TabProof | null | undefined) =>
+  Boolean(
+    a &&
+    b &&
+    a.ownershipId === b.ownershipId &&
+    a.profileId === b.profileId &&
+    a.browserSessionEpoch === b.browserSessionEpoch &&
+    a.tabId === b.tabId &&
+    a.targetId === b.targetId,
+  );
 
 export class WorkspacePageGroup {
   private tail: Promise<unknown> = Promise.resolve();

@@ -1,32 +1,21 @@
+import { extractGroupId } from '../shared/group-inviter.js';
+export { extractGroupId } from '../shared/group-inviter.js';
+
 export interface DraftGroupEntry {
   key: string;
   groupId: string;
   groupName: string;
 }
 
-export function extractGroupId(raw: string): string {
-  const value = raw.trim();
-  try {
-    const url = new URL(/^https?:\/\//i.test(value) ? value : 'https://' + value);
-    if (/(^|\.)facebook\.com$/i.test(url.hostname)) {
-      const match = /^\/groups\/([^/?#]+)/i.exec(url.pathname);
-      if (match?.[1]) return decodeURIComponent(match[1]);
-    }
-  } catch {
-    /* Plain IDs stay unchanged. */
-  }
-  return value;
-}
-
-function groupPair(line: string): [string, string] | null {
+function groupPair(line: string, normalizeId = extractGroupId): [string, string] | null {
   const explicit = /^([^\t,，|]+)[\t,，|]+(.*)$/.exec(line);
   if (explicit) {
-    const id = extractGroupId(explicit[1] ?? '');
+    const id = normalizeId(explicit[1] ?? '');
     if (/^[A-Za-z0-9._-]+$/.test(id)) return [id, (explicit[2] ?? '').trim()];
   }
   const space = /^(\S+)\s+(.+)$/.exec(line.trim());
   if (space?.[1] && space[2]) {
-    const id = extractGroupId(space[1]);
+    const id = normalizeId(space[1]);
     // A name containing spaces is one B-column cell, unless its first token
     // identifies a numeric group, URL, or a distinguishable group slug.
     if (/^\d+$/.test(id) || id !== space[1] || /^[A-Za-z0-9]+[._-][A-Za-z0-9._-]+$/.test(id))
@@ -35,12 +24,16 @@ function groupPair(line: string): [string, string] | null {
   return null;
 }
 
-export function isGroupGridPaste(text: string, column: 0 | 1): boolean {
+export function isGroupGridPaste(
+  text: string,
+  column: 0 | 1,
+  normalizeId = extractGroupId,
+): boolean {
   return (
     /[\r\n\t]/.test(text) ||
     text.trim().startsWith('"') ||
-    !!groupPair(text) ||
-    (column === 0 && extractGroupId(text) !== text.trim())
+    !!groupPair(text, normalizeId) ||
+    (column === 0 && normalizeId(text) !== text.trim())
   );
 }
 
@@ -86,6 +79,7 @@ export function applyGroupGridPaste(
   createRow: (groupId?: string, groupName?: string) => DraftGroupEntry,
   endRow = startRow,
   endCol: 0 | 1 = startCol,
+  normalizeId = extractGroupId,
 ): DraftGroupEntry[] {
   let matrix = parseGroupClipboard(clipboardText);
   const single = matrix[0]?.[0];
@@ -93,7 +87,7 @@ export function applyGroupGridPaste(
     matrix.length === 1 &&
     matrix[0]?.length === 1 &&
     single !== undefined &&
-    !groupPair(single) &&
+    !groupPair(single, normalizeId) &&
     endRow > startRow
   )
     matrix = Array.from({ length: endRow - startRow + 1 }, () => [single]);
@@ -107,12 +101,12 @@ export function applyGroupGridPaste(
     if (!row) return;
     const pair =
       cells.length >= 2
-        ? [extractGroupId(cells[0] ?? ''), cells.slice(1).join(' ').trim()]
-        : groupPair(cells[0] ?? '');
+        ? [normalizeId(cells[0] ?? ''), cells.slice(1).join(' ').trim()]
+        : groupPair(cells[0] ?? '', normalizeId);
     next[index] = pair
       ? { ...row, groupId: pair[0] ?? '', groupName: pair[1] ?? '' }
       : startCol === 0
-        ? { ...row, groupId: extractGroupId(cells[0] ?? '') }
+        ? { ...row, groupId: normalizeId(cells[0] ?? '') }
         : { ...row, groupName: cells[0] ?? '' };
   });
   return next;

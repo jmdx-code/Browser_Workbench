@@ -6,12 +6,19 @@ import type { StopReceipt } from '../shared/task-control.js';
 import { sameExecution } from '../shared/task-execution.js';
 import { ProductError } from './workspace.js';
 
-export const sameTabProof = (a: TabProof, b: TabProof): boolean =>
-  a.ownershipId === b.ownershipId &&
-  a.profileId === b.profileId &&
-  a.browserSessionEpoch === b.browserSessionEpoch &&
-  a.tabId === b.tabId &&
-  a.targetId === b.targetId;
+export const sameTabProof = (
+  a: TabProof | null | undefined,
+  b: TabProof | null | undefined,
+): boolean =>
+  Boolean(
+    a &&
+    b &&
+    a.ownershipId === b.ownershipId &&
+    a.profileId === b.profileId &&
+    a.browserSessionEpoch === b.browserSessionEpoch &&
+    a.tabId === b.tabId &&
+    a.targetId === b.targetId,
+  );
 
 export interface TaskTabRepository {
   get(ownershipId: string, jobId?: string): Awaitable<TaskTab>;

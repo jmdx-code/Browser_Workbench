@@ -21,6 +21,7 @@ import {
   BrowseVerdict,
   BrowseReadTimeout,
   BrowsePendingDiagnostic,
+  isRecoverableBrowseFault,
 } from '../shared/browse-execution.js';
 import {
   sameBinding,
@@ -64,7 +65,12 @@ export class TaskStepRunner {
   private readonly advancingJobs = new Map<string, Promise<CycleResult>>();
   private scheduling?: Promise<Promise<CycleResult>[]>;
   private readonly samples = new Map<string, TimedBrowseReading>();
+  private readonly browseStepClocks = new Map<
+    string,
+    { stepId: string; context: ExecutionSession; at: number }
+  >();
   private readonly postWaits = new Map<string, number>();
+  private readonly browseSelfHeals = new Map<string, { key: string; count: number }>();
   private readonly browseWaits = new Map<
     string,
     {
@@ -132,7 +138,9 @@ export class TaskStepRunner {
       ...[...this.active.values()].map((row) => row.work),
     ]);
     this.samples.clear();
+    this.browseStepClocks.clear();
     this.postWaits.clear();
+    this.browseSelfHeals.clear();
     this.browseWaits.clear();
     this.completedCycles = [];
   }
@@ -340,8 +348,30 @@ export class TaskStepRunner {
   }
   private async waitForWindow(plan: Plan) {
     this.samples.delete(plan.profileId);
+    this.browseStepClocks.delete(plan.profileId);
     await this.tasks.noteRunningWait?.(plan.id, 'SCHEDULE_WINDOW_CLOSED');
     return this.result(await this.tasks.get(plan.id), 'WAITING', 'SCHEDULE_WINDOW_CLOSED');
+  }
+  private claimWallClockMilliseconds(
+    profileId: string,
+    step: StepInstance,
+    session: ExecutionSession,
+    at: number,
+  ): number {
+    if (!Number.isFinite(at) || at < 0 || step.spec.type === 'post') return 0;
+    const prev = this.browseStepClocks.get(profileId);
+    this.browseStepClocks.set(profileId, {
+      stepId: step.id,
+      context: structuredClone(session),
+      at,
+    });
+    if (!prev || prev.stepId !== step.id || !sameExecution(prev.context, session) || at <= prev.at)
+      return 0;
+    const delta = Math.floor(at - prev.at);
+    return Math.min(
+      delta,
+      Math.max(0, step.spec.durationMinutes * 60_000 - step.progress.effectiveMilliseconds),
+    );
   }
   private reason(error: unknown) {
     if (!(error instanceof Error)) return 'STEP_EXECUTION_FAILED';
@@ -349,7 +379,7 @@ export class TaskStepRunner {
     if (error.name === 'ZodError' || trimmed.startsWith('[')) {
       if (trimmed.includes('FACEBOOK_BROWSE_ROUTE_REQUIRED'))
         return 'FACEBOOK_BROWSE_ROUTE_REQUIRED';
-      return 'FACEBOOK_IDENTITY_UNCONFIRMED';
+      return 'FACEBOOK_BROWSE_SCHEMA_MISMATCH';
     }
     return error.message.slice(0, 200);
   }
@@ -408,6 +438,7 @@ export class TaskStepRunner {
       | undefined;
     if (plan.state !== 'RUNNING') {
       this.samples.delete(plan.profileId);
+      this.browseStepClocks.delete(plan.profileId);
       this.clearBrowseWaits(plan.profileId);
       return this.result(plan, 'WAITING', plan.reason);
     }
@@ -433,13 +464,14 @@ export class TaskStepRunner {
         observedProof = await this.runtime.observe(plan.profileId);
       } catch (error) {
         // Admission and opening the claimed actor share the bounded startup
-        // pool. A claimed RUNNING plan can briefly have no startup slot; this
-        // is backpressure before dispatch, not a failed browser operation.
-        if (this.reason(error) !== 'CONCURRENCY_LIMIT') throw error;
+        // pool. A claimed RUNNING plan can briefly have no startup slot or be
+        // in startup backoff; this is backpressure before dispatch, not a failed browser operation.
+        const observeReason = this.reason(error);
+        if (observeReason !== 'CONCURRENCY_LIMIT' && observeReason !== 'STARTUP_BACKOFF')
+          throw error;
         const waiting = await this.tasks.get(jobId);
-        if (waiting.state === 'RUNNING')
-          await this.tasks.noteRunningWait?.(jobId, 'CONCURRENCY_LIMIT');
-        return this.result(await this.tasks.get(jobId), 'WAITING', 'CONCURRENCY_LIMIT');
+        if (waiting.state === 'RUNNING') await this.tasks.noteRunningWait?.(jobId, observeReason);
+        return this.result(await this.tasks.get(jobId), 'WAITING', observeReason);
       }
       plan = await this.tasks.get(jobId);
       if (plan.state !== 'RUNNING') return this.result(plan, 'WAITING', plan.reason);
@@ -447,6 +479,7 @@ export class TaskStepRunner {
         session = await this.runtime.session(plan.profileId);
       if (!session) {
         this.samples.delete(plan.profileId);
+        this.browseStepClocks.delete(plan.profileId);
         return this.result(plan, 'WAITING', 'ACTOR_BACKPRESSURE');
       }
       const assertCurrent = this.guard(plan, step, session);
@@ -456,6 +489,7 @@ export class TaskStepRunner {
       await assertCurrent();
       if (step.spec.type === 'post') {
         this.samples.delete(plan.profileId);
+        this.browseStepClocks.delete(plan.profileId);
         return await this.advancePost(plan, step, session, assertCurrent);
       }
       const executor = this.executors.get(step.spec.type);
@@ -471,20 +505,14 @@ export class TaskStepRunner {
           if (this.windowClosed(plan)) return await this.waitForWindow(plan);
           await this.intents.get(pending.id); // Legacy/unknown intent cannot be promoted to business work.
           await this.dispatcher.flushOne(plan.profileId);
+          await this.checkDispatchedBrowseOperation(plan.id, step);
           return this.result(await this.tasks.get(plan.id), 'DISPATCHED');
         }
         if (pending.status !== 'ACKNOWLEDGED' || !pending.binding)
           return this.result(plan, 'WAITING', 'OPERATION_UNRESOLVED');
         const intent = (await this.intents.get(pending.id)).intent,
           binding = pending.binding;
-        const resumableBrowseTimeout =
-          intent.kind === 'like' ||
-          (intent.kind === 'auxiliary' &&
-            (['activateTab', 'browsePlay', 'browseNavigate'].includes(pending.action.kind) ||
-              (pending.action.kind === 'click' &&
-                pending.action.target.css === FACEBOOK_REEL_NEXT_CSS &&
-                pending.action.target.scope === undefined &&
-                pending.action.target.text === undefined)));
+        const resumableBrowseTimeout = true;
         const dispatchReceipt = pending.receipt;
         const dispatchEvidence =
           dispatchReceipt && typeof dispatchReceipt === 'object' && !Array.isArray(dispatchReceipt)
@@ -607,6 +635,9 @@ export class TaskStepRunner {
               foreground ? 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED' : '',
             );
           if (foreground ? foregroundElapsed < 30_000 : elapsed < 30_000) {
+            if (foreground) {
+              this.browseStepClocks.delete(plan.profileId);
+            }
             devDiag.recordWait(
               `verify:${pending.id}`,
               {
@@ -635,6 +666,9 @@ export class TaskStepRunner {
           const timeoutReason = foreground
             ? 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT'
             : 'BROWSE_EFFECT_TIMEOUT';
+          if (foreground) {
+            this.browseStepClocks.delete(plan.profileId);
+          }
           devDiag.record({
             level: 'ERROR',
             category: 'TASK_RUNNER',
@@ -728,13 +762,53 @@ export class TaskStepRunner {
           await this.runtime.control(plan.id, 'pause', verdict.reason);
           return this.result(await this.tasks.get(plan.id), 'BUSINESS_UNKNOWN', verdict.reason);
         }
-        await this.dispatcher.verify(
-          verdict.receipt,
-          verdict.outcome,
+        const verifyCreditedMs = executor.continuousWallClock
+          ? pending.action.kind === 'activateTab'
+            ? (this.browseStepClocks.set(plan.profileId, {
+                stepId: step.id,
+                context: structuredClone(session),
+                at: verificationFinishedAt,
+              }),
+              0)
+            : this.claimWallClockMilliseconds(plan.profileId, step, session, verificationFinishedAt)
+          : 0;
+        const nextVerifyProgress =
           verdict.outcome === 'VERIFIED'
-            ? verifiedBrowseProgress(step, intent, verdict)
-            : undefined,
-        );
+            ? (() => {
+                const base = verifiedBrowseProgress(step, intent, verdict);
+                return verifyCreditedMs > 0
+                  ? {
+                      ...base,
+                      effectiveMilliseconds: base.effectiveMilliseconds + verifyCreditedMs,
+                    }
+                  : base;
+              })()
+            : undefined;
+        await this.dispatcher.verify(verdict.receipt, verdict.outcome, nextVerifyProgress);
+        if (verdict.outcome === 'VERIFIED' && nextVerifyProgress) {
+          step.progress = nextVerifyProgress;
+          this.browseSelfHeals.delete(plan.profileId);
+        } else if (verdict.outcome === 'NOT_APPLIED' && verifyCreditedMs > 0) {
+          const freshAfterVerify = await this.tasks.get(plan.id);
+          if (
+            !this.closed &&
+            freshAfterVerify.state === 'RUNNING' &&
+            !freshAfterVerify.controlMode &&
+            freshAfterVerify.round === plan.round &&
+            freshAfterVerify.position === plan.position
+          ) {
+            const progress = {
+              ...step.progress,
+              revision: step.progress.revision + 1,
+              effectiveMilliseconds: step.progress.effectiveMilliseconds + verifyCreditedMs,
+            };
+            if (this.tasks.checkpointAsync)
+              await this.tasks.checkpointAsync(plan.id, step.id, step.progress.revision, progress);
+            else await this.tasks.checkpoint(plan.id, step.id, step.progress.revision, progress);
+            step.progress = progress;
+            this.browseSelfHeals.delete(plan.profileId);
+          }
+        }
         if (
           verdict.outcome === 'VERIFIED' &&
           verdict.observation &&
@@ -767,6 +841,8 @@ export class TaskStepRunner {
       if (this.windowClosed(plan)) return await this.waitForWindow(plan);
       if (stepComplete(step.spec, step.progress)) {
         this.samples.delete(plan.profileId);
+        this.browseStepClocks.delete(plan.profileId);
+        this.browseSelfHeals.delete(plan.profileId);
         const next = await this.tasks.completeStep(plan.id, step.id);
         devDiag.record({
           level: 'INFO',
@@ -794,15 +870,74 @@ export class TaskStepRunner {
       if (this.windowClosed(plan)) return await this.waitForWindow(plan);
       if (decision.kind === 'wait') {
         this.samples.delete(plan.profileId);
+        if (decision.reason === 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED') {
+          this.browseStepClocks.delete(plan.profileId);
+        } else if (executor.continuousWallClock) {
+          const waitMs = this.claimWallClockMilliseconds(plan.profileId, step, session, finishedAt);
+          if (waitMs > 0) {
+            const progress = {
+              ...step.progress,
+              revision: step.progress.revision + 1,
+              effectiveMilliseconds: step.progress.effectiveMilliseconds + waitMs,
+            };
+            if (this.tasks.checkpointAsync)
+              await this.tasks.checkpointAsync(plan.id, step.id, step.progress.revision, progress);
+            else await this.tasks.checkpoint(plan.id, step.id, step.progress.revision, progress);
+            step.progress = progress;
+            this.browseSelfHeals.delete(plan.profileId);
+            await assertCurrent();
+          }
+        }
         await this.tasks.noteRunningWait?.(plan.id, decision.reason);
-        return this.result(plan, 'WAITING', decision.reason);
+        return this.result(await this.tasks.get(plan.id), 'WAITING', decision.reason);
       }
       await this.tasks.noteRunningWait?.(plan.id, '');
       if (decision.kind === 'action' && !decision.observation) {
         this.samples.delete(plan.profileId);
+        if (executor.continuousWallClock) {
+          if (decision.action.kind === 'activateTab') {
+            this.browseStepClocks.delete(plan.profileId);
+          } else {
+            const actMs = this.claimWallClockMilliseconds(
+              plan.profileId,
+              step,
+              session,
+              finishedAt,
+            );
+            if (actMs > 0) {
+              const progress = {
+                ...step.progress,
+                revision: step.progress.revision + 1,
+                effectiveMilliseconds: step.progress.effectiveMilliseconds + actMs,
+              };
+              if (this.tasks.checkpointAsync)
+                await this.tasks.checkpointAsync(
+                  plan.id,
+                  step.id,
+                  step.progress.revision,
+                  progress,
+                );
+              else await this.tasks.checkpoint(plan.id, step.id, step.progress.revision, progress);
+              step.progress = progress;
+              this.browseSelfHeals.delete(plan.profileId);
+              const current = await this.tasks.get(plan.id);
+              const updated = (await this.tasks.steps(plan.id, current.round)).find(
+                (s) => s.id === step.id,
+              );
+              if (
+                current.state !== 'RUNNING' ||
+                !updated ||
+                stepComplete(updated.spec, updated.progress)
+              )
+                return this.result(current, 'OBSERVED', 'BROWSE_BUDGET_OR_CONTROL_CHANGED');
+              await assertCurrent();
+            }
+          }
+        }
         await this.proof(plan, session, decision.intent.proof);
         await this.intents.prepare(plan.id, step.id, this.id(), decision.action, decision.intent);
         await this.dispatcher.flushOne(plan.profileId);
+        await this.checkDispatchedBrowseOperation(plan.id, step);
         return this.result(await this.tasks.get(plan.id), 'DISPATCHED');
       }
       const reading = decision.observation;
@@ -824,8 +959,13 @@ export class TaskStepRunner {
         finishedAt,
       };
       const previous = this.samples.get(plan.profileId);
+      const rawMs = executor.continuousWallClock
+        ? reading.visible && reading.ready
+          ? this.claimWallClockMilliseconds(plan.profileId, step, session, finishedAt)
+          : (this.browseStepClocks.delete(plan.profileId), 0)
+        : effectiveBrowseMilliseconds(previous, sample);
       const milliseconds = Math.min(
-        effectiveBrowseMilliseconds(previous, sample),
+        rawMs,
         Math.max(0, step.spec.durationMinutes * 60_000 - step.progress.effectiveMilliseconds),
       );
       try {
@@ -861,9 +1001,11 @@ export class TaskStepRunner {
           await this.tasks.checkpointAsync(plan.id, step.id, step.progress.revision, progress);
         else await this.tasks.checkpoint(plan.id, step.id, step.progress.revision, progress);
         step.progress = progress; // The current guard follows our acknowledged checkpoint only.
+        this.browseSelfHeals.delete(plan.profileId);
         const current = await this.tasks.get(plan.id);
         if (current.state !== 'RUNNING') {
           this.samples.delete(plan.profileId);
+          this.browseStepClocks.delete(plan.profileId);
           return this.result(current, 'WAITING', 'CONTROL_CHANGED_AFTER_CHECKPOINT');
         }
       }
@@ -880,6 +1022,7 @@ export class TaskStepRunner {
         await this.proof(plan, session, decision.intent.proof);
         await this.intents.prepare(plan.id, step.id, this.id(), decision.action, decision.intent);
         await this.dispatcher.flushOne(plan.profileId);
+        await this.checkDispatchedBrowseOperation(plan.id, step);
         return this.result(await this.tasks.get(plan.id), 'DISPATCHED');
       }
       return this.result(
@@ -889,6 +1032,7 @@ export class TaskStepRunner {
       );
     } catch (error) {
       this.samples.delete(plan.profileId);
+      this.browseStepClocks.delete(plan.profileId);
       this.clearBrowseWaits(plan.profileId);
       const current = await this.tasks.get(jobId),
         reason = this.reason(error);
@@ -930,16 +1074,95 @@ export class TaskStepRunner {
         },
       });
       if (
+        failedStep &&
+        failedStep.spec.type !== 'post' &&
+        current.controlMode !== 'stop' &&
+        !current.reason.startsWith('USER_') &&
+        current.reason !== 'SCHEDULE_WINDOW_CLOSED' &&
+        isRecoverableBrowseFault(reason) &&
+        (current.state === 'RUNNING' ||
+          current.state === 'PAUSING' ||
+          (current.state === 'REVIEW' && current.reason === 'UNRESOLVED_OPERATION'))
+      ) {
+        await this.tasks.settleTransientBrowseOperations?.(jobId, reason);
+        const healKey = `${failedStep.id}:${failedStep.progress.revision}`;
+        const prevHeal = this.browseSelfHeals.get(current.profileId);
+        const healCount = prevHeal?.key === healKey ? prevHeal.count + 1 : 1;
+        this.browseSelfHeals.set(current.profileId, { key: healKey, count: healCount });
+        if (healCount < 8) {
+          await this.runtime.retireForBrowseSelfHeal?.(current.profileId, reason);
+          await this.tasks.noteRunningWait?.(jobId, reason);
+          return this.result(await this.tasks.get(jobId), 'WAITING', reason);
+        }
+        this.browseSelfHeals.delete(current.profileId);
+      }
+      if (
         (failedStep?.spec.type === 'post' && postFailureRequiresEnding(reason)) ||
         (failedStep?.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE')
       )
         await this.tasks.noteStepFailure?.(jobId, failedStep.id, reason);
-      if (operation?.binding) await this.tasks.markBoundUnknown(operation.binding, reason);
-      if (current.state === 'REVIEW' && current.reason.startsWith('INITIAL_SESSION_FAILED:')) {
-        return this.result(current, 'PAUSED_OR_REVIEW', current.reason);
+      if (operation?.binding) {
+        if (
+          failedStep &&
+          failedStep.spec.type !== 'post' &&
+          (isRecoverableBrowseFault(reason) ||
+            taskAdmissionIssue(reason)?.disposition === 'pause' ||
+            current.controlMode === 'stop' ||
+            current.state === 'STOPPING') &&
+          this.tasks.settleTransientBrowseOperations
+        ) {
+          await this.tasks.settleTransientBrowseOperations(jobId, reason);
+        } else {
+          await this.tasks.markBoundUnknown(operation.binding, reason);
+        }
+      } else if (
+        failedStep &&
+        failedStep.spec.type !== 'post' &&
+        (taskAdmissionIssue(reason)?.disposition === 'pause' ||
+          current.controlMode === 'stop' ||
+          current.state === 'STOPPING') &&
+        this.tasks.settleTransientBrowseOperations
+      ) {
+        await this.tasks.settleTransientBrowseOperations(jobId, current.reason || reason);
+      }
+      const afterSettle = await this.tasks.get(jobId);
+      if (terminal(afterSettle.state)) {
+        return this.result(afterSettle, 'PAUSED_OR_REVIEW', afterSettle.reason);
+      }
+      if (
+        afterSettle.state === 'REVIEW' &&
+        afterSettle.reason.startsWith('INITIAL_SESSION_FAILED:')
+      ) {
+        return this.result(afterSettle, 'PAUSED_OR_REVIEW', afterSettle.reason);
+      }
+      if (
+        ['STOPPING', 'PAUSING', 'PAUSED'].includes(afterSettle.state) ||
+        afterSettle.controlMode !== null
+      ) {
+        if (
+          ['STOPPING', 'PAUSING'].includes(afterSettle.state) &&
+          !afterSettle.controlConfirmed &&
+          afterSettle.controlMode
+        ) {
+          try {
+            await this.runtime.control(
+              jobId,
+              afterSettle.controlMode,
+              afterSettle.reason || reason,
+            );
+          } catch (stopError) {
+            return this.result(
+              await this.tasks.get(jobId),
+              'CONTROL_UNCONFIRMED',
+              this.reason(stopError),
+            );
+          }
+        }
+        const finalPlan = await this.tasks.get(jobId);
+        return this.result(finalPlan, 'PAUSED_OR_REVIEW', finalPlan.reason || reason);
       }
       try {
-        await this.runtime.control(jobId, current.controlMode ?? 'pause', reason);
+        await this.runtime.control(jobId, afterSettle.controlMode ?? 'pause', reason);
       } catch (stopError) {
         return this.result(
           await this.tasks.get(jobId),
@@ -948,6 +1171,33 @@ export class TaskStepRunner {
         );
       }
       return this.result(await this.tasks.get(jobId), 'PAUSED_OR_REVIEW', reason);
+    }
+  }
+  private async checkDispatchedBrowseOperation(jobId: string, step: StepInstance) {
+    if (step.spec.type === 'post') return;
+    const ops = await this.tasks.operations(jobId);
+    const latest = ops.at(-1);
+    if (latest?.status === 'UNKNOWN' || latest?.status === 'FAILED') {
+      const receiptObj =
+        latest.receipt && typeof latest.receipt === 'object' && !Array.isArray(latest.receipt)
+          ? (latest.receipt as Record<string, unknown>)
+          : undefined;
+      const evidenceObj =
+        receiptObj?.evidence &&
+        typeof receiptObj.evidence === 'object' &&
+        !Array.isArray(receiptObj.evidence)
+          ? (receiptObj.evidence as Record<string, unknown>)
+          : undefined;
+      if (latest.status === 'FAILED' && evidenceObj?.transientBrowseSettled !== true) return;
+      const opReason =
+        typeof receiptObj?.reason === 'string'
+          ? receiptObj.reason
+          : typeof evidenceObj?.reason === 'string'
+            ? evidenceObj.reason
+            : 'KERNEL_DEBUGGER_DETACHED';
+      if (isRecoverableBrowseFault(opReason)) {
+        throw Error(opReason);
+      }
     }
   }
   private clearBrowseWaits(profileId: string, except?: string) {

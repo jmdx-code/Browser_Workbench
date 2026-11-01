@@ -168,7 +168,7 @@ if (!process.versions.electron) {
       };
       await until(`!!document.querySelector('.topnav') || !!document.querySelector('.combo-card')`);
       await evaluate(
-        `(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim().startsWith('任务记录'));if(!b)throw Error('RECORD_NAV_MISSING');b.click()})()`,
+        `(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim().startsWith('执行记录')||b.textContent.trim().startsWith('任务记录'));if(!b)throw Error('RECORD_NAV_MISSING');b.click()})()`,
       );
       await until(
         `document.querySelectorAll('.run-record-row[tabindex]').length===${speedMode ? 3 : 1}`,

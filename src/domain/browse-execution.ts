@@ -21,6 +21,7 @@ export type StepExecution = { plan: Plan; step: StepInstance; session: Execution
 // decide/verify may read the owned page, never perform browser input themselves.
 export interface BrowseStepExecutor {
   readonly type: 'video' | 'feed' | 'marketplace' | 'friends';
+  readonly continuousWallClock?: boolean;
   available(): boolean;
   decide(execution: StepExecution, assertCurrent: () => Awaitable<void>): Promise<Decision>;
   verify(
@@ -41,6 +42,7 @@ export interface TaskCycleRuntime extends TaskBrowserPort {
   preparePlan(plan: Plan, context: ExecutionSession, observedProof?: TabProof): Promise<void>;
   control(jobId: string, mode: 'pause' | 'stop', reason?: string): Promise<Plan>;
   detach(profileId: string, expected: ExecutionSession, reason: string): Promise<void>;
+  retireForBrowseSelfHeal?(profileId: string, reason: string): Promise<void>;
 }
 export interface CurrentTaskTabSource {
   // Authenticated current inventory and exact proof; cannot infer ownership from URL/tabId.

@@ -237,10 +237,6 @@ export class TaskService {
     const request = TaskCommandRequest.parse(input);
     const execution = this.execution();
     if (!execution) throw new ProductError('TASKS_UNAVAILABLE', '任务执行服务未启用', 409);
-    if (request.command === 'stop')
-      for (const target of request.plans)
-        if (target.expectedState === 'RUNNING')
-          execution.revokeForControl?.(target.planId, target.profileId, 'USER_STOP');
     const results = await Promise.all(
       request.plans.map(async (target) => {
         let current: Plan | null = null;
@@ -257,6 +253,9 @@ export class TaskService {
             throw Error('任务状态已变化，请重新读取后操作');
           if (request.command === 'resume') await this.assertStartAllowed();
           current = await execution.commandPlan(plan.id, request.command);
+          if (request.command === 'stop') {
+            execution.revokeForControl?.(target.planId, target.profileId, 'USER_STOP');
+          }
           return {
             ...target,
             accepted: true,
@@ -265,6 +264,9 @@ export class TaskService {
             reason: current.reason,
           };
         } catch (error) {
+          if (request.command === 'stop') {
+            execution.revokeForControl?.(target.planId, target.profileId, 'USER_STOP');
+          }
           if (current) current = await this.repository.get(current.id);
           return {
             ...target,

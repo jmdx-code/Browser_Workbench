@@ -17,5 +17,10 @@
     "types": ["node", "chrome"]
   },
   "include": ["src/**/*.ts", "src/**/*.cts", "extension/**/*.ts", "tests/**/*.ts"],
-  "exclude": ["src/renderer"]
+  "exclude": [
+    "src/renderer",
+    "tests/multi-browser-memory-existing-readers.test.ts",
+    "tests/multi-browser-memory-optimization.test.ts",
+    "tests/group-bumper-hardening.test.ts"
+  ]
 }

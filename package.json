@@ -1,7 +1,7 @@
 {
   "name": "browser-workbench",
   "productName": "Browser Workbench",
-  "version": "0.1.147",
+  "version": "0.1.183",
   "private": true,
   "type": "module",
   "main": "dist/src/desktop/bootstrap.js",
@@ -47,9 +47,11 @@
     "electron": "44.9.3",
     "electron-builder": "26.15.3",
     "esbuild": "0.28.2",
+    "happy-dom": "21.0.4",
     "prettier": "3.9.9",
     "typescript": "5.9.3",
     "vite": "8.3.4",
+    "vitest": "5.0.5",
     "yazl": "3.3.1"
   },
   "overrides": {

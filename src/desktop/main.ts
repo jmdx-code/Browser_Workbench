@@ -209,6 +209,18 @@ async function boot() {
       void shell.openPath(productExtensionDirectory());
       return;
     }
+    if (
+      message &&
+      typeof message === 'object' &&
+      'type' in message &&
+      message.type === 'REVEAL_DIAGNOSTIC_PACKAGE' &&
+      'filePath' in message &&
+      typeof message.filePath === 'string' &&
+      message.filePath.trim()
+    ) {
+      shell.showItemInFolder(message.filePath);
+      return;
+    }
     const notice = DesktopTaskNotification.safeParse(message);
     if (notice.success && !smokeFile && Notification.isSupported()) {
       const { failed, completed } = notice.data;
@@ -514,6 +526,19 @@ async function boot() {
       filters: [{ name: '数据备份清单', extensions: ['json'] }],
     });
     return selected.canceled || !selected.filePaths[0] ? null : path.dirname(selected.filePaths[0]);
+  });
+  ipcMain.handle('workbench:choose-feedback-directory', async (event) => {
+    if (
+      !window ||
+      event.sender !== window.webContents ||
+      event.senderFrame !== window.webContents.mainFrame
+    )
+      throw Error('IPC_SENDER_REJECTED');
+    const selected = await dialog.showOpenDialog(window, {
+      title: '选择问题反馈包保存目录',
+      properties: ['openDirectory'],
+    });
+    return selected.canceled ? null : (selected.filePaths[0] ?? null);
   });
   ipcMain.handle('workbench:restart', async (event) => {
     if (

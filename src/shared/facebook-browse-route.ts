@@ -1,11 +1,38 @@
 // The legacy Watch entry may redirect to the Reels feed or its current reel.
 // Keep browsing restricted to these surfaces; an arbitrary Facebook URL is not a feed.
 export type FacebookBrowseType = 'feed' | 'video' | 'marketplace' | 'friends';
+export type FacebookAbnormalAccountReason =
+  | 'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED'
+  | 'FACEBOOK_ACCOUNT_RESTRICTED'
+  | 'FACEBOOK_ACCOUNT_LOGGED_OUT';
+
+export function classifyFacebookAbnormalUrl(value: string): FacebookAbnormalAccountReason | null {
+  try {
+    const url = new URL(value);
+    if (
+      (url.origin !== 'https://www.facebook.com' && url.origin !== 'https://m.facebook.com') ||
+      url.username ||
+      url.password ||
+      value.length > 2048
+    )
+      return null;
+    if (/^\/checkpoint(?:\/|$)/i.test(url.pathname))
+      return 'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED';
+    if (/^\/(?:disabled|suspended|account_status|restriction)(?:\/|$)/i.test(url.pathname))
+      return 'FACEBOOK_ACCOUNT_RESTRICTED';
+    if (/^\/(?:login|recover)(?:\.php|\/|$)/i.test(url.pathname))
+      return 'FACEBOOK_ACCOUNT_LOGGED_OUT';
+    return null;
+  } catch {
+    return null;
+  }
+}
 // Marked from the current native next-card Fiber; shared by input and STOP checks.
 export const FACEBOOK_REEL_NEXT_CSS = '[data-wb-reel-next="1"]';
 export const FACEBOOK_FRIENDS_REQUESTS_URL = 'https://www.facebook.com/friends/requests/';
 export const FACEBOOK_FRIEND_CONFIRM_CSS = '[data-wb-friend-confirm="1"]';
 export const FACEBOOK_BROWSE_LIKE_CSS = '[data-wb-browse-like="1"]';
+export const FACEBOOK_BROWSE_DIALOG_DISMISS_CSS = '[data-wb-browse-dialog-dismiss="1"]';
 // Read/recovery scope only. This URL is never a valid browse action destination.
 export function facebookMarketplaceUnavailableURL(value: string): boolean {
   try {
@@ -37,7 +64,7 @@ export function facebookBrowseSurface(value: string): FacebookBrowseType | null 
     if (/^\/(?:watch|reels)\/?$/.test(url.pathname) || /^\/reel\/\d{1,30}\/?$/.test(url.pathname))
       return 'video';
     if (
-      /^\/marketplace(?:\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search)?\/?$/.test(
+      /^\/marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search)?\/?$/i.test(
         url.pathname,
       ) ||
       /^\/marketplace\/item\/\d{1,30}\/?$/.test(url.pathname)
@@ -113,13 +140,13 @@ export function matchesMarketplaceSearch(
     filter.maxPrice !== undefined;
   if (!search)
     return (
-      /^\/marketplace(?:\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)(?:\/|$))[a-z0-9_-]{1,80}))?\/?$/.test(
+      /^\/marketplace(?:\/(?:category\/[a-z0-9_-]{1,80}(?:\/search)?|(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search|category)(?:\/|$))[a-z0-9_-]{1,80}))?\/?$/i.test(
         url.pathname,
       ) &&
       !['query', 'category_id', 'minPrice', 'maxPrice'].some((name) => url.searchParams.has(name))
     );
   if (
-    !/^\/marketplace\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)\/)[a-z0-9_-]{1,80}\/)?search\/?$/.test(
+    !/^\/marketplace\/(?:category\/[a-z0-9_-]{1,80}\/|(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search|category)\/)[a-z0-9_-]{1,80}\/))?search\/?$/i.test(
       url.pathname,
     )
   )

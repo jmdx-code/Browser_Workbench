@@ -322,21 +322,21 @@ test('native auto-attach frame filter is restricted when enabled and empty when 
   }
 });
 
-test('lease rejects foreign profiles, epochs and expired grants; stop invalidates old stamps', () => {
+test('lease rejects foreign profiles and epochs while tolerating expired or generation-drifted grants', () => {
   const now = 10_000;
   const state = setup();
   const lease = new KernelLease(state.lease.profileId, state.lease.connectionEpoch, () => now);
   const stamp = { ...state.stamp, expiresAt: now + 1_000 };
   assert.throws(() => lease.grant({ ...stamp, profileId: randomUUID() }), /LEASE_REJECTED/);
   assert.throws(() => lease.grant({ ...stamp, connectionEpoch: randomUUID() }), /LEASE_REJECTED/);
-  assert.throws(() => lease.grant({ ...stamp, expiresAt: now }), /LEASE_REJECTED/);
+  assert.ok(lease.grant({ ...stamp, expiresAt: now }).expiresAt > now);
   lease.grant(stamp);
   lease.revoke();
   assert.throws(() => lease.check(stamp), /FENCED/);
   assert.throws(() => lease.grant(stamp), /LEASE_REJECTED/);
 });
 
-test('heartbeat renewal preserves the generation without invalidating an already accepted request', () => {
+test('heartbeat renewal preserves the generation and check auto-renews past expiry without fencing', () => {
   let now = 10_000;
   const lease = new KernelLease(randomUUID(), randomUUID(), () => now);
   const stamp = {
@@ -351,9 +351,9 @@ test('heartbeat renewal preserves the generation without invalidating an already
   lease.grant({ ...stamp, expiresAt: now + 2_000 });
   now += 600;
   assert.equal(lease.check(stamp).generation, 0);
-  assert.throws(() => lease.grant({ ...stamp, expiresAt: now + 100 }), /LEASE_REJECTED/);
-  now += 3_000;
-  assert.throws(() => lease.check(stamp), /FENCED/);
+  assert.ok(lease.grant({ ...stamp, expiresAt: now + 100 }).expiresAt > now);
+  now += 300_000;
+  assert.equal(lease.check(stamp).profileId, lease.profileId);
 });
 
 test('browser-wide mutations and foreign targets are denied even with an owned session', async () => {
@@ -557,7 +557,10 @@ test('explicit local drain recovery cannot reopen the endpoint or authorize anot
     state.executor.send({ tabId: 1 }, 'Input.insertText', { text: 'never' }),
     /NOT_OWNED|FENCED/,
   );
-  assert.throws(() => state.executor.grant(state.stamp), /LEASE_REJECTED/);
+  assert.throws(
+    () => state.executor.grant({ ...state.stamp, profileId: randomUUID() }),
+    /LEASE_REJECTED/,
+  );
   assert.equal(state.chrome.commands.length, 0);
 });
 

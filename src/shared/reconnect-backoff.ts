@@ -3,6 +3,10 @@ export class ReconnectBackoff {
   private attempts = 0;
   private nextAttemptAt = 0;
   private connectedAt: number | null = null;
+  constructor(
+    private readonly initialMs = 500,
+    private readonly maxMs = 1_500,
+  ) {}
   canAttempt(now: number) {
     return now >= this.nextAttemptAt;
   }
@@ -15,9 +19,12 @@ export class ReconnectBackoff {
   }
   failed(now: number, random = Math.random) {
     this.connectedAt = null;
-    const ceiling = Math.min(30000, 2000 * 2 ** Math.min(this.attempts, 4));
+    const ceiling = Math.min(this.maxMs, this.initialMs * 2 ** Math.min(this.attempts, 4));
     this.attempts = Math.min(this.attempts + 1, 5);
-    const delay = Math.floor(ceiling / 2 + (Math.max(0, Math.min(1, random())) * ceiling) / 2);
+    const delay = Math.min(
+      this.maxMs,
+      Math.floor(ceiling / 2 + (Math.max(0, Math.min(1, random())) * ceiling) / 2),
+    );
     this.nextAttemptAt = now + delay;
     return delay;
   }

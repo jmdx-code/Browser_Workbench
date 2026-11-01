@@ -1,19 +1,24 @@
+import { FinderTargetList, orderedFinderItems } from './finder-target-list.js';
+import type { TargetFolder } from '../shared/target-list.js';
 import { copyTextToClipboard } from './clipboard.js';
 import { useEffect, useRef, useState } from 'react';
-import type { GroupInviterState, InviterGroupRow } from '../shared/group-inviter.js';
-import { selectionState, toggleSet } from './selection.js';
-import { IconClose, IconPlay, IconPlus, IconSearch, IconStop } from './icons.js';
+import type { GroupInviterState } from '../shared/group-inviter.js';
+import { IconClose, IconPlay, IconPlus, IconStop } from './icons.js';
 
 type GridColumn = 0 | 1;
 type GridRange = { r1: number; c1: GridColumn; r2: number; c2: GridColumn };
 type GridEdit = { r: number; c: GridColumn; value: string };
 
-function GroupDraftGrid({
+export function GroupDraftGrid({
   rows,
   onChange,
   disabled,
   onError,
+  entityLabel = '小组',
+  normalizeId = extractGroupId,
 }: {
+  entityLabel?: string;
+  normalizeId?: (raw: string) => string;
   rows: DraftGroupEntry[];
   onChange: (rows: DraftGroupEntry[]) => void;
   disabled: boolean;
@@ -55,7 +60,7 @@ function GroupDraftGrid({
         ? {
             ...row,
             [current.c === 0 ? 'groupId' : 'groupName']:
-              current.c === 0 ? extractGroupId(current.value) : current.value,
+              current.c === 0 ? normalizeId(current.value) : current.value,
           }
         : row,
     );
@@ -141,7 +146,8 @@ function GroupDraftGrid({
         makeDraftRow,
         bounds.maxRow,
         bounds.maxCol,
-      ),
+        normalizeId,
+      ).map((row) => ({ ...row, groupId: normalizeId(row.groupId) })),
     );
     focusGrid();
   }
@@ -210,8 +216,7 @@ function GroupDraftGrid({
             {bounds.maxCol - bounds.minCol + 1}列）
           </span>
           <span>
-            已填有效小组 {rows.filter((row) => row.groupId.trim() && row.groupName.trim()).length}{' '}
-            个
+            已填有效{entityLabel} {rows.filter((row) => row.groupId.trim()).length} 个
           </span>
         </div>
         <div>
@@ -264,7 +269,7 @@ function GroupDraftGrid({
         ref={gridRef}
         className="group-inviter-grid-scroll"
         tabIndex={0}
-        aria-label="小组表格选区"
+        aria-label={`${entityLabel}表格选区`}
         onKeyDown={gridKey}
         onPaste={(event) => {
           if (disabled || editingRef.current) return;
@@ -286,7 +291,11 @@ function GroupDraftGrid({
           );
         }}
       >
-        <table className="group-inviter-matrix" role="table" aria-label="添加小组两列表格">
+        <table
+          className="group-inviter-matrix"
+          role="table"
+          aria-label={`添加${entityLabel}两列表格`}
+        >
           <colgroup>
             <col style={{ width: 40 }} />
             <col style={{ width: '38%' }} />
@@ -318,7 +327,9 @@ function GroupDraftGrid({
                       focusGrid();
                     }}
                   >
-                    {c === 0 ? 'A · 小组 ID' : 'B · 小组名字'}
+                    {c === 0
+                      ? `A · ${entityLabel} ID 或链接`
+                      : `B · ${entityLabel}名字（选填，留空自动解析）`}
                   </button>
                 </th>
               ))}
@@ -369,7 +380,7 @@ function GroupDraftGrid({
                         <input
                           autoFocus
                           disabled={disabled}
-                          aria-label={`第 ${r + 1} 行小组${c === 0 ? ' ID' : '名字'}`}
+                          aria-label={`第 ${r + 1} 行${entityLabel}${c === 0 ? ' ID' : '名字'}`}
                           value={editing.value}
                           onChange={(event) => {
                             const next = { r, c, value: event.target.value };
@@ -379,7 +390,7 @@ function GroupDraftGrid({
                           onBlur={() => finishEdit()}
                           onPaste={(event) => {
                             const text = event.clipboardData.getData('text/plain');
-                            if (!isGroupGridPaste(text, c)) return;
+                            if (!isGroupGridPaste(text, c, normalizeId)) return;
                             event.preventDefault();
                             event.stopPropagation();
                             pasteGrid(text);
@@ -445,62 +456,6 @@ function makeDraftRow(groupId = '', groupName = ''): DraftGroupEntry {
   };
 }
 
-function HeaderCheck({
-  checked,
-  mixed,
-  disabled,
-  label,
-  onChange,
-}: {
-  checked: boolean;
-  mixed: boolean;
-  disabled?: boolean;
-  label: string;
-  onChange: (checked: boolean) => void;
-}) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = mixed;
-  }, [mixed]);
-  return (
-    <input
-      ref={ref}
-      type="checkbox"
-      checked={checked}
-      disabled={disabled}
-      aria-label={label}
-      title={label}
-      onChange={(event) => onChange(event.target.checked)}
-    />
-  );
-}
-
-function GroupAvatarCell({ row }: { row: InviterGroupRow }) {
-  const [broken, setBroken] = useState(false);
-  useEffect(() => {
-    setBroken(false);
-  }, [row.avatarUrl]);
-
-  const fallbackChar = Array.from(row.groupName.trim())[0] ?? 'G';
-  if (!row.avatarUrl || broken) {
-    return (
-      <span className="group-inviter-avatar is-fallback" title={row.groupName}>
-        {fallbackChar}
-      </span>
-    );
-  }
-  return (
-    <span className="group-inviter-avatar">
-      <img
-        src={row.avatarUrl}
-        alt={row.groupName}
-        referrerPolicy="no-referrer"
-        onError={() => setBroken(true)}
-      />
-    </span>
-  );
-}
-
 export function GroupInviterPage({
   state,
   loaded,
@@ -508,6 +463,7 @@ export function GroupInviterPage({
   busy,
   onAddGroups,
   onDeleteGroups,
+  onRefresh,
   onSaveInvitesPerGroup,
   onStart,
   onStop,
@@ -516,14 +472,18 @@ export function GroupInviterPage({
   loaded: boolean;
   selectedProfileIds: ReadonlySet<string>;
   busy: boolean;
-  onAddGroups: (items: Array<{ groupId: string; groupName: string }>) => Promise<void>;
+  onAddGroups: (
+    items: Array<{ groupId: string; groupName: string; folderId?: string | null }>,
+  ) => Promise<void>;
   onDeleteGroups: (groupIds: string[]) => Promise<void>;
+  onRefresh: () => Promise<unknown>;
   onSaveInvitesPerGroup: (invitesPerGroup: number) => Promise<void>;
   onStart: (groupIds: string[], invitesPerGroup: number) => Promise<void>;
   onStop: () => Promise<void>;
 }) {
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState('');
+  const [folders, setFolders] = useState<TargetFolder[]>([]);
+  const [addFolder, setAddFolder] = useState<string | null>(null);
   const [invitesInput, setInvitesInput] = useState<number>(state?.invitesPerGroup ?? 30);
   const [addingModalOpen, setAddingModalOpen] = useState(false);
   const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
@@ -549,18 +509,11 @@ export function GroupInviterPage({
   }, [state]);
 
   const groups = state?.groups ?? [];
-  const filteredGroups = groups.filter((row) => {
-    const q = searchQuery.trim().toLowerCase();
-    if (!q) return true;
-    return row.groupId.toLowerCase().includes(q) || row.groupName.toLowerCase().includes(q);
-  });
-
-  const filteredIds = filteredGroups.map((row) => row.groupId);
-  const allSelectionState = selectionState(selectedGroups, filteredIds);
   const isRunning = Boolean(state?.running);
   const totalInvitedAcrossGroups = groups.reduce((sum, item) => sum + item.totalInvitedCount, 0);
 
   function openAddModal() {
+    setAddFolder(null);
     setDraftRows(Array.from({ length: 5 }, () => makeDraftRow()));
     setFormError('');
     setAddingModalOpen(true);
@@ -568,20 +521,20 @@ export function GroupInviterPage({
 
   async function submitAddGroups(event: React.FormEvent) {
     event.preventDefault();
-    const collected: Array<{ groupId: string; groupName: string }> = [];
+    const collected: Array<{ groupId: string; groupName: string; folderId?: string | null }> = [];
     for (const row of draftRows) {
       const groupId = extractGroupId(row.groupId);
       const groupName = row.groupName.trim();
       if (!groupId && !groupName) continue;
-      if (!groupId || !groupName) {
-        setFormError('请同时填写每行的「小组ID」和「小组名字」');
+      if (!groupId) {
+        setFormError('请填写每行的「小组ID或链接」');
         return;
       }
       if (!/^[A-Za-z0-9._-]+$/.test(groupId)) {
         setFormError(`小组ID「${groupId}」格式不正确，仅支持数字、字母、点、下划线或连字符`);
         return;
       }
-      collected.push({ groupId, groupName });
+      collected.push({ groupId, groupName, folderId: addFolder });
     }
     if (!collected.length) {
       setFormError('请至少输入一行小组数据');
@@ -619,16 +572,6 @@ export function GroupInviterPage({
           </h2>
         </div>
         <div className="section-tools group-inviter-toolbar">
-          <label className="search-field">
-            <IconSearch />
-            <input
-              type="search"
-              aria-label="搜索小组"
-              placeholder="搜索小组名字或 ID"
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-            />
-          </label>
           <label
             className="group-inviter-limit-field"
             title="每个账号进入每个小组单次最多邀请的好友人数（默认 30）"
@@ -654,19 +597,6 @@ export function GroupInviterPage({
           <button className="btn" type="button" disabled={busy} onClick={openAddModal}>
             <IconPlus size={14} /> 添加小组
           </button>
-          <button
-            className="btn btn-danger"
-            type="button"
-            disabled={busy || isRunning || selectedGroups.size === 0}
-            onClick={() => void onDeleteGroups([...selectedGroups])}
-            title={
-              selectedGroups.size
-                ? `删除已选中的 ${selectedGroups.size} 个小组`
-                : '请先在表格中勾选要删除的小组'
-            }
-          >
-            删除{selectedGroups.size > 0 ? ` (${selectedGroups.size})` : ''}
-          </button>
           {isRunning ? (
             <button
               className="btn btn-danger"
@@ -688,7 +618,14 @@ export function GroupInviterPage({
                     ? '请先在右侧表格勾选小组'
                     : `使用已选的 ${selectedProfileIds.size} 个账号向 ${selectedGroups.size} 个小组随机错峰邀请好友`
               }
-              onClick={() => void onStart([...selectedGroups], normalizeInvitesCount(invitesInput))}
+              onClick={() =>
+                void onStart(
+                  orderedFinderItems(groups, folders)
+                    .filter((g) => selectedGroups.has(g.groupId))
+                    .map((g) => g.groupId),
+                  normalizeInvitesCount(invitesInput),
+                )
+              }
             >
               <IconPlay size={12} /> 开始运行
               {selectedProfileIds.size > 0 && selectedGroups.size > 0
@@ -711,86 +648,26 @@ export function GroupInviterPage({
 
       {!loaded ? (
         <p className="muted records-empty">正在读取小组库…</p>
-      ) : groups.length === 0 ? (
-        <div className="records-empty">
-          <p>小组库还是空的。点击右上角「添加小组」录入小组 ID 和小组名字即可开始使用。</p>
-          <button className="btn btn-primary" type="button" onClick={openAddModal}>
-            <IconPlus size={14} /> 添加小组
-          </button>
-        </div>
-      ) : filteredGroups.length === 0 ? (
-        <div className="records-empty">
-          <p>没有匹配「{searchQuery}」的小组。</p>
-        </div>
       ) : (
-        <div className="records-table group-inviter-table" role="table" aria-label="小组库列表">
-          <div className="records-row records-header group-inviter-row" role="row">
-            <span role="columnheader" className="cell-check">
-              <HeaderCheck
-                {...allSelectionState}
-                disabled={isRunning}
-                label="全选当前显示的小组"
-                onChange={(checked) =>
-                  setSelectedGroups(toggleSet(selectedGroups, filteredIds, checked))
-                }
-              />
-            </span>
-            <span role="columnheader">小组头像</span>
-            <span role="columnheader">小组名字</span>
-            <span role="columnheader">小组 ID</span>
-            <span role="columnheader">累计被邀请人数</span>
-          </div>
-          {filteredGroups.map((row) => {
-            const isChecked = selectedGroups.has(row.groupId);
-            return (
-              <div
-                key={row.groupId}
-                role="row"
-                className={'records-row group-inviter-row' + (isChecked ? ' is-selected' : '')}
-                onClick={() => {
-                  if (!isRunning) {
-                    setSelectedGroups(toggleSet(selectedGroups, [row.groupId], !isChecked));
-                  }
-                }}
-              >
-                <span
-                  role="cell"
-                  className="cell-check"
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <input
-                    type="checkbox"
-                    checked={isChecked}
-                    disabled={isRunning}
-                    aria-label={'选择小组 ' + row.groupName}
-                    onChange={(event) =>
-                      setSelectedGroups(
-                        toggleSet(selectedGroups, [row.groupId], event.target.checked),
-                      )
-                    }
-                  />
-                </span>
-                <span role="cell" className="cell-avatar">
-                  <GroupAvatarCell row={row} />
-                </span>
-                <span role="cell" className="cell-group-name">
-                  <strong>{row.groupName}</strong>
-                </span>
-                <span role="cell" className="cell-group-id">
-                  <code className="fb-id">{row.groupId}</code>
-                </span>
-                <span role="cell" className="cell-invited-count">
-                  <span className="pill pill-ok">累计 {row.totalInvitedCount} 人</span>
-                </span>
-              </div>
-            );
-          })}
-          <div className="records-foot">
-            <span>
-              共 {filteredGroups.length} 个小组 · 已勾选 {selectedGroups.size} 个小组
-            </span>
-          </div>
-        </div>
+        <FinderTargetList
+          listKind="inviter_groups"
+          title="目标小组列表"
+          countLabel="累计被邀请人数"
+          disabled={busy || isRunning}
+          items={groups.map((g) => ({
+            id: g.groupId,
+            name: g.groupName,
+            folderId: g.folderId,
+            sortOrder: g.sortOrder,
+            avatarUrl: g.avatarUrl,
+            count: g.totalInvitedCount,
+          }))}
+          selected={selectedGroups}
+          onSelect={setSelectedGroups}
+          onDelete={onDeleteGroups}
+          onChanged={onRefresh}
+          onFolders={setFolders}
+        />
       )}
 
       {addingModalOpen && (
@@ -819,9 +696,26 @@ export function GroupInviterPage({
               </button>
             </div>
             <p className="muted modal-desc">
-              支持逐行输入「小组 ID」和「小组名字」两列数据，也支持从 Excel
-              或文本直接多行粘贴。保存后会自动拉取小组头像。
+              支持只填「小组 ID 或链接」（名字选填，留空将自动解析真实小组名与头像），也支持从 Excel
+              或文本直接多行粘贴。
             </p>
+            {folders.length > 0 && (
+              <label className="target-folder-select">
+                归入分组{' '}
+                <select
+                  aria-label="添加小组归入分组"
+                  value={addFolder ?? ''}
+                  onChange={(e) => setAddFolder(e.target.value || null)}
+                >
+                  <option value="">未分组</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <GroupDraftGrid
               rows={draftRows}
               onChange={setDraftRows}

@@ -1,3 +1,9 @@
+import { finderListMigration, SqliteTargetLists } from './target-list-store.js';
+import {
+  groupBumperOperationsMigration,
+  groupBumperMigration,
+  SqliteGroupBumperRepository,
+} from './group-bumper-store.js';
 import { profileTaskResultMigration } from './profile-task-result-migration.js';
 import { DEFAULT_CONCURRENT_PROFILES } from '../shared/task-capacity.js';
 import { groupInviterConfirmationMigration } from './group-inviter-store.js';
@@ -36,6 +42,7 @@ import { SqliteMaterialArchivePreparationRepository } from './material-archive-s
 import { SqliteTaskTabRepository } from './task-tab-store.js';
 import { SqliteTaskRepository } from './task-store.js';
 import { transaction } from './sqlite-transaction.js';
+import { prepareCached } from './sqlite-statement-cache.js';
 import { resourceTableMigration } from './resource-table-migration.js';
 import { taskResourceMigration } from './task-resource-migration.js';
 import { SqliteResourceTableRepository } from './resource-table-store.js';
@@ -129,14 +136,80 @@ const migrations = [
   physicalHistoryCleanupMigration,
   cleanupQuotaMigration,
   cleanupIndexesMigration,
+  groupBumperMigration,
+  '-- finder-list-migration-44',
+  [
+    'CREATE INDEX IF NOT EXISTS task_settlement_notices_profile_order ON task_settlement_notices(profile_id, created_at, operation_id, kind)',
+    'CREATE INDEX IF NOT EXISTS task_settlement_delivery_state_due ON task_settlement_delivery(state, next_attempt_at, operation_id, kind)',
+  ].join(';'),
+  [
+    'CREATE INDEX IF NOT EXISTS task_plans_account_id ON task_plans(account_id)',
+    "CREATE INDEX IF NOT EXISTS task_browse_intents_like_content ON task_browse_intents(job_id, json_extract(body, '$.intent.contentId')) WHERE json_extract(body, '$.intent.kind') = 'like'",
+    "CREATE INDEX IF NOT EXISTS task_events_notification_due ON task_events(sequence, type) WHERE type IN ('FAILED', 'COMPLETED')",
+  ].join(';'),
+  groupBumperOperationsMigration,
 ];
 export const workspaceSchemaVersion = migrations.length;
 
 export class WorkspaceStore implements WorkspaceRepository {
+  private stmt(sql: string) {
+    return prepareCached(this.db, sql);
+  }
+  targetFolders(kind: import('../shared/target-list.js').TargetListKind) {
+    return new SqliteTargetLists(this.db).folders(kind);
+  }
+  targetListCommand(input: unknown) {
+    return new SqliteTargetLists(this.db).command(input);
+  }
+  reorderGroups(ids: string[]) {
+    return this.transaction(() => {
+      const known = new Set(this.groups().map((g) => g.id));
+      if (
+        ids.length !== known.size ||
+        new Set(ids).size !== known.size ||
+        ids.some((id) => !known.has(id))
+      )
+        throw new ProductError('GROUP_ORDER_INVALID', '分组列表已变化，请刷新');
+      const stmt = this.stmt('UPDATE groups SET sort_order=? WHERE id=?');
+      ids.forEach((id, i) => stmt.run(i, id));
+    });
+  }
+  ensureProfileOrders(ids: string[]) {
+    this.transaction(() => {
+      let next = Number(
+        this.stmt(
+          'SELECT COALESCE(MAX(sort_order),-1)+1 n FROM profile_metadata WHERE group_id IS NULL',
+        ).get()?.n,
+      );
+      const get = this.stmt('SELECT 1 FROM profile_metadata WHERE profile_id=?'),
+        insert = this.stmt(
+          'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,NULL,?)',
+        );
+      for (const id of ids) if (!get.get(id)) insert.run(id, next++);
+    });
+  }
+  reorderProfiles(ids: string[], groupId: string | null) {
+    return this.transaction(() => {
+      if (groupId && !this.stmt('SELECT id FROM groups WHERE id=?').get(groupId))
+        throw new ProductError('GROUP_NOT_FOUND', '分组不存在', 404);
+      const stmt = this.stmt(
+        'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order',
+      );
+      const moved = [...new Set(ids)];
+      const rest = this.stmt(
+        'SELECT profile_id FROM profile_metadata WHERE group_id IS ? ORDER BY sort_order,profile_id',
+      )
+        .all(groupId)
+        .map((row) => String(row.profile_id))
+        .filter((id) => !moved.includes(id));
+      [...moved, ...rest].forEach((id, i) => stmt.run(id, groupId, i));
+    });
+  }
+
   maintenanceSettings() {
-    const row = this.db
-      .prepare('SELECT revision,log_retention_days FROM workspace_preferences WHERE id=1')
-      .get();
+    const row = this.stmt(
+      'SELECT revision,log_retention_days FROM workspace_preferences WHERE id=1',
+    ).get();
     return MaintenanceSettings.parse({
       version: 1,
       revision: row?.revision,
@@ -146,11 +219,9 @@ export class WorkspaceStore implements WorkspaceRepository {
   updateMaintenanceSettings(input: MaintenanceUpdate) {
     const request = UpdateMaintenanceSettings.parse(input);
     return transaction(this.db, () => {
-      const changed = this.db
-        .prepare(
-          'UPDATE workspace_preferences SET revision=revision+1,log_retention_days=? WHERE id=1 AND revision=?',
-        )
-        .run(request.logRetentionDays, request.expectedRevision);
+      const changed = this.stmt(
+        'UPDATE workspace_preferences SET revision=revision+1,log_retention_days=? WHERE id=1 AND revision=?',
+      ).run(request.logRetentionDays, request.expectedRevision);
       if (changed.changes !== 1)
         throw new ProductError(
           'PREFERENCES_REVISION_CONFLICT',
@@ -162,16 +233,14 @@ export class WorkspaceStore implements WorkspaceRepository {
   }
   taskNotificationCursor() {
     return Number(
-      this.db.prepare('SELECT coalesce(max(sequence),0) AS sequence FROM task_events').get()
-        ?.sequence,
+      this.stmt('SELECT coalesce(max(sequence),0) AS sequence FROM task_events').get()?.sequence,
     );
   }
   taskNotificationEvents(after: number) {
     if (!Number.isSafeInteger(after) || after < 0) throw Error('TASK_NOTIFICATION_CURSOR_INVALID');
-    return this.db
-      .prepare(
-        "SELECT sequence,type FROM task_events WHERE sequence>? AND type IN ('FAILED','COMPLETED') ORDER BY sequence LIMIT 100",
-      )
+    return this.stmt(
+      "SELECT sequence,type FROM task_events WHERE sequence>? AND type IN ('FAILED','COMPLETED') ORDER BY sequence LIMIT 100",
+    )
       .all(after)
       .map((row) => ({
         sequence: Number(row.sequence),
@@ -179,7 +248,7 @@ export class WorkspaceStore implements WorkspaceRepository {
       }));
   }
   preferences() {
-    const row = this.db.prepare('SELECT * FROM workspace_preferences WHERE id=1').get();
+    const row = this.stmt('SELECT * FROM workspace_preferences WHERE id=1').get();
     const rawColors =
       typeof row?.combination_colors === 'string' && row.combination_colors
         ? row.combination_colors
@@ -250,11 +319,12 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly archiveExecution: SqliteMaterialArchiveExecutionRepository;
   readonly submissionObservations: SqliteFacebookSubmissionObservationRepository;
   readonly groupInviter: SqliteGroupInviterRepository;
+  readonly groupBumper: SqliteGroupBumperRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
     this.tasks = new SqliteTaskRepository(db);
-    this.dataCleanup = new SqliteDataCleanup(db);
+    this.dataCleanup = new SqliteDataCleanup(db, () => this.tasks.invalidateBatchTimingCache());
     this.taskTabs = new SqliteTaskTabRepository(db, this.tasks);
     this.taskControls = new SqliteTaskControlRepository(db, this.tasks);
     this.browseIntents = new SqliteBrowseIntentRepository(db, this.tasks);
@@ -273,6 +343,7 @@ export class WorkspaceStore implements WorkspaceRepository {
     );
     this.submissionObservations = new SqliteFacebookSubmissionObservationRepository(db);
     this.groupInviter = new SqliteGroupInviterRepository(db);
+    this.groupBumper = new SqliteGroupBumperRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -312,7 +383,8 @@ export class WorkspaceStore implements WorkspaceRepository {
               .all()
               .some((column) => column.name === 'history_max_count')
           )
-            db.exec(sql);
+            if (next === 43) finderListMigration(db);
+            else db.exec(sql);
           if (rebuild && db.prepare('PRAGMA foreign_key_check').all().length)
             throw Error('MATERIAL_USAGE_MIGRATION_FOREIGN_KEY_FAILED');
           db.exec('PRAGMA user_version=' + (next + 1));
@@ -363,8 +435,9 @@ export class WorkspaceStore implements WorkspaceRepository {
     return transaction(this.db, work);
   }
   groups(): Group[] {
-    return this.db
-      .prepare('SELECT id,name,color,sort_order AS "order" FROM groups ORDER BY sort_order,id')
+    return this.stmt(
+      'SELECT id,name,color,sort_order AS "order" FROM groups ORDER BY sort_order,id',
+    )
       .all()
       .map((row) => ({
         id: String(row.id),
@@ -375,64 +448,68 @@ export class WorkspaceStore implements WorkspaceRepository {
   }
   createGroup(name: string, color: Group['color']): Group {
     return this.transaction(() => {
-      if (this.db.prepare('SELECT id FROM groups WHERE name=?').get(name))
+      if (this.stmt('SELECT id FROM groups WHERE name=?').get(name))
         throw new ProductError('GROUP_NAME_EXISTS', '分组名称已存在', 409);
       const group: Group = { id: randomUUID(), name, color, order: this.groups().length };
-      this.db.prepare('INSERT INTO groups VALUES(?,?,?,?)').run(group.id, name, color, group.order);
+      this.stmt('INSERT INTO groups VALUES(?,?,?,?)').run(group.id, name, color, group.order);
       return group;
     });
   }
   renameGroup(id: string, name: string) {
     this.transaction(() => {
-      if (!this.db.prepare('SELECT id FROM groups WHERE id=?').get(id))
+      if (!this.stmt('SELECT id FROM groups WHERE id=?').get(id))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在', 404);
-      if (this.db.prepare('SELECT id FROM groups WHERE name=? AND id<>?').get(name, id))
+      if (this.stmt('SELECT id FROM groups WHERE name=? AND id<>?').get(name, id))
         throw new ProductError('GROUP_NAME_EXISTS', '分组名称已存在', 409);
-      this.db.prepare('UPDATE groups SET name=? WHERE id=?').run(name, id);
+      this.stmt('UPDATE groups SET name=? WHERE id=?').run(name, id);
     });
   }
   deleteGroup(id: string): number {
     return this.transaction(() => {
-      if (!this.db.prepare('SELECT id FROM groups WHERE id=?').get(id))
+      if (!this.stmt('SELECT id FROM groups WHERE id=?').get(id))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在，请重新读取列表', 404);
-      const moved = this.db
-        .prepare('UPDATE profile_metadata SET group_id=NULL WHERE group_id=?')
-        .run(id);
-      this.db.prepare('DELETE FROM groups WHERE id=?').run(id);
-      return Number(moved.changes);
+      const ids = this.stmt(
+        'SELECT profile_id FROM profile_metadata WHERE group_id=? ORDER BY sort_order,profile_id',
+      )
+        .all(id)
+        .map((r) => String(r.profile_id));
+      this.moveProfiles(ids, null);
+      this.stmt('DELETE FROM groups WHERE id=?').run(id);
+      return ids.length;
     });
   }
   moveProfiles(profileIds: string[], groupId: string | null) {
     this.transaction(() => {
-      if (groupId && !this.db.prepare('SELECT id FROM groups WHERE id=?').get(groupId))
+      if (groupId && !this.stmt('SELECT id FROM groups WHERE id=?').get(groupId))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在', 404);
-      const insert = this.db.prepare(
-        'INSERT INTO profile_metadata(profile_id,group_id) VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id',
+      const insert = this.stmt(
+        'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order',
       );
-      for (const id of new Set(profileIds)) insert.run(id, groupId);
+      let order = Number(
+        this.stmt(
+          'SELECT COALESCE(MAX(sort_order),-1)+1 n FROM profile_metadata WHERE group_id IS ?',
+        ).get(groupId)?.n,
+      );
+      for (const id of new Set(profileIds)) insert.run(id, groupId, order++);
     });
   }
   renameProfile(id: string, alias: string) {
-    this.db
-      .prepare(
-        'INSERT INTO profile_metadata(profile_id,alias) VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET alias=excluded.alias',
-      )
-      .run(id, alias);
+    this.stmt(
+      'INSERT INTO profile_metadata(profile_id,alias) VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET alias=excluded.alias',
+    ).run(id, alias);
   }
   deleteProfiles(profileIds: string[]): number {
     return this.transaction(() => {
       const uniqueIds = [...new Set(profileIds)];
       for (const id of uniqueIds) {
-        const active = this.db
-          .prepare(
-            "SELECT id FROM task_plans WHERE profile_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1",
-          )
-          .get(id);
+        const active = this.stmt(
+          "SELECT id FROM task_plans WHERE profile_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1",
+        ).get(id);
         if (active)
           throw new ProductError('PROFILE_TASK_ACTIVE', '请先停止或完成该浏览器的任务再删除', 409);
       }
-      const delMeta = this.db.prepare('DELETE FROM profile_metadata WHERE profile_id=?');
-      const delCache = this.db.prepare('DELETE FROM profile_account_cache WHERE profile_id=?');
+      const delMeta = this.stmt('DELETE FROM profile_metadata WHERE profile_id=?');
+      const delCache = this.stmt('DELETE FROM profile_account_cache WHERE profile_id=?');
       for (const id of uniqueIds) {
         delMeta.run(id);
         delCache.run(id);
@@ -442,14 +519,14 @@ export class WorkspaceStore implements WorkspaceRepository {
   }
   profileMetadata() {
     return new Map(
-      this.db
-        .prepare('SELECT * FROM profile_metadata')
+      this.stmt('SELECT * FROM profile_metadata')
         .all()
         .map((row) => [
           String(row.profile_id),
           {
             groupId: row.group_id === null ? null : String(row.group_id),
             alias: row.alias === null ? null : String(row.alias),
+            order: Number(row.sort_order),
           },
         ]),
     );
@@ -463,8 +540,7 @@ export class WorkspaceStore implements WorkspaceRepository {
       'verification',
     ]);
     return new Map(
-      this.db
-        .prepare('SELECT * FROM profile_account_cache')
+      this.stmt('SELECT * FROM profile_account_cache')
         .all()
         .map((row) => {
           const rawState = String(row.account_state ?? 'unknown');
@@ -528,9 +604,8 @@ export class WorkspaceStore implements WorkspaceRepository {
           : update.avatar !== undefined && update.avatar !== null
             ? Date.now()
             : existing.avatarUpdatedAt;
-      this.db
-        .prepare(
-          `INSERT INTO profile_account_cache(profile_id,account_state,account_id,account_name,avatar_url,avatar_updated_at)
+      this.stmt(
+        `INSERT INTO profile_account_cache(profile_id,account_state,account_id,account_name,avatar_url,avatar_updated_at)
            VALUES(?,?,?,?,?,?)
            ON CONFLICT(profile_id) DO UPDATE SET
              account_state=excluded.account_state,
@@ -538,27 +613,25 @@ export class WorkspaceStore implements WorkspaceRepository {
              account_name=excluded.account_name,
              avatar_url=excluded.avatar_url,
              avatar_updated_at=excluded.avatar_updated_at`,
-        )
-        .run(profileId, nextState, nextId, nextName, nextAvatar, nextUpdatedAt);
+      ).run(profileId, nextState, nextId, nextName, nextAvatar, nextUpdatedAt);
     });
   }
   combinations() {
-    return this.db
-      .prepare('SELECT id FROM combinations WHERE deleted_at IS NULL ORDER BY updated_at DESC,id')
+    return this.stmt(
+      'SELECT id FROM combinations WHERE deleted_at IS NULL ORDER BY updated_at DESC,id',
+    )
       .all()
       .map((row) => this.get(String(row.id)));
   }
   private get(id: string): SavedCombination {
-    const row = this.db
-      .prepare('SELECT * FROM combinations WHERE id=? AND deleted_at IS NULL')
-      .get(id);
+    const row = this.stmt('SELECT * FROM combinations WHERE id=? AND deleted_at IS NULL').get(id);
     if (!row) throw new ProductError('COMBINATION_NOT_FOUND', '任务组合不存在', 404);
     const version = Number(row.current_version);
     const saved =
       version > 0
-        ? this.db
-            .prepare('SELECT body FROM combination_versions WHERE combination_id=? AND version=?')
-            .get(id, version)
+        ? this.stmt(
+            'SELECT body FROM combination_versions WHERE combination_id=? AND version=?',
+          ).get(id, version)
         : null;
     return SavedCombinationSchema.parse({
       id,

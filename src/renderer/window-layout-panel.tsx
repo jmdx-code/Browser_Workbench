@@ -97,7 +97,7 @@ export function WindowLayoutPanel({
     <div className="menu-panel window-layout-panel">
       <h3>任务窗口露边布局</h3>
       <p className="muted">
-        主屏、副屏均可。检测到任务页不可见时，激活并就近移动露边；过大的窗口适当缩小。请尽量保留一部分网页不被其他软件盖住。
+        在最后激活的浏览器所在屏幕上，按统一尺寸与固定间隔整齐排列所有窗口。主屏、副屏均可；任务执行期间不再频繁移动或抢占焦点。
       </p>
       <label>
         目标屏幕

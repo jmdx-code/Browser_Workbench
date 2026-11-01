@@ -12,7 +12,7 @@ import { devDiag } from '../shared/dev-diagnostics.js';
 export interface KernelBridgeHooks {
   message(peer: Peer, value: unknown): Awaitable<boolean>;
   disconnected(peer: Peer): Awaitable<void>;
-  controlStopped(peer: Peer): Awaitable<void>;
+  controlStopped(peer: Peer, requestId?: string): Awaitable<void>;
   tick(): Awaitable<void>;
   close(): Promise<void>;
 }
@@ -180,7 +180,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       const u = new URL(req.url ?? '/', ORIGIN);
       res.setHeader(
         'Content-Security-Policy',
-        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob: https://*.fbcdn.net; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob: https://*.fbcdn.net https://*.fbsbx.com; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
       );
       if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/workbench/')) {
         res.setHeader('Set-Cookie', `bridgeAdmin=${admin}; HttpOnly; SameSite=Strict; Path=/`);
@@ -624,6 +624,95 @@ export async function startBridgeServer(options: BridgeServerOptions) {
             })
             .parse(m);
           core.windowRevealed(peer, reply.requestId, reply);
+        } else if (m.type === 'EXTRA_TABS_CLEANED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const reply = z
+            .object({
+              requestId: z.string().uuid(),
+              keptTabId: z.number().int().positive().optional(),
+              closedTabIds: z.array(z.number().int().positive()).max(500).optional(),
+              remainingTabCount: z.number().int().positive().optional(),
+              error: z.string().max(500).optional(),
+            })
+            .parse(m);
+          core.extraTabsCleaned(peer, reply.requestId, reply);
+        } else if (m.type === 'BROWSER_WINDOW_INSPECTED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const boundsSchema = z
+            .object({
+              left: z.number().int(),
+              top: z.number().int(),
+              width: z.number().int(),
+              height: z.number().int(),
+            })
+            .strict();
+          const insetsSchema = z
+            .object({
+              left: z.number().int().nonnegative(),
+              top: z.number().int().nonnegative(),
+              right: z.number().int().nonnegative(),
+              bottom: z.number().int().nonnegative(),
+            })
+            .strict();
+          const reply = z
+            .object({
+              requestId: z.string().uuid(),
+              windowId: z.number().int().optional(),
+              tabId: z.number().int().nonnegative().optional(),
+              focused: z.boolean().optional(),
+              lastFocusedAt: z.number().int().nonnegative().optional(),
+              state: z.string().max(40).optional(),
+              bounds: boundsSchema.optional(),
+              contentInsets: insetsSchema.optional(),
+              displays: z
+                .array(
+                  z
+                    .object({
+                      id: z.string().max(80),
+                      left: z.number().int(),
+                      top: z.number().int(),
+                      width: z.number().int(),
+                      height: z.number().int(),
+                    })
+                    .strict(),
+                )
+                .max(32)
+                .optional(),
+              error: z.string().max(500).optional(),
+            })
+            .parse(m);
+          core.browserWindowInspected(peer, reply.requestId, reply);
+        } else if (m.type === 'BROWSER_WINDOW_POSITIONED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const boundsSchema = z
+            .object({
+              left: z.number().int(),
+              top: z.number().int(),
+              width: z.number().int(),
+              height: z.number().int(),
+            })
+            .strict();
+          const insetsSchema = z
+            .object({
+              left: z.number().int().nonnegative(),
+              top: z.number().int().nonnegative(),
+              right: z.number().int().nonnegative(),
+              bottom: z.number().int().nonnegative(),
+            })
+            .strict();
+          const reply = z
+            .object({
+              requestId: z.string().uuid(),
+              windowId: z.number().int().optional(),
+              tabId: z.number().int().nonnegative().optional(),
+              focused: z.boolean().optional(),
+              state: z.string().max(40).optional(),
+              bounds: boundsSchema.optional(),
+              contentInsets: insetsSchema.optional(),
+              error: z.string().max(500).optional(),
+            })
+            .parse(m);
+          core.browserWindowPositioned(peer, reply.requestId, reply);
         } else if (m.type === 'LOCAL_STOP') {
           await core.stop(peer.profileId);
         } else if (['STOPPED', 'RESUMED', 'SYNC_STATE'].includes(m.type)) {
@@ -631,7 +720,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
           const requestId = z.string().uuid().parse(m.requestId);
           if (m.type === 'STOPPED') {
             if (await core.stopped(peer, requestId)) {
-              await kernel?.controlStopped(peer);
+              await kernel?.controlStopped(peer, requestId);
               // A parent stop may interrupt SYNC or follow a control timeout. Retire
               // the old SDK owner first, then reconcile; STOPPED alone grants no input.
               if (!peer.synced) await core.sync(peer);
@@ -645,6 +734,14 @@ export async function startBridgeServer(options: BridgeServerOptions) {
             );
             if (synced) await options.extensionIdle?.(peer);
           }
+        } else if (m.type === 'STOP_UNCONFIRMED' || m.type === 'SYNC_UNCONFIRMED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const requestId = z.string().uuid().parse(m.requestId);
+          const reason =
+            typeof m.error === 'string' && m.error
+              ? m.error.slice(0, 120)
+              : 'KERNEL_STOP_UNCONFIRMED';
+          core.controlUnconfirmed(peer, requestId, reason);
         } else if (m.type === 'EXTENSION_RELOADING') {
           if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
           const requestId = z.string().uuid().parse(m.requestId);
@@ -660,11 +757,19 @@ export async function startBridgeServer(options: BridgeServerOptions) {
           if (m.windowCount !== undefined)
             peer.browserWindowCount = z.number().int().min(0).max(10000).parse(m.windowCount);
           if (
+            typeof m.lastFocusedAt === 'number' &&
+            Number.isFinite(m.lastFocusedAt) &&
+            m.lastFocusedAt > 0
+          ) {
+            peer.focusedWindowAt = Math.max(peer.focusedWindowAt ?? 0, m.lastFocusedAt);
+          }
+          if (
             peer.capabilities?.includes('profile-foreground-v1') &&
             m.profileWindowFocused !== undefined
           ) {
             peer.profileWindowFocused = z.boolean().parse(m.profileWindowFocused);
-            peer.focusedWindowAt = Date.now();
+            if (peer.profileWindowFocused)
+              peer.focusedWindowAt = Math.max(peer.focusedWindowAt ?? 0, Date.now());
           }
           lastPong = Date.now();
           await options.extensionIdle?.(peer);

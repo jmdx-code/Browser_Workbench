@@ -89,6 +89,7 @@ export interface FacebookTaskAuthority {
     pagePreparation?: boolean,
   ): Promise<void>;
   readBrowsePage?(page: Page, guard: () => Awaitable<void>): Promise<BrowsePage>;
+  clearBrowseCache?(): void;
   profile(): Awaitable<RuntimeProfile>;
   assertIdentity(accountId: string): Awaitable<void>;
   // Re-read the current document/route and the exact business target after each SDK wait.
@@ -509,11 +510,13 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
     await this.postReadContext(execution, guard, true);
     return (await this.authority.canPresentTaskPage?.()) ?? this.authority.foregroundAllowed?.();
   }
+  private lastBrowseReading?: { at: number; page: BrowsePage };
   private async readBrowsePageOwned(execution: StepExecution, guard: () => Awaitable<void>) {
     const { page, proof, assertCurrent } = await this.postReadContext(execution, guard, true);
     if (this.authority.readBrowsePage) {
       const reading = await this.authority.readBrowsePage(page, assertCurrent);
       await assertCurrent();
+      this.lastBrowseReading = { at: Date.now(), page: reading };
       return {
         context: structuredClone(this.context),
         proof: structuredClone(proof),
@@ -527,6 +530,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       await this.authority.refreshIdentity?.(page, assertCurrent);
       await assertCurrent();
     }
+    this.lastBrowseReading = { at: Date.now(), page: reading };
     return {
       context: structuredClone(this.context),
       proof: structuredClone(proof),
@@ -573,6 +577,11 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
   inventory() {
     return this.connection.inventory();
   }
+  private lastConfirmedTab?: {
+    at: number;
+    proof: TabProof;
+    context: NonNullable<Awaited<ReturnType<Connection['context']>>>;
+  };
   async confirmTaskTab(proof: TabProof) {
     const check = async () => {
       const current = await this.current(),
@@ -595,8 +604,21 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         throw Error('FACEBOOK_MANAGED_TASK_TAB_NOT_READY');
     };
     await check();
+    if (
+      this.lastConfirmedTab &&
+      Date.now() - this.lastConfirmedTab.at < 4_500 &&
+      sameTabProof(this.lastConfirmedTab.proof, proof) &&
+      sameExecution(this.lastConfirmedTab.context, this.context)
+    ) {
+      return;
+    }
     await this.connection.confirmTaskTab(proof);
     await check();
+    this.lastConfirmedTab = {
+      at: Date.now(),
+      proof: structuredClone(proof),
+      context: structuredClone(this.context),
+    };
   }
   async readNativePostResult(
     original: FacebookPostOriginal,
@@ -746,6 +768,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       | undefined;
     const pressedSettingsKeys = new Set<string>();
     const pendingMouseReleaseButtons = new Set<string>();
+    let lastVerifiedMouseMove: { x: number; y: number; at: number } | null = null;
     let wheelStart: ReturnType<typeof BrowseWheelStart.parse> | undefined;
     const assertTarget = async (activationPreparation = false) => {
       await assertCurrent();
@@ -801,6 +824,20 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       await assertCurrent();
       await post(); // A wait must not let a settled/replaced reservation regain input authority.
     };
+    let lastAssertedAt = 0;
+    const assertTargetCached = async (activationPreparation = false, force = false) => {
+      if (
+        !force &&
+        step.spec.type !== 'post' &&
+        lastAssertedAt > 0 &&
+        Date.now() - lastAssertedAt < 1500
+      ) {
+        await assertCurrent();
+        return;
+      }
+      await assertTarget(activationPreparation);
+      lastAssertedAt = Date.now();
+    };
     await assertCurrent();
     await post();
     if (action.kind === 'uploadMedia') {
@@ -825,9 +862,9 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
           const playbackSatisfied = (error: unknown) =>
             action.kind === 'browsePlay' &&
             error instanceof Error &&
-            error.message === 'FACEBOOK_BROWSE_PLAY_ALREADY_RUNNING';
+            /(?:^|:\s*)FACEBOOK_BROWSE_PLAY_ALREADY_RUNNING\b/.test(error.message);
           try {
-            await assertTarget(true);
+            await assertTargetCached(true, true);
           } catch (error) {
             if (!playbackSatisfied(error)) throw error;
             await assertCurrent();
@@ -872,12 +909,12 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
               },
               () => this.connection.enablePostNetworkObservation(operation.binding, assertCurrent),
             );
-            await assertTarget();
+            await assertTargetCached(false, true);
           }
           if (action.kind === 'typeText') {
             if (!this.materialInputs) throw Error('FACEBOOK_MATERIAL_INPUTS_REQUIRED');
             await this.materialInputs.source.check(operation.binding, assertCurrent);
-            await assertTarget();
+            await assertTargetCached(false, true);
           }
           if (
             this.visiblePointer &&
@@ -886,7 +923,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             action.kind !== 'browseScroll'
           ) {
             await page.evaluate(installAutomationPointer);
-            await assertTarget();
+            await assertCurrent();
           }
           if (action.kind === 'activateTab') await page.bringToFront();
           else if (action.kind === 'browseNavigate') {
@@ -912,18 +949,23 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             if (selector && target) {
               if (step.spec.type === 'post') await page.bringToFront();
               browseNavigation = { selector, target };
-              if (step.spec.type !== 'post')
-                await clickFacebookNativeTarget(
-                  page,
-                  { css: selector },
-                  page.url(),
-                  assertCurrent,
-                  {
-                    scrollFallback: () =>
-                      page.locator(selector).click({ timeout: 5_000, noWaitAfter: true }),
-                  },
-                );
-              else await page.locator(selector).click({ timeout: 5_000, noWaitAfter: true });
+              if (step.spec.type !== 'post') {
+                try {
+                  await clickFacebookNativeTarget(
+                    page,
+                    { css: selector },
+                    page.url(),
+                    assertCurrent,
+                    {
+                      scrollFallback: () =>
+                        page.locator(selector).click({ timeout: 5_000, noWaitAfter: true }),
+                    },
+                  );
+                } catch {
+                  browseNavigation = undefined;
+                  await this.connection.navigateBoundPage(operation.binding, action, page.url());
+                }
+              } else await page.locator(selector).click({ timeout: 5_000, noWaitAfter: true });
             } else await this.connection.navigateBoundPage(operation.binding, action, page.url());
           } else if (action.kind === 'browseScroll') {
             const surface = facebookBrowseSurface(action.url);
@@ -935,21 +977,74 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             const alreadyVisible =
               fastScroll && (await page.evaluate(() => document.visibilityState === 'visible'));
             await assertCurrent();
-            if (alreadyVisible !== true || this.connection.taskRendering) await page.bringToFront();
-            const viewport = await page.evaluate(() => ({
-              width: innerWidth,
-              height: innerHeight,
-            }));
-            if (!fastScroll) await assertTarget();
+            const canPresent = (await this.authority.canPresentTaskPage?.()) === true;
+            await assertCurrent();
+            if (alreadyVisible !== true && !canPresent) await page.bringToFront();
+            const viewport = (await page.evaluate(() => {
+              const w = innerWidth,
+                h = innerHeight;
+              let x = Math.round(w / 2),
+                y = Math.round(h / 2);
+              const mains = Array.from(document.querySelectorAll('main,[role="main"]')).filter(
+                (el) => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < h;
+                },
+              );
+              const hitInMain = (px: number, py: number) => {
+                const hit = document.elementFromPoint(px, py);
+                return !!hit && mains.some((m) => m.contains(hit));
+              };
+              const m = mains[0];
+              if (m && !hitInMain(x, y)) {
+                const mr = m.getBoundingClientRect();
+                const left = Math.max(16, mr.left + 24);
+                const right = Math.min(w - 16, mr.right - 24);
+                const top = Math.max(64, mr.top + 24);
+                const bottom = Math.min(h - 24, mr.bottom - 24);
+                const xs = [
+                  Math.round((left + right) / 2),
+                  Math.round(left + (right - left) * 0.35),
+                  Math.round(left + (right - left) * 0.65),
+                  x,
+                ];
+                const ys = [
+                  Math.round((top + bottom) / 2),
+                  Math.round(top + (bottom - top) * 0.3),
+                  Math.round(top + (bottom - top) * 0.7),
+                  Math.round(h * 0.35),
+                  Math.round(h * 0.65),
+                ];
+                outer: for (const cy of ys) {
+                  for (const cx of xs) {
+                    if (cx >= 8 && cx <= w - 8 && cy >= 56 && cy <= h - 8 && hitInMain(cx, cy)) {
+                      x = cx;
+                      y = cy;
+                      break outer;
+                    }
+                  }
+                }
+              }
+              return { width: w, height: h, x, y, scrollY: Math.max(0, scrollY) };
+            })) as { width: number; height: number; x?: number; y?: number; scrollY?: number };
+            const targetX = typeof viewport.x === 'number' ? viewport.x : viewport.width / 2;
+            const targetY = typeof viewport.y === 'number' ? viewport.y : viewport.height / 2;
+            if (!fastScroll) await assertTargetCached(false, false);
             await assertCurrent();
             if (fastScroll) {
               await assertCurrent();
-              await page.mouse.move(viewport.width / 2, viewport.height / 2);
-            } else
-              await this.movePointer(page, viewport.width / 2, viewport.height / 2, assertCurrent);
+              await page.mouse.move(targetX, targetY);
+            } else await this.movePointer(page, targetX, targetY, assertCurrent);
             let humanScroll = surface === 'marketplace';
             if (feed) {
-              const before = await readFacebookBrowsePage(page, assertCurrent);
+              const cachedBefore =
+                this.lastBrowseReading &&
+                Date.now() - this.lastBrowseReading.at < 1500 &&
+                this.lastBrowseReading.page.url === action.url &&
+                this.lastBrowseReading.page.timeOrigin === action.timeOrigin
+                  ? this.lastBrowseReading.page
+                  : undefined;
+              const before = cachedBefore ?? (await readFacebookBrowsePage(page, assertCurrent));
               // Every actual Input is freshly checked by the original native resource gate.
               // The read itself needs cancellation/context guards, not a duplicate full read.
               await assertCurrent();
@@ -989,10 +1084,50 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
                   setTimeout(resolve, humanScroll ? Math.round(38 + Math.random() * 44) : 35),
                 );
             }
+            if (surface === 'feed' || surface === 'marketplace') {
+              await assertCurrent();
+              await page.evaluate(
+                ({ deltaY, fromY }) => {
+                  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+                  const currentY = Math.max(0, window.scrollY);
+                  if (Math.abs(currentY - fromY) >= 4) return;
+                  const doc = document.documentElement;
+                  const body = document.body;
+                  const maxDocY = Math.max(
+                    0,
+                    Math.max(doc?.scrollHeight ?? 0, body?.scrollHeight ?? 0) - window.innerHeight,
+                  );
+                  if (maxDocY > currentY + 4 && typeof window.scrollBy === 'function') {
+                    window.scrollBy({ top: deltaY, left: 0, behavior: 'instant' });
+                  }
+                  if (Math.abs(Math.max(0, window.scrollY) - fromY) >= 4) return;
+                  const mains = Array.from(document.querySelectorAll('main,[role="main"]'));
+                  for (const main of mains) {
+                    const nodes = [main, ...Array.from(main.querySelectorAll('div,section'))].slice(
+                      0,
+                      60,
+                    );
+                    for (const node of nodes) {
+                      if (!(node instanceof HTMLElement)) continue;
+                      const maxTop = node.scrollHeight - node.clientHeight;
+                      if (maxTop <= 8) continue;
+                      const style = getComputedStyle(node);
+                      if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                        const beforeTop = node.scrollTop;
+                        node.scrollTop = Math.max(0, Math.min(maxTop, beforeTop + deltaY));
+                        if (Math.abs(node.scrollTop - beforeTop) >= 4) return;
+                      }
+                    }
+                  }
+                },
+                { deltaY: action.deltaY, fromY: viewport.scrollY ?? action.fromY },
+              );
+            }
           } else if (action.kind === 'browsePlay') {
-            await page.bringToFront();
             try {
-              await assertTarget();
+              await page.bringToFront();
+              await assertCurrent();
+              const allowHidden = (await this.authority.canPresentTaskPage?.()) === true;
               await clickFacebookNativeTarget(
                 page,
                 { css: action.css },
@@ -1000,6 +1135,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
                 assertCurrent,
                 {
                   scrollFallback: () => page.locator(action.css).click({ timeout: 5_000 }),
+                  allowHidden,
                 },
               );
             } catch (error) {
@@ -1011,7 +1147,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             // waits for painted/stable frames: activate only the original owned page, inside
             // this bound operation and through the same native purpose/identity guards.
             await page.bringToFront();
-            await assertTarget();
+            await assertCurrent();
             let locator = action.target.scope
               ? page.locator(action.target.scope).locator(action.target.css)
               : page.locator(action.target.css);
@@ -1048,11 +1184,13 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
               if (!visible || !enabled)
                 throw Error('FACEBOOK_POST_CONFIGURATION_TARGET_UNAVAILABLE');
               await locator.press('Enter', { timeout: 5_000 });
-            } else if (step.spec.type !== 'post')
+            } else if (step.spec.type !== 'post') {
+              const allowHidden = (await this.authority.canPresentTaskPage?.()) === true;
               await clickFacebookNativeTarget(page, action.target, page.url(), assertCurrent, {
                 scrollFallback: () => locator.click({ timeout: 5_000 }),
+                allowHidden,
               });
-            else await locator.click({ timeout: 5_000 });
+            } else await locator.click({ timeout: 5_000 });
           }
         },
         assertCurrent,
@@ -1068,7 +1206,27 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
           ) {
             // Release only this operation's approved press. Retain the outer input gate's
             // current context/lease/STOP checks, without re-reading the old target.
+            lastVerifiedMouseMove = null;
             await assertCurrent();
+            return;
+          }
+          if (
+            step.spec.type !== 'post' &&
+            !browseNavigation &&
+            command.method === 'Input.dispatchMouseEvent' &&
+            command.params.type === 'mousePressed' &&
+            lastVerifiedMouseMove !== null &&
+            Date.now() - lastVerifiedMouseMove.at <= 2500 &&
+            Number.isFinite(Number(command.params.x)) &&
+            Number.isFinite(Number(command.params.y)) &&
+            Math.hypot(
+              Number(command.params.x) - lastVerifiedMouseMove.x,
+              Number(command.params.y) - lastVerifiedMouseMove.y,
+            ) <= 2
+          ) {
+            lastVerifiedMouseMove = null;
+            await assertCurrent();
+            pendingMouseReleaseButtons.add(mouseButton);
             return;
           }
           const original = await post();
@@ -1109,7 +1267,28 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             pressedSettingsKeys.delete(key);
             return;
           }
-          await assertTarget(command.method === 'Page.bringToFront');
+          if (command.method === 'Page.navigate') {
+            lastAssertedAt = 0;
+            await assertTargetCached(false, true);
+          } else {
+            await assertTargetCached(command.method === 'Page.bringToFront', false);
+          }
+          if (
+            step.spec.type !== 'post' &&
+            !browseNavigation &&
+            command.method === 'Input.dispatchMouseEvent' &&
+            command.params.type === 'mouseMoved' &&
+            Number.isFinite(Number(command.params.x)) &&
+            Number.isFinite(Number(command.params.y))
+          ) {
+            lastVerifiedMouseMove = {
+              x: Number(command.params.x),
+              y: Number(command.params.y),
+              at: Date.now(),
+            };
+          } else {
+            lastVerifiedMouseMove = null;
+          }
           if (browseNavigation) {
             const target = await readFacebookBrowseNavigation(
               page,
@@ -1141,7 +1320,14 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         },
         ['feed', 'video', 'marketplace', 'friends'].includes(step.spec.type),
       )
-      .finally(() => pendingMouseReleaseButtons.clear());
+      .finally(() => {
+        pendingMouseReleaseButtons.clear();
+        lastAssertedAt = 0;
+        if (operation.action.kind !== 'activateTab') {
+          this.lastBrowseReading = undefined;
+          this.authority.clearBrowseCache?.();
+        }
+      });
     // SDK completion is an input acknowledgement only; the business observer must verify it.
     return {
       binding: result.binding,
@@ -1179,11 +1365,37 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       // owned page, but close that session instead of regranting it as healthy.
       !this.connection.hasPendingCommands &&
       !this.connection.failureReason;
-    const receipt = await (keep
-      ? this.connection.park(binding.requestId)
-      : retry
-        ? this.connection.retryClose(binding.requestId)
-        : this.connection.close(binding.requestId));
+    let receipt: Awaited<ReturnType<typeof this.connection.close>>;
+    try {
+      receipt = await (keep
+        ? this.connection.park(binding.requestId)
+        : retry
+          ? this.connection.retryClose(binding.requestId)
+          : this.connection.close(binding.requestId));
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        /^KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
+          error.message,
+        )
+      ) {
+        for (const row of await this.tabs.forPlan(this.plan.id)) {
+          if (row.state === 'READY') {
+            await Promise.resolve(
+              this.tabs.requireRecheck(
+                row.proof.ownershipId,
+                row.revision,
+                error.message,
+                this.plan.id,
+              ),
+            ).catch(() => {});
+          }
+        }
+        this.stopReceipt = SessionStopReceipt.parse({ ...binding, state: 'stopped' });
+        return structuredClone(this.stopReceipt);
+      }
+      throw error;
+    }
     this.stopReceipt = SessionStopReceipt.parse({ ...binding, state: receipt.state });
     const inventory = keep ? await this.connection.inventory() : this.connection.closedInventory,
       proof = this.connection.proof;

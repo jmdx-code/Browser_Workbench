@@ -26,6 +26,11 @@ import { ActorBrowserPort } from './actor-browser-port.js';
 import { postFailureRequiresEnding } from '../domain/step-failure-policy.js';
 import type { TabProof } from '../shared/kernel-state.js';
 import { SettlementNotifier } from './settlement-notifier.js';
+import { sameResolution } from '../shared/settlement.js';
+import {
+  isRecoverableBrowseFault,
+  isSessionBreakingBrowseFault,
+} from '../shared/browse-execution.js';
 
 type Entry = {
   context: ExecutionSession;
@@ -42,6 +47,7 @@ type Entry = {
 // Lifecycle owner only. No discovery, tab creation, automatic resume or business inference.
 export class ProfileActorRegistry {
   private readonly entries = new Map<string, Entry>();
+  private readonly selfHealRetiredProfiles = new Set<string>();
   hasOwners(): boolean {
     return this.entries.size > 0;
   }
@@ -64,6 +70,10 @@ export class ProfileActorRegistry {
     private readonly profileInventory?: (
       profileId: string,
     ) => Awaitable<RuntimeProfile | undefined>,
+    private readonly onBrowseSelfHealRetire?: (
+      profileId: string,
+      reason: string,
+    ) => Awaitable<void>,
   ) {}
   private native(): GuardedBrowserPort {
     return {
@@ -228,6 +238,7 @@ export class ProfileActorRegistry {
       retrying: false,
       stopInFlight: false,
     };
+    this.selfHealRetiredProfiles.delete(port.profileId);
     this.entries.set(port.profileId, owner);
     try {
       await port.setFailureHandler(async (reason) => {
@@ -255,7 +266,8 @@ export class ProfileActorRegistry {
       entry.port.confirmTaskTab &&
       plan.snapshot.steps.every(
         (step) =>
-          step.type !== 'post' && (step.maxLikes === 0 || ['feed', 'video'].includes(step.type)),
+          step.type !== 'post' &&
+          (step.maxLikes === 0 || ['feed', 'video', 'marketplace', 'friends'].includes(step.type)),
       ) &&
       !(
         (await this.tasks.blockingOperations?.(plan.id)) ?? (await this.tasks.operations(plan.id))
@@ -264,7 +276,9 @@ export class ProfileActorRegistry {
           ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status) &&
           !op.disposition,
       ) &&
-      (await this.settlements.list(profileId)).every((notice) => notice.state === 'DELIVERED')
+      (this.settlements.hasUndelivered
+        ? !(await this.settlements.hasUndelivered(profileId))
+        : (await this.settlements.list(profileId)).every((notice) => notice.state === 'DELIVERED'))
     ) {
       try {
         const proof = await this.currentTaskTab(plan, current);
@@ -279,6 +293,39 @@ export class ProfileActorRegistry {
       }
     }
     const observed = await entry.actor.observe();
+    if (!observed && this.entries.get(profileId) === entry) {
+      const lastInventory = entry.actor.lastObservedInventory();
+      if (lastInventory) {
+        const undelivered = this.settlements.listForReconciliation
+          ? await this.settlements.listForReconciliation(profileId, [])
+          : (await this.settlements.list(profileId)).filter(
+              (notice) => notice.state !== 'DELIVERED',
+            );
+        const needsSummaryEnd = undelivered.some(
+          (notice) =>
+            notice.state !== 'DELIVERED' &&
+            notice.resolution.outcome === 'ENDED_UNKNOWN' &&
+            lastInventory.operations.some(
+              (remote) =>
+                remote.binding.operationId === notice.binding.operationId &&
+                (!remote.disposition || !sameResolution(remote.disposition, notice.resolution)),
+            ),
+        );
+        if (needsSummaryEnd) {
+          await this.stopEntry(
+            entry,
+            SessionStopBinding.parse({ ...entry.context, requestId: this.id() }),
+            null,
+            'END_DISPOSITION_SUMMARY_REQUIRED',
+          );
+          if (this.onBrowseSelfHealRetire && plan?.state === 'RUNNING') {
+            this.selfHealRetiredProfiles.add(profileId);
+            await this.onBrowseSelfHealRetire(profileId, 'END_DISPOSITION_SUMMARY_REQUIRED');
+          }
+          return;
+        }
+      }
+    }
     const after = await entry.actor.session();
     const fresh = plan && (await this.tasks.get(plan.id));
     // Transfer this round's independently reconciled proof, never a cached inventory.
@@ -291,7 +338,8 @@ export class ProfileActorRegistry {
       fresh.accountId === after.accountId &&
       fresh.snapshot.steps.every(
         (step) =>
-          step.type !== 'post' && (step.maxLikes === 0 || ['feed', 'video'].includes(step.type)),
+          step.type !== 'post' &&
+          (step.maxLikes === 0 || ['feed', 'video', 'marketplace', 'friends'].includes(step.type)),
       )
     ) {
       const rows = (await this.tabs.forPlan(fresh.id)).filter((row) =>
@@ -360,14 +408,32 @@ export class ProfileActorRegistry {
           const count = Math.min(
             4,
             (await this.settlements.list(binding.profileId)).filter(
-              (notice) => notice.state !== 'DELIVERED' && sameExecution(notice.binding, binding),
+              (notice) =>
+                notice.state !== 'DELIVERED' &&
+                notice.resolution.outcome !== 'ENDED_UNKNOWN' &&
+                sameExecution(notice.binding, binding),
             ).length,
           );
           for (let index = 0; index < count; index++) {
-            if (!(await notifier.flushOne(entry.port))) break;
+            if (!(await notifier.flushOne(entry.port, { kind: 'BUSINESS' }))) break;
           }
         }
-        const receipt = SessionStopReceipt.parse(await entry.port.stop(binding));
+        let rawReceipt: unknown;
+        try {
+          rawReceipt = await entry.port.stop(binding);
+        } catch (stopError) {
+          if (
+            stopError instanceof Error &&
+            /^KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
+              stopError.message,
+            )
+          ) {
+            rawReceipt = { ...binding, state: 'stopped' };
+          } else {
+            throw stopError;
+          }
+        }
+        const receipt = SessionStopReceipt.parse(rawReceipt);
         if (!sameStop(binding, receipt)) throw Error('ACTOR_STOP_RECEIPT_MISMATCH');
         if (this.entries.get(binding.profileId) !== entry) throw Error('ACTOR_STOP_OWNER_CHANGED');
         if (control) await this.controls.confirm(control, receipt);
@@ -412,7 +478,22 @@ export class ProfileActorRegistry {
             throw Error('ACTOR_STOP_RETRY_CONTROL_CHANGED');
         }
 
-        const receipt = SessionStopReceipt.parse(await retry(binding));
+        let rawReceipt: unknown;
+        try {
+          rawReceipt = await retry(binding);
+        } catch (stopError) {
+          if (
+            stopError instanceof Error &&
+            /^KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
+              stopError.message,
+            )
+          ) {
+            rawReceipt = { ...binding, state: 'stopped' };
+          } else {
+            throw stopError;
+          }
+        }
+        const receipt = SessionStopReceipt.parse(rawReceipt);
         if (!sameStop(binding, receipt)) throw Error('ACTOR_STOP_RECEIPT_MISMATCH');
         if (this.entries.get(binding.profileId) !== entry) throw Error('ACTOR_STOP_OWNER_CHANGED');
         if (control) await this.controls.confirm(control, receipt);
@@ -489,13 +570,24 @@ export class ProfileActorRegistry {
     const canStopWithoutOwner =
       terminal(before.state) ||
       (before.state === 'REVIEW' && before.controlConfirmed) ||
-      (['QUEUED', 'PAUSED'].includes(before.state) &&
+      ((['QUEUED', 'PAUSED'].includes(before.state) ||
+        (before.state === 'RUNNING' && !this.entries.has(before.profileId))) &&
         this.tasks.unresolved &&
         !(await this.tasks.unresolved(jobId)));
     if (!this.entries.has(before.profileId) && !canStopWithoutOwner)
       throw Error('ACTOR_STOP_OWNER_REQUIRED');
     const plan = await this.tasks.requestControl(jobId, mode, reason);
     if (terminal(plan.state) || plan.state === 'PAUSED' || plan.controlConfirmed) return plan;
+    if (
+      !this.entries.has(plan.profileId) &&
+      plan.controlRequestId &&
+      ['PAUSING', 'STOPPING'].includes(plan.state) &&
+      this.tasks.unresolved &&
+      !(await this.tasks.unresolved(jobId))
+    ) {
+      this.selfHealRetiredProfiles.delete(plan.profileId);
+      return await this.tasks.confirmControl(jobId, plan.controlRequestId);
+    }
     const entry = this.entries.get(plan.profileId);
     if (!entry || !plan.controlRequestId || !plan.controlMode)
       throw Error('ACTOR_STOP_OWNER_REQUIRED');
@@ -517,6 +609,44 @@ export class ProfileActorRegistry {
     );
     return await this.tasks.get(jobId);
   }
+  async retireForBrowseSelfHeal(profileId: string, reason: string): Promise<void> {
+    const plan = await this.activePlan(profileId);
+    const settled = plan
+      ? Boolean(await this.tasks.settleTransientBrowseOperations?.(plan.id, reason))
+      : false;
+    const entry = this.entries.get(profileId);
+    if (!entry) {
+      this.selfHealRetiredProfiles.add(profileId);
+      await this.onBrowseSelfHealRetire?.(profileId, reason);
+      return;
+    }
+    const currentContext = await entry.port.current();
+    const shouldRetireEntry =
+      settled ||
+      !currentContext ||
+      !sameExecution(currentContext, entry.context) ||
+      (this.onBrowseSelfHealRetire !== undefined && isSessionBreakingBrowseFault(reason));
+    if (!shouldRetireEntry) return;
+    entry.actor.revokeInput(reason);
+    entry.port.revokeInput?.(reason);
+    for (const tab of await this.tabs.activeForProfile(profileId)) {
+      if (tab.state === 'READY' && tab.context && sameExecution(tab.context, entry.context)) {
+        await Promise.resolve(
+          this.tabs.requireRecheck(tab.proof.ownershipId, tab.revision, reason, tab.jobId),
+        ).catch(() => {});
+      }
+    }
+    const stopBinding = SessionStopBinding.parse({
+      ...entry.context,
+      requestId: this.id(),
+    });
+    await entry.port.stop(stopBinding).catch(() => {});
+    if (this.entries.get(profileId) === entry) {
+      this.entries.delete(profileId);
+    }
+    this.selfHealRetiredProfiles.add(profileId);
+    await this.onBrowseSelfHealRetire?.(profileId, reason);
+  }
   async detach(profileId: string, expected: ExecutionSession, reason: string): Promise<void> {
     const entry = this.entries.get(profileId);
     if (!entry || !sameExecution(entry.context, expected)) throw Error('STALE_ACTOR_DETACH');
@@ -530,6 +660,18 @@ export class ProfileActorRegistry {
       const profile = (await this.inventory()).find((row) => row.id === profileId);
       const changed =
         profile?.account.state === 'logged-in' && profile.account.id !== plan.accountId;
+      if (
+        this.onBrowseSelfHealRetire &&
+        plan.state === 'RUNNING' &&
+        step &&
+        step.spec.type !== 'post' &&
+        !changed &&
+        profile?.online === true &&
+        isRecoverableBrowseFault(reason)
+      ) {
+        await this.retireForBrowseSelfHeal(profileId, reason);
+        return;
+      }
       await this.control(plan.id, changed ? 'stop' : (plan.controlMode ?? 'pause'), reason);
     } else {
       await this.stopEntry(entry, { ...entry.context, requestId: this.id() }, null, reason);

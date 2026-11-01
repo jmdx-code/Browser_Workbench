@@ -13,11 +13,13 @@ import {
   FACEBOOK_REEL_NEXT_CSS,
   FACEBOOK_FRIEND_CONFIRM_CSS,
   FACEBOOK_BROWSE_LIKE_CSS,
+  FACEBOOK_BROWSE_DIALOG_DISMISS_CSS,
 } from '../shared/facebook-browse-route.js';
 export {
   FACEBOOK_REEL_NEXT_CSS,
   FACEBOOK_FRIEND_CONFIRM_CSS,
   FACEBOOK_BROWSE_LIKE_CSS,
+  FACEBOOK_BROWSE_DIALOG_DISMISS_CSS,
 } from '../shared/facebook-browse-route.js';
 
 export const FacebookBrowsePage = z
@@ -38,6 +40,7 @@ export const FacebookBrowsePage = z
     nextReelCSS: z.literal(FACEBOOK_REEL_NEXT_CSS).nullable().optional(),
     friendConfirmCSS: z.literal(FACEBOOK_FRIEND_CONFIRM_CSS).nullable().optional(),
     friendPendingCount: z.number().int().nonnegative().optional(),
+    dialogDismissCSS: z.literal(FACEBOOK_BROWSE_DIALOG_DISMISS_CSS).nullable().optional(),
     likeTarget: z
       .object({
         css: z.literal(FACEBOOK_BROWSE_LIKE_CSS).nullable(),
@@ -89,37 +92,83 @@ export type BrowsePage = z.infer<typeof FacebookBrowsePage>;
 export function projectFacebookFeedInputFence() {
   type DOMRecord = Record<string, unknown>;
   const record = (v: unknown): v is DOMRecord => !!v && typeof v === 'object';
-  let rootNodes: Map<Element, DOMRecord> | undefined;
+  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
+    __wbReactRootNodesV1?: WeakMap<Element, DOMRecord>;
+  };
+  const rootNodes = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, DOMRecord>());
+  let rootScanned = false;
+  let cachedFiberKey = '';
+  const currentRootNode = (node: DOMRecord | undefined): DOMRecord | undefined => {
+    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
+      let root: unknown = candidate;
+      for (let depth = 0; record(root) && depth < 256; depth++) {
+        if (!root.return) {
+          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
+          break;
+        }
+        root = root.return;
+      }
+    }
+    return undefined;
+  };
   const fiberNode = (el: Element) => {
-    const key = Object.keys(el).find(
-      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
-    );
-    if (key) return Reflect.get(el, key) as unknown;
-    if (!rootNodes) {
-      rootNodes = new Map();
+    const key =
+      cachedFiberKey && cachedFiberKey in el
+        ? cachedFiberKey
+        : Object.keys(el).find(
+            (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
+          );
+    if (key) {
+      cachedFiberKey = key;
+      const raw: unknown = Reflect.get(el, key);
+      if (record(raw)) {
+        const resolved = currentRootNode(raw) ?? raw;
+        rootNodes.set(el, resolved);
+        return resolved;
+      }
+      return raw;
+    }
+    const cached = currentRootNode(rootNodes.get(el));
+    if (cached) {
+      rootNodes.set(el, cached);
+      return cached;
+    }
+    if (!rootScanned) {
+      rootScanned = true;
       const stack: unknown[] = [],
         seen = new Set<unknown>();
-      for (const host of Array.from(document.querySelectorAll('*')))
+      const primaryHosts = Array.from(
+        document.querySelectorAll(
+          'video, [role="main"], [role="presentation"], [data-pagelet], body, [id^="mount"]',
+        ),
+      ).slice(0, 40);
+      const hosts =
+        primaryHosts.length > 0
+          ? primaryHosts
+          : Array.from(document.querySelectorAll('*')).slice(0, 40);
+      for (const host of hosts)
         for (const k of Object.keys(host).filter((k) => k.startsWith('__reactContainer$'))) {
           const r: unknown = Reflect.get(host, k);
           stack.push(record(r) && record(r.stateNode) ? (r.stateNode.current ?? r) : r);
         }
-      while (stack.length && seen.size < 100000) {
+      while (stack.length && seen.size < 3000) {
         const f = stack.pop();
         if (!record(f) || seen.has(f)) continue;
         seen.add(f);
         if (f.stateNode instanceof Element) rootNodes.set(f.stateNode, f);
-        if (f.child) stack.push(f.child);
-        if (f.sibling) stack.push(f.sibling);
+        const child = f.child;
+        if (child) stack.push(child);
+        const sibling = f.sibling;
+        if (sibling) stack.push(sibling);
       }
     }
     return rootNodes.get(el);
   };
   const frames = (el: Element, limit = 40) => {
-    const out: { name: string; props: DOMRecord }[] = [];
-    let f: unknown = fiberNode(el);
-    for (let i = 0; record(f) && i < limit; i++, f = f.return) {
-      const t = f.type ?? f.elementType;
+    const primary: { name: string; props: DOMRecord }[] = [];
+    const secondary: { name: string; props: DOMRecord }[] = [];
+    const frameOf = (node: DOMRecord) => {
+      const t = node.type ?? node.elementType;
       const name =
         typeof t === 'function'
           ? String(Reflect.get(t, 'displayName') ?? t.name)
@@ -128,17 +177,28 @@ export function projectFacebookFeedInputFence() {
             : typeof t === 'string'
               ? t
               : '';
-      out.push({ name, props: record(f.memoizedProps) ? f.memoizedProps : {} });
+      const memoProps = record(node.memoizedProps) ? node.memoizedProps : null;
+      const pendingProps = record(node.pendingProps) ? node.pendingProps : null;
+      const props =
+        memoProps && (!pendingProps || pendingProps === memoProps)
+          ? memoProps
+          : pendingProps && !memoProps
+            ? pendingProps
+            : memoProps && pendingProps
+              ? { ...pendingProps, ...memoProps }
+              : {};
+      return { name, props };
+    };
+    let f: unknown = fiberNode(el);
+    for (let i = 0; record(f) && i < limit; i++, f = f.return) {
+      primary.push(frameOf(f));
+      if (record(f.alternate)) secondary.push(frameOf(f.alternate));
     }
-    return out;
+    return [...primary, ...secondary];
   };
   const blockingDialog = (el: Element) => {
-    const r = el.getBoundingClientRect(),
-      style = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
     if (
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      Number(style.opacity) === 0 ||
       r.width <= 0 ||
       r.height <= 0 ||
       r.bottom <= 0 ||
@@ -146,6 +206,9 @@ export function projectFacebookFeedInputFence() {
       r.top >= innerHeight ||
       r.left >= innerWidth
     )
+      return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)
       return false;
     if (el.getAttribute('aria-modal') === 'true') return true;
     const chain = frames(el, 48);
@@ -176,23 +239,22 @@ export function projectFacebookFeedInputFence() {
 
   const visible = (element: Element) => {
     const rect = element.getBoundingClientRect();
+    if (
+      rect.right <= 0 ||
+      rect.bottom <= 0 ||
+      rect.left >= innerWidth ||
+      rect.top >= innerHeight ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    )
+      return false;
     const style = getComputedStyle(element);
-    return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      Number(style.opacity) !== 0 &&
-      rect.right > 0 &&
-      rect.bottom > 0 &&
-      rect.left < innerWidth &&
-      rect.top < innerHeight &&
-      rect.width > 0 &&
-      rect.height > 0
-    );
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0;
   };
   const mains = Array.from(document.querySelectorAll('main,[role="main"]')).filter(visible);
   const marketplaceSurface =
-    /^\/marketplace(?:\/(?:category\/[a-z0-9_-]+|search|item\/\d{1,30}))?\/?$/i.test(
-      location.pathname,
+    /^\/marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search|\/item\/\d{1,30})?\/?$/i.test(
+      location.pathname ?? '',
     );
   return {
     url: location.href,
@@ -233,39 +295,90 @@ export function browsePageDiagnostic(page: BrowsePage) {
 // Bounded current-page DOM/Fiber read with observed legacy label fallbacks.
 // Only local target markers/scroll preparation; no social action or network request.
 export function projectFacebookBrowsePage() {
+  const homeSurface = location.pathname === '/';
+  const reelSurface =
+    /^\/(?:watch|reels)\/?$/.test(location.pathname) ||
+    /^\/reel\/\d{1,30}\/?$/.test(location.pathname) ||
+    (location.pathname === '/reel/' && location.search === '?s=tab' && !location.hash);
   type DOMRecord = Record<string, unknown>;
   const record = (v: unknown): v is DOMRecord => !!v && typeof v === 'object';
-  let rootNodes: Map<Element, DOMRecord> | undefined;
+  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
+    __wbReactRootNodesV1?: WeakMap<Element, DOMRecord>;
+  };
+  const rootNodes = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, DOMRecord>());
+  let rootScanned = false;
+  let cachedFiberKey = '';
+  const currentRootNode = (node: DOMRecord | undefined): DOMRecord | undefined => {
+    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
+      let root: unknown = candidate;
+      for (let depth = 0; record(root) && depth < 256; depth++) {
+        if (!root.return) {
+          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
+          break;
+        }
+        root = root.return;
+      }
+    }
+    return undefined;
+  };
   const fiberNode = (el: Element) => {
-    const key = Object.keys(el).find(
-      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
-    );
-    if (key) return Reflect.get(el, key) as unknown;
-    if (!rootNodes) {
-      rootNodes = new Map();
+    const key =
+      cachedFiberKey && cachedFiberKey in el
+        ? cachedFiberKey
+        : Object.keys(el).find(
+            (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
+          );
+    if (key) {
+      cachedFiberKey = key;
+      const raw: unknown = Reflect.get(el, key);
+      if (record(raw)) {
+        const resolved = currentRootNode(raw) ?? raw;
+        rootNodes.set(el, resolved);
+        return resolved;
+      }
+      return raw;
+    }
+    const cached = currentRootNode(rootNodes.get(el));
+    if (cached) {
+      rootNodes.set(el, cached);
+      return cached;
+    }
+    if (!rootScanned) {
+      rootScanned = true;
       const stack: unknown[] = [],
         seen = new Set<unknown>();
-      for (const host of Array.from(document.querySelectorAll('*')))
+      const primaryHosts = Array.from(
+        document.querySelectorAll(
+          'video, [role="main"], [role="presentation"], [data-pagelet], body, [id^="mount"]',
+        ),
+      ).slice(0, 40);
+      const hosts =
+        primaryHosts.length > 0
+          ? primaryHosts
+          : Array.from(document.querySelectorAll('*')).slice(0, 40);
+      for (const host of hosts)
         for (const k of Object.keys(host).filter((k) => k.startsWith('__reactContainer$'))) {
           const r: unknown = Reflect.get(host, k);
           stack.push(record(r) && record(r.stateNode) ? (r.stateNode.current ?? r) : r);
         }
-      while (stack.length && seen.size < 100000) {
+      while (stack.length && seen.size < 3000) {
         const f = stack.pop();
         if (!record(f) || seen.has(f)) continue;
         seen.add(f);
         if (f.stateNode instanceof Element) rootNodes.set(f.stateNode, f);
-        if (f.child) stack.push(f.child);
-        if (f.sibling) stack.push(f.sibling);
+        const child = f.child;
+        if (child) stack.push(child);
+        const sibling = f.sibling;
+        if (sibling) stack.push(sibling);
       }
     }
     return rootNodes.get(el);
   };
   const frames = (el: Element, limit = 40) => {
-    const out: { name: string; props: DOMRecord }[] = [];
-    let f: unknown = fiberNode(el);
-    for (let i = 0; record(f) && i < limit; i++, f = f.return) {
-      const t = f.type ?? f.elementType;
+    const primary: { name: string; props: DOMRecord }[] = [];
+    const secondary: { name: string; props: DOMRecord }[] = [];
+    const frameOf = (node: DOMRecord) => {
+      const t = node.type ?? node.elementType;
       const name =
         typeof t === 'function'
           ? String(Reflect.get(t, 'displayName') ?? t.name)
@@ -274,17 +387,28 @@ export function projectFacebookBrowsePage() {
             : typeof t === 'string'
               ? t
               : '';
-      out.push({ name, props: record(f.memoizedProps) ? f.memoizedProps : {} });
+      const memoProps = record(node.memoizedProps) ? node.memoizedProps : null;
+      const pendingProps = record(node.pendingProps) ? node.pendingProps : null;
+      const props =
+        memoProps && (!pendingProps || pendingProps === memoProps)
+          ? memoProps
+          : pendingProps && !memoProps
+            ? pendingProps
+            : memoProps && pendingProps
+              ? { ...pendingProps, ...memoProps }
+              : {};
+      return { name, props };
+    };
+    let f: unknown = fiberNode(el);
+    for (let i = 0; record(f) && i < limit; i++, f = f.return) {
+      primary.push(frameOf(f));
+      if (record(f.alternate)) secondary.push(frameOf(f.alternate));
     }
-    return out;
+    return [...primary, ...secondary];
   };
   const blockingDialog = (el: Element) => {
-    const r = el.getBoundingClientRect(),
-      style = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
     if (
-      style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      Number(style.opacity) === 0 ||
       r.width <= 0 ||
       r.height <= 0 ||
       r.bottom <= 0 ||
@@ -292,6 +416,9 @@ export function projectFacebookBrowsePage() {
       r.top >= innerHeight ||
       r.left >= innerWidth
     )
+      return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)
       return false;
     if (el.getAttribute('aria-modal') === 'true') return true;
     const chain = frames(el, 48);
@@ -321,21 +448,22 @@ export function projectFacebookBrowsePage() {
   };
 
   const visibleArea = (el: Element) => {
-    const r = el.getBoundingClientRect(),
-      style = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+    if (w <= 0) return 0;
+    const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    if (h <= 0) return 0;
+    const style = getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)
       return 0;
-    return (
-      Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) *
-      Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0))
-    );
+    return w * h;
   };
   const mains = Array.from(document.querySelectorAll('main,[role="main"]')).filter(
     (el) => visibleArea(el) > 0,
   );
   const marketplaceSurface =
-    /^\/marketplace(?:\/(?:category\/[a-z0-9_-]+|search|item\/\d{1,30}))?\/?$/i.test(
-      location.pathname,
+    /^\/marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search|\/item\/\d{1,30})?\/?$/i.test(
+      location.pathname ?? '',
     );
   const main =
     mains.length === 1
@@ -343,7 +471,63 @@ export function projectFacebookBrowsePage() {
       : marketplaceSurface && mains.length > 1
         ? [...mains].sort((a, b) => visibleArea(b) - visibleArea(a))[0]
         : null;
-  const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).some(blockingDialog);
+  const blockingDialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
+    blockingDialog,
+  );
+  const dialogs = blockingDialogs.length > 0;
+  for (const old of Array.from(document.querySelectorAll('[data-wb-browse-dialog-dismiss]')))
+    old.removeAttribute('data-wb-browse-dialog-dismiss');
+  let dialogDismissCSS: typeof FACEBOOK_BROWSE_DIALOG_DISMISS_CSS | null = null;
+  if (dialogs) {
+    const canHitDialogBtn = (el: Element) => {
+      const rect = el.getBoundingClientRect();
+      const x = Math.round(rect.left + rect.width / 2);
+      const y = Math.round(rect.top + rect.height / 2);
+      if (
+        rect.width <= 0 ||
+        rect.height <= 0 ||
+        rect.top < 4 ||
+        rect.bottom > innerHeight - 4 ||
+        x < 0 ||
+        x >= innerWidth ||
+        y < 0 ||
+        y >= innerHeight
+      )
+        return false;
+      const hit = document.elementFromPoint(x, y);
+      return Boolean(hit && (hit === el || el.contains(hit) || hit.contains(el)));
+    };
+    const dangerousRe = /删除|刪除|Delete|注销|註銷|Deactivate|退出|登出|Log\s*Out|Sign\s*Out/i;
+    const primaryLabelRe = /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now)$/i;
+    const secondaryLabelRe =
+      /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now|继续|繼續|Continue|知道了|Got\s*it|OK|确定|確定|取消|Cancel)$/i;
+    const candidates: { el: Element; priority: number }[] = [];
+    for (const dlg of blockingDialogs) {
+      for (const btn of Array.from(dlg.querySelectorAll('[role="button"],button')).slice(0, 80)) {
+        if (
+          btn.getAttribute('aria-disabled') === 'true' ||
+          btn.hasAttribute('disabled') ||
+          visibleArea(btn) <= 0 ||
+          !canHitDialogBtn(btn)
+        )
+          continue;
+        const aria = (btn.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const text = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+        if (dangerousRe.test(aria) || dangerousRe.test(text)) continue;
+        if (primaryLabelRe.test(aria)) {
+          candidates.push({ el: btn, priority: 1 });
+        } else if (secondaryLabelRe.test(aria) || secondaryLabelRe.test(text)) {
+          candidates.push({ el: btn, priority: 2 });
+        }
+      }
+    }
+    candidates.sort((a, b) => a.priority - b.priority);
+    const chosen = candidates[0]?.el;
+    if (chosen) {
+      chosen.setAttribute('data-wb-browse-dialog-dismiss', '1');
+      dialogDismissCSS = '[data-wb-browse-dialog-dismiss="1"]';
+    }
+  }
   const videos = main
     ? Array.from(main.querySelectorAll('video'))
         .slice(0, 100)
@@ -355,6 +539,39 @@ export function projectFacebookBrowsePage() {
   // Equal-sized visible players are ambiguous; do not start an arbitrary one.
   const video =
     selected && (!videos[1] || selected.area > videos[1].area * 1.1) ? selected.el : null;
+  // Do not retain decoder buffers for already-passed feed/Reel media. The current
+  // player and visible previews are untouched; keeping the DOM preserves React ownership.
+  if (homeSurface || reelSurface) {
+    for (const otherVid of Array.from(document.querySelectorAll('video'))) {
+      if (otherVid === video) continue;
+      const otherRect = otherVid.getBoundingClientRect();
+      const visibleH = Math.max(
+        0,
+        Math.min(otherRect.bottom, innerHeight) - Math.max(otherRect.top, 0),
+      );
+      const passedAbove =
+        otherRect.bottom < 80 ||
+        ((otherRect.width === 0 || otherRect.height === 0) && otherRect.top <= 0);
+      if (visibleArea(otherVid) > 0 && visibleH >= 120 && !passedAbove) continue;
+      otherVid.preload = 'none';
+      try {
+        if (!otherVid.paused) otherVid.pause();
+      } catch {
+        /* Detached/unsupported player. */
+      }
+      if (passedAbove && otherVid.getAttribute('data-wb-buffer-freed') !== '1') {
+        try {
+          otherVid.pause();
+          if (otherVid.srcObject) otherVid.srcObject = null;
+          if (otherVid.hasAttribute('src')) otherVid.removeAttribute('src');
+          otherVid.load();
+          otherVid.setAttribute('data-wb-buffer-freed', '1');
+        } catch {
+          /* Media teardown must not interrupt reading the active player. */
+        }
+      }
+    }
+  }
   const cssPath = (el: Element) => {
     if (el.tagName === 'VIDEO' && document.querySelectorAll('video').length === 1) return 'video';
     const src = el.getAttribute('src');
@@ -363,11 +580,12 @@ export function projectFacebookBrowsePage() {
       if (css.length <= 300 && document.querySelectorAll(css).length === 1) return css;
     }
     const parts: string[] = [];
-    for (let node: Element | null = el; node && parts.length < 64; node = node.parentElement) {
+    for (let node: Element | null = el; node && parts.length < 32; node = node.parentElement) {
       const index = node.parentElement
         ? Array.from(node.parentElement.children).indexOf(node) + 1
         : 1;
       parts.unshift(node.tagName.toLowerCase() + ':nth-child(' + index + ')');
+      if (parts.length > 2 && node.parentElement && node.parentElement !== main) continue;
       const css = parts.join('>');
       if (css.length > 300) return null;
       const matches = document.querySelectorAll(css);
@@ -380,25 +598,27 @@ export function projectFacebookBrowsePage() {
       .replace(/\b\d{1,2}:\d{2}(?:\s*\/\s*\d{1,2}:\d{2})?/g, '[media-time]')
       .trim()
       .slice(0, 512);
-  const article = main
-    ? Array.from(main.querySelectorAll('[role="article"]'))
-        .slice(0, 100)
-        .map((el) => ({
-          el,
-          area: visibleArea(el),
-          key:
-            el
-              .querySelector('a[href*="/posts/"],a[href*="story_fbid="]')
-              ?.getAttribute('href')
-              ?.replace(/[?&]__cft__.*$/, '') ||
-            feedText(el.textContent ?? '') ||
-            null,
-        }))
-        .filter((row) => row.area > 0 && row.key && row.el.getAttribute('aria-busy') !== 'true')
-        .sort((a, b) => b.area - a.area)[0]
-    : null;
+  const article =
+    main && homeSurface
+      ? Array.from(main.querySelectorAll('[role="article"]'))
+          .slice(0, 100)
+          .map((el) => ({
+            el,
+            area: visibleArea(el),
+            key:
+              el
+                .querySelector('a[href*="/posts/"],a[href*="story_fbid="]')
+                ?.getAttribute('href')
+                ?.replace(/[?&]__cft__.*$/, '') ||
+              feedText(el.textContent ?? '') ||
+              null,
+          }))
+          .filter((row) => row.area > 0 && row.key && row.el.getAttribute('aria-busy') !== 'true')
+          .sort((a, b) => b.area - a.area)[0]
+      : null;
   // Observed Facebook posts may have no article role. Require a single native
-  // author boundary, both post-action markers, and visible loaded body content.
+  // author boundary, post-action markers (some posts disable sharing and have no share_button),
+  // and visible loaded body content.
   const structuralPosts: {
     area: number;
     key: string;
@@ -410,15 +630,16 @@ export function projectFacebookBrowsePage() {
     hasInlineVideo: boolean;
   }[] = [];
   for (const profile of Array.from(
-    main?.querySelectorAll('[data-ad-rendering-role="profile_name"]') ?? [],
+    homeSurface ? (main?.querySelectorAll('[data-ad-rendering-role="profile_name"]') ?? []) : [],
   ).slice(0, 40)) {
     let root = profile.parentElement;
     for (let depth = 0; root && root !== main && depth < 24; depth++, root = root.parentElement) {
       if (root.querySelectorAll('[data-ad-rendering-role="profile_name"]').length !== 1) break;
       if (root.getAttribute('aria-busy') === 'true') break;
       if (
-        !root.querySelector('[data-ad-rendering-role="like_button"]') ||
-        !root.querySelector('[data-ad-rendering-role="share_button"]')
+        !root.querySelector(
+          '[data-ad-rendering-role="like_button"],[data-ad-rendering-role="comment_button"],[data-ad-rendering-role="share_button"]',
+        )
       )
         continue;
       const bodies = Array.from(
@@ -495,7 +716,9 @@ export function projectFacebookBrowsePage() {
     video?.getAttribute('src') ||
     (video?.srcObject && reel ? 'srcObject:' + reel : '');
   const entries = new Map<string, number>();
-  for (const link of Array.from(main?.querySelectorAll('a[href]') ?? []).slice(0, 500)) {
+  for (const link of Array.from(
+    reelSurface && !reel ? (main?.querySelectorAll('a[href]') ?? []) : [],
+  ).slice(0, 500)) {
     const href = (link as HTMLAnchorElement).href,
       area = visibleArea(link);
     if (
@@ -522,16 +745,13 @@ export function projectFacebookBrowsePage() {
       feedScrollCandidates.add(element);
   }
   const scrolling = main
-    ? (location.pathname === '/'
+    ? (homeSurface || reelSurface
         ? [...feedScrollCandidates]
-        : [main, ...Array.from(main.querySelectorAll('*')).slice(0, 1000)]
+        : [...new Set([...feedScrollCandidates, ...Array.from(main.children ?? [])])]
       ).filter((el) => {
+        if (el.scrollHeight <= el.clientHeight + 20 || visibleArea(el) <= 0) return false;
         const style = getComputedStyle(el);
-        return (
-          visibleArea(el) > 0 &&
-          el.scrollHeight > el.clientHeight + 20 &&
-          /auto|scroll/.test(style.overflowY)
-        );
+        return /auto|scroll/.test(style.overflowY);
       })
     : [];
   const canHitCenter = (el: Element, rect = el.getBoundingClientRect()) => {
@@ -608,12 +828,9 @@ export function projectFacebookBrowsePage() {
   const friendScroller =
     friendRequestsRoute && friendNav
       ? [friendNav, ...Array.from(friendNav.querySelectorAll('div')).slice(0, 240)].find((el) => {
+          if (el.scrollHeight <= el.clientHeight + 20 || visibleArea(el) <= 0) return false;
           const style = getComputedStyle(el);
-          return (
-            visibleArea(el) > 0 &&
-            el.scrollHeight > el.clientHeight + 20 &&
-            /auto|scroll/.test(style.overflowY)
-          );
+          return /auto|scroll/.test(style.overflowY);
         })
       : undefined;
   const confirmLabels = new Set(['confirm', '确认', '確認']);
@@ -687,7 +904,7 @@ export function projectFacebookBrowsePage() {
     }
   }
   const marketplace =
-    /^\/marketplace(?:\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)\/)[a-z0-9_-]{1,80}\/)?search)?\/?$/.test(
+    /^\/marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search)?\/?$/i.test(
       location.pathname,
     );
   // Category links may be below the fold in the sidebar. Read only their native URLs,
@@ -703,7 +920,7 @@ export function projectFacebookBrowsePage() {
               const url = new URL(href);
               return (
                 url.origin === 'https://www.facebook.com' &&
-                /^\/marketplace\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)\/)[a-z0-9_-]{1,80}\/)?search\/?$/.test(
+                /^\/marketplace\/(?:category\/[a-z0-9_-]{1,80}\/|(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)\/)[a-z0-9_-]{1,80}\/))?search\/?$/i.test(
                   url.pathname,
                 ) &&
                 url.searchParams.getAll('category_id').length === 1 &&
@@ -717,12 +934,19 @@ export function projectFacebookBrowsePage() {
   const items = marketplace
     ? Array.from(main?.querySelectorAll('a[href]') ?? [])
         .slice(0, 1000)
-        .filter((el) => visibleArea(el) > 0)
-        .map((el) => (el as HTMLAnchorElement).href)
-        .filter((href) =>
-          /^https:\/\/www\.facebook\.com\/marketplace\/item\/\d{1,30}\/?(?:[?#].*)?$/.test(href),
-        )
-        .map((href) => new URL(href).pathname)
+        .filter((el) => {
+          const href = (el as HTMLAnchorElement).href;
+          if (
+            !/^https:\/\/www\.facebook\.com\/marketplace\/item\/\d{1,30}\/?(?:[?#].*)?$/.test(href)
+          )
+            return false;
+          return (
+            visibleArea(el) > 0 ||
+            (el.firstElementChild ? visibleArea(el.firstElementChild) > 0 : false) ||
+            (el.parentElement ? visibleArea(el.parentElement) > 0 : false)
+          );
+        })
+        .map((el) => new URL((el as HTMLAnchorElement).href).pathname)
     : [];
   const marketplaceKey = [...new Set(items)].slice(0, 8).join('|') || null;
   const itemRoute = /^\/marketplace\/item\/\d{1,30}\/?$/.test(location.pathname);
@@ -730,12 +954,16 @@ export function projectFacebookBrowsePage() {
   // visible product media or action buttons before crediting a detail dwell.
   const detailRoot = main ?? document.body;
   const hasDetailText =
-    Array.from(detailRoot.querySelectorAll('h1,h2,h3,[role="heading"],span[dir="auto"]'))
+    itemRoute &&
+    !!main &&
+    (Array.from(detailRoot.querySelectorAll('h1,h2,h3,[role="heading"],span[dir="auto"]'))
       .slice(0, 120)
       .some((el) => visibleArea(el) > 0 && (el.textContent?.trim().length ?? 0) >= 2) ||
-    (!!main && (main.textContent?.replace(/\s+/g, ' ').trim().length ?? 0) >= 20);
+      (main.textContent?.replace(/\s+/g, ' ').trim().length ?? 0) >= 20);
   const hasDetailMediaOrAction =
-    Array.from(detailRoot.querySelectorAll('img,video,svg image'))
+    itemRoute &&
+    !!main &&
+    (Array.from(detailRoot.querySelectorAll('img,video,svg image'))
       .slice(0, 120)
       .some((el) => {
         if (el instanceof HTMLImageElement) {
@@ -743,14 +971,31 @@ export function projectFacebookBrowsePage() {
         }
         return visibleArea(el) >= 2500;
       }) ||
-    Array.from(detailRoot.querySelectorAll('[role="button"],a[href*="/marketplace/"]'))
-      .slice(0, 80)
-      .some((el) => visibleArea(el) > 0);
+      Array.from(detailRoot.querySelectorAll('[role="button"],a[href*="/marketplace/"]'))
+        .slice(0, 80)
+        .some((el) => visibleArea(el) > 0));
   const detailLoaded = itemRoute && !!main && hasDetailText && hasDetailMediaOrAction;
   // Only a visible native empty-state heading, never arbitrary body/product text.
   const noAccessRoute = /^\/marketplace\/ineligible\/?$/.test(location.pathname);
   const marketRoot = main ?? (noAccessRoute ? document.body : null);
+  const checkMarketUnavailable =
+    (marketplace || itemRoute || noAccessRoute) &&
+    !!marketRoot &&
+    !dialogs &&
+    document.readyState !== 'loading' &&
+    !detailLoaded &&
+    items.length === 0 &&
+    !Array.from(marketRoot.querySelectorAll('a[href]'))
+      .slice(0, 1000)
+      .some(
+        (el) =>
+          visibleArea(el) > 0 &&
+          /^https:\/\/www\.facebook\.com\/marketplace\/item\/\d{1,30}\/?(?:[?#].*)?$/.test(
+            (el as HTMLAnchorElement).href,
+          ),
+      );
   const nativeNoAccess =
+    checkMarketUnavailable &&
     !!marketRoot &&
     Array.from(marketRoot.querySelectorAll('div,span,svg'))
       .slice(0, 1000)
@@ -764,20 +1009,8 @@ export function projectFacebookBrowsePage() {
           ),
       );
   const marketplaceUnavailable =
-    (marketplace || itemRoute || noAccessRoute) &&
+    checkMarketUnavailable &&
     !!marketRoot &&
-    !dialogs &&
-    document.readyState !== 'loading' &&
-    !detailLoaded &&
-    !Array.from(marketRoot.querySelectorAll('a[href]'))
-      .slice(0, 1000)
-      .some(
-        (el) =>
-          visibleArea(el) > 0 &&
-          /^https:\/\/www\.facebook\.com\/marketplace\/item\/\d{1,30}\/?(?:[?#].*)?$/.test(
-            (el as HTMLAnchorElement).href,
-          ),
-      ) &&
     (nativeNoAccess ||
       Array.from(marketRoot.querySelectorAll('h1,h2,[role="heading"]'))
         .slice(0, 40)
@@ -810,10 +1043,6 @@ export function projectFacebookBrowsePage() {
   );
   const videoDurationSeconds =
     video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
-  const reelSurface =
-    /^\/(?:watch|reels)\/?$/.test(location.pathname) ||
-    /^\/reel\/\d{1,30}\/?$/.test(location.pathname) ||
-    (location.pathname === '/reel/' && location.search === '?s=tab' && !location.hash);
   let recommendedDwellMs: number | undefined;
   let nextScrollDeltaY: number | undefined;
   if (friendRequestsRoute) {
@@ -950,13 +1179,26 @@ export function projectFacebookBrowsePage() {
     sponsored: boolean;
     text: string;
   } | null = null;
-  const reactionFrame = (el: Element) =>
-    frames(el).find((f) => f.name.includes('CometUFIReactButtonBase.react'));
+  const isReactionSelected = (props: DOMRecord | undefined) =>
+    props?.selected === true ||
+    props?.isSelected === true ||
+    props?.pressed === true ||
+    props?.isReacted === true ||
+    props?.active === true;
+  const reactionFrames = (el: Element) =>
+    frames(el).filter((f) => f.name.includes('CometUFIReactButtonBase.react'));
+  const reactionFrame = (el: Element) => {
+    const matching = reactionFrames(el);
+    return matching.find((f) => isReactionSelected(f.props)) ?? matching[0];
+  };
   const reactionIcons = (el: Element) =>
     Array.from(el.querySelectorAll('svg,img,[data-visualcompletion="css-img"]'))
       .flatMap((icon) => frames(icon, 28))
       .filter(
-        (f) => /^FBNucleusLike.*Icon\.react$/.test(f.name) || f.name === 'CometReactionIcon.react',
+        (f) =>
+          /^FBNucleus.*Like.*Icon\.react$/i.test(f.name) ||
+          /(?:^|\b)Like(?:Filled|Active)?Icon/i.test(f.name) ||
+          f.name === 'CometReactionIcon.react',
       );
   const feedbackEvidence = (el: Element) => {
     const chain = frames(el, 100),
@@ -978,16 +1220,24 @@ export function projectFacebookBrowsePage() {
         if (!record(data)) continue;
         const props = reactionFrame(el)?.props;
         const liked =
-          Object.keys(data).some(
-            (key) =>
-              (key === 'viewer_feedback_reaction_info' ||
-                key.startsWith('viewer_feedback_reaction_info(')) &&
-              data[key] !== null &&
-              data[key] !== undefined,
-          ) ||
-          props?.selected === true ||
-          props?.isSelected === true ||
-          props?.pressed === true;
+          Object.keys(data).some((key) => {
+            if (
+              key !== 'viewer_feedback_reaction_info' &&
+              !key.startsWith('viewer_feedback_reaction_info(')
+            )
+              return false;
+            const info = data[key];
+            if (info === null || info === undefined) return false;
+            if (record(info) && 'reaction_type' in info) {
+              return info.reaction_type !== 0 && info.reaction_type !== null;
+            }
+            return true;
+          }) ||
+          (data.viewer_reaction !== undefined &&
+            data.viewer_reaction !== null &&
+            data.viewer_reaction !== 0) ||
+          data.is_viewer_reacted === true ||
+          isReactionSelected(props);
         const connection = data.reactors;
         const reactors: unknown =
           record(connection) && typeof connection.__ref === 'string'
@@ -1008,92 +1258,146 @@ export function projectFacebookBrowsePage() {
     return null;
   };
   if (likeScopeRoot) {
+    const matchesLikeLabel = (el: Element) => {
+      if (visibleArea(el) <= 0) return false;
+      const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+      if (/comment|share|send|评论|評論|分享|发送|發送/i.test(label)) return false;
+      return /^(?:like|liked|remove\s+like|unlike|love|care|haha|wow|sad|angry|赞|讚|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒)(?:$|[\s·•:：0-9])/i.test(
+        label,
+      );
+    };
+    const sharesCard = (el: Element) => {
+      if (!video) return false;
+      for (
+        let parent = video.parentElement;
+        parent && parent !== main;
+        parent = parent.parentElement
+      ) {
+        if (
+          Array.from(parent.querySelectorAll('video')).filter((v) => visibleArea(v) > 0).length > 1
+        )
+          break;
+        if (parent.contains(el)) return true;
+      }
+      return false;
+    };
+    const distanceToVideo = (el: Element) => {
+      if (!video) return 0;
+      const vr = video.getBoundingClientRect();
+      const r = el.getBoundingClientRect(),
+        y = r.top + r.height / 2;
+      return (
+        Math.max(vr.top - y, y - vr.bottom, 0) * 10000 + Math.abs(y - (vr.top + vr.bottom) / 2)
+      );
+    };
     const adLike = likeScopeRoot.querySelector('[data-ad-rendering-role="like_button"]');
     let likeBtn: Element | null = adLike
       ? (adLike.closest('[role="button"],button') ?? adLike)
       : null;
     if (!likeBtn && reelSurface) {
-      const candidates = Array.from(
+      const rawCandidates = Array.from(
         likeScopeRoot.querySelectorAll('[role="button"],button'),
-      ).filter((el) => visibleArea(el) > 0 && !!reactionFrame(el) && reactionIcons(el).length > 0);
-      if (video && candidates.length > 1) {
-        const vr = video.getBoundingClientRect();
-        const sharesCard = (el: Element) => {
-          for (
-            let parent = video.parentElement;
-            parent && parent !== main;
-            parent = parent.parentElement
-          ) {
-            if (
-              Array.from(parent.querySelectorAll('video')).filter((v) => visibleArea(v) > 0)
-                .length > 1
-            )
-              break;
-            if (parent.contains(el)) return true;
-          }
-          return false;
-        };
-        candidates.sort((a, b) => {
-          const distance = (el: Element) => {
-            const r = el.getBoundingClientRect(),
-              y = r.top + r.height / 2;
-            return (
-              Math.max(vr.top - y, y - vr.bottom, 0) * 10000 +
-              Math.abs(y - (vr.top + vr.bottom) / 2)
-            );
-          };
-          return Number(sharesCard(b)) - Number(sharesCard(a)) || distance(a) - distance(b);
-        });
+      ).filter(
+        (el) =>
+          visibleArea(el) > 0 &&
+          !el.closest(
+            '[role="article"], [aria-label*="comment" i], [aria-label*="评论"], [aria-label*="評論"], [role="dialog"]',
+          ) &&
+          !!reactionFrame(el) &&
+          (reactionIcons(el).length > 0 || !!el.querySelector('svg')),
+      );
+      const candidates = rawCandidates.filter(
+        (el) => !rawCandidates.some((other) => other !== el && el.contains(other)),
+      );
+      if (candidates.length > 1) {
+        candidates.sort(
+          (a, b) =>
+            Number(sharesCard(b)) - Number(sharesCard(a)) ||
+            Number(matchesLikeLabel(b)) - Number(matchesLikeLabel(a)) ||
+            distanceToVideo(a) - distanceToVideo(b),
+        );
       }
       likeBtn = candidates[0] ?? null;
     }
     if (!likeBtn) {
-      likeBtn =
-        Array.from(likeScopeRoot.querySelectorAll('[role="button"],button'))
-          .slice(0, 80)
-          .find((el) => {
-            if (visibleArea(el) <= 0) return false;
-            const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
-            if (/comment|share|send|评论|評論|分享|发送|發送/i.test(label)) return false;
-            return /^(?:like|remove\s+like|unlike|love|care|haha|wow|sad|angry|赞|讚|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒)(?:$|[\s·•:：0-9])/i.test(
-              label,
-            );
-          }) ?? null;
+      const rawLabelCandidates = Array.from(
+        likeScopeRoot.querySelectorAll('[role="button"],button'),
+      )
+        .slice(0, 400)
+        .filter(
+          (el) =>
+            matchesLikeLabel(el) &&
+            (!reelSurface ||
+              !el.closest(
+                '[role="article"], [aria-label*="comment" i], [aria-label*="评论"], [aria-label*="評論"], [role="dialog"]',
+              )),
+        );
+      const labelCandidates = rawLabelCandidates.filter(
+        (el) => !rawLabelCandidates.some((other) => other !== el && el.contains(other)),
+      );
+      if (reelSurface && video && labelCandidates.length > 1) {
+        labelCandidates.sort(
+          (a, b) =>
+            Number(sharesCard(b)) - Number(sharesCard(a)) ||
+            distanceToVideo(a) - distanceToVideo(b),
+        );
+      }
+      likeBtn = labelCandidates[0] ?? rawLabelCandidates[0] ?? null;
     }
     if (likeBtn) {
-      const ariaPressed = likeBtn.getAttribute('aria-pressed') === 'true';
+      const ariaPressed =
+        likeBtn.getAttribute('aria-pressed') === 'true' ||
+        likeBtn.querySelector('[aria-pressed="true"]') !== null;
       const btnLabel = (likeBtn.getAttribute('aria-label') || likeBtn.textContent || '').trim();
       const labelLiked =
-        /^(?:remove\s+|取消|收回)?(?:unlike|remove\s+like|love|care|haha|wow|sad|angry|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒)(?:$|[\s·•:：0-9])/i.test(
+        /^(?:remove\s+|取消|收回)?(?:unlike|remove\s+like|liked|love|care|haha|wow|sad|angry|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒)(?:$|[\s·•:：0-9])/i.test(
           btnLabel,
-        ) || /unlike|remove\s+like|取消赞|取消讚|已赞|已讚/i.test(btnLabel);
+        ) || /unlike|remove\s+like|\bliked\b|取消赞|取消讚|已赞|已讚/i.test(btnLabel);
       const colorProbe = adLike ?? likeBtn;
-      const colorLiked = [colorProbe, colorProbe.querySelector('svg,span,i')].some((el) => {
-        if (!el) return false;
-        const style = getComputedStyle(el);
-        return [style.color, style.fill].some((color) => {
-          const rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(color || '');
-          return (
-            !!rgbMatch &&
-            Math.max(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) -
-              Math.min(Number(rgbMatch[1]), Number(rgbMatch[2]), Number(rgbMatch[3])) >=
-              45
-          );
+      const colorNodes = [
+        colorProbe,
+        ...Array.from(colorProbe.querySelectorAll('svg,path,g,span,i')).slice(0, 16),
+      ];
+      const colorLiked = colorNodes.some((node) => {
+        if (!node) return false;
+        const style = getComputedStyle(node);
+        const candidates = [
+          style.color,
+          style.fill,
+          style.stroke,
+          node.getAttribute('fill') ?? '',
+          node.getAttribute('stroke') ?? '',
+          node.getAttribute('color') ?? '',
+        ];
+        return candidates.some((color) => {
+          const val = (color || '').trim().toLowerCase();
+          if (!val || val === 'none' || val === 'currentcolor' || val === 'transparent')
+            return false;
+          if (
+            val.includes('#0866ff') ||
+            val.includes('#1877f2') ||
+            val.includes('#2078f4') ||
+            val.includes('var(--accent)') ||
+            val.includes('var(--primary-button-background)')
+          )
+            return true;
+          const rgbMatch = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(val);
+          if (!rgbMatch) return false;
+          const r = Number(rgbMatch[1]),
+            g = Number(rgbMatch[2]),
+            b = Number(rgbMatch[3]);
+          return (b > 180 && b > r + 40) || Math.max(r, g, b) - Math.min(r, g, b) >= 45;
         });
       });
       const nativeFeedback = feedbackEvidence(likeBtn);
       const filledIcon = reactionIcons(likeBtn).some(
         (f) =>
-          /^FBNucleusLikeFilled.*Icon\.react$/.test(f.name) || f.name === 'CometReactionIcon.react',
+          /^FBNucleus.*Like(?:Filled|Active).*Icon\.react$/i.test(f.name) ||
+          /(?:^|\b)Like(?:Filled|Active)Icon/i.test(f.name) ||
+          f.name === 'CometReactionIcon.react',
       );
-      const props = reactionFrame(likeBtn)?.props;
-      const domLiked =
-        ariaPressed ||
-        labelLiked ||
-        colorLiked ||
-        props?.selected === true ||
-        props?.isSelected === true ||
-        props?.pressed === true;
+      const reactionSelected = reactionFrames(likeBtn).some((f) => isReactionSelected(f.props));
+      const domLiked = ariaPressed || labelLiked || colorLiked || reactionSelected;
       const liked = filledIcon || nativeFeedback?.liked === true || domLiked;
       let likeCSS: typeof FACEBOOK_BROWSE_LIKE_CSS | null = null;
       if (
@@ -1135,16 +1439,40 @@ export function projectFacebookBrowsePage() {
         return Math.round(num * mult);
       };
       let likeCount = 0;
+      const reelNearbyCandidates: string[] = [];
+      if (reelSurface) {
+        const btnRect = likeBtn.getBoundingClientRect();
+        if (likeBtn.parentElement)
+          reelNearbyCandidates.push(likeBtn.parentElement.textContent ?? '');
+        let actionCol: Element | null = likeBtn.parentElement;
+        for (
+          let d = 0;
+          actionCol && actionCol !== main && d < 3;
+          d++, actionCol = actionCol.parentElement
+        ) {
+          for (const node of Array.from(actionCol.querySelectorAll('span,div')).slice(0, 24)) {
+            const nr = node.getBoundingClientRect();
+            if (Math.abs(nr.top - btnRect.top) < 64 && Math.abs(nr.left - btnRect.left) < 80) {
+              reelNearbyCandidates.push(
+                node.getAttribute('aria-label') || '',
+                node.textContent || '',
+              );
+            }
+          }
+        }
+      }
       const candidates = [
         btnLabel,
-        reelSurface ? (likeBtn.parentElement?.textContent ?? '') : '',
-        ...Array.from(
-          likeScopeRoot.querySelectorAll(
-            '[aria-label*="like" i],[aria-label*="reaction" i],[aria-label*="赞"],[aria-label*="讚"],[aria-label*="心情"],[role="toolbar"]',
-          ),
-        )
-          .slice(0, 30)
-          .flatMap((el) => [el.getAttribute('aria-label') || '', el.textContent || '']),
+        likeBtn.textContent ?? '',
+        ...(reelSurface
+          ? reelNearbyCandidates
+          : Array.from(
+              likeScopeRoot.querySelectorAll(
+                '[aria-label*="like" i],[aria-label*="reaction" i],[aria-label*="赞"],[aria-label*="讚"],[aria-label*="心情"],[role="toolbar"]',
+              ),
+            )
+              .slice(0, 30)
+              .flatMap((el) => [el.getAttribute('aria-label') || '', el.textContent || ''])),
       ];
       for (const candidate of candidates) {
         if (!candidate || /comment|share|评论|評論|分享|views|次播放/i.test(candidate)) continue;
@@ -1195,6 +1523,7 @@ export function projectFacebookBrowsePage() {
     ...(recommendedDwellMs !== undefined ? { recommendedDwellMs } : {}),
     ...(nextScrollDeltaY !== undefined ? { nextScrollDeltaY } : {}),
     ...(likeTarget !== null ? { likeTarget } : {}),
+    ...(dialogDismissCSS !== null ? { dialogDismissCSS } : {}),
     contentKey: friendRequestsRoute
       ? friendKey
       : marketplace

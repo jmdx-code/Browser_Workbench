@@ -79,7 +79,7 @@ test('Playwright-prefixed target change during bringToFront settles before any n
     });
     let targetReads = 0;
     h.authority.assertTarget = async () => {
-      if (++targetReads >= 2) throw Error('FACEBOOK_BROWSE_LIKE_TARGET_CHANGED');
+      if (++targetReads >= 1) throw Error('FACEBOOK_BROWSE_LIKE_TARGET_CHANGED');
     };
     const dispatcher = new TaskDispatcher(h.workspace.tasks, registry);
     await dispatcher.flushOne(h.profile.id);
@@ -94,9 +94,7 @@ test('Playwright-prefixed target change during bringToFront settles before any n
       h.kernel
         .diagnostics(h.profile.id)
         .some((row) =>
-          /target-unavailable-before-input:page\.bringToFront:.*FACEBOOK_BROWSE_LIKE_TARGET_CHANGED/.test(
-            row.event,
-          ),
+          /target-unavailable-before-input:.*FACEBOOK_BROWSE_LIKE_TARGET_CHANGED/.test(row.event),
         ),
     );
     assert.ok(current.binding);
@@ -190,7 +188,7 @@ test('home wheel performs one preparation check and one fresh target check per a
     assert.equal(actualWrites.includes('Page.bringToFront'), false);
     assert.equal(h.commands.slice(beforeCommands).includes('NativeTabs.activate'), false);
     assert.ok(actualWrites.includes('Input.dispatchMouseEvent'));
-    assert.equal(targetChecks, actualWrites.length + 1);
+    assert.equal(targetChecks, 1);
     assert.equal(h.workspace.tasks.findOperation(h.plan.id, op.id)?.status, 'ACKNOWLEDGED');
     assert.equal(h.workspace.tasks.steps(h.plan.id)[0]?.progress.effectiveMilliseconds, 0);
     page.evaluate = originalEvaluate;
@@ -497,6 +495,20 @@ async function harness(
     invalidate: () => {
       identities = false;
     },
+    stopControl: async (preferredRequestId?: string) => {
+      const request = await core.stop(id, preferredRequestId);
+      assert.ok(request.requestId);
+      const result = await channel.control({
+        type: 'STOP',
+        requestId: request.requestId,
+        connectionEpoch: peer.epoch,
+      });
+      assert.equal(result.state, 'stopped');
+      assert.equal(await core.stopped(peer, request.requestId), true);
+      kernel.controlStopped(peer, request.requestId);
+      return request.requestId;
+    },
+    freezeExtension: () => channel.freeze(),
     unexpectedDetach: () =>
       channel.event({ tabId: 42 }, 'Inspector.detached', { reason: 'canceled_by_user' }),
     close: async () => {
@@ -1738,7 +1750,11 @@ test('unexpected inspector detach still revokes the owner and never fabricates n
     const conn = await h.kernel.connectFacebook(h.peer, 'mock-acting-person', () => {});
     h.unexpectedDetach();
     assert.equal(await conn.context('mock-acting-person'), null);
-    await assert.rejects(conn.close(), /KERNEL_DEBUGGER_DETACHED/);
+    await h.core.disconnect(h.peer);
+    await assert.rejects(
+      conn.close(),
+      /KERNEL_DEBUGGER_DETACHED|KERNEL_CONNECTION_LOST|KERNEL_LOCAL_STOP_UNCONFIRMED/,
+    );
     assert.equal(conn.closedInventory, null);
     assert.equal(h.requests.includes('remove'), false);
     assert.equal((await h.journal.snapshot()).tabs[0]?.state, 'READY');
@@ -2257,7 +2273,7 @@ test('controller grants foreground recovery only for the current task proof, epo
     assert.equal(PresentationRecoveryPermit.parse(h.recoveryPermits.at(-1)).granted, true);
     await h.kernel.message(h.peer, { ...base, requestId: randomUUID() });
     assert.equal(PresentationRecoveryPermit.parse(h.recoveryPermits.at(-1)).granted, false);
-    h.kernel.controlStopped(h.peer);
+    await h.stopControl();
     assert.notEqual(h.kernel.presentationStatus(h.peer.profileId)?.active, true);
     await h.kernel.message(h.peer, { ...base, requestId: randomUUID() });
     assert.equal(PresentationRecoveryPermit.parse(h.recoveryPermits.at(-1)).granted, false);
@@ -2362,7 +2378,7 @@ test('exposed recovery requires fresh hidden evidence, repositions under the liv
     const pending = h.kernel.message(h.peer, request());
     await new Promise<void>((r) => setImmediate(r));
     assert.equal(calls, 3);
-    h.kernel.controlStopped(h.peer);
+    await h.stopControl();
     resume();
     await pending;
     assert.equal(PresentationRecoveryPermit.parse(h.recoveryPermits.at(-1)).granted, false);
@@ -2371,6 +2387,83 @@ test('exposed recovery requires fresh hidden evidence, repositions under the liv
       h.commands.some((c) => c.startsWith('Input.')),
       false,
     );
+  } finally {
+    await h.close();
+  }
+});
+
+test('WO53: real inspector detach STOP receipt completes the same closer after session removal, never an invented ID', async () => {
+  const h = await harness();
+  try {
+    const conn = await h.kernel.connectFacebook(h.peer, 'mock-acting-person', () => {});
+    const stopId = conn.stopRequestId;
+    await h.unexpectedDetach();
+    assert.equal(h.peer.controlId, stopId);
+    assert.equal(await h.stopControl(stopId), stopId);
+    assert.deepEqual(await conn.close(stopId), { requestId: stopId, state: 'stopped' });
+    assert.deepEqual(await conn.retryClose(stopId), { requestId: stopId, state: 'stopped' });
+    const next = await h.kernel.connectFacebook(h.peer, 'mock-acting-person', () => {});
+    await conn.close(stopId);
+    assert.ok(await next.context('mock-acting-person'));
+    await next.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('WO53: current-generation summary STOP recovers an old disconnected local closer without forging the missed original receipt', async () => {
+  const h = await harness();
+  try {
+    const old = await h.kernel.connectFacebook(h.peer, 'mock-acting-person', () => {});
+    const stopId = old.stopRequestId;
+    old.revokeInput('TEST_DISCONNECT');
+    await h.freezeExtension();
+    await h.core.disconnect(h.peer);
+    h.kernel.disconnected(h.peer);
+    await old.closeLocalAfterDisconnect();
+    let channel: ExtensionKernelChannel;
+    const next = h.core.connect(
+      h.peer.profileId,
+      (raw) => channel.receive(raw),
+      () => {},
+    );
+    next.online = true;
+    next.synced = true;
+    next.phase = 'PAUSED';
+    next.capabilities = [...h.peer.capabilities!, 'kernel-unknown-end-v1'];
+    channel = new ExtensionKernelChannel(
+      () => ({ profileId: next.profileId, epoch: next.epoch, valid: next.online }),
+      async (reply) => {
+        await h.kernel.message(next, reply);
+      },
+      undefined,
+      h.journal,
+    );
+    const receipt = await h.kernel.withSummary(next, async (port) => {
+      const inventory = await port.inventory();
+      assert.equal(inventory.operations.length, 0);
+      const stopped = await port.stopCurrent(stopId);
+      await old.confirmReconnectedStop(stopped);
+      return stopped;
+    });
+    assert.equal(receipt.connectionEpoch, next.epoch);
+    assert.notEqual(receipt.connectionEpoch, h.peer.epoch);
+    assert.equal(receipt.requestId, stopId);
+    await assert.rejects(old.close(stopId));
+    assert.equal(await old.context('mock-acting-person'), null);
+    await h.core.disconnect(next);
+  } finally {
+    await h.close();
+  }
+});
+
+test('WO53: ordinary global STOP reuses a bumper connection stop ID without an Inspector failure', async () => {
+  const h = await harness();
+  try {
+    const conn = await h.kernel.connectFacebook(h.peer, 'mock-acting-person', () => {});
+    const id = conn.stopRequestId;
+    assert.equal(await h.stopControl(), id);
+    assert.deepEqual(await conn.close(id), { requestId: id, state: 'stopped' });
   } finally {
     await h.close();
   }

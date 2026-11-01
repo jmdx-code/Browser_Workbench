@@ -512,7 +512,7 @@ test('completed publication remains consumed after reopening; no archive complet
       assert.deepEqual(facts(file), before);
       assert.equal(reopened.materialPosts.archives().length, 1);
       reopened.tasks.recoverOnStartup();
-      assert.equal(reopened.tasks.get(r.jobId).state, 'PAUSED');
+      assert.equal(reopened.tasks.get(r.jobId).state, 'STOPPED');
       assert.equal(reopened.materials.reservation(r.attemptId).state, 'PUBLISHED');
       assert.equal(reopened.materialPosts.archives().length, 1);
     } finally {

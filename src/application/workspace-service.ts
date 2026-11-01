@@ -19,13 +19,18 @@ export class WorkspaceService {
     private readonly browsers: BrowserProfileSource,
   ) {}
   async snapshot(): Promise<Workspace> {
-    const metadata = await this.repository.profileMetadata();
+    const profiles = await this.browsers.profiles();
+    let metadata = await this.repository.profileMetadata();
+    if (this.repository.ensureProfileOrders && profiles.some((p) => !metadata.has(p.id))) {
+      await this.repository.ensureProfileOrders(profiles.map((p) => p.id));
+      metadata = await this.repository.profileMetadata();
+    }
     const accountCache = (await this.repository.profileAccountCache?.()) ?? new Map();
     return {
       schemaVersion: 1,
       groups: await this.repository.groups(),
       combinations: await this.repository.combinations(),
-      profiles: await mapAsync(await this.browsers.profiles(), async (profile) => {
+      profiles: await mapAsync(profiles, async (profile) => {
         const live = profile.account;
         let cached = accountCache.get(profile.id);
         if (
@@ -64,6 +69,7 @@ export class WorkspaceService {
         return {
           ...profile,
           groupId: metadata.get(profile.id)?.groupId ?? null,
+          order: metadata.get(profile.id)?.order ?? 0,
           alias: metadata.get(profile.id)?.alias ?? profile.alias,
           account: {
             state,
@@ -72,7 +78,9 @@ export class WorkspaceService {
             avatar: abnormal ? null : (live.avatar ?? cached?.avatar ?? null),
           },
         };
-      }),
+      }).then((rows) =>
+        rows.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id)),
+      ),
       records: await this.browsers.records(),
       support: {
         comboExecution: false,

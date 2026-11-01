@@ -1,3 +1,5 @@
+import type { TaskRepository } from '../domain/tasks.js';
+import type { SettlementRepository } from '../domain/settlement.js';
 import type { Core, Peer } from '../bridge/core.js';
 import type { Awaitable } from '../domain/persistence.js';
 import type { ReloadResult } from '../shared/software-update.js';
@@ -15,7 +17,8 @@ export class ExtensionUpdates {
     this.bundledVersion = version;
   }
   async automatic(peer: Peer) {
-    if (peer.extensionVersion === this.bundledVersion) {
+    const missingReveal = !peer.capabilities?.includes('browser-window-reveal-v1');
+    if (peer.extensionVersion === this.bundledVersion && !missingReveal) {
       this.autoReloadAttempted.delete(peer.profileId);
       return;
     }
@@ -31,7 +34,7 @@ export class ExtensionUpdates {
     };
     if (
       !peer.extensionVersion ||
-      !older(peer.extensionVersion) ||
+      (!older(peer.extensionVersion) && !missingReveal) ||
       this.autoReloadAttempted.get(peer.profileId) === this.bundledVersion ||
       this.checking.has(peer.profileId)
     )
@@ -40,6 +43,7 @@ export class ExtensionUpdates {
     try {
       if (await this.busy(peer.profileId)) return;
       await this.releaseIdle(peer);
+      if (await this.busy(peer.profileId)) return;
       const result = await this.core.reloadExtension(peer.profileId);
       if (result.requested) this.autoReloadAttempted.set(peer.profileId, this.bundledVersion);
     } finally {
@@ -68,6 +72,10 @@ export class ExtensionUpdates {
         continue;
       }
       await this.releaseIdle(p);
+      if (await this.busy(id)) {
+        result.skippedBusy++;
+        continue;
+      }
       const sent = await this.core.reloadExtension(id);
       if (sent.requested) {
         result.reloaded++;
@@ -76,4 +84,28 @@ export class ExtensionUpdates {
     }
     return result;
   }
+}
+
+// A queued plan alone has not acquired an execution session. Persisted operations and
+// every undelivered notice still block reload, including notices excluded from readiness.
+export async function extensionReloadTasksBusy(
+  tasks: Pick<TaskRepository, 'plansForProfile' | 'blockingOperations' | 'operations'>,
+  settlements: SettlementRepository,
+  profileId: string,
+): Promise<boolean> {
+  const plans = await tasks.plansForProfile(profileId, [
+    'QUEUED',
+    'RUNNING',
+    'PAUSING',
+    'STOPPING',
+    'REVIEW',
+  ]);
+  for (const plan of plans) {
+    if (plan.state !== 'QUEUED') return true;
+    const operations = tasks.blockingOperations
+      ? await tasks.blockingOperations(plan.id)
+      : await tasks.operations(plan.id);
+    if (operations.length > 0) return true;
+  }
+  return (await settlements.list(profileId)).some((notice) => notice.state !== 'DELIVERED');
 }

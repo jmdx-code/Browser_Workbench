@@ -6,6 +6,10 @@ import {
   fitTaskWindow,
   taskWindowPositions,
   reservedLayoutDisplay,
+  displayForRect,
+  normalizeTaskWindowSize,
+  gridCascadeSlotRect,
+  arrangeTaskWindowsInOrder,
 } from '../src/domain/window-layout.js';
 import {
   defaultWindowLayout,
@@ -325,16 +329,13 @@ test('queued operation checks STOP after preceding move drains', async () => {
   assert.equal(f.moves.length, 1);
 });
 
-test('changed proof cannot inherit an in-progress recovery but new task may adopt it', async () => {
+test('changed proof resets in-progress recovery and adopts the updated main tab', async () => {
   const f = fixture(1),
     id = f.ids[0]!;
   await f.service.command({ action: 'configure', settings: enabled });
   await f.service.arrange(id);
   f.windows.get(id)!.proof.ownershipId = randomUUID();
-  await assert.rejects(
-    f.service.recover(id, () => {}),
-    /MAIN_CHANGED/,
-  );
+  await f.service.recover(id, () => {});
   await f.service.arrange(id);
   await f.service.recover(id, () => {});
 });
@@ -466,4 +467,184 @@ test('normal task startup arranges without focusing; actual hidden recovery requ
   await f.service.arrange(id);
   await f.service.recover(id, () => {});
   assert.deepEqual(focuses, [false, true]);
+});
+
+test('gridCascadeSlotRect and arrangeTaskWindowsInOrder produce uniform sizes and fixed offsets on the active display', async () => {
+  const f = fixture(5);
+  const primary: LayoutScreen = {
+    id: 'primary',
+    primary: true,
+    scaleFactor: 1,
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+  };
+  f.displays([primary, screen]);
+  // Put focused browser on secondary display
+  f.windows.get(f.ids[2]!)!.rect = { x: -1600, y: 650, width: 920, height: 700 };
+  assert.equal(displayForRect(f.windows.get(f.ids[2]!)!.rect, [primary, screen])?.id, 'secondary');
+
+  const size = normalizeTaskWindowSize(screen, f.windows.get(f.ids[2]!)!.rect);
+  const arranged = arrangeTaskWindowsInOrder(f.ids, screen, 8, f.windows.get(f.ids[2]!)!.rect);
+  assert.equal(arranged.size, 5);
+  for (const [idx, id] of f.ids.entries()) {
+    const r = arranged.get(id)!;
+    assert.equal(r.width, size.width);
+    assert.equal(r.height, size.height);
+    assert.deepEqual(r, gridCascadeSlotRect(idx, size, screen, 8));
+    assert.ok(r.x >= screen.workArea.x + 12);
+    assert.ok(r.y >= screen.workArea.y + 12);
+  }
+
+  let focusedId: string | null = f.ids[2]!;
+  const activeService = new WindowLayoutService(
+    () => [primary, screen],
+    f.port,
+    async () => ({ version: 1, enabled: true, displayId: null, step: 8 }),
+    async () => {},
+    undefined,
+    () => focusedId,
+  );
+  await activeService.command({ action: 'apply', profileIds: f.ids });
+  const r0 = f.windows.get(f.ids[0]!)!.rect;
+  const r1 = f.windows.get(f.ids[1]!)!.rect;
+  const r2 = f.windows.get(f.ids[2]!)!.rect;
+  const r3 = f.windows.get(f.ids[3]!)!.rect;
+  assert.equal(r0.width, r1.width);
+  assert.equal(r0.height, r1.height);
+  assert.ok(
+    r0.x < 0,
+    'expected window to be arranged on secondary display where focusedId resides',
+  );
+  assert.ok(r1.x > r0.x && r1.y > r0.y, 'expected diagonal cascade step for slot 0 -> 1');
+  assert.ok(r2.x > r1.x && r2.y > r1.y, 'expected diagonal cascade step for slot 1 -> 2');
+  assert.ok(r3.x > r2.x && r3.y > r2.y, 'expected diagonal cascade step for slot 2 -> 3');
+
+  const fullScreenSize = normalizeTaskWindowSize(primary, {
+    x: 0,
+    y: 0,
+    width: 1920,
+    height: 1040,
+  });
+  assert.ok(
+    fullScreenSize.height <= Math.floor(primary.workArea.height * 0.75),
+    'expected at least 25% vertical cascade headroom even for full-screen reference window',
+  );
+});
+
+test('window layout apply tolerates offline or failed individual browsers and arranges online ones concurrently', async () => {
+  const f = fixture(5);
+  // Remove one profile to simulate offline browser
+  const offlineId = f.ids[1]!;
+  f.windows.delete(offlineId);
+  const moveFailId = f.ids[3]!;
+  const origMove = f.port.move;
+  let concurrentInFlight = 0;
+  let maxConcurrent = 0;
+  f.port.move = async (...args) => {
+    concurrentInFlight++;
+    maxConcurrent = Math.max(maxConcurrent, concurrentInFlight);
+    try {
+      await new Promise<void>((r) => setImmediate(r));
+      if (args[0] === moveFailId) throw Error('WINDOW_MINIMIZED_OR_BUSY');
+      return await origMove(...args);
+    } finally {
+      concurrentInFlight--;
+    }
+  };
+  const service = new WindowLayoutService(
+    () => [screen],
+    f.port,
+    async () => enabled,
+    async () => {},
+    undefined,
+    () => f.ids[0]!,
+  );
+  await service.command({ action: 'apply', profileIds: f.ids });
+  // 4 online profiles inspected, 1 move failed -> 3 moves succeeded without throwing 409/500
+  assert.equal(f.moves.length, 3);
+  assert.ok(maxConcurrent >= 2, 'expected concurrent window positioning');
+});
+
+test('window layout apply follows user-dragged browser to primary display instead of sticking to cached secondary display', async () => {
+  const f = fixture(5);
+  const primary: LayoutScreen = {
+    id: 'primary',
+    primary: true,
+    scaleFactor: 1,
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+  };
+  let focusedId: string | null = f.ids[0]!;
+  const service = new WindowLayoutService(
+    () => [primary, screen],
+    f.port,
+    async () => ({ version: 1, enabled: true, displayId: 'secondary', step: 8 }),
+    async () => {},
+    undefined,
+    () => focusedId,
+  );
+  // First arrange all 5 windows on secondary display
+  await service.command({ action: 'apply', profileIds: f.ids });
+  for (const id of f.ids) {
+    assert.ok(f.windows.get(id)!.rect.x < 0, 'initially arranged on secondary display');
+  }
+  assert.equal((await service.snapshot()).settings.displayId, 'secondary');
+
+  // Simulate user dragging ids[3] onto primary display without changing focusedId first
+  f.windows.get(f.ids[3]!)!.rect = { x: 200, y: 160, width: 960, height: 720 };
+  await service.command({ action: 'apply', profileIds: f.ids });
+  for (const id of f.ids) {
+    const r = f.windows.get(id)!.rect;
+    assert.ok(r.x >= 0 && r.x < 1920, `expected ${id} to move to primary display, got x=${r.x}`);
+  }
+  assert.equal((await service.snapshot()).settings.displayId, 'primary');
+
+  // Also verify when focusedId is explicitly ids[3] after moving back to secondary and then dragging to primary
+  for (const id of f.ids) {
+    f.windows.get(id)!.rect = { x: -1600, y: 650, width: 960, height: 720 };
+  }
+  focusedId = f.ids[0]!;
+  await service.command({ action: 'apply', profileIds: f.ids });
+  assert.equal((await service.snapshot()).settings.displayId, 'secondary');
+
+  f.windows.get(f.ids[3]!)!.rect = { x: 200, y: 160, width: 960, height: 720 };
+  focusedId = f.ids[3]!;
+  await service.command({ action: 'apply', profileIds: f.ids });
+  for (const id of f.ids) {
+    const r = f.windows.get(id)!.rect;
+    assert.ok(
+      r.x >= 0 && r.x < 1920,
+      `expected ${id} on primary display when focusedId=${focusedId}`,
+    );
+  }
+  assert.equal((await service.snapshot()).settings.displayId, 'primary');
+});
+
+test('window layout apply arranges selected subset onto the display of an unselected last-focused window', async () => {
+  const f = fixture(5);
+  const primary: LayoutScreen = {
+    id: 'primary',
+    primary: true,
+    scaleFactor: 1,
+    workArea: { x: 0, y: 0, width: 1920, height: 1040 },
+  };
+  // Place ids[4] on primary display as the last-focused window, while ids[0..2] are on secondary display
+  f.windows.get(f.ids[4]!)!.rect = { x: 300, y: 180, width: 960, height: 720 };
+  const focusedId = f.ids[4]!;
+  const service = new WindowLayoutService(
+    () => [primary, screen],
+    f.port,
+    async () => ({ version: 1, enabled: true, displayId: 'secondary', step: 8 }),
+    async () => {},
+    undefined,
+    () => focusedId,
+  );
+  const subset = f.ids.slice(0, 3);
+  await service.command({ action: 'apply', profileIds: subset });
+  for (const id of subset) {
+    const r = f.windows.get(id)!.rect;
+    assert.ok(
+      r.x >= 0 && r.x < 1920,
+      `expected subset window ${id} to arrange onto primary display where focused window resides, got x=${r.x}`,
+    );
+  }
+  assert.equal((await service.snapshot()).settings.displayId, 'primary');
 });

@@ -332,7 +332,7 @@ if (!process.versions.electron) {
         })),
       );
       await evaluate(
-        `[...document.querySelectorAll('nav.tabs button')].find(b=>b.textContent.includes('任务记录')).click()`,
+        `[...document.querySelectorAll('.feature-nav-rail button, nav.tabs button')].find(b=>b.textContent.includes('执行记录')||b.textContent.includes('任务记录')).click()`,
       );
       await until(`!!document.querySelector('.records-page')`);
       await evaluate(`document.querySelector('button.status-tab.tab-attention').click()`);

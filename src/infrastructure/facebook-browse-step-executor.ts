@@ -17,10 +17,12 @@ import {
   FACEBOOK_REEL_NEXT_CSS,
   FACEBOOK_FRIEND_CONFIRM_CSS,
   FACEBOOK_BROWSE_LIKE_CSS,
+  FACEBOOK_BROWSE_DIALOG_DISMISS_CSS,
   browsePageDiagnostic,
   type BrowsePage,
 } from './facebook-browse-reader.js';
 import {
+  classifyFacebookAbnormalUrl,
   facebookBrowseSurface,
   facebookMarketplaceUnavailableURL,
   facebookMarketplaceURL,
@@ -57,6 +59,7 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 // Feed/video/marketplace/friends reuse the existing runner, actor, outbox and progress. This adapter
 // only returns decisions and reads effects; all actual input is dispatched by the original bound operation.
 export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
+  readonly continuousWallClock = true;
   private readonly foregroundWaits = new Map<
     string,
     { jobId: string; stepId: string; context: ExecutionSession; readAt: number }
@@ -71,7 +74,10 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       targetDwellMs: number;
     }
   >();
-  private readonly waits = new Map<string, { stepId: string; since: number }>();
+  private readonly waits = new Map<
+    string,
+    { stepId: string; since: number; lazyScrollAttempted?: boolean }
+  >();
   private readonly viewedItems = new Map<string, { stepId: string; items: Set<string> }>();
   private readonly marketplaceTargets = new Map<string, { stepId: string; url: string }>();
   private readonly likeStates = new Map<
@@ -240,22 +246,54 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
     return decision.kind === 'action' && observation ? { ...decision, observation } : decision;
   }
   private assertAvailableSurface(page: BrowsePage) {
+    const abnormal = classifyFacebookAbnormalUrl(page.url);
+    if (abnormal) throw new BrowseReadTimeout(abnormal, this.diagnostic(page));
     if (
       this.type === 'marketplace' &&
       (facebookMarketplaceUnavailableURL(page.url) || page.marketplaceUnavailable === true)
     )
       throw new BrowseReadTimeout('FACEBOOK_MARKETPLACE_UNAVAILABLE', this.diagnostic(page));
   }
-  private continuousObservation(page: BrowsePage, proof: TabProof): BrowseReading | undefined {
+  private continuousObservation(
+    page: BrowsePage,
+    proof: TabProof,
+    effectivelyVisible = page.visible,
+  ): BrowseReading | undefined {
     if (
-      !['feed', 'marketplace'].includes(this.type) ||
-      !page.contentKey ||
       !page.ready ||
       page.blocked ||
-      !page.visible ||
+      !effectivelyVisible ||
       facebookBrowseSurface(page.url) !== this.type
     )
       return undefined;
+    if (this.type === 'video') {
+      if (!page.video || page.video.failed) return undefined;
+      return {
+        type: 'video',
+        proof,
+        documentEpoch: 0,
+        routeEpoch: 0,
+        contentId: this.contentId(page),
+        visible: true,
+        ready: true,
+        paused: page.video.paused,
+        buffering: page.video.buffering,
+        timeSeconds: page.video.timeSeconds,
+        playbackRate: page.video.playbackRate,
+      };
+    }
+    if (!page.contentKey) return undefined;
+    if (this.type === 'friends') {
+      return {
+        type: 'friends',
+        proof,
+        documentEpoch: 0,
+        routeEpoch: 0,
+        contentId: this.contentId(page),
+        visible: true,
+        ready: true,
+      };
+    }
     return {
       type: this.type as 'feed' | 'marketplace',
       proof,
@@ -313,41 +351,179 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
         action: { kind: 'browseNavigate', tabId: proof.tabId, url },
         intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
       };
-    if (!facebookBrowseSurface(page.url))
+    if (!facebookBrowseSurface(page.url)) {
+      const prevRouteWait = this.waits.get(execution.plan.profileId);
+      const routeWaitElapsed =
+        prevRouteWait &&
+        prevRouteWait.stepId === execution.step.id &&
+        this.now() >= prevRouteWait.since
+          ? this.now() - prevRouteWait.since
+          : 0;
+      const safeFacebookOrigin = (() => {
+        try {
+          const parsed = new URL(page.url);
+          return (
+            parsed.origin === 'https://www.facebook.com' &&
+            !/^\/(?:login|recover|checkpoint|disabled|suspended|account_status|restriction)(?:\.php|\/|$)/i.test(
+              parsed.pathname,
+            )
+          );
+        } catch {
+          return false;
+        }
+      })();
+      if (
+        page.ready &&
+        safeFacebookOrigin &&
+        routeWaitElapsed >= 4_000 &&
+        (page.blocked ||
+          page.visible ||
+          ['marketplace', 'friends'].includes(this.type) ||
+          foregroundAllowed === true ||
+          canPresentTaskPage === true)
+      ) {
+        this.dwells.delete(execution.plan.profileId);
+        this.waits.delete(execution.plan.profileId);
+        return {
+          kind: 'action',
+          action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+          intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+        };
+      }
       return this.wait(execution, 'FACEBOOK_BROWSE_ROUTE_REQUIRED', undefined, page);
-    if (page.blocked || !page.ready) {
-      this.dwells.delete(execution.plan.profileId);
-      return this.wait(execution, 'FACEBOOK_BROWSE_LOADING_OR_DIALOG', undefined, page);
     }
-    if (
-      !['marketplace', 'friends'].includes(this.type) &&
-      !page.visible &&
-      foregroundAllowed !== true &&
-      canPresentTaskPage !== true
-    ) {
-      this.dwells.delete(execution.plan.profileId);
-      return this.wait(execution, 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED', page);
-    }
-    if (
+    const routeMismatch =
       facebookBrowseSurface(page.url) !== this.type ||
       (this.type === 'friends' && !/^\/friends\/requests\/?$/.test(new URL(page.url).pathname)) ||
       (execution.step.spec.type === 'marketplace' &&
         ((!detailFromCurrentStep && !matchesMarketplaceSearch(page.url, execution.step.spec)) ||
-          (execution.step.spec.categoryId && url === MARKETPLACE_HOME)))
-    )
+          (execution.step.spec.categoryId && url === MARKETPLACE_HOME)));
+    if (
+      page.ready &&
+      routeMismatch &&
+      (page.blocked ||
+        page.visible ||
+        ['marketplace', 'friends'].includes(this.type) ||
+        foregroundAllowed === true ||
+        canPresentTaskPage === true)
+    ) {
+      this.dwells.delete(execution.plan.profileId);
+      this.waits.delete(execution.plan.profileId);
       return {
         kind: 'action',
         action: { kind: 'browseNavigate', tabId: proof.tabId, url },
         intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
       };
-    if (!page.visible)
+    }
+    if (page.blocked || !page.ready) {
+      this.dwells.delete(execution.plan.profileId);
+      if (
+        page.ready &&
+        page.blocked &&
+        page.dialogDismissCSS === FACEBOOK_BROWSE_DIALOG_DISMISS_CSS &&
+        (page.visible ||
+          ['marketplace', 'friends'].includes(this.type) ||
+          foregroundAllowed === true ||
+          canPresentTaskPage === true)
+      ) {
+        this.waits.delete(execution.plan.profileId);
+        return {
+          kind: 'action',
+          action: {
+            kind: 'click',
+            tabId: proof.tabId,
+            documentEpoch: 0,
+            routeEpoch: 0,
+            target: { css: page.dialogDismissCSS },
+          },
+          intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+        };
+      }
+      const prevWait = this.waits.get(execution.plan.profileId);
+      const blockedElapsed =
+        prevWait && prevWait.stepId === execution.step.id && this.now() >= prevWait.since
+          ? this.now() - prevWait.since
+          : 0;
+      if (page.ready && page.blocked && blockedElapsed >= 12_000) {
+        this.waits.delete(execution.plan.profileId);
+        devDiag.clearWait(`browse-wait:${execution.plan.profileId}`);
+        return {
+          kind: 'action',
+          action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+          intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+        };
+      }
+      return this.wait(execution, 'FACEBOOK_BROWSE_LOADING_OR_DIALOG', undefined, page);
+    }
+    const effectivelyVisible = page.visible || canPresentTaskPage === true;
+    if (
+      !['marketplace', 'friends'].includes(this.type) &&
+      !effectivelyVisible &&
+      foregroundAllowed !== true
+    ) {
+      this.dwells.delete(execution.plan.profileId);
+      return this.wait(execution, 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED', page);
+    }
+    if (routeMismatch)
+      return {
+        kind: 'action',
+        action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+        intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+      };
+    if (!effectivelyVisible)
       return {
         kind: 'action',
         action: { kind: 'activateTab', tabId: proof.tabId },
         intent: { kind: 'auxiliary', purpose: 'activate', ...scope },
       };
-    if (this.type === 'marketplace' && !page.contentKey)
+    if (this.type === 'marketplace' && !page.contentKey) {
+      const key = execution.plan.profileId;
+      const existingWait = this.waits.get(key);
+      const now = this.now();
+      const contentWaitElapsed =
+        existingWait && existingWait.stepId === execution.step.id && now >= existingWait.since
+          ? now - existingWait.since
+          : 0;
+      if (
+        page.ready &&
+        !page.blocked &&
+        effectivelyVisible &&
+        contentWaitElapsed >= 4_500 &&
+        contentWaitElapsed < 30_000
+      ) {
+        if (contentWaitElapsed >= 12_000) {
+          this.waits.delete(key);
+          this.dwells.delete(key);
+          return {
+            kind: 'action',
+            action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+            intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+          };
+        }
+        if (!existingWait?.lazyScrollAttempted && page.scrollY < 400) {
+          this.waits.set(key, {
+            stepId: execution.step.id,
+            since: existingWait?.stepId === execution.step.id ? existingWait.since : now,
+            lazyScrollAttempted: true,
+          });
+          return {
+            kind: 'action',
+            action: {
+              kind: 'browseScroll',
+              tabId: proof.tabId,
+              documentEpoch: 0,
+              routeEpoch: 0,
+              url: page.url,
+              timeOrigin: page.timeOrigin,
+              fromY: page.scrollY,
+              deltaY: 480,
+            },
+            intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+          };
+        }
+      }
       return this.wait(execution, 'FACEBOOK_MARKETPLACE_ITEMS_REQUIRED', undefined, page);
+    }
     if (
       this.type === 'video' &&
       page.video?.paused &&
@@ -436,7 +612,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
           ...scope,
           type: 'friends',
           contentId: settledContentId,
-          visible: page.visible,
+          visible: effectivelyVisible,
           ready: page.ready && !page.blocked,
         },
       };
@@ -585,6 +761,21 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
     if (
       this.type === 'video' &&
       page.video &&
+      (page.video.ended || dwell >= targetDwellMs) &&
+      page.scrollY >= 15_000
+    )
+      return {
+        kind: 'action',
+        action: {
+          kind: 'browseNavigate',
+          tabId: proof.tabId,
+          url: 'https://www.facebook.com/reels/',
+        },
+        intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+      };
+    if (
+      this.type === 'video' &&
+      page.video &&
       page.nextReelCSS &&
       (page.video.ended || dwell >= targetDwellMs)
     )
@@ -632,9 +823,40 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
           ...scope,
         },
       };
-    if (this.type === 'video' && !page.video)
+    if (this.type === 'video' && !page.video) {
+      const prevPlayerWait = this.waits.get(execution.plan.profileId);
+      const playerWaitElapsed =
+        prevPlayerWait && prevPlayerWait.stepId === execution.step.id && at >= prevPlayerWait.since
+          ? at - prevPlayerWait.since
+          : 0;
+      if (playerWaitElapsed >= 12_000) {
+        this.waits.delete(execution.plan.profileId);
+        this.dwells.delete(execution.plan.profileId);
+        return {
+          kind: 'action',
+          action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+          intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+        };
+      }
       return this.wait(execution, 'FACEBOOK_VIDEO_PLAYER_REQUIRED');
-    if (this.type !== 'video' && !page.contentKey)
+    }
+    if (this.type !== 'video' && !page.contentKey) {
+      const prevContentWait = this.waits.get(execution.plan.profileId);
+      const contentWaitElapsed =
+        prevContentWait &&
+        prevContentWait.stepId === execution.step.id &&
+        at >= prevContentWait.since
+          ? at - prevContentWait.since
+          : 0;
+      if (this.type === 'feed' && contentWaitElapsed >= 12_000) {
+        this.waits.delete(execution.plan.profileId);
+        this.dwells.delete(execution.plan.profileId);
+        return {
+          kind: 'action',
+          action: { kind: 'browseNavigate', tabId: proof.tabId, url },
+          intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
+        };
+      }
       return this.wait(
         execution,
         this.type === 'marketplace'
@@ -642,6 +864,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
           : 'FACEBOOK_FEED_CONTENT_REQUIRED',
         page,
       );
+    }
     // Feed/marketplace duration measures a usable visible document, not changing card text.
     // Auto-playing inline video timers may change post text every second without a navigation.
     // Dwell and wheel-effect anchors above remain scoped to the observed individual content.
@@ -650,16 +873,64 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       contentId: ['feed', 'marketplace'].includes(this.type)
         ? hash(page.url + '|' + page.timeOrigin)
         : contentId,
-      visible: page.visible,
+      visible: effectivelyVisible,
       ready: page.ready && !page.blocked,
     };
     if (this.type === 'video' && page.video) {
-      if (page.video.failed || page.video.paused || page.video.buffering)
+      if (page.video.failed || page.video.paused || page.video.buffering) {
+        const prevVideoWait = this.waits.get(execution.plan.profileId);
+        const videoWaitElapsed =
+          prevVideoWait && prevVideoWait.stepId === execution.step.id && at >= prevVideoWait.since
+            ? at - prevVideoWait.since
+            : 0;
+        if (videoWaitElapsed >= 12_000) {
+          this.waits.delete(execution.plan.profileId);
+          this.dwells.delete(execution.plan.profileId);
+          if (page.nextReelCSS) {
+            return {
+              kind: 'action',
+              action: {
+                kind: 'click',
+                tabId: proof.tabId,
+                documentEpoch: 0,
+                routeEpoch: 0,
+                target: { css: page.nextReelCSS },
+              },
+              intent: {
+                kind: 'auxiliary',
+                purpose: 'advance',
+                beforeContentId: contentId,
+                ...scope,
+              },
+            };
+          }
+          return {
+            kind: 'action',
+            action: {
+              kind: 'browseScroll',
+              tabId: proof.tabId,
+              documentEpoch: 0,
+              routeEpoch: 0,
+              url: page.url,
+              timeOrigin: page.timeOrigin,
+              fromY: page.scrollY,
+              deltaY:
+                page.nextScrollDeltaY ??
+                Math.max(100, Math.min(1200, Math.floor(page.viewportHeight * 0.8))),
+            },
+            intent: {
+              kind: 'auxiliary',
+              purpose: 'advance',
+              ...(page.contentKey ? { beforeContentId: hash(page.contentKey) } : {}),
+              ...scope,
+            },
+          };
+        }
         this.wait(
           execution,
           page.video.failed ? 'FACEBOOK_VIDEO_DECODE_FAILED' : 'FACEBOOK_VIDEO_PLAYBACK_STALLED',
         );
-      else this.waits.delete(execution.plan.profileId);
+      } else this.waits.delete(execution.plan.profileId);
       return {
         kind: 'observe',
         observation: {
@@ -684,7 +955,8 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
     intent: Intent,
     guard: () => Awaitable<void>,
   ): Promise<Verdict> {
-    const { page, proof } = await this.read(execution, guard);
+    const { page, proof, canPresentTaskPage } = await this.read(execution, guard);
+    const effectivelyVisible = page.visible || canPresentTaskPage === true;
     if (
       operation.status !== 'ACKNOWLEDGED' ||
       !sameBinding(operation.binding, {
@@ -723,7 +995,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       if (
         page.ready &&
         !page.blocked &&
-        page.visible &&
+        effectivelyVisible &&
         facebookBrowseSurface(page.url) === this.type &&
         sameContent &&
         (page.likeTarget?.liked === true ||
@@ -741,6 +1013,9 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
             contentId: intent.contentId,
             observedLiked: true,
           },
+          ...(this.continuousObservation(page, proof, effectivelyVisible)
+            ? { observation: this.continuousObservation(page, proof, effectivelyVisible) }
+            : {}),
         };
       }
       const at = this.now();
@@ -748,7 +1023,12 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       const since = prevWait?.operationId === operation.id ? prevWait.since : at;
       if (!prevWait || prevWait.operationId !== operation.id)
         this.likeVerifyWaits.set(operation.id, { operationId: operation.id, since });
-      if (page.ready && !page.blocked && page.visible && (!sameContent || at - since >= 3500)) {
+      if (
+        page.ready &&
+        !page.blocked &&
+        effectivelyVisible &&
+        (!sameContent || at - since >= 3500)
+      ) {
         this.likeVerifyWaits.delete(operation.id);
         return { outcome: 'NOT_APPLIED', receipt: likeReceipt };
       }
@@ -762,7 +1042,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
           },
         },
         reason:
-          !page.visible && page.ready && !page.blocked
+          !effectivelyVisible && page.ready && !page.blocked
             ? 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED'
             : 'FACEBOOK_BROWSE_LIKE_EFFECT_PENDING',
       };
@@ -823,7 +1103,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       action.kind === 'browseScroll' &&
       !visualAdvance &&
       page.ready &&
-      page.visible &&
+      effectivelyVisible &&
       !page.blocked &&
       page.url === action.url &&
       page.timeOrigin === action.timeOrigin &&
@@ -843,6 +1123,38 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       });
       return { outcome: 'NOT_APPLIED', receipt };
     }
+    const dialogDismissClick =
+      action.kind === 'click' &&
+      action.target.css === FACEBOOK_BROWSE_DIALOG_DISMISS_CSS &&
+      action.target.scope === undefined &&
+      action.target.text === undefined &&
+      intent.purpose === 'advance';
+    if (dialogDismissClick) {
+      if (page.ready && !page.blocked) {
+        this.likeVerifyWaits.delete(operation.id);
+        return {
+          outcome: 'VERIFIED',
+          receipt,
+          effect: {
+            kind: 'auxiliary',
+            purpose: intent.purpose,
+            observed: true,
+          },
+          ...(this.continuousObservation(page, proof, effectivelyVisible)
+            ? { observation: this.continuousObservation(page, proof, effectivelyVisible) }
+            : {}),
+        };
+      }
+      const at = this.now();
+      const prevWait = this.likeVerifyWaits.get(operation.id);
+      const since = prevWait?.operationId === operation.id ? prevWait.since : at;
+      if (!prevWait || prevWait.operationId !== operation.id)
+        this.likeVerifyWaits.set(operation.id, { operationId: operation.id, since });
+      if (at - since >= 2000) {
+        this.likeVerifyWaits.delete(operation.id);
+        return { outcome: 'NOT_APPLIED', receipt };
+      }
+    }
     const nextReel =
       this.type === 'video' &&
       action.kind === 'click' &&
@@ -856,7 +1168,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       !page.video.failed &&
       !page.video.buffering &&
       !!page.contentKey &&
-      page.visible &&
+      effectivelyVisible &&
       facebookBrowseSurface(page.url) === 'video' &&
       this.contentId(page) !== intent.beforeContentId;
     const friendAccepted =
@@ -868,7 +1180,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       intent.purpose === 'acceptFriend' &&
       !!intent.beforeContentId &&
       !!page.contentKey &&
-      page.visible &&
+      effectivelyVisible &&
       facebookBrowseSurface(page.url) === 'friends' &&
       this.contentId(page) !== intent.beforeContentId;
     const applied =
@@ -891,16 +1203,16 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
         (action.kind === 'browseScroll' &&
           page.timeOrigin === action.timeOrigin &&
           ((page.url === action.url && page.scrollY > fromY + 20) ||
-            (page.visible && page.url === action.url && visualAdvance) ||
+            (effectivelyVisible && page.url === action.url && visualAdvance) ||
             // Exploration starts without a content anchor. Once usable content is
             // independently visible, its goal is met even if feed virtualization
             // lowered scrollTop. This auxiliary verdict credits no browsing time.
             (this.type === 'feed' &&
-              page.visible &&
+              effectivelyVisible &&
               page.url === action.url &&
               !intent.beforeContentId &&
               !!page.contentKey) ||
-            (page.visible &&
+            (effectivelyVisible &&
               page.url === action.url &&
               !!page.contentKey &&
               !!intent.beforeContentId &&
@@ -909,7 +1221,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
               page.url !== action.url &&
               facebookBrowseSurface(page.url) === 'video' &&
               !!page.video))) ||
-        (action.kind === 'activateTab' && page.visible) ||
+        (action.kind === 'activateTab' && effectivelyVisible) ||
         (action.kind === 'browsePlay' &&
           intent.purpose === 'play' &&
           page.url === action.url &&
@@ -918,6 +1230,9 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
           page.video.source === action.source &&
           !page.video.paused &&
           !page.video.buffering));
+    if (applied) {
+      this.likeVerifyWaits.delete(operation.id);
+    }
     if (applied && (action.kind === 'browseScroll' || nextReel || friendAccepted))
       this.dwells.set(execution.plan.profileId, {
         stepId: execution.step.id,
@@ -929,6 +1244,38 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
     if (applied && action.kind === 'activateTab' && intent.purpose === 'activate') {
       this.dwells.delete(execution.plan.profileId);
     }
+    if (!applied) {
+      const at = this.now();
+      const prevVerifyWait = this.likeVerifyWaits.get(operation.id);
+      const verifySince = prevVerifyWait?.operationId === operation.id ? prevVerifyWait.since : at;
+      if (!prevVerifyWait || prevVerifyWait.operationId !== operation.id) {
+        this.likeVerifyWaits.set(operation.id, { operationId: operation.id, since: at });
+      }
+      const softVerifyLimitMs = action.kind === 'browseNavigate' ? 6000 : 3500;
+      if (
+        effectivelyVisible &&
+        page.ready &&
+        !page.blocked &&
+        at - verifySince >= softVerifyLimitMs
+      ) {
+        this.likeVerifyWaits.delete(operation.id);
+        if (action.kind === 'browseScroll' || nextReel || friendAccepted) {
+          this.dwells.set(execution.plan.profileId, {
+            stepId: execution.step.id,
+            contentId: this.contentId(page),
+            since: at,
+            observations: 0,
+            targetDwellMs: this.defaultDwellMs(page),
+          });
+        } else {
+          this.dwells.delete(execution.plan.profileId);
+        }
+        return {
+          outcome: 'NOT_APPLIED',
+          receipt,
+        };
+      }
+    }
     return applied
       ? {
           outcome: 'VERIFIED',
@@ -939,8 +1286,8 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
             observed: true,
             ...(friendAccepted ? { afterContentId: this.contentId(page) } : {}),
           },
-          ...(this.continuousObservation(page, proof)
-            ? { observation: this.continuousObservation(page, proof) }
+          ...(this.continuousObservation(page, proof, effectivelyVisible)
+            ? { observation: this.continuousObservation(page, proof, effectivelyVisible) }
             : {}),
         }
       : {
@@ -958,7 +1305,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
             },
           },
           reason:
-            !page.visible &&
+            !effectivelyVisible &&
             page.ready &&
             !page.blocked &&
             (action.kind === 'activateTab' ||

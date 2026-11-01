@@ -161,6 +161,7 @@ test('inspection details disable new page checks for unknown release, unresolved
     id: randomUUID(),
     alias: 'Local',
     groupId: null,
+    order: 0,
     online: true,
     phase: 'PAUSED',
     synced: true,

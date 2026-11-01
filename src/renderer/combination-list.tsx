@@ -175,6 +175,7 @@ function stepShort(step: Step) {
   return [name, detail];
 }
 const liveStates = ['QUEUED', 'RUNNING', 'PAUSING', 'PAUSED', 'STOPPING', 'REVIEW'];
+const activeOrQueuedStates = ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING', 'REVIEW'];
 export function CombinationList({
   rows,
   selectedCount,
@@ -197,12 +198,14 @@ export function CombinationList({
   colorOf,
   colorSupported,
   onColor,
+  isProfileBusy,
 }: {
   rows: SavedCombination[];
   selectedCount: number;
   selectedIds?: ReadonlySet<string>;
   profiles?: readonly Profile[];
   groupInviterRunningIds?: readonly string[];
+  isProfileBusy?: ((profileId: string) => boolean) | undefined;
   onEdit: (row: SavedCombination) => void;
   onNew: () => void;
   onCopy: (row: SavedCombination) => void;
@@ -262,17 +265,19 @@ export function CombinationList({
       value && (!query || (value.name + '\n' + value.note).toLocaleLowerCase().includes(query))
     );
   });
-  const busyProfileSet = new Set<string>([
-    ...(runtime?.plans
-      .filter(
-        (plan) =>
-          selectedIds?.has(plan.profileId) &&
-          !['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state) &&
-          !isErroredPausedPlan(plan),
-      )
-      .map((plan) => plan.profileId) ?? []),
-    ...(groupInviterRunningIds?.filter((id) => selectedIds?.has(id)) ?? []),
-  ]);
+  const busyProfileSet = isProfileBusy
+    ? new Set<string>([...(selectedIds ?? [])].filter((id) => isProfileBusy(id)))
+    : new Set<string>([
+        ...(runtime?.plans
+          .filter(
+            (plan) =>
+              selectedIds?.has(plan.profileId) &&
+              !['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state) &&
+              !isErroredPausedPlan(plan),
+          )
+          .map((plan) => plan.profileId) ?? []),
+        ...(groupInviterRunningIds?.filter((id) => selectedIds?.has(id)) ?? []),
+      ]);
   const busySelected = busyProfileSet.size;
   const offlineSelected =
     selectedIds && profiles
@@ -383,10 +388,18 @@ export function CombinationList({
             : resourceSummaries === null
               ? '…'
               : String(summary?.remaining ?? 0);
-          const using = new Set(
-            runtime?.plans
-              .filter((plan) => plan.combinationId === row.id && liveStates.includes(plan.state))
-              .map((plan) => plan.profileId) ?? [],
+          const comboPlans =
+            runtime?.plans.filter(
+              (plan) => plan.combinationId === row.id && liveStates.includes(plan.state),
+            ) ?? [];
+          const using = new Set(comboPlans.map((plan) => plan.profileId)).size;
+          const activeUsing = new Set(
+            comboPlans
+              .filter((plan) => activeOrQueuedStates.includes(plan.state))
+              .map((plan) => plan.profileId),
+          ).size;
+          const pausedUsing = new Set(
+            comboPlans.filter((plan) => plan.state === 'PAUSED').map((plan) => plan.profileId),
           ).size;
           const startDisabled =
             managing || busy || !onStart || !capability?.enabled || eligibleImmediateCount === 0;
@@ -504,8 +517,24 @@ export function CombinationList({
                   <strong>{remaining}</strong>
                   <span>剩余资源</span>
                 </div>
-                <div className="combo-stat" title="正在执行或排队此组合的浏览器数量">
-                  <strong className={using ? 'is-live' : ''}>{using}</strong>
+                <div
+                  className="combo-stat"
+                  title={
+                    pausedUsing > 0
+                      ? `正在执行或排队 ${activeUsing} 个 · 已暂停 ${pausedUsing} 个`
+                      : '正在执行或排队此组合的浏览器数量'
+                  }
+                >
+                  <strong
+                    className={[
+                      activeUsing ? 'is-live' : '',
+                      pausedUsing ? 'combo-usage-split' : '',
+                    ].join(' ')}
+                  >
+                    {pausedUsing > 0
+                      ? `执行/排队 ${activeUsing} · 暂停 ${pausedUsing}`
+                      : activeUsing}
+                  </strong>
                   <span>使用中浏览器</span>
                 </div>
               </div>
@@ -557,7 +586,7 @@ export function CombinationList({
                               disabled: busy || using > 0,
                               title:
                                 using > 0
-                                  ? `有 ${using} 个浏览器正在执行或排队此组合，请先停止对应任务`
+                                  ? `有 ${activeUsing} 个执行/排队、${pausedUsing} 个已暂停浏览器正在引用此组合，请先停止对应任务`
                                   : '删除此任务组合',
                               onSelect: () => setDeletingRow(row),
                             },

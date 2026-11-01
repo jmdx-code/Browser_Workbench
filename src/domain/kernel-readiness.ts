@@ -3,7 +3,7 @@ import {
   kernelOperationPending,
   type KernelState,
 } from '../shared/kernel-state.js';
-import { sameBinding } from '../shared/task-execution.js';
+import { DispatchBinding, sameBinding } from '../shared/task-execution.js';
 import { sameResolution, type Notice } from '../shared/settlement.js';
 import type { Operation } from '../shared/task-contracts.js';
 export type ReadinessIssue = {
@@ -17,6 +17,53 @@ export type ReadinessIssue = {
     | 'REMOTE_MISSING'
     | 'TAB_CREATION_UNRESOLVED';
 };
+
+const INERT_UNREGISTERED_ACTION_KINDS: ReadonlySet<string> = new Set([
+  'browseScroll',
+  'browseNavigate',
+  'browsePlay',
+  'activateTab',
+]);
+const INERT_AUXILIARY_PURPOSES: ReadonlySet<string> = new Set([
+  'play',
+  'advance',
+  'dismiss',
+  'activate',
+]);
+
+export function isInertSettledBrowseOperation(op: Operation): boolean {
+  if (
+    op.status !== 'FAILED' ||
+    !op.binding ||
+    op.inertBrowseProof?.verified !== true ||
+    !op.receipt ||
+    typeof op.receipt !== 'object' ||
+    Array.isArray(op.receipt)
+  ) {
+    return false;
+  }
+  const allowedAction =
+    INERT_UNREGISTERED_ACTION_KINDS.has(op.action.kind) ||
+    ((op.action.kind === 'click' || op.action.kind === 'mediaClick') &&
+      op.inertBrowseProof.purpose !== undefined &&
+      INERT_AUXILIARY_PURPOSES.has(op.inertBrowseProof.purpose));
+  if (!allowedAction) return false;
+  const receiptRecord = op.receipt as Record<string, unknown>;
+  const receiptBinding = DispatchBinding.safeParse(receiptRecord.binding);
+  if (!receiptBinding.success || !sameBinding(receiptBinding.data, op.binding)) {
+    return false;
+  }
+  const ev = receiptRecord.evidence;
+  if (!ev || typeof ev !== 'object' || Array.isArray(ev)) {
+    return false;
+  }
+  const evRecord = ev as Record<string, unknown>;
+  return (
+    evRecord.transientBrowseSettled === true ||
+    (evRecord.offlineBrowseCancelled === true && op.inertBrowseProof.planConfirmedStopped === true)
+  );
+}
+
 // Pure verdict, not an execution permit. A lifecycle owner must also guard its current live lease.
 export function evaluateKernelReadiness(
   profileId: string,
@@ -43,7 +90,6 @@ export function evaluateKernelReadiness(
   const settled = (op: Operation) =>
     ['VERIFIED', 'FAILED'].includes(op.status) ||
     (op.status === 'CANCELLED' &&
-      op.action.kind === 'browseScroll' &&
       notifications.get(op.id)?.resolution.outcome === 'CONTROL_RELEASED');
   const issues: ReadinessIssue[] = [];
   const add = (id: string, reason: ReadinessIssue['reason']) => {
@@ -58,6 +104,12 @@ export function evaluateKernelReadiness(
     }
     if (!sameBinding(op.binding, remote.binding)) {
       add(id, 'BINDING_CONFLICT');
+      continue;
+    }
+    if (
+      isInertSettledBrowseOperation(op) &&
+      (remote.disposition || remote.state === 'RECONCILED')
+    ) {
       continue;
     }
     if (op.disposition) {
@@ -95,6 +147,10 @@ export function evaluateKernelReadiness(
       add(id, 'REMOTE_RESULT_MISMATCH');
   }
   for (const op of local.values()) {
+    if (isInertSettledBrowseOperation(op)) {
+      const remote = inventory.operations.find((row) => row.binding.operationId === op.id);
+      if (!remote || remote.disposition || remote.state === 'RECONCILED') continue;
+    }
     if (!inventory.operations.some((row) => row.binding.operationId === op.id))
       add(op.id, 'REMOTE_MISSING');
     if (!op.disposition && !settled(op)) add(op.id, 'BUSINESS_UNRESOLVED');

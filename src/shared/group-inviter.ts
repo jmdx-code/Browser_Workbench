@@ -10,11 +10,15 @@ export const GroupIdString = z
 
 export const GroupNameString = z.string().trim().min(1, '请输入小组名字').max(200, '小组名字过长');
 
+export const AVATAR_URL_MAX_LENGTH = 131_072; // 128KB
+
 export const InviterGroupRow = z
   .object({
     groupId: GroupIdString,
     groupName: GroupNameString,
-    avatarUrl: z.string().max(8192).nullable(),
+    avatarUrl: z.string().max(AVATAR_URL_MAX_LENGTH).nullable(),
+    folderId: z.string().nullable().default(null),
+    sortOrder: z.number().int().default(0),
     totalInvitedCount: z.number().int().nonnegative(),
     createdAt: z.number().int().nonnegative(),
     updatedAt: z.number().int().nonnegative(),
@@ -65,7 +69,8 @@ export const AddInviterGroupsRequest = z
         z
           .object({
             groupId: GroupIdString,
-            groupName: GroupNameString,
+            groupName: z.string().trim().max(200, '小组名字过长').optional().default(''),
+            folderId: z.string().nullable().optional(),
           })
           .strict(),
       )
@@ -104,3 +109,17 @@ export const StopGroupInviterProfilesRequest = z
   })
   .strict();
 export type StopGroupInviterProfilesRequest = z.infer<typeof StopGroupInviterProfilesRequest>;
+
+export function extractGroupId(raw: string): string {
+  const value = raw.trim();
+  try {
+    const url = new URL(/^https?:\/\//i.test(value) ? value : 'https://' + value);
+    if (/(^|\.)facebook\.com$/i.test(url.hostname)) {
+      const match = /^\/groups\/([^/?#]+)/i.exec(url.pathname);
+      if (match?.[1]) return decodeURIComponent(match[1]);
+    }
+  } catch {
+    /* Plain IDs stay unchanged. */
+  }
+  return value;
+}

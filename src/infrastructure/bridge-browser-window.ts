@@ -1,8 +1,10 @@
+import { mapAsync } from '../shared/async-collections.js';
 import type { Core } from '../bridge/core.js';
 import type { TaskRepository } from '../domain/tasks.js';
 import { ProductError } from '../domain/workspace.js';
 import type { BrowserWindowPort } from '../shared/browser-window.js';
 import type { TabProof } from '../shared/kernel-state.js';
+import { marketplaceBridgeSupported } from '../shared/task-features.js';
 
 // Local window management reuses the original bridge journal. It never executes a FB task.
 export class BridgeBrowserWindow implements BrowserWindowPort {
@@ -33,17 +35,36 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     const peer = this.core.peers.get(profileId);
     if (!peer?.online)
       throw new ProductError('BROWSER_OFFLINE', '这份浏览器未连接，请先手动打开', 409);
-    if (peer.phase !== 'PAUSED' || !peer.synced)
-      throw new ProductError('BROWSER_BUSY', '浏览器正在执行或对账，请稍后再整理标签', 409);
-    if (this.inviterBusy(profileId))
-      throw new ProductError('BROWSER_TASK_ACTIVE', '小组邀请正在执行，请稍后再清理标签', 409);
-    if (!this.consolidateTabs)
-      throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '当前服务未启用非主标签清理', 409);
+    const supportsExtraCleanup = marketplaceBridgeSupported(peer.extensionVersion, '0.3.59');
     this.active.add(profileId);
     try {
-      await this.assertIdle(profileId, true);
+      const isIdle = peer.phase === 'PAUSED' && peer.synced && !this.inviterBusy(profileId);
+      if (isIdle && this.consolidateTabs) {
+        try {
+          await this.assertIdle(profileId, true);
+          if (!this.inviterBusy(profileId)) {
+            return await this.consolidateTabs(profileId, preferActiveTab);
+          }
+        } catch (error) {
+          if (!supportsExtraCleanup) throw error;
+        }
+      }
+      if (supportsExtraCleanup) {
+        const res = await this.core.cleanupExtraTabs(profileId, preferActiveTab);
+        return {
+          profileId,
+          url: 'https://www.facebook.com/',
+          closedTabIds: res.closedTabIds,
+          remainingTabCount: res.remainingTabCount,
+        };
+      }
+      if (peer.phase !== 'PAUSED' || !peer.synced)
+        throw new ProductError('BROWSER_BUSY', '浏览器正在执行或对账，请稍后再整理标签', 409);
       if (this.inviterBusy(profileId))
         throw new ProductError('BROWSER_TASK_ACTIVE', '小组邀请正在执行，请稍后再清理标签', 409);
+      await this.assertIdle(profileId, true);
+      if (!this.consolidateTabs)
+        throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '当前服务未启用非主标签清理', 409);
       return await this.consolidateTabs(profileId, preferActiveTab);
     } finally {
       this.active.delete(profileId);
@@ -52,34 +73,45 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
 
   async cleanupTabs(profileIds: string[], preferActiveTab = false) {
     const result = { cleanedProfiles: 0, closedTabs: 0, skippedBusy: 0, skippedOffline: 0 };
-    for (const id of new Set(profileIds)) {
-      if (!this.core.peers.get(id)?.online) {
-        result.skippedOffline++;
-        continue;
-      }
-      try {
-        const cleaned = await this.consolidate(id, preferActiveTab);
-        if (cleaned.remainingTabCount !== 1) throw Error('WORKSPACE_CLEANUP_TABS_UNCONFIRMED');
-        result.cleanedProfiles++;
-        result.closedTabs += cleaned.closedTabIds.length;
-      } catch (error) {
-        const code =
-          error instanceof ProductError ? error.code : error instanceof Error ? error.message : '';
-        if (
-          [
-            'BROWSER_BUSY',
-            'BROWSER_TASK_ACTIVE',
-            'BROWSER_CLEANUP_PENDING',
-            'WORKSPACE_CLEANUP_CHANNEL_BUSY',
-            'WORKSPACE_CLEANUP_OPERATION_PENDING',
-            'KERNEL_PROFILE_NOT_IDLE',
-          ].includes(code)
-        )
-          result.skippedBusy++;
-        else if (code === 'BROWSER_OFFLINE') result.skippedOffline++;
-        else throw error;
-      }
-    }
+    const uniqueIds = [...new Set(profileIds)];
+    await mapAsync(
+      uniqueIds,
+      async (id) => {
+        const peer = this.core.peers.get(id);
+        if (!peer?.online) {
+          result.skippedOffline++;
+          return;
+        }
+        try {
+          const cleaned = await this.consolidate(id, preferActiveTab);
+          if (cleaned.remainingTabCount < 1) throw Error('WORKSPACE_CLEANUP_TABS_UNCONFIRMED');
+          result.cleanedProfiles++;
+          result.closedTabs += cleaned.closedTabIds.length;
+        } catch (error) {
+          const code =
+            error instanceof ProductError
+              ? error.code
+              : error instanceof Error
+                ? error.message
+                : '';
+          if (code === 'BROWSER_OFFLINE') result.skippedOffline++;
+          else if (
+            [
+              'BROWSER_BUSY',
+              'BROWSER_TASK_ACTIVE',
+              'BROWSER_CLEANUP_PENDING',
+              'WORKSPACE_CLEANUP_CHANNEL_BUSY',
+              'WORKSPACE_CLEANUP_OPERATION_PENDING',
+              'KERNEL_PROFILE_NOT_IDLE',
+            ].includes(code) ||
+            uniqueIds.length > 1
+          )
+            result.skippedBusy++;
+          else throw error;
+        }
+      },
+      8,
+    );
     return result;
   }
 
@@ -87,11 +119,27 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     const peer = this.core.peers.get(profileId);
     if (!peer?.online)
       throw new ProductError('BROWSER_OFFLINE', '这份浏览器未连接，请先手动打开', 409);
-    if (this.revealMain) {
-      const result = await this.revealMain(profileId);
-      if (result) return result;
+    try {
+      if (this.revealMain) {
+        const result = await this.revealMain(profileId);
+        if (result) return result;
+      }
+      return await this.core.revealBrowserWindow(profileId);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message === 'WORKSPACE_REVEAL_EXTENSION_UPDATE_REQUIRED' ||
+          ('code' in error && error.code === 'WORKSPACE_REVEAL_EXTENSION_UPDATE_REQUIRED'))
+      ) {
+        await this.core.reloadExtension(profileId);
+        throw new ProductError(
+          'WORKSPACE_REVEAL_EXTENSION_RELOADING',
+          '已通知该浏览器自动刷新插件，请等待 2 秒后再次点击显示窗口',
+          409,
+        );
+      }
+      throw error;
     }
-    return this.core.revealBrowserWindow(profileId);
   }
   private async assertIdle(profileId: string, allowPaused = false) {
     if (

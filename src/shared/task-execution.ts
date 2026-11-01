@@ -22,7 +22,11 @@ export type ExecutionSession = z.infer<typeof ExecutionContext>;
 export type Binding = z.infer<typeof DispatchBinding>;
 export type ExecutionReceipt = z.infer<typeof BoundReceipt>;
 
-export function sameExecution(a: ExecutionSession, b: ExecutionSession): boolean {
+export function sameExecution(
+  a: ExecutionSession | null | undefined,
+  b: ExecutionSession | null | undefined,
+): boolean {
+  if (!a || !b) return false;
   return (
     a.profileId === b.profileId &&
     a.accountId === b.accountId &&
@@ -31,7 +35,8 @@ export function sameExecution(a: ExecutionSession, b: ExecutionSession): boolean
     a.generation === b.generation
   );
 }
-export function sameBinding(a: Binding, b: Binding): boolean {
+export function sameBinding(a: Binding | null | undefined, b: Binding | null | undefined): boolean {
+  if (!a || !b) return false;
   return (
     sameExecution(a, b) &&
     a.operationId === b.operationId &&

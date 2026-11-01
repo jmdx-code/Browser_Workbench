@@ -1,0 +1,158 @@
+import { z } from 'zod';
+import { Id } from './contracts.js';
+import { GroupIdString, GroupNameString, AVATAR_URL_MAX_LENGTH } from './group-inviter.js';
+export { AVATAR_URL_MAX_LENGTH };
+
+export const BumperSettings = z
+  .object({
+    searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']).default('time_sort'),
+    maxPostAgeHours: z.number().int().min(1).max(720).default(24),
+    maxPostsPerGroupPage: z.number().int().min(1).max(50).default(5),
+    dailyMaxLikesPerAccount: z.number().int().min(1).max(500).default(20),
+    maxLikesPerPost: z.number().int().min(1).max(500).default(50),
+    likeProbability: z.number().int().min(0).max(100).default(100),
+    commentProbability: z.number().int().min(0).max(100).default(30),
+    consumeCommentOnUse: z.boolean().default(false),
+  })
+  .strict();
+export type BumperSettings = z.infer<typeof BumperSettings>;
+export const BumperTarget = z.object({
+  id: GroupIdString,
+  name: GroupNameString,
+  avatarUrl: z.string().nullable(),
+  folderId: z.string().nullable().default(null),
+  sortOrder: z.number().int().default(0),
+  totalBumpedCount: z.number().int().nonnegative(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+export type BumperTarget = z.infer<typeof BumperTarget>;
+
+export const MAX_LOCAL_AVATAR_BYTES = 131_072; // 128KB
+
+export function isCompleteNumericId(id: string | null | undefined): boolean {
+  return typeof id === 'string' && /^\d+$/.test(id.trim());
+}
+
+export function isPlaceholderTargetName(
+  name: string | null | undefined,
+  id: string | null | undefined,
+): boolean {
+  const trimmedName = typeof name === 'string' ? name.trim() : '';
+  const trimmedId = typeof id === 'string' ? id.trim() : '';
+  return !trimmedName || trimmedName === trimmedId;
+}
+
+export function isLocalAvatar(url: string | null | undefined): boolean {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_LOCAL_AVATAR_BYTES) return false;
+  return /^data:image\/(?:webp|jpeg|png);base64,[A-Za-z0-9+/=]{32,}$/i.test(trimmed);
+}
+
+export function isTargetIncomplete(item: {
+  id: string;
+  name: string;
+  avatarUrl?: string | null;
+}): boolean {
+  return (
+    !isCompleteNumericId(item.id) ||
+    isPlaceholderTargetName(item.name, item.id) ||
+    !isLocalAvatar(item.avatarUrl)
+  );
+}
+
+export interface BumperRefreshResult {
+  updated: number;
+  needsBrowser: number;
+  failed: number;
+  error?: string;
+}
+export const BumperTargetsInput = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            id: GroupIdString,
+            name: z.string().trim().max(200, '名字过长').optional().default(''),
+            folderId: z.string().nullable().optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(500),
+  })
+  .strict();
+export const BumperIdsInput = z.object({ ids: z.array(GroupIdString).min(1).max(500) }).strict();
+export const BumperCommentsInput = z
+  .object({
+    texts: z.array(z.string().trim().min(1).max(8000)).max(5000),
+    consumeCommentOnUse: z.boolean(),
+  })
+  .strict();
+export interface BumperComment {
+  id: string;
+  text: string;
+  usedCount: number;
+  createdAt: number;
+}
+export interface BumperLog {
+  id: string;
+  profileId: string;
+  accountId: string;
+  groupId: string;
+  groupName: string;
+  pageId: string;
+  pageName: string;
+  postId: string;
+  postUrl: string;
+  liked: boolean;
+  commentText: string | null;
+  bumpedAt: number;
+}
+export const StartBumper = z
+  .object({
+    profileIds: z.array(Id).min(1).max(500),
+    groupIds: z.array(GroupIdString).min(1).max(500),
+    pageIds: z.array(GroupIdString).min(1).max(500),
+  })
+  .strict();
+export interface BumperProfileStat {
+  today: number;
+  session: number;
+  status: string;
+  running: boolean;
+}
+export interface BumperDailyStat {
+  date: string; // yyyy-mm-dd（本地时区日期）
+  count: number;
+}
+export interface BumperState {
+  groups: BumperTarget[];
+  pages: BumperTarget[];
+  settings: BumperSettings;
+  comments: BumperComment[];
+  total: number;
+  running: boolean;
+  statusText: string;
+  profileCounts: Record<string, BumperProfileStat>;
+  dailyStats?: BumperDailyStat[];
+}
+
+export function extractBumperPageId(raw: string): string {
+  const value = raw.trim();
+  try {
+    const u = new URL(/^https?:\/\//i.test(value) ? value : 'https://' + value);
+    if (!/(^|\.)facebook\.com$/i.test(u.hostname)) return value;
+    if (u.pathname === '/profile.php' && u.searchParams.get('id'))
+      return u.searchParams.get('id') ?? value;
+    const segments = u.pathname.split('/').filter(Boolean);
+    const user = segments.indexOf('user');
+    if (user >= 0 && segments[user + 1]) return decodeURIComponent(segments[user + 1] ?? value);
+    if (segments[0] === 'pages' && segments[2]) return decodeURIComponent(segments[2]);
+    return decodeURIComponent(segments[0] ?? value);
+  } catch {
+    return value;
+  }
+}

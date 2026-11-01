@@ -11,6 +11,7 @@ import {
   marketplaceBootstrap,
   FACEBOOK_REEL_NEXT_CSS,
   FACEBOOK_FRIEND_CONFIRM_CSS,
+  FACEBOOK_BROWSE_DIALOG_DISMISS_CSS,
 } from '../shared/facebook-browse-route.js';
 
 export function validateBrowseIntent(step: StepInstance, action: Action, intent: Intent): void {
@@ -81,6 +82,15 @@ export function validateBrowseIntent(step: StepInstance, action: Action, intent:
   )
     throw Error('BROWSE_FRIEND_CONFIRM_PURPOSE_REJECTED');
   if (
+    action.kind === 'click' &&
+    action.target.css === FACEBOOK_BROWSE_DIALOG_DISMISS_CSS &&
+    (intent.kind !== 'auxiliary' ||
+      intent.purpose !== 'advance' ||
+      action.target.scope !== undefined ||
+      action.target.text !== undefined)
+  )
+    throw Error('BROWSE_DIALOG_DISMISS_PURPOSE_REJECTED');
+  if (
     'documentEpoch' in action &&
     (action.documentEpoch !== intent.documentEpoch || action.routeEpoch !== intent.routeEpoch)
   )
@@ -141,7 +151,8 @@ const usable = (sample: TimedBrowseReading) =>
   sample.finishedAt >= sample.startedAt &&
   sample.finishedAt - sample.startedAt <=
     (sample.reading.type === 'feed' || sample.reading.type === 'marketplace' ? 5000 : 2500) &&
-  (sample.reading.type !== 'video' || (!sample.reading.paused && !sample.reading.buffering));
+  (sample.reading.type !== 'video' ||
+    (!sample.reading.paused && !sample.reading.buffering && sample.reading.playbackRate >= 0.25));
 // Controller monotonic time only. No carry-over across route/media/lease/step changes or missing polls.
 export function effectiveBrowseMilliseconds(
   previous: TimedBrowseReading | undefined,

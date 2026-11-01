@@ -3,7 +3,10 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Core, Peer } from '../bridge/core.js';
 import type { ProfileInspectionPort, InspectionConnection } from '../domain/profile-inspection.js';
 import type { TaskRepository } from '../domain/tasks.js';
+import type { SettlementRepository } from '../domain/settlement.js';
 import type { KernelBridge } from './kernel-bridge.js';
+import { SettlementNotifier } from '../application/settlement-notifier.js';
+import { isInertSettledBrowseOperation } from '../domain/kernel-readiness.js';
 import { facebookDisplayInspectionProjection } from './facebook-read-adapter.js';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
@@ -18,6 +21,7 @@ export class KernelProfileInspection implements ProfileInspectionPort {
     private readonly kernel: KernelBridge,
     private readonly core: Core,
     private readonly tasks: TaskRepository,
+    private readonly settlements: SettlementRepository | undefined = tasks.settlements,
   ) {}
   connection(profileId: string) {
     const peer = this.core.peers.get(profileId);
@@ -46,7 +50,7 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       queuedPlanId &&
       (pending.length !== 1 ||
         pending[0]?.id !== queuedPlanId ||
-        pending[0]?.state !== 'QUEUED' ||
+        !['QUEUED', 'RUNNING'].includes(pending[0]?.state ?? '') ||
         (
           (await this.tasks.blockingOperations?.(queuedPlanId)) ??
           (await this.tasks.operations(queuedPlanId))
@@ -58,14 +62,51 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       throw Error('INSPECTION_OPERATION_PENDING');
     return peer;
   }
+  private async settledBrowseOperationIds(
+    planId?: string,
+  ): Promise<ReadonlySet<string> | undefined> {
+    if (!planId) return undefined;
+    const ops = await this.tasks.operations(planId);
+    const ids = ops.filter(isInertSettledBrowseOperation).map((op) => op.id);
+    return ids.length > 0 ? new Set(ids) : undefined;
+  }
+  private async flushIdleSettlements(peer: Peer, guard: () => Awaitable<void>): Promise<void> {
+    if (!this.settlements || !peer.capabilities?.includes('kernel-journal-v1')) return;
+    if (
+      this.settlements.hasUndelivered &&
+      !(await this.settlements.hasUndelivered(peer.profileId))
+    ) {
+      return;
+    }
+    const notifier = new SettlementNotifier(this.settlements);
+    const pendingCount = (await this.settlements.list(peer.profileId)).filter(
+      (notice) => notice.state !== 'DELIVERED',
+    ).length;
+    for (let index = 0; index < pendingCount; index++) {
+      await guard();
+      const sent = await this.kernel.withSummary(peer, (port) => notifier.flushOne(port));
+      if (!sent) break;
+    }
+  }
   async assertIdle(connection: InspectionConnection) {
     await this.assertNativeIdle(connection);
   }
   private async assertNativeIdle(connection: InspectionConnection, queuedPlanId?: string) {
     const peer = await this.peer(connection, queuedPlanId);
-    const { inventory } = await prepareFacebookWorkspace(this.kernel, peer, undefined, async () => {
+    await this.flushIdleSettlements(peer, async () => {
       await this.peer(connection, queuedPlanId);
     });
+    const settledIds = await this.settledBrowseOperationIds(queuedPlanId);
+    const { inventory } = await prepareFacebookWorkspace(
+      this.kernel,
+      peer,
+      undefined,
+      async () => {
+        await this.peer(connection, queuedPlanId);
+      },
+      settledIds,
+      true,
+    );
     await this.peer(connection, queuedPlanId);
     const main = peer.capabilities?.includes('kernel-workspace-main-proof-v1')
       ? inventory.workspaceMain
@@ -94,6 +135,8 @@ export class KernelProfileInspection implements ProfileInspectionPort {
         await this.peer(connection),
         undefined,
         guard,
+        undefined,
+        true,
       );
       await guard();
       if (native.workspaceMain) {
@@ -199,9 +242,19 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       (row) => row.round === plan.round && row.position === plan.position,
     );
     const storyAdmission = step?.spec.type === 'post' && step.spec.destination === 'story';
+    const browseAdmission = Boolean(step && (step.spec.type !== 'post' || storyAdmission));
     const peer = await this.peer(connection, planId);
+    await this.flushIdleSettlements(peer, guard);
     const retained = (await this.tasks.retainedTaskPage?.(connection.profileId)) ?? undefined;
-    const prepared = await prepareFacebookWorkspace(this.kernel, peer, retained, guard);
+    const settledIds = await this.settledBrowseOperationIds(planId);
+    const prepared = await prepareFacebookWorkspace(
+      this.kernel,
+      peer,
+      retained,
+      guard,
+      settledIds,
+      true,
+    );
     if (prepared.inventory.operations.some(kernelOperationPending))
       throw Error('FACEBOOK_IDENTITY_NATIVE_REVIEW_REQUIRED');
     const idle = peer.capabilities?.includes('kernel-page-quiesce-v1')
@@ -214,7 +267,7 @@ export class KernelProfileInspection implements ProfileInspectionPort {
         guard,
         true,
         prepared.proof,
-        true,
+        browseAdmission,
         storyAdmission,
       );
     if (
@@ -227,32 +280,42 @@ export class KernelProfileInspection implements ProfileInspectionPort {
         const composers =
           existing.page.rows.find((row) => row.key === 'homeComposers')?.nodes ?? [];
         const href = links[0]?.attributes.href;
-        const creatorURL = href ? new URL(href, existing.page.url) : null;
-        if (
-          composers.length !== 1 ||
-          links.length !== 1 ||
-          !href ||
-          creatorURL?.origin !== 'https://www.facebook.com' ||
-          creatorURL.pathname !== '/profile.php' ||
-          creatorURL.searchParams.get('id') !== existing.actor.accountId
-        )
-          throw Error('FACEBOOK_CURRENT_CREATOR_UNCONFIRMED');
-        return {
-          actor: existing.actor,
-          transport: 'document-preload' as const,
-          connection: { ...connection },
-          proof: null,
-          closedRecord: null,
-          stop: null,
-          page: existing.page,
-          passive: true as const,
-        };
+        let creatorURL: URL | null = null;
+        if (href) {
+          try {
+            creatorURL = new URL(href, existing.page.url);
+          } catch {
+            creatorURL = null;
+          }
+        }
+        const creatorConfirmed =
+          composers.length === 1 &&
+          links.length === 1 &&
+          Boolean(href) &&
+          creatorURL?.origin === 'https://www.facebook.com' &&
+          creatorURL.pathname === '/profile.php' &&
+          creatorURL.searchParams.get('id') === existing.actor.accountId;
+        if (creatorConfirmed) {
+          return {
+            actor: existing.actor,
+            transport: 'document-preload' as const,
+            connection: { ...connection },
+            proof: null,
+            closedRecord: null,
+            stop: null,
+            page: existing.page,
+            passive: true as const,
+          };
+        }
       }
     }
     const evidence = await this.kernel.inspectFacebookIdentity(
       await this.peer(connection, planId),
       guard,
       true,
+      undefined,
+      browseAdmission,
+      storyAdmission,
     );
     await guard();
     if (evidence.connection.connectionEpoch !== connection.connectionEpoch)

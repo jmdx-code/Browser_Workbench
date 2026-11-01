@@ -17,7 +17,7 @@ export function projectFacebookDocumentIdentity(
   const browseRoute =
     /^https:\/\/www\.facebook\.com\/marketplace\/ineligible\/?(?:[?#].*)?$/.test(location.href) ||
     location.href === 'https://www.facebook.com/reel/?s=tab' ||
-    /^https:\/\/www\.facebook\.com\/(?:[?#].*|(?:watch|reels)\/?(?:[?#].*)?|reel\/\d{1,30}\/?(?:[?#].*)?|friends(?:\/requests)?\/?(?:[?#].*)?|marketplace(?:\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|search)\/)[a-z0-9_-]{1,80}\/)?search|\/item\/\d{1,30})?\/?(?:[?#].*)?)?$/.test(
+    /^https:\/\/www\.facebook\.com\/(?:[?#].*|(?:watch|reels)\/?(?:[?#].*)?|reel\/\d{1,30}\/?(?:[?#].*)?|friends(?:\/requests)?\/?(?:[?#].*)?|marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search|\/item\/\d{1,30})?\/?(?:[?#].*)?)?$/i.test(
       location.href,
     );
   if (
@@ -38,114 +38,217 @@ export function projectFacebookDocumentIdentity(
       !(scope !== 'home' && scope !== 'task' && document.readyState === 'interactive'))
   )
     return empty();
-  for (const script of Array.from(
+  type ScopedActor = { actor: Actor; taskOnly: boolean };
+  type StoryChunk = {
+    key: string;
+    actor: Actor | null;
+    hasActor: boolean;
+    path: 'root' | 'patch' | 'invalid';
+    final: boolean;
+  };
+  type CachedScriptSummary = {
+    byteLength: number;
+    tooLarge: number;
+    abort: number;
+    modules: number;
+    menu: ScopedActor[];
+    composer: ScopedActor[];
+    storyNavigation: string[];
+    stories: StoryChunk[];
+  };
+  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
+    __wbIdentityScriptsV1?: WeakMap<Element, CachedScriptSummary>;
+    __wbIdentityResultCacheV1?: {
+      url: string;
+      timeOrigin: number;
+      scriptCount: number;
+      actor: Actor;
+    };
+  };
+  const summaries = (cacheHost.__wbIdentityScriptsV1 ??= new WeakMap<
+    Element,
+    CachedScriptSummary
+  >());
+  const currentOrigin = typeof performance !== 'undefined' ? (performance.timeOrigin ?? 0) : 0;
+  const scriptNodes = Array.from(
     document.querySelectorAll('script[type="application/json"][data-sjs]'),
-  )) {
-    // The observed homepage has 203 scripts, many unrelated to identity. Inspect all within
-    // the bounded document budget so a late duplicate/conflict still cannot be ignored.
-    if (++scripts > 1024) return empty();
+  );
+  const cachedResult = cacheHost.__wbIdentityResultCacheV1;
+  if (
+    scope === 'browse' &&
+    document.readyState === 'complete' &&
+    cachedResult &&
+    cachedResult.url === location.href &&
+    cachedResult.timeOrigin === currentOrigin &&
+    cachedResult.scriptCount === scriptNodes.length &&
+    scriptNodes.length > 0 &&
+    scriptNodes.every((node) => summaries.has(node))
+  ) {
+    return {
+      url: location.href,
+      ready: document.readyState,
+      actor: {
+        version: 1,
+        source: 'CometSettingsDropdownTriggerQuery' as const,
+        accountId: cachedResult.actor.id,
+        name: cachedResult.actor.name,
+        type: 'User' as const,
+        checkedAt: Date.now(),
+      },
+    };
+  }
+  const record = (value: unknown): Record<string, unknown> =>
+    value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  const at = (value: unknown, key: string | number): unknown => Reflect.get(record(value), key);
+  const summarize = (script: Element): CachedScriptSummary => {
     const text = script.textContent ?? '';
-    bytes += new TextEncoder().encode(text).byteLength;
-    if (bytes > 24 * 1024 * 1024) return empty();
+    const summary: CachedScriptSummary = {
+      byteLength: new TextEncoder().encode(text).byteLength,
+      tooLarge: 0,
+      abort: 0,
+      modules: 0,
+      menu: [],
+      composer: [],
+      storyNavigation: [],
+      stories: [],
+    };
     if (text.length > 1024 * 1024) {
-      if (
-        /adp_Comet(?:SettingsDropdownTrigger|FeedInlineComposer)QueryRelayPreloader_/.test(text) ||
-        (scope === 'story' &&
-          /adp_Stories(?:Create|SuspenseNavigationPaneRootWithEntryPoint)QueryRelayPreloader_/.test(
-            text,
-          ))
+      if (/adp_Comet(?:SettingsDropdownTrigger|FeedInlineComposer)QueryRelayPreloader_/.test(text))
+        summary.tooLarge = 7;
+      else if (
+        /adp_Stories(?:Create|SuspenseNavigationPaneRootWithEntryPoint)QueryRelayPreloader_/.test(
+          text,
+        )
       )
-        return empty();
-      continue;
+        summary.tooLarge = 4;
+      return summary;
     }
-    let body;
+    // Skip JSON.parse only when the script cannot affect the verdict: no identity preloader
+    // and no ScheduledServerJS modules (which count toward the fail-closed 60000 module cap).
+    // Any \u escape may hide either name, so escaped text is always parsed.
+    const mayAffectVerdict =
+      text.includes('CometSettingsDropdownTriggerQueryRelayPreloader_') ||
+      text.includes('CometFeedInlineComposerQueryRelayPreloader_') ||
+      text.includes('StoriesCreateQueryRelayPreloader_') ||
+      text.includes('StoriesSuspenseNavigationPaneRootWithEntryPointQueryRelayPreloader_') ||
+      text.includes('ScheduledServerJS') ||
+      text.includes('\\u');
+    if (!mayAffectVerdict) return summary;
+    let body: unknown;
     try {
-      body = JSON.parse(text);
+      body = JSON.parse(text) as unknown;
     } catch {
-      continue;
+      return summary;
     }
-    if (!Array.isArray(body?.require)) continue;
-    for (const top of body.require) {
-      if (top?.[0] !== 'ScheduledServerJS') continue;
-      const entries = top?.[3]?.[0]?.__bbox?.require;
+    const topEntries = at(body, 'require');
+    if (!Array.isArray(topEntries)) return summary;
+    const actorValue = (value: unknown): Actor | null => {
+      const actor = record(value);
+      return actor.__typename === 'User' &&
+        typeof actor.id === 'string' &&
+        /^\d{1,30}$/.test(actor.id) &&
+        typeof actor.name === 'string' &&
+        actor.name.length >= 1 &&
+        actor.name.length <= 300
+        ? { __typename: 'User', id: actor.id, name: actor.name }
+        : null;
+    };
+    const addActor = (list: ScopedActor[], actor: Actor, taskOnly: boolean) => {
+      if (
+        list.some(
+          (item) =>
+            item.taskOnly === taskOnly &&
+            item.actor.id === actor.id &&
+            item.actor.name === actor.name,
+        )
+      )
+        return;
+      // More than one distinct actor in either eligibility class already conflicts.
+      if (list.filter((item) => item.taskOnly === taskOnly).length >= 2) {
+        summary.abort |= taskOnly ? 6 : 7;
+        return;
+      }
+      list.push({ actor, taskOnly });
+    };
+    for (const top of topEntries) {
+      if (at(top, 0) !== 'ScheduledServerJS') continue;
+      const entries = at(at(at(at(top, 3), 0), '__bbox'), 'require');
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
-        if (++modules > 60000) return empty();
+        if (++summary.modules > 60000) {
+          summary.abort |= 7;
+          return summary;
+        }
+        const module = at(entry, 0),
+          taskOnly = module !== 'RelayPrefetchedStreamCache';
         if (
-          entry?.[0] !== 'RelayPrefetchedStreamCache' &&
-          !(
-            scope !== 'home' &&
-            typeof entry?.[0] === 'string' &&
-            /^RelayPrefetchedStreamCache@[a-f0-9]{32}$/.test(entry[0])
-          )
+          taskOnly &&
+          (typeof module !== 'string' || !/^RelayPrefetchedStreamCache@[a-f0-9]{32}$/.test(module))
         )
           continue;
-        const args = entry?.[3],
-          key = args?.[0];
+        const args = at(entry, 3),
+          key = at(args, 0);
         if (typeof key !== 'string') continue;
+        const resultValue = at(at(args, 1), '__bbox'),
+          rawResult = at(resultValue, 'result'),
+          result = record(rawResult);
+        const viewer = record(at(at(result, 'data'), 'viewer')),
+          rawActor = viewer.actor,
+          actor = actorValue(rawActor);
         if (
-          scope === 'story' &&
           /^adp_StoriesSuspenseNavigationPaneRootWithEntryPointQueryRelayPreloader_[a-f0-9]{16,80}$/.test(
             key,
           )
         ) {
-          const result = args?.[1]?.__bbox?.result,
-            actor = result?.data?.viewer?.actor,
-            me = result?.data?.me;
+          const navActor = record(rawActor),
+            me = record(at(at(result, 'data'), 'me'));
           if (
-            !result ||
+            !rawResult ||
             'errors' in result ||
             result.path !== undefined ||
-            result.extensions?.is_final !== true ||
-            actor?.__typename !== 'User' ||
-            me?.__typename !== 'User' ||
-            typeof actor.id !== 'string' ||
-            !/^\d{1,30}$/.test(actor.id) ||
-            me.id !== actor.id
+            at(result.extensions, 'is_final') !== true ||
+            navActor.__typename !== 'User' ||
+            me.__typename !== 'User' ||
+            typeof navActor.id !== 'string' ||
+            !/^\d{1,30}$/.test(navActor.id) ||
+            me.id !== navActor.id
           )
-            return empty();
-          storyNavigation.push(actor.id);
+            summary.abort |= 4;
+          else if (summary.storyNavigation.length < 2) summary.storyNavigation.push(navActor.id);
+          else summary.abort |= 4;
           continue;
         }
-        if (
-          scope === 'story' &&
-          /^adp_StoriesCreateQueryRelayPreloader_[a-f0-9]{16,80}$/.test(key)
-        ) {
-          const result = args?.[1]?.__bbox?.result;
-          if (!result || 'errors' in result || typeof result.extensions?.is_final !== 'boolean')
-            return empty();
-          const previous = stories.get(key),
-            actor = result.data?.viewer?.actor;
-          if (!previous) {
-            if (
-              result.path !== undefined ||
-              actor?.__typename !== 'User' ||
-              typeof actor.id !== 'string' ||
-              !/^\d{1,30}$/.test(actor.id) ||
-              typeof actor.name !== 'string' ||
-              actor.name.length < 1 ||
-              actor.name.length > 300 ||
-              actor.is_additional_profile_plus !== false
-            )
-              return empty();
-            stories.set(key, {
-              actor: { __typename: 'User', id: actor.id, name: actor.name },
-              final: result.extensions.is_final,
-              chunks: 1,
-            });
-          } else {
-            // The observed creator query streams root patches under one exact key. Only
-            // its first record carries the actor; completion must belong to that same stream.
-            if (
-              previous.final ||
-              ++previous.chunks > 8 ||
-              !Array.isArray(result.path) ||
-              result.path.length !== 0 ||
-              actor !== undefined
-            )
-              return empty();
-            previous.final = result.extensions.is_final;
+        if (/^adp_StoriesCreateQueryRelayPreloader_[a-f0-9]{16,80}$/.test(key)) {
+          const final = at(result.extensions, 'is_final');
+          if (
+            !rawResult ||
+            'errors' in result ||
+            typeof final !== 'boolean' ||
+            (rawActor !== undefined &&
+              (!actor || at(rawActor, 'is_additional_profile_plus') !== false))
+          ) {
+            summary.abort |= 4;
+            continue;
           }
+          const chunk: StoryChunk = {
+            key,
+            actor,
+            hasActor: rawActor !== undefined,
+            path:
+              result.path === undefined
+                ? 'root'
+                : Array.isArray(result.path) && result.path.length === 0
+                  ? 'patch'
+                  : 'invalid',
+            final,
+          };
+          // At most two streams and nine chunks can affect a successful result.
+          if (
+            summary.stories.filter((item) => item.key === key).length >= 9 ||
+            new Set([...summary.stories.map((item) => item.key), key]).size > 2
+          )
+            summary.abort |= 4;
+          else summary.stories.push(chunk);
           continue;
         }
         const match =
@@ -153,28 +256,64 @@ export function projectFacebookDocumentIdentity(
             key,
           );
         if (!match) continue;
-        const result = args?.[1]?.__bbox?.result,
-          viewer = result?.data?.viewer,
-          actor = viewer?.actor;
         if (
-          !result ||
+          !rawResult ||
           'errors' in result ||
-          result.extensions?.is_final !== true ||
-          actor?.__typename !== 'User' ||
-          typeof actor.id !== 'string' ||
-          !/^\d{1,30}$/.test(actor.id) ||
-          typeof actor.name !== 'string' ||
-          actor.name.length < 1 ||
-          actor.name.length > 300
+          at(result.extensions, 'is_final') !== true ||
+          !actor ||
+          (match[1] === 'SettingsDropdownTrigger' &&
+            viewer.is_lar_acting_as_additional_profile !== false)
+        ) {
+          summary.abort |= taskOnly ? 6 : 7;
+          continue;
+        }
+        addActor(
+          match[1] === 'SettingsDropdownTrigger' ? summary.menu : summary.composer,
+          actor,
+          taskOnly,
+        );
+      }
+    }
+    return summary;
+  };
+  const scopeMask = scope === 'home' ? 1 : scope === 'story' ? 4 : 2;
+  for (const script of scriptNodes) {
+    if (++scripts > 1024) return empty();
+    let summary = summaries.get(script);
+    if (!summary) {
+      summary = summarize(script);
+      summaries.set(script, summary);
+    }
+    bytes += summary.byteLength;
+    modules += summary.modules;
+    if (
+      bytes > 24 * 1024 * 1024 ||
+      modules > 60000 ||
+      (summary.tooLarge & scopeMask) !== 0 ||
+      (summary.abort & scopeMask) !== 0
+    )
+      return empty();
+    for (const [source, target] of [
+      [summary.menu, menu],
+      [summary.composer, composer],
+    ] as const)
+      for (const item of source)
+        if (
+          (scope !== 'home' || !item.taskOnly) &&
+          !target.some((actor) => actor.id === item.actor.id && actor.name === item.actor.name)
         )
+          target.push({ ...item.actor });
+    if (scope !== 'story') continue;
+    storyNavigation.push(...summary.storyNavigation);
+    for (const chunk of summary.stories) {
+      const previous = stories.get(chunk.key);
+      if (!previous) {
+        if (chunk.path !== 'root' || !chunk.actor) return empty();
+        stories.set(chunk.key, { actor: { ...chunk.actor }, final: chunk.final, chunks: 1 });
+      } else {
+        if (previous.final || ++previous.chunks > 8 || chunk.path !== 'patch' || chunk.hasActor)
           return empty();
-        const selected: Actor = { __typename: 'User', id: actor.id, name: actor.name };
-        if (match[1] === 'SettingsDropdownTrigger') {
-          if (viewer.is_lar_acting_as_additional_profile !== false) return empty();
-          if (!menu.some((a) => a.id === selected.id && a.name === selected.name))
-            menu.push(selected);
-        } else if (!composer.some((a) => a.id === selected.id && a.name === selected.name))
-          composer.push(selected);
+        previous.final = chunk.final;
       }
     }
   }
@@ -233,6 +372,14 @@ export function projectFacebookDocumentIdentity(
       )
         return empty();
     }
+  }
+  if (scope === 'browse' && document.readyState === 'complete' && scriptNodes.length > 0) {
+    cacheHost.__wbIdentityResultCacheV1 = {
+      url: location.href,
+      timeOrigin: currentOrigin,
+      scriptCount: scriptNodes.length,
+      actor: { ...selected },
+    };
   }
   const actor: NativeFacebookActor = {
     version: 1,

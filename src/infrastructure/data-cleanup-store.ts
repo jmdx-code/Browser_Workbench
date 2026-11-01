@@ -64,7 +64,10 @@ CREATE INDEX IF NOT EXISTS task_resource_bindings_job ON task_resource_bindings(
 CREATE INDEX IF NOT EXISTS task_account_locks_job ON task_account_locks(job_id);
 `;
 export class SqliteDataCleanup {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly onInvalidate?: () => void,
+  ) {}
   settings() {
     const row = this.db
       .prepare(
@@ -221,6 +224,7 @@ export class SqliteDataCleanup {
     this.db
       .prepare(`DELETE FROM task_record_deletions WHERE step_id ${inJobs}`)
       .run(JSON.stringify(stepIds));
+    this.onInvalidate?.();
     return rows.length;
   }
   hiddenIds() {

@@ -244,7 +244,12 @@ test('every feed scroll input gets one fresh atomic actor/document fence; hidden
       if (failure === 'window-stopped') plan.state = 'PAUSING';
     }
     const check = authority.assertTarget(action, 0, failure.startsWith('hidden-prepare'));
-    if (failure && failure !== 'window-original' && failure !== 'hidden-prepare-cap')
+    if (
+      failure &&
+      failure !== 'window-original' &&
+      failure !== 'hidden-prepare-cap' &&
+      failure !== 'hidden-cap-input'
+    )
       await assert.rejects(check);
     else await check;
     assert.equal(

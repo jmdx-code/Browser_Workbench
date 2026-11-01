@@ -80,6 +80,10 @@ test('HTTP/WS integration uses an isolated database and simulated peers, not a b
       });
     });
     const landing = await fetch(base);
+    assert.match(
+      landing.headers.get('content-security-policy') ?? '',
+      /img-src[^;]*https:\/\/\*\.fbcdn\.net[^;]*https:\/\/\*\.fbsbx\.com/,
+    );
     const cookie = landing.headers.get('set-cookie')!.split(';')[0]!;
     const state = async () =>
       (await (await fetch(base + '/api/state', { headers: { cookie } })).json()) as any;

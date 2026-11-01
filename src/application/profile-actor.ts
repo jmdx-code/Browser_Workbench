@@ -16,7 +16,7 @@ import {
 } from '../shared/task-execution.js';
 import type { Operation } from '../shared/task-contracts.js';
 import { canonicalAction } from '../shared/browser-actions.js';
-import type { KernelState } from '../shared/kernel-state.js';
+import { kernelOperationPending, type KernelState } from '../shared/kernel-state.js';
 
 // Per-profile logical actor. It does not create plans, resume paused work or infer business results.
 export class ProfileActor {
@@ -28,6 +28,7 @@ export class ProfileActor {
   private observing: Promise<KernelState | void> | undefined;
   private inFlight = false;
   private pending: Binding | null = null;
+  private lastInventory: KernelState | null = null;
   private readonly notifier: SettlementNotifier;
   constructor(
     private readonly port: ProfileActorSession,
@@ -38,6 +39,9 @@ export class ProfileActor {
   }
   get profileId(): string {
     return this.port.profileId;
+  }
+  lastObservedInventory(): KernelState | null {
+    return this.lastInventory ? structuredClone(this.lastInventory) : null;
   }
   async status() {
     await this.session(); // A stale cached READY can never be reported as current.
@@ -83,8 +87,11 @@ export class ProfileActor {
         await this.tasks.markBoundUnknown(this.pending, reason);
     }
   }
-  private async operations() {
-    return await flatMapAsync(
+  private async operations(
+    notices?: Awaited<ReturnType<SettlementRepository['list']>>,
+    inventory?: KernelState,
+  ) {
+    const blocking = await flatMapAsync(
       await this.tasks.plansForProfile(this.profileId, [
         'QUEUED',
         'RUNNING',
@@ -93,8 +100,28 @@ export class ProfileActor {
         'STOPPING',
         'REVIEW',
       ]),
-      async (plan) => await this.tasks.operations(plan.id),
+      async (plan) =>
+        this.tasks.blockingOperations
+          ? await this.tasks.blockingOperations(plan.id)
+          : await this.tasks.operations(plan.id),
     );
+    const seen = new Set(blocking.map((op) => op.id));
+    const extras: Operation[] = [];
+    for (const notice of notices ?? []) {
+      if (notice.state !== 'DELIVERED' && !seen.has(notice.binding.operationId)) {
+        seen.add(notice.binding.operationId);
+        const op = await this.operation(notice.binding.operationId, notice.binding.jobId);
+        if (op) extras.push(op);
+      }
+    }
+    for (const remote of inventory?.operations ?? []) {
+      if (kernelOperationPending(remote) && !seen.has(remote.binding.operationId)) {
+        seen.add(remote.binding.operationId);
+        const op = await this.operation(remote.binding.operationId, remote.binding.jobId);
+        if (op) extras.push(op);
+      }
+    }
+    return extras.length ? [...blocking, ...extras] : blocking;
   }
   private async operation(id: string, jobId: string) {
     return this.tasks.findOperation
@@ -138,13 +165,7 @@ export class ProfileActor {
         this.revoke('BUSINESS_UNRESOLVED');
         return;
       }
-      if (
-        !op ||
-        !(
-          ['VERIFIED', 'FAILED'].includes(op.status) ||
-          (op.status === 'CANCELLED' && op.action.kind === 'browseScroll')
-        )
-      ) {
+      if (!op || !(['VERIFIED', 'FAILED'].includes(op.status) || op.status === 'CANCELLED')) {
         this.revoke('BUSINESS_RESULT_REQUIRED');
         return;
       }
@@ -160,19 +181,31 @@ export class ProfileActor {
     this.phase = 'OBSERVING';
     this.issues = [];
     try {
-      await this.notifier.flushOne(this.port);
+      await this.notifier.flushOne(this.port, { kind: 'BUSINESS' });
       const inventory = await this.port.inventory();
+      this.lastInventory = inventory;
       const current = await this.current();
       if (revision !== this.revision || !current || !sameExecution(context, current)) {
         if (revision === this.revision) this.revoke('CONTEXT_CHANGED_DURING_OBSERVATION');
         return;
       }
-      const result = evaluateKernelReadiness(
-        this.profileId,
-        inventory,
-        await this.operations(),
-        await this.settlements.list(this.profileId),
-      );
+      let ops: Operation[];
+      let notices: Awaited<ReturnType<SettlementRepository['list']>>;
+      if (this.settlements.listForReconciliation) {
+        const undelivered = await this.settlements.listForReconciliation(this.profileId, []);
+        ops = await this.operations(undelivered, inventory);
+        notices =
+          ops.length > 0
+            ? await this.settlements.listForReconciliation(
+                this.profileId,
+                ops.map((op) => op.id),
+              )
+            : undelivered;
+      } else {
+        notices = await this.settlements.list(this.profileId);
+        ops = await this.operations(notices, inventory);
+      }
+      const result = evaluateKernelReadiness(this.profileId, inventory, ops, notices);
       this.issues = result.issues;
       this.phase = result.ready ? 'READY' : 'BLOCKED';
       this.reason = result.ready ? 'CURRENT_SESSION_RECONCILED' : 'RECONCILIATION_REQUIRED';

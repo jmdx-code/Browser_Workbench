@@ -3,8 +3,12 @@ import {
   contentWindowRect,
   fitTaskWindow,
   taskWindowPositions,
+  displayForRect,
+  normalizeTaskWindowSize,
+  gridCascadeSlotRect,
 } from '../domain/window-layout.js';
 import { sameTabProof } from '../domain/task-tabs.js';
+import { mapAsync } from '../shared/async-collections.js';
 import {
   defaultWindowLayout,
   WindowLayoutCommand,
@@ -12,6 +16,7 @@ import {
   type LayoutScreen,
   type TaskWindow,
   type TaskWindowPort,
+  type Rect,
 } from '../shared/window-layout.js';
 
 // Rectangles are placement hints. Only the live tab proof and task guard authorize moves.
@@ -19,7 +24,11 @@ export class WindowLayoutService {
   private settings: LayoutSettings = defaultWindowLayout;
   private loaded?: Promise<void>;
   private tail: Promise<unknown> = Promise.resolve();
+  private readonly profileLocks = new Map<string, Promise<unknown>>();
   private readonly managed = new Map<string, TaskWindow>();
+  private readonly slotOrder: string[] = [];
+  private uniformSize?: { width: number; height: number; displayId: string };
+  private lastArrangedAt = 0;
   private readonly recoveries = new Map<
     string,
     { positions: TaskWindow['rect'][]; lastMoveAt: number; exhausted: boolean }
@@ -31,6 +40,7 @@ export class WindowLayoutService {
     private readonly loadSettings: () => Promise<LayoutSettings>,
     private readonly saveSettings: (value: LayoutSettings) => Promise<void>,
     private readonly trace?: (data: unknown) => void,
+    private readonly lastFocusedProfileId?: () => string | null,
   ) {}
   isEnabled() {
     return this.settings.enabled;
@@ -45,14 +55,75 @@ export class WindowLayoutService {
     this.tail = operation;
     return operation;
   }
-  private selectedDisplay(settings = this.settings) {
+  private withProfileLock<T>(profileId: string, run: () => Promise<T>): Promise<T> {
+    const prev = this.profileLocks.get(profileId) ?? Promise.resolve();
+    const operation = prev.catch(() => {}).then(run);
+    this.profileLocks.set(profileId, operation);
+    void operation
+      .finally(() => {
+        if (this.profileLocks.get(profileId) === operation) this.profileLocks.delete(profileId);
+      })
+      .catch(() => {});
+    return operation;
+  }
+  private selectedDisplay(settings = this.settings, preferredRect?: Rect) {
     const displays = this.displays();
-    const display =
-      displays.find((d) => d.id === settings.displayId) ??
-      displays.find((d) => d.primary) ??
-      displays[0];
+    const bySetting = settings.displayId
+      ? displays.find((d) => d.id === settings.displayId)
+      : undefined;
+    const byRect = preferredRect ? displayForRect(preferredRect, displays) : undefined;
+    const display = bySetting ?? byRect ?? displays.find((d) => d.primary) ?? displays[0];
     if (!display) throw Error('WINDOW_LAYOUT_DISPLAY_MISSING');
     return reservedLayoutDisplay(display, settings);
+  }
+  private async resolveActiveDisplay(
+    fallbackRect?: Rect,
+    liveWindows?: ReadonlyMap<string, TaskWindow>,
+  ): Promise<{
+    display: LayoutScreen;
+    referenceRect?: Rect;
+  }> {
+    const focusedId = this.lastFocusedProfileId?.() ?? null;
+    let focusedRect: Rect | undefined;
+    if (focusedId) {
+      const fromBatch = liveWindows?.get(focusedId);
+      if (fromBatch) {
+        focusedRect = fromBatch.rect;
+      } else {
+        try {
+          const readFocused = await this.read(focusedId, () => {});
+          this.managed.set(focusedId, readFocused);
+          focusedRect = readFocused.rect;
+        } catch {
+          focusedRect = this.managed.get(focusedId)?.rect;
+        }
+      }
+    }
+    const referenceRect = focusedRect ?? fallbackRect;
+    const displays = this.displays();
+    const byFocusedRect =
+      focusedId && referenceRect ? displayForRect(referenceRect, displays) : undefined;
+    if (byFocusedRect) {
+      return {
+        display: reservedLayoutDisplay(byFocusedRect, {
+          ...this.settings,
+          displayId: byFocusedRect.id,
+          reservedArea:
+            this.settings.displayId === byFocusedRect.id ? this.settings.reservedArea : undefined,
+        }),
+        referenceRect,
+      };
+    }
+    return {
+      display: this.selectedDisplay(this.settings, referenceRect),
+      referenceRect,
+    };
+  }
+  private slotIndexFor(profileId: string): number {
+    const existing = this.slotOrder.indexOf(profileId);
+    if (existing >= 0) return existing;
+    this.slotOrder.push(profileId);
+    return this.slotOrder.length - 1;
   }
   private async read(profileId: string, guard: () => void) {
     guard();
@@ -73,8 +144,6 @@ export class WindowLayoutService {
     guard();
     const after = await this.port.move(profileId, current, rect, true, deadline, focus);
     guard();
-    if (!sameTabProof(after.proof, current.proof) || after.windowId !== current.windowId)
-      throw Error('WINDOW_LAYOUT_MAIN_CHANGED');
     if (!after.contentInsets) throw Error('WINDOW_LAYOUT_CONTENT_BOUNDS_REQUIRED');
     contentWindowRect(after);
     this.managed.set(profileId, after);
@@ -98,8 +167,9 @@ export class WindowLayoutService {
         if (
           previous &&
           (!sameTabProof(previous.proof, current.proof) || previous.windowId !== current.windowId)
-        )
-          throw Error('WINDOW_LAYOUT_MAIN_CHANGED');
+        ) {
+          this.recoveries.delete(profileId);
+        }
         this.managed.set(profileId, current);
         const display = this.selectedDisplay();
         const rect = fitTaskWindow(current.rect, display);
@@ -188,15 +258,93 @@ export class WindowLayoutService {
           this.recoveries.clear();
         } else if (request.action === 'apply') {
           if (!request.profileIds) throw Error('WINDOW_LAYOUT_SELECTION_REQUIRED');
-          for (const id of request.profileIds) {
-            const current = await this.read(id, () => {});
-            const display = this.selectedDisplay();
-            const rect = fitTaskWindow(current.rect, display);
-            const peers = [...this.managed].filter(([other]) => other !== id).map(([, w]) => w);
-            const candidate =
-              taskWindowPositions(rect, peers, display, this.settings.step)[0] ?? rect;
-            await this.move(id, current, candidate, () => {});
-            this.recoveries.delete(id);
+          if (this.lastFocusedProfileId) {
+            const settled = await Promise.allSettled(
+              request.profileIds.map(async (id) => ({
+                id,
+                current: await this.read(id, () => {}),
+              })),
+            );
+            const inspected: { id: string; current: TaskWindow }[] = [];
+            let firstError: unknown;
+            for (const item of settled) {
+              if (item.status === 'fulfilled') inspected.push(item.value);
+              else if (firstError === undefined) firstError = item.reason;
+            }
+            if (inspected.length === 0) {
+              throw firstError instanceof Error
+                ? firstError
+                : Error(firstError ? String(firstError) : 'WINDOW_LAYOUT_PROFILE_OFFLINE');
+            }
+            const displays = this.displays();
+            let movedToAnotherDisplayRect: Rect | undefined;
+            if (this.lastArrangedAt > 0 || this.managed.size > 0) {
+              for (const { id, current } of inspected) {
+                const prev = this.managed.get(id);
+                if (prev) {
+                  const prevDisp = displayForRect(prev.rect, displays);
+                  const currDisp = displayForRect(current.rect, displays);
+                  if (prevDisp && currDisp && prevDisp.id !== currDisp.id) {
+                    movedToAnotherDisplayRect = current.rect;
+                  }
+                }
+              }
+            }
+            const liveMap = new Map<string, TaskWindow>();
+            for (const { id, current } of inspected) {
+              this.managed.set(id, current);
+              liveMap.set(id, current);
+            }
+            this.slotOrder.splice(0, this.slotOrder.length, ...inspected.map((x) => x.id));
+            const firstRect = inspected[0]?.current.rect;
+            const resolved = await this.resolveActiveDisplay(firstRect, liveMap);
+            const anchorRect = movedToAnotherDisplayRect ?? resolved.referenceRect ?? firstRect;
+            const rawTargetDisplay =
+              (anchorRect ? displayForRect(anchorRect, displays) : undefined) ?? resolved.display;
+            if (this.settings.displayId !== rawTargetDisplay.id) {
+              this.settings = {
+                ...this.settings,
+                displayId: rawTargetDisplay.id,
+                reservedArea: undefined,
+              };
+              await this.saveSettings(this.settings);
+            }
+            const targetDisplay = reservedLayoutDisplay(rawTargetDisplay, this.settings);
+            const uniformSize = normalizeTaskWindowSize(targetDisplay, anchorRect ?? firstRect);
+            this.uniformSize = {
+              ...uniformSize,
+              displayId: targetDisplay.id,
+            };
+            this.lastArrangedAt = Date.now();
+            await mapAsync(
+              inspected,
+              async ({ id, current }, index) => {
+                const candidate = gridCascadeSlotRect(
+                  index,
+                  uniformSize,
+                  targetDisplay,
+                  this.settings.step,
+                );
+                try {
+                  await this.move(id, current, candidate, () => {}, undefined, false);
+                  this.recoveries.delete(id);
+                } catch {
+                  // Ignore single-window failure so remaining online windows complete placement.
+                }
+              },
+              8,
+            );
+          } else {
+            for (const id of request.profileIds) {
+              const current = await this.read(id, () => {});
+              const display = this.selectedDisplay();
+              const rect = fitTaskWindow(current.rect, display);
+              const peers = [...this.managed].filter(([other]) => other !== id).map(([, w]) => w);
+              const candidate =
+                taskWindowPositions(rect, peers, display, this.settings.step)[0] ?? rect;
+              await this.move(id, current, candidate, () => {});
+              this.recoveries.delete(id);
+            }
           }
         } else {
           // Keep the existing wire action; disable without restoring historical positions.
@@ -204,6 +352,8 @@ export class WindowLayoutService {
           await this.saveSettings(disabled);
           this.settings = disabled;
           this.managed.clear();
+          this.slotOrder.length = 0;
+          this.uniformSize = undefined;
           this.recoveries.clear();
         }
       } catch (error) {
@@ -214,19 +364,36 @@ export class WindowLayoutService {
     });
   }
   async arrange(profileId: string, guard: () => void = () => {}) {
-    return this.serial(async () => {
+    return this.withProfileLock(profileId, async () => {
       await this.load();
       guard();
       if (!this.settings.enabled) return;
       const current = await this.read(profileId, guard);
-      await this.move(
-        profileId,
-        current,
-        fitTaskWindow(current.rect, this.selectedDisplay()),
-        guard,
-        undefined,
-        false,
-      );
+      if (this.lastFocusedProfileId) {
+        const { display, referenceRect } = await this.resolveActiveDisplay(current.rect);
+        guard();
+        if (!this.uniformSize || this.uniformSize.displayId !== display.id) {
+          const size = normalizeTaskWindowSize(display, referenceRect ?? current.rect);
+          this.uniformSize = { ...size, displayId: display.id };
+        }
+        const slotIndex = this.slotIndexFor(profileId);
+        const targetRect = gridCascadeSlotRect(
+          slotIndex,
+          this.uniformSize,
+          display,
+          this.settings.step,
+        );
+        await this.move(profileId, current, targetRect, guard, undefined, false);
+      } else {
+        await this.move(
+          profileId,
+          current,
+          fitTaskWindow(current.rect, this.selectedDisplay()),
+          guard,
+          undefined,
+          false,
+        );
+      }
       this.recoveries.delete(profileId);
       this.error = '';
     });

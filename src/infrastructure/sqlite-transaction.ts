@@ -10,6 +10,7 @@ export function beforeCommit(db: DatabaseSync, hook: () => void) {
 interface ConnectionTransactionState {
   writeDepth: number;
   readDepth: number;
+  ownedReadSnapshot: boolean;
 }
 
 const connectionStates = new WeakMap<DatabaseSync, ConnectionTransactionState>();
@@ -17,10 +18,16 @@ const connectionStates = new WeakMap<DatabaseSync, ConnectionTransactionState>()
 function getState(db: DatabaseSync): ConnectionTransactionState {
   let state = connectionStates.get(db);
   if (!state) {
-    state = { writeDepth: 0, readDepth: 0 };
+    state = { writeDepth: 0, readDepth: 0, ownedReadSnapshot: false };
     connectionStates.set(db, state);
   }
   return state;
+}
+
+export function isUncommittedTransaction(db: DatabaseSync): boolean {
+  if (!db.isTransaction) return false;
+  const state = connectionStates.get(db);
+  return !(state?.ownedReadSnapshot === true && state.writeDepth === 0);
 }
 
 function isThenable(value: unknown): boolean {
@@ -143,6 +150,7 @@ function performReadSnapshot<T>(
   }
   db.exec('BEGIN');
   state.readDepth++;
+  state.ownedReadSnapshot = true;
   try {
     const result = work();
     if (isThenable(result)) {
@@ -155,5 +163,6 @@ function performReadSnapshot<T>(
     throw error;
   } finally {
     state.readDepth--;
+    if (state.readDepth === 0) state.ownedReadSnapshot = false;
   }
 }

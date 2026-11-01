@@ -303,6 +303,7 @@ test('service rejects unknown profiles before moving and isolates partial stop f
       id,
       alias: id,
       groupId: null,
+      order: 0,
       online: true,
       phase: 'PAUSED',
       synced: true,

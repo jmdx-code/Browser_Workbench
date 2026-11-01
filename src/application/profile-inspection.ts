@@ -54,7 +54,8 @@ function failureReason(error: unknown): InspectionReasonCode {
       'KERNEL_LEASE_REJECTED',
       'KERNEL_FENCED',
       'KERNEL_LEASE_RENEW_FAILED',
-    ].includes(message)
+    ].includes(message) ||
+    message.startsWith('KERNEL_LEASE_REJECTED:')
   )
     return 'INSPECTION_CONNECTION_CHANGED';
   if (['KERNEL_RPC_RESULT_UNKNOWN', 'KERNEL_RPC_SEND_UNKNOWN'].includes(message))
@@ -350,6 +351,31 @@ export class ProfileInspectionService {
       this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 120000);
     } catch (error) {
       if (this.entries.get(entry.connection.profileId) !== entry || entry.cancelled) return;
+      const msg = error instanceof Error ? error.message : '';
+      const abnormalState: 'verification' | 'restricted' | 'logged-out' | null =
+        msg === 'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED'
+          ? 'verification'
+          : msg === 'FACEBOOK_ACCOUNT_RESTRICTED'
+            ? 'restricted'
+            : msg === 'FACEBOOK_ACCOUNT_LOGGED_OUT'
+              ? 'logged-out'
+              : null;
+      if (abnormalState) {
+        const account = { state: abnormalState, id: null, name: null, avatar: null };
+        entry.display = { name: null, avatar: null };
+        entry.row = ProfileInspection.parse({
+          profileId: entry.connection.profileId,
+          state: 'OBSERVED',
+          reason: abnormalState === 'verification' ? 'CHECKPOINT_ROUTE' : 'VISIBLE_LOGIN_FORM',
+          checkedAt: this.now(),
+          account,
+          avatarObservation: null,
+          nameObservation: null,
+        });
+        this.onObserved?.(entry.connection.profileId, account);
+        this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 120000);
+        return;
+      }
       entry.row = {
         ...entry.row,
         state: 'FAILED',

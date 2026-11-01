@@ -6,12 +6,16 @@ import type { Spec } from '../shared/browser-actions.js';
 type Target = z.infer<typeof Spec>;
 
 // Read-only DOM probe. It never scrolls, changes focus, synthesizes DOM events or mutates visibility.
-export function projectNativeClickTarget(input: { target: Target; url: string }) {
+export function projectNativeClickTarget(input: {
+  target: Target;
+  url: string;
+  allowHidden?: boolean;
+}) {
   if (
     location.origin !== 'https://www.facebook.com' ||
     location.href !== input.url ||
     document.readyState === 'loading' ||
-    document.visibilityState !== 'visible'
+    (document.visibilityState !== 'visible' && !input.allowHidden)
   )
     return null;
   const roots = input.target.scope
@@ -72,6 +76,7 @@ export async function clickFacebookNativeTarget(
     wait?: () => Promise<void>;
     attempts?: number;
     scrollFallback?: () => Promise<void>;
+    allowHidden?: boolean;
   } = {},
 ) {
   const wait = options.wait ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
@@ -79,7 +84,11 @@ export async function clickFacebookNativeTarget(
   let previous: Awaited<ReturnType<typeof projectNativeClickTarget>> = null;
   for (let index = 0; index < attempts; index++) {
     await guard();
-    const point = await page.evaluate(projectNativeClickTarget, { target, url });
+    const point = await page.evaluate(projectNativeClickTarget, {
+      target,
+      url,
+      ...(options.allowHidden ? { allowHidden: true } : {}),
+    });
     await guard();
     if (!point) throw Error('FACEBOOK_NATIVE_CLICK_TARGET_UNAVAILABLE');
     if (point.needsScroll) {

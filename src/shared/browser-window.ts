@@ -25,7 +25,7 @@ export const CleanupProfileTabsResult = z
 export const ConsolidateBrowserResult = z
   .object({
     profileId: z.uuid(),
-    proof: OwnedTabProof,
+    proof: OwnedTabProof.optional(),
     url: z.string(),
     closedTabIds: z.array(z.number().int().positive()),
     remainingTabCount: z.number().int().positive(),

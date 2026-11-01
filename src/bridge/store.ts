@@ -55,6 +55,9 @@ export class Store {
       this.db.exec(
         'CREATE INDEX IF NOT EXISTS operations_profile_status ON operations(profileId,status)',
       );
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS operations_updated_at ON operations(updatedAt DESC)',
+      );
       this.db.exec('PRAGMA user_version=2; COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -280,12 +283,16 @@ export class Store {
   }
   profileList() {
     return this.db
-      .prepare('SELECT profileId,alias,extensionId,facebookAllowed FROM profiles')
+      .prepare(
+        "SELECT profileId,alias,extensionId,facebookAllowed,(SELECT COUNT(*) FROM operations o WHERE o.profileId=profiles.profileId AND o.status IN ('UNKNOWN','ACKNOWLEDGED')) AS unresolvedCount FROM profiles",
+      )
       .all();
   }
   profileSummary(profileId: string) {
     return this.db
-      .prepare('SELECT profileId,alias,extensionId,facebookAllowed FROM profiles WHERE profileId=?')
+      .prepare(
+        "SELECT profileId,alias,extensionId,facebookAllowed,(SELECT COUNT(*) FROM operations o WHERE o.profileId=profiles.profileId AND o.status IN ('UNKNOWN','ACKNOWLEDGED')) AS unresolvedCount FROM profiles WHERE profileId=?",
+      )
       .get(profileId);
   }
   replaceConnectionSecret(profileId: string, extensionId: string, expected: string, next: string) {

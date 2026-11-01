@@ -8,6 +8,7 @@ export interface DesktopBridge {
   chooseMaterialDirectory(): Promise<string | null>;
   chooseBackupDirectory(): Promise<string | null>;
   chooseRestoreBackup(): Promise<string | null>;
+  chooseFeedbackDirectory?(): Promise<string | null>;
   restartSoftware(): Promise<void>;
   materialFilePath(file: File): string;
   revealLocalFile(source: string): Promise<z.infer<typeof FileLocationResult>>;

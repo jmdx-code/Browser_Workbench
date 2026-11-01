@@ -469,3 +469,47 @@ test('story stream rejects incomplete, cross-key, duplicate, errored or conflict
     }
   }
 });
+
+test('WO48-6: irrelevant data-sjs scripts skip JSON.parse while escaped preloaders and conflicts keep original verdicts', () => {
+  const f = documentFixture();
+  const doc = globalThis.document as unknown as {
+    querySelectorAll: () => { textContent: string }[];
+  };
+  const [valid] = doc.querySelectorAll();
+  assert.ok(valid);
+  const irrelevant = '{"require":[["Bootloader","handle",null,[{"unterminated":';
+  const parse = JSON.parse;
+  let irrelevantParses = 0;
+  JSON.parse = function (text: string, reviver?: Parameters<typeof JSON.parse>[1]) {
+    if (text === irrelevant) irrelevantParses++;
+    return parse.call(JSON, text, reviver) as unknown;
+  } as typeof JSON.parse;
+  try {
+    doc.querySelectorAll = () => [{ textContent: irrelevant }, valid];
+    assert.equal(projectFacebookDocumentIdentity().actor?.accountId, sample.request.av);
+    assert.equal(irrelevantParses, 0);
+    // Escaped preloader names have no literal prefix and must still be parsed.
+    const escaped = valid.textContent
+      .replaceAll(
+        'CometSettingsDropdownTriggerQueryRelayPreloader_',
+        '\\u0043ometSettingsDropdownTriggerQueryRelayPreloader_',
+      )
+      .replaceAll(
+        'CometFeedInlineComposerQueryRelayPreloader_',
+        '\\u0043ometFeedInlineComposerQueryRelayPreloader_',
+      );
+    assert.equal(escaped.includes('CometSettingsDropdownTriggerQueryRelayPreloader_'), false);
+    doc.querySelectorAll = () => [{ textContent: escaped }];
+    assert.equal(projectFacebookDocumentIdentity().actor?.accountId, sample.request.av);
+    // A conflicting actor in another script still aborts identity.
+    const conflicting = valid.textContent.replaceAll(sample.request.av, '100000000000001');
+    doc.querySelectorAll = () => [valid, { textContent: conflicting }];
+    assert.equal(projectFacebookDocumentIdentity().actor, null);
+    // Removing every preloader record leaves no identity.
+    doc.querySelectorAll = () => [{ textContent: irrelevant }, { textContent: '{"require":[]}' }];
+    assert.equal(projectFacebookDocumentIdentity().actor, null);
+  } finally {
+    JSON.parse = parse;
+    f.close();
+  }
+});

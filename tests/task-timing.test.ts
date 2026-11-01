@@ -100,7 +100,7 @@ test('50 scheduled plans pin original combination, release once as a batch and c
       db.close();
     }
   }));
-test('restart retains future unstarted schedules but pauses released work and missed time; no original operation is replayed', async () =>
+test('restart retains future unstarted schedules but ends released work and missed time; no original operation is replayed', async () =>
   settlementFixture(async (store, file) => {
     const db = new DatabaseSync(file);
     let now = 10000;
@@ -143,7 +143,7 @@ test('restart retains future unstarted schedules but pauses released work and mi
       now = 20000;
       tasks.releaseScheduled();
       tasks.recoverOnStartup();
-      assert.equal(tasks.get(plan.id).state, 'PAUSED');
+      assert.equal(tasks.get(plan.id).state, 'STOPPED');
       assert.equal(tasks.operations(plan.id).length, 0);
       assert.equal(tasks.claimNext([profile], new Set(['feed'])), null);
       const restoredProfile = {
@@ -163,7 +163,7 @@ test('restart retains future unstarted schedules but pauses released work and mi
       );
       assert.ok(restored);
       tasks.recoverOnStartup(false);
-      assert.equal(tasks.get(restored.id).state, 'PAUSED');
+      assert.equal(tasks.get(restored.id).state, 'STOPPED');
       assert.equal(tasks.operations(restored.id).length, 0);
       const missedProfile = {
         ...profile,

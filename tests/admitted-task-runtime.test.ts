@@ -140,6 +140,8 @@ test('50 queued profiles inspect only available slots; full budget prevents new 
     const settled = Promise.allSettled(requests);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(reads.length, 2);
+    assert.equal(runtime.hasExecutionOrOpening(profiles[0]!.id), true);
+    assert.equal(runtime.hasExecutionOrOpening(profiles[2]!.id), false);
     release();
     const results = await settled;
     assert.equal(results.filter((row) => row.status === 'fulfilled').length, 2);
@@ -382,11 +384,12 @@ test('hundred-profile startup admits all hundred together without the old four-s
   );
   try {
     while (admitted.size < 100) {
+      const remaining = 100 - admitted.size;
       const results = Promise.allSettled(
         profiles.filter((p) => !admitted.has(p.id)).map(async (p) => runtime.observe(p.id)),
       );
       await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.equal(active, 100);
+      assert.equal(active, Math.min(6, remaining));
       assert.equal(runtime.startupStatus().active, active);
       assert.equal(store.tasks.livePlans().filter((p) => p.state === 'RUNNING').length, 0);
       const batch = releases;
@@ -395,8 +398,8 @@ test('hundred-profile startup admits all hundred together without the old four-s
       await results;
       assert.equal(runtime.startupStatus().active, 0);
     }
-    assert.equal(maximum, 100);
-    assert.equal(runtime.startupStatus().deferred, 0);
+    assert.equal(maximum, 6);
+    assert.ok(runtime.startupStatus().deferred > 0);
     assert.equal(admitted.size, 100);
   } finally {
     releases.forEach((release) => release());

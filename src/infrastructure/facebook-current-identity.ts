@@ -2,6 +2,7 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
+import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
 import { projectFacebookDocumentIdentity } from '../shared/facebook-document-identity.js';
 import { projectPage } from '../shared/page-projection.js';
 import { PageReadRequest, validateProjection } from '../shared/page-read.js';
@@ -36,6 +37,10 @@ export async function readCurrentFacebookIdentity(
 ) {
   await assertCurrent();
   const parseFence = (input: unknown) => {
+    if (input && typeof input === 'object' && 'url' in input && typeof input.url === 'string') {
+      const abnormalUrl = classifyFacebookAbnormalUrl(input.url);
+      if (abnormalUrl) throw Error(abnormalUrl);
+    }
     const result = DocumentFence.safeParse(input);
     if (!result.success)
       throw Error(
@@ -53,6 +58,14 @@ export async function readCurrentFacebookIdentity(
       selected: z.unknown(),
       creator: z.unknown(),
       after: z.unknown(),
+      abnormal: z
+        .enum([
+          'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED',
+          'FACEBOOK_ACCOUNT_RESTRICTED',
+          'FACEBOOK_ACCOUNT_LOGGED_OUT',
+        ])
+        .nullable()
+        .optional(),
     })
     .strict()
     .parse(
@@ -61,7 +74,19 @@ export async function readCurrentFacebookIdentity(
     const before = fence();
     const selected = (${projectFacebookDocumentIdentity.toString()})("post-current");
     const creator = (${projectPage.toString()})(${JSON.stringify(creatorProjection)});
-    return {before, selected, creator, after: fence()};
+    const abnormal = !selected.actor ? (() => {
+      const loginForm = Boolean(
+        document.querySelector('input[name="email"]') &&
+        document.querySelector('input[name="pass"], input[type="password"]'),
+      );
+      if (loginForm) return 'FACEBOOK_ACCOUNT_LOGGED_OUT';
+      const bodyText = (document.body?.innerText || '').slice(0, 4000);
+      if (/account has been disabled|your account is disabled|we suspended your account|账号已被停用|账户已被停用|已停用你的账户/i.test(bodyText)) {
+        return 'FACEBOOK_ACCOUNT_RESTRICTED';
+      }
+      return null;
+    })() : null;
+    return abnormal ? {before, selected, creator, after: fence(), abnormal} : {before, selected, creator, after: fence()};
   })()`),
     );
   await assertCurrent();
@@ -69,6 +94,7 @@ export async function readCurrentFacebookIdentity(
     after = parseFence(observation.after),
     selected = CurrentActor.parse(observation.selected),
     creator = validateProjection(creatorProjection, observation.creator);
+  if (!selected.actor && observation.abnormal) throw Error(observation.abnormal);
   if (
     !selected.actor ||
     before.url !== after.url ||

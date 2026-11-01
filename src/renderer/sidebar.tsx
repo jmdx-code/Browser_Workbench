@@ -1,10 +1,12 @@
-import { profileTaskResultLabel } from '../shared/profile-task-result.js';
+import { insertFinderIds, nudgeFinderIds } from './finder-list-model.js';
+import type { BumperProfileStat } from '../shared/group-bumper.js';
 import { useEffect, useRef, useState } from 'react';
 import type { Profile, Workspace } from '../shared/contracts.js';
 import { selectionState, toggleSet } from './selection.js';
 import { api } from './api.js';
 import { NameDialog } from './name-dialog.js';
 import { ConfirmDialog } from './confirm-dialog.js';
+import { SelectByIdsDialog, buildProfileCandidates } from './select-by-ids-dialog.js';
 import type { Inspection } from '../shared/profile-inspection.js';
 import {
   inspectionPresentation,
@@ -12,14 +14,20 @@ import {
   inspectionDisplayName,
 } from './inspection-presentation.js';
 import { ProfileAvatar, type StatusTone } from './profile-avatar.js';
-import { taskTimingLabel } from '../shared/task-timing.js';
 import { marketplaceBridgeSupported } from '../shared/task-features.js';
 import type { z } from 'zod';
 import type { TaskRuntimeOverview, TaskCommand } from '../shared/task-contracts.js';
 import type { GroupInviterProfileStat } from '../shared/group-inviter.js';
 import { TaskProgressView } from './task-progress.js';
-import { taskReasonDescription } from '../shared/task-issues.js';
 import { PopoverMenu, type MenuItem } from './popover-menu.js';
+import type {
+  ProfileActivityDescriptor,
+  SelectionControlSummary,
+} from './modules/module-contracts.js';
+import {
+  projectProfileActivitiesMap,
+  projectSelectionControls,
+} from './modules/profile-activity-projector.js';
 import {
   IconChevronDown,
   IconClose,
@@ -68,13 +76,6 @@ const phaseNames: Record<string, string> = {
   STARTING: '恢复中',
   RECOVERING: '需要核对',
 };
-const taskNames = {
-  feed: '浏览首页',
-  video: '浏览 Reels',
-  post: '发布内容',
-  marketplace: '浏览商城',
-  friends: '接受好友请求',
-};
 const toneNames: Record<StatusTone, string> = {
   idle: '离线',
   ok: '已连接',
@@ -98,7 +99,12 @@ export function Sidebar({
   onShow,
   tasks,
   onTaskCommand,
+  activities,
+  selectionControls,
+  onStopModules,
   groupInviterCounts,
+  bumperCounts,
+  bumperRunningIds,
   groupInviterRunningIds,
   onStopGroupInviterProfiles,
 }: {
@@ -117,6 +123,11 @@ export function Sidebar({
   onShow?: (id: string) => void;
   tasks?: z.infer<typeof TaskRuntimeOverview> | null;
   onTaskCommand?: (command: TaskCommand['command'], plans: TaskCommand['plans']) => void;
+  activities?: ReadonlyMap<string, ProfileActivityDescriptor>;
+  selectionControls?: SelectionControlSummary;
+  onStopModules?: (profileIds: string[]) => void;
+  bumperCounts?: Record<string, BumperProfileStat>;
+  bumperRunningIds?: string[];
   groupInviterCounts?: Record<string, GroupInviterProfileStat> | null;
   groupInviterRunningIds?: string[];
   onStopGroupInviterProfiles?: (profileIds: string[]) => void;
@@ -133,7 +144,15 @@ export function Sidebar({
     label: string;
   } | null>(null);
   const rangeAnchor = useRef<string | null>(null);
-  const matched = workspace.profiles.filter(
+  const draggingProfiles = useRef<string[]>([]);
+  const [dropProfile, setDropProfile] = useState('');
+  const [createAndMove, setCreateAndMove] = useState(false);
+  const [selectByIdsOpen, setSelectByIdsOpen] = useState(false);
+  const [arrangingWindows, setArrangingWindows] = useState(false);
+  const sortedProfiles = [...workspace.profiles].sort(
+    (a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id),
+  );
+  const matched = sortedProfiles.filter(
     (profile) =>
       (
         profile.alias +
@@ -156,19 +175,19 @@ export function Sidebar({
   );
   const matchedIds = matched.map((profile) => profile.id);
   const matchedState = selectionState(selected, matchedIds);
-  const selectedPlans = tasks?.plans.filter((plan) => selected.has(plan.profileId)) ?? [];
-  const pausable = selectedPlans.filter((plan) => ['RUNNING', 'QUEUED'].includes(plan.state));
-  const resumable = selectedPlans.filter((plan) => plan.state === 'PAUSED');
-  const stoppable = selectedPlans.filter(
-    (plan) => !['COMPLETED', 'FAILED', 'STOPPED'].includes(plan.state),
-  );
-  const stoppableInviterIds = (groupInviterRunningIds ?? []).filter((id) => selected.has(id));
-  const totalStoppableCount = new Set([
-    ...stoppable.map((plan) => plan.profileId),
-    ...stoppableInviterIds,
-  ]).size;
+  const projectionInput = {
+    tasks,
+    bumperCounts,
+    bumperRunningIds,
+    groupInviterCounts,
+    groupInviterRunningIds,
+  };
+  const resolvedActivities =
+    activities ?? projectProfileActivitiesMap(workspace.profiles, projectionInput);
+  const resolvedControls = selectionControls ?? projectSelectionControls(selected, projectionInput);
+  const stopModulesHandler = onStopModules ?? onStopGroupInviterProfiles;
   const visibleGroups = [
-    ...workspace.groups,
+    ...[...workspace.groups].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
     { id: 'ungrouped', name: '未分组', color: 'gray', order: -1 },
   ];
   const visibleIds = visibleGroups.flatMap((group) =>
@@ -189,31 +208,30 @@ export function Sidebar({
     onSelect(toggleSet(selected, ids, checked));
     rangeAnchor.current = id;
   }
-  const targets = (plans: typeof selectedPlans) =>
-    plans.map((plan) => ({
-      profileId: plan.profileId,
-      planId: plan.id,
-      expectedState: plan.state,
-      expectedUpdatedAt: plan.updatedAt,
-    }));
-  function stopBrowsers() {
-    void mutate(async () => {
-      const { results } = await api.stop([...selected]);
-      const sent = results.filter((row) => row.requested).length;
-      const failed = results.filter((row) => !row.requested);
-      const reasons = [
-        ...new Set(failed.map((row) => (row.reason === 'OFFLINE' ? '离线' : row.reason))),
-      ];
-      return (
-        '停止请求已发送 ' +
-        sent +
-        ' 份；' +
-        failed.length +
-        ' 份未发送' +
-        (reasons.length ? '（' + reasons.join('、') + '）' : '') +
-        '。实际停止状态见资料列表。'
-      );
-    });
+  function moveProfilesTo(
+    groupId: string | null,
+    ids = [...selected],
+    target?: string,
+    after = false,
+  ) {
+    const old = sortedProfiles.filter((p) => p.groupId === groupId).map((p) => p.id);
+    return mutate(() => api.reorderProfiles(groupId, insertFinderIds(old, ids, target, after)));
+  }
+  async function nudgeProfiles(direction: -1 | 1) {
+    for (const group of visibleGroups) {
+      const id = group.id === 'ungrouped' ? null : group.id;
+      const ids = sortedProfiles.filter((p) => p.groupId === id).map((p) => p.id);
+      if (ids.some((key) => selected.has(key)))
+        await mutate(() => api.reorderProfiles(id, nudgeFinderIds(ids, selected, direction)));
+    }
+  }
+  function nudgeGroup(id: string, direction: -1 | 1) {
+    const ids = workspace.groups.map((g) => g.id),
+      at = ids.indexOf(id),
+      to = at + direction;
+    if (to < 0 || to >= ids.length) return;
+    [ids[at], ids[to]] = [ids[to] ?? '', ids[at] ?? ''];
+    void mutate(() => api.reorderGroups(ids));
   }
   function row(profile: Profile) {
     const displayName = profile.browserName ?? profile.alias;
@@ -221,9 +239,7 @@ export function Sidebar({
       (value) =>
         value.profileId === profile.id && !['STOPPED', 'COMPLETED', 'FAILED'].includes(value.state),
     );
-    const lastResult = tasks?.profileResults?.find((value) => value.profileId === profile.id);
-    const lastStatus = lastResult ? profileTaskResultLabel(lastResult) : undefined;
-    const step = tasks?.currentSteps.find((value) => value.jobId === plan?.id);
+    const activity = resolvedActivities.get(profile.id) ?? null;
     const inspection = inspections.find((item) => item.profileId === profile.id);
     const inspectionText = inspectionPresentation(profile, inspection, inspectionAvailable).title;
     const observedName = inspectionDisplayName(profile, inspection, inspectionAvailable);
@@ -231,7 +247,8 @@ export function Sidebar({
     const fbId = account.id ?? profile.account.id;
     const extensionOutdated =
       profile.online && !marketplaceBridgeSupported(profile.extensionVersion, '0.3.21');
-    const inviterActive = groupInviterRunningIds?.includes(profile.id) === true;
+    const isRunningAny = Boolean(activity?.running);
+    const isBusyAny = resolvedControls.isProfileBusy(profile.id);
     // Priority: offline > account problem > needs attention > running > connected.
     // An unknown account state is never shown as a problem.
     const tone: StatusTone = !profile.online
@@ -243,83 +260,31 @@ export function Sidebar({
             profile.phase === 'RECOVERING' ||
             (plan && ['PAUSED', 'PAUSING', 'STOPPING', 'REVIEW'].includes(plan.state))
           ? 'warn'
-          : (plan && ['RUNNING', 'QUEUED'].includes(plan.state)) || inviterActive
+          : isRunningAny
             ? 'run'
             : 'ok';
-    const taskTone =
-      plan?.state === 'RUNNING'
-        ? 'run'
-        : plan?.state === 'QUEUED'
-          ? 'queue'
-          : plan?.state === 'REVIEW'
-            ? 'warn'
-            : 'pause';
-    const reasonSummary = plan?.reason ? taskReasonDescription(plan.reason)?.summary : undefined;
-    const activeStepSpec =
-      plan && step ? plan.snapshot.steps.find((item) => item.id === step.id) : undefined;
-    const stepIndexPrefix =
-      plan && plan.snapshot.steps.length > 1
-        ? `[${plan.position + 1}/${plan.snapshot.steps.length}] `
-        : '';
-    const stepLabel = !plan
-      ? ''
-      : plan.state === 'QUEUED'
-        ? plan.timing
-          ? taskTimingLabel(plan.timing)
-          : reasonSummary
-            ? '排队中 · ' + reasonSummary
-            : '排队中'
-        : plan.state === 'REVIEW'
-          ? '待核对'
-          : plan.state === 'PAUSED'
-            ? reasonSummary && !/^(USER_|MANUAL_)/.test(plan.reason)
-              ? '已暂停 · ' + reasonSummary
-              : '已暂停'
-            : plan.state === 'PAUSING'
-              ? '正在暂停'
-              : plan.state === 'STOPPING'
-                ? '正在停止'
-                : step
-                  ? stepIndexPrefix +
-                    (step.destination === 'story' ? '发布快拍' : taskNames[step.type]) +
-                    ' · 执行中'
-                  : '运行中';
     const tooltip = [
       displayName + (observedName ? ' · ' + observedName : ''),
       '连接：' + (phaseNames[profile.phase] ?? profile.phase),
       'FB 状态：' + inspectionText,
-      ...(!plan && lastResult && lastStatus
-        ? [
-            lastStatus.text,
-            '结束：' + new Date(lastResult.finishedAt).toLocaleString(),
-            ...(lastResult.reason
-              ? [taskReasonDescription(lastResult.reason)?.summary ?? lastResult.reason]
-              : []),
-          ]
-        : []),
       ...(profile.unresolved ? [profile.unresolved + ' 项待核对'] : []),
       ...(extensionOutdated
         ? ['插件 ' + (profile.extensionVersion ?? '未知') + '，测试需刷新至 0.3.21']
         : []),
-      ...(plan
-        ? [
-            '任务：' +
-              plan.snapshot.name +
-              ' · 第' +
-              plan.round +
-              '轮' +
-              (plan.snapshot.loop.mode === 'finite'
-                ? '/' + plan.snapshot.loop.rounds
-                : '（循环）') +
-              ' · 第' +
-              (plan.position + 1) +
-              '/' +
-              plan.snapshot.steps.length +
-              '项',
-            ...(plan.reason ? [taskReasonDescription(plan.reason)?.summary ?? plan.reason] : []),
-          ]
-        : []),
+      ...(activity?.tooltipLines ?? []),
     ].join('\n');
+    const singleTarget = plan
+      ? [
+          {
+            profileId: plan.profileId,
+            planId: plan.id,
+            expectedState: plan.state,
+            expectedUpdatedAt: plan.updatedAt,
+          },
+        ]
+      : [];
+    const hasStoppableModule =
+      activity?.running === true && activity.moduleId !== 'active-accounts';
     const rowItems: MenuItem[] = [
       {
         label: '显示浏览器窗口',
@@ -337,11 +302,7 @@ export function Sidebar({
       {
         label: '清理其他标签页',
         icon: <IconClose />,
-        disabled:
-          !profile.online ||
-          busy ||
-          !!(plan && !['COMPLETED', 'FAILED', 'STOPPED', 'PAUSED'].includes(plan.state)) ||
-          inviterActive,
+        disabled: !profile.online || busy,
         onSelect: () =>
           void mutate(async () => {
             const res = await api.cleanupProfileTabs([profile.id]);
@@ -357,7 +318,7 @@ export function Sidebar({
               label: '暂停任务',
               icon: <IconPause />,
               disabled: busy,
-              onSelect: () => onTaskCommand('pause', targets([plan])),
+              onSelect: () => onTaskCommand('pause', singleTarget),
             },
           ]
         : []),
@@ -368,12 +329,12 @@ export function Sidebar({
               label: '继续任务',
               icon: <IconPlay />,
               disabled: busy,
-              onSelect: () => onTaskCommand('resume', targets([plan])),
+              onSelect: () => onTaskCommand('resume', singleTarget),
             },
           ]
         : []),
       ...((plan && !['COMPLETED', 'FAILED', 'STOPPED'].includes(plan.state) && onTaskCommand) ||
-      (inviterActive && onStopGroupInviterProfiles)
+      (hasStoppableModule && stopModulesHandler)
         ? [
             ...(plan && ['RUNNING', 'QUEUED', 'PAUSED'].includes(plan.state)
               ? []
@@ -389,10 +350,10 @@ export function Sidebar({
                   !['COMPLETED', 'FAILED', 'STOPPED'].includes(plan.state) &&
                   onTaskCommand
                 ) {
-                  onTaskCommand('stop', targets([plan]));
+                  onTaskCommand('stop', singleTarget);
                 }
-                if (inviterActive && onStopGroupInviterProfiles) {
-                  onStopGroupInviterProfiles([profile.id]);
+                if (hasStoppableModule && stopModulesHandler) {
+                  stopModulesHandler([profile.id]);
                 }
               },
             },
@@ -403,9 +364,8 @@ export function Sidebar({
         label: '删除浏览器',
         icon: <IconClose />,
         danger: true,
-        disabled: busy || !!plan || inviterActive,
-        title:
-          plan || inviterActive ? '请先停止该浏览器的运行任务后再删除' : '从列表中移除该浏览器资料',
+        disabled: busy || isBusyAny,
+        title: isBusyAny ? '请先停止该浏览器的运行任务后再删除' : '从列表中移除该浏览器资料',
         onSelect: () =>
           setDeletingProfiles({
             ids: [profile.id],
@@ -419,9 +379,65 @@ export function Sidebar({
         className={
           'profile-row' +
           (selected.has(profile.id) ? ' selected' : '') +
-          (filteredId === profile.id ? ' is-filtered' : '')
+          (filteredId === profile.id ? ' is-filtered' : '') +
+          (dropProfile === 'b:' + profile.id
+            ? ' drop-before'
+            : dropProfile === 'a:' + profile.id
+              ? ' drop-after'
+              : '')
         }
         key={profile.id}
+        draggable={!busy}
+        onClick={(e) => {
+          if (e.target instanceof Element && e.target.closest('button,input')) return;
+          if (e.shiftKey || e.ctrlKey || e.metaKey)
+            selectProfile(profile.id, !selected.has(profile.id), e.shiftKey);
+        }}
+        onDragStart={(e) => {
+          draggingProfiles.current = selected.has(profile.id)
+            ? sortedProfiles.filter((p) => selected.has(p.id)).map((p) => p.id)
+            : [profile.id];
+          e.dataTransfer.setData('text/plain', JSON.stringify(draggingProfiles.current));
+          e.dataTransfer.effectAllowed = 'move';
+          const ghost = document.createElement('div');
+          ghost.className = 'finder-drag-ghost';
+          ghost.textContent = '移动 ' + draggingProfiles.current.length + ' 个浏览器';
+          document.body.append(ghost);
+          e.dataTransfer.setDragImage(ghost, 0, 0);
+          setTimeout(() => ghost.remove(), 0);
+        }}
+        onDragEnd={() => {
+          draggingProfiles.current = [];
+          setDropProfile('');
+        }}
+        onDragOver={(e) => {
+          if (!busy && draggingProfiles.current.length) {
+            e.preventDefault();
+            setDropProfile(
+              (e.clientY <
+              e.currentTarget.getBoundingClientRect().top + e.currentTarget.offsetHeight / 2
+                ? 'b:'
+                : 'a:') + profile.id,
+            );
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropProfile('');
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          if (busy || draggingProfiles.current.includes(profile.id)) return;
+          void moveProfilesTo(
+            profile.groupId,
+            draggingProfiles.current,
+            profile.id,
+            e.clientY >=
+              e.currentTarget.getBoundingClientRect().top +
+                e.currentTarget.getBoundingClientRect().height / 2,
+          );
+          draggingProfiles.current = [];
+          setDropProfile('');
+        }}
       >
         <input
           aria-label={'选择 ' + displayName}
@@ -447,7 +463,7 @@ export function Sidebar({
           title={tooltip}
           aria-pressed={nameAction === 'filter' ? filteredId === profile.id : undefined}
           onClick={(event) =>
-            nameAction === 'filter'
+            nameAction === 'filter' && !event.shiftKey && !event.ctrlKey && !event.metaKey
               ? onInspect(profile.id)
               : selectProfile(profile.id, !selected.has(profile.id), event.shiftKey)
           }
@@ -456,58 +472,25 @@ export function Sidebar({
             <strong>{displayName}</strong>
             <code className="fb-id">{fbId ?? '—'}</code>
           </span>
-          {groupInviterCounts && (
+          {activity && (
             <span
               className={
-                'task-line group-inviter-profile-stat tone-' +
-                (inviterActive
-                  ? 'run'
-                  : /失败|未确认|不可|异常|离线/.test(groupInviterCounts[profile.id]?.status ?? '')
-                    ? 'err'
-                    : /停止/.test(groupInviterCounts[profile.id]?.status ?? '')
-                      ? 'pause'
-                      : 'ok')
+                'task-line' +
+                (activity.className ? ' ' + activity.className : '') +
+                ' tone-' +
+                activity.tone
               }
             >
-              <span className="task-line-text">
-                本次邀请 {groupInviterCounts[profile.id]?.sessionInvited ?? 0} 人 · 累计{' '}
-                {groupInviterCounts[profile.id]?.totalInvited ?? 0} 人
-                {groupInviterCounts[profile.id]?.status
-                  ? ' · ' + groupInviterCounts[profile.id]?.status
-                  : ''}
-              </span>
-            </span>
-          )}
-          {plan && (
-            <span className={'task-line tone-' + taskTone}>
-              <span className="task-line-text">
-                {plan.state === 'RUNNING' && step
-                  ? stepLabel
-                  : plan.snapshot.name + ' · ' + stepLabel}
-              </span>
-              {step && plan.state === 'RUNNING' && (
+              <span className="task-line-text">{activity.text}</span>
+              {activity.progressView && (
                 <TaskProgressView
-                  type={step.type}
-                  progress={step.progress}
-                  budget={step.budget}
-                  maxLikes={
-                    activeStepSpec && 'maxLikes' in activeStepSpec
-                      ? activeStepSpec.maxLikes
-                      : undefined
-                  }
+                  type={activity.progressView.type}
+                  progress={activity.progressView.progress}
+                  budget={activity.progressView.budget}
+                  maxLikes={activity.progressView.maxLikes}
                   compact
                 />
               )}
-            </span>
-          )}
-          {!plan && !inviterActive && lastStatus && (
-            <span className={'task-line tone-' + lastStatus.tone}>
-              <span className="task-line-text">{lastStatus.text}</span>
-            </span>
-          )}
-          {!groupInviterCounts && !plan && inviterActive && (
-            <span className="task-line tone-run">
-              <span className="task-line-text">小组邀请人 · 运行中</span>
             </span>
           )}
         </button>
@@ -527,6 +510,16 @@ export function Sidebar({
         <span className="count-chip" title="已连接 / 全部">
           {onlineCount}/{workspace.profiles.length}
         </span>
+        <button
+          type="button"
+          className="btn btn-sm sidebar-select-ids-btn"
+          title="按 ID 批量选中浏览器"
+          aria-label="按 ID 选中浏览器"
+          disabled={workspace.profiles.length === 0}
+          onClick={() => setSelectByIdsOpen(true)}
+        >
+          按 ID 选中
+        </button>
         <button
           className="btn btn-icon btn-ghost"
           title="新建分组"
@@ -613,15 +606,31 @@ export function Sidebar({
           const visibleGroupIds = profiles.map((profile) => profile.id);
           const state = selectionState(selected, visibleGroupIds);
           const isClosed = closed.has(group.id);
-          const running = ids.filter(
-            (id) =>
-              tasks?.plans.some((plan) => plan.profileId === id && plan.state === 'RUNNING') ||
-              groupInviterRunningIds?.includes(id),
-          ).length;
-          if (group.id === 'ungrouped' && !all.length && workspace.groups.length) return null;
+          const running = ids.filter((id) => resolvedActivities.get(id)?.running === true).length;
           return (
             <section className={'group color-' + group.color} key={group.id}>
-              <div className="group-head">
+              <div
+                className={'group-head' + (dropProfile === 'g:' + group.id ? ' is-drop' : '')}
+                onDragOver={(e) => {
+                  if (!busy && draggingProfiles.current.length) {
+                    e.preventDefault();
+                    setDropProfile('g:' + group.id);
+                  }
+                }}
+                onDragLeave={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropProfile('');
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (busy) return;
+                  void moveProfilesTo(
+                    group.id === 'ungrouped' ? null : group.id,
+                    draggingProfiles.current,
+                  );
+                  draggingProfiles.current = [];
+                  setDropProfile('');
+                }}
+              >
                 <GroupCheck
                   {...state}
                   label={'选择整组 ' + group.name}
@@ -650,6 +659,16 @@ export function Sidebar({
                     trigger={<IconMore size={15} />}
                     items={[
                       {
+                        label: '↑ 上移分组',
+                        disabled: busy,
+                        onSelect: () => nudgeGroup(group.id, -1),
+                      },
+                      {
+                        label: '↓ 下移分组',
+                        disabled: busy,
+                        onSelect: () => nudgeGroup(group.id, 1),
+                      },
+                      {
                         label: '重命名分组',
                         icon: <IconEdit />,
                         onSelect: () => setRenaming({ id: group.id, name: group.name }),
@@ -667,7 +686,31 @@ export function Sidebar({
               </div>
               {!isClosed && profiles.map(row)}
               {!isClosed && profiles.length === 0 && (
-                <p className="group-empty">{all.length ? '没有匹配的浏览器' : '暂无浏览器'}</p>
+                <p
+                  className={'group-empty' + (dropProfile === 'g:' + group.id ? ' is-drop' : '')}
+                  onDragOver={(e) => {
+                    if (!busy && draggingProfiles.current.length) {
+                      e.preventDefault();
+                      setDropProfile('g:' + group.id);
+                    }
+                  }}
+                  onDragLeave={(e) => {
+                    if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+                      setDropProfile('');
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    if (busy || !draggingProfiles.current.length) return;
+                    void moveProfilesTo(
+                      group.id === 'ungrouped' ? null : group.id,
+                      draggingProfiles.current,
+                    );
+                    draggingProfiles.current = [];
+                    setDropProfile('');
+                  }}
+                >
+                  {all.length ? '没有匹配的浏览器' : '暂无浏览器'}
+                </p>
               )}
             </section>
           );
@@ -685,116 +728,166 @@ export function Sidebar({
         </p>
       )}
       {selected.size > 0 && (
-        <div className="selection-bar" aria-label="已选浏览器操作">
-          <div className="selection-bar-head">
-            <strong>已选 {selected.size}</strong>
-            <button className="btn btn-ghost btn-sm" onClick={() => onSelect(new Set())}>
-              清空
-            </button>
-          </div>
-          <div className="selection-bar-actions">
+        <div className="selection-bar compact-selection" aria-label="已选浏览器操作">
+          <span className="compact-selection-count">
+            <strong>{selected.size}</strong>
             <button
-              className="btn btn-sm"
-              disabled={busy}
-              title="仅保留主 Facebook 页面，跳过忙碌或离线浏览器"
-              onClick={() =>
-                void mutate(async () => {
-                  const res = await api.cleanupProfileTabs([...selected]);
-                  return (
-                    `已清理 ${res.cleanedProfiles} 个浏览器，共关闭 ${res.closedTabs} 个多余标签页` +
-                    (res.skippedBusy || res.skippedOffline
-                      ? `；跳过 ${res.skippedBusy} 个忙碌、${res.skippedOffline} 个离线`
-                      : '')
-                  );
-                })
-              }
+              type="button"
+              className="compact-clear-btn"
+              aria-label="清空选择"
+              title="清空选择"
+              onClick={() => onSelect(new Set())}
             >
-              <IconClose size={14} /> 清理标签页
+              ×
             </button>
-            <button
-              className="btn btn-sm"
-              title="检查所选浏览器的 Facebook 状态（只读）"
-              disabled={busy || !inspectionAvailable}
-              onClick={() => onCheck([...selected])}
-            >
-              <IconRefresh size={14} /> 检查
-            </button>
-            <button
-              className="btn btn-sm"
-              title="暂停所选浏览器的任务"
-              disabled={busy || !onTaskCommand || !pausable.length}
-              onClick={() => onTaskCommand?.('pause', targets(pausable))}
-            >
-              <IconPause size={14} /> 暂停{pausable.length ? ` ${pausable.length}` : ''}
-            </button>
-            <button
-              className="btn btn-sm"
-              title="继续所选浏览器已暂停的任务"
-              disabled={busy || !onTaskCommand || !resumable.length}
-              onClick={() => onTaskCommand?.('resume', targets(resumable))}
-            >
-              <IconPlay size={12} /> 继续{resumable.length ? ` ${resumable.length}` : ''}
-            </button>
-            <button
-              className="btn btn-sm btn-danger"
-              title="停止所选浏览器的任务"
-              disabled={
-                busy || totalStoppableCount === 0 || (!onTaskCommand && !onStopGroupInviterProfiles)
-              }
-              onClick={() => {
-                if (stoppable.length && onTaskCommand) onTaskCommand('stop', targets(stoppable));
-                if (stoppableInviterIds.length && onStopGroupInviterProfiles)
-                  onStopGroupInviterProfiles(stoppableInviterIds);
-              }}
-            >
-              <IconStop size={13} /> 停止{totalStoppableCount ? ` ${totalStoppableCount}` : ''}
-            </button>
-            <PopoverMenu
-              label="更多批量操作"
-              align="start"
-              trigger={<IconMore size={15} />}
-              items={[
-                { separator: true, label: '移到分组' },
-                {
-                  label: '未分组',
-                  onSelect: () => void mutate(() => api.move([...selected], null)),
-                },
-                ...workspace.groups.map((group) => ({
-                  label: group.name,
-                  onSelect: () => void mutate(() => api.move([...selected], group.id)),
-                })),
-                { separator: true },
-                {
-                  label: '停止所选浏览器控制',
-                  icon: <IconStop />,
-                  danger: true,
-                  disabled: busy,
-                  title: '向所选浏览器发送停止控制请求',
-                  onSelect: stopBrowsers,
-                },
-                {
-                  label: `删除所选浏览器 (${selected.size})`,
-                  icon: <IconClose />,
-                  danger: true,
-                  disabled:
-                    busy ||
-                    stoppable.length > 0 ||
-                    [...selected].some((id) => groupInviterRunningIds?.includes(id)),
-                  title:
-                    stoppable.length > 0 ||
-                    [...selected].some((id) => groupInviterRunningIds?.includes(id))
-                      ? '所选浏览器中存在运行中任务，请先停止任务后再删除'
-                      : '从列表中批量移除所选浏览器资料',
-                  onSelect: () =>
-                    setDeletingProfiles({
-                      ids: [...selected],
-                      label: `所选的 ${selected.size} 个浏览器`,
-                    }),
-                },
-              ]}
-            />
-          </div>
+          </span>
+          <PopoverMenu
+            label="移到分组"
+            disabled={busy}
+            align="start"
+            trigger={<>移到分组 ▾</>}
+            items={[
+              { label: '未分组', onSelect: () => void moveProfilesTo(null) },
+              ...workspace.groups.map((g) => ({
+                label: g.name,
+                onSelect: () => void moveProfilesTo(g.id),
+              })),
+              { label: '+ 新建分组并移入', onSelect: () => setCreateAndMove(true) },
+            ]}
+          />
+          <button
+            className="btn btn-sm compact-arrow"
+            aria-label="上移"
+            title="上移所选浏览器"
+            disabled={busy}
+            onClick={() => void nudgeProfiles(-1)}
+          >
+            ↑
+          </button>
+          <button
+            className="btn btn-sm compact-arrow"
+            aria-label="下移"
+            title="下移所选浏览器"
+            disabled={busy}
+            onClick={() => void nudgeProfiles(1)}
+          >
+            ↓
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={busy}
+            onClick={() =>
+              void mutate(async () => {
+                const res = await api.cleanupProfileTabs([...selected]);
+                return `已清理 ${res.cleanedProfiles} 个浏览器，共关闭 ${res.closedTabs} 个多余标签页${res.skippedOffline > 0 ? `（${res.skippedOffline} 个离线未连接）` : ''}`;
+              })
+            }
+          >
+            清理标签
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={arrangingWindows || selected.size === 0 || selected.size > 100}
+            title="在最后激活的浏览器所在屏幕上，按统一尺寸与固定间隔整齐排列所选窗口"
+            onClick={() => {
+              if (arrangingWindows) return;
+              setArrangingWindows(true);
+              void api
+                .windowLayout({ action: 'apply', profileIds: [...selected] })
+                .catch(() => {})
+                .finally(() => {
+                  setArrangingWindows(false);
+                });
+            }}
+          >
+            {arrangingWindows ? '整理中...' : '整理窗口'}
+          </button>
+          <button
+            className="btn btn-sm btn-danger"
+            disabled={busy || resolvedControls.totalStoppableCount === 0}
+            onClick={() => {
+              if (resolvedControls.stoppableTargets.length)
+                onTaskCommand?.('stop', resolvedControls.stoppableTargets);
+              if (resolvedControls.stoppableModuleProfileIds.length)
+                stopModulesHandler?.(resolvedControls.stoppableModuleProfileIds);
+            }}
+          >
+            停止
+          </button>
+          <PopoverMenu
+            label="更多批量操作"
+            align="end"
+            trigger={<IconMore size={15} />}
+            items={[
+              {
+                label: '检查 FB 状态',
+                disabled: busy || !inspectionAvailable,
+                onSelect: () => onCheck([...selected]),
+              },
+              {
+                label: '暂停任务',
+                disabled: busy || !resolvedControls.pausableTargets.length || !onTaskCommand,
+                onSelect: () => onTaskCommand?.('pause', resolvedControls.pausableTargets),
+              },
+              {
+                label: '继续任务',
+                disabled: busy || !resolvedControls.resumableTargets.length || !onTaskCommand,
+                onSelect: () => onTaskCommand?.('resume', resolvedControls.resumableTargets),
+              },
+              {
+                label: '删除所选浏览器',
+                disabled: busy || resolvedControls.totalStoppableCount > 0,
+                danger: true,
+                onSelect: () =>
+                  setDeletingProfiles({
+                    ids: [...selected],
+                    label: '所选的 ' + selected.size + ' 个浏览器',
+                  }),
+              },
+            ]}
+          />
         </div>
+      )}
+      {selectByIdsOpen && (
+        <SelectByIdsDialog
+          title="按 ID 批量选中浏览器"
+          kind="profiles"
+          candidates={buildProfileCandidates(sortedProfiles, inspections)}
+          onClose={() => setSelectByIdsOpen(false)}
+          onApply={(matchedProfileIds, applyMode) => {
+            const next =
+              applyMode === 'replace'
+                ? new Set(matchedProfileIds)
+                : new Set([...selected, ...matchedProfileIds]);
+            onSelect(next);
+            const matchedSet = new Set(matchedProfileIds);
+            const groupsToOpen = new Set(
+              workspace.profiles
+                .filter((p) => matchedSet.has(p.id))
+                .map((p) => p.groupId ?? 'ungrouped'),
+            );
+            if (groupsToOpen.size > 0) {
+              setClosed((prev) => {
+                const nextClosed = new Set(prev);
+                for (const gid of groupsToOpen) nextClosed.delete(gid);
+                return nextClosed;
+              });
+            }
+          }}
+        />
+      )}
+      {createAndMove && (
+        <NameDialog
+          title="新建分组并移入"
+          initial=""
+          onClose={() => setCreateAndMove(false)}
+          onSubmit={async (name) => {
+            await mutate(async () => {
+              const group = (await api.createGroup(name, 'blue')) as { id: string };
+              await api.reorderProfiles(group.id, [...selected]);
+            });
+          }}
+        />
       )}
       {deletingProfiles && (
         <ConfirmDialog

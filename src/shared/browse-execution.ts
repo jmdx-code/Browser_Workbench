@@ -166,7 +166,7 @@ export const BrowseObservation = z.discriminatedUnion('type', [
       paused: z.boolean(),
       buffering: z.boolean(),
       timeSeconds: z.number().finite().nonnegative(),
-      playbackRate: z.number().min(0.25).max(4),
+      playbackRate: z.number().min(0).max(4),
     })
     .strict(),
 ]);
@@ -232,3 +232,27 @@ export type IntentRecord = z.infer<typeof BrowseOperationIntent>;
 export type BrowseReading = z.infer<typeof BrowseObservation>;
 export type Decision = z.infer<typeof BrowseDecision>;
 export type Verdict = z.infer<typeof BrowseVerdict>;
+
+export function isRecoverableBrowseFault(reason: string): boolean {
+  const text = String(reason ?? '');
+  return (
+    /(?:^|:\s*)(?:KERNEL_FENCED|KERNEL_LEASE_REJECTED|KERNEL_LEASE_EXPIRED|KERNEL_LEASE_RENEW_FAILED(?:_DURING_READ)?|KERNEL_OPERATION_BINDING_REJECTED|TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED|KERNEL_DEBUGGER_DETACHED|KERNEL_CONNECTION_LOST(?:_DURING_READ)?|KERNEL_RPC_RESULT_UNKNOWN|KERNEL_PEER_NOT_IDLE|KERNEL_OPERATION_FINISH_TIMEOUT|KERNEL_EXECUTE_TIMEOUT|KERNEL_BRIDGE_TIMEOUT|FACEBOOK_BROWSE_LOADING_OR_DIALOG_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|FACEBOOK_TASK_DOCUMENT_READ_FAILED|FACEBOOK_NAVIGATION_SCOPE_CHANGED|FACEBOOK_NAVIGATION_TIMEOUT|FACEBOOK_NAVIGATION_READ_TIMEOUT|FACEBOOK_NAVIGATION_DOCUMENT_TIMEOUT|FACEBOOK_NAVIGATION_ABORTED|FACEBOOK_MANAGED_CONTEXT_CHANGED|STEP_EXECUTION_CONTEXT_CHANGED|ACTOR_INPUT_FENCED|ACTOR_TASK_TAB_CONTEXT_CHANGED|ACTOR_TASK_SCOPE_FAILED|ACTOR_TRANSPORT_OR_IDENTITY_CHANGED|TASK_TAB_SOURCE_CONTEXT_CHANGED|TASK_TAB_OBSERVATION_CHANGED|BROWSE_EFFECT_TIMEOUT|FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT|FACEBOOK_PROFILE_ADMISSION_EXPIRED_OR_CHANGED|FACEBOOK_PROFILE_CONNECTION_CHANGED|FACEBOOK_BROWSE_SCHEMA_MISMATCH|FACEBOOK_BROWSE_ROUTE_REQUIRED|FACEBOOK_IDENTITY_UNCONFIRMED|FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED|FACEBOOK_BROWSE_SAMPLE_DOCUMENT_CHANGED)\b/.test(
+      text,
+    ) ||
+    /(?:Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Execution context was destroyed|Cannot find context|Frame was detached|Session closed|Inspector\.detached|Navigation failed because page was closed|timeout\s+\d+ms\s+exceeded)/i.test(
+      text,
+    )
+  );
+}
+
+export function isSessionBreakingBrowseFault(reason: string): boolean {
+  const text = String(reason ?? '');
+  return (
+    /(?:^|:\s*)(?:KERNEL_FENCED|KERNEL_LEASE_REJECTED|KERNEL_LEASE_EXPIRED|KERNEL_LEASE_RENEW_FAILED(?:_DURING_READ)?|KERNEL_OPERATION_BINDING_REJECTED|TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED|KERNEL_DEBUGGER_DETACHED|KERNEL_CONNECTION_LOST(?:_DURING_READ)?|KERNEL_RPC_RESULT_UNKNOWN|KERNEL_PEER_NOT_IDLE|KERNEL_OPERATION_FINISH_TIMEOUT|KERNEL_EXECUTE_TIMEOUT|KERNEL_BRIDGE_TIMEOUT|FACEBOOK_NAVIGATION_READ_TIMEOUT|FACEBOOK_NAVIGATION_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|ACTOR_TASK_TAB_CONTEXT_CHANGED|ACTOR_TASK_SCOPE_FAILED|ACTOR_TRANSPORT_OR_IDENTITY_CHANGED)\b/.test(
+      text,
+    ) ||
+    /(?:Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|Frame was detached|Session closed|Inspector\.detached)/i.test(
+      text,
+    )
+  );
+}

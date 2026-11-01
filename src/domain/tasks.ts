@@ -17,6 +17,7 @@ import type { Binding, ExecutionReceipt, ExecutionSession } from '../shared/task
 import type { PendingDiagnostic } from '../shared/browse-execution.js';
 import type { TabProof } from '../shared/kernel-state.js';
 import type { ChildPageLifecycle } from '../shared/task-child-page.js';
+import type { SettlementRepository } from './settlement.js';
 
 export type RuntimeSnapshotResult = {
   settings: Settings;
@@ -44,6 +45,7 @@ export type RuntimeProfile = Pick<
   unreadyReason?: string;
 };
 export interface TaskRepository {
+  readonly settlements?: SettlementRepository;
   hiddenRecordIds?(): Awaitable<string[]>;
   recordsPage?(
     input: unknown,
@@ -60,6 +62,7 @@ export interface TaskRepository {
   list(): Awaitable<Plan[]>;
   livePlans(): Awaitable<Plan[]>;
   get(id: string): Awaitable<Plan>;
+  ensurePlanExists?(id: string): Awaitable<void>;
   steps(id: string, round?: number): Awaitable<StepInstance[]>;
   currentStepForPlan?(id: string, round: number, position: number): Awaitable<StepInstance | null>;
   events(id: string): Awaitable<Event[]>;
@@ -83,7 +86,11 @@ export interface TaskRepository {
   releaseErroredPausedPlans?(profileIds: readonly string[]): Awaitable<number>;
   recoverOnStartup(preserveFutureSchedules?: boolean): Awaitable<void>;
   unresolved?(id: string): Awaitable<boolean>;
-  stopOfflineBrowse?(id: string, reason?: string): Awaitable<Plan | null>;
+  stopOfflineBrowse?(
+    id: string,
+    reason?: string,
+    options?: { expectedUpdatedAt?: number; reviewIfBlocked?: boolean },
+  ): Awaitable<Plan | null>;
   prepareOperation(
     id: string,
     stepId: string,
@@ -121,6 +128,7 @@ export interface TaskRepository {
   recentOperations?(id: string, limit: number): Awaitable<Operation[]>;
   findOperation?(jobId: string, operationId: string): Awaitable<Operation | null>;
   blockingOperations?(id: string): Awaitable<Operation[]>;
+  settleTransientBrowseOperations?(id: string, reason: string): Awaitable<boolean>;
   noteStepFailure?(id: string, stepId: string, reason: string): Awaitable<void>;
   markAcknowledged(operationId: string, receipt: Operation['receipt']): Awaitable<void>;
   settleOperation(

@@ -14,6 +14,7 @@ import { TaskCycleHost } from './task-cycle-host.js';
 import { taskTimingEligibility } from '../domain/task-timing.js';
 import type { TabProof } from '../shared/kernel-state.js';
 import { MAX_CONCURRENT_STARTUPS } from '../shared/task-capacity.js';
+import { isRecoverableBrowseFault } from '../shared/browse-execution.js';
 
 // Composition of the original host/registry, not another scheduler. A QUEUED plan first gets
 // a finite private native observation; only the original SQL claim grants the account lock.
@@ -23,9 +24,45 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
   private readonly host: TaskCycleHost;
   private readonly opening = new Map<string, Promise<TabProof | void>>();
   private readonly openingControls = new Map<string, string>();
+  private readonly reopeningProfiles = new Set<string>();
+  private readonly startupBackoffs = new Map<string, { attempts: number; until: number }>();
+  private readonly lastOnlineStates = new Map<string, boolean>();
   private startupCount = 0;
   private deferredStartups = 0;
+  private startupWakeNeeded = false;
+  private startupWakeScheduled = false;
   private closed = false;
+  private onStartupSlotFreed?: () => void;
+  setStartupSlotFreedHook(hook: () => void) {
+    this.onStartupSlotFreed = hook;
+  }
+  clearStartupBackoff(profileId: string) {
+    this.startupBackoffs.delete(profileId);
+  }
+  private recordStartupBackoff(profileId: string, error: unknown) {
+    const reason = error instanceof Error ? (error.message.split('\n')[0] ?? 'UNKNOWN') : 'UNKNOWN';
+    if (
+      reason === 'CONCURRENCY_LIMIT' ||
+      reason === 'STARTUP_BACKOFF' ||
+      reason === 'TASK_RUNTIME_CLOSED' ||
+      reason === 'TASK_SINGLE_ORIGINAL_PLAN_REQUIRED' ||
+      reason === 'TASK_EXPLICIT_RECOVERY_REQUIRED' ||
+      reason === 'TASK_RUNTIME_OPEN_REVOKED'
+    )
+      return;
+    const prev = this.startupBackoffs.get(profileId);
+    const attempts = (prev?.attempts ?? 0) + 1;
+    const delayMs = Math.min(10_000, 1_500 * 2 ** Math.min(attempts - 1, 3));
+    this.startupBackoffs.set(profileId, { attempts, until: this.now() + delayMs });
+  }
+  private syncOnlineState(raw: RuntimeProfile) {
+    const prevOnline = this.lastOnlineStates.get(raw.id);
+    this.lastOnlineStates.set(raw.id, raw.online);
+    if (!raw.online) this.clearReopeningIfIdle(raw.id);
+    if (prevOnline === false && raw.online) {
+      this.startupBackoffs.delete(raw.id);
+    }
+  }
   constructor(
     private readonly tasks: TaskRepository,
     tabs: TaskTabRepository,
@@ -37,6 +74,7 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     private readonly profileInventory?: (
       profileId: string,
     ) => Awaitable<RuntimeProfile | undefined>,
+    private readonly now: () => number = Date.now,
   ) {
     this.registry = new ProfileActorRegistry(
       async () => await this.profiles(),
@@ -46,6 +84,11 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
       tabs,
       id,
       async (profileId) => await this.profile(profileId),
+      async (profileId) => {
+        this.reopeningProfiles.add(profileId);
+        this.startupBackoffs.delete(profileId);
+        await this.factory.forget(profileId);
+      },
     );
     this.host = new TaskCycleHost(this.registry, tabs, {
       currentTaskTab: (plan, context) => this.registry.currentTaskTab(plan, context),
@@ -57,11 +100,30 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
   hasActiveExecution(): boolean {
     return this.opening.size > 0 || this.startupCount > 0 || this.registry.hasOwners();
   }
+  hasInFlightExecution(profileId: string): boolean {
+    return (
+      this.registry.hasOwner(profileId) ||
+      this.opening.has(profileId) ||
+      this.queuedAdmissions.has(profileId)
+    );
+  }
+  clearReopeningIfIdle(profileId: string): void {
+    if (!this.hasInFlightExecution(profileId)) this.reopeningProfiles.delete(profileId);
+  }
+  hasExecutionOrOpening(profileId: string): boolean {
+    return (
+      this.registry.hasOwner(profileId) ||
+      this.opening.has(profileId) ||
+      this.queuedAdmissions.has(profileId) ||
+      this.reopeningProfiles.has(profileId)
+    );
+  }
   hasOwner(profileId: string) {
     return this.registry.hasOwner(profileId);
   }
   async profiles() {
     return await mapAsync(await this.inventory(), async (raw) => {
+      this.syncOnlineState(raw);
       const privateProfile =
         (await this.registry.ownedProfile(raw.id)) ?? (await this.factory.profile(raw.id));
       // The full inventory is retained, including offline/unknown profiles. Private identity
@@ -71,15 +133,22 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
           ? { ...privateProfile, id: raw.id }
           : { ...raw, dispatchAllowed: false };
       const openingPlan =
-        this.opening.has(raw.id) && !this.registry.hasOwner(raw.id)
-          ? await findAsync(
-              await this.tasks.plansForProfile(raw.id, ['RUNNING']),
-              async (plan) =>
+        (this.opening.has(raw.id) || this.reopeningProfiles.has(raw.id)) &&
+        !this.registry.hasOwner(raw.id)
+          ? await findAsync(await this.tasks.plansForProfile(raw.id, ['RUNNING']), async (plan) => {
+              if (this.reopeningProfiles.has(raw.id)) return true;
+              const steps = await this.tasks.steps(plan.id, plan.round);
+              const activeStep = steps.find(
+                (step) => step.position === plan.position && step.status === 'ACTIVE',
+              );
+              if (activeStep && activeStep.spec.type !== 'post') return true;
+              return (
                 (
                   (await this.tasks.blockingOperations?.(plan.id)) ??
                   (await this.tasks.operations(plan.id))
-                ).length === 0,
-            )
+                ).length === 0
+              );
+            })
           : undefined;
       return openingPlan ? { ...profile, openingPlanId: openingPlan.id } : profile;
     });
@@ -88,11 +157,32 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     if (!this.profileInventory) return (await this.profiles()).find((row) => row.id === profileId);
     const raw = await this.profileInventory(profileId);
     if (!raw || raw.id !== profileId) return undefined;
+    this.syncOnlineState(raw);
     const current =
       (await this.registry.ownedProfile(profileId)) ?? (await this.factory.profile(profileId));
-    return current && raw.online && raw.synced && !raw.unresolved
-      ? { ...current, id: raw.id }
-      : { ...raw, dispatchAllowed: false };
+    const base =
+      current && raw.online && raw.synced && !raw.unresolved
+        ? { ...current, id: raw.id }
+        : { ...raw, dispatchAllowed: false };
+    const openingPlan =
+      (this.opening.has(raw.id) || this.reopeningProfiles.has(raw.id)) &&
+      !this.registry.hasOwner(raw.id)
+        ? await findAsync(await this.tasks.plansForProfile(raw.id, ['RUNNING']), async (plan) => {
+            if (this.reopeningProfiles.has(raw.id)) return true;
+            const steps = await this.tasks.steps(plan.id, plan.round);
+            const activeStep = steps.find(
+              (step) => step.position === plan.position && step.status === 'ACTIVE',
+            );
+            if (activeStep && activeStep.spec.type !== 'post') return true;
+            return (
+              (
+                (await this.tasks.blockingOperations?.(plan.id)) ??
+                (await this.tasks.operations(plan.id))
+              ).length === 0
+            );
+          })
+        : undefined;
+    return openingPlan ? { ...base, openingPlanId: openingPlan.id } : base;
   }
   async schedulingProfiles() {
     const original = await this.host.schedulingProfiles();
@@ -130,17 +220,41 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     const pending = this.opening.get(profileId);
     if (pending) return pending;
     const startup = !this.registry.hasOwner(profileId);
-    if (startup && this.startupCount >= MAX_CONCURRENT_STARTUPS) {
-      this.deferredStartups++;
-      return Promise.reject(Error('CONCURRENCY_LIMIT')); // Original runner keeps it QUEUED; no owner or timer is created.
+    if (!startup) {
+      this.startupBackoffs.delete(profileId);
+    } else {
+      const backoff = this.startupBackoffs.get(profileId);
+      if (backoff && this.now() < backoff.until) {
+        return Promise.reject(Error('STARTUP_BACKOFF'));
+      }
+      if (this.startupCount >= MAX_CONCURRENT_STARTUPS) {
+        this.deferredStartups++;
+        this.startupWakeNeeded = true;
+        return Promise.reject(Error('CONCURRENCY_LIMIT')); // Original runner keeps it QUEUED; no owner or timer is created.
+      }
+      this.startupCount++;
     }
-    if (startup) this.startupCount++;
     const work = this.observeOnce(profileId);
     this.opening.set(profileId, work);
     void work
       .finally(() => {
         if (startup) this.startupCount--;
         if (this.opening.get(profileId) === work) this.opening.delete(profileId);
+        if (
+          startup &&
+          !this.closed &&
+          this.startupWakeNeeded &&
+          !this.startupWakeScheduled &&
+          this.onStartupSlotFreed
+        ) {
+          this.startupWakeNeeded = false;
+          this.deferredStartups = 0;
+          this.startupWakeScheduled = true;
+          setImmediate(() => {
+            this.startupWakeScheduled = false;
+            if (!this.closed) this.onStartupSlotFreed?.();
+          });
+        }
       })
       .catch(() => {});
     return work;
@@ -155,6 +269,7 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
   private readonly queuedAdmissions = new Set<string>();
   private async observeOnce(profileId: string) {
     if (this.registry.hasOwner(profileId)) {
+      this.startupBackoffs.delete(profileId);
       return this.host.observe(profileId);
     }
     const plans = await this.tasks.plansForProfile(profileId, [
@@ -184,6 +299,10 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
       this.queuedAdmissions.add(profileId);
       try {
         await this.factory.observeQueued(plan.id);
+        this.startupBackoffs.delete(profileId);
+      } catch (error) {
+        this.recordStartupBackoff(profileId, error);
+        throw error;
       } finally {
         this.queuedAdmissions.delete(profileId);
       }
@@ -192,22 +311,36 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     if (plan.state !== 'RUNNING') throw Error('TASK_EXPLICIT_RECOVERY_REQUIRED');
     let port;
     try {
+      if (this.reopeningProfiles.has(profileId) && !(await this.factory.profile(profileId))) {
+        await this.factory.observeQueued(plan.id);
+      }
       port = await this.factory.openClaimed(plan.id);
     } catch (error) {
       await this.factory.forget(profileId);
+      const errReason =
+        error instanceof Error ? (error.message.split('\n')[0] ?? 'UNKNOWN') : 'UNKNOWN';
+      const activeStep = (await this.tasks.steps(plan.id, plan.round)).find(
+        (step) => step.position === plan.position && step.status === 'ACTIVE',
+      );
+      if (activeStep && activeStep.spec.type !== 'post' && isRecoverableBrowseFault(errReason)) {
+        this.reopeningProfiles.add(profileId);
+        this.recordStartupBackoff(profileId, error);
+        throw error;
+      }
+      this.reopeningProfiles.delete(profileId);
+      this.startupBackoffs.delete(profileId);
       if (plan.accountId)
-        await this.tasks.reviewFailedAdmission(
-          plan.id,
-          plan.accountId,
-          error instanceof Error ? (error.message.split('\n')[0] ?? 'UNKNOWN') : 'UNKNOWN',
-        );
+        await this.tasks.reviewFailedAdmission(plan.id, plan.accountId, errReason);
       throw error;
     }
     try {
       if (this.closed || (await this.tasks.get(plan.id)).state !== 'RUNNING')
         throw Error('TASK_RUNTIME_OPEN_REVOKED');
       await this.registry.attach(port);
+      this.reopeningProfiles.delete(profileId);
+      this.startupBackoffs.delete(profileId);
     } catch (error) {
+      this.startupBackoffs.delete(profileId);
       const context = await port.current();
       if (!context) throw Error('TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED');
       const cancelled = await this.tasks.get(plan.id);
@@ -241,12 +374,17 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     return this.host.preparePlan(plan, context, observedProof);
   }
   async control(jobId: string, mode: 'pause' | 'stop', reason?: string) {
+    const plan = await this.tasks.get(jobId);
+    this.reopeningProfiles.delete(plan.profileId);
+    this.startupBackoffs.delete(plan.profileId);
     const result = await this.host.control(jobId, mode, reason);
     await this.factory.forget(result.profileId);
     return result;
   }
   async controlFromUser(jobId: string, mode: 'pause' | 'stop', reason?: string) {
     const plan = await this.tasks.get(jobId);
+    this.reopeningProfiles.delete(plan.profileId);
+    this.startupBackoffs.delete(plan.profileId);
     const opening = this.opening.get(plan.profileId);
     if (opening && !this.registry.hasOwner(plan.profileId)) {
       // Withdraw admission synchronously. Let that same opening release its native owner
@@ -268,10 +406,17 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     return result;
   }
   detach(profileId: string, expected: ExecutionSession, reason: string) {
+    this.startupBackoffs.delete(profileId);
     return this.host.detach(profileId, expected, reason);
+  }
+  retireForBrowseSelfHeal(profileId: string, reason: string) {
+    this.startupBackoffs.delete(profileId);
+    return this.host.retireForBrowseSelfHeal(profileId, reason);
   }
   async close() {
     this.closed = true;
+    this.startupWakeNeeded = false;
+    this.startupBackoffs.clear();
     await this.factory.close();
     await Promise.allSettled([...this.opening.values()]);
     await this.registry.close();

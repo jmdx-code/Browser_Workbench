@@ -1,3 +1,5 @@
+import type { TargetListKind, TargetListCommand, TargetFolder } from '../shared/target-list.js';
+import type { BumperState, BumperLog } from '../shared/group-bumper.js';
 import { MediaComponentStatus } from '../shared/media-component.js';
 import {
   SoftwareUpdateStatus,
@@ -86,6 +88,7 @@ import {
   type StartGroupInviterRequest,
   type StopGroupInviterProfilesRequest,
   type UpdateGroupInviterSettingsRequest,
+  type GroupInviteLogRow,
 } from '../shared/group-inviter.js';
 export class ApiError extends Error {
   constructor(
@@ -153,6 +156,18 @@ async function request(
   return result;
 }
 export const api = {
+  bumperState: async () => (await request('/group-bumper/state')) as BumperState,
+  bumperAction: async (action: string, input: unknown = {}) =>
+    (await request('/group-bumper/' + action, input)) as BumperState,
+  bumperLogs: async (search = '', before?: number, beforeId?: string) =>
+    (await request(
+      '/group-bumper/logs?' +
+        new URLSearchParams({
+          search,
+          ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
+        }),
+    )) as BumperLog[],
+
   softwareUpdateStatus: async () => SoftwareUpdateStatus.parse(await request('/update/status')),
   checkSoftwareUpdate: async () => SoftwareUpdateStatus.parse(await request('/update/check', {})),
   configureSoftwareUpdate: async (config: UpdateConfiguration) =>
@@ -541,6 +556,12 @@ export const api = {
     ),
   snapshot: async (signal?: AbortSignal) =>
     WorkspaceSchema.parse(await request('', undefined, signal ?? AbortSignal.timeout(10_000))),
+  targetFolders: (listKind: TargetListKind) =>
+    request('/target-lists/folders?listKind=' + listKind) as Promise<TargetFolder[]>,
+  targetListCommand: (command: TargetListCommand) => request('/target-lists/command', command),
+  reorderProfiles: (groupId: string | null, orderedProfileIds: string[]) =>
+    request('/profiles/reorder', { groupId, orderedProfileIds }),
+  reorderGroups: (orderedGroupIds: string[]) => request('/groups/reorder', { orderedGroupIds }),
   createGroup: (name: string, color: string) => request('/groups/create', { name, color }),
   renameGroup: (groupId: string, name: string) => request('/groups/rename', { groupId, name }),
   deleteGroup: (groupId: string) => request('/groups/delete', { groupId }),
@@ -604,11 +625,42 @@ export const api = {
     GroupInviterState.parse(
       await request('/group-inviter/stop-profiles', input, AbortSignal.timeout(10_000)),
     ),
-  recordDiagnosticSnapshot: async (note?: string) =>
-    (await request('/diagnostics/snapshot', note ? { note } : {}, AbortSignal.timeout(10_000))) as {
+  groupInviterLogs: async (search = '', before?: number) =>
+    (await request(
+      '/group-inviter/logs?' +
+        new URLSearchParams({
+          search,
+          ...(before ? { before: String(before) } : {}),
+        }),
+      undefined,
+      AbortSignal.timeout(10_000),
+    )) as GroupInviteLogRow[],
+  recordDiagnosticSnapshot: async (
+    input?: string | { note?: string; uiContext?: string; targetDir?: string; reveal?: boolean },
+  ) =>
+    (await request(
+      '/diagnostics/snapshot',
+      typeof input === 'string' ? { note: input } : (input ?? {}),
+      AbortSignal.timeout(30_000),
+    )) as {
       recorded: boolean;
       filePath: string;
+      fileName: string;
+      sizeBytes: number;
       entryId: number;
       at: string;
+    },
+  revealDiagnosticPackage: async (fileName?: string, targetDir?: string) =>
+    (await request(
+      '/diagnostics/reveal',
+      {
+        ...(fileName ? { fileName } : {}),
+        ...(targetDir ? { targetDir } : {}),
+      },
+      AbortSignal.timeout(10_000),
+    )) as {
+      revealed: boolean;
+      filePath: string;
+      fileName: string;
     },
 };

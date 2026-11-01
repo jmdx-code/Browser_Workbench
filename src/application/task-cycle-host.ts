@@ -37,6 +37,9 @@ export class TaskCycleHost implements TaskCycleRuntime {
   detach(profileId: string, expected: ExecutionSession, reason: string) {
     return this.registry.detach(profileId, expected, reason);
   }
+  retireForBrowseSelfHeal(profileId: string, reason: string) {
+    return this.registry.retireForBrowseSelfHeal(profileId, reason);
+  }
   async preparePlan(plan: Plan, context: ExecutionSession, observedProof?: TabProof) {
     const proof = OwnedTabProof.parse(
       observedProof ?? (await this.source.currentTaskTab(plan, context)),

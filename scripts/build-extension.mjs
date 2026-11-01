@@ -20,6 +20,7 @@ await build({
   platform: 'browser',
   target: 'chrome125',
   sourcemap: true,
+  define: { __BUNDLED_EXTENSION_VERSION__: JSON.stringify(manifest.version) },
 });
 for (const file of ['manifest.json', 'options.html'])
   await copyFile('extension/' + file, 'extension-build/' + file);

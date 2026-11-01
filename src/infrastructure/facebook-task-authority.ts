@@ -22,11 +22,12 @@ import {
   readCurrentFacebookBrowseSample,
 } from './facebook-browse-identity.js';
 import {
-  readFacebookBrowsePage,
   FACEBOOK_REEL_NEXT_CSS,
   FACEBOOK_FRIEND_CONFIRM_CSS,
   FACEBOOK_BROWSE_LIKE_CSS,
+  FACEBOOK_BROWSE_DIALOG_DISMISS_CSS,
   browsePageDiagnostic,
+  type BrowsePage,
 } from './facebook-browse-reader.js';
 import { taskTimingEligibility } from '../domain/task-timing.js';
 import { readFacebookHomePreparation } from './facebook-home-preparation.js';
@@ -45,6 +46,10 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
   private owned: { page: Page; proof: TabProof } | null = null;
   private revoked = false;
   private revocationReason: string | undefined;
+  private cachedUnresolved?: { at: number; count: number };
+  private cachedLivePlan?: { at: number; plan: Plan };
+  private cachedSteps?: { at: number; steps: Awaited<ReturnType<TaskRepository['steps']>> };
+  private lastBrowseReading?: { at: number; page: BrowsePage };
   constructor(
     private readonly core: Core,
     private readonly peer: Peer,
@@ -77,7 +82,33 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     // the current durable plan and local revocation checks before granting use.
   }
   private async assertLive() {
-    const current = await this.tasks.get(this.plan.id);
+    if (
+      this.revoked ||
+      this.core.peers.get(this.peer.profileId) !== this.peer ||
+      this.peer.epoch !== this.bootstrap.connection.connectionEpoch ||
+      !this.peer.online ||
+      !this.peer.synced ||
+      this.peer.phase !== 'PAUSED' ||
+      (!this.owned &&
+        (this.now() < this.bootstrap.actor.checkedAt ||
+          this.now() - this.bootstrap.actor.checkedAt > 60_000))
+    ) {
+      this.cachedLivePlan = undefined;
+      this.cachedSteps = undefined;
+      throw Error('FACEBOOK_NATIVE_AUTHORITY_REVOKED');
+    }
+    const now = this.now();
+    let current: Plan;
+    if (
+      this.cachedLivePlan &&
+      now >= this.cachedLivePlan.at &&
+      now - this.cachedLivePlan.at < 400
+    ) {
+      current = this.cachedLivePlan.plan;
+    } else {
+      current = await this.tasks.get(this.plan.id);
+      this.cachedLivePlan = { at: this.now(), plan: current };
+    }
     if (
       this.revoked ||
       this.core.peers.get(this.peer.profileId) !== this.peer ||
@@ -91,8 +122,20 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       (!this.owned &&
         (this.now() < this.bootstrap.actor.checkedAt ||
           this.now() - this.bootstrap.actor.checkedAt > 60_000))
-    )
+    ) {
+      this.cachedLivePlan = undefined;
+      this.cachedSteps = undefined;
       throw Error('FACEBOOK_NATIVE_AUTHORITY_REVOKED');
+    }
+  }
+  private async currentSteps(): Promise<Awaited<ReturnType<TaskRepository['steps']>>> {
+    const now = this.now();
+    if (this.cachedSteps && now >= this.cachedSteps.at && now - this.cachedSteps.at < 400) {
+      return this.cachedSteps.steps;
+    }
+    const steps = await this.tasks.steps(this.plan.id);
+    this.cachedSteps = { at: this.now(), steps };
+    return steps;
   }
   async assertIdentity(accountId: string) {
     await this.assertLive();
@@ -106,11 +149,19 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     } catch {
       allowed = false;
     }
+    const at = Date.now();
+    let unresolvedCount: number;
+    if (this.cachedUnresolved && at - this.cachedUnresolved.at < 2000) {
+      unresolvedCount = this.cachedUnresolved.count;
+    } else {
+      unresolvedCount = (await this.core.store.unresolved(this.peer.profileId)).length;
+      this.cachedUnresolved = { at, count: unresolvedCount };
+    }
     return {
       id: this.peer.profileId,
       online: this.peer.online,
       synced: this.peer.synced,
-      unresolved: (await this.core.store.unresolved(this.peer.profileId)).length,
+      unresolved: unresolvedCount,
       dispatchAllowed: allowed,
       ...(!allowed
         ? { unreadyReason: this.revocationReason ?? 'FACEBOOK_NATIVE_AUTHORITY_REVOKED' }
@@ -158,7 +209,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     if (!this.owned || this.owned.page !== page)
       throw Error('FACEBOOK_OWNED_IDENTITY_PAGE_REQUIRED');
     return this.readWithRetry(async () => {
-      const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
+      const step = (await this.currentSteps()).find((s) => s.status === 'ACTIVE');
       const reader =
         step?.spec.type === 'post' &&
         step.spec.destination === 'story' &&
@@ -185,7 +236,12 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       this.bootstrap.actor.checkedAt = this.now();
     });
   }
-  async readBrowsePage(page: Page, guard: () => Awaitable<void>, inputFence = false) {
+  async readBrowsePage(
+    page: Page,
+    guard: () => Awaitable<void>,
+    inputFence = false,
+    requireActor = false,
+  ) {
     await this.assertLive();
     await guard();
     if (!this.owned || this.owned.page !== page)
@@ -199,13 +255,23 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         },
         inputFence,
       );
-      if (inputFence && !sample.actor) throw Error('FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED');
+      if ((inputFence || requireActor) && !sample.actor)
+        throw Error('FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED');
       if (
         sample.actor &&
         (sample.actor.accountId !== this.bootstrap.actor.accountId ||
           sample.actor.name !== this.bootstrap.actor.name)
       )
         throw Error('FACEBOOK_NATIVE_ACCOUNT_CHANGED');
+      if (sample.actor) {
+        this.bootstrap.actor.checkedAt = this.now();
+        if (!inputFence) {
+          this.lastBrowseReading = {
+            at: this.now(),
+            page: structuredClone(sample.page),
+          };
+        }
+      }
       return sample.page;
     });
   }
@@ -216,7 +282,10 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         return await read();
       } catch (error) {
         const reason = error instanceof Error ? error.message : '';
-        if (/^FACEBOOK_NATIVE_ACCOUNT_(?:CHANGED|MISMATCH)$/.test(reason)) {
+        if (
+          /^FACEBOOK_NATIVE_ACCOUNT_(?:CHANGED|MISMATCH)$/.test(reason) ||
+          /^FACEBOOK_ACCOUNT_(?:VERIFICATION_REQUIRED|RESTRICTED|LOGGED_OUT)$/.test(reason)
+        ) {
           this.revocationReason = reason;
           this.revoked = true;
           throw error;
@@ -236,7 +305,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     if (taskTimingEligibility(this.plan.timing, this.now(), true) === 'OPEN') return true;
     const current = await this.tasks.get(this.plan.id);
     if (current.state !== 'RUNNING' || current.controlMode) return false;
-    const active = (await this.tasks.steps(this.plan.id)).find((step) => step.status === 'ACTIVE');
+    const active = (await this.currentSteps()).find((step) => step.status === 'ACTIVE');
     const original = (await this.tasks.operations(this.plan.id)).filter(
       (op) =>
         op.status === 'DISPATCHING' &&
@@ -252,6 +321,9 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     // A wheel gesture/key sequence/upload already dispatched inside the window is
     // one atomic operation. Finish it; the runner refuses every subsequent operation.
     return original.length === 1;
+  }
+  clearBrowseCache() {
+    this.lastBrowseReading = undefined;
   }
   async assertTarget(action: Action, appliedScrollDelta = 0, activationPreparation = false) {
     await this.assertLive();
@@ -271,19 +343,60 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       ].includes(action.kind)
     )
       throw Error('FACEBOOK_NATIVE_TARGET_REQUIRED');
-    const active = (await this.tasks.steps(this.plan.id)).find((step) => step.status === 'ACTIVE');
-    const feedInput =
+    const steps = await this.currentSteps();
+    const active = steps.find((step) => step.status === 'ACTIVE');
+    let feedInput: BrowsePage | null = null;
+    if (
       action.kind === 'browseScroll' &&
       (active?.spec.type === 'feed' ||
         active?.spec.type === 'marketplace' ||
         active?.spec.type === 'video') &&
       facebookBrowseSurface(action.url) === active.spec.type
-        ? await this.readBrowsePage(this.owned.page, async () => await this.assertLive(), true)
-        : null;
-    if (!feedInput)
+    ) {
+      if (
+        appliedScrollDelta === 0 &&
+        this.lastBrowseReading &&
+        this.now() - this.lastBrowseReading.at < 1_000 &&
+        this.lastBrowseReading.page.url === action.url &&
+        this.lastBrowseReading.page.timeOrigin === action.timeOrigin &&
+        this.lastBrowseReading.page.ready &&
+        !this.lastBrowseReading.page.blocked &&
+        this.lastBrowseReading.page.visible
+      ) {
+        feedInput = structuredClone(this.lastBrowseReading.page);
+        this.lastBrowseReading = undefined;
+      } else {
+        feedInput = await this.readBrowsePage(
+          this.owned.page,
+          async () => await this.assertLive(),
+          true,
+        );
+      }
+    }
+    const needsFullBrowsePage =
+      (action.kind === 'click' &&
+        (action.target.css === FACEBOOK_REEL_NEXT_CSS ||
+          action.target.css === FACEBOOK_FRIEND_CONFIRM_CSS ||
+          action.target.css === FACEBOOK_BROWSE_LIKE_CSS ||
+          action.target.css === FACEBOOK_BROWSE_DIALOG_DISMISS_CSS)) ||
+      action.kind === 'browsePlay' ||
+      (action.kind === 'browseScroll' && !feedInput) ||
+      (action.kind === 'browseNavigate' &&
+        active?.spec.type === 'marketplace' &&
+        Boolean(facebookMarketplaceItemURL(action.url)));
+    let currentBrowsePage: BrowsePage | null = null;
+    if (needsFullBrowsePage) {
+      currentBrowsePage = await this.readBrowsePage(
+        this.owned.page,
+        async () => await this.assertLive(),
+        false,
+        true,
+      );
+    } else if (!feedInput) {
       await this.refreshIdentity(this.owned.page, async () => await this.assertLive());
+    }
     if (
-      (await this.tasks.steps(this.plan.id)).some(
+      steps.some(
         (step) =>
           step.status === 'ACTIVE' &&
           step.spec.type === 'post' &&
@@ -291,12 +404,19 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       )
     )
       throw Error('FACEBOOK_STORY_EXECUTOR_REQUIRED');
+    const backgroundAllowed =
+      (activationPreparation && (await this.canPresentTaskPage())) ||
+      this.peer.capabilities?.includes('kernel-background-presentation-v1') === true;
     if (action.kind === 'click' && action.target.css === FACEBOOK_REEL_NEXT_CSS) {
-      const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
-      const current = await readFacebookBrowsePage(
-        this.owned.page,
-        async () => await this.assertLive(),
-      );
+      const step = active;
+      const current =
+        currentBrowsePage ??
+        (await this.readBrowsePage(
+          this.owned.page,
+          async () => await this.assertLive(),
+          false,
+          true,
+        ));
       if (
         step?.spec.type !== 'video' ||
         action.target.scope !== undefined ||
@@ -305,7 +425,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         action.routeEpoch !== 0 ||
         facebookBrowseSurface(current.url) !== 'video' ||
         !current.ready ||
-        (!current.visible && !(activationPreparation && (await this.canPresentTaskPage()))) ||
+        (!current.visible && !backgroundAllowed) ||
         current.blocked ||
         !current.video ||
         current.nextReelCSS !== FACEBOOK_REEL_NEXT_CSS
@@ -313,11 +433,15 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         throw Error('FACEBOOK_REEL_NEXT_TARGET_CHANGED');
     }
     if (action.kind === 'click' && action.target.css === FACEBOOK_FRIEND_CONFIRM_CSS) {
-      const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
-      const current = await readFacebookBrowsePage(
-        this.owned.page,
-        async () => await this.assertLive(),
-      );
+      const step = active;
+      const current =
+        currentBrowsePage ??
+        (await this.readBrowsePage(
+          this.owned.page,
+          async () => await this.assertLive(),
+          false,
+          true,
+        ));
       if (
         step?.spec.type !== 'friends' ||
         step.spec.maxLikes > 0 ||
@@ -328,18 +452,22 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         facebookBrowseSurface(current.url) !== 'friends' ||
         !/^\/friends\/requests\/?$/.test(new URL(current.url).pathname) ||
         !current.ready ||
-        (!current.visible && !(activationPreparation && (await this.canPresentTaskPage()))) ||
+        (!current.visible && !backgroundAllowed) ||
         current.blocked ||
         current.friendConfirmCSS !== FACEBOOK_FRIEND_CONFIRM_CSS
       )
         throw Error('FACEBOOK_FRIEND_CONFIRM_TARGET_CHANGED');
     }
     if (action.kind === 'click' && action.target.css === FACEBOOK_BROWSE_LIKE_CSS) {
-      const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
-      const current = await readFacebookBrowsePage(
-        this.owned.page,
-        async () => await this.assertLive(),
-      );
+      const step = active;
+      const current =
+        currentBrowsePage ??
+        (await this.readBrowsePage(
+          this.owned.page,
+          async () => await this.assertLive(),
+          false,
+          true,
+        ));
       if (
         (step?.spec.type !== 'feed' && step?.spec.type !== 'video') ||
         step.spec.maxLikes <= 0 ||
@@ -350,14 +478,39 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         action.routeEpoch !== 0 ||
         facebookBrowseSurface(current.url) !== step.spec.type ||
         !current.ready ||
-        (!current.visible && !(activationPreparation && (await this.canPresentTaskPage()))) ||
+        (!current.visible && !backgroundAllowed) ||
         current.blocked ||
         current.likeTarget?.css !== FACEBOOK_BROWSE_LIKE_CSS
       )
         throw Error('FACEBOOK_BROWSE_LIKE_TARGET_CHANGED');
     }
+    if (action.kind === 'click' && action.target.css === FACEBOOK_BROWSE_DIALOG_DISMISS_CSS) {
+      const step = active;
+      const current =
+        currentBrowsePage ??
+        (await this.readBrowsePage(
+          this.owned.page,
+          async () => await this.assertLive(),
+          false,
+          true,
+        ));
+      if (
+        !step ||
+        step.spec.type === 'post' ||
+        action.target.scope !== undefined ||
+        action.target.text !== undefined ||
+        action.documentEpoch !== 0 ||
+        action.routeEpoch !== 0 ||
+        !facebookBrowseSurface(current.url) ||
+        !current.ready ||
+        (!current.visible && !backgroundAllowed) ||
+        !current.blocked ||
+        current.dialogDismissCSS !== FACEBOOK_BROWSE_DIALOG_DISMISS_CSS
+      )
+        throw Error('FACEBOOK_BROWSE_DIALOG_DISMISS_TARGET_CHANGED');
+    }
     if (['browseNavigate', 'browseScroll', 'browsePlay'].includes(action.kind)) {
-      const step = (await this.tasks.steps(this.plan.id)).find((s) => s.status === 'ACTIVE');
+      const step = active;
       if (
         !step ||
         step.spec.type === 'post' ||
@@ -370,15 +523,19 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
         if (step.spec.type === 'marketplace') {
           const item = facebookMarketplaceItemURL(action.url);
           if (item) {
-            const current = await readFacebookBrowsePage(
-              this.owned.page,
-              async () => await this.assertLive(),
-            );
+            const current =
+              currentBrowsePage ??
+              (await this.readBrowsePage(
+                this.owned.page,
+                async () => await this.assertLive(),
+                false,
+                true,
+              ));
             if (
               item !== action.url ||
               !matchesMarketplaceSearch(current.url, step.spec) ||
               !current.ready ||
-              !current.visible ||
+              (!current.visible && !backgroundAllowed) ||
               current.blocked ||
               !current.marketplaceItems?.includes(item)
             )
@@ -392,7 +549,13 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
       } else if (action.kind === 'browseScroll' || action.kind === 'browsePlay') {
         const current =
           feedInput ??
-          (await readFacebookBrowsePage(this.owned.page, async () => await this.assertLive()));
+          currentBrowsePage ??
+          (await this.readBrowsePage(
+            this.owned.page,
+            async () => await this.assertLive(),
+            false,
+            true,
+          ));
         const inputFence =
           action.kind === 'browseScroll'
             ? {
@@ -457,11 +620,10 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
           }
           throw Error('FACEBOOK_BROWSE_DOCUMENT_OR_TARGET_CHANGED');
         }
-        if (!current.visible && !(activationPreparation && (await this.canPresentTaskPage())))
-          throw Error(BROWSE_VISIBILITY_WAIT);
+        if (!current.visible && !backgroundAllowed) throw Error(BROWSE_VISIBILITY_WAIT);
         if (
           action.kind === 'browsePlay' &&
-          current.visible &&
+          (current.visible || backgroundAllowed) &&
           current.video &&
           !current.video.paused
         )
@@ -485,7 +647,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     appliedScrollDelta: number,
     activationPreparation = false,
   ) {
-    const active = (await this.tasks.steps(this.plan.id)).find((step) => step.status === 'ACTIVE');
+    const active = (await this.currentSteps()).find((step) => step.status === 'ACTIVE');
     if (post && active?.spec.type === 'post' && active.spec.destination === 'story') {
       await this.assertLive();
       if (
@@ -506,7 +668,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     if (post?.link.purpose === 'PREPARE_HOME') {
       await this.assertLive();
       if (!this.owned) throw Error('FACEBOOK_NATIVE_TARGET_REQUIRED');
-      const step = (await this.tasks.steps(this.plan.id)).find((item) => item.status === 'ACTIVE');
+      const step = (await this.currentSteps()).find((item) => item.status === 'ACTIVE');
       if (
         step?.spec.type !== 'post' ||
         step.spec.destination === 'story' ||
@@ -528,7 +690,7 @@ export class NativeFacebookTaskAuthority implements FacebookTaskAuthority {
     )
       throw Error('FACEBOOK_NATIVE_ORIGINAL_POST_REQUIRED');
     validatePostAction(post.intent, post.link.purpose, action);
-    const active = (await this.tasks.steps(this.plan.id)).find(
+    const active = (await this.currentSteps()).find(
       (step) => step.id === post.intent.stepId && step.status === 'ACTIVE',
     );
     if (active?.spec.type === 'post' && active.spec.destination === 'story') {

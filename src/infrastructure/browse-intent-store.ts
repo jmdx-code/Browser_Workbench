@@ -6,26 +6,28 @@ import { validateBrowseIntent } from '../domain/browse-policy.js';
 import { BrowseIntent, BrowseOperationIntent, type Intent } from '../shared/browse-execution.js';
 import type { Action } from '../shared/browser-actions.js';
 import { transaction } from './sqlite-transaction.js';
+import { prepareCached } from './sqlite-statement-cache.js';
 
 export class SqliteBrowseIntentRepository implements BrowseIntentRepository {
   constructor(
     private readonly db: DatabaseSync,
     private readonly tasks: TaskRepository,
   ) {}
+  private stmt(sql: string) {
+    return prepareCached(this.db, sql);
+  }
   get(operationId: string) {
-    const row = this.db
-      .prepare('SELECT body FROM task_browse_intents WHERE operation_id=?')
-      .get(operationId);
+    const row = this.stmt('SELECT body FROM task_browse_intents WHERE operation_id=?').get(
+      operationId,
+    );
     if (!row) throw Error('BROWSE_INTENT_REQUIRED');
     return BrowseOperationIntent.parse(JSON.parse(String(row.body)) as unknown);
   }
   hasAccountLiked(accountId: string | null, contentId: string): boolean {
     if (!accountId) return false;
-    const rows = this.db
-      .prepare(
-        "SELECT i.body FROM task_browse_intents i JOIN task_outbox o ON o.id=i.operation_id JOIN task_plans p ON p.id=i.job_id WHERE p.account_id=? AND o.status IN ('DISPATCHING','ACKNOWLEDGED','UNKNOWN','VERIFIED')",
-      )
-      .all(accountId);
+    const rows = this.stmt(
+      "SELECT i.body FROM task_browse_intents i JOIN task_outbox o ON o.id=i.operation_id JOIN task_plans p ON p.id=i.job_id WHERE p.account_id=? AND json_extract(i.body, '$.intent.kind')='like' AND json_extract(i.body, '$.intent.contentId')=? AND o.status IN ('DISPATCHING','ACKNOWLEDGED','UNKNOWN','VERIFIED')",
+    ).all(accountId, contentId);
     return rows.some((row) => {
       try {
         const previous = BrowseOperationIntent.parse(
@@ -44,19 +46,17 @@ export class SqliteBrowseIntentRepository implements BrowseIntentRepository {
       const step = this.tasks.steps(jobId).find((row) => row.id === stepId);
       if (!step) throw Error('BROWSE_STEP_NOT_FOUND');
       validateBrowseIntent(step, action, intent);
-      const exists = this.db
-        .prepare('SELECT operation_id FROM task_browse_intents WHERE operation_id=?')
-        .get(operationId);
+      const exists = this.stmt(
+        'SELECT operation_id FROM task_browse_intents WHERE operation_id=?',
+      ).get(operationId);
       if (exists && JSON.stringify(this.get(operationId)) !== JSON.stringify(body))
         throw Error('BROWSE_INTENT_ID_CONFLICT');
       const plan = this.tasks.get(jobId);
       if (plan.profileId !== intent.proof.profileId) throw Error('BROWSE_INTENT_PROFILE_MISMATCH');
       if (intent.kind === 'like') {
-        const rows = this.db
-          .prepare(
-            "SELECT i.body FROM task_browse_intents i JOIN task_outbox o ON o.id=i.operation_id JOIN task_plans p ON p.id=i.job_id WHERE p.account_id=? AND o.id<>? AND o.status IN ('DISPATCHING','ACKNOWLEDGED','UNKNOWN','VERIFIED')",
-          )
-          .all(plan.accountId, operationId);
+        const rows = this.stmt(
+          "SELECT i.body FROM task_browse_intents i JOIN task_outbox o ON o.id=i.operation_id JOIN task_plans p ON p.id=i.job_id WHERE p.account_id=? AND o.id<>? AND json_extract(i.body, '$.intent.kind')='like' AND json_extract(i.body, '$.intent.contentId')=? AND o.status IN ('DISPATCHING','ACKNOWLEDGED','UNKNOWN','VERIFIED')",
+        ).all(plan.accountId, operationId, intent.contentId);
         if (
           rows.some((row) => {
             const previous = BrowseOperationIntent.parse(
@@ -69,9 +69,13 @@ export class SqliteBrowseIntentRepository implements BrowseIntentRepository {
       }
       const operation = this.tasks.prepareOperation(jobId, stepId, operationId, action);
       if (!exists)
-        this.db
-          .prepare('INSERT INTO task_browse_intents VALUES(?,?,?,?,?)')
-          .run(operationId, jobId, stepId, JSON.stringify(body), Date.now());
+        this.stmt('INSERT INTO task_browse_intents VALUES(?,?,?,?,?)').run(
+          operationId,
+          jobId,
+          stepId,
+          JSON.stringify(body),
+          Date.now(),
+        );
       return operation;
     });
   }

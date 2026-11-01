@@ -13,10 +13,21 @@ export interface KernelStateStorage {
   read(): Promise<unknown>;
   write(state: KernelState): Promise<void>;
 }
+const sameTabProof = (a: TabProof | null | undefined, b: TabProof | null | undefined): boolean =>
+  Boolean(
+    a &&
+    b &&
+    a.ownershipId === b.ownershipId &&
+    a.profileId === b.profileId &&
+    a.browserSessionEpoch === b.browserSessionEpoch &&
+    a.tabId === b.tabId &&
+    a.targetId === b.targetId,
+  );
 export class KernelJournal {
   private state: KernelState | undefined;
   private tail: Promise<unknown> = Promise.resolve();
   private healthy = true;
+  private revision = 0;
   constructor(private readonly storage: KernelStateStorage) {}
   private serialized<T>(run: () => Promise<T>): Promise<T> {
     const pending = this.tail.catch(() => {}).then(run);
@@ -30,13 +41,19 @@ export class KernelJournal {
   get writable(): boolean {
     return this.healthy && this.state !== undefined;
   }
+  get currentRevision(): number {
+    return this.revision;
+  }
   private async commit(next: KernelState): Promise<void> {
     const parsed = KernelPersistentState.parse(next);
     try {
       await this.storage.write(parsed);
       this.state = parsed;
+      this.revision++;
     } catch (error) {
       this.healthy = false;
+      // Invalidate every snapshot taken before the failure; readers re-read and are rejected.
+      this.revision += 1;
       throw error;
     }
   }
@@ -82,12 +99,12 @@ export class KernelJournal {
     });
   }
   snapshot(): Promise<KernelState> {
-    return this.serialized(async () => KernelPersistentState.parse(this.current()));
+    return this.serialized(async () => structuredClone(this.current()));
   }
   begin(input: Binding): Promise<{ fresh: boolean; record: KernelState['operations'][number] }> {
     const binding = DispatchBinding.parse(input);
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       if (binding.profileId !== next.profileId) throw Error('KERNEL_OPERATION_PROFILE_MISMATCH');
       const old = next.operations.find((row) => row.binding.operationId === binding.operationId);
       if (old) {
@@ -110,7 +127,7 @@ export class KernelJournal {
   finish(input: Binding, state: 'ACKNOWLEDGED' | 'UNKNOWN', reason = ''): Promise<void> {
     const binding = DispatchBinding.parse(input);
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const record = next.operations.find((row) => row.binding.operationId === binding.operationId);
       if (!record || !sameBinding(record.binding, binding))
         throw Error('KERNEL_OPERATION_BINDING_REJECTED');
@@ -130,7 +147,7 @@ export class KernelJournal {
     const binding = DispatchBinding.parse(input);
     resolution = KernelOperationRecord.shape.resolution.unwrap().parse(resolution);
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const record = next.operations.find((row) => row.binding.operationId === binding.operationId);
       if (!record || !sameBinding(record.binding, binding))
         throw Error('KERNEL_OPERATION_BINDING_REJECTED');
@@ -139,7 +156,11 @@ export class KernelJournal {
           throw Error('KERNEL_RECONCILIATION_CONFLICT');
         return;
       }
-      if (record.state !== 'UNKNOWN' && record.state !== 'ACKNOWLEDGED')
+      if (
+        record.state !== 'UNKNOWN' &&
+        record.state !== 'ACKNOWLEDGED' &&
+        !(record.state === 'DISPATCHING' && resolution.outcome === 'NOT_APPLIED')
+      )
         throw Error('KERNEL_RECONCILIATION_NOT_REQUIRED');
       if (resolution.outcome === 'CONTROL_RELEASED' && record.state !== 'ACKNOWLEDGED')
         throw Error('KERNEL_CONTROL_RELEASE_ACK_REQUIRED');
@@ -150,7 +171,7 @@ export class KernelJournal {
   }
   prepareTab(ownershipId: string, url: string): Promise<void> {
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       if (next.tabs.some((row) => row.ownershipId === ownershipId))
         throw Error('KERNEL_TAB_CREATE_ALREADY_RECORDED');
       if (next.tabs.some((row) => ['CREATING', 'UNKNOWN'].includes(row.state)))
@@ -163,7 +184,7 @@ export class KernelJournal {
     const binding = DispatchBinding.parse(input),
       disposition = OperationDisposition.parse(value);
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const record = next.operations.find((row) => row.binding.operationId === binding.operationId);
       if (!record || !sameBinding(record.binding, binding))
         throw Error('KERNEL_OPERATION_BINDING_REJECTED');
@@ -172,15 +193,16 @@ export class KernelJournal {
           throw Error('KERNEL_END_CONFLICT');
         return;
       }
-      if (!['UNKNOWN', 'ACKNOWLEDGED'].includes(record.state))
+      if (!['DISPATCHING', 'UNKNOWN', 'ACKNOWLEDGED'].includes(record.state))
         throw Error('KERNEL_END_NOT_REQUIRED');
+      if (record.state === 'DISPATCHING') record.state = 'UNKNOWN';
       record.disposition = disposition;
       await this.commit(next);
     });
   }
   confirmTab(proof: TabProof): Promise<void> {
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const row = next.tabs.find((tab) => tab.ownershipId === proof.ownershipId);
       if (
         !row ||
@@ -204,12 +226,12 @@ export class KernelJournal {
   }
   restoreWithdrawnTab(proof: TabProof): Promise<void> {
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const row = next.tabs.find((tab) => tab.ownershipId === proof.ownershipId);
       if (
         row?.state !== 'LOST' ||
         row.reason !== 'TASK_ENDED_OWNERSHIP_WITHDRAWN' ||
-        JSON.stringify(row.proof) !== JSON.stringify(proof) ||
+        !sameTabProof(row.proof, proof) ||
         proof.profileId !== next.profileId ||
         proof.browserSessionEpoch !== next.browserSessionEpoch ||
         next.operations.some(kernelOperationPending)
@@ -222,12 +244,12 @@ export class KernelJournal {
   }
   reobserveMain(previous: TabProof, proof: TabProof, url: string): Promise<void> {
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const old = next.tabs.find((tab) => tab.ownershipId === previous.ownershipId);
       if (
         old?.state !== 'LOST' ||
         old.reason !== 'BROWSER_SESSION_CHANGED' ||
-        JSON.stringify(old.proof) !== JSON.stringify(previous) ||
+        !sameTabProof(old.proof, previous) ||
         previous.profileId !== next.profileId ||
         proof.profileId !== next.profileId ||
         proof.browserSessionEpoch !== next.browserSessionEpoch ||
@@ -255,7 +277,7 @@ export class KernelJournal {
   bindWorkspaceMainTab(input: TabProof, url: string): Promise<TabProof> {
     const proof = OwnedTabProof.parse(input);
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       if (
         proof.profileId !== next.profileId ||
         proof.browserSessionEpoch !== next.browserSessionEpoch ||
@@ -298,7 +320,7 @@ export class KernelJournal {
     reason: string,
   ): Promise<void> {
     return this.serialized(async () => {
-      const next = KernelPersistentState.parse(this.current());
+      const next = structuredClone(this.current());
       const row = next.tabs.find((tab) => tab.ownershipId === ownershipId);
       if (!row) throw Error('KERNEL_TAB_NOT_RECORDED');
       if (row.state === 'CLOSED') return;

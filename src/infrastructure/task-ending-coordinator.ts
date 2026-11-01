@@ -31,10 +31,34 @@ export class TaskEndingCoordinator {
       .catch(() => {});
     return work;
   }
-  async stopOffline(planId: string, hasOwner: boolean): Promise<Plan | null> {
+  async stopOffline(
+    planId: string,
+    hasOwner: boolean,
+    reason = 'OFFLINE_BROWSE_CANCELLED',
+    options?: {
+      expectedUpdatedAt?: number;
+      reviewIfBlocked?: boolean;
+      canStopOffline?: () => boolean;
+    },
+  ): Promise<Plan | null> {
+    if (hasOwner || options?.canStopOffline?.() === false) return null;
     const plan = await this.store.tasks.get(planId);
-    if (hasOwner || this.core.peers.get(plan.profileId)?.online) return null;
-    return await this.store.tasks.stopOfflineBrowse(planId);
+    const peer = this.core.peers.get(plan.profileId);
+    if (
+      hasOwner ||
+      (peer?.online === true && peer.browserWindowCount !== 0) ||
+      options?.canStopOffline?.() === false ||
+      (options?.expectedUpdatedAt !== undefined && plan.updatedAt !== options.expectedUpdatedAt)
+    )
+      return null;
+    return await this.store.tasks.stopOfflineBrowse(planId, reason, {
+      ...(options?.expectedUpdatedAt !== undefined
+        ? { expectedUpdatedAt: options.expectedUpdatedAt }
+        : {}),
+      ...(options?.reviewIfBlocked !== undefined
+        ? { reviewIfBlocked: options.reviewIfBlocked }
+        : {}),
+    });
   }
   private async run(planId: string): Promise<Plan> {
     const plan = await this.store.tasks.get(planId);

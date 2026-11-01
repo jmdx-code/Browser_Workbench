@@ -60,6 +60,57 @@ export type Reply = {
   evidence?: unknown;
   error?: string;
 };
+export type WindowBounds = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+export type WindowDisplayBounds = {
+  id: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+};
+export type InspectBrowserWindowCommand = {
+  type: 'INSPECT_BROWSER_WINDOW';
+  requestId: string;
+  connectionEpoch: string;
+};
+export type PositionBrowserWindowCommand = {
+  type: 'POSITION_BROWSER_WINDOW';
+  requestId: string;
+  connectionEpoch: string;
+  bounds: WindowBounds;
+  focus?: boolean;
+};
+export type BrowserWindowInspectedReply = {
+  type: 'BROWSER_WINDOW_INSPECTED';
+  requestId: string;
+  connectionEpoch: string;
+  windowId?: number;
+  tabId?: number;
+  focused?: boolean;
+  lastFocusedAt?: number;
+  state?: string;
+  bounds?: WindowBounds;
+  contentInsets?: { left: number; top: number; right: number; bottom: number };
+  displays?: WindowDisplayBounds[];
+  error?: string;
+};
+export type BrowserWindowPositionedReply = {
+  type: 'BROWSER_WINDOW_POSITIONED';
+  requestId: string;
+  connectionEpoch: string;
+  windowId?: number;
+  tabId?: number;
+  focused?: boolean;
+  state?: string;
+  bounds?: WindowBounds;
+  contentInsets?: { left: number; top: number; right: number; bottom: number };
+  error?: string;
+};
 export class BridgeError extends Error {
   constructor(public code: string) {
     super(code);

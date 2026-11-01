@@ -1,5 +1,4 @@
 import { Worker } from 'node:worker_threads';
-import { serialize } from 'node:v8';
 import { existsSync } from 'node:fs';
 import { ProductError } from '../domain/workspace.js';
 import { BridgeError } from '../bridge/protocol.js';
@@ -156,13 +155,6 @@ export class PersistenceClient {
     if (this.closing && !closing) return Promise.reject(Error('PERSISTENCE_CLOSING'));
     if (this.pending.size >= 256 && !closing)
       return Promise.reject(Error('PERSISTENCE_QUEUE_FULL'));
-    let bytes: number;
-    try {
-      bytes = serialize(args).byteLength;
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    if (bytes > 8 * 1024 * 1024) return Promise.reject(Error('PERSISTENCE_REQUEST_TOO_LARGE'));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { path: path.join('.'), resolve, reject });

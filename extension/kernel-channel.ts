@@ -23,9 +23,65 @@ import {
   type PresentationRecoveryDecision,
 } from '../src/shared/presentation-recovery.js';
 import { TaskWindowController } from './task-window-controller.js';
+import type { TaskRendering } from './task-rendering.js';
+
+async function withBoundedWait<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<{ completed: true; value: T } | { completed: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ completed: true as const, value })),
+      new Promise<{ completed: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ completed: false }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export class ExtensionKernelChannel {
   private readonly windows = new TaskWindowController();
+  private abandoned = false;
+  private stopUnconfirmed = false;
+  private readonly stopWrites = new Set<Promise<void>>();
+  private stopWriteFailed = false;
+  private customRendering: TaskRendering | undefined;
+  abandon(): void {
+    this.abandoned = true;
+    this.stopUnconfirmed = true;
+    this.activeOperation = undefined;
+    for (const pending of this.recoveryPending.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(false);
+    }
+    this.recoveryPending.clear();
+    this.backend?.forgetRendering?.();
+    this.customRendering?.forgetAll();
+    this.executor?.markUnconfirmed();
+  }
+  isStopUnconfirmed(): boolean {
+    return this.stopUnconfirmed;
+  }
+  setStopUnconfirmed(unconfirmed = true): void {
+    this.stopUnconfirmed = unconfirmed;
+    if (unconfirmed) {
+      this.activeOperation = undefined;
+      this.executor?.markUnconfirmed();
+    }
+  }
+  get rendering(): TaskRendering | undefined {
+    return this.customRendering ?? this.backend?.rendering;
+  }
+  set rendering(value: TaskRendering | undefined) {
+    this.customRendering = value;
+  }
+  private emit(message: unknown): void {
+    if (this.abandoned) return;
+    this.output(message);
+  }
   private readonly recoveryPending = new Map<
     string,
     {
@@ -88,7 +144,7 @@ export class ExtensionKernelChannel {
         timer,
       });
       try {
-        this.output({
+        this.emit({
           type: 'PRESENTATION_RECOVERY_REQUEST',
           requestId,
           proof,
@@ -127,15 +183,24 @@ export class ExtensionKernelChannel {
       allowRead: () => boolean,
       currentOperation: () => Binding | undefined,
     ) => KernelNativeBackend = (allowInput, journal, access, allowRead, currentOperation) =>
-      new ChromeKernelBackend(journal, allowInput, access, allowRead, currentOperation),
+      new ChromeKernelBackend(
+        journal,
+        allowInput,
+        access,
+        allowRead,
+        currentOperation,
+        undefined,
+        this.windows,
+      ),
     private readonly journal: KernelJournal = kernelJournal,
   ) {}
   receive(value: unknown): void {
+    if (this.abandoned) return;
     const request = KernelRequest.parse(value);
     const context = this.context();
     if (request.connectionEpoch !== context.epoch) throw Error('KERNEL_CONTEXT_REJECTED');
     if (!context.valid || request.sequence <= this.lastSequence) {
-      this.output({
+      this.emit({
         type: 'KERNEL_REPLY',
         requestId: request.requestId,
         connectionEpoch: request.connectionEpoch,
@@ -146,7 +211,7 @@ export class ExtensionKernelChannel {
     }
     this.lastSequence = request.sequence;
     if (request.kind !== 'open' && request.leaseId !== this.activeLeaseId) {
-      this.output({
+      this.emit({
         type: 'KERNEL_REPLY',
         requestId: request.requestId,
         connectionEpoch: request.connectionEpoch,
@@ -164,8 +229,8 @@ export class ExtensionKernelChannel {
       throw Error('KERNEL_RPC_BUDGET_EXCEEDED');
     const operation = this.handle(request)
       .then((result) => {
-        if (request.connectionEpoch === this.context().epoch)
-          this.output({
+        if (!this.abandoned && request.connectionEpoch === this.context().epoch)
+          this.emit({
             type: 'KERNEL_REPLY',
             requestId: request.requestId,
             connectionEpoch: request.connectionEpoch,
@@ -174,8 +239,8 @@ export class ExtensionKernelChannel {
           });
       })
       .catch((error: unknown) => {
-        if (request.connectionEpoch === this.context().epoch)
-          this.output({
+        if (!this.abandoned && request.connectionEpoch === this.context().epoch)
+          this.emit({
             type: 'KERNEL_REPLY',
             requestId: request.requestId,
             connectionEpoch: request.connectionEpoch,
@@ -199,8 +264,11 @@ export class ExtensionKernelChannel {
       .catch(() => {});
   }
   private async handle(request: Request): Promise<KernelJsonObject> {
+    if (this.abandoned) throw Error('KERNEL_CHANNEL_ABANDONED');
+    if (this.stopUnconfirmed && request.kind !== 'stop') throw Error('KERNEL_STOP_NOT_CONFIRMED');
     if (request.kind === 'open') {
       if (
+        this.stopUnconfirmed ||
         (this.executor &&
           (this.executor.state !== 'stopped' ||
             (this.executor.reviewRequired && !request.summaryOnly))) ||
@@ -209,7 +277,8 @@ export class ExtensionKernelChannel {
         this.businessPending.size
       )
         throw Error('KERNEL_ALREADY_OPEN_OR_REVIEW_REQUIRED');
-      if (request.leaseId !== request.stamp.leaseId) throw Error('KERNEL_LEASE_REJECTED');
+      if (request.leaseId !== request.stamp.leaseId)
+        throw Error('KERNEL_LEASE_REJECTED:lease_id_mismatch');
       const context = this.context();
       const lease = new KernelLease(context.profileId, context.epoch);
       const access = request.access ?? 'fixture';
@@ -223,6 +292,8 @@ export class ExtensionKernelChannel {
           try {
             const stamp = executor.lease.check();
             return (
+              !this.abandoned &&
+              !this.stopUnconfirmed &&
               !request.summaryOnly &&
               access !== 'facebook-readonly' &&
               executor.state === 'running' &&
@@ -243,7 +314,12 @@ export class ExtensionKernelChannel {
         () => {
           try {
             executor.lease.check();
-            return executor.state === 'running' && this.context().valid;
+            return (
+              !this.abandoned &&
+              !this.stopUnconfirmed &&
+              executor.state === 'running' &&
+              this.context().valid
+            );
           } catch {
             return false;
           }
@@ -371,13 +447,15 @@ export class ExtensionKernelChannel {
           inventory.operations.some((row) => row.state !== 'RECONCILED' && !row.disposition)
         )
           throw Error('KERNEL_PAGE_QUIESCE_PROOF_OR_OPERATION_CHANGED');
-        const evidence = await this.stopExecutor(request.requestId, true);
+        const evidence = await this.stopExecutor(request.requestId, false);
         const result = KernelJsonObject.parse({
           ...evidence,
-          pageRetained: true,
+          pageRetained: evidence.state === 'stopped',
           generation: executor.lease.generation,
         });
-        this.quiesced = { requestId: request.requestId, scope, result };
+        if (evidence.state === 'stopped') {
+          this.quiesced = { requestId: request.requestId, scope, result };
+        }
         return result;
       }
       case 'scope':
@@ -386,7 +464,7 @@ export class ExtensionKernelChannel {
         executor.lease.check();
         return {};
       case 'attach':
-        return KernelJsonObject.parse({ info: await executor.attach(request.tabId) });
+        return { info: await executor.attach(request.tabId) } as unknown as KernelJsonObject;
       case 'detach':
         await backend.detach(request.tabId);
         return {};
@@ -394,7 +472,7 @@ export class ExtensionKernelChannel {
         return await executor.create(request.url, request.ownershipId, request.foreground);
       case 'inventory':
         executor.lease.check();
-        return KernelJsonObject.parse(await (backend.inventory?.() ?? this.journal.snapshot()));
+        return (await (backend.inventory?.() ?? this.journal.snapshot())) as KernelJsonObject;
       case 'observeFacebookIdentity':
         return KernelJsonObject.parse({
           identity: await executor.observeFacebookIdentity(request.tabId),
@@ -447,7 +525,7 @@ export class ExtensionKernelChannel {
           executor.lease.check(stamp);
           if (executor.state !== 'running' || !this.context().valid) throw Error('KERNEL_FENCED');
           if (result.fresh) this.activeOperation = request.binding;
-          return KernelJsonObject.parse(result);
+          return result as unknown as KernelJsonObject;
         } catch (error) {
           if (result.fresh) await this.journal.finish(request.binding, 'UNKNOWN', 'BEGIN_FENCED');
           throw error;
@@ -647,6 +725,14 @@ export class ExtensionKernelChannel {
         !kernelAccessURL(frame.data.url, this.access)
       ) {
         void this.freeze().catch(() => {});
+        this.emit({
+          type: 'KERNEL_EVENT',
+          connectionEpoch: this.context().epoch,
+          leaseId: this.activeLeaseId,
+          source: { tabId: source.tabId },
+          method: 'Inspector.detached',
+          params: { reason: 'main_frame_escaped' },
+        });
         return;
       }
     }
@@ -656,7 +742,7 @@ export class ExtensionKernelChannel {
     }
     if (method === 'Target.detachedFromTarget' && typeof params.sessionId === 'string')
       executor.forgetChild(source.tabId, params.sessionId);
-    this.output({
+    this.emit({
       type: 'KERNEL_EVENT',
       connectionEpoch: this.context().epoch,
       leaseId: this.activeLeaseId,
@@ -670,7 +756,7 @@ export class ExtensionKernelChannel {
     this.backend.detached(tabId);
     if (this.backend.expectedDetach(tabId)) return;
     void this.freeze().catch(() => {});
-    this.output({
+    this.emit({
       type: 'KERNEL_EVENT',
       connectionEpoch: this.context().epoch,
       leaseId: this.activeLeaseId,
@@ -688,40 +774,204 @@ export class ExtensionKernelChannel {
   freeze(): Promise<void> {
     if (this.freezing) return this.freezing;
     const executor = this.executor;
-    if (!executor) return Promise.resolve();
+    if (!executor) {
+      if (this.stopUnconfirmed) return Promise.reject(Error('KERNEL_STOP_UNCONFIRMED'));
+      return Promise.resolve();
+    }
     this.freezing = (async () => {
-      const evidence = await this.stopExecutor(crypto.randomUUID());
-      if (evidence.state !== 'stopped') throw Error('KERNEL_STOP_UNCONFIRMED');
+      const evidence = await this.stopExecutor(crypto.randomUUID(), true);
+      if (evidence.state !== 'stopped') {
+        this.stopUnconfirmed = true;
+        throw Error('KERNEL_STOP_UNCONFIRMED');
+      }
     })().finally(() => {
       this.freezing = undefined;
     });
     return this.freezing;
   }
-  private stopExecutor(requestId: string, retainAttachments = false): Promise<KernelStopEvidence> {
+  async control(
+    msg: { type: 'STOP'; id?: string; requestId?: string; connectionEpoch?: string },
+    options?: {
+      previousTimeoutMs?: number;
+      journalTimeoutMs?: number;
+      releaseTimeoutMs?: number;
+      stopTimeoutMs?: number;
+    },
+  ): Promise<KernelStopEvidence> {
+    const reqId = msg.requestId ?? msg.id ?? crypto.randomUUID();
+    const epoch = msg.connectionEpoch ?? this.context().epoch;
+    const stopped = await this.stopExecutor(reqId, true, options);
+    if (stopped.state === 'stopped') {
+      this.emit({
+        type: 'STOPPED',
+        ...(msg.id !== undefined ? { id: msg.id, ok: true, result: { type: 'STOPPED' } } : {}),
+        requestId: reqId,
+        connectionEpoch: epoch,
+      });
+    } else {
+      this.emit({
+        type: 'STOP_UNCONFIRMED',
+        ...(msg.id !== undefined ? { id: msg.id } : {}),
+        requestId: reqId,
+        connectionEpoch: epoch,
+        ok: false,
+        error: 'KERNEL_STOP_UNCONFIRMED',
+        unresolvedMethods: stopped.unresolvedMethods,
+      });
+    }
+    return stopped;
+  }
+  stopExecutor(
+    requestId: string,
+    detach = true,
+    options?: {
+      previousTimeoutMs?: number;
+      journalTimeoutMs?: number;
+      releaseTimeoutMs?: number;
+      stopTimeoutMs?: number;
+    },
+  ): Promise<KernelStopEvidence> {
     const executor = this.executor;
     if (!executor) return Promise.reject(Error('KERNEL_NOT_OPEN'));
     const binding = this.activeOperation;
     this.activeOperation = undefined; // Synchronous input gate, before storage or detach awaits.
+    executor.revokeFiles();
     for (const pending of this.recoveryPending.values()) {
       clearTimeout(pending.timer);
       pending.resolve(false);
     }
     this.recoveryPending.clear();
-    const renderingStopped = Promise.allSettled([
-      this.backend?.releaseRendering?.() ?? Promise.resolve(),
-      this.windows.drain(),
-    ]);
     const previous = this.stoppingRpc;
-    const operation = previous
-      ? previous.catch(() => {}).then(() => executor.stop(requestId, 12_000, retainAttachments))
-      : executor.stop(requestId, 12_000, retainAttachments);
-    const drained = (async () => {
-      if (binding) await this.journal.finish(binding, 'UNKNOWN', 'CONTROL_STOPPED');
-      await Promise.allSettled([...this.businessPending]);
-      const stopped = await operation;
-      const rendering = await renderingStopped;
-      for (const result of rendering) if (result.status === 'rejected') throw result.reason;
-      return stopped;
+    const previousTimeoutMs = options?.previousTimeoutMs ?? 3_000;
+    const journalTimeoutMs = options?.journalTimeoutMs ?? 3_000;
+    const releaseTimeoutMs = options?.releaseTimeoutMs ?? 2_500;
+    const stopTimeoutMs = options?.stopTimeoutMs ?? 10_000;
+    const retainAttachments = !detach;
+    // Start native detach immediately, before old stop promises or storage waits.
+    let operation: Promise<KernelStopEvidence>;
+    try {
+      if (previous) {
+        executor.fence();
+        // A second STOP must not wait for a renderer before initiating native detach.
+        if (detach) void withBoundedWait(executor.forceDetachAll(), stopTimeoutMs).catch(() => {});
+        operation = (async () => {
+          const earlier = await withBoundedWait(
+            previous.catch(() => undefined),
+            previousTimeoutMs,
+          );
+          if (!earlier.completed)
+            return {
+              requestId,
+              state: 'unconfirmed' as const,
+              unresolvedMethods: ['PreviousStop'],
+            };
+          return executor.stop(requestId, stopTimeoutMs, retainAttachments);
+        })();
+      } else operation = executor.stop(requestId, stopTimeoutMs, retainAttachments);
+    } catch {
+      if (detach) void withBoundedWait(executor.forceDetachAll(), stopTimeoutMs).catch(() => {});
+      operation = Promise.resolve({
+        requestId,
+        state: 'unconfirmed',
+        unresolvedMethods: ['PreviousStop'],
+      });
+    }
+    // Attach rejection handlers now; storage can take longer than native stop.
+    const stopped = withBoundedWait(operation, stopTimeoutMs + 200).catch(() => ({
+      completed: false as const,
+    }));
+    const businessDrain = withBoundedWait(
+      Promise.allSettled([...this.businessPending]),
+      journalTimeoutMs,
+    );
+    if (detach) {
+      this.backend?.forgetRendering?.();
+      this.customRendering?.forgetAll();
+    }
+    const releaseWork = (async () => {
+      if (!detach) {
+        const rendering = this.customRendering ?? this.backend?.rendering;
+        const release =
+          this.backend?.releaseRendering && !this.customRendering
+            ? this.backend.releaseRendering(undefined, releaseTimeoutMs)
+            : (rendering?.release(undefined, releaseTimeoutMs) ?? Promise.resolve(true));
+        const result = await withBoundedWait(release, releaseTimeoutMs + 100);
+        if (!result.completed || !result.value) return false;
+      }
+      const windows = await withBoundedWait(this.windows.drain(), releaseTimeoutMs);
+      return windows.completed;
+    })().catch(() => false);
+    const drained = (async (): Promise<KernelStopEvidence> => {
+      let previousStopTimedOut = false;
+      if (previous) {
+        const prevResult = await withBoundedWait(
+          previous.catch(() => undefined),
+          previousTimeoutMs,
+        );
+        if (!prevResult.completed) {
+          previousStopTimedOut = true;
+        }
+      }
+      let journalTimedOut = false;
+      if (binding) {
+        try {
+          const finishPromise = this.journal.finish(binding, 'UNKNOWN', 'CONTROL_STOPPED');
+          this.stopWrites.add(finishPromise);
+          void finishPromise
+            .catch(() => {
+              this.stopWriteFailed = true;
+            })
+            .finally(() => this.stopWrites.delete(finishPromise));
+          void finishPromise.catch(() => {});
+          const finishResult = await withBoundedWait(finishPromise, journalTimeoutMs);
+          if (!finishResult.completed) {
+            journalTimedOut = true;
+          }
+        } catch {
+          journalTimedOut = true;
+        }
+      }
+      const business = await businessDrain;
+      const released = await releaseWork;
+      const stopResult = await stopped;
+      const stoppedEvidence: KernelStopEvidence = stopResult.completed
+        ? stopResult.value
+        : {
+            requestId,
+            state: 'unconfirmed',
+            unresolvedMethods: ['KernelExecutor.stop'],
+          };
+      const unresolved = new Set<string>(stoppedEvidence.unresolvedMethods);
+      if (!released) unresolved.add('TaskRendering.release');
+      if (journalTimedOut) unresolved.add('KernelJournal.finish');
+      if (this.stopWrites.size || this.stopWriteFailed) unresolved.add('KernelJournal.finish');
+      if (previousStopTimedOut) unresolved.add('PreviousStop');
+      if (!business.completed || this.businessPending.size) unresolved.add('BusinessPending');
+      const confirmed =
+        stoppedEvidence.state === 'stopped' &&
+        released &&
+        business.completed &&
+        this.businessPending.size === 0 &&
+        !this.abandoned &&
+        !journalTimedOut &&
+        this.stopWrites.size === 0 &&
+        !this.stopWriteFailed &&
+        !previousStopTimedOut;
+      if (confirmed) {
+        this.stopUnconfirmed = false;
+        return {
+          requestId,
+          state: 'stopped',
+          unresolvedMethods: [...unresolved],
+        };
+      }
+      this.stopUnconfirmed = true;
+      executor.markUnconfirmed();
+      return {
+        requestId,
+        state: 'unconfirmed',
+        unresolvedMethods: [...unresolved],
+      };
     })();
     this.stoppingRpc = drained;
     void drained
@@ -739,5 +989,19 @@ export class ExtensionKernelChannel {
     } catch {
       void this.freeze().catch(() => {});
     }
+  }
+  async exposePositionedWindow(tabId?: number): Promise<void> {
+    const backend = this.backend;
+    if (!backend?.setWindowExposure) return;
+    try {
+      const state = await this.journal.snapshot();
+      const ready =
+        (tabId !== undefined
+          ? state.tabs.find((t) => t.state === 'READY' && t.proof?.tabId === tabId)?.proof
+          : undefined) ??
+        state.workspaceMain ??
+        state.tabs.find((t) => t.state === 'READY' && t.proof)?.proof;
+      if (ready) await backend.setWindowExposure(ready, true).catch(() => {});
+    } catch {}
   }
 }

@@ -18,6 +18,7 @@ export type DevDiagCategory =
   | 'HTTP_API'
   | 'KERNEL_RPC'
   | 'GROUP_INVITER'
+  | 'GROUP_BUMPER'
   | 'SNAPSHOT'
   | 'SYSTEM';
 

@@ -118,6 +118,7 @@ async function generated() {
     id: randomUUID(),
     alias: '生成资料' + index,
     groupId: null,
+    order: 0,
     online: false,
     phase: 'PAUSED',
     synced: false,

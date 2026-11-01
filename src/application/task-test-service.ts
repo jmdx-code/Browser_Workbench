@@ -17,7 +17,7 @@ export class TaskTestService {
   constructor(
     private readonly workspace: WorkspaceService,
     private readonly tasks: TaskService,
-    private readonly isProfileExternalBusy?: (profileId: string) => boolean,
+    private readonly isProfileExternalBusy?: (profileId: string) => boolean | Promise<boolean>,
   ) {}
   async start(input: unknown) {
     const request = TaskTestRequest.parse(input);
@@ -51,21 +51,23 @@ export class TaskTestService {
     await this.tasks.releaseErroredPausedPlans(request.profileIds);
     const snapshot = await this.workspace.snapshot();
     const live = await this.tasks.livePlans();
-    const rejected = request.profileIds.flatMap((profileId) => {
+    const rejected: { profileId: string; reason: string }[] = [];
+    for (const profileId of request.profileIds) {
       const profile = snapshot.profiles.find((item) => item.id === profileId);
+      const externalBusy = (await this.isProfileExternalBusy?.(profileId)) === true;
       const reason = !profile?.online
         ? '浏览器未连接，请打开对应资料'
         : !marketplaceBridgeSupported(profile.extensionVersion, '0.3.21')
           ? '请将这份浏览器的桥接插件刷新到0.3.21或更新版本，再测试'
           : !profile.synced || profile.unresolved
             ? '连接正在对账或有待处理操作，请先查看状态'
-            : this.isProfileExternalBusy?.(profileId)
+            : externalBusy
               ? '正在执行小组邀请人任务，请先停止'
               : live.some((plan) => plan.profileId === profileId)
                 ? '已有任务未结束，请先停止或处理原任务'
                 : '';
-      return reason ? [{ profileId, reason }] : [];
-    });
+      if (reason) rejected.push({ profileId, reason });
+    }
     const eligible = request.profileIds.filter(
       (id) => !rejected.some((item) => item.profileId === id),
     );

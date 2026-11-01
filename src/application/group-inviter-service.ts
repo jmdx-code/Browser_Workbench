@@ -31,6 +31,10 @@ export interface GroupInviterRepository {
   listGroups(): Awaitable<InviterGroupRow[]>;
   upsertGroups(input: unknown): Awaitable<InviterGroupRow[]>;
   updateGroupAvatar(groupId: string, avatarUrl: string): Awaitable<void>;
+  updateGroupMetadata?(
+    groupId: string,
+    metadata: { groupName?: string | null; avatarUrl?: string | null },
+  ): Awaitable<void>;
   deleteGroups(input: unknown): Awaitable<number>;
   getInvitesPerGroup(): Awaitable<number>;
   setInvitesPerGroup(input: unknown): Awaitable<number>;
@@ -67,6 +71,10 @@ export interface GroupInviterBrowserRunner {
   isProfileReady(profileId: string): boolean;
   isProfileBusy?(profileId: string): Awaitable<boolean>;
   fetchGroupAvatar(group: InviterGroupRow, allowIdleBrowser: boolean): Promise<string | null>;
+  resolveGroupMetadata?(
+    group: InviterGroupRow,
+    allowIdleBrowser: boolean,
+  ): Promise<{ groupName?: string | null; avatarUrl?: string | null }>;
   inviteForGroup(
     profileId: string,
     group: InviterGroupRow,
@@ -188,8 +196,13 @@ export class GroupInviterService {
   }
 
   async addGroups(input: unknown): Promise<GroupInviterState> {
-    await this.repo.upsertGroups(input);
-    void this.fetchMissingAvatars();
+    const groups = await this.repo.upsertGroups(input);
+    const task = this.fetchMissingAvatars();
+    if (groups.some((g) => g.groupName === g.groupId)) {
+      await Promise.race([task, sleep(2500)]);
+    } else {
+      void task;
+    }
     return await this.state();
   }
 
@@ -201,6 +214,22 @@ export class GroupInviterService {
   async updateSettings(input: unknown): Promise<GroupInviterState> {
     await this.repo.setInvitesPerGroup(input);
     return await this.state();
+  }
+
+  async logs(search = '', before?: number, limit = 300): Promise<GroupInviteLogRow[]> {
+    const q = search.trim().toLowerCase();
+    const rows = await this.repo.listLogs();
+    return rows
+      .filter(
+        (r) =>
+          (before === undefined || r.invitedAt < before) &&
+          (!q ||
+            r.friendName.toLowerCase().includes(q) ||
+            r.friendId.toLowerCase().includes(q) ||
+            r.groupId.toLowerCase().includes(q) ||
+            r.profileId.toLowerCase().includes(q)),
+      )
+      .slice(0, limit);
   }
 
   isProfileRunning(profileId: string): boolean {
@@ -426,16 +455,27 @@ export class GroupInviterService {
   private async fetchMissingAvatars(): Promise<void> {
     if (!this.runner) return;
     const missing = (await this.repo.listGroups()).filter(
-      (g) => !g.avatarUrl && !this.avatarFetching.has(g.groupId),
+      (g) => (!g.avatarUrl || g.groupName === g.groupId) && !this.avatarFetching.has(g.groupId),
     );
     if (missing.length === 0) return;
 
     for (const group of missing) {
       this.avatarFetching.add(group.groupId);
       try {
-        const avatar = await this.runner.fetchGroupAvatar(group, this.activeRun === null);
-        if (avatar) {
-          await this.repo.updateGroupAvatar(group.groupId, avatar);
+        if (this.runner.resolveGroupMetadata) {
+          const meta = await this.runner.resolveGroupMetadata(group, this.activeRun === null);
+          if (meta.groupName || meta.avatarUrl) {
+            if (this.repo.updateGroupMetadata) {
+              await this.repo.updateGroupMetadata(group.groupId, meta);
+            } else if (meta.avatarUrl) {
+              await this.repo.updateGroupAvatar(group.groupId, meta.avatarUrl);
+            }
+          }
+        } else {
+          const avatar = await this.runner.fetchGroupAvatar(group, this.activeRun === null);
+          if (avatar) {
+            await this.repo.updateGroupAvatar(group.groupId, avatar);
+          }
         }
       } catch {
         // Ignore background avatar errors; avatar will also be captured during actual run

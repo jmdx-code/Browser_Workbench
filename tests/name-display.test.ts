@@ -171,6 +171,7 @@ test('name display rejects stale or foreign observations and never changes profi
     id: randomUUID(),
     alias: 'Browser alias',
     groupId: null,
+    order: 0,
     online: true,
     phase: 'PAUSED',
     synced: true,

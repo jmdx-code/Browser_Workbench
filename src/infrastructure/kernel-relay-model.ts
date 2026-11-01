@@ -105,7 +105,7 @@ export class KernelRelayModel {
       if (command.method === 'Target.getTargetInfo') {
         if (params.targetId && params.targetId !== tab?.targetInfo.targetId)
           throw Error('KERNEL_TARGET_NOT_OWNED');
-        if (tab) return KernelJsonObject.parse({ targetInfo: tab.targetInfo });
+        if (tab) return { targetInfo: tab.targetInfo } as unknown as KernelJsonObject;
       }
       // The publisher's observed controls all belong to the owned main page. Attaching every
       // embedded Facebook widget is unnecessary and can pause/detach initialization on an
@@ -167,7 +167,7 @@ export class KernelRelayModel {
           (row) => row.targetInfo.targetId === params.targetId,
         );
         if (!tab) throw Error('KERNEL_TARGET_NOT_OWNED');
-        return KernelJsonObject.parse({ targetInfo: tab.targetInfo });
+        return { targetInfo: tab.targetInfo } as unknown as KernelJsonObject;
       }
       default:
         // Including Browser.close, Storage.*, cookie clearing and setting changes.
@@ -191,11 +191,11 @@ export class KernelRelayModel {
       this.tabs.set(tabId, session);
       this.emit({
         method: 'Target.attachedToTarget',
-        params: KernelJsonObject.parse({
+        params: {
           sessionId: session.sessionId,
           targetInfo: { ...info, attached: true },
           waitingForDebugger: false,
-        }),
+        },
       });
       return session;
     })();
@@ -204,6 +204,17 @@ export class KernelRelayModel {
     return promise;
   }
   debuggerEvent(source: KernelTarget, method: string, value: unknown): void {
+    this.dispatchDebuggerEvent(source, method, () => KernelJsonObject.parse(value ?? {}));
+  }
+  // Only for callers whose params already passed the strict KernelEvent contract.
+  debuggerEventValidated(source: KernelTarget, method: string, params: KernelJsonObject): void {
+    this.dispatchDebuggerEvent(source, method, () => params);
+  }
+  private dispatchDebuggerEvent(
+    source: KernelTarget,
+    method: string,
+    readParams: () => KernelJsonObject,
+  ): void {
     if (this.closed || !this.executor.acceptsEvent(source)) return;
     const tab = this.tabs.get(source.tabId);
     if (!tab) {
@@ -216,7 +227,7 @@ export class KernelRelayModel {
         )?.[0]
       : tab.sessionId;
     if (!parent) return;
-    const params = KernelJsonObject.parse(value ?? {});
+    const params = readParams();
     if (method === 'Runtime.executionContextCreated') {
       const context = KernelJsonObject.safeParse(params.context);
       const auxiliary = context.success && KernelJsonObject.safeParse(context.data.auxData);

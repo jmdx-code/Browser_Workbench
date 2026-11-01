@@ -1,6 +1,7 @@
 import type { SynchronousRepository } from '../domain/persistence.js';
 import { TaskRecordReader } from './task-record-reader.js';
 import { CheckpointCommitQueue } from './checkpoint-commit-queue.js';
+import { classifySqliteInertAuxiliaryBrowseOperation } from './inert-browse-operation.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -8,6 +9,7 @@ import { Action, canonicalAction, isWrite } from '../shared/browser-actions.js';
 import {
   BrowsePendingDiagnostic,
   BrowseOperationIntent,
+  isRecoverableBrowseFault,
   type PendingDiagnostic,
 } from '../shared/browse-execution.js';
 import { validateBrowseIntent } from '../domain/browse-policy.js';
@@ -59,7 +61,8 @@ import {
 import { ProductError } from '../domain/workspace.js';
 import { needsResourceTable } from '../domain/task-resources.js';
 import { SqliteTaskResourceRepository } from './task-resource-store.js';
-import { readSnapshot, transaction } from './sqlite-transaction.js';
+import { isUncommittedTransaction, readSnapshot, transaction } from './sqlite-transaction.js';
+import { prepareCached } from './sqlite-statement-cache.js';
 import { TaskTiming } from '../shared/task-timing.js';
 import { taskTimingEligibility } from '../domain/task-timing.js';
 import { cancelNeverDispatchedPost } from './material-post-cancellation.js';
@@ -138,12 +141,12 @@ const CancelledBrowseReceipt = z
   .strict();
 export class SqliteTaskRepository implements TaskRepository {
   readonly recordReader: TaskRecordReader;
+  private stmt(sql: string) {
+    return prepareCached(this.db, sql);
+  }
   hiddenRecordIds() {
-    return this.db
-      .prepare("SELECT name FROM sqlite_master WHERE name='task_record_deletions'")
-      .get()
-      ? this.db
-          .prepare('SELECT step_id FROM task_record_deletions')
+    return this.stmt("SELECT name FROM sqlite_master WHERE name='task_record_deletions'").get()
+      ? this.stmt('SELECT step_id FROM task_record_deletions')
           .all()
           .map((r) => String(r.step_id))
       : [];
@@ -177,9 +180,20 @@ export class SqliteTaskRepository implements TaskRepository {
     );
   }
   private event(id: string, type: string, detail: Operation['receipt'] = null) {
-    this.db
-      .prepare('INSERT INTO task_events(job_id,type,detail,created_at) VALUES(?,?,?,?)')
-      .run(id, type, JSON.stringify(detail), this.dependencies.now());
+    if (type === 'SCHEDULE_RELEASED') {
+      // Release affects every plan of this batch only; other batches keep their caches.
+      const batchId =
+        this.planRowCache.get(id)?.plan.batchId ??
+        this.stmt('SELECT batch_id FROM task_plans WHERE id=?').get(id)?.batch_id;
+      if (typeof batchId === 'string') this.invalidateBatchTimingCache(batchId);
+      else this.invalidateBatchTimingCache();
+    }
+    this.stmt('INSERT INTO task_events(job_id,type,detail,created_at) VALUES(?,?,?,?)').run(
+      id,
+      type,
+      JSON.stringify(detail),
+      this.dependencies.now(),
+    );
   }
   noteQueuedWait(id: string, reason: string) {
     const plan = this.get(id);
@@ -194,42 +208,103 @@ export class SqliteTaskRepository implements TaskRepository {
     });
   }
   retainedTaskPage(profileId: string) {
-    const row = this.db
-      .prepare(
-        "SELECT o.proof FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state='RELEASED' AND s.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1",
-      )
-      .get(profileId);
+    const row = this.stmt(
+      "SELECT o.proof FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state='RELEASED' AND s.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1",
+    ).get(profileId);
     return row ? OwnedTabProof.parse(JSON.parse(String(row.proof))) : null;
   }
   private state(id: string, state: Plan['state'], reason: string) {
-    this.db
-      .prepare('UPDATE task_plans SET state=?,reason=?,updated_at=? WHERE id=?')
-      .run(state, reason, this.dependencies.now(), id);
+    this.stmt('UPDATE task_plans SET state=?,reason=?,updated_at=? WHERE id=?').run(
+      state,
+      reason,
+      this.dependencies.now(),
+      id,
+    );
     this.event(id, state, { reason });
   }
   private unlock(id: string) {
-    this.db.prepare('DELETE FROM task_account_locks WHERE job_id=?').run(id);
+    this.stmt('DELETE FROM task_account_locks WHERE job_id=?').run(id);
   }
   private readonly planRowCache = new Map<string, { key: string; plan: Plan }>();
+  private readonly batchTimingCache = new Map<
+    string,
+    {
+      body: string | null;
+      parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
+      timingReleased: boolean;
+    }
+  >();
+  invalidateBatchTimingCache(batchId?: string) {
+    if (batchId === undefined) {
+      this.batchTimingCache.clear();
+      this.planRowCache.clear();
+      return;
+    }
+    this.batchTimingCache.delete(batchId);
+    for (const [id, entry] of this.planRowCache)
+      if (entry.plan.batchId === batchId) this.planRowCache.delete(id);
+  }
+  ensurePlanExists(id: string): void {
+    const row = this.stmt('SELECT 1 FROM task_plans WHERE id=?').get(id);
+    if (!row) {
+      this.planRowCache.delete(id);
+      throw new ProductError('TASK_NOT_FOUND', '任务计划不存在', 404);
+    }
+  }
+  private resolveBatchTiming(batchId: string): {
+    body: string | null;
+    parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
+    timingReleased: boolean;
+  } {
+    const inWriteTx = isUncommittedTransaction(this.db);
+    if (inWriteTx) {
+      this.batchTimingCache.delete(batchId);
+    } else {
+      const cached = this.batchTimingCache.get(batchId);
+      if (cached !== undefined) {
+        this.batchTimingCache.delete(batchId);
+        this.batchTimingCache.set(batchId, cached);
+        return cached;
+      }
+    }
+    const timingRow = this.stmt('SELECT body FROM task_batch_timing WHERE batch_id=?').get(batchId);
+    const body = timingRow ? String(timingRow.body) : null;
+    const parsedTiming = body !== null ? TaskTiming.parse(JSON.parse(body)) : undefined;
+    const timingReleased =
+      body !== null
+        ? Boolean(
+            this.stmt(
+              "SELECT e.sequence FROM task_events e JOIN task_plans p ON p.id=e.job_id WHERE p.batch_id=? AND e.type='SCHEDULE_RELEASED' LIMIT 1",
+            ).get(batchId),
+          )
+        : false;
+    const entry = { body, parsedTiming, timingReleased };
+    if (!inWriteTx) {
+      this.batchTimingCache.set(batchId, entry);
+      while (this.batchTimingCache.size > 1024) {
+        const oldest = this.batchTimingCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.batchTimingCache.delete(oldest);
+      }
+    }
+    return entry;
+  }
   private parsePlanRow(row: Record<string, unknown>): Plan {
     const id = String(row.id);
     const batchId = String(row.batch_id);
-    const timing = this.db
-      .prepare('SELECT body FROM task_batch_timing WHERE batch_id=?')
-      .get(batchId);
-    const timingReleased = timing
-      ? !!this.db
-          .prepare(
-            "SELECT e.sequence FROM task_events e JOIN task_plans p ON p.id=e.job_id WHERE p.batch_id=? AND e.type='SCHEDULE_RELEASED' LIMIT 1",
-          )
-          .get(batchId)
-      : false;
-    const cacheKey = `${String(row.state)}:${String(row.updated_at)}:${String(row.reason)}:${String(row.control_mode)}:${String(row.control_request_id ?? '')}:${String(row.control_confirmed)}:${String(row.round)}:${String(row.position)}:${timing ? String(timing.body) : ''}:${String(timingReleased)}`;
-    const cached = this.planRowCache.get(id);
-    if (cached?.key === cacheKey) {
+    const inWriteTx = isUncommittedTransaction(this.db);
+    if (inWriteTx) {
       this.planRowCache.delete(id);
-      this.planRowCache.set(id, cached);
-      return cached.plan;
+    }
+    const timingInfo = this.resolveBatchTiming(batchId);
+    const cacheKey = `${String(row.state)}:${String(row.updated_at)}:${String(row.reason)}:${String(row.control_mode)}:${String(row.control_request_id ?? '')}:${String(row.control_confirmed)}:${String(row.round)}:${String(row.position)}:${timingInfo.body ?? ''}:${String(timingInfo.timingReleased)}`;
+    if (!inWriteTx) {
+      const cached = this.planRowCache.get(id);
+      if (cached?.key === cacheKey) {
+        this.planRowCache.delete(id);
+        this.planRowCache.set(id, cached);
+        return cached.plan;
+      }
     }
     const plan = TaskPlan.parse({
       id: row.id,
@@ -248,37 +323,39 @@ export class SqliteTaskRepository implements TaskRepository {
       position: row.position,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      ...(timing
+      ...(timingInfo.parsedTiming !== undefined
         ? {
-            timing: TaskTiming.parse(JSON.parse(String(timing.body))),
-            timingReleased,
+            timing: timingInfo.parsedTiming,
+            timingReleased: timingInfo.timingReleased,
           }
         : {}),
     });
-    this.planRowCache.set(id, { key: cacheKey, plan });
-    if (this.planRowCache.size > 1024) {
-      const oldest = this.planRowCache.keys().next().value;
-      if (oldest !== undefined) this.planRowCache.delete(oldest);
+    if (!inWriteTx) {
+      this.planRowCache.set(id, { key: cacheKey, plan });
+      if (this.planRowCache.size > 1024) {
+        const oldest = this.planRowCache.keys().next().value;
+        if (oldest !== undefined) this.planRowCache.delete(oldest);
+      }
     }
     return plan;
   }
   get(id: string): Plan {
-    const row = this.db.prepare('SELECT * FROM task_plans WHERE id=?').get(id);
-    if (!row) throw new ProductError('TASK_NOT_FOUND', '任务计划不存在', 404);
+    const row = this.stmt('SELECT * FROM task_plans WHERE id=?').get(id);
+    if (!row) {
+      this.planRowCache.delete(id);
+      throw new ProductError('TASK_NOT_FOUND', '任务计划不存在', 404);
+    }
     return this.parsePlanRow(row);
   }
   batchExists(batchId: string): boolean {
     return Boolean(
-      this.db
-        .prepare(
-          'SELECT 1 FROM task_batches WHERE id=? UNION ALL SELECT 1 FROM task_plans WHERE batch_id=? LIMIT 1',
-        )
-        .get(batchId, batchId),
+      this.stmt(
+        'SELECT 1 FROM task_batches WHERE id=? UNION ALL SELECT 1 FROM task_plans WHERE batch_id=? LIMIT 1',
+      ).get(batchId, batchId),
     );
   }
   plansForBatch(batchId: string): Plan[] {
-    return this.db
-      .prepare('SELECT * FROM task_plans WHERE batch_id=? ORDER BY created_at,rowid')
+    return this.stmt('SELECT * FROM task_plans WHERE batch_id=? ORDER BY created_at,rowid')
       .all(batchId)
       .map((row) => this.parsePlanRow(row));
   }
@@ -293,8 +370,7 @@ export class SqliteTaskRepository implements TaskRepository {
         .all(profileId, ...states)
         .map((row) => this.parsePlanRow(row));
     }
-    return this.db
-      .prepare('SELECT * FROM task_plans WHERE profile_id=? ORDER BY created_at,rowid')
+    return this.stmt('SELECT * FROM task_plans WHERE profile_id=? ORDER BY created_at,rowid')
       .all(profileId)
       .map((row) => this.parsePlanRow(row));
   }
@@ -311,50 +387,61 @@ export class SqliteTaskRepository implements TaskRepository {
   }
   hasPlanOrOperation(jobId: string, operationId: string): boolean {
     return Boolean(
-      this.db
-        .prepare(
-          'SELECT 1 FROM task_plans WHERE id=? UNION ALL SELECT 1 FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.id=? LIMIT 1',
-        )
-        .get(jobId, operationId),
+      this.stmt(
+        'SELECT 1 FROM task_plans WHERE id=? UNION ALL SELECT 1 FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.id=? LIMIT 1',
+      ).get(jobId, operationId),
     );
   }
   list() {
-    return this.db
-      .prepare('SELECT * FROM task_plans ORDER BY created_at,rowid')
+    return this.stmt('SELECT * FROM task_plans ORDER BY created_at,rowid')
       .all()
       .map((row) => this.parsePlanRow(row));
   }
   releaseScheduled() {
+    // Read-only prefilter: no write transaction (and no cache invalidation) unless at least
+    // one queued timed plan is due to open or has missed its window.
+    const candidates = this.livePlans().filter(
+      (row) =>
+        row.state === 'QUEUED' &&
+        row.timing &&
+        !row.timingReleased &&
+        taskTimingEligibility(row.timing, this.dependencies.now()) !== 'WAIT',
+    );
+    if (!candidates.length) return;
     transaction(this.db, () => {
-      for (const plan of this.livePlans().filter(
-        (row) => row.state === 'QUEUED' && row.timing && !row.timingReleased,
-      )) {
+      for (const plan of candidates) {
         // The activation marker is an append-only original task event. After release,
         // concurrency/offline queueing does not turn the other 49 plans into missed jobs.
         const current = this.get(plan.id);
-        if (current.timingReleased) continue;
+        if (current.state !== 'QUEUED' || !current.timing || current.timingReleased) continue;
         const eligibility = taskTimingEligibility(current.timing, this.dependencies.now());
-        if (eligibility === 'OPEN') this.event(current.id, 'SCHEDULE_RELEASED');
-        else if (eligibility === 'MISSED') this.state(current.id, 'FAILED', 'SCHEDULE_MISSED');
+        if (eligibility === 'OPEN') {
+          this.event(current.id, 'SCHEDULE_RELEASED');
+          this.invalidateBatchTimingCache(current.batchId);
+        } else if (eligibility === 'MISSED') {
+          this.state(current.id, 'FAILED', 'SCHEDULE_MISSED');
+          this.invalidateBatchTimingCache(current.batchId);
+        }
       }
     });
   }
   livePlans() {
-    return this.db
-      .prepare(
-        "SELECT * FROM task_plans WHERE state NOT IN ('STOPPED','COMPLETED','FAILED') ORDER BY created_at,rowid",
-      )
+    return this.stmt(
+      "SELECT * FROM task_plans WHERE state NOT IN ('STOPPED','COMPLETED','FAILED') ORDER BY created_at,rowid",
+    )
       .all()
       .map((row) => this.parsePlanRow(row));
   }
   cacheStateToken(): string | null {
     if (this.db.isTransaction) return null;
-    return `${this.instanceEpoch}:${String(this.db.prepare('PRAGMA data_version').get()?.data_version)}:${String(this.db.prepare('SELECT total_changes() AS n').get()?.n)}`;
+    return `${this.instanceEpoch}:${String(this.stmt('PRAGMA data_version').get()?.data_version)}:${String(this.stmt('SELECT total_changes() AS n').get()?.n)}`;
   }
   currentStepForPlan(id: string, round: number, position: number): StepInstance | null {
-    const row = this.db
-      .prepare('SELECT * FROM task_steps WHERE job_id=? AND round=? AND position=?')
-      .get(id, round, position);
+    const row = this.stmt('SELECT * FROM task_steps WHERE job_id=? AND round=? AND position=?').get(
+      id,
+      round,
+      position,
+    );
     return row
       ? TaskStepV2.parse({
           id: row.id,
@@ -371,12 +458,12 @@ export class SqliteTaskRepository implements TaskRepository {
   runtimeSnapshot(options: RuntimeRequest = {}): RuntimeSnapshotResult {
     return readSnapshot(this.db, () => {
       const high = Number(
-        this.db.prepare('SELECT coalesce(max(sequence),0) AS n FROM task_events').get()?.n ?? 0,
+        this.stmt('SELECT coalesce(max(sequence),0) AS n FROM task_events').get()?.n ?? 0,
       );
       const anchor = (seq: number): RuntimeAnchor | null => {
-        const row = this.db
-          .prepare('SELECT sequence,job_id,created_at FROM task_events WHERE sequence=?')
-          .get(seq);
+        const row = this.stmt(
+          'SELECT sequence,job_id,created_at FROM task_events WHERE sequence=?',
+        ).get(seq);
         return row
           ? {
               seq: Number(row.sequence),
@@ -385,9 +472,9 @@ export class SqliteTaskRepository implements TaskRepository {
             }
           : null;
       };
-      const firstRow = this.db
-        .prepare('SELECT sequence FROM task_events ORDER BY sequence LIMIT 1')
-        .get();
+      const firstRow = this.stmt(
+        'SELECT sequence FROM task_events ORDER BY sequence LIMIT 1',
+      ).get();
       const first = firstRow ? anchor(Number(firstRow.sequence)) : null;
       const previous = options.cursor ? decodeRuntimeCursor(options.cursor) : null;
       const resetRequired = Boolean(
@@ -402,11 +489,9 @@ export class SqliteTaskRepository implements TaskRepository {
       const after = resetRequired ? 0 : (previous?.seq ?? options.afterSequence ?? 0);
       if (after > high)
         throw new ProductError('RUNTIME_CURSOR_INVALID', '任务游标已失效，请重新读取', 409);
-      const rows = this.db
-        .prepare(
-          'SELECT sequence,job_id,type,created_at FROM task_events WHERE sequence>? ORDER BY sequence LIMIT ?',
-        )
-        .all(after, options.limit ?? 100);
+      const rows = this.stmt(
+        'SELECT sequence,job_id,type,created_at FROM task_events WHERE sequence>? ORDER BY sequence LIMIT ?',
+      ).all(after, options.limit ?? 100);
       const events: RuntimeEvent[] = [];
       let bytes = 2,
         scanned = after;
@@ -445,11 +530,10 @@ export class SqliteTaskRepository implements TaskRepository {
           return step ? [step] : [];
         }),
         recentTerminalPlans,
-        profileResults: this.db
-          .prepare(
-            `SELECT profile_id AS profileId,source,run_id AS runId,
+        profileResults: this.stmt(
+          `SELECT profile_id AS profileId,source,run_id AS runId,
           name,state,reason,finished_at AS finishedAt,failed_steps AS failedSteps,skipped_steps AS skippedSteps FROM profile_task_results`,
-          )
+        )
           .all()
           .map((row) => ProfileTaskResult.parse(row)),
         events,
@@ -486,21 +570,20 @@ export class SqliteTaskRepository implements TaskRepository {
     });
   }
   settings() {
-    const row = this.db
-      .prepare('SELECT max_concurrent_profiles FROM scheduler_settings WHERE id=1')
-      .get();
+    const row = this.stmt(
+      'SELECT max_concurrent_profiles FROM scheduler_settings WHERE id=1',
+    ).get();
     return SchedulerSettings.parse({ maxConcurrentProfiles: row?.max_concurrent_profiles });
   }
   setSettings(value: Settings) {
     const parsed = SchedulerSettings.parse(value);
-    this.db
-      .prepare('UPDATE scheduler_settings SET max_concurrent_profiles=? WHERE id=1')
-      .run(parsed.maxConcurrentProfiles);
+    this.stmt('UPDATE scheduler_settings SET max_concurrent_profiles=? WHERE id=1').run(
+      parsed.maxConcurrentProfiles,
+    );
   }
   events(id: string) {
-    this.get(id);
-    return this.db
-      .prepare('SELECT * FROM task_events WHERE job_id=? ORDER BY sequence')
+    this.ensurePlanExists(id);
+    return this.stmt('SELECT * FROM task_events WHERE job_id=? ORDER BY sequence')
       .all(id)
       .map((row) =>
         TaskEvent.parse({
@@ -513,13 +596,14 @@ export class SqliteTaskRepository implements TaskRepository {
       );
   }
   steps(id: string, round?: number) {
-    this.get(id);
+    this.ensurePlanExists(id);
     const rows =
       round === undefined
-        ? this.db.prepare('SELECT * FROM task_steps WHERE job_id=? ORDER BY round,position').all(id)
-        : this.db
-            .prepare('SELECT * FROM task_steps WHERE job_id=? AND round=? ORDER BY position')
-            .all(id, round);
+        ? this.stmt('SELECT * FROM task_steps WHERE job_id=? ORDER BY round,position').all(id)
+        : this.stmt('SELECT * FROM task_steps WHERE job_id=? AND round=? ORDER BY position').all(
+            id,
+            round,
+          );
     return rows.map((row) =>
       TaskStepV2.parse({
         id: row.id,
@@ -546,19 +630,17 @@ export class SqliteTaskRepository implements TaskRepository {
       this.dependencies.random,
     );
     for (const [position, spec] of order.entries())
-      this.db
-        .prepare(
-          'INSERT INTO task_steps(id,job_id,round,position,spec,status,progress) VALUES(?,?,?,?,?,?,?)',
-        )
-        .run(
-          this.dependencies.id(),
-          plan.id,
-          round,
-          position,
-          JSON.stringify(spec),
-          'PENDING',
-          JSON.stringify(emptyProgress()),
-        );
+      this.stmt(
+        'INSERT INTO task_steps(id,job_id,round,position,spec,status,progress) VALUES(?,?,?,?,?,?,?)',
+      ).run(
+        this.dependencies.id(),
+        plan.id,
+        round,
+        position,
+        JSON.stringify(spec),
+        'PENDING',
+        JSON.stringify(emptyProgress()),
+      );
     this.event(plan.id, 'ROUND_CREATED', { round, stepIds: order.map((step) => step.id) });
   }
   assign(input: Assignment, profiles: RuntimeProfile[]) {
@@ -567,9 +649,9 @@ export class SqliteTaskRepository implements TaskRepository {
     const serialized = JSON.stringify(request);
     const runtime = new Map(profiles.map((profile) => [profile.id, profile]));
     return transaction(this.db, () => {
-      const previous = this.db
-        .prepare('SELECT request FROM task_batches WHERE id=?')
-        .get(request.requestId);
+      const previous = this.stmt('SELECT request FROM task_batches WHERE id=?').get(
+        request.requestId,
+      );
       if (previous) {
         if (previous.request !== serialized)
           throw new ProductError('BATCH_ID_CONFLICT', '提交标识对应的参数不同', 409);
@@ -577,9 +659,9 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       if (request.profileIds.some((id) => !runtime.has(id)))
         throw new ProductError('PROFILE_NOT_FOUND', '分配中包含不存在的资料', 404);
-      const saved = this.db
-        .prepare('SELECT body FROM combination_versions WHERE combination_id=? AND version=?')
-        .get(request.combinationId, request.version);
+      const saved = this.stmt(
+        'SELECT body FROM combination_versions WHERE combination_id=? AND version=?',
+      ).get(request.combinationId, request.version);
       if (!saved) throw new ProductError('COMBINATION_VERSION_NOT_FOUND', '保存版本不存在', 404);
       const snapshot = CombinationSchema.parse(JSON.parse(String(saved.body)) as unknown);
       const resourceRevision = this.resources.assertAssignment(request, snapshot);
@@ -589,15 +671,19 @@ export class SqliteTaskRepository implements TaskRepository {
         )
       )
         throw new ProductError('PROFILE_PLAN_BUSY', '部分资料已有未结束计划，请先停止原计划', 409);
-      this.db
-        .prepare('INSERT INTO task_batches VALUES(?,?,?)')
-        .run(request.requestId, serialized, this.dependencies.now());
+      this.stmt('INSERT INTO task_batches VALUES(?,?,?)').run(
+        request.requestId,
+        serialized,
+        this.dependencies.now(),
+      );
+      this.invalidateBatchTimingCache(request.requestId);
       if (request.timing) {
         if (request.timing.mode === 'at' && request.timing.startAt < this.dependencies.now())
           throw new ProductError('SCHEDULE_PAST_TIME', '请选择未来的启动时间', 409);
-        this.db
-          .prepare('INSERT INTO task_batch_timing VALUES(?,?)')
-          .run(request.requestId, JSON.stringify(request.timing));
+        this.stmt('INSERT INTO task_batch_timing VALUES(?,?)').run(
+          request.requestId,
+          JSON.stringify(request.timing),
+        );
       }
       return request.profileIds.map((profileId) => {
         const profile = runtime.get(profileId);
@@ -605,21 +691,19 @@ export class SqliteTaskRepository implements TaskRepository {
         const accountId = profile.account.state === 'logged-in' ? profile.account.id : null;
         const id = this.dependencies.id(),
           now = this.dependencies.now();
-        this.db
-          .prepare(
-            "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?)",
-          )
-          .run(
-            id,
-            request.requestId,
-            profileId,
-            request.combinationId,
-            request.version,
-            accountId,
-            JSON.stringify(snapshot),
-            now,
-            now,
-          );
+        this.stmt(
+          "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?)",
+        ).run(
+          id,
+          request.requestId,
+          profileId,
+          request.combinationId,
+          request.version,
+          accountId,
+          JSON.stringify(snapshot),
+          now,
+          now,
+        );
         const plan = this.get(id);
         if (resourceRevision !== null) this.resources.insert(plan, resourceRevision);
         this.createRound(plan, 1);
@@ -801,6 +885,18 @@ export class SqliteTaskRepository implements TaskRepository {
   }
   private finishControl(plan: Plan) {
     if (this.unresolved(plan.id)) {
+      const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
+      const pending = this.blockingOperations(plan.id);
+      if (
+        step &&
+        step.spec.type !== 'post' &&
+        pending.length > 0 &&
+        pending.every((op) => op.status !== 'UNKNOWN' && this.isInertAuxiliaryBrowseOperation(op))
+      ) {
+        this.settleTransientBrowseOperations(plan.id, plan.reason || 'CONTROL_CONFIRMED');
+      }
+    }
+    if (this.unresolved(plan.id)) {
       this.state(plan.id, 'REVIEW', 'UNRESOLVED_OPERATION');
       return;
     }
@@ -850,9 +946,30 @@ export class SqliteTaskRepository implements TaskRepository {
           profile?.account.state === 'logged-in' &&
           profile.account.id &&
           profile.account.id !== plan.accountId
-        )
+        ) {
           this.control(plan.id, 'stop', 'ACCOUNT_CHANGED');
-        else if (
+          continue;
+        }
+        const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
+        const isBrowseStep = step !== null && step.spec.type !== 'post';
+        if (
+          isBrowseStep &&
+          profile?.online === true &&
+          !['logged-out', 'restricted', 'verification'].includes(profile.account.state)
+        ) {
+          if (
+            (profile.unresolved > 0 ||
+              ((profile.openingPlanId === plan.id || !profile.dispatchAllowed) &&
+                this.blockingOperations(plan.id).length > 0)) &&
+            this.settleTransientBrowseOperations(plan.id, 'RUNTIME_RECONCILE_TRANSIENT_BROWSE')
+          ) {
+            profile.unresolved = 0;
+          }
+          if (profile.openingPlanId === plan.id) {
+            continue;
+          }
+        }
+        if (
           profile?.openingPlanId === plan.id &&
           profile.online &&
           profile.synced &&
@@ -877,6 +994,7 @@ export class SqliteTaskRepository implements TaskRepository {
     });
   }
   recoverOnStartup(preserveFutureSchedules = true) {
+    this.invalidateBatchTimingCache();
     transaction(this.db, () => {
       for (const plan of this.livePlans()) {
         this.cancelStepContinuation(plan.id); // Boot may finish stopping, never automatically resume business.
@@ -889,16 +1007,15 @@ export class SqliteTaskRepository implements TaskRepository {
         ) {
           const timing = taskTimingEligibility(plan.timing, this.dependencies.now());
           if (timing === 'WAIT') continue; // Future scheduled work has never been admitted.
-          this.state(plan.id, 'PAUSED', 'SCHEDULE_MISSED_ON_RESTART');
-          continue; // Never catch up missed publishing on boot.
+          if (this.stopOfflineBrowse(plan.id, 'SCHEDULE_MISSED_ON_RESTART')) continue;
         }
-        if (
-          (this.blockingOperations(plan.id).some((op) => op.status !== 'PREPARED') ||
-            ['STOPPING', 'PAUSING'].includes(plan.state) ||
-            ['SOFTWARE_RESTART_UNCERTAIN', 'STOP_CONFIRMATION_REQUIRED'].includes(plan.reason)) &&
-          this.stopOfflineBrowse(plan.id, 'SOFTWARE_RESTART_BROWSE_CANCELLED')
-        )
-          continue;
+        const restartReason =
+          this.blockingOperations(plan.id).some((op) => op.status !== 'PREPARED') ||
+          ['STOPPING', 'PAUSING'].includes(plan.state) ||
+          ['SOFTWARE_RESTART_UNCERTAIN', 'STOP_CONFIRMATION_REQUIRED'].includes(plan.reason)
+            ? 'SOFTWARE_RESTART_BROWSE_CANCELLED'
+            : 'SOFTWARE_RESTART_STOPPED';
+        if (this.stopOfflineBrowse(plan.id, restartReason)) continue;
         this.db
           .prepare(
             "UPDATE material_reservations SET state='REVIEW',reason='SOFTWARE_RESTART',updated_at=? WHERE job_id=? AND state='RESERVED'",
@@ -935,40 +1052,65 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     });
   }
-  stopOfflineBrowse(id: string, reason = 'OFFLINE_BROWSE_CANCELLED'): Plan | null {
-    return transaction(this.db, () => {
+  stopOfflineBrowse(
+    id: string,
+    reason = 'OFFLINE_BROWSE_CANCELLED',
+    options?: { expectedUpdatedAt?: number; reviewIfBlocked?: boolean },
+  ): Plan | null {
+    const inspect = () => {
       const plan = this.get(id);
-      if (terminal(plan.state)) return plan;
-      if (
-        this.db
-          .prepare(
-            "SELECT 1 FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
-          )
-          .get(id)
-      )
-        return null;
       const pending = this.blockingOperations(id).filter((op) => op.status !== 'PREPARED');
-      if (
-        pending.some(
-          (op) =>
-            (op.action.kind !== 'browseScroll' && !this.isRegisteredReelAdvance(op)) ||
-            postLink(this.db, op.id),
-        )
-      )
+      const blocked =
+        Boolean(
+          this.db
+            .prepare(
+              "SELECT 1 FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
+            )
+            .get(id),
+        ) || pending.some((op) => !this.isInertAuxiliaryBrowseOperation(op));
+      return { plan, pending, blocked };
+    };
+    const stale = (plan: Plan) =>
+      options?.expectedUpdatedAt !== undefined && plan.updatedAt !== options.expectedUpdatedAt;
+    const before = inspect();
+    if (terminal(before.plan.state)) return before.plan;
+    if (stale(before.plan)) return null;
+    // Keep already-reviewed/offline plans read-only, including avoiding an empty write transaction.
+    if (before.blocked && (!options?.reviewIfBlocked || !this.offlineReviewNeeded(before.plan)))
+      return null;
+    return transaction(this.db, () => {
+      const { plan, pending, blocked } = inspect();
+      if (terminal(plan.state)) return plan;
+      if (stale(plan)) return null;
+      if (blocked) {
+        if (options?.reviewIfBlocked) this.reviewBlockedOffline(plan, reason);
         return null;
+      }
       this.cancelStepContinuation(id);
       this.cancelPrepared(id);
       for (const op of pending) {
+        const info = this.classifyInertAuxiliaryBrowseOperation(op);
+        if (!info.ok) {
+          if (options?.reviewIfBlocked) this.reviewBlockedOffline(plan, reason);
+          return null;
+        }
+        const evidence = {
+          reason,
+          offlineBrowseCancelled: true,
+          inertAuxiliaryBrowse: true,
+          actionKind: op.action.kind,
+          ...(info.purpose ? { intentKind: 'auxiliary', intentPurpose: info.purpose } : {}),
+        };
         // Cancellation concerns inert browsing only, not proof that scrolling never happened.
         // Reuse NOT_APPLIED delivery so a later reconnect can retire the original journal entry.
         if (op.binding) {
           const receipt = {
             binding: op.binding,
-            evidence: { reason, offlineBrowseCancelled: true },
+            evidence,
           };
           this.settle(op.id, 'NOT_APPLIED', receipt);
           this.settlements.ensureSettled(op.binding, 'NOT_APPLIED', receipt);
-        } else this.settle(op.id, 'NOT_APPLIED', { reason, offlineBrowseCancelled: true });
+        } else this.settle(op.id, 'NOT_APPLIED', evidence);
       }
       this.db
         .prepare(
@@ -986,53 +1128,133 @@ export class SqliteTaskRepository implements TaskRepository {
       return this.get(id);
     });
   }
-  private operation(id: string): Operation {
-    const row = this.db
-      .prepare(
-        'SELECT o.*,b.body AS binding FROM task_outbox o LEFT JOIN task_dispatch_bindings b ON b.operation_id=o.id WHERE o.id=?',
+  private offlineReviewNeeded(plan: Plan): boolean {
+    return (
+      plan.state !== 'REVIEW' ||
+      plan.controlMode === null ||
+      plan.controlConfirmed ||
+      Boolean(
+        this.db
+          .prepare(
+            "SELECT 1 FROM material_reservations WHERE job_id=? AND state='RESERVED' AND control_ended=0 LIMIT 1",
+          )
+          .get(plan.id),
+      ) ||
+      this.blockingOperations(plan.id).some((op) =>
+        ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED'].includes(op.status),
       )
-      .get(id);
+    );
+  }
+  private reviewBlockedOffline(plan: Plan, reason: string): void {
+    if (!this.offlineReviewNeeded(plan)) return;
+    const now = this.dependencies.now();
+    this.db
+      .prepare(
+        "UPDATE material_reservations SET state='REVIEW',reason=?,updated_at=? WHERE job_id=? AND state='RESERVED' AND control_ended=0",
+      )
+      .run(reason.slice(0, 200), now, plan.id);
+    this.cancelPrepared(plan.id);
+    this.db
+      .prepare(
+        "UPDATE task_outbox SET status='UNKNOWN',updated_at=? WHERE job_id=? AND status IN ('DISPATCHING','ACKNOWLEDGED')",
+      )
+      .run(now, plan.id);
+    if (this.unresolved(plan.id)) {
+      if (plan.controlMode === null || plan.controlConfirmed)
+        this.db
+          .prepare(
+            "UPDATE task_plans SET control_mode=coalesce(control_mode,'pause'),control_confirmed=0 WHERE id=?",
+          )
+          .run(plan.id);
+      if (plan.state !== 'REVIEW') this.state(plan.id, 'REVIEW', 'UNRESOLVED_OPERATION');
+    }
+  }
+  private operation(id: string): Operation {
+    const row = this.stmt(
+      'SELECT o.*,b.body AS binding FROM task_outbox o LEFT JOIN task_dispatch_bindings b ON b.operation_id=o.id WHERE o.id=?',
+    ).get(id);
     if (!row) throw new ProductError('OPERATION_NOT_FOUND', '任务指令不存在', 404);
+    const action = Action.parse(JSON.parse(String(row.action)) as unknown);
+    const binding =
+      row.binding === null
+        ? null
+        : DispatchBinding.parse(JSON.parse(String(row.binding)) as unknown);
+    const receipt = row.receipt === null ? null : (JSON.parse(String(row.receipt)) as unknown);
+    let inertBrowseProof: Operation['inertBrowseProof'];
+    if (
+      row.status === 'FAILED' &&
+      row.disposition === null &&
+      binding !== null &&
+      receipt &&
+      typeof receipt === 'object' &&
+      !Array.isArray(receipt)
+    ) {
+      const ev = (receipt as Record<string, unknown>).evidence;
+      if (
+        ev &&
+        typeof ev === 'object' &&
+        !Array.isArray(ev) &&
+        ((ev as Record<string, unknown>).transientBrowseSettled === true ||
+          (ev as Record<string, unknown>).offlineBrowseCancelled === true)
+      ) {
+        const info = classifySqliteInertAuxiliaryBrowseOperation(this.db, {
+          id: String(row.id),
+          jobId: String(row.job_id),
+          stepId: String(row.step_id),
+          action,
+          binding,
+        });
+        if (info.ok) {
+          const planRow = this.stmt(
+            'SELECT state, control_confirmed FROM task_plans WHERE id=?',
+          ).get(String(row.job_id));
+          inertBrowseProof = {
+            verified: true,
+            ...(info.purpose ? { purpose: info.purpose } : {}),
+            planConfirmedStopped: planRow?.state === 'STOPPED' && planRow?.control_confirmed === 1,
+          };
+        }
+      }
+    }
     return TaskOperation.parse({
       id: row.id,
       jobId: row.job_id,
       stepId: row.step_id,
-      action: JSON.parse(String(row.action)) as unknown,
-      binding: row.binding === null ? null : (JSON.parse(String(row.binding)) as unknown),
+      action,
+      binding,
       status: row.status,
-      receipt: row.receipt === null ? null : (JSON.parse(String(row.receipt)) as unknown),
+      receipt,
       checkpointApplied: row.checkpoint_applied === 1,
       ...(row.disposition ? { disposition: JSON.parse(String(row.disposition)) as unknown } : {}),
+      ...(inertBrowseProof ? { inertBrowseProof } : {}),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     });
   }
   operations(id: string) {
-    return this.db
-      .prepare('SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at,rowid')
+    return this.stmt('SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at,rowid')
       .all(id)
       .map((row) => this.operation(String(row.id)));
   }
   recentOperations(id: string, limit: number) {
-    return this.db
-      .prepare(
-        'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?',
-      )
+    return this.stmt(
+      'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?',
+    )
       .all(id, Math.max(1, Math.min(100, limit)))
       .reverse()
       .map((row) => this.operation(String(row.id)));
   }
   findOperation(jobId: string, operationId: string): Operation | null {
-    const row = this.db
-      .prepare('SELECT id FROM task_outbox WHERE id=? AND job_id=?')
-      .get(operationId, jobId);
+    const row = this.stmt('SELECT id FROM task_outbox WHERE id=? AND job_id=?').get(
+      operationId,
+      jobId,
+    );
     return row ? this.operation(String(row.id)) : null;
   }
   blockingOperations(id: string) {
-    return this.db
-      .prepare(
-        "SELECT id FROM task_outbox WHERE job_id=? AND (status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED') OR (status='UNKNOWN' AND control_ended=0)) ORDER BY created_at,rowid",
-      )
+    return this.stmt(
+      "SELECT id FROM task_outbox WHERE job_id=? AND (status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED') OR (status='UNKNOWN' AND control_ended=0)) ORDER BY created_at,rowid",
+    )
       .all(id)
       .map((row) => this.operation(String(row.id)));
   }
@@ -1048,9 +1270,11 @@ export class SqliteTaskRepository implements TaskRepository {
       )
         return;
       if (this.endingId(id)) return;
-      this.db
-        .prepare('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?')
-        .run(stepId, reason.slice(0, 200), id);
+      this.stmt('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?').run(
+        stepId,
+        reason.slice(0, 200),
+        id,
+      );
       this.event(id, 'STEP_FAILURE_INTENT', { stepId, reason });
     });
   }
@@ -1068,19 +1292,19 @@ export class SqliteTaskRepository implements TaskRepository {
       const previous = this.stepEnding(id);
       if (previous && previous.stepId !== stepId) throw Error('STEP_END_ALREADY_PENDING');
       const endingId = this.requestEnd(id);
-      this.db
-        .prepare('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?')
-        .run(stepId, reason.slice(0, 200), id);
+      this.stmt('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?').run(
+        stepId,
+        reason.slice(0, 200),
+        id,
+      );
       this.event(id, 'STEP_END_REQUESTED', { stepId, endingId, reason });
       return endingId;
     });
   }
   stepEnding(id: string): { stepId: string; reason: string; finished: boolean } | null {
-    const row = this.db
-      .prepare(
-        'SELECT ending_step_id,ending_step_reason,ending_finished FROM task_plans WHERE id=?',
-      )
-      .get(id);
+    const row = this.stmt(
+      'SELECT ending_step_id,ending_step_reason,ending_finished FROM task_plans WHERE id=?',
+    ).get(id);
     return row?.ending_step_id
       ? {
           stepId: String(row.ending_step_id),
@@ -1092,15 +1316,15 @@ export class SqliteTaskRepository implements TaskRepository {
   cancelStepContinuation(id: string): void {
     transaction(this.db, () => {
       if (!this.stepEnding(id)) return;
-      this.db
-        .prepare('UPDATE task_plans SET ending_step_id=NULL,ending_step_reason=NULL WHERE id=?')
-        .run(id);
+      this.stmt('UPDATE task_plans SET ending_step_id=NULL,ending_step_reason=NULL WHERE id=?').run(
+        id,
+      );
       this.event(id, 'STEP_CONTINUATION_CANCELLED', {});
     });
   }
   endingId(id: string): string | null {
-    this.get(id);
-    const row = this.db.prepare('SELECT ending_id FROM task_plans WHERE id=?').get(id);
+    this.ensurePlanExists(id);
+    const row = this.stmt('SELECT ending_id FROM task_plans WHERE id=?').get(id);
     return row?.ending_id ? String(row.ending_id) : null;
   }
   pendingEndings(): Plan[] {
@@ -1157,6 +1381,38 @@ export class SqliteTaskRepository implements TaskRepository {
         });
       }
     });
+  }
+  private classifyInertAuxiliaryBrowseOperation(op: Operation) {
+    return classifySqliteInertAuxiliaryBrowseOperation(this.db, op);
+  }
+  private isInertAuxiliaryBrowseOperation(op: Operation): boolean {
+    return this.classifyInertAuxiliaryBrowseOperation(op).ok;
+  }
+  private isRegisteredBrowseOperation(op: Operation): boolean {
+    if (!op.binding) return false;
+    try {
+      const row = this.db
+        .prepare(
+          'SELECT body FROM task_browse_intents WHERE operation_id=? AND job_id=? AND step_id=?',
+        )
+        .get(op.id, op.binding.jobId, op.binding.stepId);
+      if (!row) return false;
+      const registered = BrowseOperationIntent.parse(JSON.parse(String(row.body)) as unknown);
+      const step = this.steps(op.binding.jobId).find((item) => item.id === op.binding?.stepId);
+      if (
+        !step ||
+        step.spec.type === 'post' ||
+        registered.operationId !== op.id ||
+        registered.jobId !== op.binding.jobId ||
+        registered.stepId !== op.binding.stepId ||
+        registered.intent.proof.profileId !== op.binding.profileId
+      )
+        return false;
+      validateBrowseIntent(step, op.action, registered.intent);
+      return true;
+    } catch {
+      return false;
+    }
   }
   private isRegisteredReelAdvance(op: Operation): boolean {
     if (
@@ -1321,29 +1577,68 @@ export class SqliteTaskRepository implements TaskRepository {
         plan.controlMode === 'stop' &&
         plan.controlConfirmed &&
         !possiblePublication &&
-        plan.snapshot.steps.every(
-          (step) =>
-            ['feed', 'video', 'marketplace'].includes(step.type) &&
-            'maxLikes' in step &&
-            step.maxLikes === 0,
+        operations.every((op) =>
+          ['VERIFIED', 'CANCELLED', 'FAILED', 'UNKNOWN'].includes(op.status),
         ) &&
-        operations.every((op) => ['VERIFIED', 'CANCELLED', 'UNKNOWN'].includes(op.status)) &&
-        unknown.length > 0 &&
-        unknown.every((op) => {
-          const cancelled = CancelledBrowseReceipt.safeParse(op.receipt);
-          return (
-            (op.action.kind === 'browseScroll' || this.isRegisteredReelAdvance(op)) &&
-            op.disposition?.outcome === 'ENDED_UNKNOWN' &&
-            op.binding &&
-            cancelled.success &&
-            sameBinding(op.binding, cancelled.data.binding)
-          );
-        });
+        ((unknown.length === 0 &&
+          this.steps(id).every((step) => step.status !== 'FAILED') &&
+          !this.db
+            .prepare(
+              "SELECT 1 FROM material_post_operations m JOIN task_outbox o ON o.id=m.operation_id WHERE o.job_id=? AND m.purpose='SUBMIT' LIMIT 1",
+            )
+            .get(id)) ||
+          (unknown.length > 0 &&
+            unknown.every((op) => {
+              if (
+                op.disposition?.outcome !== 'ENDED_UNKNOWN' ||
+                !op.binding ||
+                postLink(this.db, op.id)
+              )
+                return false;
+              if (this.isRegisteredBrowseOperation(op) || op.action.kind === 'browseNavigate') {
+                const step = this.steps(id).find((item) => item.id === op.stepId);
+                return step !== undefined && step.spec.type !== 'post';
+              }
+              const cancelled = CancelledBrowseReceipt.safeParse(op.receipt);
+              return (
+                plan.snapshot.steps.every(
+                  (step) =>
+                    ['feed', 'video', 'marketplace'].includes(step.type) &&
+                    'maxLikes' in step &&
+                    step.maxLikes === 0,
+                ) &&
+                (op.action.kind === 'browseScroll' || this.isRegisteredReelAdvance(op)) &&
+                cancelled.success &&
+                sameBinding(op.binding, cancelled.data.binding)
+              );
+            })));
       // A verified, never-submitted draft can stop normally. Unknown inputs keep their
       // original UNKNOWN/disposition; only registered, non-interactive browse cancellation applies.
       const cancelled = cancelledBrowse || cancelledDraft;
+      const pausedBrowse =
+        !cancelled &&
+        !possiblePublication &&
+        plan.controlMode !== 'stop' &&
+        this.steps(id).every((step) => step.status !== 'FAILED') &&
+        unknown.length > 0 &&
+        unknown.every((op) => {
+          if (postLink(this.db, op.id) || !this.isRegisteredBrowseOperation(op)) return false;
+          const step = this.steps(id).find((item) => item.id === op.stepId);
+          if (!step || step.spec.type === 'post') return false;
+          const receiptReason =
+            op.receipt &&
+            typeof op.receipt === 'object' &&
+            !Array.isArray(op.receipt) &&
+            typeof (op.receipt as Record<string, unknown>).reason === 'string'
+              ? String((op.receipt as Record<string, unknown>).reason)
+              : '';
+          return isRecoverableBrowseFault(receiptReason);
+        });
       const preservedReason =
-        !cancelled && !possiblePublication && unknown.length === 0 && plan.controlMode !== 'stop'
+        !cancelled &&
+        !possiblePublication &&
+        (unknown.length === 0 || pausedBrowse) &&
+        plan.controlMode !== 'stop'
           ? (() => {
               const eventReasons = this.events(id)
                 .map((item) => {
@@ -1372,6 +1667,25 @@ export class SqliteTaskRepository implements TaskRepository {
               );
             })()
           : null;
+      if (pausedBrowse) {
+        this.db
+          .prepare(
+            "UPDATE task_outbox SET status='FAILED',updated_at=? WHERE job_id=? AND status='UNKNOWN'",
+          )
+          .run(this.dependencies.now(), id);
+        this.state(
+          id,
+          'PAUSED',
+          preservedReason ??
+            (plan.reason &&
+            plan.reason !== 'ENDING_UNCONFIRMED_TASK' &&
+            plan.reason !== 'UNRESOLVED_OPERATION'
+              ? plan.reason
+              : 'BROWSE_TRANSIENT_PAUSED'),
+        );
+        this.unlock(id);
+        return this.get(id);
+      }
       this.state(
         id,
         cancelled ? 'STOPPED' : 'FAILED',
@@ -1584,17 +1898,91 @@ export class SqliteTaskRepository implements TaskRepository {
     const receipt = BoundReceipt.parse(input);
     transaction(this.db, () => {
       const op = this.requireBinding(receipt.binding);
-      if (
-        op.status !== 'ACKNOWLEDGED' ||
-        op.action.kind !== 'browseScroll' ||
-        postLink(this.db, op.id)
-      )
+      if (op.status !== 'ACKNOWLEDGED' || postLink(this.db, op.id))
         throw Error('BROWSE_CONTROL_RELEASE_REJECTED');
       this.db
         .prepare("UPDATE task_outbox SET status='CANCELLED',receipt=?,updated_at=? WHERE id=?")
         .run(JSON.stringify(receipt), this.dependencies.now(), op.id);
       this.settlements.ensureSettled(receipt.binding, 'CONTROL_RELEASED', receipt);
       this.event(op.jobId, 'BROWSE_CONTROL_RELEASED', { operationId: op.id });
+    });
+  }
+  settleTransientBrowseOperations(id: string, reason: string): boolean {
+    return transaction(this.db, () => {
+      const plan = this.get(id);
+      if (terminal(plan.state)) return false;
+      const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
+      if (!step || step.spec.type === 'post') return false;
+      const pending = this.blockingOperations(id);
+      let settledAny = false;
+      if (pending.some((op) => op.status === 'PREPARED')) {
+        this.cancelPrepared(id);
+        settledAny = true;
+      }
+      for (const op of pending) {
+        if (op.status === 'PREPARED') continue;
+        const info = this.classifyInertAuxiliaryBrowseOperation(op);
+        if (!info.ok) continue;
+        const evidence = {
+          reason,
+          transientBrowseSettled: true,
+          inertAuxiliaryBrowse: true,
+          actionKind: op.action.kind,
+          ...(info.purpose ? { intentKind: 'auxiliary', intentPurpose: info.purpose } : {}),
+        };
+        if (op.binding) {
+          const receipt = {
+            binding: op.binding,
+            evidence,
+          };
+          this.settle(op.id, 'NOT_APPLIED', receipt);
+          this.settlements.ensureSettled(op.binding, 'NOT_APPLIED', receipt);
+        } else {
+          this.settle(op.id, 'NOT_APPLIED', evidence);
+        }
+        settledAny = true;
+      }
+      const updated = this.get(id);
+      if (
+        updated.state === 'REVIEW' &&
+        updated.reason === 'UNRESOLVED_OPERATION' &&
+        !this.unresolved(id)
+      ) {
+        if (updated.controlMode === 'stop' || updated.controlRequestId !== null) {
+          if (updated.controlConfirmed) {
+            this.finishControl(updated);
+          } else {
+            this.state(
+              id,
+              updated.controlMode === 'stop' ? 'STOPPING' : 'PAUSING',
+              updated.controlMode === 'stop' ? 'USER_STOP' : updated.reason,
+            );
+          }
+        } else {
+          this.db
+            .prepare(
+              "UPDATE task_plans SET state='RUNNING',reason=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0,updated_at=? WHERE id=?",
+            )
+            .run(reason, this.dependencies.now(), id);
+        }
+        settledAny = true;
+      } else if (
+        updated.state === 'PAUSING' &&
+        updated.controlMode === 'pause' &&
+        !updated.controlConfirmed &&
+        !updated.reason.startsWith('USER_') &&
+        updated.reason !== 'SCHEDULE_WINDOW_CLOSED' &&
+        isRecoverableBrowseFault(reason) &&
+        !this.unresolved(id)
+      ) {
+        this.db
+          .prepare(
+            "UPDATE task_plans SET state='RUNNING',reason=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0,updated_at=? WHERE id=?",
+          )
+          .run(reason, this.dependencies.now(), id);
+        settledAny = true;
+      }
+      return settledAny;
     });
   }
   settleBound(input: ExecutionReceipt, outcome: 'VERIFIED' | 'NOT_APPLIED', progress?: Progress) {

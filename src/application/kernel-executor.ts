@@ -359,6 +359,19 @@ export class KernelExecutor {
       this.cleanupFailures.add(tabId);
     }
   }
+  markUnconfirmed(reasonMethod?: string): void {
+    this.revokeFiles();
+    this.lease.revoke();
+    this.phase = 'unconfirmed';
+    this.retainedStop = undefined;
+    if (reasonMethod) this.unresolved.add(reasonMethod);
+  }
+  fence(): void {
+    this.markUnconfirmed();
+  }
+  async forceDetachAll(): Promise<void> {
+    await Promise.all([...this.attached].map((tabId) => this.detach(tabId)));
+  }
   stop(
     requestId: string,
     timeoutMs = 12_000,
@@ -366,6 +379,7 @@ export class KernelExecutor {
   ): Promise<KernelStopEvidence> {
     if (retainAttachments && this.retainedStop?.requestId === requestId)
       return Promise.resolve(this.retainedStop);
+    this.lease.revoke(); // Synchronous fence on the very first line of stop().
     if (this.stopOperation) {
       if (this.stopOperation.id !== requestId) throw Error('KERNEL_CONTROL_PENDING');
       if (this.stopOperation.retained !== retainAttachments)
@@ -376,7 +390,6 @@ export class KernelExecutor {
       throw Error('KERNEL_STOP_TIMEOUT_INVALID');
     this.phase = 'stopping';
     this.revokeFiles();
-    this.lease.revoke(); // Synchronous fence before any detach or wait.
     let timer: ReturnType<typeof setTimeout> | undefined;
     const promise = (async (): Promise<KernelStopEvidence> => {
       const detached = retainAttachments
@@ -404,6 +417,7 @@ export class KernelExecutor {
                 kernelRequiresOperation(method, this.access) ||
                 /^Runtime\.(evaluate|callFunctionOn)$/.test(method),
             ),
+            ...(this.cleanupFailures.size > 0 ? ['chrome.debugger.detach'] : []),
           ]),
         ],
       };

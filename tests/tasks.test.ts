@@ -629,7 +629,7 @@ test('unknown side effects retain account lock even after stop; reconciliation a
     assert.equal((await current(store, plan)).progress.likes, 1);
   });
 });
-test('restart preserves order and checkpoints, pauses queues, cancels unsent commands and holds uncertain locks', async () => {
+test('restart preserves order and checkpoints, ends safe queues, cancels unsent commands and holds uncertain locks', async () => {
   await fixture(async (store, file) => {
     const runtime = profiles(3),
       { plans } = await assign(store, runtime, combination(2, true));
@@ -656,9 +656,9 @@ test('restart preserves order and checkpoints, pauses queues, cancels unsent com
       restarted.tasks.recoverOnStartup();
       assert.equal(restarted.tasks.get(a.id).state, 'REVIEW');
       assert.equal(restarted.tasks.operations(a.id)[0]?.status, 'UNKNOWN');
-      assert.equal(restarted.tasks.get(b.id).state, 'PAUSED');
+      assert.equal(restarted.tasks.get(b.id).state, 'STOPPED');
       assert.equal(restarted.tasks.operations(b.id)[0]?.status, 'CANCELLED');
-      assert.equal(restarted.tasks.list().filter((row) => row.state === 'PAUSED').length, 2);
+      assert.equal(restarted.tasks.list().filter((row) => row.state === 'STOPPED').length, 2);
       assert.deepEqual(
         restarted.tasks.steps(a.id).map((row) => row.id),
         order,

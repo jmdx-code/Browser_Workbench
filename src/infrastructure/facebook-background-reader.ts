@@ -16,14 +16,36 @@ export function projectFacebookBackground(input: {
 }) {
   type DOMRecord = Record<string, unknown>;
   const record = (v: unknown): v is DOMRecord => !!v && typeof v === 'object';
-  let rootNodes: Map<Element, DOMRecord> | undefined;
+  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
+    __wbReactRootNodesV1?: WeakMap<Element, DOMRecord>;
+  };
+  const rootNodes = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, DOMRecord>());
+  let rootScanned = false;
+  const currentRootNode = (node: DOMRecord | undefined): DOMRecord | undefined => {
+    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
+      let root: unknown = candidate;
+      for (let depth = 0; record(root) && depth < 256; depth++) {
+        if (!root.return) {
+          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
+          break;
+        }
+        root = root.return;
+      }
+    }
+    return undefined;
+  };
   const fiberNode = (el: Element) => {
     const key = Object.keys(el).find(
       (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
     );
     if (key) return Reflect.get(el, key) as unknown;
-    if (!rootNodes) {
-      rootNodes = new Map();
+    const cached = currentRootNode(rootNodes.get(el));
+    if (cached) {
+      rootNodes.set(el, cached);
+      return cached;
+    }
+    if (!rootScanned) {
+      rootScanned = true;
       const stack: unknown[] = [],
         seen = new Set<unknown>();
       for (const host of Array.from(document.querySelectorAll('*')))

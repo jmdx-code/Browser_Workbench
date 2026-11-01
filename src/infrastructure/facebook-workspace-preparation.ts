@@ -24,13 +24,18 @@ export async function endInvitationSetupOperations(
   peer: Peer,
   guard: () => Awaitable<void> = () => {},
   includeOrphans = false,
+  reconcileOperationIds?: ReadonlySet<string>,
 ) {
   await guard();
+  const protectedIds = await kernel.recoverBumperWorkspace?.(peer, guard);
   let inventory = await kernel.withSummary(peer, (port) => port.inventory());
   await guard();
   for (const operation of inventory.operations.filter(kernelOperationPending)) {
+    if (protectedIds?.has(operation.binding.operationId)) continue;
+    const isSettledBrowse = reconcileOperationIds?.has(operation.binding.operationId) === true;
     if (
       !includeOrphans &&
+      !isSettledBrowse &&
       (!['UNKNOWN', 'ACKNOWLEDGED'].includes(operation.state) ||
         !setupLabels.some(
           (label) =>
@@ -40,22 +45,29 @@ export async function endInvitationSetupOperations(
     )
       continue;
     await guard();
-    await kernel.withSummary(peer, (port) =>
-      port.notify(operation.binding, {
-        id: randomUUID(),
-        outcome: 'ENDED_UNKNOWN',
-        evidenceDigest: createHash('sha256')
-          .update(
-            JSON.stringify({
-              binding: operation.binding,
-              reason: includeOrphans
-                ? 'Idle orphan operation ended; business result remains unknown'
-                : 'Non-submit invitation setup ended before workspace reuse',
-            }),
-          )
-          .digest('hex'),
-      }),
-    );
+    try {
+      await kernel.withSummary(peer, (port) =>
+        port.notify(operation.binding, {
+          id: randomUUID(),
+          outcome: 'ENDED_UNKNOWN',
+          evidenceDigest: createHash('sha256')
+            .update(
+              JSON.stringify({
+                binding: operation.binding,
+                reason: includeOrphans
+                  ? 'Idle orphan operation ended; business result remains unknown'
+                  : isSettledBrowse
+                    ? 'Transient browse operation ended before workspace reuse'
+                    : 'Non-submit invitation setup ended before workspace reuse',
+              }),
+            )
+            .digest('hex'),
+        }),
+      );
+    } catch (error) {
+      if (!(error instanceof Error && error.message === 'KERNEL_END_NOT_REQUIRED')) throw error;
+      continue;
+    }
     await guard();
     inventory = await kernel.withSummary(peer, (port) => port.inventory());
     await guard();
@@ -70,8 +82,16 @@ export async function prepareFacebookWorkspace(
   peer: Peer,
   preferred: TabProof | undefined,
   guard: () => Awaitable<void>,
+  reconcileOperationIds?: ReadonlySet<string>,
+  includeOrphans = false,
 ) {
-  let inventory = await endInvitationSetupOperations(kernel, peer, guard);
+  let inventory = await endInvitationSetupOperations(
+    kernel,
+    peer,
+    guard,
+    includeOrphans,
+    reconcileOperationIds,
+  );
   const ready = inventory.tabs.filter((t) => t.state === 'READY' && t.proof);
   let proof =
     ready.find((t) => preferred && t.proof && sameTabProof(t.proof, preferred))?.proof ??
@@ -80,8 +100,10 @@ export async function prepareFacebookWorkspace(
     )?.proof ??
     ready[0]?.proof ??
     undefined;
-  if (inventory.operations.some(kernelOperationPending)) return { inventory, proof };
+  if (!includeOrphans && inventory.operations.some(kernelOperationPending))
+    return { inventory, proof };
   const conflict =
+    (includeOrphans && inventory.operations.some(kernelOperationPending)) ||
     ready.length > 1 ||
     inventory.tabs.some((t) => !['READY', 'CLOSED', 'LOST'].includes(t.state)) ||
     (proof && (!inventory.workspaceMain || !sameTabProof(inventory.workspaceMain, proof)));

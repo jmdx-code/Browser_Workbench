@@ -18,12 +18,28 @@ async function visit(dir) {
       continue;
     }
     if (!/\.(ts|tsx)$/.test(file)) continue;
-    const source = ts.createSourceFile(
-      file,
-      await readFile(file, 'utf8'),
-      ts.ScriptTarget.Latest,
-      true,
-    );
+    const rawText = await readFile(file, 'utf8');
+    const lineCount = rawText.split(/\r?\n/).length;
+    const normalizedPath = file.split(path.sep).join('/');
+    if (normalizedPath === 'src/renderer/main.tsx' && lineCount > 550) {
+      problems.push(
+        `${file}: main.tsx exceeds 550 lines (${lineCount}); extract module/page components`,
+      );
+    }
+    if (normalizedPath === 'src/http/workspace-api.ts' && lineCount > 550) {
+      problems.push(
+        `${file}: workspace-api.ts exceeds 550 lines (${lineCount}); extract route handlers to src/http/routes/`,
+      );
+    }
+    if (
+      (normalizedPath.startsWith('src/renderer/modules/') ||
+        normalizedPath.startsWith('src/http/routes/') ||
+        normalizedPath === 'src/application/feature-execution-registry.ts') &&
+      lineCount > 450
+    ) {
+      problems.push(`${file}: modular file exceeds 450 lines (${lineCount})`);
+    }
+    const source = ts.createSourceFile(file, rawText, ts.ScriptTarget.Latest, true);
     const layer = file.split(path.sep)[1];
     if (!rules[layer]) continue; // Imported bridge and desktop are platform boundaries.
     function walk(node) {

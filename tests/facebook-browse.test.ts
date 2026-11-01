@@ -389,7 +389,7 @@ test('a bounded negative foreground wait skips only repeated hidden reads and im
     assert.equal(f.execution.step.progress.effectiveMilliseconds, 0);
   }));
 
-test('a background-capable owner restores its hidden task via original activation without inventing foreground or progress', async () =>
+test('a background-capable owner advances its cascade-occluded task without dispatching activateTab or waiting for foreground', async () =>
   fixture('feed', async (f) => {
     let canPresent = false;
     const executor = new FacebookBrowseStepExecutor(
@@ -417,20 +417,26 @@ test('a background-capable owner restores its hidden task via original activatio
     f.reading.visible = false;
     assert.equal((await executor.decide(f.execution, () => {})).kind, 'wait');
     canPresent = true;
-    const decision = await executor.decide(f.execution, () => {});
-    assert.equal(decision.kind, 'action');
-    if (decision.kind !== 'action') throw Error('ACTIVATION_REQUIRED');
-    assert.equal(decision.action.kind, 'activateTab');
-    assert.equal(f.reading.visible, false);
-    assert.equal(f.execution.step.progress.effectiveMilliseconds, 0);
+    const firstObserve = await executor.decide(f.execution, () => {});
+    assert.equal(firstObserve.kind, 'observe');
+    if (firstObserve.kind === 'observe') {
+      assert.equal(firstObserve.observation.visible, true);
+    }
+    const secondObserve = await executor.decide(f.execution, () => {});
+    assert.equal(secondObserve.kind, 'observe');
+    f.h.clock.at = 15_000;
+    const scrollDecision = await executor.decide(f.execution, () => {});
+    assert.ok(scrollDecision.kind === 'action' && scrollDecision.action.kind === 'browseScroll');
+    const op = operation(f, scrollDecision.action);
+    f.reading.scrollY = 450;
+    const verdict = await executor.verify(f.execution, op, scrollDecision.intent, () => {});
+    assert.equal(verdict.outcome, 'VERIFIED');
     await assert.rejects(
       executor.decide(f.execution, () => {
         throw Error('ORIGINAL_SCOPE_STOPPED');
       }),
       /ORIGINAL_SCOPE_STOPPED/,
     );
-    f.reading.visible = true;
-    assert.equal((await executor.decide(f.execution, () => {})).kind, 'observe');
   }));
 
 test('a visible owned task page needs no entry activation, while a hidden page still needs independent visibility verification', async () =>
@@ -808,15 +814,14 @@ test('buffering Reels never become valid playback and end bounded waiting withou
         observation.observation.type === 'video' &&
         observation.observation.buffering,
     );
-    // Keep the same document so a stalled player cannot reset its wait by repainting.
-    f.h.clock.at = 29000;
+    // Keep the same document: after 12s stalled wait, executor recovers via browseScroll instead of hard timeout.
+    f.h.clock.at = 11000;
     assert.equal((await f.executor.decide(f.execution, () => {})).kind, 'observe');
-    f.h.clock.at = 31000;
+    f.h.clock.at = 13000;
     f.reading.timeOrigin++;
-    await assert.rejects(
-      f.executor.decide(f.execution, () => {}),
-      /PLAYBACK_STALLED_TIMEOUT/,
-    );
+    const recovery = await f.executor.decide(f.execution, () => {});
+    assert.equal(recovery.kind, 'action');
+    assert.equal(recovery.action.kind, 'browseScroll');
   }));
 
 test('feed end and layout contraction settle a clipped wheel without inventing movement or leaving an unknown operation', async () =>
@@ -1260,13 +1265,17 @@ test('Watch navigation accepts the Reels redirect; play and scroll retain the ex
       validateBrowseIntent(f.execution.step, scroll.action, scroll.intent);
     }
     for (const url of [
-      'https://www.facebook.com/login/',
       'https://www.facebook.com/groups/123',
       'https://www.facebook.com.evil.test/reels/',
     ]) {
       f.reading.url = url;
       assert.equal((await f.executor.decide(f.execution, () => {})).kind, 'wait');
     }
+    f.reading.url = 'https://www.facebook.com/login/';
+    await assert.rejects(
+      f.executor.decide(f.execution, () => {}),
+      /FACEBOOK_ACCOUNT_LOGGED_OUT/,
+    );
   }));
 
 test('feed observes, scrolls after its dwell and waits for original scroll effect without claiming an ACK is success', async () =>
@@ -1413,7 +1422,10 @@ test('loading, dialogs and hidden feed wait, configured likes are explicitly uns
     const decision = await f.executor.decide(f.execution, () => {});
     assert.deepEqual(decision, { kind: 'wait', reason: 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED' });
     f.reading.url = 'https://www.facebook.com/checkpoint/';
-    assert.equal((await f.executor.decide(f.execution, () => {})).kind, 'wait');
+    await assert.rejects(
+      f.executor.decide(f.execution, () => {}),
+      /FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED/,
+    );
   });
   await fixture('marketplace', async (f) => {
     (f.execution.step.spec as { maxLikes: number }).maxLikes = 1;

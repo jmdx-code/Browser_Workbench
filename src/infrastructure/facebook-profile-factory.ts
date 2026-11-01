@@ -47,7 +47,11 @@ export class NativeFacebookProfileFactory {
     private readonly openSession = KernelManagedFacebookSession.open,
     private readonly storyAuthorized: (plan: Plan) => Awaitable<boolean> = () => false,
   ) {}
-  private async guard(planId: string, peer: Peer, state: 'QUEUED' | 'RUNNING') {
+  private async guard(
+    planId: string,
+    peer: Peer,
+    state: 'QUEUED' | 'RUNNING' | 'QUEUED_OR_RUNNING',
+  ) {
     const plan = await this.tasks.get(planId);
     if (
       plan.snapshot.steps.some((step) => step.type === 'marketplace') &&
@@ -65,6 +69,10 @@ export class NativeFacebookProfileFactory {
       'STOPPING',
       'REVIEW',
     ]);
+    const stateMatches =
+      state === 'QUEUED_OR_RUNNING'
+        ? plan.state === 'QUEUED' || plan.state === 'RUNNING'
+        : plan.state === state;
     if (
       this.closed ||
       this.core.peers.get(peer.profileId) !== peer ||
@@ -73,7 +81,7 @@ export class NativeFacebookProfileFactory {
       peer.phase !== 'PAUSED' ||
       (await this.core.store.unresolved(peer.profileId)).length ||
       plan.profileId !== peer.profileId ||
-      plan.state !== state ||
+      !stateMatches ||
       others.length !== 1 ||
       others[0]?.id !== planId ||
       (
@@ -83,7 +91,7 @@ export class NativeFacebookProfileFactory {
       throw Error('FACEBOOK_PROFILE_ADMISSION_REVOKED');
     return plan;
   }
-  private async fresh(admission: Admission, state: 'QUEUED' | 'RUNNING') {
+  private async fresh(admission: Admission, state: 'QUEUED' | 'RUNNING' | 'QUEUED_OR_RUNNING') {
     const plan = await this.guard(admission.planId, admission.peer, state);
     const { evidence } = admission;
     if (
@@ -146,7 +154,7 @@ export class NativeFacebookProfileFactory {
     const old = this.admissions.get(peer.profileId);
     if (old && old.planId === planId && !old.consumed) {
       try {
-        await this.fresh(old, 'QUEUED');
+        await this.fresh(old, 'QUEUED_OR_RUNNING');
         const profile = await this.profile(peer.profileId);
         if (!profile) throw Error('FACEBOOK_PROFILE_ADMISSION_REVOKED');
         return Promise.resolve(profile);
@@ -167,7 +175,7 @@ export class NativeFacebookProfileFactory {
   private async observeOnce(planId: string, peer: Peer) {
     const epoch = peer.epoch;
     const guard = async () => {
-      await this.guard(planId, peer, 'QUEUED');
+      await this.guard(planId, peer, 'QUEUED_OR_RUNNING');
       if (peer.epoch !== epoch) throw Error('FACEBOOK_PROFILE_CONNECTION_CHANGED');
     };
     await guard();
@@ -207,7 +215,7 @@ export class NativeFacebookProfileFactory {
     )
       throw Error('FACEBOOK_CLOSED_BOOTSTRAP_REQUIRED');
     const admission = { planId, peer, evidence, consumed: false };
-    await this.fresh(admission, 'QUEUED');
+    await this.fresh(admission, 'QUEUED_OR_RUNNING');
     evidence.actor.checkedAt = this.now();
     this.admissions.set(peer.profileId, admission);
     const profile = await this.profile(peer.profileId);

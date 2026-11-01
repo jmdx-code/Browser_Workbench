@@ -170,6 +170,7 @@ test('renderer avatar rejects unavailable, foreign, offline, stale and logged-ou
     id: randomUUID(),
     alias: 'Generated',
     groupId: null,
+    order: 0,
     online: true,
     phase: 'PAUSED',
     synced: true,

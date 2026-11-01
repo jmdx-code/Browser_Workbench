@@ -205,6 +205,7 @@ export const ProfileSchema = z
     alias: z.string(),
     browserName: z.string().optional(),
     groupId: Id.nullable(),
+    order: z.number().int().default(0),
     online: z.boolean(),
     phase: z.string(),
     synced: z.boolean(),

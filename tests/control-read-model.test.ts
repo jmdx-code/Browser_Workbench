@@ -8,7 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
+import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { TaskService } from '../src/application/task-service.js';
 import { readSnapshot, transaction } from '../src/infrastructure/sqlite-transaction.js';
 import type { RuntimeProfile } from '../src/domain/tasks.js';
@@ -731,7 +731,7 @@ test('migration41 to42 installs all job indexes and the resource cleanup guard, 
     const fresh = await WorkspaceStore.open(file);
     fresh.close();
     const db = new DatabaseSync(file);
-    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 42);
+    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, workspaceSchemaVersion);
     for (const name of names) {
       assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name));
       db.exec('DROP INDEX ' + name);
@@ -744,7 +744,10 @@ test('migration41 to42 installs all job indexes and the resource cleanup guard, 
     upgraded.close();
     const verified = new DatabaseSync(file, { readOnly: true });
     try {
-      assert.equal(verified.prepare('PRAGMA user_version').get()?.user_version, 42);
+      assert.equal(
+        verified.prepare('PRAGMA user_version').get()?.user_version,
+        workspaceSchemaVersion,
+      );
       for (const name of names)
         assert.ok(
           verified.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name),

@@ -23,6 +23,7 @@ import {
 } from '../domain/task-tabs.js';
 import { ProductError } from '../domain/workspace.js';
 import { transaction } from './sqlite-transaction.js';
+import { prepareCached } from './sqlite-statement-cache.js';
 import type { SqliteTaskRepository } from './task-store.js';
 import { assertPostDispatch, postLink } from './material-post-guards.js';
 import { CurrentStopReceipt } from '../shared/task-ending.js';
@@ -38,12 +39,13 @@ export class SqliteTaskTabRepository implements TaskTabRepository {
     private readonly db: DatabaseSync,
     private readonly tasks: SqliteTaskRepository,
   ) {}
+  private stmt(sql: string) {
+    return prepareCached(this.db, sql);
+  }
   get(ownershipId: string, jobId?: string): TaskTab {
-    const rows = this.db
-      .prepare(
-        'SELECT o.*,s.state,s.revision,s.context,s.reason,s.updated_at FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE ownership_id=? AND (? IS NULL OR job_id=?) LIMIT 2',
-      )
-      .all(ownershipId, jobId ?? null, jobId ?? null);
+    const rows = this.stmt(
+      'SELECT o.*,s.state,s.revision,s.context,s.reason,s.updated_at FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE ownership_id=? AND (? IS NULL OR job_id=?) LIMIT 2',
+    ).all(ownershipId, jobId ?? null, jobId ?? null);
     if (rows.length > 1)
       throw new ProductError('TASK_TAB_PLAN_REQUIRED', '该页面有多份历史任务，请指定原任务', 409);
     const row = rows[0];
@@ -61,19 +63,17 @@ export class SqliteTaskTabRepository implements TaskTabRepository {
     });
   }
   forPlan(jobId: string): TaskTab[] {
-    this.tasks.get(jobId);
-    return this.db
-      .prepare(
-        'SELECT ownership_id FROM task_tab_ownership WHERE job_id=? ORDER BY created_at,ownership_id',
-      )
+    this.tasks.ensurePlanExists(jobId);
+    return this.stmt(
+      'SELECT ownership_id FROM task_tab_ownership WHERE job_id=? ORDER BY created_at,ownership_id',
+    )
       .all(jobId)
       .map((row) => this.get(String(row.ownership_id), jobId));
   }
   activeForProfile(profileId: string): TaskTab[] {
-    return this.db
-      .prepare(
-        "SELECT o.ownership_id,o.job_id FROM task_tab_state s JOIN task_tab_ownership o USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state IN ('READY','RECHECK_REQUIRED') ORDER BY o.created_at,o.ownership_id,o.job_id",
-      )
+    return this.stmt(
+      "SELECT o.ownership_id,o.job_id FROM task_tab_state s JOIN task_tab_ownership o USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state IN ('READY','RECHECK_REQUIRED') ORDER BY o.created_at,o.ownership_id,o.job_id",
+    )
       .all(profileId)
       .map((row) => this.get(String(row.ownership_id), String(row.job_id)));
   }
@@ -162,6 +162,60 @@ export class SqliteTaskTabRepository implements TaskTabRepository {
           !['PAUSED', 'STOPPED', 'COMPLETED', 'FAILED'].includes(this.tasks.get(row.jobId).state)
         )
           throw new ProductError('TASK_TAB_REUSE_UNCONFIRMED', '原任务尚未释放此页面的控制', 409);
+      }
+      const existingActive = this.db
+        .prepare(
+          "SELECT ownership_id,job_id,last_context,release_receipt FROM task_tab_state WHERE profile_id=? AND state IN ('READY','RECHECK_REQUIRED') AND ownership_id<>?",
+        )
+        .all(proof.profileId, proof.ownershipId);
+      const currentHasBlocking = this.tasks
+        .blockingOperations(jobId)
+        .some((op) => ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status));
+      if (!currentHasBlocking) {
+        const supersedeNow = Date.now();
+        for (const item of existingActive) {
+          const oldOwnershipId = String(item.ownership_id);
+          const oldJobId = String(item.job_id);
+          try {
+            const oldRow = this.get(oldOwnershipId, oldJobId);
+            const oldPlan = this.tasks.get(oldJobId);
+            const oldIsTerminal = ['COMPLETED', 'STOPPED', 'FAILED'].includes(oldPlan.state);
+            const oldHasBlocking =
+              !oldIsTerminal &&
+              this.tasks
+                .blockingOperations(oldJobId)
+                .some((op) => ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status));
+            const sameJobSuperseded =
+              oldJobId === jobId &&
+              (oldRow.state === 'RECHECK_REQUIRED' ||
+                !oldRow.context ||
+                !sameExecution(oldRow.context, context));
+            const settledOtherJob =
+              oldJobId !== jobId &&
+              !['RUNNING', 'PAUSING', 'STOPPING'].includes(oldPlan.state) &&
+              !oldHasBlocking;
+            if (sameJobSuperseded || settledOtherJob) {
+              let receipt = item.release_receipt ? String(item.release_receipt) : null;
+              if (!receipt && item.last_context) {
+                const parsed = ExecutionContext.safeParse(JSON.parse(String(item.last_context)));
+                if (parsed.success) {
+                  receipt = JSON.stringify({
+                    ...parsed.data,
+                    requestId: oldPlan.controlRequestId ?? oldPlan.id,
+                    state: 'stopped',
+                  });
+                }
+              }
+              this.db
+                .prepare(
+                  "UPDATE task_tab_state SET state='RELEASED',context=NULL,reason='SUPERSEDED_BY_NEW_OWNED_TAB',release_receipt=COALESCE(release_receipt,?),revision=revision+1,updated_at=? WHERE ownership_id=? AND job_id=?",
+                )
+                .run(receipt, supersedeNow, oldOwnershipId, oldJobId);
+            }
+          } catch {
+            // Leave non-reconcilable rows for explicit check below.
+          }
+        }
       }
       if (
         this.db
@@ -500,12 +554,18 @@ export class SqliteTaskTabRepository implements TaskTabRepository {
       const jobId = String(item.job_id);
       try {
         const plan = this.tasks.get(jobId);
+        const isTerminalPlan =
+          plan.state === 'COMPLETED' || plan.state === 'STOPPED' || plan.state === 'FAILED';
+        const isSettledPlan =
+          isTerminalPlan ||
+          (plan.state === 'PAUSED' && plan.controlConfirmed === true) ||
+          (plan.state === 'REVIEW' && plan.controlConfirmed === true);
         if (
-          (plan.state === 'COMPLETED' ||
-            (plan.state === 'FAILED' && plan.reason === 'PARTIAL_STEP_FAILURE')) &&
-          !this.tasks
-            .operations(jobId)
-            .some((op) => ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status))
+          isSettledPlan &&
+          (isTerminalPlan ||
+            !this.tasks
+              .blockingOperations(jobId)
+              .some((op) => ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status)))
         ) {
           let receipt = item.release_receipt ? String(item.release_receipt) : null;
           if (!receipt && item.last_context) {

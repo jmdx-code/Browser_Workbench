@@ -62,7 +62,7 @@ export const KernelPersistentState = z
         (row) =>
           (row.state === 'RECONCILED') !== (row.resolution !== null) ||
           (row.disposition !== undefined &&
-            !['UNKNOWN', 'ACKNOWLEDGED', 'RECONCILED'].includes(row.state)),
+            !['DISPATCHING', 'UNKNOWN', 'ACKNOWLEDGED', 'RECONCILED'].includes(row.state)),
       ) ||
       value.tabs.some(
         (row) =>

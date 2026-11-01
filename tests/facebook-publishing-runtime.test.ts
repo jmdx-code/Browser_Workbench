@@ -60,6 +60,13 @@ test('next daily window resumes only a confirmed automatic window pause, never a
       const control = await workspace.tasks.requestControl(plan.id, 'pause', reason);
       assert.ok(control.controlRequestId);
       await workspace.tasks.confirmControl(plan.id, control.controlRequestId);
+      const peer = core.connect(
+        profile.id,
+        () => {},
+        () => {},
+      );
+      peer.phase = 'PAUSED';
+      peer.synced = true;
       return plan.id;
     };
     const automatic = await paused('SCHEDULE_WINDOW_CLOSED');
@@ -84,8 +91,8 @@ test('next daily window resumes only a confirmed automatic window pause, never a
       // Startup recovery replaces the old controller's automatic-resume authority.
       await workspace.tasks.recoverOnStartup();
       await runtime.tick();
-      assert.equal((await workspace.tasks.get(automatic)).state, 'PAUSED');
-      assert.equal((await workspace.tasks.get(manual)).state, 'PAUSED');
+      assert.equal((await workspace.tasks.get(automatic)).state, 'STOPPED');
+      assert.equal((await workspace.tasks.get(manual)).state, 'STOPPED');
     } finally {
       await runtime.close();
       await kernel.close();

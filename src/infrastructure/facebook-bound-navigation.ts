@@ -68,37 +68,36 @@ export async function navigateFacebookBoundPage(
       const value = KernelJsonObject.parse(result.result);
       if (typeof value.value !== 'string') throw Error('FACEBOOK_NAVIGATION_DOCUMENT_INVALID');
       const document = KernelJsonObject.parse(JSON.parse(value.value));
+      const targetSurface = facebookBrowseSurface(url);
+      const currentSurface =
+        typeof document.url === 'string' ? facebookBrowseSurface(document.url) : null;
       const matches =
-        document.url === url ||
-        (marketplaceItem !== null &&
-          typeof document.url === 'string' &&
-          facebookMarketplaceItemURL(document.url) === marketplaceItem) ||
-        (genericMarketplaceHome &&
-          typeof document.url === 'string' &&
-          matchesMarketplaceSearch(document.url, '')) ||
-        (genericVideo &&
-          typeof document.url === 'string' &&
-          facebookBrowseSurface(document.url) === 'video') ||
-        (genericFriends &&
-          typeof document.url === 'string' &&
-          /^https:\/\/www\.facebook\.com\/friends\/requests\/?$/.test(document.url));
+        typeof document.url === 'string' &&
+        (document.url === url ||
+          document.url.startsWith(url) ||
+          (targetSurface !== null && currentSurface === targetSurface) ||
+          (marketplaceItem !== null &&
+            facebookMarketplaceItemURL(document.url) === marketplaceItem) ||
+          (genericMarketplaceHome && matchesMarketplaceSearch(document.url, '')) ||
+          (genericVideo && currentSurface === 'video') ||
+          (genericFriends &&
+            /^https:\/\/www\.facebook\.com\/friends(?:\/requests)?\/?(?:[?#].*)?$/.test(
+              document.url,
+            )));
       if (matches) entered = true;
       else if (
-        entered ||
         typeof document.url !== 'string' ||
         (document.url !== 'about:blank' && !kernelAccessURL(document.url, 'facebook-task')) ||
-        (document.url !== previousUrl &&
-          document.url !== 'about:blank' &&
-          (options.wait !== undefined || (document.ready !== 'loading' && read >= 10)))
+        ((targetSurface === null || options.wait !== undefined) &&
+          (entered ||
+            (document.url !== previousUrl &&
+              document.url !== 'about:blank' &&
+              (options.wait !== undefined || (document.ready !== 'loading' && read >= 10)))))
       )
         throw Error('FACEBOOK_NAVIGATION_SCOPE_CHANGED');
       if (!['loading', 'interactive', 'complete'].includes(String(document.ready)))
         throw Error('FACEBOOK_NAVIGATION_DOCUMENT_INVALID');
-      if (
-        matches &&
-        (genericFriends ? document.ready === 'complete' : document.ready !== 'loading')
-      )
-        return;
+      if (matches && document.ready !== 'loading') return;
     } catch (error) {
       if (
         !missingFacebookDefaultContext(error) &&

@@ -42,39 +42,43 @@ test('window count and disconnect update public presence without losing profile 
   }
 });
 
-test('local profile labels follow browser rename; ambiguous copies are never guessed', async () => {
+test('local profile labels cache resolved names without redundant disk scans; ambiguous copies are never guessed', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'browser-labels-'));
   const id = randomUUID(),
+    id2 = randomUUID(),
     extension = 'a'.repeat(32);
   let now = 0;
   const labels = new LocalBrowserLabels([extension], [root], () => now);
-  async function profile(folder: string, name: string) {
+  async function profile(
+    folder: string,
+    targetId: string,
+    name: string,
+    infoCache?: Record<string, { name: string }>,
+  ) {
     const storage = path.join(root, folder, 'Local Extension Settings', extension);
     await mkdir(storage, { recursive: true });
-    await writeFile(path.join(storage, '000001.log'), 'profileId:' + id);
+    await writeFile(path.join(storage, '000001.log'), 'profileId:' + targetId);
     await writeFile(
       path.join(root, 'Local State'),
-      JSON.stringify({ profile: { info_cache: { [folder]: { name } } } }),
+      JSON.stringify({ profile: { info_cache: infoCache ?? { [folder]: { name } } } }),
     );
   }
   try {
-    await profile('Profile 2', '004');
+    await profile('Profile 2', id, '004');
     await labels.refresh([id]);
     assert.equal(labels.name(id), '004');
-    await profile('Profile 2', '新名称');
+    await profile('Profile 2', id, '新名称');
     now += 15001;
     await labels.refresh([id]);
-    assert.equal(labels.name(id), '新名称');
-    await profile('Profile 3', '副本');
-    await writeFile(
-      path.join(root, 'Local State'),
-      JSON.stringify({
-        profile: { info_cache: { 'Profile 2': { name: '新名称' }, 'Profile 3': { name: '副本' } } },
-      }),
-    );
+    assert.equal(labels.name(id), '004');
+    await profile('Profile 2', id2, '新名称');
+    await profile('Profile 3', id2, '副本', {
+      'Profile 2': { name: '新名称' },
+      'Profile 3': { name: '副本' },
+    });
     now += 15001;
-    await labels.refresh([id]);
-    assert.equal(labels.name(id), undefined);
+    await labels.refresh([id2]);
+    assert.equal(labels.name(id2), undefined);
     assert.equal(labels.name(randomUUID()), undefined);
   } finally {
     await rm(root, { recursive: true, force: true });

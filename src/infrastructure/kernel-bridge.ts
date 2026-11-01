@@ -9,6 +9,7 @@ import { TaskWindowSnapshot, type TaskWindow, type Rect } from '../shared/window
 import { randomUUID, createHash } from 'node:crypto';
 import { MAX_PENDING_KERNEL_RPC, RESERVED_KERNEL_CONTROL_RPC } from '../shared/kernel-capacity.js';
 import { Action, canonicalAction, FacebookBrowseURL } from '../shared/browser-actions.js';
+import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
 import { navigateFacebookBoundPage } from './facebook-bound-navigation.js';
 import type { Core, Peer } from '../bridge/core.js';
 import { readFacebookStoryPage } from './facebook-story-page-reader.js';
@@ -128,6 +129,15 @@ class KernelRpcSession {
   }
   executionFailure: { binding: Binding; message: string } | null = null;
   failureReason: string | null = null;
+  stopControlId: string | null = null;
+  detachedByConfirmedStop = false;
+  controlStopReceipt: {
+    requestId: string;
+    connectionEpoch: string;
+    owner: string;
+    state: 'stopped';
+  } | null = null;
+  readonly priorStopRequestId: string | null;
   opened = false;
   record(event: string): void {
     // Keep setup plus recent events; a long browsing run must retain its eventual failure.
@@ -183,13 +193,14 @@ class KernelRpcSession {
     readonly owner: string,
     private readonly nextSequence: () => number,
   ) {
+    this.priorStopRequestId = peer.lastStopRequestId ?? null;
     this.lease = new KernelLease(peer.profileId, peer.epoch);
     this.stamp = {
       profileId: peer.profileId,
       connectionEpoch: peer.epoch,
       leaseId: randomUUID(),
       generation: 0,
-      expiresAt: Date.now() + 10_000,
+      expiresAt: Date.now() + 60_000,
     };
     this.lease.grant(this.stamp);
   }
@@ -215,7 +226,12 @@ class KernelRpcSession {
     )
       this.mutationRequested = true;
     this.record('rpc:' + body.kind + (body.kind === 'send' ? ':' + body.method : ''));
-    if (!this.peer.online || this.peer.phase !== 'PAUSED' || !this.peer.synced) {
+    if (
+      this.failureReason ||
+      !this.peer.online ||
+      this.peer.phase !== 'PAUSED' ||
+      !this.peer.synced
+    ) {
       this.record(
         'peer-fenced:' +
           this.peer.phase +
@@ -278,7 +294,49 @@ class KernelRpcSession {
         Math.round(performance.now() - pending.startedAt) +
         'ms',
     );
-    if (reply.error) this.record('rpc-error:' + reply.error.slice(0, 160));
+    if (reply.error) {
+      this.record('rpc-error:' + reply.error.slice(0, 160));
+      if (/\bKERNEL_LEASE_REJECTED\b/.test(reply.error)) {
+        const subReason = reply.error.includes(':')
+          ? reply.error.slice(reply.error.indexOf(':') + 1).trim() || 'unknown'
+          : 'unspecified';
+        this.record(
+          'lease-rejected:' +
+            subReason +
+            ':stamp=' +
+            this.stamp.profileId +
+            '/' +
+            this.stamp.connectionEpoch +
+            '/' +
+            this.stamp.leaseId +
+            '/gen=' +
+            this.stamp.generation +
+            ':peer=' +
+            this.peer.profileId +
+            '/' +
+            this.peer.epoch,
+        );
+        devDiag.record({
+          level: 'ERROR',
+          category: 'KERNEL_RPC',
+          event: 'KERNEL_LEASE_REJECTED_DIAG',
+          profileId: this.peer.profileId,
+          planId: this.activeBinding?.jobId,
+          stepId: this.activeBinding?.stepId,
+          operationId: this.activeBinding?.operationId,
+          reason: reply.error,
+          data: {
+            subReason,
+            owner: this.owner,
+            access: this.access,
+            controllerStamp: { ...this.stamp },
+            replyEpoch: reply.connectionEpoch,
+            replyLeaseId: reply.leaseId,
+            peerEpoch: this.peer.epoch,
+          },
+        });
+      }
+    }
     this.pending.delete(reply.requestId);
     clearTimeout(pending.timer);
     if (reply.error) pending.reject(Error(reply.error));
@@ -311,6 +369,7 @@ class KernelRpcSession {
       attach: async (tabId) =>
         KernelTargetInfo.parse((await this.request({ kind: 'attach', tabId })).info),
       detach: async (tabId) => {
+        if (this.detachedByConfirmedStop) return;
         await this.request({ kind: 'detach', tabId });
       },
       create: async (url, ownershipId, foreground) => {
@@ -391,7 +450,7 @@ class KernelRpcSession {
   }
   async renew(): Promise<void> {
     if (this.closing) return;
-    this.stamp.expiresAt = Date.now() + 10_000;
+    this.stamp.expiresAt = Date.now() + 60_000;
     this.lease.grant(this.stamp);
     await this.request({ kind: 'renew', stamp: { ...this.stamp } });
   }
@@ -399,6 +458,11 @@ class KernelRpcSession {
 
 // Private transport owner. Production inspection exposes projections, never raw commands.
 export class KernelBridge implements KernelBridgeHooks {
+  recoverBumperWorkspace?: (
+    peer: Peer,
+    guard: () => Awaitable<void>,
+  ) => Promise<ReadonlySet<string>>;
+
   private arrangeWindow?: (profileId: string, guard: () => void) => Promise<void>;
   private exposedLayoutEnabled?: () => boolean;
   private recoverWindow?: (profileId: string, guard: () => void, deadline: number) => Promise<void>;
@@ -421,90 +485,57 @@ export class KernelBridge implements KernelBridgeHooks {
     profileId: string,
     expected?: TaskWindow,
     rect?: Rect,
-    exposed = false,
-    deadline?: number,
+    _exposed = false,
+    _deadline?: number,
     focus = true,
   ): Promise<TaskWindow> {
     const peer = this.core.peers.get(profileId);
-    if (!peer?.online || !peer.synced) throw Error('WINDOW_LAYOUT_PROFILE_OFFLINE');
-    if (!peer.capabilities?.includes('task-window-layout-v1'))
-      throw Error('WINDOW_LAYOUT_EXTENSION_UPDATE_REQUIRED');
-    if (!peer.capabilities.includes('task-window-content-layout-v1'))
-      throw Error('WINDOW_LAYOUT_EXTENSION_UPDATE_REQUIRED');
-    if (!peer.capabilities.includes('task-window-simple-recovery-v1'))
-      throw Error('WINDOW_LAYOUT_EXTENSION_UPDATE_REQUIRED');
-    let session = this.sessions.get(profileId);
-    let temporary = false;
-    if (!session) {
-      const owner = randomUUID();
-      await this.core.claimFixtureKernel(peer, owner);
-      session = new KernelRpcSession(peer, owner, () => {
-        const next = (this.sequences.get(peer) ?? 0) + 1;
-        this.sequences.set(peer, next);
-        return next;
-      });
-      session.access = 'facebook-task';
-      this.sessions.set(profileId, session);
-      temporary = true;
-    }
-    const current = session;
-    const guard = () => {
-      if (
-        this.sessions.get(profileId) !== current ||
-        this.core.peers.get(profileId) !== peer ||
-        !peer.online ||
-        !peer.synced ||
-        current.closing ||
-        current.failureReason ||
-        current.access !== 'facebook-task'
-      )
-        throw Error('WINDOW_LAYOUT_CHANNEL_CHANGED');
-      current.lease.check();
-    };
-    try {
-      if (temporary)
-        await current.request({
-          kind: 'open',
-          stamp: { ...current.stamp },
-          files: [],
-          access: 'facebook-task',
-        });
-      guard();
-      const inventory = KernelPersistentState.parse(await current.request({ kind: 'inventory' }));
-      guard();
-      const proof = inventory.workspaceMain;
-      if (!proof || (expected && !sameTabProof(expected.proof, proof)))
-        throw Error('WINDOW_LAYOUT_MAIN_CHANGED');
-      const value = await current.request(
-        expected && rect
-          ? {
-              kind: 'positionTaskWindow',
-              expected,
-              rect,
-              exposed,
-              ...(peer.capabilities.includes('task-window-passive-layout-v1') ? { focus } : {}),
-              ...(deadline !== undefined ? { deadline } : {}),
-            }
-          : { kind: 'inspectTaskWindow', proof },
+    if (!peer?.online) throw Error('WINDOW_LAYOUT_PROFILE_OFFLINE');
+    if (expected && rect) {
+      const moved = await this.core.positionBrowserWindow(
+        profileId,
+        {
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+        },
+        focus,
       );
-      guard();
-      return TaskWindowSnapshot.parse(value);
-    } finally {
-      if (temporary) {
-        current.closing = true;
-        try {
-          const stopped = await current.request({ kind: 'stop' });
-          if (stopped.state !== 'stopped') throw Error('WINDOW_LAYOUT_STOP_UNCONFIRMED');
-          if (this.sessions.get(profileId) === current) this.sessions.delete(profileId);
-          this.core.releaseFixtureKernel(peer, current.owner);
-        } catch {
-          if (this.core.peers.get(profileId) === peer) await this.core.stop(profileId);
-          throw Error('WINDOW_LAYOUT_STOP_UNCONFIRMED');
-        } finally {
-          current.fail('WINDOW_LAYOUT_CLOSED');
-        }
-      }
+      return TaskWindowSnapshot.parse({
+        proof: expected.proof,
+        windowId: moved.windowId,
+        state: moved.state,
+        rect: {
+          x: moved.bounds.left,
+          y: moved.bounds.top,
+          width: moved.bounds.width,
+          height: moved.bounds.height,
+        },
+        contentInsets: moved.contentInsets ??
+          expected.contentInsets ?? { left: 16, top: 104, right: 16, bottom: 16 },
+      });
     }
+    const inspected = await this.core.inspectBrowserWindow(profileId);
+    const proof = expected?.proof ?? {
+      ownershipId: peer.epoch,
+      profileId,
+      browserSessionEpoch: peer.epoch,
+      tabId: Math.max(1, inspected.tabId || 1),
+      targetId: 'window-' + inspected.windowId,
+    };
+    return TaskWindowSnapshot.parse({
+      proof,
+      windowId: inspected.windowId,
+      state: inspected.state,
+      rect: {
+        x: inspected.bounds.left,
+        y: inspected.bounds.top,
+        width: inspected.bounds.width,
+        height: inspected.bounds.height,
+      },
+      contentInsets: inspected.contentInsets ?? { left: 16, top: 104, right: 16, bottom: 16 },
+    });
   }
   private readonly presentationFocusGate = new PresentationFocusGate();
   async releaseIdleForExtension(peer: Peer) {
@@ -520,9 +551,7 @@ export class KernelBridge implements KernelBridgeHooks {
       peer.phase !== 'PAUSED'
     )
       throw Error('WORKSPACE_CLEANUP_SESSION_RECHECK_REQUIRED');
-    const inventory = await endInvitationSetupOperations(this, peer, undefined, true);
-    if (inventory.operations.some(kernelOperationPending))
-      throw Error('WORKSPACE_CLEANUP_OPERATION_PENDING');
+    await endInvitationSetupOperations(this, peer, undefined, true);
     const idle = this.idlePages.get(peer.profileId);
     if (idle) {
       if (idle.peer !== peer) throw Error('WORKSPACE_CLEANUP_CHANNEL_BUSY');
@@ -598,7 +627,7 @@ export class KernelBridge implements KernelBridgeHooks {
         if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
         this.core.releaseFixtureKernel(peer, owner);
       } catch {
-        if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+        await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
       } finally {
         session.fail('WORKSPACE_CLEANUP_CLOSED');
       }
@@ -641,6 +670,8 @@ export class KernelBridge implements KernelBridgeHooks {
     const result = await session.request({ kind: 'revealOwnedPage', proof });
     if (result.tabId !== proof.tabId || result.focused !== true)
       throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
+    peer.profileWindowFocused = true;
+    peer.focusedWindowAt = Date.now();
     return { profileId: peer.profileId, tabId: proof.tabId, focused: true as const };
   }
   private async revealIdleFacebookPage(peer: Peer, proof: TabProof, guard: () => Awaitable<void>) {
@@ -693,6 +724,8 @@ export class KernelBridge implements KernelBridgeHooks {
       if (result.tabId !== proof.tabId || result.focused !== true)
         throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
       displayed = true;
+      peer.profileWindowFocused = true;
+      peer.focusedWindowAt = Date.now();
       return { profileId: peer.profileId, tabId: proof.tabId, focused: true as const };
     } finally {
       session.closing = true;
@@ -702,7 +735,7 @@ export class KernelBridge implements KernelBridgeHooks {
         if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
         this.core.releaseFixtureKernel(peer, owner);
       } catch {
-        if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+        await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
         if (displayed) throw Error('WORKSPACE_REVEAL_STOP_UNCONFIRMED');
       } finally {
         session.fail('WORKSPACE_REVEAL_CLOSED');
@@ -1055,7 +1088,7 @@ export class KernelBridge implements KernelBridgeHooks {
       }
       session.closing = true;
       // No guessing ownership or retrying a failed read. Global stop also protects a late create/attach.
-      if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+      await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
       session.fail('FACEBOOK_READ_FAILED');
       throw error;
     }
@@ -1130,7 +1163,7 @@ export class KernelBridge implements KernelBridgeHooks {
       };
     } catch (error) {
       session.closing = true;
-      if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+      await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
       session.fail('FACEBOOK_READ_RELEASE_FAILED');
       throw error;
     }
@@ -1341,16 +1374,25 @@ export class KernelBridge implements KernelBridgeHooks {
     } catch (error) {
       closed = true;
       session.closing = true;
-      if (opened) {
+      const errMessage = error instanceof Error ? error.message : '';
+      const deterministicOpenRejected =
+        !opened &&
+        /^(?:KERNEL_LEASE_REJECTED(?::[a-z0-9_]+)?|KERNEL_SUMMARY_SCOPE_REJECTED|KERNEL_READONLY_FILES_REJECTED|KERNEL_CONTEXT_REJECTED|KERNEL_RPC_BUDGET_EXCEEDED)$/.test(
+          errMessage,
+        );
+      if (deterministicOpenRejected) {
+        if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
+        this.core.releaseFixtureKernel(peer, owner);
+      } else if (opened) {
         try {
           const stopped = await session.request({ kind: 'stop' });
           if (stopped.state !== 'stopped') throw Error('SUMMARY_STOP_UNCONFIRMED');
           if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
           this.core.releaseFixtureKernel(peer, owner);
         } catch {
-          if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+          await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
         }
-      } else if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
+      } else await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
       session.fail('SUMMARY_FAILED');
       throw error;
     }
@@ -1377,8 +1419,48 @@ export class KernelBridge implements KernelBridgeHooks {
       !peer.capabilities.includes('kernel-operation-files-v1')
     )
       throw Error('FACEBOOK_TASK_EXTENSION_UPDATE_REQUIRED');
-    const prepared = await prepareFacebookWorkspace(this, peer, retainedTab, assertIdentity);
-    retainedTab = prepared.proof;
+    if (!retainedTab) {
+      const prepared = await prepareFacebookWorkspace(
+        this,
+        peer,
+        retainedTab,
+        assertIdentity,
+        undefined,
+        true,
+      );
+      retainedTab = prepared.proof;
+      const inventory = prepared.inventory;
+      await assertIdentity();
+      if (
+        inventory.operations.some(kernelOperationPending) ||
+        inventory.tabs.some(
+          (row) =>
+            !['CLOSED', 'LOST'].includes(row.state) &&
+            !(
+              retainedTab &&
+              row.state === 'READY' &&
+              row.proof &&
+              sameTabProof(row.proof, retainedTab)
+            ),
+        )
+      )
+        throw Error(
+          'FACEBOOK_TASK_NATIVE_REVIEW_REQUIRED:' +
+            JSON.stringify({
+              pendingOperations: inventory.operations.filter(kernelOperationPending).map((row) => ({
+                id: row.binding.operationId,
+                state: row.state,
+              })),
+              activeTabs: inventory.tabs
+                .filter((row) => !['CLOSED', 'LOST'].includes(row.state))
+                .map((row) => ({
+                  ownershipId: row.ownershipId,
+                  state: row.state,
+                  retained: !!(retainedTab && row.proof && sameTabProof(row.proof, retainedTab)),
+                })),
+            }),
+        );
+    }
     const idle = this.idlePages.get(peer.profileId);
     if (idle) {
       if (
@@ -1402,37 +1484,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.idlePages.delete(peer.profileId);
       return idle.connection;
     }
-    const inventory = prepared.inventory;
     await assertIdentity();
-    if (
-      inventory.operations.some(kernelOperationPending) ||
-      inventory.tabs.some(
-        (row) =>
-          !['CLOSED', 'LOST'].includes(row.state) &&
-          !(
-            retainedTab &&
-            row.state === 'READY' &&
-            row.proof &&
-            sameTabProof(row.proof, retainedTab)
-          ),
-      )
-    )
-      throw Error(
-        'FACEBOOK_TASK_NATIVE_REVIEW_REQUIRED:' +
-          JSON.stringify({
-            pendingOperations: inventory.operations.filter(kernelOperationPending).map((row) => ({
-              id: row.binding.operationId,
-              state: row.state,
-            })),
-            activeTabs: inventory.tabs
-              .filter((row) => !['CLOSED', 'LOST'].includes(row.state))
-              .map((row) => ({
-                ownershipId: row.ownershipId,
-                state: row.state,
-                retained: !!(retainedTab && row.proof && sameTabProof(row.proof, retainedTab)),
-              })),
-          }),
-      );
     return this.connectOwned(peer, [], retainedTab, {
       accountId,
       assertIdentity,
@@ -1571,8 +1623,10 @@ export class KernelBridge implements KernelBridgeHooks {
       row?.state !== 'READY' ||
       !row.proof ||
       !sameTabProof(row.proof, proof)
-    )
-      throw Error('FACEBOOK_WORKSPACE_NATIVE_RECHECK_REQUIRED');
+    ) {
+      await idle.connection.close().catch(() => {});
+      return null;
+    }
     const page = idle.connection.browser.contexts()[0]?.pages()[0];
     if (!page) throw Error('FACEBOOK_WORKSPACE_PAGE_REQUIRED');
     if (
@@ -1601,6 +1655,12 @@ export class KernelBridge implements KernelBridgeHooks {
           !homeAdmission &&
           !navigated &&
           !storyAdmission &&
+          !(
+            firstError instanceof Error &&
+            /^FACEBOOK_ACCOUNT_(?:VERIFICATION_REQUIRED|RESTRICTED|LOGGED_OUT)$/.test(
+              firstError.message,
+            )
+          ) &&
           (await this.navigateRetainedPageHome(page, guard))
         ) {
           current = await readIdentity();
@@ -1656,7 +1716,12 @@ export class KernelBridge implements KernelBridgeHooks {
       readonlyIdentity: true,
       assertIdentity: guard,
     });
-    await connection.close();
+    try {
+      await connection.close();
+    } catch (error) {
+      await connection.stopOnCloseFailure().catch(() => {});
+      throw error;
+    }
   }
   // Private read of a new owned SDK page before an account exists. No execution context or
   // execute callback can be obtained; unbound native input remains rejected by the original gate.
@@ -1704,6 +1769,12 @@ export class KernelBridge implements KernelBridgeHooks {
               !homeAdmission &&
               !navigated &&
               !storyAdmission &&
+              !(
+                firstError instanceof Error &&
+                /^FACEBOOK_ACCOUNT_(?:VERIFICATION_REQUIRED|RESTRICTED|LOGGED_OUT)$/.test(
+                  firstError.message,
+                )
+              ) &&
               (await this.navigateRetainedPageHome(page, assertAllowed))
             ) {
               current = await readIdentity();
@@ -1747,6 +1818,7 @@ export class KernelBridge implements KernelBridgeHooks {
     page: Page,
     guard: () => Awaitable<void>,
     currentRoute = false,
+    profileId?: string,
   ) {
     await guard();
     const projection = validateProjection(
@@ -1761,11 +1833,19 @@ export class KernelBridge implements KernelBridgeHooks {
         : ('task' as const),
     );
     await guard();
-    const after = await page.evaluate(() => ({
-      url: location.href,
-      timeOrigin: performance.timeOrigin,
-      ready: document.readyState,
-    }));
+    const after = await page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').slice(0, 4000);
+      const restricted =
+        /account has been disabled|your account is disabled|we suspended your account|账号已被停用|账户已被停用|已停用你的账户/i.test(
+          bodyText,
+        );
+      return {
+        url: location.href,
+        timeOrigin: performance.timeOrigin,
+        ready: document.readyState,
+        restricted,
+      };
+    });
     await guard();
     if (
       projection.url !== after.url ||
@@ -1775,7 +1855,14 @@ export class KernelBridge implements KernelBridgeHooks {
       identity.url !== after.url
     )
       throw Error('FACEBOOK_DISPLAY_DOCUMENT_CHANGED');
-    return { page: projection, actor: FacebookNativeActor.nullable().parse(identity.actor) };
+    const actor = FacebookNativeActor.nullable().parse(identity.actor);
+    if (profileId) await this.observeExternalPageAccount(profileId, page, actor);
+    if (!actor) {
+      const abnormalUrl = classifyFacebookAbnormalUrl(after.url);
+      if (abnormalUrl) throw Error(abnormalUrl);
+      if (after.restricted) throw Error('FACEBOOK_ACCOUNT_RESTRICTED');
+    }
+    return { page: projection, actor };
   }
   async inspectRetainedFacebookDisplay(peer: Peer, proof: TabProof, guard: () => Awaitable<void>) {
     await guard();
@@ -1795,17 +1882,19 @@ export class KernelBridge implements KernelBridgeHooks {
         !inventory.tabs.some(
           (tab) => tab.state === 'READY' && tab.proof && sameTabProof(tab.proof, proof),
         )
-      )
-        throw Error('INSPECTION_NATIVE_REVIEW_REQUIRED');
-      const page = idle.connection.browser.contexts()[0]?.pages()[0];
-      if (!page) throw Error('FACEBOOK_WORKSPACE_PAGE_REQUIRED');
-      return this.readFacebookDisplayDocument(page, guard, true);
+      ) {
+        await idle.connection.close().catch(() => {});
+      } else {
+        const page = idle.connection.browser.contexts()[0]?.pages()[0];
+        if (!page) throw Error('FACEBOOK_WORKSPACE_PAGE_REQUIRED');
+        return this.readFacebookDisplayDocument(page, guard, true, peer.profileId);
+      }
     }
     const observed = await this.inspectOwnedFacebookPage(
       peer,
       guard,
       'https://www.facebook.com/',
-      (page) => this.readFacebookDisplayDocument(page, guard, true),
+      (page) => this.readFacebookDisplayDocument(page, guard, true, peer.profileId),
       false,
       false,
       proof,
@@ -1817,7 +1906,7 @@ export class KernelBridge implements KernelBridgeHooks {
       peer,
       assertAllowed,
       'https://www.facebook.com/',
-      (page) => this.readFacebookDisplayDocument(page, assertAllowed),
+      (page) => this.readFacebookDisplayDocument(page, assertAllowed, false, peer.profileId),
     );
     return observed.reading;
   }
@@ -1981,6 +2070,50 @@ export class KernelBridge implements KernelBridgeHooks {
       true,
     );
   }
+  // Metadata reads never consolidate tabs or adopt more than one ready page.
+  async readFacebookMetadataPage<T>(
+    peer: Peer,
+    guard: () => Awaitable<void>,
+    read: (page: Page) => Promise<T>,
+    existingTab?: TabProof,
+    timeoutMs = 10_000,
+    options?: {
+      initialUrl?: string;
+      forceNewTemporaryTab?: boolean;
+      backgroundMetadataRead?: boolean;
+      disableOuterTimeout?: boolean;
+    },
+  ) {
+    const inventory = await this.withSummary(peer, (port) => port.inventory());
+    await guard();
+    const ready = inventory.tabs.filter((row) => row.state === 'READY' && row.proof);
+    if (
+      inventory.operations.some(kernelOperationPending) ||
+      ready.length > 1 ||
+      inventory.tabs.some((row) => !['READY', 'CLOSED', 'LOST'].includes(row.state))
+    )
+      throw Error('FACEBOOK_METADATA_BROWSER_BUSY');
+    void existingTab;
+    return this.inspectOwnedFacebookPage(
+      peer,
+      guard,
+      options?.initialUrl ?? 'https://www.facebook.com/',
+      async (page) => {
+        await guard();
+        return read(page);
+      },
+      false,
+      false,
+      undefined,
+      {
+        noWorkspaceCleanup: true,
+        timeoutMs,
+        forceNewTemporaryTab: options?.forceNewTemporaryTab ?? true,
+        backgroundMetadataRead: options?.backgroundMetadataRead ?? true,
+        disableOuterTimeout: options?.disableOuterTimeout ?? true,
+      },
+    );
+  }
   private async inspectOwnedFacebookPage<T>(
     peer: Peer,
     assertAllowed: () => Awaitable<void>,
@@ -1989,6 +2122,13 @@ export class KernelBridge implements KernelBridgeHooks {
     foreground = false,
     retainForTask = false,
     existingTab?: TabProof,
+    readOptions?: {
+      noWorkspaceCleanup?: boolean;
+      timeoutMs?: number;
+      forceNewTemporaryTab?: boolean;
+      backgroundMetadataRead?: boolean;
+      disableOuterTimeout?: boolean;
+    },
   ) {
     await assertAllowed();
     if (
@@ -1996,33 +2136,66 @@ export class KernelBridge implements KernelBridgeHooks {
       !peer.capabilities.includes('facebook-task-main-frame-v1')
     )
       throw Error('FACEBOOK_TASK_EXTENSION_UPDATE_REQUIRED');
-    const prepared = await prepareFacebookWorkspace(this, peer, existingTab, assertAllowed);
-    existingTab = prepared.proof;
-    const inventory = prepared.inventory;
-    await assertAllowed();
-    if (
-      inventory.operations.some(kernelOperationPending) ||
-      inventory.tabs.some(
-        (row) =>
-          !['CLOSED', 'LOST'].includes(row.state) &&
-          !(
-            existingTab &&
-            row.state === 'READY' &&
-            row.proof &&
-            sameTabProof(row.proof, existingTab)
-          ),
+    if (readOptions?.forceNewTemporaryTab === true) {
+      existingTab = undefined;
+      if (this.idlePages.has(peer.profileId)) {
+        await this.releaseIdleForExtension(peer);
+        await assertAllowed();
+      }
+    }
+    if (!existingTab && !readOptions?.noWorkspaceCleanup) {
+      const prepared = await prepareFacebookWorkspace(
+        this,
+        peer,
+        existingTab,
+        assertAllowed,
+        undefined,
+        true,
+      );
+      existingTab = prepared.proof;
+      const inventory = prepared.inventory;
+      await assertAllowed();
+      if (
+        inventory.operations.some(kernelOperationPending) ||
+        inventory.tabs.some(
+          (row) =>
+            !['CLOSED', 'LOST'].includes(row.state) &&
+            !(
+              existingTab &&
+              row.state === 'READY' &&
+              row.proof &&
+              sameTabProof(row.proof, existingTab)
+            ),
+        )
       )
-    )
-      throw Error('FACEBOOK_IDENTITY_NATIVE_REVIEW_REQUIRED');
+        throw Error('FACEBOOK_IDENTITY_NATIVE_REVIEW_REQUIRED');
+    }
     let keepPage = existingTab !== undefined;
-    const connection = await this.connectOwned(peer, [], existingTab, {
-      accountId: null,
-      assertIdentity: assertAllowed,
-      readonlyIdentity: true,
-      initialUrl,
-      foreground,
-      preservePage: () => keepPage,
-    });
+    const parked =
+      readOptions?.noWorkspaceCleanup && !readOptions.forceNewTemporaryTab
+        ? this.idlePages.get(peer.profileId)
+        : undefined;
+    if (
+      parked &&
+      (parked.peer !== peer ||
+        !existingTab ||
+        !parked.connection.proof ||
+        !sameTabProof(parked.connection.proof, existingTab) ||
+        !peer.capabilities?.includes('kernel-page-quiesce-v1'))
+    )
+      throw Error('FACEBOOK_METADATA_BROWSER_BUSY');
+    const connection =
+      parked?.connection ??
+      (await this.connectOwned(peer, [], existingTab, {
+        accountId: null,
+        assertIdentity: assertAllowed,
+        readonlyIdentity: true,
+        initialUrl,
+        foreground: readOptions?.backgroundMetadataRead ? false : foreground,
+        preservePage: () => keepPage,
+        forceNewTemporaryTab: readOptions?.forceNewTemporaryTab === true,
+        backgroundMetadataRead: readOptions?.backgroundMetadataRead === true,
+      }));
     let current: T;
     let stop: Awaited<ReturnType<typeof connection.close>>;
     try {
@@ -2039,23 +2212,35 @@ export class KernelBridge implements KernelBridgeHooks {
         await this.revealOwnedFacebookPage(peer, connection.proof).catch(() => {});
         await assertAllowed();
       }
-      // A page.evaluate can wait for an SDK execution context without producing a CDP
-      // request. The RPC deadline therefore cannot bound this read on its own.
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        current = await Promise.race([
-          read(pages[0], existingTab),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(Error('FACEBOOK_TASK_DOCUMENT_TIMEOUT')), 40_000);
-          }),
-        ]);
-      } finally {
-        clearTimeout(timer);
+      if (readOptions?.disableOuterTimeout === true) {
+        current = await read(pages[0], existingTab);
+      } else {
+        // A page.evaluate can wait for an SDK execution context without producing a CDP
+        // request. The RPC deadline therefore cannot bound this read on its own.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          current = await Promise.race([
+            read(pages[0], existingTab),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(Error('FACEBOOK_TASK_DOCUMENT_TIMEOUT')),
+                readOptions?.timeoutMs ?? 40_000,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
       }
       await assertAllowed();
       keepPage = retainForTask || existingTab !== undefined;
     } finally {
-      stop = await connection.close();
+      try {
+        stop = await connection.close();
+      } catch (closeError) {
+        await connection.stopOnCloseFailure().catch(() => {});
+        throw closeError;
+      }
     }
     await assertAllowed();
     const proof = connection.proof,
@@ -2087,8 +2272,13 @@ export class KernelBridge implements KernelBridgeHooks {
       initialUrl?: string;
       foreground?: boolean;
       preservePage?: () => boolean;
+      backgroundMetadataRead?: boolean;
+      forceNewTemporaryTab?: boolean;
     },
   ) {
+    if (facebook?.forceNewTemporaryTab === true) {
+      existingTab = undefined;
+    }
     const access: KernelAccess = facebook ? 'facebook-task' : 'fixture';
     if (
       !peer.capabilities?.includes(facebook ? 'facebook-task-kernel-v1' : 'fixture-kernel-v1') ||
@@ -2130,7 +2320,7 @@ export class KernelBridge implements KernelBridgeHooks {
               ? (facebook.initialUrl ?? 'https://www.facebook.com/')
               : 'http://127.0.0.1:18767/kernel-fixture',
             ownershipId,
-            facebook?.foreground,
+            facebook?.backgroundMetadataRead ? false : facebook?.foreground,
           );
       let proof: TabProof | null = null;
       if (persistent) {
@@ -2139,7 +2329,7 @@ export class KernelBridge implements KernelBridgeHooks {
           inventory.tabs.find((row) => row.ownershipId === ownershipId && row.state === 'READY')
             ?.proof ?? null;
         if (!proof || proof.tabId !== tab.tabId) throw Error('KERNEL_TAB_PERSISTENCE_UNCONFIRMED');
-        session.presentationProof = proof;
+        if (!facebook?.backgroundMetadataRead) session.presentationProof = proof;
         if (!existingTab) initialProof = proof;
       }
       await facebook?.assertIdentity();
@@ -2169,7 +2359,7 @@ export class KernelBridge implements KernelBridgeHooks {
           await new Promise<void>((resolve) => setTimeout(resolve, 200));
         }
       }
-      if (facebook && proof)
+      if (facebook && proof && !facebook.backgroundMetadataRead)
         await this.arrangeWindow?.(peer.profileId, () => {
           session.lease.check();
           if (
@@ -2179,7 +2369,12 @@ export class KernelBridge implements KernelBridgeHooks {
           )
             throw Error('WINDOW_LAYOUT_REVOKED');
         });
-      if (facebook && proof && peer.capabilities?.includes('task-presentation-recovery-v1'))
+      if (
+        facebook &&
+        proof &&
+        !facebook.backgroundMetadataRead &&
+        peer.capabilities?.includes('task-presentation-recovery-v1')
+      )
         await session.request({ kind: 'armTaskPresentation', proof });
       if (facebook)
         await awaitFacebookTaskDocument(
@@ -2201,6 +2396,7 @@ export class KernelBridge implements KernelBridgeHooks {
           {
             expectedUrl: facebook.initialUrl,
             retainedPage: existingTab !== undefined,
+            allowTargetBrowseUrl: facebook.backgroundMetadataRead === true,
             observe: async (document) => {
               session.record('initial-document:' + document.scope + ':' + document.ready);
               if (document.scope === 'other' && document.url && this.accountObserver) {
@@ -2263,10 +2459,45 @@ export class KernelBridge implements KernelBridgeHooks {
       let closingId: string | undefined;
       let closedInventory: ReturnType<typeof KernelPersistentState.parse> | null = null;
       let closedPageState: 'READY' | 'CLOSED' | null = null;
+      const hasVerifiedStopReceipt = (expectedId = closingId ?? session.stopControlId) => {
+        const receipt = session.controlStopReceipt;
+        return (
+          !!receipt &&
+          receipt.state === 'stopped' &&
+          receipt.owner === owner &&
+          receipt.connectionEpoch === session.stamp.connectionEpoch &&
+          receipt.requestId === expectedId &&
+          this.core.peers.get(peer.profileId) === peer &&
+          peer.online &&
+          peer.epoch === session.stamp.connectionEpoch &&
+          peer.lastStoppedRequestId === receipt.requestId
+        );
+      };
+      const awaitingControlStop = () =>
+        this.core.peers.get(peer.profileId) === peer &&
+        peer.online &&
+        peer.epoch === session.stamp.connectionEpoch &&
+        peer.phase === 'STOPPING' &&
+        peer.controlId === session.stopControlId;
       const closer = new SessionCloser({
         closeLocal: async () => {
           session.closing = true;
           executor.revokeFiles();
+          if (session.failureReason || hasVerifiedStopReceipt() || awaitingControlStop()) {
+            let local = await endpoint.close();
+            if (local.state !== 'stopped' && awaitingControlStop()) {
+              const until = Date.now() + 14000;
+              while (!hasVerifiedStopReceipt() && awaitingControlStop() && Date.now() < until)
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (local.state !== 'stopped' && hasVerifiedStopReceipt())
+              local = await endpoint.retryClose();
+            await browser.close().catch(() => {});
+            if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+            if (!hasVerifiedStopReceipt() && !awaitingControlStop())
+              throw Error(session.failureReason ?? 'KERNEL_STOP_UNCONFIRMED');
+            return;
+          }
           if (facebook) {
             const before = KernelPersistentState.parse(
               await session.request({ kind: 'inventory' }),
@@ -2309,6 +2540,14 @@ export class KernelBridge implements KernelBridgeHooks {
           if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
         },
         retryCloseLocal: async () => {
+          if (session.failureReason || hasVerifiedStopReceipt() || awaitingControlStop()) {
+            const local = await endpoint.retryClose();
+            await browser.close().catch(() => {});
+            if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+            if (!hasVerifiedStopReceipt() && !awaitingControlStop())
+              throw Error(session.failureReason ?? 'KERNEL_STOP_UNCONFIRMED');
+            return;
+          }
           // Never repeat removal. The first attempt must have observed this exact closed
           // or retained main before retrying the same local/remote cancellation.
           if (facebook) {
@@ -2340,6 +2579,7 @@ export class KernelBridge implements KernelBridgeHooks {
           if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
         },
         assertTransport: () => {
+          if (hasVerifiedStopReceipt() || awaitingControlStop()) return;
           if (
             this.sessions.get(peer.profileId) !== session ||
             this.core.peers.get(peer.profileId) !== peer ||
@@ -2350,6 +2590,17 @@ export class KernelBridge implements KernelBridgeHooks {
             throw Error('KERNEL_STOP_TRANSPORT_CHANGED');
         },
         stopRemote: async (requestId) => {
+          if (awaitingControlStop()) {
+            const until = Date.now() + 14000;
+            while (
+              !hasVerifiedStopReceipt(requestId) &&
+              awaitingControlStop() &&
+              Date.now() < until
+            )
+              await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          if (hasVerifiedStopReceipt(requestId)) return { requestId, state: 'stopped' };
+          if (session.failureReason) throw Error('KERNEL_STOP_UNCONFIRMED');
           const remote = await session.request({ kind: 'stop' }, requestId);
           if (remote.requestId !== requestId || remote.state !== 'stopped')
             throw Error('KERNEL_STOP_UNCONFIRMED');
@@ -2364,10 +2615,15 @@ export class KernelBridge implements KernelBridgeHooks {
           session.fail('KERNEL_CLOSED');
         },
       });
-      const close = (requestId: string = closingId ?? randomUUID()) => {
+      const close = (requestId: string = closingId ?? session.stopControlId ?? randomUUID()) => {
         if (closingId && closingId !== requestId)
           return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
+        if (session.stopControlId && session.stopControlId !== requestId)
+          return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
         closingId = requestId;
+        session.stopControlId = requestId;
+        if (this.core.hasFixtureKernelOwner(peer, owner))
+          this.core.bindFixtureStopRequest(peer, owner, requestId);
         return closer.close(requestId);
       };
       const context = async (accountId: string): Promise<ExecutionSession | null> => {
@@ -2439,7 +2695,20 @@ export class KernelBridge implements KernelBridgeHooks {
           if (!sameBinding(record.binding, binding) || record.state !== 'DISPATCHING')
             throw Error('KERNEL_OPERATION_BEGIN_REJECTED');
           await inputFence?.();
-          const value = await work();
+          const executeTimeoutMs = allowTargetMiss ? 45_000 : 180_000;
+          let executeTimer: ReturnType<typeof setTimeout> | undefined;
+          const value = await Promise.race([
+            work(),
+            new Promise<never>((_, reject) => {
+              executeTimer = setTimeout(
+                () => reject(Error('KERNEL_EXECUTE_TIMEOUT')),
+                executeTimeoutMs,
+              );
+              executeTimer.unref?.();
+            }),
+          ]).finally(() => {
+            if (executeTimer !== undefined) clearTimeout(executeTimer);
+          });
           await inputFence?.();
           const result = await finishKernelOperation(
             () => session.request({ kind: 'finishOperation', binding }),
@@ -2470,7 +2739,7 @@ export class KernelBridge implements KernelBridgeHooks {
             allowTargetMiss &&
             session.nativeInputCount === inputCountBefore &&
             error instanceof Error &&
-            /(?:^|:\s*)(?:FACEBOOK_NATIVE_CLICK_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_LIKE_TARGET_CHANGED|FACEBOOK_REEL_NEXT_TARGET_CHANGED|FACEBOOK_FRIEND_CONFIRM_TARGET_CHANGED|FACEBOOK_BROWSE_PLAY_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_DOCUMENT_OR_TARGET_CHANGED|FACEBOOK_WHEEL_START_DOCUMENT_CHANGED)\b/.test(
+            /(?:^|:\s*)(?:FACEBOOK_NATIVE_CLICK_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_LIKE_TARGET_CHANGED|FACEBOOK_BROWSE_DIALOG_DISMISS_TARGET_CHANGED|FACEBOOK_REEL_NEXT_TARGET_CHANGED|FACEBOOK_FRIEND_CONFIRM_TARGET_CHANGED|FACEBOOK_BROWSE_PLAY_TARGET_UNAVAILABLE|FACEBOOK_BROWSE_PLAY_ALREADY_RUNNING|FACEBOOK_BROWSE_TARGET_MISSING|FACEBOOK_BROWSE_PLAY_UNVERIFIED|FACEBOOK_BROWSE_SCROLL_STALLED|FACEBOOK_BROWSE_DOCUMENT_OR_TARGET_CHANGED|FACEBOOK_WHEEL_START_DOCUMENT_CHANGED)\b/.test(
               error.message,
             )
           ) {
@@ -2539,8 +2808,7 @@ export class KernelBridge implements KernelBridgeHooks {
             }
           } else
             await close().catch(async () => {
-              if (this.core.peers.get(peer.profileId) === peer)
-                await this.core.stop(peer.profileId);
+              await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
             });
           throw error;
         } finally {
@@ -2552,8 +2820,41 @@ export class KernelBridge implements KernelBridgeHooks {
         }
       };
       let retainConnection = (_stop: { requestId: string; state: 'stopped' }): void => {};
+      const thisBridge = this;
       const connection = {
         browser,
+        get stopRequestId() {
+          const requestId = (session.stopControlId ??= randomUUID());
+          if (thisBridge.core.hasFixtureKernelOwner(peer, owner))
+            thisBridge.core.bindFixtureStopRequest(peer, owner, requestId);
+          return requestId;
+        },
+        closeLocalAfterDisconnect: async () => {
+          session.inputRevoked = true;
+          executor.revokeFiles();
+          const local = await endpoint.close();
+          await browser.close().catch(() => {});
+          return local;
+        },
+        confirmReconnectedStop: async (receipt: import('../shared/task-ending.js').CurrentStop) => {
+          const current = this.core.peers.get(peer.profileId);
+          if (
+            !current ||
+            current === peer ||
+            !current.online ||
+            !current.synced ||
+            current.phase !== 'PAUSED' ||
+            receipt.profileId !== peer.profileId ||
+            receipt.connectionEpoch !== current.epoch ||
+            receipt.requestId !== session.stopControlId ||
+            receipt.state !== 'stopped'
+          )
+            throw Error('KERNEL_RECONNECTED_STOP_MISMATCH');
+          // This is a current-generation stop, never represented as the missed original receipt.
+          session.detachedByConfirmedStop = true;
+          const local = await endpoint.retryClose();
+          if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+        },
         revokeInput: (reason: string) => {
           session.inputRevoked = true;
           executor.revokeFiles();
@@ -2905,6 +3206,7 @@ export class KernelBridge implements KernelBridgeHooks {
           }
         },
         retryClose: (requestId: string) => closer.retry(requestId),
+        stopOnCloseFailure: () => this.stopOwnedSessionOnCloseFailure(peer, session, owner, true),
       };
       retainConnection = (stop) => this.idlePages.set(peer.profileId, { peer, connection, stop });
       return connection;
@@ -2980,8 +3282,9 @@ export class KernelBridge implements KernelBridgeHooks {
       session.closing = true;
       session.fail('KERNEL_OPEN_FAILED');
       await session.endpoint?.close().catch(() => {});
-      if (!released && this.core.peers.get(peer.profileId) === peer)
-        await this.core.stop(peer.profileId);
+      if (!released) {
+        await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
+      }
       throw originalFailure ? Error(originalFailure) : error;
     }
   }
@@ -2998,8 +3301,13 @@ export class KernelBridge implements KernelBridgeHooks {
     peer.close();
   }
   async message(peer: Peer, value: unknown): Promise<boolean> {
-    const recovery = PresentationRecoveryRequest.safeParse(value);
-    if (recovery.success) {
+    const rawType =
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>).type
+        : undefined;
+    if (rawType === 'PRESENTATION_RECOVERY_REQUEST') {
+      const recovery = PresentationRecoveryRequest.safeParse(value);
+      if (!recovery.success) return false;
       const request = recovery.data;
       const session = this.sessions.get(peer.profileId);
       const now = Date.now();
@@ -3127,14 +3435,12 @@ export class KernelBridge implements KernelBridgeHooks {
         });
       return true;
     }
-    const header = KernelJsonObject.safeParse(value);
-    if (!header.success || !['KERNEL_REPLY', 'KERNEL_EVENT'].includes(String(header.data.type)))
-      return false;
+    if (rawType !== 'KERNEL_REPLY' && rawType !== 'KERNEL_EVENT') return false;
     const session = this.sessions.get(peer.profileId);
     // Late replies from a closed fixture session cannot affect any new session.
     if (!session) return true;
     if (session.peer !== peer) throw Error('KERNEL_SESSION_NOT_CURRENT');
-    if (header.data.type === 'KERNEL_REPLY') session.response(value);
+    if (rawType === 'KERNEL_REPLY') session.response(value);
     else {
       const event = KernelEvent.parse(value);
       if (event.leaseId !== session.stamp.leaseId) return true;
@@ -3212,8 +3518,8 @@ export class KernelBridge implements KernelBridgeHooks {
         session.closing = true;
         session.fail('KERNEL_DEBUGGER_DETACHED');
         void session.endpoint?.close().catch(() => {});
-        if (this.core.peers.get(peer.profileId) === peer) await this.core.stop(peer.profileId);
-      } else session.model?.debuggerEvent(event.source, event.method, event.params);
+        await this.stopOwnedSessionOnCloseFailure(peer, session, session.owner, true);
+      } else session.model?.debuggerEventValidated(event.source, event.method, event.params);
     }
     return true;
   }
@@ -3233,11 +3539,68 @@ export class KernelBridge implements KernelBridgeHooks {
     void session.endpoint?.close().catch(() => {});
     if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
   }
-  controlStopped(peer: Peer): void {
+  private async stopOwnedSessionOnCloseFailure(
+    peer: Peer,
+    session: KernelRpcSession,
+    owner: string,
+    claimedOwnership = true,
+  ): Promise<void> {
+    if (
+      !claimedOwnership ||
+      this.core.peers.get(peer.profileId) !== peer ||
+      this.sessions.get(peer.profileId) !== session ||
+      !this.core.hasFixtureKernelOwner(peer, owner)
+    ) {
+      return;
+    }
+    session.closing = true;
+    session.stopControlId ??= randomUUID();
+    const stopReq = await this.core.stop(peer.profileId, session.stopControlId);
+    if (stopReq.requestId) {
+      session.stopControlId = stopReq.requestId;
+    }
+  }
+  controlStopped(peer: Peer, requestId?: string): void {
     const session = this.sessions.get(peer.profileId);
-    if (!session || session.peer !== peer) return;
-    this.disconnected(peer);
-    // The parent bridge has matched the actual global STOPPED request; fixtures cannot resume.
+    if (
+      !session ||
+      session.peer !== peer ||
+      this.core.peers.get(peer.profileId) !== peer ||
+      !this.core.hasFixtureKernelOwner(peer, session.owner)
+    ) {
+      return;
+    }
+    if (session.stopControlId) {
+      if (requestId !== undefined && session.stopControlId !== requestId) return;
+      if (peer.lastStoppedRequestId && peer.lastStoppedRequestId !== session.stopControlId) return;
+    } else if (requestId !== undefined) {
+      if (
+        requestId === session.priorStopRequestId ||
+        peer.phase === 'STOPPING' ||
+        (peer.lastStoppedRequestId !== undefined && peer.lastStoppedRequestId !== requestId)
+      ) {
+        return;
+      }
+    }
+    if (
+      !requestId ||
+      !peer.online ||
+      peer.epoch !== session.stamp.connectionEpoch ||
+      peer.lastStoppedRequestId !== requestId
+    )
+      return;
+    session.stopControlId = requestId;
+    session.controlStopReceipt = {
+      requestId,
+      connectionEpoch: peer.epoch,
+      owner: session.owner,
+      state: 'stopped',
+    };
+    session.detachedByConfirmedStop = true;
+    session.fail(session.failureReason ?? 'KERNEL_CONTROL_STOPPED');
+    session.closing = true;
+    void session.endpoint?.close().catch(() => {});
+    if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
     this.core.releaseFixtureKernel(peer, session.owner);
   }
   tick(): void {
@@ -3247,7 +3610,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.renewing.add(session);
       void session
         .renew()
-        .catch(async (error: unknown) => {
+        .catch((error: unknown) => {
           if (
             session.closing ||
             this.sessions.get(session.peer.profileId) !== session ||
@@ -3256,17 +3619,8 @@ export class KernelBridge implements KernelBridgeHooks {
             session.record('renew-owner-expired');
             return;
           }
-          session.record(
-            'renew-failed:' + (error instanceof Error ? error.message.slice(0, 160) : 'unknown'),
-          );
-          session.closing = true;
-          this.idlePages.delete(session.peer.profileId);
-          session.fail(
-            'KERNEL_LEASE_RENEW_FAILED:' +
-              (error instanceof Error ? error.message.slice(0, 160) : 'unknown'),
-          );
-          void session.endpoint?.close().catch(() => {});
-          if (session.peer.online) await this.core.stop(session.peer.profileId);
+          const msg = error instanceof Error ? error.message.slice(0, 160) : 'unknown';
+          session.record('renew-failed:' + msg);
         })
         .finally(() => this.renewing.delete(session));
     }

@@ -1,3 +1,11 @@
+declare const __BUNDLED_EXTENSION_VERSION__: string | undefined;
+function reportedExtensionVersion(): string {
+  return typeof __BUNDLED_EXTENSION_VERSION__ === 'string' &&
+    __BUNDLED_EXTENSION_VERSION__.length > 0
+    ? __BUNDLED_EXTENSION_VERSION__
+    : chrome.runtime.getManifest().version;
+}
+
 import {
   VERSION,
   LEASE_MS,
@@ -12,6 +20,7 @@ import {
 import { Journal, type Saved } from './journal.js';
 import { mediaPoint } from './media-point.js';
 import { ExtensionKernelChannel } from './kernel-channel.js';
+import { isBenignDetachError } from './kernel-backend.js';
 import { initializeKernelJournal } from './kernel-storage.js';
 import { bridgeHelloCapabilities } from '../src/shared/bridge-capabilities.js';
 import { projectPage } from '../src/shared/page-projection.js';
@@ -20,8 +29,25 @@ import { BridgeCommandQueue } from '../src/application/bridge-command-queue.js';
 import { heartbeatLeaseDeadline } from '../src/shared/bridge-heartbeat.js';
 import { ProfileHeartbeat } from '../src/application/profile-heartbeat.js';
 import { ReconnectBackoff } from '../src/shared/reconnect-backoff.js';
-import { revealBrowserWindow } from './reveal-browser-window.js';
-const journal = new Journal(chrome.storage.local);
+import { Id } from '../src/shared/contracts.js';
+import {
+  cleanupExtraTabs,
+  getLastUserFocusedAt,
+  inspectBrowserWindow,
+  isProgrammaticWindowMoveActive,
+  positionBrowserWindow,
+  recordUserWindowFocus,
+  revealBrowserWindow,
+} from './reveal-browser-window.js';
+const fallbackStorage = {
+  get: async () => ({}),
+  set: async () => {},
+  remove: async () => {},
+} as unknown as chrome.storage.LocalStorageArea;
+const journal = new Journal(
+  typeof chrome !== 'undefined' && chrome?.storage?.local ? chrome.storage.local : fallbackStorage,
+);
+let activeHeartbeat: ProfileHeartbeat | undefined;
 type Owned = {
   tabId: number;
   token: string;
@@ -39,6 +65,13 @@ let profileId = '',
 let generation = 0,
   connectionSerial = 0,
   connecting = false;
+let freezeSerial = 0,
+  kernelStopUnconfirmed = false,
+  reloadingExtension = false;
+const defaultFreezeTimeoutMs = 8_000,
+  welcomeFreezeTimeoutMs = 5_000,
+  disconnectFreezeTimeoutMs = 5_000,
+  reloadFreezeTimeoutMs = 1_500;
 const commands = new BridgeCommandQueue();
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 const reconnectBackoff = new ReconnectBackoff();
@@ -48,14 +81,27 @@ let connectionStage = 'disconnected',
 const owned = new Map<number, Owned>(),
   attached = new Set<number>(),
   frames = new Map<string, { tabId: number; sessionId: string }>();
-let kernel = new ExtensionKernelChannel(
-  () => ({
-    profileId,
-    epoch,
-    valid: paused && !stopping && socket?.readyState === WebSocket.OPEN && Date.now() < leaseUntil,
-  }),
-  (message) => send(message),
-);
+function createChannel(channelEpoch: string): ExtensionKernelChannel {
+  const instance: ExtensionKernelChannel = new ExtensionKernelChannel(
+    () => ({
+      profileId,
+      epoch: channelEpoch,
+      valid:
+        kernel === instance &&
+        epoch === channelEpoch &&
+        paused &&
+        !stopping &&
+        !kernelStopUnconfirmed &&
+        socket?.readyState === WebSocket.OPEN &&
+        Date.now() < leaseUntil,
+    }),
+    (message) => {
+      if (kernel === instance && epoch === channelEpoch) send(message);
+    },
+  );
+  return instance;
+}
+let kernel = createChannel(epoch);
 async function init() {
   await journal.migrate();
   const config = await chrome.storage.local.get(['profileId', 'secret']);
@@ -78,7 +124,7 @@ async function init() {
         owned.set(row.tabId, { ...row, documentEpoch: row.documentEpoch + 1 });
     } catch {}
 }
-const ready = init();
+let ready = typeof chrome !== 'undefined' && chrome?.storage?.local ? init() : Promise.resolve();
 const send = (msg: unknown) => {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
 };
@@ -97,6 +143,9 @@ function localURL(url: string) {
   }
 }
 function guard(command: Command, startGeneration: number) {
+  if ((kernelStopUnconfirmed || kernel.isStopUnconfirmed()) && isWrite(command.action)) {
+    throw Error('KERNEL_STOP_UNCONFIRMED');
+  }
   if (
     stopping ||
     (paused && isWrite(command.action)) ||
@@ -465,32 +514,72 @@ async function handle(command: Command, g: number) {
     if (entry) await journal.finish(entry, { status, error });
     send({ type: 'RESULT', commandId: command.commandId, status, error });
     if (status === 'UNKNOWN') {
-      void freeze('UNKNOWN');
+      void freeze('UNKNOWN').catch(() => {});
       send({ type: 'LOCAL_STOP' });
     }
   }
 }
 let freezing: Promise<void> | undefined;
-function freeze(_reason: string): Promise<void> {
-  if (freezing) return freezing;
+async function bounded<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Error('KERNEL_STOP_UNCONFIRMED')), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function freeze(_reason: string, options: { timeoutMs?: number } = {}): Promise<void> {
+  // An existing cleanup has already revoked input. Each caller can bound its own wait.
+  if (freezing) return bounded(freezing, options.timeoutMs ?? defaultFreezeTimeoutMs);
+  const token = ++freezeSerial,
+    serial = connectionSerial,
+    originalKernel = kernel;
+  const originalEpoch = epoch;
+  const grantedLeaseUntil = leaseUntil;
   paused = true;
   generation++;
+  leaseUntil = 0;
   stopping = true;
-  freezing = (async () => {
-    const kernelStopped = kernel.freeze();
-    await commands.drainWrites();
-    await kernelStopped;
-    for (const tabId of [...attached]) {
-      attached.delete(tabId);
+  const tabsToDetach = [...attached];
+  frames.clear();
+  const current = () =>
+    token === freezeSerial &&
+    serial === connectionSerial &&
+    originalKernel === kernel &&
+    epoch === originalEpoch;
+  // Start detach before waiting for writes: renderer requests may require detach to settle.
+  const detached = Promise.all(
+    tabsToDetach.map(async (tabId) => {
       try {
-        await chrome.debugger.detach({ tabId });
-      } catch {}
-    }
-    frames.clear();
-  })().finally(() => {
-    stopping = false;
-    freezing = undefined;
-  });
+        await bounded(chrome.debugger.detach({ tabId }), 3_000);
+      } catch (error) {
+        if (!isBenignDetachError(error)) throw error;
+      }
+      if (current()) attached.delete(tabId);
+    }),
+  );
+  const work = Promise.all([detached, originalKernel.freeze(), commands.drainWrites()]);
+  freezing = bounded(work, options.timeoutMs ?? defaultFreezeTimeoutMs)
+    .then(() => {
+      if (!current()) throw Error('KERNEL_STOP_UNCONFIRMED');
+      kernelStopUnconfirmed = false;
+      leaseUntil = Math.max(leaseUntil, grantedLeaseUntil);
+    })
+    .catch(() => {
+      if (current()) kernelStopUnconfirmed = true;
+      throw Error('KERNEL_STOP_UNCONFIRMED');
+    })
+    .finally(() => {
+      if (token === freezeSerial) {
+        stopping = false;
+        freezing = undefined;
+      }
+    });
   return freezing;
 }
 async function proof(challenge: string) {
@@ -507,7 +596,6 @@ async function proof(challenge: string) {
   ).join('');
 }
 async function connect() {
-  await ready;
   if (
     manualPauseReconnect ||
     connecting ||
@@ -515,18 +603,34 @@ async function connect() {
     !reconnectBackoff.canAttempt(performance.now())
   )
     return;
-  try {
-    const windows = await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] });
-    if (windows.length === 0) return;
-  } catch {}
-  if (
-    manualPauseReconnect ||
-    connecting ||
-    socket?.readyState === WebSocket.OPEN ||
-    !reconnectBackoff.canAttempt(performance.now())
-  )
-    return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
   connecting = true;
+  let openedSocket = false;
+  try {
+    await ready;
+    if (
+      manualPauseReconnect ||
+      socket?.readyState === WebSocket.OPEN ||
+      !reconnectBackoff.canAttempt(performance.now())
+    )
+      return;
+    try {
+      const windows = await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] });
+      if (windows.length === 0) return;
+    } catch {}
+    if (
+      manualPauseReconnect ||
+      socket?.readyState === WebSocket.OPEN ||
+      !reconnectBackoff.canAttempt(performance.now())
+    )
+      return;
+    openedSocket = true;
+  } finally {
+    if (!openedSocket) connecting = false;
+  }
   connectionStage = 'connecting';
   const serial = ++connectionSerial;
   const ws = new WebSocket('ws://127.0.0.1:18767/bridge');
@@ -537,7 +641,14 @@ async function connect() {
     () => epoch,
     send,
     () => chrome.windows.getAll({ windowTypes: ['normal', 'popup'] }),
+    (focused) => {
+      if (focused && !isProgrammaticWindowMoveActive()) {
+        recordUserWindowFocus(Date.now());
+      }
+      return getLastUserFocusedAt();
+    },
   );
+  activeHeartbeat = heartbeat;
   ws.onmessage = (event) => {
     if (serial !== connectionSerial) return;
     let incoming: unknown;
@@ -554,6 +665,51 @@ async function connect() {
       heartbeat.pulse();
       return;
     }
+    if (
+      incoming &&
+      typeof incoming === 'object' &&
+      'type' in incoming &&
+      incoming.type === 'RELOAD_EXTENSION'
+    ) {
+      const request = incoming as Record<string, unknown>;
+      if (
+        connectionStage !== 'ready' ||
+        ws.readyState !== WebSocket.OPEN ||
+        request.connectionEpoch !== epoch ||
+        !Id.safeParse(request.requestId).success
+      ) {
+        ws.close(1008, 'PROTOCOL_REJECTED');
+        return;
+      }
+      if (reloadingExtension) return;
+      reloadingExtension = true;
+      void (async () => {
+        let dispatched = false;
+        try {
+          await freeze('EXTENSION_RELOAD', { timeoutMs: reloadFreezeTimeoutMs }).catch(() => {});
+          if (
+            serial !== connectionSerial ||
+            ws.readyState !== WebSocket.OPEN ||
+            epoch !== request.connectionEpoch
+          )
+            return;
+          // This acknowledges a reload request, never a successful business stop.
+          send({
+            type: 'EXTENSION_RELOADING',
+            extensionVersion: reportedExtensionVersion(),
+            requestId: request.requestId,
+            connectionEpoch: epoch,
+          });
+          chrome.runtime.reload();
+          dispatched = true;
+        } finally {
+          if (!dispatched) reloadingExtension = false;
+        }
+      })().catch(() => {
+        reloadingExtension = false;
+      });
+      return;
+    }
     inbox = inbox
       .then(async () => {
         try {
@@ -566,7 +722,7 @@ async function connect() {
               JSON.stringify({
                 type: 'HELLO',
                 version: VERSION,
-                extensionVersion: chrome.runtime.getManifest().version,
+                extensionVersion: reportedExtensionVersion(),
                 capabilities: bridgeHelloCapabilities(m.capabilities),
                 profileId,
                 ...(secret ? { proof: await proof(m.challenge) } : {}),
@@ -575,22 +731,21 @@ async function connect() {
           } else if (m.type === 'WELCOME') {
             connectionStage = 'restoring';
             connecting = false;
-            epoch = m.connectionEpoch;
             paused = true;
-            await kernel.freeze();
+            const oldKernel = kernel;
+            await freeze('WELCOME_RESET', { timeoutMs: welcomeFreezeTimeoutMs }).catch(() => {
+              kernelStopUnconfirmed = true;
+            });
             if (serial !== connectionSerial || ws.readyState !== WebSocket.OPEN) return;
-            kernel = new ExtensionKernelChannel(
-              () => ({
-                profileId,
-                epoch,
-                valid:
-                  paused &&
-                  !stopping &&
-                  socket?.readyState === WebSocket.OPEN &&
-                  Date.now() < leaseUntil,
-              }),
-              (message) => send(message),
-            );
+            kernelStopUnconfirmed ||= oldKernel.isStopUnconfirmed();
+            oldKernel.abandon();
+            // A timed-out cleanup may still settle later. Retire its global-finalizer token.
+            ++freezeSerial;
+            freezing = undefined;
+            stopping = false;
+            epoch = m.connectionEpoch;
+            kernel = createChannel(epoch);
+            kernel.setStopUnconfirmed(kernelStopUnconfirmed);
             leaseUntil = Date.now() + Math.min(m.leaseMs, LEASE_MS);
             if (m.secret) {
               secret = m.secret;
@@ -629,26 +784,106 @@ async function connect() {
                   error: error instanceof Error ? error.message : String(error),
                 }),
             );
+          } else if (m.type === 'CLEANUP_EXTRA_TABS') {
+            const requestEpoch = epoch;
+            void cleanupExtraTabs(Boolean(m.preferActiveTab), new Set(owned.keys())).then(
+              (result) =>
+                send({
+                  type: 'EXTRA_TABS_CLEANED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  ...result,
+                }),
+              (error) =>
+                send({
+                  type: 'EXTRA_TABS_CLEANED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+            );
+          } else if (m.type === 'INSPECT_BROWSER_WINDOW') {
+            const requestEpoch = epoch;
+            void inspectBrowserWindow().then(
+              (result) =>
+                send({
+                  type: 'BROWSER_WINDOW_INSPECTED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  ...result,
+                }),
+              (error) =>
+                send({
+                  type: 'BROWSER_WINDOW_INSPECTED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+            );
+          } else if (m.type === 'POSITION_BROWSER_WINDOW') {
+            const requestEpoch = epoch;
+            void positionBrowserWindow(m.bounds, Boolean(m.focus))
+              .then(async (result) => {
+                await kernel.exposePositionedWindow(result.tabId);
+                send({
+                  type: 'BROWSER_WINDOW_POSITIONED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  ...result,
+                });
+              })
+              .catch((error) =>
+                send({
+                  type: 'BROWSER_WINDOW_POSITIONED',
+                  requestId: m.requestId,
+                  connectionEpoch: requestEpoch,
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+              );
           } else if (m.type === 'KERNEL_REQUEST') {
             // Do not await a long Runtime call here: STOP must remain processable.
             kernel.receive(m);
           } else if (m.type === 'PRESENTATION_RECOVERY_PERMIT') {
             kernel.presentationRecoveryPermit(m);
           } else if (m.type === 'SYNC') {
-            await freeze('SYNC');
+            try {
+              await freeze('SYNC');
+            } catch {
+              kernelStopUnconfirmed = true;
+              if (serial === connectionSerial && m.connectionEpoch === epoch)
+                send({
+                  type: 'SYNC_UNCONFIRMED',
+                  requestId: m.requestId,
+                  connectionEpoch: epoch,
+                  error: 'KERNEL_STOP_UNCONFIRMED',
+                });
+              return;
+            }
+            if (kernelStopUnconfirmed) return;
             const entries = await journal.snapshot();
+            if (serial !== connectionSerial || m.connectionEpoch !== epoch) return;
             send({ type: 'SYNC_STATE', requestId: m.requestId, connectionEpoch: epoch, entries });
           } else if (m.type === 'RESUME') {
+            if (kernelStopUnconfirmed || kernel.isStopUnconfirmed()) return;
             if (stopping || Date.now() >= leaseUntil) throw Error('RESUME_NOT_READY');
             paused = false;
             send({ type: 'RESUMED', requestId: m.requestId, connectionEpoch: epoch });
           } else if (m.type === 'STOP') {
-            await freeze('CORE_STOP');
+            try {
+              await freeze('CORE_STOP');
+            } catch {
+              kernelStopUnconfirmed = true;
+              if (serial === connectionSerial && m.connectionEpoch === epoch)
+                send({
+                  type: 'STOP_UNCONFIRMED',
+                  requestId: m.requestId,
+                  connectionEpoch: epoch,
+                  error: 'KERNEL_STOP_UNCONFIRMED',
+                });
+              return;
+            }
+            if (serial !== connectionSerial || m.connectionEpoch !== epoch) return;
             send({ type: 'STOPPED', requestId: m.requestId, connectionEpoch: epoch });
-          } else if (m.type === 'RELOAD_EXTENSION') {
-            await freeze('EXTENSION_RELOAD');
-            send({ type: 'EXTENSION_RELOADING', requestId: m.requestId, connectionEpoch: epoch });
-            chrome.runtime.reload();
           } else if (m.type === 'COMMAND') {
             const receivedGeneration = generation;
             void commands
@@ -669,8 +904,10 @@ async function connect() {
     if (['AUTH_TIMEOUT', 'AUTH_OR_PROTOCOL_REJECTED', 'PROTOCOL_REJECTED'].includes(event.reason))
       connectionFailure = event.reason;
     else if (!connectionFailure) connectionFailure = 'CONNECTION_CLOSED';
-    void freeze('DISCONNECTED')
-      .catch(() => {})
+    void freeze('DISCONNECTED', { timeoutMs: disconnectFreezeTimeoutMs })
+      .catch(() => {
+        if (serial === connectionSerial) kernelStopUnconfirmed = true;
+      })
       .finally(() => {
         if (serial !== connectionSerial) return;
         if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -717,7 +954,7 @@ chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId !== undefined) kernel.detached(source.tabId);
   if (source.tabId === undefined || !attached.has(source.tabId)) return;
   if (!stopping) {
-    void freeze('DEBUGGER_DETACHED');
+    void freeze('DEBUGGER_DETACHED').catch(() => {});
     send({ type: 'LOCAL_STOP' });
   }
 });
@@ -752,6 +989,64 @@ chrome.windows.onRemoved.addListener(() => {
     })
     .catch(() => {});
 });
+function tryWakeReconnect() {
+  if (
+    manualPauseReconnect ||
+    connecting ||
+    socket?.readyState === WebSocket.OPEN ||
+    !reconnectBackoff.canAttempt(performance.now())
+  )
+    return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
+  void connect().catch(() => {});
+}
+if (typeof chrome.windows?.onFocusChanged?.addListener === 'function') {
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (
+      typeof windowId !== 'number' ||
+      windowId === chrome.windows.WINDOW_ID_NONE ||
+      windowId < 0 ||
+      isProgrammaticWindowMoveActive()
+    )
+      return;
+    tryWakeReconnect();
+    void chrome.windows
+      .get(windowId)
+      .then((win) => {
+        if (win?.focused && (!win.type || win.type === 'normal')) {
+          recordUserWindowFocus(Date.now());
+          activeHeartbeat?.pulse();
+        }
+      })
+      .catch(() => {});
+  });
+}
+if (typeof chrome.windows?.onBoundsChanged?.addListener === 'function') {
+  chrome.windows.onBoundsChanged.addListener((win) => {
+    if (!isProgrammaticWindowMoveActive() && win?.focused && (!win.type || win.type === 'normal')) {
+      recordUserWindowFocus(Date.now());
+      activeHeartbeat?.pulse();
+    }
+  });
+}
+if (typeof chrome.tabs?.onActivated?.addListener === 'function') {
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    if (isProgrammaticWindowMoveActive()) return;
+    tryWakeReconnect();
+    void chrome.windows
+      .get(activeInfo.windowId)
+      .then((win) => {
+        if (win?.focused && (!win.type || win.type === 'normal')) {
+          recordUserWindowFocus(Date.now());
+          activeHeartbeat?.pulse();
+        }
+      })
+      .catch(() => {});
+  });
+}
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   if (sender.id !== chrome.runtime.id || sender.tab) return false;
   void (async () => {
@@ -780,7 +1075,13 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   return true;
 });
 chrome.alarms.onAlarm.addListener(() => {
-  void connect();
+  if (manualPauseReconnect || connecting || socket?.readyState === WebSocket.OPEN) return;
+  reconnectBackoff.reset();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
+  void connect().catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   manualPauseReconnect = false;
@@ -790,6 +1091,6 @@ chrome.runtime.onStartup.addListener(() => {
 void chrome.alarms.create('reconnect', { periodInMinutes: 0.5 });
 setInterval(() => {
   kernel.expire();
-  if (!paused && Date.now() > leaseUntil) void freeze('LEASE_EXPIRED');
+  if (!paused && Date.now() > leaseUntil) void freeze('LEASE_EXPIRED').catch(() => {});
 }, 500);
 void ready.then(() => connect());

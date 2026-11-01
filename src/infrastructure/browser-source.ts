@@ -45,6 +45,11 @@ export class BridgeProfileSource implements BrowserProfileSource {
     const id = String(row.profileId);
     const peer = this.core.peers.get(id);
     const online = peer?.online === true && peer.browserWindowCount !== 0;
+    const inlineUnresolved = (row as { unresolvedCount?: unknown }).unresolvedCount;
+    const unresolved =
+      typeof inlineUnresolved === 'number'
+        ? inlineUnresolved
+        : (await this.store.unresolved(id)).length;
     return ProfileSchema.parse({
       id,
       alias: String(row.alias),
@@ -53,7 +58,7 @@ export class BridgeProfileSource implements BrowserProfileSource {
       online,
       phase: online ? peer.phase : 'OFFLINE',
       synced: online && peer.synced,
-      unresolved: (await this.store.unresolved(id)).length,
+      unresolved,
       extensionVersion: peer?.extensionVersion ?? null,
       capabilities: peer?.capabilities ?? [],
       ...(this.presentation ? { presentation: online ? this.presentation(id) : null } : {}),

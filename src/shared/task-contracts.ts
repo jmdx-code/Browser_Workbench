@@ -84,6 +84,14 @@ export const TaskOperation = z
     receipt: z.json().nullable(),
     checkpointApplied: z.boolean(),
     disposition: OperationDisposition.optional(),
+    inertBrowseProof: z
+      .object({
+        verified: z.literal(true),
+        purpose: z.enum(['play', 'advance', 'dismiss', 'activate']).optional(),
+        planConfirmedStopped: z.boolean(),
+      })
+      .strict()
+      .optional(),
     createdAt: z.number(),
     updatedAt: z.number(),
   })
@@ -280,7 +288,7 @@ export type RuntimeRequest = z.infer<typeof TaskRuntimeRequest>;
 export const ProfileTaskResult = z
   .object({
     profileId: Id,
-    source: z.enum(['task', 'group-inviter']),
+    source: z.enum(['task', 'group-inviter', 'group-bumper']),
     runId: z.string().min(1).max(200),
     name: z.string().max(300),
     state: z.enum(['COMPLETED', 'FAILED', 'STOPPED']),

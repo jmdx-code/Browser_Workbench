@@ -2,8 +2,10 @@ import type { Awaitable } from './persistence.js';
 import type { Notice, NoticeReceipt, Resolution } from '../shared/settlement.js';
 import type { Binding } from '../shared/task-execution.js';
 export interface SettlementRepository {
+  hasUndelivered?(profileId: string): Awaitable<boolean>;
+  listForReconciliation?(profileId: string, operationIds: readonly string[]): Awaitable<Notice[]>;
   list(profileId?: string): Awaitable<Notice[]>;
-  claim(profileId: string): Awaitable<Notice | null>;
+  claim(profileId: string, options?: { kind?: 'BUSINESS' | 'END' }): Awaitable<Notice | null>;
   delivered(operationId: string, claimToken: string, receipt: NoticeReceipt): Awaitable<void>;
   retry(operationId: string, claimToken: string, reason: string): Awaitable<void>;
   recoverOnStartup(): Awaitable<void>;

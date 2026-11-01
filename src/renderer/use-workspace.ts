@@ -17,7 +17,7 @@ export function useWorkspace() {
     });
     reader.current = current;
     void current.refresh();
-    const timer = setInterval(() => void current.refresh(), 1000);
+    const timer = setInterval(() => void current.refresh(), 1800);
     return () => {
       clearInterval(timer);
       current.dispose();

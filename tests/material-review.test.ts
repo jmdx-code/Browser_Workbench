@@ -23,6 +23,7 @@ function profile(online = true): Profile {
     id: randomUUID(),
     alias: online ? '已连接的生成资料' : '离线的生成资料',
     groupId: null,
+    order: 0,
     online,
     phase: 'PAUSED',
     synced: true,

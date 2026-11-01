@@ -22,7 +22,7 @@ test('a redirected or incomplete identity document produces an actionable admiss
   } as unknown as Page;
   await assert.rejects(
     readCurrentFacebookIdentity(redirected, () => {}),
-    /FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED/,
+    /FACEBOOK_ACCOUNT_LOGGED_OUT/,
   );
   const incomplete = {
     evaluate: async () => ({

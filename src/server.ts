@@ -1,8 +1,12 @@
+import { recoverBumperOperations } from './infrastructure/group-bumper-recovery.js';
+import { GroupBumperService } from './application/group-bumper-service.js';
+import { FeatureExecutionRegistry } from './application/feature-execution-registry.js';
+import { GroupBumperBrowserAdapter } from './infrastructure/group-bumper-runner.js';
 import { mediaRuntimeComponent } from './infrastructure/media-runtime-component.js';
 import { SoftwareUpdateService } from './application/software-update-service.js';
 import { taskBlocksSoftwareUpdate } from './domain/software-update.js';
 import { SoftwareUpdateBackend } from './infrastructure/software-update-backend.js';
-import { ExtensionUpdates } from './infrastructure/extension-updates.js';
+import { ExtensionUpdates, extensionReloadTasksBusy } from './infrastructure/extension-updates.js';
 import {
   productExtensionDirectory,
   syncProductExtensionDirectory,
@@ -41,15 +45,6 @@ import { productDataDirectory, canonicalDataDirectory } from './infrastructure/p
 import { TaskService } from './application/task-service.js';
 import { reserveControllerPort, releaseControllerPort } from './infrastructure/controller-port.js';
 import { KernelBridge } from './infrastructure/kernel-bridge.js';
-import { KernelAuditRunner } from './infrastructure/kernel-audit-runner.js';
-import { KernelPersistenceAudit } from './infrastructure/kernel-persistence-audit.js';
-import { KernelStartupAudit } from './infrastructure/kernel-startup-audit.js';
-import { KernelActorAudit } from './infrastructure/kernel-actor-audit.js';
-import { KernelLifecycleAudit } from './infrastructure/kernel-lifecycle-audit.js';
-import { KernelStopRetryAudit } from './infrastructure/kernel-stop-retry-audit.js';
-import { FacebookReadAudit } from './infrastructure/facebook-read-audit.js';
-import { FacebookFollowupAudit } from './infrastructure/facebook-followup-audit.js';
-import { KernelUploadAudit } from './infrastructure/kernel-upload-audit.js';
 import { MaterialPreflightService } from './application/material-preflight.js';
 import { FilesystemMaterialScanner } from './infrastructure/material-scanner.js';
 import { checkKnownFacebookVideo } from './infrastructure/video-metadata.js';
@@ -61,9 +56,6 @@ import { ResourceDownloadService } from './application/resource-download-service
 import { PublicResourceDriveDownloader } from './infrastructure/resource-drive-downloader.js';
 import { FilesystemResourceSourceReader } from './infrastructure/resource-source-reader.js';
 import { KernelProfileInspection } from './infrastructure/kernel-profile-inspection.js';
-import { FacebookNativeIdentityAudit } from './infrastructure/facebook-native-identity-audit.js';
-import { FacebookAdmissionAudit } from './infrastructure/facebook-admission-audit.js';
-import { FacebookDraftAudit } from './infrastructure/facebook-draft-audit.js';
 import { FacebookPublishingRuntime } from './infrastructure/facebook-publishing-runtime.js';
 import { ArchiveManagementService } from './application/archive-management.js';
 import { MaterialUsageService } from './application/material-usage-service.js';
@@ -79,6 +71,10 @@ import { GroupInviterService } from './application/group-inviter-service.js';
 import { GroupInviterBrowserAdapter } from './infrastructure/group-inviter-runner.js';
 import { devDiag } from './shared/dev-diagnostics.js';
 import { DevDiagnosticsFileWriter } from './infrastructure/dev-diagnostics-writer.js';
+import {
+  buildDiagnosticFeedbackPackage,
+  revealDiagnosticPackage,
+} from './infrastructure/diagnostic-package.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
@@ -172,21 +168,9 @@ try {
   throw error;
 }
 let bridge: Awaited<ReturnType<typeof startBridgeServer>>;
-let kernelAudit: KernelAuditRunner | undefined;
-let persistenceAudit: KernelPersistenceAudit | undefined;
-let startupAudit: KernelStartupAudit | undefined;
-let actorAudit: KernelActorAudit | undefined;
-let lifecycleAudit: KernelLifecycleAudit | undefined;
-let stopRetryAudit: KernelStopRetryAudit | undefined;
-let facebookReadAudit: FacebookReadAudit | undefined;
-let facebookFollowupAudit: FacebookFollowupAudit | undefined;
-let uploadAudit: KernelUploadAudit | undefined;
 let inspection: ProfileInspectionService | undefined;
 let nativeReview: NativeReviewService | undefined;
 let mainKernel: KernelBridge | undefined;
-let nativeIdentityAudit: FacebookNativeIdentityAudit | undefined;
-let admissionAudit: FacebookAdmissionAudit | undefined;
-let draftAudit: FacebookDraftAudit | undefined;
 let publishingRuntime: FacebookPublishingRuntime | undefined;
 let backups: WorkspaceBackupService | undefined;
 let dataCleanup: DataCleanupService | undefined;
@@ -242,6 +226,8 @@ try {
       port === 18767 || process.env.WORKBENCH_SMOKE_WINDOW_LAYOUT === '1'
         ? ({ core, tasks }) => {
             const kernel = new KernelBridge(core, tasks);
+            kernel.recoverBumperWorkspace = (peer, guard) =>
+              recoverBumperOperations(kernel, peer, repository.groupBumper, guard);
             const layout = new WindowLayoutService(
               () => layoutDisplays,
               {
@@ -261,11 +247,24 @@ try {
               process.env.WORKBENCH_TRACE_TIMING === '1'
                 ? (data) => console.error(JSON.stringify({ event: 'WINDOW_LAYOUT_TRIAL', data }))
                 : undefined,
+              () => {
+                let bestId: string | null = null;
+                let bestAt = 0;
+                for (const peer of core.peers.values()) {
+                  if (!peer.online) continue;
+                  const at = peer.focusedWindowAt ?? 0;
+                  if (at > bestAt) {
+                    bestAt = at;
+                    bestId = peer.profileId;
+                  }
+                }
+                return bestId;
+              },
             );
             kernel.setWindowLayoutHook(
               (id, guard) => layout.arrange(id, guard),
               () => layout.isEnabled(),
-              (id, guard, deadline) => layout.recover(id, guard, deadline),
+              undefined,
               (id, at) => layout.visible(id, at),
             );
             windowLayout = layout;
@@ -383,111 +382,11 @@ try {
                     : undefined;
                 },
               );
-            if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_NATIVE_IDENTITY_AUDIT === '1'
-            )
-              nativeIdentityAudit = new FacebookNativeIdentityAudit(
-                kernel,
-                core,
-                repository.tasks,
-                path.join(root, 'audit'),
-                process.env.WORKBENCH_NATIVE_IDENTITY_DECISION_AUDIT === '1',
-                process.env.WORKBENCH_NATIVE_IDENTITY_SDK_AUDIT === '1',
-              );
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              (process.env.WORKBENCH_FACEBOOK_DRAFT_AUDIT === '1' ||
-                process.env.WORKBENCH_FACEBOOK_VIDEO_DRAFT_AUDIT === '1' ||
-                process.env.WORKBENCH_FACEBOOK_LAST_TWO_DRAFT_AUDIT === '1' ||
-                process.env.WORKBENCH_FACEBOOK_REMAINING_DRAFT_AUDIT === '1')
-            )
-              draftAudit = new FacebookDraftAudit(
-                kernel,
-                core,
-                path.join(root, 'audit'),
-                process.env.WORKBENCH_FACEBOOK_REMAINING_DRAFT_AUDIT === '1',
-                process.env.WORKBENCH_FACEBOOK_LAST_TWO_DRAFT_AUDIT === '1',
-                process.env.WORKBENCH_FACEBOOK_VIDEO_DRAFT_AUDIT === '1',
-              );
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              (process.env.WORKBENCH_FACEBOOK_ADMISSION_AUDIT === '1' ||
-                process.env.WORKBENCH_FACEBOOK_EMPTY_COMPOSER_AUDIT === '1')
-            )
-              admissionAudit = new FacebookAdmissionAudit(
-                kernel,
-                core,
-                path.join(root, 'audit'),
-                process.env.WORKBENCH_FACEBOOK_EMPTY_COMPOSER_AUDIT === '1',
-                process.env.WORKBENCH_FACEBOOK_EMPTY_COMPOSER_RECOVERY_AUDIT === '1',
-              );
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_UPLOAD_AUDIT === '1'
-            )
-              uploadAudit = new KernelUploadAudit(kernel, core, root, repository);
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_FACEBOOK_FOLLOWUP_AUDIT === '1'
-            )
-              facebookFollowupAudit = new FacebookFollowupAudit(
-                kernel,
-                core,
-                repository,
-                path.join(root, 'audit'),
-              );
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_FACEBOOK_READ_AUDIT === '1'
-            )
-              facebookReadAudit = new FacebookReadAudit(kernel, core, path.join(root, 'audit'));
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_STOP_RETRY_AUDIT === '1'
-            )
-              stopRetryAudit = new KernelStopRetryAudit(kernel, core, path.join(root, 'audit'));
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_LIFECYCLE_AUDIT === '1'
-            )
-              lifecycleAudit = new KernelLifecycleAudit(kernel, core, path.join(root, 'audit'));
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_ACTOR_FENCE_AUDIT === '1'
-            )
-              actorAudit = new KernelActorAudit(kernel, core, path.join(root, 'audit'));
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_STARTUP_AUDIT === '1'
-            )
-              startupAudit = new KernelStartupAudit(
-                kernel,
-                core,
-                repository,
-                path.join(root, 'audit'),
-              );
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              process.env.WORKBENCH_KERNEL_AUDIT === '1'
-            )
-              kernelAudit = new KernelAuditRunner(kernel, core, path.join(root, 'audit'));
-            else if (
-              process.env.WORKBENCH_DIAGNOSTICS === '1' &&
-              (process.env.WORKBENCH_KERNEL_PERSISTENCE_AUDIT === '1' ||
-                process.env.WORKBENCH_TASK_TAB_AUDIT === '1')
-            )
-              persistenceAudit = new KernelPersistenceAudit(
-                kernel,
-                core,
-                path.join(root, 'audit'),
-                process.env.WORKBENCH_TASK_TAB_AUDIT === '1',
-              );
             return {
               message: async (peer, value) => await kernel.message(peer, value),
               disconnected: (peer) => kernel.disconnected(peer),
-              controlStopped: async (peer) => {
-                kernel.controlStopped(peer);
+              controlStopped: async (peer, requestId) => {
+                kernel.controlStopped(peer, requestId);
                 await publishingRuntime?.parentControlStopped(peer);
               },
               tick: async () => {
@@ -495,37 +394,12 @@ try {
                 void browserLabels
                   .refresh((await core.store.profileList()).map((row) => String(row.profileId)))
                   .catch(() => {});
-                kernelAudit?.tick();
-
-                persistenceAudit?.tick();
-                startupAudit?.tick();
-                actorAudit?.tick();
-                lifecycleAudit?.tick();
-                stopRetryAudit?.tick();
-                facebookReadAudit?.tick();
-                facebookFollowupAudit?.tick();
-                uploadAudit?.tick();
-                nativeIdentityAudit?.tick();
-                admissionAudit?.tick();
-                draftAudit?.tick();
                 void publishingRuntime
                   ?.tick()
                   .catch((error) => console.error('Publishing runtime failed', error));
               },
               close: async () => {
-                kernelAudit?.disable();
-                nativeIdentityAudit?.disable();
-                persistenceAudit?.disable();
-                startupAudit?.disable();
-                actorAudit?.disable();
-                lifecycleAudit?.disable();
-                stopRetryAudit?.disable();
-                facebookReadAudit?.disable();
-                facebookFollowupAudit?.disable();
-                uploadAudit?.disable();
                 const settling = inspection?.close();
-                await admissionAudit?.close();
-                await draftAudit?.close();
                 await publishingRuntime?.close();
                 await kernel.close();
                 await settling;
@@ -548,7 +422,8 @@ try {
         new FilesystemWorkspaceRestore(dataDir),
         () =>
           (publishingRuntime?.hasActiveExecution() ?? false) ||
-          groupInviterService.hasActiveExecution(),
+          groupInviterService.hasActiveExecution() ||
+          groupBumperService?.hasActiveExecution() === true,
       );
       const workspaceService = new WorkspaceService(
         repository,
@@ -574,6 +449,24 @@ try {
           void publishingRuntime?.tick().catch(() => {});
         },
       );
+      let groupBumperService: GroupBumperService | undefined;
+      const featureExecution = new FeatureExecutionRegistry();
+      featureExecution.register({
+        id: 'active-accounts',
+        label: '活跃账号',
+        isProfileRunning: async (profileId) => {
+          await repository.tasks.releaseErroredPausedPlans([profileId]);
+          return await repository.tasks.hasProfilePlanInStates(profileId, [
+            'QUEUED',
+            'RUNNING',
+            'PAUSING',
+            'PAUSED',
+            'STOPPING',
+            'REVIEW',
+          ]);
+        },
+        hasActiveExecution: () => publishingRuntime?.hasActiveExecution() === true,
+      });
       const groupInviterService = new GroupInviterService(
         repository.groupInviter,
         new GroupInviterBrowserAdapter(
@@ -592,17 +485,7 @@ try {
               p?.account.id ?? (await repository.profileAccountCache()).get(profileId)?.id ?? null
             );
           },
-          async (profileId) => {
-            await repository.tasks.releaseErroredPausedPlans([profileId]);
-            return await repository.tasks.hasProfilePlanInStates(profileId, [
-              'QUEUED',
-              'RUNNING',
-              'PAUSING',
-              'PAUSED',
-              'STOPPING',
-              'REVIEW',
-            ]);
-          },
+          (profileId) => featureExecution.isProfileBusy(profileId, 'group-inviter'),
         ),
         () => {
           dataCleanup?.assertNotResetting();
@@ -610,6 +493,45 @@ try {
           softwareUpdate?.assertIdle();
         },
       );
+      featureExecution.register({
+        id: 'group-inviter',
+        label: '小组邀请人',
+        isProfileRunning: (profileId) => groupInviterService.isProfileRunning(profileId),
+        hasActiveExecution: () => groupInviterService.hasActiveExecution(),
+        stopProfiles: async (profileIds) => {
+          await groupInviterService.stopProfiles({ profileIds: [...profileIds] });
+        },
+      });
+      const bumperAdapter = new GroupBumperBrowserAdapter(
+        repository.groupBumper,
+        () => mainKernel,
+        () => core,
+        (id) => featureExecution.isProfileBusy(id, 'group-bumper'),
+      );
+      groupBumperService = new GroupBumperService(
+        repository.groupBumper,
+        bumperAdapter,
+        async () => ({
+          comments: await repository.groupBumper.comments(),
+          total: await repository.groupBumper.total(),
+        }),
+        () => {
+          dataCleanup?.assertNotResetting();
+          backups?.assertIdle();
+          softwareUpdate?.assertIdle();
+        },
+        (kind, items, options) => bumperAdapter.refreshTargetBatch(kind, items, options),
+      );
+
+      featureExecution.register({
+        id: 'group-bumper',
+        label: '小组顶贴',
+        isProfileRunning: (profileId) => groupBumperService?.isProfileRunning(profileId) === true,
+        hasActiveExecution: () => groupBumperService?.hasActiveExecution() === true,
+        stopProfiles: async (profileIds) => {
+          await groupBumperService?.stop([...profileIds]);
+        },
+      });
       const mediaComponent = mediaRuntimeComponent(dataDir);
       const updaterBackend = new SoftwareUpdateBackend({
         root,
@@ -622,20 +544,15 @@ try {
         bundledExtension.version,
         productExtensionDirectory(),
         async (id) =>
+          groupBumperService?.isProfileRunning(id) === true ||
           groupInviterService.isProfileRunning(id) ||
-          (
-            await repository.tasks.plansForProfile(id, ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'])
-          ).some(
-            (p) =>
-              p.state === 'QUEUED' ||
-              taskBlocksSoftwareUpdate(
-                p.state,
-                core.peers.get(id)?.online === true,
-                publishingRuntime?.hasOwner(id) === true,
-              ),
-          ),
+          publishingRuntime?.hasExecutionOrOpening(id) === true ||
+          core.hasPendingControlOrOperation(id) ||
+          (await store.unresolved(id)).length > 0 ||
+          (await extensionReloadTasksBusy(repository.tasks, repository.tasks.settlements, id)),
         async (peer) => {
           await mainKernel?.releaseIdleForExtension(peer);
+          publishingRuntime?.clearStartupBackoff(peer.profileId);
         },
       );
       softwareUpdate = new SoftwareUpdateService(
@@ -651,6 +568,7 @@ try {
             if (!process.parentPort)
               throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中执行更新', 409);
             if (
+              groupBumperService?.hasActiveExecution() === true ||
               groupInviterService.hasActiveExecution() ||
               publishingRuntime?.hasActiveExecution() ||
               (await repository.tasks.livePlans()).some((p) =>
@@ -707,6 +625,8 @@ try {
         async () => {
           if (publishingRuntime?.hasActiveExecution())
             throw new ProductError('RESET_TASKS_ACTIVE', '请先停止当前正在执行的任务', 409);
+          if (groupBumperService?.hasActiveExecution())
+            throw new ProductError('RESET_BUMPER_ACTIVE', '请先停止小组顶贴任务', 409);
           if ((await groupInviterService.state()).running)
             throw new ProductError('RESET_INVITER_ACTIVE', '请先停止小组邀请任务', 409);
         },
@@ -756,7 +676,9 @@ try {
               );
             return mainKernel.consolidateFacebookWorkspace(peer, preferActiveTab);
           },
-          (profileId) => groupInviterService.isProfileRunning(profileId),
+          (profileId) =>
+            groupInviterService.isProfileRunning(profileId) ||
+            groupBumperService?.isProfileRunning(profileId) === true,
         ),
         new MaterialCacheManagement(
           repository.cacheCleanup,
@@ -770,7 +692,9 @@ try {
           cacheDirectory: uploadCacheRoot,
         }),
         groupInviterService,
-        async (note?: string) => {
+        async (diagInput) => {
+          const note = diagInput?.note;
+          const uiContext = diagInput?.uiContext;
           const wsSnapshot = await workspaceService.snapshot();
           const runtime = await taskService.runtimeOverview();
           const activePlans = await mapAsync(runtime.plans.slice(-16), async (plan) => {
@@ -809,40 +733,51 @@ try {
               recentOps,
             };
           });
-          const profileSummaries = wsSnapshot.profiles.map((p) => ({
-            id: p.id,
-            name: p.alias || p.browserName || p.id.slice(0, 8),
-            online: p.online,
-            phase: p.phase,
-            synced: p.synced,
-            profileWindowFocused: core.peers.get(p.id)?.profileWindowFocused ?? null,
-            focusedWindowAt: core.peers.get(p.id)?.focusedWindowAt ?? null,
-            presentationRecoverySupported:
-              core.peers.get(p.id)?.capabilities?.includes('task-presentation-recovery-v1') ??
-              false,
-            unresolved: p.unresolved,
-            accountState: p.account.state,
-            accountName: p.account.name ?? null,
-            kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-20) : [],
-          }));
+          const profileSummaries = wsSnapshot.profiles.map((p) => {
+            const peer = core.peers.get(p.id);
+            return {
+              id: p.id,
+              name: p.alias || p.browserName || p.id.slice(0, 8),
+              alias: p.alias ?? '',
+              browserName: p.browserName ?? '',
+              online: p.online,
+              phase: p.phase,
+              synced: p.synced,
+              unresolved: p.unresolved,
+              extensionVersion: peer?.extensionVersion ?? null,
+              accountState: p.account.state,
+              accountId: p.account.id ?? null,
+              accountName: p.account.name ?? null,
+              profileWindowFocused: peer?.profileWindowFocused ?? null,
+              focusedWindowAt: peer?.focusedWindowAt ?? null,
+              presentationRecoverySupported:
+                peer?.capabilities?.includes('task-presentation-recovery-v1') ?? false,
+              kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-50) : [],
+            };
+          });
           const inviterState = await groupInviterService.state();
+          const inviterLogs = await groupInviterService.logs('', undefined, 300);
+          const bumperState = groupBumperService ? await groupBumperService.state() : null;
+          const bumperLogs = groupBumperService
+            ? await groupBumperService.logs('', undefined, undefined, 300)
+            : [];
+          const loopDelaySummary = {
+            resolutionMs: 20,
+            samples: controllerLoopDelay.count,
+            maxSampleIntervalMs: controllerLoopDelay.count ? controllerLoopDelay.max / 1e6 : null,
+            p99SampleIntervalMs: controllerLoopDelay.count
+              ? controllerLoopDelay.percentile(99) / 1e6
+              : null,
+          };
           const entry = devDiag.record({
             level: 'SNAPSHOT',
             category: 'SNAPSHOT',
             event: 'USER_MANUAL_SNAPSHOT',
-            reason: note?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
+            reason: note?.trim() || uiContext?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
             data: {
               softwareVersion,
-              controllerLoopDelay: {
-                resolutionMs: 20,
-                samples: controllerLoopDelay.count,
-                maxSampleIntervalMs: controllerLoopDelay.count
-                  ? controllerLoopDelay.max / 1e6
-                  : null,
-                p99SampleIntervalMs: controllerLoopDelay.count
-                  ? controllerLoopDelay.percentile(99) / 1e6
-                  : null,
-              },
+              uiContext: uiContext?.trim() || '',
+              controllerLoopDelay: loopDelaySummary,
               controllerMemory: process.memoryUsage(),
               settings: runtime.settings,
               profiles: profileSummaries,
@@ -854,18 +789,66 @@ try {
                 statusText: inviterState.statusText,
                 profileCounts: inviterState.profileCounts,
               },
+              groupBumper: bumperState
+                ? {
+                    running: bumperState.running,
+                    statusText: bumperState.statusText,
+                    profileCounts: bumperState.profileCounts,
+                  }
+                : null,
             },
           });
-          return {
-            filePath: devDiagWriter.filePath,
+          const combinationsSummary = wsSnapshot.combinations.map((row) => ({
+            id: row.id,
+            version: row.version,
+            revision: row.revision,
+            updatedAt: row.updatedAt,
+            saved: row.saved
+              ? {
+                  name: row.saved.name,
+                  note: row.saved.note,
+                  randomOrder: row.saved.randomOrder,
+                  loop: row.saved.loop,
+                  steps: row.saved.steps,
+                }
+              : null,
+          }));
+          return await buildDiagnosticFeedbackPackage({
+            dataDir,
+            softwareVersion,
+            extensionVersion: bundledExtension.version,
+            note,
+            uiContext,
+            targetDir: diagInput?.targetDir,
+            reveal: diagInput?.reveal,
             entryId: entry.id,
             at: entry.at,
-          };
+            controllerLoopDelay: loopDelaySummary,
+            profiles: profileSummaries,
+            combinations: combinationsSummary,
+            groupInviter: {
+              state: inviterState,
+              logs: inviterLogs,
+            },
+            groupBumper: bumperState
+              ? {
+                  state: bumperState,
+                  logs: bumperLogs,
+                }
+              : null,
+            tasksRepository: repository.tasks,
+            taskTabsRepository: repository.taskTabs,
+            devDiagFlush: () => devDiagWriter.flush(),
+            devDiagFilePath: devDiagWriter.filePath,
+          });
         },
         dataCleanup,
         windowLayout,
         mediaComponent,
         softwareUpdate,
+        groupBumperService,
+        (fileName, targetDir) => revealDiagnosticPackage(dataDir, fileName, targetDir),
+        featureExecution,
       );
       return async (...args) => {
         const [req] = args;

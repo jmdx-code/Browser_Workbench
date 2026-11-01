@@ -9,12 +9,16 @@ test('stop drains a native capture refresh before confirming cleanup and rejects
   let starts = 0,
     stops = 0,
     allowed = true;
-  const rendering = new TaskRendering(async (_target, method) => {
-    if (method === 'Page.startScreencast' && ++starts === 2)
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (
+      method === 'Emulation.setFocusEmulationEnabled' &&
+      params.enabled === true &&
+      ++starts === 2
+    )
       await new Promise<void>((resolve) => {
         resume = resolve;
       });
-    if (method === 'Page.stopScreencast') stops++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) stops++;
   });
   const guard = () => {
     if (!allowed) throw Error('STOPPED');
@@ -38,13 +42,15 @@ test('refresh serializes stop before start and coalesces callers arriving during
   const calls: string[] = [];
   let active = false,
     resumeStop!: () => void;
-  const rendering = new TaskRendering(async (_target, method) => {
-    calls.push(method);
-    if (method === 'Page.startScreencast') {
-      if (active) throw Error('Screencast is already active');
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Page.setWebLifecycleState') return;
+    const tag = `${method}:${String(params.enabled)}`;
+    calls.push(tag);
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true) {
+      if (active) throw Error('Focus emulation is already active');
       active = true;
     }
-    if (method === 'Page.stopScreencast') {
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) {
       if (calls.length === 2)
         await new Promise<void>((resolve) => {
           resumeStop = resolve;
@@ -65,10 +71,17 @@ test('refresh serializes stop before start and coalesces callers arriving during
     });
   await tick();
   assert.equal(ensured, false);
-  assert.deepEqual(calls, ['Page.startScreencast', 'Page.stopScreencast']);
+  assert.deepEqual(calls, [
+    'Emulation.setFocusEmulationEnabled:true',
+    'Emulation.setFocusEmulationEnabled:false',
+  ]);
   resumeStop();
   await Promise.all([first, second, third, ensuring]);
-  assert.deepEqual(calls, ['Page.startScreencast', 'Page.stopScreencast', 'Page.startScreencast']);
+  assert.deepEqual(calls, [
+    'Emulation.setFocusEmulationEnabled:true',
+    'Emulation.setFocusEmulationEnabled:false',
+    'Emulation.setFocusEmulationEnabled:true',
+  ]);
   await rendering.release();
   assert.equal(active, false);
 });
@@ -77,9 +90,13 @@ test('STOP during native refresh stop prevents restart and drains cleanup', asyn
   let resumeStop!: () => void,
     starts = 0,
     stops = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
-    if (method === 'Page.startScreencast') starts++;
-    if (method === 'Page.stopScreencast' && ++stops === 1)
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true) starts++;
+    if (
+      method === 'Emulation.setFocusEmulationEnabled' &&
+      params.enabled === false &&
+      ++stops === 1
+    )
       await new Promise<void>((resolve) => {
         resumeStop = resolve;
       });
@@ -104,12 +121,12 @@ test('STOP during native refresh stop prevents restart and drains cleanup', asyn
 test('late ACK failure from before refresh cannot stop the refreshed stream', async () => {
   let rejectAck!: (error: Error) => void,
     stops = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
+  const rendering = new TaskRendering(async (_target, method, params) => {
     if (method === 'Page.screencastFrameAck')
       await new Promise<void>((_resolve, reject) => {
         rejectAck = reject;
       });
-    if (method === 'Page.stopScreencast') stops++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) stops++;
   });
   await rendering.ensure(7, 'native-seven', () => {});
   rendering.consume({ tabId: 7 }, 'Page.screencastFrame', { sessionId: 1 }, () => true);
@@ -123,9 +140,10 @@ test('late ACK failure from before refresh cannot stop the refreshed stream', as
 
 test('a rejected refresh stop never starts another encoder and remains fenced', async () => {
   let starts = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
-    if (method === 'Page.startScreencast') starts++;
-    if (method === 'Page.stopScreencast') throw Error('NATIVE_STOP_FAILED');
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true) starts++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false)
+      throw Error('NATIVE_STOP_FAILED');
   });
   await rendering.ensure(7, 'native-seven', () => {});
   await assert.rejects(
@@ -142,11 +160,12 @@ test('a rejected refresh stop never starts another encoder and remains fenced', 
 
 test('refresh without an existing stream starts only once', async () => {
   const calls: string[] = [];
-  const rendering = new TaskRendering(async (_target, method) => {
-    calls.push(method);
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Page.setWebLifecycleState') return;
+    calls.push(`${method}:${String(params.enabled)}`);
   });
   await rendering.refresh(7, 'native-seven', () => {});
-  assert.deepEqual(calls, ['Page.startScreencast']);
+  assert.deepEqual(calls, ['Emulation.setFocusEmulationEnabled:true']);
   await rendering.release();
 });
 
@@ -157,12 +176,12 @@ test(
     let active = false,
       starts = 0,
       stops = 0;
-    const rendering = new TaskRendering(async (_target, method) => {
-      if (method === 'Page.startScreencast') {
+    const rendering = new TaskRendering(async (_target, method, params) => {
+      if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true) {
         if (++starts === 2) throw Error('START_FAILED');
         active = true;
       }
-      if (method === 'Page.stopScreencast') {
+      if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) {
         active = false;
         stops++;
       }
@@ -180,8 +199,9 @@ test('presentation maintenance is coalesced and stop revokes then drains it befo
   const calls: string[] = [];
   let resume!: () => void;
   let guarded = false;
-  const rendering = new TaskRendering(async (_target, method) => {
-    calls.push(method);
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Page.setWebLifecycleState') return;
+    calls.push(`${method}:${String(params.enabled)}`);
   });
   await rendering.ensure(7, 'native-seven', () => {});
   const work = async (tabId: number, targetId: string, guard: () => void) => {
@@ -209,7 +229,10 @@ test('presentation maintenance is coalesced and stop revokes then drains it befo
   await stopping;
   assert.equal(guarded, true);
   assert.equal(released, true);
-  assert.deepEqual(calls, ['Page.startScreencast', 'Page.stopScreencast']);
+  assert.deepEqual(calls, [
+    'Emulation.setFocusEmulationEnabled:true',
+    'Emulation.setFocusEmulationEnabled:false',
+  ]);
   rendering.maintain(async () => {
     throw Error('IDLE_MAINTENANCE');
   });
@@ -219,12 +242,12 @@ test('presentation maintenance is coalesced and stop revokes then drains it befo
 test('slow frame acknowledgements are bounded and exhausted permission tears the stream down', async () => {
   const pending: (() => void)[] = [];
   let stopped = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
+  const rendering = new TaskRendering(async (_target, method, params) => {
     if (method === 'Page.screencastFrameAck')
       return new Promise<void>((resolve) => {
         pending.push(resolve);
       });
-    if (method === 'Page.stopScreencast') stopped++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) stopped++;
   });
   await rendering.ensure(7, 'native-seven', () => {});
   for (let i = 0; i < 5; i++)
@@ -247,6 +270,7 @@ test('slow frame acknowledgements are bounded and exhausted permission tears the
 test('rendering is bounded to one exact native target, shares startup, discards pixels and acknowledges every frame', async () => {
   const calls: { tabId: number; method: string; params: Record<string, unknown> }[] = [];
   const rendering = new TaskRendering(async (target, method, params) => {
+    if (method === 'Page.setWebLifecycleState') return;
     calls.push({ ...target, method, params });
   });
   await Promise.all([
@@ -284,7 +308,12 @@ test('rendering is bounded to one exact native target, shares startup, discards 
     false,
   );
   await Promise.all([rendering.release(), rendering.release()]);
-  assert.equal(calls.filter((c) => c.method === 'Page.stopScreencast').length, 1);
+  assert.equal(
+    calls.filter(
+      (c) => c.method === 'Emulation.setFocusEmulationEnabled' && c.params.enabled === false,
+    ).length,
+    1,
+  );
   await rendering.ensure(8, 'other', () => {});
   await rendering.release();
 });
@@ -293,12 +322,12 @@ test('revocation during native start releases its eventual stream and never retu
   let started!: () => void,
     allowed = true,
     stopped = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
-    if (method === 'Page.startScreencast')
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true)
       return new Promise<void>((resolve) => {
         started = resolve;
       });
-    if (method === 'Page.stopScreencast') stopped++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) stopped++;
   });
   const pending = assert.rejects(
     rendering.ensure(7, 'native-seven', () => {
@@ -315,26 +344,30 @@ test('revocation during native start releases its eventual stream and never retu
 
 test('uncertain native start is cleaned up once, never retried or reported as success', async () => {
   const calls: string[] = [];
-  const rendering = new TaskRendering(async (_target, method) => {
-    calls.push(method);
-    if (method === 'Page.startScreencast') throw Error('ACK_LOST');
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    calls.push(`${method}:${String(params.enabled)}`);
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === true)
+      throw Error('ACK_LOST');
   });
   await assert.rejects(
     rendering.ensure(7, 'native-seven', () => {}),
     /ACK_LOST/,
   );
-  assert.deepEqual(calls, ['Page.startScreencast', 'Page.stopScreencast']);
+  assert.deepEqual(calls, [
+    'Emulation.setFocusEmulationEnabled:true',
+    'Emulation.setFocusEmulationEnabled:false',
+  ]);
 });
 
 test('a late old-frame acknowledgement failure cannot release a replacement stream', async () => {
   let rejectAck!: (error: Error) => void,
     stopped = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
+  const rendering = new TaskRendering(async (_target, method, params) => {
     if (method === 'Page.screencastFrameAck')
       return new Promise<void>((_resolve, reject) => {
         rejectAck = reject;
       });
-    if (method === 'Page.stopScreencast') stopped++;
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false) stopped++;
   });
   await rendering.ensure(7, 'native-seven', () => {});
   rendering.consume({ tabId: 7 }, 'Page.screencastFrame', { sessionId: 1 }, () => true);
@@ -348,8 +381,9 @@ test('a late old-frame acknowledgement failure cannot release a replacement stre
 
 test('failed cleanup stays fenced until native detach, and frame traffic cannot reactivate it', async () => {
   let acks = 0;
-  const rendering = new TaskRendering(async (_target, method) => {
-    if (method === 'Page.stopScreencast') throw Error('NATIVE_STOP_FAILED');
+  const rendering = new TaskRendering(async (_target, method, params) => {
+    if (method === 'Emulation.setFocusEmulationEnabled' && params.enabled === false)
+      throw Error('NATIVE_STOP_FAILED');
     if (method === 'Page.screencastFrameAck') acks++;
   });
   await rendering.ensure(7, 'native-seven', () => {});

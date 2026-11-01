@@ -513,3 +513,23 @@ test('temporary busy inspection retries automatically once the same browser beco
   assert.equal(f.calls.filter((call) => call.startsWith('read:')).length, 1);
   await f.service.close();
 });
+
+test('abnormal account errors immediately transition profile inspection state to verification, restricted or logged-out', async () => {
+  for (const [errorCode, expectedState, expectedReason] of [
+    ['FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED', 'verification', 'CHECKPOINT_ROUTE'],
+    ['FACEBOOK_ACCOUNT_RESTRICTED', 'restricted', 'VISIBLE_LOGIN_FORM'],
+    ['FACEBOOK_ACCOUNT_LOGGED_OUT', 'logged-out', 'VISIBLE_LOGIN_FORM'],
+  ] as const) {
+    const f = fixture(),
+      id = f.ids[0]!;
+    f.port.read = async () => {
+      throw Error(errorCode);
+    };
+    f.service.request([id]);
+    await settle();
+    assert.equal(f.service.get(id)?.state, 'OBSERVED');
+    assert.equal(f.service.get(id)?.reason, expectedReason);
+    assert.equal(f.service.account(id).state, expectedState);
+    await f.service.close();
+  }
+});

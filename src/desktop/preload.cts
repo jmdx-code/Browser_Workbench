@@ -28,6 +28,8 @@ const bridge: DesktopBridge = {
     ipcRenderer.invoke('workbench:choose-backup-directory') as Promise<string | null>,
   chooseRestoreBackup: () =>
     ipcRenderer.invoke('workbench:choose-restore-backup') as Promise<string | null>,
+  chooseFeedbackDirectory: () =>
+    ipcRenderer.invoke('workbench:choose-feedback-directory') as Promise<string | null>,
   restartSoftware: () => ipcRenderer.invoke('workbench:restart') as Promise<void>,
 };
 contextBridge.exposeInMainWorld('workbenchDesktop', bridge);

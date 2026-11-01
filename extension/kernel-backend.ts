@@ -17,7 +17,7 @@ import {
   type PageProjectionRequest,
 } from '../src/shared/page-read.js';
 import { pageProjectionExpression } from './page-projection.js';
-import { OwnedTabProof, type TabProof } from '../src/shared/kernel-state.js';
+import { OwnedTabProof, type KernelState, type TabProof } from '../src/shared/kernel-state.js';
 import type { KernelJournal } from '../src/application/kernel-journal.js';
 import { kernelJournal } from './kernel-storage.js';
 import { readNativeFacebookIdentity } from './facebook-identity-reader.js';
@@ -26,6 +26,12 @@ import { digestAction } from './journal.js';
 import { WorkspacePageGroup } from './workspace-page-group.js';
 import { TaskRendering } from './task-rendering.js';
 import { sameTabProof } from '../src/domain/task-tabs.js';
+
+export function isBenignDetachError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (message.includes('DEBUGGER_DETACH_TIMEOUT')) return false;
+  return /Debugger is not attached|No tab with (?:given )?id/i.test(message);
+}
 
 export interface KernelNativeBackend extends KernelBackend {
   owns(tabId: number): boolean;
@@ -36,7 +42,9 @@ export interface KernelNativeBackend extends KernelBackend {
   inventory?(): Promise<unknown>;
   closingDialog?(source: KernelTarget, method: string, value: unknown): Promise<void>;
   consumeRendering?(source: KernelTarget, method: string, value: unknown): boolean;
-  releaseRendering?(): Promise<void>;
+  rendering?: TaskRendering;
+  releaseRendering?(tabId?: number, timeoutMs?: number): Promise<boolean>;
+  forgetRendering?(tabId?: number): void;
   maintainPresentation?(): void;
   setPresentationRecoveryGate?(
     gate: (proof: TabProof, positionOnly?: boolean) => Promise<PresentationRecoveryDecision>,
@@ -61,10 +69,27 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   }
   async setWindowExposure(proof: TabProof, exposed: boolean) {
     this.exposedWindow = exposed ? proof : undefined;
-    if (exposed) await this.rendering.release();
+    if (
+      exposed &&
+      this.owned.has(proof.tabId) &&
+      this.attached.get(proof.tabId) === proof.targetId
+    ) {
+      await this.rendering
+        .ensure(proof.tabId, proof.targetId, () => {
+          if (
+            !this.allowRead() ||
+            !this.journal.writable ||
+            this.owned.get(proof.tabId) !== proof ||
+            this.attached.get(proof.tabId) !== proof.targetId
+          )
+            throw Error('KERNEL_PRESENTATION_REVOKED');
+        })
+        .catch(() => {});
+    }
   }
-  private readonly rendering = new TaskRendering((target, method, params) =>
-    chrome.debugger.sendCommand(target, method, params),
+  readonly rendering = new TaskRendering(
+    (target, method, params) => chrome.debugger.sendCommand(target, method, params),
+    { forgetTab: (tabId) => this.windows?.forgetTab?.(tabId) },
   );
   consumeRendering(source: KernelTarget, method: string, value: unknown) {
     return this.rendering.consume(
@@ -78,11 +103,35 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         this.attached.has(source.tabId),
     );
   }
-  async releaseRendering() {
+  forgetRendering(tabId?: number): void {
+    this.exposedWindow = undefined;
+    if (tabId === undefined) {
+      this.presentation = undefined;
+      this.rendering.forgetAll();
+    } else {
+      if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+      this.rendering.forget(tabId);
+    }
+  }
+  async releaseRendering(tabId?: number, timeoutMs = 2_500): Promise<boolean> {
     this.exposedWindow = undefined;
     this.presentation = undefined; // Revoke recovery synchronously, including an in-flight check.
-    const stopped = this.rendering.release();
-    await Promise.all([stopped, this.presenting?.catch(() => {})]);
+    const stopped = await this.rendering.release(tabId, timeoutMs);
+    if (this.presenting) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const completed = await Promise.race([
+          this.presenting.then(() => true),
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), timeoutMs);
+          }),
+        ]);
+        if (!completed) return false;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    return stopped;
   }
   private presentation?: {
     proof: TabProof;
@@ -111,6 +160,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     gate: (proof: TabProof, positionOnly?: boolean) => Promise<PresentationRecoveryDecision>,
   ) {
     this.recoverPresentation = gate;
+    void this.recoverPresentation;
   }
   async armTaskPresentation(proof: TabProof) {
     const owned = this.owned.get(proof.tabId);
@@ -137,6 +187,9 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   maintainPresentation() {
     const presentation = this.presentation;
     if (this.access !== 'facebook-task' || !presentation || this.presenting) return;
+    const at = this.presentationNow();
+    if (at - presentation.checkedAt < 8_000) return;
+    presentation.checkedAt = at;
     const { proof } = presentation;
     const tabId = proof.tabId;
     const pending = (async () => {
@@ -165,14 +218,11 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         await chrome.tabs.update(tabId, { active: true });
         guard();
       }
-      const at = this.presentationNow();
-      if (at - presentation.checkedAt < 2000) return;
-      presentation.checkedAt = at;
       // Renderer/CDP can itself be suspended by occlusion. Its probe must never
       // block browser-process window recovery or the next watchdog tick.
       if (!presentation.probe) {
         const probe = (async () => {
-          if (!this.isExposed(proof)) await this.rendering.ensure(tabId, proof.targetId, guard);
+          await this.rendering.ensure(tabId, proof.targetId, guard);
           guard();
           const value = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
             expression: 'document.visibilityState',
@@ -189,7 +239,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           presentation.visibility = visibility;
           presentation.visibilityAt = Date.now();
           if (visibility === 'hidden') {
-            if (!this.isExposed(proof)) await this.rendering.refresh(tabId, proof.targetId, guard);
+            await this.rendering.refresh(tabId, proof.targetId, guard);
             guard();
           }
         })();
@@ -218,10 +268,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         probePending: !!presentation.probe,
       };
       const diagnostic = JSON.stringify(state);
-      if (
-        presentation.diagnostic !== diagnostic ||
-        at - (presentation.reportedAt ?? -Infinity) >= 15000
-      ) {
+      if (presentation.diagnostic !== diagnostic) {
         presentation.diagnostic = diagnostic;
         presentation.reportedAt = at;
         this.reportPresentation(proof, state);
@@ -230,43 +277,11 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         presentation.visibility === 'hidden' &&
         presentation.visibilityAt !== undefined &&
         Date.now() - presentation.visibilityAt <= 5000;
-      const inactive =
-        presentation.inactiveSince !== undefined && at - presentation.inactiveSince >= 4000;
-      const exposed = this.isExposed(proof);
-      if ((hidden || (!exposed && inactive)) && this.recoverPresentation) {
-        this.reportPresentation(proof, {
-          phase: 'REQUEST',
-          reason: hidden ? 'HIDDEN' : 'WINDOW_UNFOCUSED',
-        });
-        const granted = await this.recoverPresentation(proof, exposed);
+      if (hidden) {
+        await this.rendering.refresh(tabId, proof.targetId, guard).catch(() => {});
         guard();
-        if (granted) {
-          if (exposed) {
-            // The controller has moved the exact window. This is only a native
-            // movement result; a later real visibility probe decides recovery.
-            this.reportPresentation(proof, { phase: 'LAYOUT_RESULT' });
-            return;
-          }
-          // User-authorized recovery of this exact live task, not an arbitrary
-          // window or a replay of the business action currently being verified.
-          const current = await chrome.tabs.get(tabId);
-          guard();
-          if (!kernelAccessURL(current.url ?? '', 'facebook-task'))
-            throw Error('KERNEL_PRESENTATION_URL_CHANGED');
-          await chrome.tabs.update(tabId, { active: true });
-          guard();
-          await chrome.windows.update(current.windowId, { focused: true });
-          guard();
-          const focused = await chrome.windows.get(current.windowId);
-          guard();
-          this.reportPresentation(proof, {
-            phase: 'FOCUS_RESULT',
-            windowFocused: focused.focused ?? null,
-          });
-          if (focused.focused === true) presentation.inactiveSince = undefined;
-        } else this.reportPresentation(proof, { phase: 'DEFERRED' });
       }
-      guard();
+      return;
     })();
     this.presenting = pending;
     void pending
@@ -305,9 +320,13 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     private readonly allowRead: () => boolean = () => false,
     private readonly currentOperation: () => Binding | undefined = () => undefined,
     private readonly presentationNow: () => number = performance.now.bind(performance),
+    private readonly windows?: { forgetTab?(tabId: number): void },
   ) {}
   async inventory(): Promise<unknown> {
+    let currentRev = this.journal.currentRevision;
     const before = await this.journal.snapshot();
+    currentRev = this.journal.currentRevision;
+    let mutated = false;
     if (
       this.allowRead() &&
       !before.operations.some((row) => row.state !== 'RECONCILED' && !row.disposition)
@@ -322,7 +341,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
         });
         const original = withdrawn.find(
-          (row) => main && JSON.stringify(main.proof) === JSON.stringify(row.proof),
+          (row) => main && row.proof && sameTabProof(main.proof, row.proof),
         );
         if (main && original?.proof) {
           const target = (await chrome.debugger.getTargets()).find(
@@ -333,9 +352,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
             if (
               original.reason === 'TASK_ENDED_OWNERSHIP_WITHDRAWN' &&
               original.proof.browserSessionEpoch === before.browserSessionEpoch
-            )
+            ) {
               await this.journal.restoreWithdrawnTab(original.proof);
-            else if (
+              mutated = true;
+            } else if (
               original.reason === 'BROWSER_SESSION_CHANGED' &&
               original.proof.profileId === before.profileId
             ) {
@@ -352,7 +372,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
                   ownershipId: crypto.randomUUID(),
                   browserSessionEpoch: before.browserSessionEpoch,
                 });
-              if (!known) await this.journal.reobserveMain(original.proof, proof, target.url);
+              if (!known) {
+                await this.journal.reobserveMain(original.proof, proof, target.url);
+                mutated = true;
+              }
               await this.workspaceGroup.rebind(original.proof, proof, () => {
                 if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
               });
@@ -361,15 +384,19 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         }
       }
     }
-    const observed = await this.journal.snapshot();
+    const observed =
+      mutated || !this.journal.writable || this.journal.currentRevision !== currentRev
+        ? await this.journal.snapshot()
+        : before;
+    currentRev = this.journal.currentRevision;
     const retained = observed.tabs.filter(
       (row) =>
         row.state === 'READY' &&
         row.proof &&
-        row.proof.browserSessionEpoch === before.browserSessionEpoch &&
+        row.proof.browserSessionEpoch === observed.browserSessionEpoch &&
         !this.owned.has(row.proof.tabId),
     );
-    if (!retained.length) return this.workspaceSnapshot();
+    if (!retained.length) return this.workspaceSnapshot(observed, currentRev);
     if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
     // Worker reload can miss onRemoved. Observe retained pages without adopting, attaching
     // or closing them. Absence in both tab and target inventories confirms page lifecycle
@@ -387,7 +414,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           (target) => target.tabId === row.proof?.tabId || target.id === row.proof?.targetId,
         ),
     );
-    if (!absent.length) return this.workspaceSnapshot();
+    if (!absent.length) return this.workspaceSnapshot(observed, currentRev);
     const confirmedTabs = await chrome.tabs.query({});
     if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
     for (const row of absent) {
@@ -395,18 +422,33 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         await this.journal.tabState(row.ownershipId, 'CLOSED', 'RETAINED_TARGET_ABSENT');
       if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
     }
-    return this.workspaceSnapshot();
+    return this.workspaceSnapshot(observed, currentRev);
   }
-  private async workspaceSnapshot() {
-    const state = await this.journal.snapshot();
-    if (!chrome.storage?.local) return state;
+  private async workspaceSnapshot(cachedState?: KernelState, cachedRevision?: number) {
+    // A cached snapshot is reusable only while the journal is still healthy and unchanged.
+    // Otherwise snapshot() re-reads, and rejects with KERNEL_JOURNAL_NOT_READY after a failure.
+    const stale = (revision: number) =>
+      !this.journal.writable || this.journal.currentRevision !== revision;
+    let state =
+      cachedState !== undefined && cachedRevision !== undefined && !stale(cachedRevision)
+        ? cachedState
+        : await this.journal.snapshot();
+    let stateRev = this.journal.currentRevision;
+    if (!chrome.storage?.local) {
+      if (stale(stateRev)) state = await this.journal.snapshot();
+      return state;
+    }
     const main = await this.workspaceGroup.read(() => {
       if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
     });
+    if (stale(stateRev)) {
+      state = await this.journal.snapshot();
+      stateRev = this.journal.currentRevision;
+    }
     if (
       !main ||
       !state.tabs.some(
-        (row) => row.state === 'READY' && JSON.stringify(row.proof) === JSON.stringify(main.proof),
+        (row) => row.state === 'READY' && row.proof && sameTabProof(row.proof, main.proof),
       )
     )
       return state;
@@ -414,6 +456,16 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       (row) => row.tabId === main.proof.tabId && row.id === main.proof.targetId,
     );
     if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+    if (stale(stateRev)) {
+      state = await this.journal.snapshot();
+      stateRev = this.journal.currentRevision;
+      if (
+        !state.tabs.some(
+          (row) => row.state === 'READY' && row.proof && sameTabProof(row.proof, main.proof),
+        )
+      )
+        return state;
+    }
     return target?.type === 'page' && kernelAccessURL(target.url, 'facebook-task')
       ? { ...state, workspaceMain: main.proof }
       : state;
@@ -425,7 +477,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     if (
       record?.state !== 'READY' ||
       !record.proof ||
-      JSON.stringify(record.proof) !== JSON.stringify(proof) ||
+      !sameTabProof(record.proof, proof) ||
       proof.browserSessionEpoch !== state.browserSessionEpoch
     )
       throw Error('KERNEL_TAB_ADOPTION_REJECTED');
@@ -451,10 +503,8 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   async revealOwnedPage(proof: TabProof): Promise<{ tabId: number; focused: true }> {
     proof = OwnedTabProof.parse(proof);
     const check = () => {
-      if (
-        !this.allowRead() ||
-        JSON.stringify(this.owned.get(proof.tabId)) !== JSON.stringify(proof)
-      )
+      const owned = this.owned.get(proof.tabId);
+      if (!this.allowRead() || !owned || !sameTabProof(owned, proof))
         throw Error('WORKSPACE_REVEAL_REVOKED');
     };
     check();
@@ -656,7 +706,18 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     await this.scope(tabId);
     if (!this.attached.has(tabId)) {
       this.expectedDetaches.delete(tabId);
-      await chrome.debugger.attach({ tabId }, '1.3');
+      try {
+        await chrome.debugger.attach({ tabId }, '1.3');
+      } catch (error) {
+        if (error instanceof Error && /Another debugger is already attached/i.test(error.message)) {
+          this.expectedDetaches.add(tabId);
+          await chrome.debugger.detach({ tabId }).catch(() => {});
+          this.expectedDetaches.delete(tabId);
+          await chrome.debugger.attach({ tabId }, '1.3');
+        } else {
+          throw error;
+        }
+      }
       this.attached.set(tabId, '');
     }
     const result = KernelJsonObject.parse(
@@ -672,20 +733,31 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     this.attached.set(tabId, info.targetId);
     return info;
   }
-  async detach(tabId: number): Promise<void> {
+  async detach(tabId: number, timeoutMs = 3_000): Promise<void> {
+    if (this.exposedWindow?.tabId === tabId) this.exposedWindow = undefined;
+    if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+    this.rendering.forget(tabId);
     if (!this.attached.has(tabId)) return;
     if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
-    if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
-    await this.rendering.release(tabId).catch(() => {}); // Detach also destroys the native stream.
     this.expectedDetaches.add(tabId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await chrome.debugger.detach({ tabId });
+      await Promise.race([
+        chrome.debugger.detach({ tabId }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('DEBUGGER_DETACH_TIMEOUT')), timeoutMs);
+        }),
+      ]);
+      this.attached.delete(tabId);
     } catch (error) {
-      // A user cancellation may already have detached. Only an observed absence confirms release.
-      const target = (await chrome.debugger.getTargets()).find((item) => item.tabId === tabId);
-      if (target?.attached) throw error;
+      if (isBenignDetachError(error)) {
+        this.attached.delete(tabId);
+        return;
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    this.attached.delete(tabId);
   }
   async create(
     url: string,
@@ -746,22 +818,98 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     }
   }
   async remove(tabId: number): Promise<void> {
-    if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
-    await this.scopeForClose(tabId);
-    // STOP can arrive while the native target lookup is awaiting. Recheck immediately before close.
-    if (this.access !== 'fixture' && !this.allowRead())
-      throw Error('KERNEL_READONLY_LEASE_REJECTED');
+    const assertReadable = () => {
+      if (this.access !== 'fixture' && !this.allowRead())
+        throw Error('KERNEL_READONLY_LEASE_REJECTED');
+    };
+    const assertRemovable = () => {
+      if (this.currentOperation()) throw Error('KERNEL_CLOSE_DURING_OPERATION');
+      assertReadable();
+    };
+    const cleanupClosed = async (expectedProof: TabProof) => {
+      if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+      this.rendering.forget(tabId);
+      this.identityReadTabs.delete(tabId);
+      this.owned.delete(tabId);
+      this.attached.delete(tabId);
+      this.expectedDetaches.delete(tabId);
+      await this.journal.tabState(expectedProof.ownershipId, 'CLOSED', 'CLOSED_BY_EXECUTOR');
+    };
+    const confirmDisappeared = async (
+      expectedProof: TabProof,
+      fallbackError: unknown,
+      markLostOnPresent = false,
+    ): Promise<void> => {
+      assertRemovable();
+      const [freshTargets, freshTabs] = await Promise.all([
+        chrome.debugger.getTargets(),
+        chrome.tabs.query({}),
+      ]);
+      assertRemovable();
+      const stillInTargets = freshTargets.some(
+        (row) => row.tabId === tabId || row.id === expectedProof.targetId,
+      );
+      const stillInTabs = freshTabs.some((tab) => tab.id === tabId);
+      if (!stillInTargets && !stillInTabs) {
+        await cleanupClosed(expectedProof);
+        return;
+      }
+      if (markLostOnPresent) {
+        this.owned.delete(tabId);
+        await this.journal.tabState(expectedProof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
+      }
+      throw fallbackError instanceof Error ? fallbackError : Error(String(fallbackError));
+    };
+
+    assertReadable();
     const proof = this.owned.get(tabId);
+    if (!proof) {
+      const snapshot = await this.journal.snapshot();
+      let latestClosedProof: TabProof | null = null;
+      for (let index = snapshot.tabs.length - 1; index >= 0; index--) {
+        const row = snapshot.tabs[index];
+        if (
+          row?.proof &&
+          row.proof.browserSessionEpoch === snapshot.browserSessionEpoch &&
+          row.proof.tabId === tabId
+        ) {
+          if (row.state === 'CLOSED') {
+            latestClosedProof = row.proof;
+          }
+          break;
+        }
+      }
+      if (!latestClosedProof) throw Error('KERNEL_TAB_NOT_OWNED');
+      return await confirmDisappeared(latestClosedProof, Error('KERNEL_TAB_NOT_OWNED'));
+    }
+
+    const targets = await chrome.debugger.getTargets();
+    const target = targets.find((row) => row.tabId === tabId);
+    if (!target) {
+      return await confirmDisappeared(proof, Error('KERNEL_TAB_IDENTITY_CHANGED'), true);
+    }
+    if (target.type !== 'page' || target.id !== proof.targetId) {
+      this.owned.delete(tabId);
+      await this.journal.tabState(proof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
+      throw Error('KERNEL_TAB_IDENTITY_CHANGED');
+    }
+    // STOP can arrive while the native target lookup is awaiting. Recheck immediately before close.
+    assertReadable();
     this.expectedDetaches.add(tabId);
     this.expectedRemovals.add(tabId);
     this.removingUntil.set(tabId, Date.now() + 10_000);
     this.removalDialogs.delete(tabId);
     try {
-      await chrome.tabs.remove(tabId);
-      this.identityReadTabs.delete(tabId);
-      this.owned.delete(tabId);
-      this.attached.delete(tabId);
-      if (proof) await this.journal.tabState(proof.ownershipId, 'CLOSED', 'CLOSED_BY_EXECUTOR');
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (error) {
+        if (error instanceof Error && /No tab with id/i.test(error.message)) {
+          await confirmDisappeared(proof, error);
+          return;
+        }
+        throw error;
+      }
+      await cleanupClosed(proof);
     } finally {
       this.expectedRemovals.delete(tabId);
       this.removingUntil.delete(tabId);
@@ -870,8 +1018,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       if (operation) {
         // Preparation only: the following actual Input still passes its original fresh
         // target/identity guard. No new await is inserted immediately before an Input.
-        if (!this.isExposed(proof!))
-          await this.rendering.ensure(target.tabId, proof!.targetId, guard);
+        await this.rendering.ensure(target.tabId, proof!.targetId, guard);
         guard();
         if (this.presentation?.proof !== proof)
           this.presentation = { proof: proof!, checkedAt: -Infinity };

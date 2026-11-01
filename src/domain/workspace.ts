@@ -23,6 +23,13 @@ export interface WorkspaceRepository {
   updatePreferences?(input: PreferenceUpdate): Awaitable<Preferences>;
   maintenanceSettings?(): Awaitable<MaintenanceConfiguration>;
   updateMaintenanceSettings?(input: MaintenanceUpdate): Awaitable<MaintenanceConfiguration>;
+  targetFolders?(
+    kind: import('../shared/target-list.js').TargetListKind,
+  ): Awaitable<import('../shared/target-list.js').TargetFolder[]>;
+  targetListCommand?(input: unknown): Awaitable<void>;
+  ensureProfileOrders?(ids: string[]): Awaitable<void>;
+  reorderProfiles?(ids: string[], groupId: string | null): Awaitable<void>;
+  reorderGroups?(ids: string[]): Awaitable<void>;
   groups(): Awaitable<Group[]>;
   createGroup(name: string, color: Group['color']): Awaitable<Group>;
   renameGroup(id: string, name: string): Awaitable<void>;
@@ -30,7 +37,9 @@ export interface WorkspaceRepository {
   moveProfiles(profileIds: string[], groupId: string | null): Awaitable<void>;
   renameProfile(id: string, alias: string): Awaitable<void>;
   deleteProfiles?(profileIds: string[]): Awaitable<number>;
-  profileMetadata(): Awaitable<Map<string, { groupId: string | null; alias: string | null }>>;
+  profileMetadata(): Awaitable<
+    Map<string, { groupId: string | null; alias: string | null; order?: number }>
+  >;
   profileAccountCache?(): Awaitable<Map<string, CachedProfileAccount>>;
   updateProfileAccountCache?(
     profileId: string,
