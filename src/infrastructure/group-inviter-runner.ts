@@ -952,7 +952,9 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
 
       // Step 3: Check if already in group; if not, click Join group / 加入小组 and close any modal
       const joinBtnLoc = page
-        .getByRole('button', { name: /^(?:Join group|Join|加入小组|加入社團|加入)$/i })
+        .getByRole('button', {
+          name: /^(?:Join group|Join|加入小组|加入小組|加入社團|加入社团|加入群组|加入群組|加入)$/i,
+        })
         .first();
       const inviteButton = async () => {
         const state = await readGroupInvitationState(page, guard);

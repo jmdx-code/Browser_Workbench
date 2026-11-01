@@ -1636,3 +1636,254 @@ it('WO58: GroupBumperBrowserAdapter joins group before time_sort navigation and 
   expect(preparedActions).toContain('setup_open_group');
   expect(recorded).toEqual([post]);
 });
+
+it('WO59: projectGroupBumper filters out sticky header join button with hidden/transparent ancestor and marks visible main Join group / 加入社團 button', () => {
+  const main = document.querySelector('main')!;
+  main.innerHTML = `
+    <div id="sticky-bar" style="opacity: 0; visibility: hidden;">
+      <div>
+        <div id="sticky-join" role="button" aria-label="加入社團">加入社團</div>
+      </div>
+    </div>
+    <div id="main-header">
+      <div id="main-join" role="button" aria-label="加入社團">加入社團</div>
+    </div>
+  `;
+  [main, ...main.querySelectorAll('*')].forEach(box);
+  const stickyJoin = main.querySelector<HTMLElement>('#sticky-join')!;
+  const mainJoin = main.querySelector<HTMLElement>('#main-join')!;
+  stickyJoin.getBoundingClientRect = () => ({
+    x: 0,
+    y: 112.5,
+    left: 0,
+    top: 112.5,
+    right: 104,
+    bottom: 148.5,
+    width: 104,
+    height: 36,
+    toJSON: () => ({}),
+  });
+  mainJoin.getBoundingClientRect = () => ({
+    x: 0,
+    y: 362,
+    left: 0,
+    top: 362,
+    right: 104,
+    bottom: 398,
+    width: 104,
+    height: 36,
+    toJSON: () => ({}),
+  });
+
+  const surface = projectGroupBumper({ groupId: group });
+  expect(surface.joinGroupCSS).toBe('[data-wb-bumper-join="1"]');
+  expect(stickyJoin.getAttribute('data-wb-bumper-join')).toBeNull();
+  expect(mainJoin.getAttribute('data-wb-bumper-join')).toBe('1');
+
+  // Also verify English aria-label="Join group" is matched
+  main.innerHTML = `
+    <div id="en-header">
+      <div id="en-join" role="button" aria-label="Join group">Join group</div>
+    </div>
+  `;
+  [main, ...main.querySelectorAll('*')].forEach(box);
+  const enSurface = projectGroupBumper({ groupId: group });
+  expect(enSurface.joinGroupCSS).toBe('[data-wb-bumper-join="1"]');
+  expect(main.querySelector('#en-join')?.getAttribute('data-wb-bumper-join')).toBe('1');
+});
+
+it('WO59: GroupBumperBrowserAdapter joins group after waitForFeed when SPA entry initially had joinGroupCSS=null, and re-navigates to CHRONOLOGICAL in time_sort mode', async () => {
+  vi.useFakeTimers();
+  let current = '';
+  let joined = false;
+  let groupReads = 0;
+  const actionOrder: string[] = [];
+  const liked = new Set<string>();
+  let mutations = 0;
+
+  const page = {
+    url: () => current,
+    viewportSize: () => ({ width: 1280, height: 800 }),
+    goto: async (url: string) => {
+      current = url;
+      if (url.includes('sorting_setting=CHRONOLOGICAL')) {
+        actionOrder.push('navigate:time_sort');
+      }
+      return null;
+    },
+    waitForURL: async () => {},
+    on: () => {},
+    off: () => {},
+    mouse: {
+      wheel: async () => {},
+      move: async () => {},
+    },
+    evaluate: async (fn: Function, input?: { groupId?: string; targetPostId?: string }) => {
+      if (!input) return 'test-document';
+      if (fn.name === 'projectGroupInvitationState')
+        return {
+          accountId: '10000000001',
+          ready: true,
+          visible: true,
+          verificationRequired: false,
+        };
+      if (!current.includes('/search')) groupReads++;
+      // Simulate SPA transition: 1st read on group page has joinGroupCSS=null; subsequent reads in waitForFeed have joinGroupCSS present until joined
+      const showJoin = !joined && !current.includes('/search') && groupReads >= 2;
+      return {
+        url: current,
+        groupIds: [group],
+        avatarUrl: null,
+        pageAvatarUrl: null,
+        ready: true,
+        visible: true,
+        restricted: false,
+        loading: false,
+        groupEntryCSS: null,
+        joinGroupCSS: showJoin ? '[data-wb-bumper-join="1"]' : null,
+        welcomeDismissCSS: null,
+        posts: [
+          {
+            postId: post,
+            postUrl: `https://www.facebook.com/groups/${group}/posts/${post}/`,
+            authorId: author,
+            authorName: 'TargetPage',
+            authorAliases: [],
+            authorAvatarUrl: null,
+            pinned: false,
+            ageHours: 1,
+            timeText: '1h',
+            feedbackId: 'fb-' + post,
+            liked: liked.has(post),
+            postCSS: `[data-wb-bumper-post="${post}"]`,
+            likeCSS: `[data-wb-bumper-like="${post}"]`,
+            commentCSS: null,
+            commentButtonCSS: null,
+            hasVideo: false,
+            comments: [],
+          },
+        ],
+      };
+    },
+    locator: (selector: string) => ({
+      first() {
+        return this;
+      },
+      evaluate: async () => {},
+      click: async () => {
+        mutations++;
+        if (selector === '[data-wb-bumper-join="1"]') {
+          joined = true;
+          actionOrder.push('click:join');
+          return;
+        }
+        if (selector === `[data-wb-bumper-like="${post}"]`) {
+          liked.add(post);
+          actionOrder.push('click:like');
+        }
+      },
+    }),
+  };
+
+  const proof = {
+    ownershipId: '00000000-0000-4000-8000-000000000001',
+    profileId: 'p',
+    browserSessionEpoch: 'session',
+    tabId: 1,
+    targetId: 't',
+  };
+  const connection = {
+    stopRequestId: '00000000-0000-4000-8000-000000000055',
+    revokeInput: () => {},
+    browser: { contexts: () => [{ pages: () => [page] }] },
+    context: async () => ({ accountId: '10000000001' }),
+    execute: async (binding: unknown, work: () => Promise<unknown>) => ({
+      binding,
+      value: await work(),
+    }),
+    reconcile: async () => {},
+    get nativeMutationCalls() {
+      return { input: mutations };
+    },
+    close: async () => {},
+    retryClose: async () => {},
+  };
+  const peer = { online: true, synced: true, epoch: 'epoch', profileId: 'p', capabilities: [] };
+  const kernel = {
+    withSummary: async (_p: unknown, run: (port: unknown) => unknown) =>
+      run({
+        inventory: async () => ({
+          tabs: [{ state: 'READY', proof }],
+          workspaceMain: proof,
+          operations: [],
+        }),
+      }),
+    inspectIdleFacebookPage: async () => ({ actor: { accountId: '10000000001' }, proof }),
+    connectFacebook: async () => connection,
+  };
+  const recorded: string[] = [];
+  const repo = {
+    getOperation: async () => null,
+    listOperationsByProfile: async () => [],
+    prepareOperation: async (input: unknown) => input,
+    setOperationResolution: async (_id: string, r: unknown) => r,
+    markOperationSettled: async () => {},
+    markOperationReview: async () => {},
+    confirmSubmission: async (_id: string, row: never, _comment: unknown, resolution: unknown) => {
+      await repo.record(row);
+      return resolution;
+    },
+    eligibility: async () => ({ today: 0, allowed: true }),
+    pickComment: async () => null,
+    record: async (row: { postId: string }) => {
+      recorded.push(row.postId);
+      return true;
+    },
+    updateAvatar: async () => {},
+  };
+  const adapter = new GroupBumperBrowserAdapter(
+    repo as unknown as ConstructorParameters<typeof GroupBumperBrowserAdapter>[0],
+    () =>
+      kernel as unknown as ReturnType<ConstructorParameters<typeof GroupBumperBrowserAdapter>[1]>,
+    () =>
+      ({ peers: new Map([['p', peer]]) }) as unknown as ReturnType<
+        ConstructorParameters<typeof GroupBumperBrowserAdapter>[2]
+      >,
+    async () => false,
+    0,
+  );
+  const mkTarget = (id: string) => ({
+    id,
+    name: 'target',
+    avatarUrl: null,
+    folderId: null,
+    sortOrder: 0,
+    totalBumpedCount: 0,
+    createdAt: 0,
+    updatedAt: 0,
+  });
+
+  const work = adapter.run(
+    'p',
+    [mkTarget(group)],
+    [mkTarget(author)],
+    {
+      ...BumperSettings.parse({}),
+      searchMode: 'time_sort',
+      likeProbability: 100,
+      commentProbability: 0,
+      maxPostsPerGroupPage: 1,
+    },
+    { cancelled: () => false, status: () => {}, added: () => {} },
+  );
+  await vi.runAllTimersAsync();
+  await work;
+
+  expect(actionOrder).toEqual([
+    'navigate:time_sort',
+    'click:join',
+    'navigate:time_sort',
+    'click:like',
+  ]);
+  expect(recorded).toEqual([post]);
+});

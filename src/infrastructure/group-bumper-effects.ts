@@ -110,6 +110,25 @@ export function projectGroupBumper(input: {
       s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
   };
+  const ancestorsVisible = (el: Element): boolean => {
+    const selfStyle = getComputedStyle(el);
+    if (!(Number.parseFloat(selfStyle.opacity || '1') > 0)) return false;
+    let cur: Element | null = el.parentElement;
+    for (
+      let depth = 0;
+      cur && cur !== document.body && depth < 12;
+      depth++, cur = cur.parentElement
+    ) {
+      const s = getComputedStyle(cur);
+      if (
+        s.display === 'none' ||
+        s.visibility === 'hidden' ||
+        Number.parseFloat(s.opacity || '1') === 0
+      )
+        return false;
+    }
+    return true;
+  };
   const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
     __wbReactRootNodesV1?: WeakMap<Element, RecordValue>;
   };
@@ -316,10 +335,11 @@ export function projectGroupBumper(input: {
     ).filter(
       (el) =>
         visible(el) &&
+        ancestorsVisible(el) &&
         el.getAttribute('aria-disabled') !== 'true' &&
         !el.closest('[role="feed"], [role="article"], [role="dialog"], [role="navigation"], nav'),
     );
-    const joinBtn = headerButtons.find((el) => {
+    const joinCandidates = headerButtons.filter((el) => {
       const raw = (el.getAttribute('aria-label') || el.textContent || '')
         .replace(/\s+/g, ' ')
         .trim();
@@ -329,13 +349,20 @@ export function projectGroupBumper(input: {
         )
       )
         return false;
-      if (/^(?:Join group|Join|加入小组|加入社團|加入)$/i.test(raw)) return true;
+      if (
+        /^(?:Join group|Join|加入小组|加入小組|加入社團|加入社团|加入群组|加入群組|加入)$/i.test(
+          raw,
+        )
+      )
+        return true;
       return chain(el, 16).some(
         (f) =>
           /GroupsCometJoinButton/i.test(f.name) &&
           !/JOINED|REQUESTED/i.test(String(f.props.joinState ?? f.props.viewerJoinState ?? '')),
       );
     });
+    const joinBtn =
+      joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
     if (joinBtn) {
       joinBtn.setAttribute('data-wb-bumper-join', '1');
       joinGroupCSS = '[data-wb-bumper-join="1"]';
@@ -708,7 +735,9 @@ export function projectGroupBumper(input: {
     if (like) {
       liked ||=
         like.getAttribute('aria-pressed') === 'true' ||
-        /^(?:Remove Like|取消赞|取消讚|已赞|已讚)/i.test(like.getAttribute('aria-label') ?? '');
+        /^(?:Remove Like|Liked|取消赞|取消讚|已赞|已讚)/i.test(
+          like.getAttribute('aria-label') ?? '',
+        );
       like.setAttribute('data-wb-bumper-like', postId);
     }
     comment?.setAttribute('data-wb-bumper-comment', postId);

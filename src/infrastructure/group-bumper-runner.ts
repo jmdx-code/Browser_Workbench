@@ -1764,7 +1764,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 const css = refreshed.joinGroupCSS ?? '[data-wb-bumper-join="1"]';
                 const btn = page.locator(css).first();
                 await centerBumperControl(btn, this.paceScale);
-                await btn.click({ timeout: 4000 });
+                await btn.click({ timeout: 4000 }).catch(async () => {
+                  await btn.evaluate((el: HTMLElement) => el.click());
+                });
                 return true;
               },
               async () => {
@@ -1839,7 +1841,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             if (observed.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
             return observed;
           };
-          const initialFeed = await waitForFeed();
+          let initialFeed = await waitForFeed();
+          if (await joinGroupIfNeeded(initialFeed)) {
+            if (settings.searchMode === 'time_sort') {
+              await navigate(
+                `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
+              );
+              initialFeed = await waitForFeed();
+            } else {
+              initialFeed = await readGroupBumper(page, { groupId: effectiveGroupId });
+            }
+          }
           if (initialFeed.groupTitle && (!group.name.trim() || group.name === group.id)) {
             await updateMetadata('groups', group.id, {
               name: initialFeed.groupTitle,
