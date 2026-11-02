@@ -1448,9 +1448,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     };
     await recoverBumperOperations(kernel, peer, this.repo, guard);
     const prepareAndConnect = async () => {
-      const prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard);
-      if (prepared.inventory.operations.some(kernelOperationPending))
-        throw Error('存在待核对操作，请先处理原记录');
+      const prepared = await prepareFacebookWorkspace(
+        kernel,
+        peer,
+        undefined,
+        guard,
+        undefined,
+        true,
+      );
+      if (prepared.inventory.operations.some(kernelOperationPending)) {
+        await recoverBumperOperations(kernel, peer, this.repo, guard);
+      }
       type BumperIdentity =
         | NonNullable<Awaited<ReturnType<typeof kernel.inspectIdleFacebookPage>>>
         | Awaited<ReturnType<typeof kernel.inspectFacebookIdentity>>;
@@ -1500,10 +1508,13 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       if (isBumperFatal(firstErr)) throw firstErr;
       const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
       if (
-        /BUMPER_PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE/i.test(
+        /BUMPER_PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE|KERNEL_PROFILE_NOT_IDLE|KERNEL_PEER_NOT_IDLE/i.test(
           msg,
         )
       ) {
+        if (!(await this.isBusy(profileId))) {
+          await recoverBumperOperations(kernel, peer, this.repo, guard).catch(() => {});
+        }
         await kernel.taskWindow?.(profileId).catch(() => {});
         await wait(Math.max(10, Math.round(1000 * this.paceScale)));
         guard();
@@ -1606,11 +1617,13 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       };
       const index = bumperSetupLabels.indexOf(label as (typeof bumperSetupLabels)[number]);
       const actionKind =
-        index >= 0
-          ? (bumperSetupKinds[index] ?? 'setup_navigate')
-          : label === '点赞'
-            ? 'submit_like'
-            : 'submit_comment';
+        label === '点赞'
+          ? 'submit_like'
+          : label === '发送评论'
+            ? 'submit_comment'
+            : index >= 0
+              ? (bumperSetupKinds[index] ?? 'setup_navigate')
+              : 'setup_navigate';
       await this.repo.prepareOperation({ binding, runId, actionKind, ...operationContext });
       try {
         return await executeBumperOperation({
@@ -2059,7 +2072,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               : [null];
           for (const feed of feeds) {
             let resolvedPageId = feed?.id;
-            let pageOwnerAuthorId: string | null = null;
             if (isPageBumperMode && feed) {
               operationContext = {
                 groupId: '-',
@@ -2166,15 +2178,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 continue;
               }
               initialFeed = pageFeed;
-              // 只有在当前时间线上确认了专页自身的数字作者 ID 后，才过滤他人访客贴
-              pageOwnerAuthorId =
-                pageFeed.posts.find(
-                  (p) =>
-                    /^\d+$/.test(p.authorId ?? '') &&
-                    (bumperAuthorMatch(p, feed) ||
-                      (!isPlaceholderTargetName(feed.name, feed.id) &&
-                        p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
-                )?.authorId ?? null;
               groupsEntered++;
               callbacks.status('正在扫描专页 · ' + feed.name);
             } else if (feed && !/^\d+$/.test(feed.id)) {
@@ -2270,14 +2273,25 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             ) {
               guard();
               await assertIdentity();
-              surface =
-                scroll === 0 && (!feed || isPageBumperMode) && !scanOnly
-                  ? initialFeed
-                  : await readGroupBumper(page, {
-                      groupId: effectiveGroupId,
-                      ...(feed ? { pageId: resolvedPageId } : {}),
-                      audit: scanOnly && scroll === 0,
-                    });
+              if (scroll === 0 && isPageBumperMode && !scanOnly) {
+                const refreshedSurface = await readGroupBumper(page, {
+                  groupId: effectiveGroupId,
+                  ...(feed ? { pageId: resolvedPageId } : {}),
+                }).catch(() => null);
+                surface =
+                  refreshedSurface && refreshedSurface.posts.length > 0
+                    ? refreshedSurface
+                    : initialFeed;
+              } else {
+                surface =
+                  scroll === 0 && !feed && !scanOnly
+                    ? initialFeed
+                    : await readGroupBumper(page, {
+                        groupId: effectiveGroupId,
+                        ...(feed ? { pageId: resolvedPageId } : {}),
+                        audit: scanOnly && scroll === 0,
+                      });
+              }
               if (scanOnly && scroll === 0)
                 devDiag.record({
                   category: 'GROUP_BUMPER',
@@ -2313,7 +2327,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 if (!isPageBumperMode && !post.authorId && !post.authorName.trim()) continue;
                 const target =
                   isPageBumperMode && feed
-                    ? isForeignPagePost(post, feed, pageOwnerAuthorId)
+                    ? post.authorId &&
+                      post.authorId === accountId &&
+                      accountId !== feed.id &&
+                      accountId !== resolvedPageId
                       ? undefined
                       : feed
                     : (feed ? [feed] : pages).find((p) =>
@@ -2341,6 +2358,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   )
                     oldPosts++;
                   else if (!post.pinned) oldPosts = 0;
+                  continue;
+                }
+                if (
+                  isPageBumperMode &&
+                  scroll === 0 &&
+                  surface.posts.indexOf(post) > 0 &&
+                  !post.likeCSS &&
+                  !post.commentButtonCSS &&
+                  !post.commentCSS &&
+                  !post.videoCSS
+                ) {
                   continue;
                 }
                 if (
@@ -2644,7 +2672,23 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     callbacks.status('只读扫描 · ' + post.postId);
                     continue;
                   }
-                  const hydratedPost = await checkPost();
+                  let hydratedPost = await checkPost();
+                  if (wantLike && !hydratedPost.liked && !hydratedPost.likeCSS) {
+                    const bottomAnchor =
+                      hydratedPost.commentButtonCSS ??
+                      hydratedPost.commentCSS ??
+                      hydratedPost.postCSS ??
+                      post.postCSS;
+                    if (bottomAnchor) {
+                      await page
+                        .locator(bottomAnchor)
+                        .first()
+                        .evaluate((el) => el.scrollIntoView({ block: 'end', inline: 'nearest' }))
+                        .catch(() => {});
+                      await paceWait(500);
+                      hydratedPost = await checkPost().catch(() => hydratedPost);
+                    }
+                  }
                   const doLike = wantLike && !hydratedPost.liked && !!hydratedPost.likeCSS;
                   if (doLike) {
                     const native = observeBumperGraphql(page, {

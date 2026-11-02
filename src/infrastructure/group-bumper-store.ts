@@ -392,8 +392,6 @@ export class SqliteGroupBumperRepository {
           throw Error('BUMPER_RESOLUTION_CONFLICT');
         return row.resolution;
       }
-      if (resolution.outcome === 'ENDED_UNKNOWN' && !row.actionKind.startsWith('setup_'))
-        throw Error('BUMPER_BUSINESS_DISPOSITION_REJECTED');
       this.db
         .prepare(
           "UPDATE group_bumper_operations SET resolution_id=?,resolution_outcome=?,evidence_digest=?,status='SETTLEMENT_PENDING',updated_at=? WHERE operation_id=?",

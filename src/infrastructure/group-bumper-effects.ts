@@ -578,16 +578,36 @@ export function projectGroupBumper(input: {
       return false;
     };
     const links = Array.from(article.querySelectorAll<HTMLAnchorElement>('a[href]'));
+    const linkId = (raw: unknown): string | null => {
+      if (typeof raw !== 'string') return null;
+      try {
+        const u = new URL(raw, location.href);
+        if (u.origin !== 'https://www.facebook.com') return null;
+        const m = /^\/groups\/([^/]+)\/(?:posts|permalink)\/(\d+)/.exec(u.pathname);
+        if (
+          m &&
+          !groupIds.has((m[1] ?? '').toLowerCase()) &&
+          m[1]?.toLowerCase() !== input.groupId.toLowerCase()
+        )
+          return null;
+        return (
+          m?.[2] ??
+          /^\/reel\/(\d+)/i.exec(u.pathname)?.[1] ??
+          u.searchParams.get('story_fbid') ??
+          /pcb\.(\d+)/.exec(u.href)?.[1] ??
+          /^\/(?!groups(?:\/|$))[^/]+\/(?:posts|videos|permalink)\/(\d+)/i.exec(u.pathname)?.[1] ??
+          (/^\/(?:watch|video\.php)\/?$/i.test(u.pathname) ? u.searchParams.get('v') : null) ??
+          (/^\/photo(?:\.php|\/)?$/i.test(u.pathname) ? u.searchParams.get('fbid') : null) ??
+          null
+        );
+      } catch {
+        return null;
+      }
+    };
     const storyPostId = text(primaryNative.post_id ?? primaryStory.post_id) || decodeId(storyKey);
     if (input.targetPostId && storyPostId && storyPostId !== input.targetPostId) continue;
     if (input.targetPostId && !storyPostId) {
-      const linked = links
-        .map(
-          (a) =>
-            /\/(?:posts|permalink|reel)\/(\d+)/.exec(a.href)?.[1] ??
-            new URL(a.href).searchParams.get('story_fbid'),
-        )
-        .filter(Boolean);
+      const linked = links.map((a) => linkId(a.href)).filter(Boolean);
       if (linked.length && !linked.includes(input.targetPostId)) continue;
     }
     const controls = Array.from(
@@ -616,38 +636,24 @@ export function projectGroupBumper(input: {
         ) || null,
       liked = false,
       pinned = false;
-    const linkId = (raw: unknown): string | null => {
-      if (typeof raw !== 'string') return null;
-      try {
-        const u = new URL(raw, location.href);
-        if (u.origin !== 'https://www.facebook.com') return null;
-        const m = /^\/groups\/([^/]+)\/(?:posts|permalink)\/(\d+)/.exec(u.pathname);
-        if (
-          m &&
-          !groupIds.has((m[1] ?? '').toLowerCase()) &&
-          m[1]?.toLowerCase() !== input.groupId.toLowerCase()
-        )
-          return null;
-        return (
-          m?.[2] ??
-          /^\/reel\/(\d+)/i.exec(u.pathname)?.[1] ??
-          u.searchParams.get('story_fbid') ??
-          /pcb\.(\d+)/.exec(u.href)?.[1] ??
-          null
-        );
-      } catch {
-        return null;
-      }
-    };
     const keepTime = (value: unknown) => {
       const v = label(value).trim();
       if (v && age(v) !== null && !timeText) timeText = v;
     };
+    let fallbackPhotoId: string | null = null;
     for (const link of links.filter(belongsToStory)) {
-      postId ??= linkId(link.href);
+      const candidateId = linkId(link.href);
+      if (candidateId) {
+        if (/\/photo(?:\.php|\/|\?)/i.test(link.href) && !/pcb\.\d+/.test(link.href)) {
+          fallbackPhotoId ??= candidateId;
+        } else {
+          postId ??= candidateId;
+        }
+      }
       keepTime(link.getAttribute('aria-label'));
       keepTime(link.textContent);
     }
+    postId ??= fallbackPhotoId;
     const timeSeen = new Set<unknown>();
     let timeBudget = 0;
     const findTime = (value: unknown, depth = 0) => {

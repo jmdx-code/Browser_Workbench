@@ -9,6 +9,7 @@ import type { SqliteGroupBumperRepository } from './group-bumper-store.js';
 
 export const bumperSetupLabels = [
   '打开小组页面',
+  '打开搜索结果',
   '打开搜索到的小组',
   '加入小组',
   '关闭入组欢迎弹窗',
@@ -19,6 +20,7 @@ export const bumperSetupLabels = [
   '浏览小组帖子',
 ] as const;
 export const bumperSetupKinds = [
+  'setup_navigate',
   'setup_navigate',
   'setup_open_group',
   'setup_open_group',
@@ -50,16 +52,6 @@ export async function recoverBumperOperations(
   for (const op of inventory.operations) {
     await guard();
     let row = known.get(op.binding.operationId);
-    if (
-      row ||
-      (kernelOperationPending(op) &&
-        ['点赞', '发送评论'].some(
-          (label) =>
-            op.binding.actionDigest ===
-            bumperDigest({ purpose: 'group-bumper', label, accountId: op.binding.accountId }),
-        ))
-    )
-      protectedIds.add(op.binding.operationId);
     if (!row && kernelOperationPending(op) && ['ACKNOWLEDGED', 'UNKNOWN'].includes(op.state)) {
       const index = bumperSetupLabels.findIndex(
         (label) =>
@@ -96,11 +88,7 @@ export async function recoverBumperOperations(
     }
     if (!kernelOperationPending(op)) continue;
     let resolution = row.resolution;
-    if (
-      !resolution &&
-      row.actionKind.startsWith('setup_') &&
-      ['ACKNOWLEDGED', 'UNKNOWN'].includes(op.state)
-    )
+    if (!resolution && ['ACKNOWLEDGED', 'UNKNOWN'].includes(op.state))
       resolution = await repo.setOperationResolution(op.binding.operationId, {
         id: randomUUID(),
         outcome: 'ENDED_UNKNOWN',
@@ -110,7 +98,6 @@ export async function recoverBumperOperations(
         }),
       });
     if (!resolution) continue;
-    if (resolution.outcome === 'ENDED_UNKNOWN' && !row.actionKind.startsWith('setup_')) continue;
     const savedResolution = resolution;
     await kernel.withSummary(peer, async (port) => {
       try {

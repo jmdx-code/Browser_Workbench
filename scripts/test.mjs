@@ -15,5 +15,6 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/group-bumper-hardening.test.ts',
   'tests/wo60b-bumper-fixes.test.ts',
   'tests/wo61-video-and-concurrency.test.ts',
+  'tests/wo62-page-bumper-and-recovery.test.ts',
   'tests/finder-list-ui.test.tsx',
 ]);
