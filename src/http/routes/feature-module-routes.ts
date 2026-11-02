@@ -106,14 +106,27 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
           ? await groupBumper.startScanOnly(input)
           : action === 'start'
             ? await groupBumper.start(input)
-            : action === 'stop'
-              ? await groupBumper.stop(
-                  z
-                    .object({ profileIds: z.array(z.string().uuid()).min(1).max(500).optional() })
-                    .strict()
-                    .parse(input).profileIds,
-                )
-              : await groupBumper.manage(action, input),
+            : action === 'start-page'
+              ? await groupBumper.startPageBumper(input)
+              : action === 'stop' || action === 'stop-page'
+                ? await (() => {
+                    const { profileIds } = z
+                      .object({
+                        profileIds: z.array(z.string().uuid()).min(1).max(500).optional(),
+                      })
+                      .strict()
+                      .parse(input);
+                    // 指定浏览器时按 ID 精确停止；「停止全部」只停对应模块（小组/专页）的浏览器
+                    return groupBumper.stop(
+                      profileIds,
+                      action === 'stop-page'
+                        ? 'page-bumper'
+                        : profileIds
+                          ? undefined
+                          : 'group-bumper',
+                    );
+                  })()
+                : await groupBumper.manage(action, input),
       );
       return true;
     }

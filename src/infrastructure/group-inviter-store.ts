@@ -1,6 +1,6 @@
 import { ensureTargetColumns } from './target-list-store.js';
-import { mergedAvatar } from './group-bumper-store.js';
-import { isLocalAvatar } from '../shared/group-bumper.js';
+import { mergedAvatar, syncSharedGroupTables } from './group-bumper-store.js';
+import { isLocalAvatar, isPlaceholderTargetName } from '../shared/group-bumper.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { transaction } from './sqlite-transaction.js';
@@ -35,6 +35,7 @@ export function ensureGroupInviterSchema(db: DatabaseSync): void {
   );
   ensureTargetColumns(db, 'group_inviter_groups');
   syncLocalAvatarsFromBumper(db);
+  syncSharedGroupTables(db);
 }
 
 export function syncLocalAvatarsFromBumper(db: DatabaseSync): void {
@@ -137,6 +138,7 @@ export class SqliteGroupInviterRepository {
         const effectiveName = item.groupName.trim() || item.groupId;
         stmt.run(item.groupId, effectiveName, now, now, item.folderId ?? null);
       }
+      syncSharedGroupTables(this.db);
       return this.listGroups();
     });
   }
@@ -156,11 +158,35 @@ export class SqliteGroupInviterRepository {
         ? metadata.groupName.trim()
         : curName || groupId;
     const nextAvatar = mergedAvatar(curAvatar, metadata.avatarUrl);
+    const now = Date.now();
     this.db
       .prepare(
         'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
       )
-      .run(nextName, nextAvatar, Date.now(), groupId);
+      .run(nextName, nextAvatar, now, groupId);
+    if (!isPlaceholderTargetName(nextName, groupId)) {
+      const hasBumper = Boolean(
+        this.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
+          .get(),
+      );
+      if (hasBumper) {
+        // 名称与头像一并写给顶贴侧（同一时间戳下统一不会把新头像反向覆盖成旧值）
+        const bumperRow = this.db
+          .prepare('SELECT avatar_url FROM group_bumper_groups WHERE group_id=?')
+          .get(groupId) as { avatar_url?: string | null } | undefined;
+        const bumperAvatar = mergedAvatar(
+          bumperRow?.avatar_url == null ? null : String(bumperRow.avatar_url),
+          nextAvatar,
+        );
+        this.db
+          .prepare(
+            'UPDATE group_bumper_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
+          )
+          .run(nextName, bumperAvatar, now, groupId);
+      }
+    }
+    syncSharedGroupTables(this.db);
   }
 
   updateGroupAvatar(groupId: string, avatarUrl: string): void {
@@ -176,16 +202,26 @@ export class SqliteGroupInviterRepository {
     this.db
       .prepare('UPDATE group_inviter_groups SET avatar_url=?, updated_at=? WHERE group_id=?')
       .run(nextAvatar, Date.now(), groupId);
+    syncSharedGroupTables(this.db);
   }
 
   deleteGroups(input: unknown): number {
     const parsed = DeleteInviterGroupsRequest.parse(input);
     return transaction(this.db, () => {
       const stmt = this.db.prepare('DELETE FROM group_inviter_groups WHERE group_id=?');
+      const hasBumper = Boolean(
+        this.db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
+          .get(),
+      );
+      const delBumper = hasBumper
+        ? this.db.prepare('DELETE FROM group_bumper_groups WHERE group_id=?')
+        : null;
       let deleted = 0;
       for (const id of new Set(parsed.groupIds)) {
         const res = stmt.run(id);
         deleted += Number(res.changes ?? 0);
+        delBumper?.run(id);
       }
       return deleted;
     });

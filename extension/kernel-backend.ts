@@ -230,9 +230,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           });
           guard();
           const result = KernelJsonObject.parse(value ?? {});
+          const resultValue = result.result;
           const visibility =
-            result.result && typeof result.result === 'object' && !Array.isArray(result.result)
-              ? result.result.value
+            resultValue && typeof resultValue === 'object' && !Array.isArray(resultValue)
+              ? (resultValue as Record<string, unknown>).value
               : undefined;
           if (visibility !== 'hidden' && visibility !== 'visible')
             throw Error('TASK_PRESENTATION_VISIBILITY_UNAVAILABLE');
@@ -496,7 +497,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     // A new native target may temporarily report its initial blank document
     // during navigation. It still grants no command scope. Only the software's
     // fixed initial-document reader may wait on this explicit pending result.
-    if (this.access === 'facebook-task' && ['about:blank', ''].includes(target.url))
+    if (
+      (this.access === 'facebook-task' || this.access === 'facebook-readonly') &&
+      ['about:blank', ''].includes(target.url)
+    )
       throw Error('KERNEL_INITIAL_DOCUMENT_PENDING');
     if (!kernelAccessURL(target.url, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
   }

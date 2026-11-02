@@ -15,13 +15,7 @@ import {
 } from '../shared/group-bumper.js';
 
 const blank = (): DraftGroupEntry => ({ key: crypto.randomUUID(), groupId: '', groupName: '' });
-export function GroupBumperPage({
-  state,
-  selected,
-  profiles,
-  onState,
-  onMessage,
-}: {
+type BumperPageProps = {
   state: BumperState | null;
   selected: ReadonlySet<string>;
   profiles?: ReadonlyArray<{
@@ -32,7 +26,32 @@ export function GroupBumperPage({
   }>;
   onState: (s: BumperState) => void;
   onMessage: (s: string) => void;
-}) {
+  mode?: 'group-bumper' | 'page-bumper';
+};
+/** 专页顶贴：复用顶贴页面与执行器，直接进入专页主页按时间线顶贴。 */
+export function PageBumperPage(props: Omit<BumperPageProps, 'mode'>) {
+  return <GroupBumperPage {...props} mode="page-bumper" />;
+}
+export function GroupBumperPage({
+  state,
+  selected,
+  profiles,
+  onState,
+  onMessage,
+  mode = 'group-bumper',
+}: BumperPageProps) {
+  const pageMode = mode === 'page-bumper';
+  const isRunning = pageMode ? !!state?.pageBumperRunning : !!state?.running;
+  const statusText = pageMode ? state?.pageBumperStatusText : state?.statusText;
+  const runningIds = new Set(
+    [
+      ...Object.entries(state?.profileCounts ?? {}),
+      ...Object.entries(state?.pageBumperProfileCounts ?? {}),
+    ]
+      .filter(([, stat]) => stat.running)
+      .map(([id]) => id),
+  );
+  const idleSelected = [...selected].filter((id) => !runningIds.has(id));
   const [chosenGroups, setGroups] = useState<Set<string>>(new Set()),
     [chosenPages, setPages] = useState<Set<string>>(new Set());
   const [folders, setFolders] = useState<{ groups: TargetFolder[]; pages: TargetFolder[] }>({
@@ -112,6 +131,8 @@ export function GroupBumperPage({
     key:
       | 'maxPostAgeHours'
       | 'maxPostsPerGroupPage'
+      | 'maxPostsPerPage'
+      | 'maxConcurrentProfiles'
       | 'dailyMaxLikesPerAccount'
       | 'maxLikesPerPost'
       | 'likeProbability'
@@ -122,25 +143,28 @@ export function GroupBumperPage({
     const min = key.includes('Probability') ? 0 : 1;
     const max = key.includes('Probability')
       ? 100
-      : key === 'maxPostsPerGroupPage'
+      : key === 'maxPostsPerGroupPage' ||
+          key === 'maxPostsPerPage' ||
+          key === 'maxConcurrentProfiles'
         ? 50
         : key === 'maxPostAgeHours'
           ? 720
           : 500;
+    const value = settings[key] ?? (key === 'maxPostsPerPage' ? 3 : 8);
     return (
       <label key={key} className="bumper-policy-field">
         <span>{label}</span>
         <input
           type="number"
           aria-label={key}
-          value={Number.isFinite(settings[key]) ? settings[key] : ''}
+          value={Number.isFinite(value) ? value : ''}
           min={min}
           max={max}
           onChange={(e) => update(key, e.target.value === '' ? Number.NaN : Number(e.target.value))}
           onBlur={(e) => {
             const fromDom =
               e.currentTarget.value === '' ? Number.NaN : Number(e.currentTarget.value);
-            const raw = Number.isFinite(fromDom) ? fromDom : settings[key];
+            const raw = Number.isFinite(fromDom) ? fromDom : value;
             const fallback = state?.settings[key] ?? min;
             const normalized = Number.isFinite(raw)
               ? Math.min(max, Math.max(min, Math.round(raw)))
@@ -165,7 +189,7 @@ export function GroupBumperPage({
         items={items.map((i) => ({ ...i, count: i.totalBumpedCount }))}
         selected={chosen}
         onSelect={set}
-        disabled={busy || !!state?.running}
+        disabled={busy}
         onFolders={(next) => setFolders((prev) => ({ ...prev, [kind]: next }))}
         onDelete={async (ids) => {
           if (!(await action(kind + '/delete', { ids }))) throw Error('删除未完成');
@@ -180,7 +204,7 @@ export function GroupBumperPage({
             </button>
             <button
               className="btn btn-sm"
-              disabled={busy || !!state?.running}
+              disabled={busy || !!state?.running || !!state?.pageBumperRunning}
               onClick={() =>
                 void action(kind + '/refresh', chosen.size ? { ids: [...chosen] } : {})
               }
@@ -205,17 +229,34 @@ export function GroupBumperPage({
   }
 
   const showStatusBadge = Boolean(
-    state?.running ||
-    (state?.statusText &&
-      !['请选择账号、小组和目标主页', '本轮已结束', '正在读取…'].includes(state.statusText)),
+    isRunning ||
+    (statusText &&
+      !['请选择账号、小组和目标主页', '请选择账号和目标专页', '本轮已结束', '正在读取…'].includes(
+        statusText,
+      )),
   );
+  const startDisabled =
+    busy || !idleSelected.length || (!pageMode && !selectedGroups.length) || !selectedPages.length;
+  const startRun = () =>
+    void action(
+      pageMode ? 'start-page' : 'start',
+      pageMode
+        ? { profileIds: idleSelected, pageIds: selectedPages }
+        : { profileIds: idleSelected, groupIds: selectedGroups, pageIds: selectedPages },
+    );
 
   return (
     <section className="records-page bumper-page">
       <div className="bumper-sticky-header">
         <div className="bumper-heading">
           <div className="bumper-primary-controls">
-            {settings && (
+            {settings && pageMode && (
+              <div className="bumper-search-highlight bumper-policy">
+                {renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')}
+                {renderSettingInput('maxConcurrentProfiles', '最大并发浏览器数')}
+              </div>
+            )}
+            {settings && !pageMode && (
               <div className="bumper-search-highlight bumper-policy">
                 <label className="bumper-policy-field">
                   <span>查找方式</span>
@@ -253,12 +294,9 @@ export function GroupBumperPage({
                 ⚠️ 留言列表为空仅点赞
               </span>
             )}
-            {showStatusBadge && state?.statusText && (
-              <span
-                className={'bumper-status' + (state?.running ? ' is-running' : '')}
-                role="status"
-              >
-                {state.statusText}
+            {showStatusBadge && statusText && (
+              <span className={'bumper-status' + (isRunning ? ' is-running' : '')} role="status">
+                {statusText}
               </span>
             )}
             <button className="btn btn-sm" onClick={() => void open('comments')}>
@@ -282,37 +320,41 @@ export function GroupBumperPage({
                       {renderSettingInput('commentProbability', '留言概率 %')}
                     </div>
                     <div className="bumper-advanced-group">
-                      {renderSettingInput('maxPostsPerGroupPage', '每组每主页最多扫帖')}
+                      {pageMode
+                        ? renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')
+                        : renderSettingInput('maxPostsPerGroupPage', '每组每主页最多扫帖')}
+                      {renderSettingInput('maxConcurrentProfiles', '最大并发浏览器数')}
                     </div>
                   </div>
                 )}
               </PopoverMenu>
             )}
-            {state?.running ? (
-              <button className="btn btn-danger" onClick={() => void action('stop')}>
-                ■ 停止运行
-              </button>
+            {isRunning ? (
+              <>
+                {idleSelected.length > 0 && (
+                  <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
+                    ▶ 追加运行已选闲置号 ({idleSelected.length}号)
+                  </button>
+                )}
+                <button
+                  className="btn btn-danger"
+                  onClick={() => void action(pageMode ? 'stop-page' : 'stop')}
+                >
+                  ■ 停止全部运行
+                </button>
+              </>
             ) : (
-              <button
-                className="btn btn-primary"
-                disabled={busy || !selected.size || !selectedGroups.length || !selectedPages.length}
-                onClick={() =>
-                  void action('start', {
-                    profileIds: [...selected],
-                    groupIds: selectedGroups,
-                    pageIds: selectedPages,
-                  })
-                }
-              >
-                ▶ 开始运行 (已选{selected.size}号 × {selectedGroups.length}组 ×{' '}
-                {selectedPages.length}主页)
+              <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
+                {pageMode
+                  ? `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedPages.length}专页)`
+                  : `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`}
               </button>
             )}
           </div>
         </div>
       </div>
-      <div className="bumper-columns">
-        {targets('groups', state?.groups ?? [])}
+      <div className={'bumper-columns' + (pageMode ? ' is-single' : '')}>
+        {!pageMode && targets('groups', state?.groups ?? [])}
         {targets('pages', state?.pages ?? [])}
       </div>
       {modal && (
@@ -346,12 +388,7 @@ export function GroupBumperPage({
                       ? '留言列表'
                       : '顶贴记录'}
               </h2>
-              <button
-                className="btn"
-                aria-label="关闭弹窗"
-                disabled={busy}
-                onClick={() => setModal(null)}
-              >
+              <button className="btn" aria-label="关闭弹窗" onClick={() => setModal(null)}>
                 ×
               </button>
             </div>
@@ -406,7 +443,7 @@ export function GroupBumperPage({
                       });
                     }}
                   >
-                    保存
+                    {busy ? '正在保存…' : '保存'}
                   </button>
                 </div>
               </>

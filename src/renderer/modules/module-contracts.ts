@@ -2,7 +2,8 @@ import type { z } from 'zod';
 import type { Step } from '../../shared/contracts.js';
 import type { Progress, TaskCommand, TaskStepBudget } from '../../shared/task-contracts.js';
 
-export type FeatureModuleId = 'active-accounts' | 'group-inviter' | 'group-bumper' | 'records';
+export type FeatureModuleId =
+  'active-accounts' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'records';
 
 export type StepBudget = z.infer<typeof TaskStepBudget>;
 
@@ -28,7 +29,7 @@ export interface FeatureNavItem {
   id: FeatureModuleId;
   group: 'automation' | 'monitor';
   title: string;
-  icon: 'active-accounts' | 'group-inviter' | 'group-bumper' | 'records';
+  icon: FeatureModuleId;
   runningCount?: number | undefined;
   badgeCount?: number | undefined;
   badgeTone?: 'run' | 'warn' | 'err' | 'ok' | undefined;

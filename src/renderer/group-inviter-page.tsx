@@ -31,6 +31,7 @@ export function GroupDraftGrid({
   const [undo, setUndo] = useState<DraftGroupEntry[][]>([]);
   const [editing, setEditing] = useState<GridEdit | null>(null);
   const editingRef = useRef<GridEdit | null>(null),
+    editStartRef = useRef<DraftGroupEntry[] | null>(null),
     dragging = useRef<'cells' | 'rows' | null>(null);
   const bounds = {
     minRow: Math.min(range.r1, range.r2),
@@ -65,7 +66,11 @@ export function GroupDraftGrid({
         : row,
     );
     if (advance && current.r === next.length - 1) next = [...next, makeDraftRow()];
-    editRows(next);
+    const startRows = editStartRef.current;
+    editStartRef.current = null;
+    if (startRows && JSON.stringify(startRows) !== JSON.stringify(next))
+      setUndo((prev) => [...prev, startRows].slice(-10));
+    editRows(next, false);
     if (advance) select({ r1: current.r + 1, c1: current.c, r2: current.r + 1, c2: current.c });
   }
   function startEdit(r: number, c: GridColumn, value?: string) {
@@ -75,6 +80,7 @@ export function GroupDraftGrid({
     if (!row) return;
     select({ r1: r, c1: c, r2: r, c2: c });
     const next = { r, c, value: value ?? (c === 0 ? row.groupId : row.groupName) };
+    editStartRef.current = rowsRef.current.map((item) => ({ ...item }));
     editingRef.current = next;
     setEditing(next);
   }
@@ -386,6 +392,18 @@ export function GroupDraftGrid({
                             const next = { r, c, value: event.target.value };
                             editingRef.current = next;
                             setEditing(next);
+                            // 立即同步到父级：未失焦直接点「保存」也不会丢失当前单元格输入
+                            const updatedRows = rowsRef.current.map((row, index) =>
+                              index === r
+                                ? {
+                                    ...row,
+                                    [c === 0 ? 'groupId' : 'groupName']:
+                                      c === 0 ? normalizeId(next.value) : next.value,
+                                  }
+                                : row,
+                            );
+                            rowsRef.current = updatedRows;
+                            onChange(updatedRows);
                           }}
                           onBlur={() => finishEdit()}
                           onPaste={(event) => {
@@ -406,6 +424,9 @@ export function GroupDraftGrid({
                               event.preventDefault();
                               editingRef.current = null;
                               setEditing(null);
+                              const startRows = editStartRef.current;
+                              editStartRef.current = null;
+                              if (startRows) editRows(startRows, false);
                               focusGrid();
                             }
                           }}

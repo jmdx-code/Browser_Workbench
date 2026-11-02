@@ -24,7 +24,11 @@ export async function sampleFacebookPage(
       await port.assertCurrent();
       // getTargets may expose the requested URL before the initial document has committed.
       // Extension checks each native scope and refuses out-of-scope document results.
-      if (!(error instanceof Error) || error.message !== 'KERNEL_SCOPE_CHANGED' || attempt === 15)
+      if (
+        !(error instanceof Error) ||
+        !['KERNEL_SCOPE_CHANGED', 'KERNEL_INITIAL_DOCUMENT_PENDING'].includes(error.message) ||
+        attempt === 15
+      )
         throw error;
     }
     await port.wait();

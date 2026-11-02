@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { api } from './api.js';
 import { NameDialog } from './name-dialog.js';
 import { PopoverMenu, type MenuItem } from './popover-menu.js';
@@ -88,10 +88,25 @@ export function FinderTargetList({
   const anchor = useRef<string | null>(null),
     drag = useRef<string[]>([]),
     paint = useRef<boolean | null>(null),
+    textSelectRef = useRef(false),
     pointerHandledRef = useRef<string | null>(null),
     selectionRef = useRef(selected);
   selectionRef.current = selected;
   const unavailable = disabled || working;
+  const disableRowDragForTextSelect = (e: MouseEvent<HTMLElement>) => {
+    textSelectRef.current = true;
+    e.stopPropagation();
+    const row = e.currentTarget.closest<HTMLElement>('.finder-row');
+    if (!row || !row.draggable) return;
+    row.draggable = false;
+    const restore = () => {
+      row.draggable = !unavailable;
+      window.removeEventListener('mouseup', restore, true);
+      window.removeEventListener('dragend', restore, true);
+    };
+    window.addEventListener('mouseup', restore, true);
+    window.addEventListener('dragend', restore, true);
+  };
   async function loadFolders() {
     const next = await api.targetFolders(listKind);
     setFolders(next);
@@ -103,14 +118,17 @@ export function FinderTargetList({
   useEffect(() => {
     const stop = () => {
       paint.current = null;
+      textSelectRef.current = false;
       setTimeout(() => {
         pointerHandledRef.current = null;
       }, 0);
     };
     window.addEventListener('pointerup', stop);
+    window.addEventListener('mouseup', stop);
     window.addEventListener('blur', stop);
     return () => {
       window.removeEventListener('pointerup', stop);
+      window.removeEventListener('mouseup', stop);
       window.removeEventListener('blur', stop);
     };
   }, []);
@@ -405,10 +423,16 @@ export function FinderTargetList({
                           : '')
                     }
                     onClick={(e) => {
+                      const selection = window.getSelection()?.toString().trim() ?? '';
+                      if (selection.length > 0) return;
                       if (!unavailable) choose(item.id, e.shiftKey);
                     }}
                     onDragStart={(e) => {
-                      if (paint.current !== null) {
+                      if (
+                        paint.current !== null ||
+                        textSelectRef.current ||
+                        (window.getSelection()?.toString().trim().length ?? 0) > 0
+                      ) {
                         e.preventDefault();
                         return;
                       }
@@ -499,9 +523,11 @@ export function FinderTargetList({
                     </span>
                     <span className="finder-name">
                       <FinderAvatar item={item} />
-                      <strong>{item.name}</strong>
+                      <strong className="finder-row-name" onMouseDown={disableRowDragForTextSelect}>
+                        {item.name}
+                      </strong>
                     </span>
-                    <code>{item.id}</code>
+                    <code onMouseDown={disableRowDragForTextSelect}>{item.id}</code>
                     <span className="pill pill-ok">{item.count}</span>
                     <button
                       className="finder-delete"

@@ -3,7 +3,10 @@ import type { PageProjection, PageProjectionRequest } from './page-read.js';
 import type { NativeFacebookIdentityRead } from './facebook-native-identity.js';
 
 // Private SDK transport contract. It is deliberately absent from public HTTP/UI contracts.
-export const KernelJsonObject = z.record(z.string(), z.json());
+export const KernelJsonObject = z.custom<Record<string, unknown>>(
+  (value): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value),
+);
 export type KernelJsonObject = z.infer<typeof KernelJsonObject>;
 export const KernelStamp = z
   .object({

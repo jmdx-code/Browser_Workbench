@@ -118,7 +118,8 @@ it('skeletons are loading rather than an empty finished feed, and searches can m
   expect(projectGroupBumper({ groupId: group }).loading).toBe(true);
   vi.stubGlobal('location', new URL('https://www.facebook.com/groups/search/groups/'));
   const link = document.createElement('a');
-  link.href = '/opaque';
+  // WO60-B：搜索入口只认 /groups/<id或别名>/ 形态的小组主页链接，再按 Fiber 小组 ID 匹配
+  link.href = 'https://www.facebook.com/groups/opaque-slug/';
   link.textContent = 'result';
   box(link);
   document.body.append(link);
@@ -1632,7 +1633,14 @@ it('WO58: GroupBumperBrowserAdapter joins group before time_sort navigation and 
   await vi.runAllTimersAsync();
   await work;
 
-  expect(actionOrder).toEqual(['click:join', 'navigate:time_sort', 'center:postCSS', 'click:like']);
+  // WO60：无搜索名时直接一步打开 CHRONOLOGICAL 小组页；加入小组后再重开时间排序页
+  expect(actionOrder).toEqual([
+    'navigate:time_sort',
+    'click:join',
+    'navigate:time_sort',
+    'center:postCSS',
+    'click:like',
+  ]);
   expect(preparedActions).toContain('setup_open_group');
   expect(recorded).toEqual([post]);
 });

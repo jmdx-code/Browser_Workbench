@@ -53,6 +53,24 @@ function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
           <path d="M12 8v6M9 11l3-3 3 3" />
         </svg>
       );
+    case 'page-bumper':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M5 21V4h11l-1.5 4L16 12H5" />
+          <path d="M12 20v-5M9.5 17.5 12 15l2.5 2.5" />
+        </svg>
+      );
     case 'records':
       return <IconCheckList size={16} />;
   }

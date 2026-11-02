@@ -90,7 +90,8 @@ test('schema 43 adds only bumper data, target CRUD and inviter import preserve e
     r.updateAvatar('pages', '20001', 'https://example.com/page.jpg');
     assert.equal(r.targets('pages')[0]?.avatarUrl, 'https://example.com/page.jpg');
     assert.equal(r.deleteTargets('pages', { ids: ['20001'] }), 1);
-    assert.equal(store.groupInviter.listGroups()[0]?.groupName, 'original');
+    // WO60-B：共用小组库两侧都是真实名称时，较新一侧的改名同步给另一侧
+    assert.equal(store.groupInviter.listGroups()[0]?.groupName, 'updated');
     const db = new DatabaseSync(file, { readOnly: true });
     assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, workspaceSchemaVersion);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
@@ -609,4 +610,226 @@ test('WO58: bumperSetupLabels maps 加入小组 to setup_open_group and extractB
       groupName: 'Test Group',
     });
     assert.equal(store.groupBumper.getOperation(opId)?.actionKind, 'setup_open_group');
+  }));
+
+test('WO60/WO61: settings expose maxPostsPerPage=3 and maxConcurrentProfiles=8 defaults', () => {
+  const settings = BumperSettings.parse({});
+  assert.equal(settings.maxPostsPerPage, 3);
+  assert.equal(settings.maxConcurrentProfiles, 8);
+});
+
+test('WO60: concurrency semaphore queues profiles above maxConcurrentProfiles', async () =>
+  fixture(async (store) => {
+    const r = store.groupBumper;
+    r.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    r.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    r.saveSettings({ ...r.settings(), maxConcurrentProfiles: 1 });
+    const ids = [randomUUID(), randomUUID()];
+    let concurrent = 0,
+      peak = 0;
+    const release: Array<() => void> = [];
+    const service = new GroupBumperService(
+      r,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        run: async (_id, _g, _p, _s, cb) => {
+          concurrent++;
+          peak = Math.max(peak, concurrent);
+          await new Promise<void>((res) => {
+            let done = false;
+            const finish = () => {
+              done = true;
+              res();
+            };
+            release.push(finish);
+            const tick = () => {
+              if (done) return;
+              if (cb.cancelled()) finish();
+              else setTimeout(tick, 5);
+            };
+            tick();
+          });
+          concurrent--;
+        },
+      },
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      undefined,
+      0,
+    );
+    await service.start({ profileIds: ids, groupIds: ['12345'], pageIds: ['20001'] });
+    for (let i = 0; i < 40 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
+    await new Promise((x) => setTimeout(x, 30));
+    const queued = (await service.state()).profileCounts;
+    assert.equal(peak, 1);
+    assert.equal(Object.values(queued).filter((s) => s.status === '排队等待并发槽位…').length, 1);
+    release.shift()?.();
+    for (let i = 0; i < 60 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
+    release.shift()?.();
+    for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
+      await new Promise((x) => setTimeout(x, 10));
+    assert.equal(peak, 1);
+    assert.equal(service.hasActiveExecution(), false);
+  }));
+
+test('WO60: append run starts only idle profiles and keeps running profiles untouched; page mode is tracked separately', async () =>
+  fixture(async (store) => {
+    const r = store.groupBumper;
+    r.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    r.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    const [a, b, c] = [randomUUID(), randomUUID(), randomUUID()];
+    const runs: Array<{ id: string; groupId: string; runId: string | undefined }> = [];
+    const service = new GroupBumperService(
+      r,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        run: async (id, g, _p, _s, cb) => {
+          runs.push({ id, groupId: g[0]!.id, runId: cb.runId });
+          while (!cb.cancelled()) await new Promise((x) => setTimeout(x, 5));
+        },
+      },
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      undefined,
+      0,
+    );
+    await service.start({ profileIds: [a], groupIds: ['12345'], pageIds: ['20001'] });
+    await assert.rejects(
+      () => service.start({ profileIds: [a], groupIds: ['12345'], pageIds: ['20001'] }),
+      /所选浏览器正在运行顶贴任务/,
+    );
+    await service.start({ profileIds: [a, b], groupIds: ['12345'], pageIds: ['20001'] });
+    const page = await service.startPageBumper({ profileIds: [c], pageIds: ['20001'] });
+    for (let i = 0; i < 40 && runs.length < 3; i++) await new Promise((x) => setTimeout(x, 5));
+    assert.deepEqual(runs.map((x) => x.id).sort(), [a, b, c].sort());
+    assert.equal(runs.find((x) => x.id === c)?.groupId, '-');
+    assert.notEqual(runs.find((x) => x.id === a)?.runId, runs.find((x) => x.id === b)?.runId);
+    assert.equal(page.pageBumperRunning, true);
+    assert.equal(page.pageBumperProfileCounts?.[c]?.running, true);
+    assert.equal(page.profileCounts[c], undefined);
+    assert.equal(service.isProfileRunningInMode(c, 'page-bumper'), true);
+    assert.equal(service.isProfileRunningInMode(a, 'group-bumper'), true);
+    // 停止小组顶贴「全部」不影响专页顶贴
+    await service.stop(undefined, 'group-bumper');
+    for (let i = 0; i < 60 && service.hasActiveExecutionInMode('group-bumper'); i++)
+      await new Promise((x) => setTimeout(x, 10));
+    assert.equal(service.hasActiveExecutionInMode('group-bumper'), false);
+    assert.equal(service.isProfileRunning(c), true);
+    await service.stop(undefined, 'page-bumper');
+    for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
+      await new Promise((x) => setTimeout(x, 10));
+    const result = store.tasks.runtimeSnapshot().profileResults?.find((row) => row.profileId === c);
+    assert.equal(result?.source, 'group-bumper');
+    assert.equal(result?.name, '专页顶贴');
+  }));
+
+test('WO60: adding targets while running saves rows without fetching avatars', async () =>
+  fixture(async (store) => {
+    const r = store.groupBumper;
+    r.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    r.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    let refreshCalls = 0;
+    const id = randomUUID();
+    const service = new GroupBumperService(
+      r,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        run: async (_id, _g, _p, _s, cb) => {
+          while (!cb.cancelled()) await new Promise((x) => setTimeout(x, 5));
+        },
+      },
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      async () => {
+        refreshCalls++;
+        return { updated: 0, failed: 0, needsBrowser: 0 };
+      },
+      0,
+    );
+    await service.start({ profileIds: [id], groupIds: ['12345'], pageIds: ['20001'] });
+    const state = await service.manage('pages/add', { items: [{ id: '30003', name: '' }] });
+    assert.equal(refreshCalls, 0);
+    assert.ok(state.pages.some((p) => p.id === '30003'));
+    assert.match(state.statusText, /运行中暂不抓取头像/);
+    await service.stop([id]);
+  }));
+
+test('WO60: shared group sync unifies avatars without swapping and never downgrades local avatars', async () =>
+  fixture((store) => {
+    store.groupBumper.upsertTargets('groups', { items: [{ id: '55555', name: 'g' }] });
+    store.groupBumper.updateAvatar('groups', '55555', 'https://example.com/a.jpg');
+    const b = store.groupBumper.targets('groups').find((g) => g.id === '55555');
+    const i = store.groupInviter.listGroups().find((g) => g.groupId === '55555');
+    assert.equal(b?.avatarUrl, 'https://example.com/a.jpg');
+    assert.equal(i?.avatarUrl, 'https://example.com/a.jpg');
+    const local = 'data:image/webp;base64,' + 'A'.repeat(64);
+    store.groupBumper.updateAvatar('groups', '55555', local);
+    store.groupBumper.updateAvatar('groups', '55555', 'https://example.com/b.jpg');
+    assert.equal(
+      store.groupBumper.targets('groups').find((g) => g.id === '55555')?.avatarUrl,
+      local,
+    );
+    assert.equal(
+      store.groupInviter.listGroups().find((g) => g.groupId === '55555')?.avatarUrl,
+      local,
+    );
+  }));
+
+test('WO60-B: shared group rename syncs both ways when both sides already have real names', async () =>
+  fixture(async (store) => {
+    store.groupInviter.upsertGroups({ items: [{ groupId: '66666', groupName: '旧群名' }] });
+    assert.equal(store.groupBumper.targets('groups').find((g) => g.id === '66666')?.name, '旧群名');
+    await new Promise((r) => setTimeout(r, 5));
+    store.groupBumper.upsertTargets('groups', { items: [{ id: '66666', name: '新群名' }] });
+    assert.equal(
+      store.groupInviter.listGroups().find((g) => g.groupId === '66666')?.groupName,
+      '新群名',
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    store.groupInviter.upsertGroups({ items: [{ groupId: '66666', groupName: '再改名' }] });
+    assert.equal(store.groupBumper.targets('groups').find((g) => g.id === '66666')?.name, '再改名');
+    // 占位名不会覆盖真实名
+    await new Promise((r) => setTimeout(r, 5));
+    store.groupBumper.upsertTargets('groups', { items: [{ id: '66666', name: '' }] });
+    assert.equal(
+      store.groupInviter.listGroups().find((g) => g.groupId === '66666')?.groupName,
+      '再改名',
+    );
+  }));
+
+test('WO60-B: pages/add and pages/refresh status is mirrored to pageBumperStatusText', async () =>
+  fixture(async (store) => {
+    const r = store.groupBumper;
+    r.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    r.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    const id = randomUUID();
+    const service = new GroupBumperService(
+      r,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        run: async (_id, _g, _p, _s, cb) => {
+          while (!cb.cancelled()) await new Promise((x) => setTimeout(x, 5));
+        },
+      },
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      async () => ({ updated: 0, failed: 0, needsBrowser: 0 }),
+      0,
+    );
+    await service.start({ profileIds: [id], groupIds: ['12345'], pageIds: ['20001'] });
+    const added = await service.manage('pages/add', { items: [{ id: '30003', name: '' }] });
+    assert.match(added.pageBumperStatusText ?? '', /运行中暂不抓取头像/);
+    await service.stop([id]);
+    for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
+      await new Promise((x) => setTimeout(x, 10));
+    const refreshed = await service.manage('pages/refresh', { ids: ['20001'] });
+    assert.match(refreshed.pageBumperStatusText ?? '', /读取资料/);
   }));

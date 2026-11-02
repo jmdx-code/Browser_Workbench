@@ -12,6 +12,7 @@ import type { ProfileTaskResultValue } from '../shared/task-contracts.js';
 import { z } from 'zod';
 import {
   StartBumper,
+  StartPageBumper,
   isTargetIncomplete,
   type BumperRefreshResult,
 } from '../shared/group-bumper.js';
@@ -94,8 +95,24 @@ export interface BumperRunner {
   isReadingProfile?(id: string): boolean;
   hasMetadataReads?(): boolean;
 }
+export type BumperMode = 'group-bumper' | 'page-bumper';
+const RUNNING_ADD_STATUS = '已保存新增目标（运行中暂不抓取头像，停止后可点「读取资料」补齐）';
+/** 专页顶贴复用顶贴执行器时使用的合成小组：runner 以 id === '-' 识别专页主页模式。 */
+export const PAGE_BUMPER_SYNTHETIC_GROUP: BumperTarget = {
+  id: '-',
+  name: '专页主页',
+  avatarUrl: null,
+  folderId: null,
+  sortOrder: 0,
+  totalBumpedCount: 0,
+  createdAt: 0,
+  updatedAt: 0,
+};
 export class GroupBumperService {
-  private runId = globalThis.crypto.randomUUID();
+  /** 每个浏览器独立的运行批次号：追加运行不会改写已在运行浏览器的批次。 */
+  private profileRunIds = new Map<string, string>();
+  private profileModes = new Map<string, BumperMode>();
+  private slotsInUse = 0;
   private workers = new Map<string, Promise<void>>();
   private profiles = new Map<string, BumperProfileStat>();
   private active = new Set<string>();
@@ -104,6 +121,7 @@ export class GroupBumperService {
   private refreshing = false;
   private refreshAbort: AbortController | null = null;
   private statusText = '请选择账号、小组和目标主页';
+  private pageStatusText = '请选择账号和目标专页';
   constructor(
     private readonly repo: CompatibleRepository<BumperRepository>,
     private readonly runner: BumperRunner,
@@ -132,6 +150,20 @@ export class GroupBumperService {
       this.runner.hasMetadataReads?.() === true
     );
   }
+  private modeOf(id: string): BumperMode {
+    return this.profileModes.get(id) ?? 'group-bumper';
+  }
+  isProfileRunningInMode(id: string, mode: BumperMode) {
+    return (
+      this.modeOf(id) === mode &&
+      (this.active.has(id) || this.starting.has(id) || this.workers.has(id))
+    );
+  }
+  hasActiveExecutionInMode(mode: BumperMode) {
+    for (const id of new Set([...this.active, ...this.starting, ...this.workers.keys()]))
+      if (this.modeOf(id) === mode) return true;
+    return false;
+  }
   async state(): Promise<BumperState> {
     const [groups, pages, settings, extra] = await Promise.all([
       this.repo.targets('groups'),
@@ -147,22 +179,49 @@ export class GroupBumperService {
         { today, session: 0, status: '未运行', running: false },
       ]),
     );
-    for (const [id, stat] of this.profiles)
-      profiles[id] = { ...stat, today: counts[id] ?? stat.today };
+    const pageProfiles: Record<string, BumperProfileStat> = Object.fromEntries(
+      Object.entries(counts).map(([id, today]) => [
+        id,
+        { today, session: 0, status: '未运行', running: false },
+      ]),
+    );
+    for (const [id, stat] of this.profiles) {
+      const target = this.modeOf(id) === 'page-bumper' ? pageProfiles : profiles;
+      target[id] = { ...stat, today: counts[id] ?? stat.today };
+    }
+    const groupRunning =
+      this.hasActiveExecutionInMode('group-bumper') || this.runner.hasMetadataReads?.() === true;
     return {
       groups,
       pages,
       settings,
       ...extra,
-      running: this.hasActiveExecution(),
+      running: groupRunning,
       statusText: this.statusText,
       profileCounts: profiles,
       dailyStats,
+      pageBumperRunning: this.hasActiveExecutionInMode('page-bumper'),
+      pageBumperStatusText: this.pageStatusText,
+      pageBumperProfileCounts: pageProfiles,
     };
   }
   async manage(action: string, input: unknown) {
     this.assertAllowed();
     if (this.refreshing) throw new ProductError('BUMPER_READING', '正在读取资料，请稍候', 409);
+    const statusBefore = this.statusText;
+    const syncPageStatus = () => {
+      // 「专页顶贴」页面读取 pageStatusText：主页相关操作的提示同步过去
+      if (action.startsWith('pages/') && this.statusText !== statusBefore)
+        this.pageStatusText = this.statusText;
+    };
+    try {
+      await this.manageAction(action, input);
+    } finally {
+      syncPageStatus();
+    }
+    return this.state();
+  }
+  private async manageAction(action: string, input: unknown): Promise<void> {
     switch (action) {
       case 'groups/refresh':
       case 'pages/refresh': {
@@ -209,6 +268,10 @@ export class GroupBumperService {
       case 'groups/add': {
         const items = await this.repo.upsertTargets('groups', input);
         const pending = items.filter((item) => isTargetIncomplete(item));
+        if (pending.length && this.refreshAvatars && this.hasActiveExecution()) {
+          this.statusText = RUNNING_ADD_STATUS;
+          return;
+        }
         if (pending.length && this.refreshAvatars) {
           this.refreshing = true;
           const abortController = new AbortController();
@@ -229,6 +292,11 @@ export class GroupBumperService {
       case 'pages/add': {
         const items = await this.repo.upsertTargets('pages', input);
         const pending = items.filter((item) => isTargetIncomplete(item));
+        if (pending.length && this.refreshAvatars && this.hasActiveExecution()) {
+          this.statusText = RUNNING_ADD_STATUS;
+          this.pageStatusText = RUNNING_ADD_STATUS;
+          return;
+        }
         if (pending.length && this.refreshAvatars) {
           this.refreshing = true;
           const abortController = new AbortController();
@@ -267,7 +335,6 @@ export class GroupBumperService {
       default:
         throw new ProductError('BUMPER_ACTION_UNKNOWN', '未知的小组顶贴操作', 404);
     }
-    return this.state();
   }
   async logs(search: string, before?: number, beforeId?: string, limit = 200) {
     return this.repo.logs(search.slice(0, 300), limit, before, beforeId);
@@ -278,23 +345,54 @@ export class GroupBumperService {
   async startScanOnly(input: unknown) {
     return this.startRun(input, 'scan_only');
   }
-  private async startRun(input: unknown, executionMode: 'live' | 'scan_only') {
+  /** 专页顶贴：直接进入专页主页按时间线顶贴，复用顶贴执行器、账本与配额。 */
+  async startPageBumper(input: unknown) {
+    const req = StartPageBumper.parse(input);
+    return this.startRun(req, 'live', 'page-bumper');
+  }
+  private async startRun(
+    input: unknown,
+    executionMode: 'live' | 'scan_only',
+    mode: BumperMode = 'group-bumper',
+  ) {
     this.assertAllowed();
-    if (this.refreshing) throw new ProductError('BUMPER_READING', '正在读取资料，请稍候', 409);
-    if (this.hasActiveExecution())
-      throw new ProductError('BUMPER_RUNNING', '小组顶贴正在运行，请先停止', 409);
-    const req = StartBumper.parse(input);
-    this.runId = globalThis.crypto.randomUUID();
-    this.cancelled.clear();
-    this.profiles.clear();
-    this.starting = new Set(req.profileIds);
+    if (this.refreshing || this.runner.hasMetadataReads?.() === true)
+      throw new ProductError('BUMPER_READING', '正在读取资料，请稍候', 409);
+    const req =
+      mode === 'page-bumper'
+        ? { ...StartPageBumper.parse(input), groupIds: [] as string[] }
+        : StartBumper.parse(input);
+    const requested = [...new Set(req.profileIds)];
+    // 增量追加：已在运行（任一模式）的浏览器保持原批次不动，只启动新选的闲置浏览器。
+    const freshIds = requested.filter((id) => !this.isProfileRunning(id));
+    if (!freshIds.length)
+      throw new ProductError('BUMPER_RUNNING', '所选浏览器正在运行顶贴任务', 409);
+    const runId = globalThis.crypto.randomUUID();
+    const setStatus = (text: string) => {
+      if (mode === 'page-bumper') this.pageStatusText = text;
+      else this.statusText = text;
+    };
+    for (const id of freshIds) {
+      this.cancelled.delete(id);
+      this.profiles.delete(id);
+      this.profileModes.set(id, mode);
+      this.profileRunIds.set(id, runId);
+      this.starting.add(id);
+    }
     try {
       const allGroups = await this.repo.targets('groups');
-      const groups = req.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
+      const groups =
+        mode === 'page-bumper'
+          ? [PAGE_BUMPER_SYNTHETIC_GROUP]
+          : req.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
       const allPages = await this.repo.targets('pages');
       const pages = req.pageIds.flatMap((id) => allPages.filter((p) => p.id === id));
       if (!groups.length || !pages.length)
-        throw new ProductError('BUMPER_TARGETS_EMPTY', '请选择已保存的小组和目标主页', 400);
+        throw new ProductError(
+          'BUMPER_TARGETS_EMPTY',
+          mode === 'page-bumper' ? '请选择已保存的目标专页' : '请选择已保存的小组和目标主页',
+          400,
+        );
       const settings = await this.repo.settings();
       if (
         executionMode === 'live' &&
@@ -318,7 +416,7 @@ export class GroupBumperService {
           );
       }
       const eligibleIds: string[] = [];
-      for (const id of new Set(req.profileIds)) {
+      for (const id of freshIds) {
         if (this.cancelled.has(id)) continue;
         const unavailable = !this.runner.ready(id)
           ? '跳过：浏览器未连接'
@@ -334,15 +432,16 @@ export class GroupBumperService {
       const groupQueues = buildStaggeredBumperQueues(eligibleIds, groups);
       const pageQueues = buildStaggeredBumperQueues(eligibleIds, pages);
       let stagger = 0;
+      let launched = 0;
       for (const id of eligibleIds) {
         this.assertAllowed();
         if (this.cancelled.has(id)) continue;
         this.active.add(id);
+        launched++;
         this.profiles.set(id, { today: 0, session: 0, status: '准备中', running: true });
         const delay = stagger;
         stagger += Math.round((1800 + Math.floor(Math.random() * 2001)) * this.staggerScale);
         // Each browser has an independent worker with staggered group & page rotation queues.
-        const runId = this.runId;
         const work = this.worker(
           id,
           groupQueues.get(id) ?? groups,
@@ -351,20 +450,40 @@ export class GroupBumperService {
           delay,
           runId,
           executionMode,
+          mode,
         );
         this.workers.set(id, work);
         void work.finally(() => {
           if (this.workers.get(id) === work) this.workers.delete(id);
-          if (!this.hasActiveExecution()) this.statusText = '本轮已结束';
+          if (!this.hasActiveExecutionInMode(mode)) setStatus('本轮已结束');
         });
       }
-      this.statusText = this.active.size
-        ? `运行中 · ${this.active.size} 个账号`
-        : '没有可运行的空闲账号';
+      const runningCount = [...this.active].filter((id) => this.modeOf(id) === mode).length;
+      setStatus(
+        launched
+          ? `运行中 · ${runningCount} 个账号`
+          : runningCount
+            ? `运行中 · ${runningCount} 个账号（本次追加无可运行的空闲账号）`
+            : '没有可运行的空闲账号',
+      );
     } finally {
-      this.starting.clear();
+      for (const id of freshIds) this.starting.delete(id);
     }
     return this.state();
+  }
+  private async acquireSlot(id: string, max: number, stat: BumperProfileStat, runId: string) {
+    let queued = false;
+    while (this.slotsInUse >= Math.max(1, max)) {
+      if (this.cancelled.has(id) || this.profileRunIds.get(id) !== runId) return false;
+      if (!queued) {
+        queued = true;
+        stat.status = '排队等待并发槽位…';
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.cancelled.has(id) || this.profileRunIds.get(id) !== runId) return false;
+    this.slotsInUse++;
+    return true;
   }
   private async worker(
     id: string,
@@ -374,29 +493,36 @@ export class GroupBumperService {
     delay: number,
     runId: string,
     executionMode: 'live' | 'scan_only',
+    mode: BumperMode = 'group-bumper',
   ) {
     const stat = this.profiles.get(id);
     if (!stat) throw Error('BUMPER_PROFILE_STATE_MISSING');
     let failed = false;
+    let slot = false;
+    const current = () => this.profileRunIds.get(id) === runId;
     try {
       for (let left = delay; left > 0 && !this.cancelled.has(id); left -= 100)
         await new Promise((r) => setTimeout(r, Math.min(100, left)));
       if (!this.cancelled.has(id))
+        slot = await this.acquireSlot(id, settings.maxConcurrentProfiles ?? 8, stat, runId);
+      if (slot && !this.cancelled.has(id)) {
+        if (stat.status === '排队等待并发槽位…') stat.status = '准备中';
         await this.runner.run(id, groups, pages, settings, {
           runId,
           executionMode,
-          cancelled: () => this.runId !== runId || this.cancelled.has(id),
+          cancelled: () => !current() || this.cancelled.has(id),
           status: (text, today) => {
-            if (this.runId !== runId || this.profiles.get(id) !== stat) return;
+            if (!current() || this.profiles.get(id) !== stat) return;
             stat.status = text;
             if (today !== undefined) stat.today = today;
           },
           added: (today) => {
-            if (this.runId !== runId || this.profiles.get(id) !== stat) return;
+            if (!current() || this.profiles.get(id) !== stat) return;
             stat.session++;
             stat.today = today;
           },
         });
+      }
       if (!stat.status.startsWith('今日已达上限')) {
         if (this.cancelled.has(id)) stat.status = '已停止';
         else if (stat.session > 0 || !stat.status.startsWith('已完成 · 0 次'))
@@ -406,6 +532,7 @@ export class GroupBumperService {
       failed = true;
       stat.status = e instanceof Error ? e.message : '顶贴执行失败';
     } finally {
+      if (slot) this.slotsInUse = Math.max(0, this.slotsInUse - 1);
       stat.running = this.runner.hasControl?.(id) === true;
       if (!stat.running) {
         this.active.delete(id);
@@ -414,7 +541,7 @@ export class GroupBumperService {
             profileId: id,
             source: 'group-bumper',
             runId,
-            name: '小组顶贴',
+            name: mode === 'page-bumper' ? '专页顶贴' : '小组顶贴',
             state: this.cancelled.has(id) ? 'STOPPED' : failed ? 'FAILED' : 'COMPLETED',
             reason: stat.status,
             finishedAt: Date.now(),
@@ -425,12 +552,17 @@ export class GroupBumperService {
       } else {
         stat.status = '停止待确认 · ' + stat.status;
       }
-      if (!this.hasActiveExecution()) this.statusText = '本轮已结束';
+      if (!this.hasActiveExecutionInMode(mode)) {
+        if (mode === 'page-bumper') this.pageStatusText = '本轮已结束';
+        else this.statusText = '本轮已结束';
+      }
     }
   }
-  async stop(profileIds?: string[]) {
+  async stop(profileIds?: string[], mode?: BumperMode) {
     this.refreshAbort?.abort();
-    const ids = profileIds ?? [...new Set([...this.active, ...this.starting])];
+    const ids = (profileIds ?? [...new Set([...this.active, ...this.starting])]).filter(
+      (id) => !mode || this.modeOf(id) === mode,
+    );
     for (const id of ids) this.cancelled.add(id);
     await Promise.all(
       ids.map(async (id) => {

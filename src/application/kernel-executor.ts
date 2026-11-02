@@ -192,8 +192,15 @@ export class KernelExecutor {
           } catch {
             fenced = true;
           }
+          const isBenignScrollPreconditionError =
+            !fenced &&
+            method === 'DOM.scrollIntoViewIfNeeded' &&
+            /Node is detached from document|Could not find node|Node does not have a layout object|Cannot find context/i.test(
+              error instanceof Error ? error.message : String(error),
+            );
           if (
             dispatched &&
+            !isBenignScrollPreconditionError &&
             (kernelRequiresOperation(method, this.access) ||
               (/^Runtime\.(evaluate|callFunctionOn)$/.test(method) &&
                 (fenced || (error instanceof Error && error.message.includes('_UNKNOWN')))))

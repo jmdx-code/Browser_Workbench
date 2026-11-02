@@ -98,6 +98,9 @@ export interface BumperSurface {
 export function projectGroupBumper(input: {
   groupId: string;
   pageId?: string;
+  /** 搜索结果页入口的名称兜底匹配（ID 未命中时按链接文本精确匹配）。 */
+  groupName?: string;
+  pageName?: string;
   targetPostId?: string;
   audit?: boolean;
 }): BumperSurface {
@@ -324,7 +327,9 @@ export function projectGroupBumper(input: {
       e.removeAttribute('data-wb-bumper-group');
       e.removeAttribute('data-wb-bumper-welcome-dismiss');
       e.removeAttribute('data-wb-bumper-join');
-      e.removeAttribute('data-wb-bumper-post');
+      if (!input.targetPostId || e.getAttribute('data-wb-bumper-post') === input.targetPostId) {
+        e.removeAttribute('data-wb-bumper-post');
+      }
     });
   let joinGroupCSS: string | null = null;
   if (/^\/groups\/(?!search(?:\/|$))[^/]+/i.test(location.pathname)) {
@@ -368,30 +373,87 @@ export function projectGroupBumper(input: {
       joinGroupCSS = '[data-wb-bumper-join="1"]';
     }
   }
-  if (/\/groups\/search|\/search/.test(location.pathname))
+  if (/\/groups\/search|\/search/.test(location.pathname)) {
+    // 搜索结果入口：只认合法的专页/小组主页链接（排除帖子、照片、话题、外链等子链接，
+    // 防止因继承同一张结果卡片的 Fiber 而误标）；ID 匹配优先，其次才按名称精确匹配。
+    const pageMode = input.groupId === '-' && !!input.pageId;
+    const reservedPagePath =
+      /^\/(?:search|groups|watch|marketplace|gaming|friends|bookmarks|notifications|messages|events|memories|saved|settings|help|login|checkpoint|reel|reels|stories|photo|photos|videos|permalink|posts|hashtag|share|l\.php)\/?$/i;
+    const pageNameKey =
+      input.pageName && input.pageName.trim() && input.pageName.trim() !== input.pageId
+        ? input.pageName.trim().toLowerCase()
+        : null;
+    const groupNameKey =
+      input.groupName && input.groupName.trim() && input.groupName.trim() !== input.groupId
+        ? input.groupName.trim().toLowerCase()
+        : null;
+    let nameMatched: HTMLAnchorElement | null = null;
+    let idMatched: HTMLAnchorElement | null = null;
     for (const link of Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]')).filter(
       visible,
     )) {
-      let matched = false;
+      let u: URL;
       try {
-        const u = new URL(link.href);
-        matched =
-          u.origin === 'https://www.facebook.com' &&
-          u.pathname.replace(/\/$/, '').toLowerCase() === '/groups/' + input.groupId.toLowerCase();
-      } catch {}
-      matched ||= chain(link).some((f) => {
-        const entity = obj(f.props.group ?? f.props.entity ?? f.props['group$key']);
-        return (
-          (entity.id === input.groupId || entity.__id === input.groupId) &&
-          (entity.__typename === 'Group' || /Group/.test(f.name))
-        );
-      });
-      if (matched) {
-        link.setAttribute('data-wb-bumper-group', '1');
-        groupEntryCSS = '[data-wb-bumper-group="1"]';
-        break;
+        u = new URL(link.href);
+      } catch {
+        continue;
+      }
+      if (u.origin !== 'https://www.facebook.com') continue;
+      const cleanPath = u.pathname.replace(/\/$/, '').toLowerCase();
+      const text = (link.textContent ?? '').trim().toLowerCase();
+      if (pageMode && input.pageId) {
+        const isPageHome =
+          (u.pathname === '/profile.php' && !!u.searchParams.get('id')) ||
+          (/^\/[^/]+\/?$/.test(u.pathname) && !reservedPagePath.test(u.pathname));
+        if (!isPageHome) continue;
+        const pageId = input.pageId;
+        const idHit =
+          cleanPath === '/' + pageId.toLowerCase() ||
+          (u.pathname === '/profile.php' && u.searchParams.get('id') === pageId) ||
+          chain(link).some((f) => {
+            const entity = obj(
+              f.props.page ??
+                f.props.profile ??
+                f.props.user ??
+                f.props.entity ??
+                f.props['page$key'] ??
+                f.props['profile$key'],
+            );
+            const decodedEntityId = typeof entity.__id === 'string' ? decodeId(entity.__id) : null;
+            return entity.id === pageId || entity.__id === pageId || decodedEntityId === pageId;
+          });
+        if (idHit) {
+          idMatched = link;
+          break;
+        }
+        if (!nameMatched && pageNameKey && text === pageNameKey) nameMatched = link;
+      } else {
+        if (!/^\/groups\/(?!search(?:\/|$))[^/]+\/?$/i.test(u.pathname)) continue;
+        const idHit =
+          cleanPath === '/groups/' + input.groupId.toLowerCase() ||
+          chain(link).some((f) => {
+            const entity = obj(f.props.group ?? f.props.entity ?? f.props['group$key']);
+            const decodedEntityId = typeof entity.__id === 'string' ? decodeId(entity.__id) : null;
+            return (
+              (entity.id === input.groupId ||
+                entity.__id === input.groupId ||
+                decodedEntityId === input.groupId) &&
+              (entity.__typename === 'Group' || /Group/.test(f.name))
+            );
+          });
+        if (idHit) {
+          idMatched = link;
+          break;
+        }
+        if (!nameMatched && groupNameKey && text === groupNameKey) nameMatched = link;
       }
     }
+    const entryLink = idMatched ?? nameMatched;
+    if (entryLink) {
+      entryLink.setAttribute('data-wb-bumper-group', '1');
+      groupEntryCSS = '[data-wb-bumper-group="1"]';
+    }
+  }
   const posts: BumperPost[] = [];
   let loading = false;
   document
@@ -399,10 +461,16 @@ export function projectGroupBumper(input: {
       '[data-wb-bumper-like],[data-wb-bumper-comment],[data-wb-bumper-open-comment],[data-wb-bumper-video]',
     )
     .forEach((e) => {
-      e.removeAttribute('data-wb-bumper-like');
-      e.removeAttribute('data-wb-bumper-comment');
-      e.removeAttribute('data-wb-bumper-open-comment');
-      e.removeAttribute('data-wb-bumper-video');
+      for (const attr of [
+        'data-wb-bumper-like',
+        'data-wb-bumper-comment',
+        'data-wb-bumper-open-comment',
+        'data-wb-bumper-video',
+      ]) {
+        if (!input.targetPostId || e.getAttribute(attr) === input.targetPostId) {
+          e.removeAttribute(attr);
+        }
+      }
     });
   // Native feed cards need not have role=article; comment rows do. Resolve the
   // actual feed-card host before reading identity, author or action controls.
@@ -836,11 +904,17 @@ export function projectGroupBumper(input: {
       postId,
       ...(sourceEvidence ? { sourceEvidence } : {}),
       postUrl:
-        'https://www.facebook.com/groups/' +
-        encodeURIComponent(input.groupId) +
-        '/posts/' +
-        postId +
-        '/',
+        input.groupId === '-'
+          ? 'https://www.facebook.com/' +
+            encodeURIComponent(input.pageId || authorId || 'facebook') +
+            '/posts/' +
+            postId +
+            '/'
+          : 'https://www.facebook.com/groups/' +
+            encodeURIComponent(input.groupId) +
+            '/posts/' +
+            postId +
+            '/',
       authorId:
         authorId ??
         (input.pageId && location.pathname.includes('/user/' + input.pageId + '/')
@@ -1004,7 +1078,14 @@ export function projectGroupBumper(input: {
 }
 export async function readGroupBumper(
   page: Page,
-  input: { groupId: string; pageId?: string; targetPostId?: string; audit?: boolean },
+  input: {
+    groupId: string;
+    pageId?: string;
+    groupName?: string;
+    pageName?: string;
+    targetPostId?: string;
+    audit?: boolean;
+  },
 ): Promise<BumperSurface> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {

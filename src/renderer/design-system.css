@@ -3079,6 +3079,9 @@ code {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
 }
+.bumper-columns.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
 .bumper-target-card {
   min-width: 0;
   border: 1px solid var(--line, #dce0e6);
@@ -3375,6 +3378,14 @@ code {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+.finder-name strong,
+.finder-row-name,
+.finder-row code,
+.finder-row-meta code {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
 }
 .finder-name img,
 .finder-avatar-placeholder {

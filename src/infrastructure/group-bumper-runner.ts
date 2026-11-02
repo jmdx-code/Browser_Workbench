@@ -1,4 +1,3 @@
-import { bumperVideoCredit, type BumperVideoSample } from '../domain/bumper-video.js';
 import type { BumperResolutionValue } from '../shared/bumper-operation.js';
 import {
   bumperSetupLabels,
@@ -649,9 +648,9 @@ export async function typeBumperComment(
   for (const ch of Array.from(text)) {
     guard();
     await typeChar(ch);
-    const charDelay = 85 + Math.floor(Math.random() * 156);
+    const charDelay = 55 + Math.floor(Math.random() * 56);
     const punctDelay = /[，。！？、；：,.!?;:\s]/.test(ch)
-      ? 180 + Math.floor(Math.random() * 241)
+      ? 60 + Math.floor(Math.random() * 81)
       : 0;
     const stepMs = Math.round((charDelay + punctDelay) * paceScale);
     for (let left = stepMs; left > 0; left -= 100) {
@@ -754,6 +753,24 @@ export async function executeBumperOperation<T>(input: {
   return value;
 }
 
+/**
+ * 专页时间线上的他人贴（访客贴/分享混入）判定：仅当已确认专页自身数字作者 ID，
+ * 且贴文带有明确的数字作者 ID、与专页 ID/别名/名称均不匹配时，才判为非目标。
+ * 未确认专页作者时保持放行，避免误杀新版专页（作者 ID 与专页 ID 不同）的真实贴文。
+ */
+export function isForeignPagePost(
+  post: Pick<BumperPost, 'authorId' | 'authorName' | 'authorAliases'>,
+  page: Pick<BumperTarget, 'id' | 'name'>,
+  pageOwnerAuthorId: string | null,
+): boolean {
+  if (!pageOwnerAuthorId || !post.authorId || !/^\d+$/.test(post.authorId)) return false;
+  if (post.authorId === pageOwnerAuthorId || post.authorId === page.id) return false;
+  if (bumperAuthorMatch(post as BumperPost, page as BumperTarget)) return false;
+  const name = page.name.trim().toLowerCase();
+  if (name && name !== page.id.toLowerCase() && post.authorName.trim().toLowerCase() === name)
+    return false;
+  return true;
+}
 export class GroupBumperBrowserAdapter implements BumperRunner {
   private metadataPreferred?: { id: string; epoch: string };
   private metadataProfiles = new Set<string>();
@@ -765,7 +782,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
   }
   private connections = new Map<string, Connection>();
   private stopWorks = new WeakMap<Connection, Promise<void>>();
-  private postClaims = new Set<string>();
   private commentClaims = new Set<string>();
   private accountClaims = new Set<string>();
   private closing = new Map<
@@ -1431,13 +1447,71 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         throw new BumperFatalError('浏览器连接已变化');
     };
     await recoverBumperOperations(kernel, peer, this.repo, guard);
-    const prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard);
-    if (prepared.inventory.operations.some(kernelOperationPending))
-      throw Error('存在待核对操作，请先处理原记录');
-    const identity =
-      (await kernel.inspectIdleFacebookPage(peer, guard, false, true)) ??
-      (await kernel.inspectFacebookIdentity(peer, guard, true, prepared.proof, true, false, true));
-    guard();
+    const prepareAndConnect = async () => {
+      const prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard);
+      if (prepared.inventory.operations.some(kernelOperationPending))
+        throw Error('存在待核对操作，请先处理原记录');
+      type BumperIdentity =
+        | NonNullable<Awaited<ReturnType<typeof kernel.inspectIdleFacebookPage>>>
+        | Awaited<ReturnType<typeof kernel.inspectFacebookIdentity>>;
+      let identity: BumperIdentity | null = await kernel
+        .inspectIdleFacebookPage(peer, guard, false, false)
+        .catch(() => null);
+      if (!identity) {
+        identity = await kernel
+          .inspectFacebookIdentity(peer, guard, true, prepared.proof, true, false, false)
+          .catch(() => null);
+      }
+      if (!identity) {
+        identity =
+          (await kernel.inspectIdleFacebookPage(peer, guard, false, true)) ??
+          (await kernel.inspectFacebookIdentity(
+            peer,
+            guard,
+            true,
+            prepared.proof,
+            true,
+            false,
+            true,
+          ));
+      }
+      guard();
+      if (!identity) throw Error('未能确认 Facebook 登录身份');
+      return identity;
+    };
+    const runWithPrepareTimeout = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          prepareAndConnect(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(Error('BUMPER_PREPARE_TIMEOUT')), 15000);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    };
+    let identity: Awaited<ReturnType<typeof prepareAndConnect>>;
+    try {
+      identity = await runWithPrepareTimeout();
+    } catch (firstErr) {
+      if (isBumperFatal(firstErr)) throw firstErr;
+      const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+      if (
+        /BUMPER_PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE/i.test(
+          msg,
+        )
+      ) {
+        await kernel.taskWindow?.(profileId).catch(() => {});
+        await wait(Math.max(10, Math.round(1000 * this.paceScale)));
+        guard();
+        identity = await runWithPrepareTimeout();
+      } else {
+        throw firstErr;
+      }
+    }
     const accountId = identity.actor.accountId;
     if (this.accountClaims.has(accountId)) throw Error('同一登录账号已在其他浏览器顶贴');
     this.accountClaims.add(accountId);
@@ -1625,9 +1699,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               !!u.searchParams.get('q') &&
               u.searchParams.get('q') === requested.searchParams.get('q') &&
               (/^\/groups\/search\//.test(u.pathname) ||
-                /^\/search(?:\/groups)?\/?$/.test(u.pathname) ||
+                /^\/search(?:\/(?:groups|pages|top))?\/?$/.test(u.pathname) ||
                 /^\/groups\/[^/]+\/search\//.test(u.pathname))
             );
+          if (!requested.pathname.startsWith('/groups/'))
+            return !/^\/(?:login|checkpoint)(?:\/|\.php|$)/i.test(u.pathname);
           return (
             /^\/groups\/(?!search(?:\/|$))[^/]+/.test(u.pathname) &&
             (!requested.searchParams.has('sorting_setting') ||
@@ -1636,6 +1712,69 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           );
         },
       );
+    const searchViaInputOrUrl = async (query: string, fallbackSearchUrl: string) => {
+      const searchSelector =
+        'input[type="search"], input[role="combobox"], input[aria-label*="Search" i], input[aria-label*="搜索"], input[aria-label*="搜尋"], input[placeholder*="Search" i], input[placeholder*="搜索"], input[placeholder*="搜尋"]';
+      let typed = false;
+      try {
+        const hasVisibleInput = await page
+          .evaluate((sel) => {
+            for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+              const r = el.getBoundingClientRect();
+              const s = getComputedStyle(el);
+              if (
+                r.width > 20 &&
+                r.height > 12 &&
+                s.display !== 'none' &&
+                s.visibility !== 'hidden'
+              )
+                return true;
+            }
+            return false;
+          }, searchSelector)
+          .catch(() => false);
+        if (hasVisibleInput === true) {
+          await op(
+            '打开搜索结果',
+            async () => {
+              const box = page.locator(searchSelector).first();
+              await box.click({ timeout: 3000 });
+              await box.press('ControlOrMeta+A').catch(() => {});
+              await box.press('Backspace').catch(() => {});
+              const typeChar =
+                typeof page.keyboard.type === 'function'
+                  ? (ch: string) => page.keyboard.type(ch)
+                  : (ch: string) => page.keyboard.insertText(ch);
+              for (const ch of Array.from(query)) {
+                guard();
+                await typeChar(ch);
+                const delayMs = Math.round((55 + Math.floor(Math.random() * 56)) * this.paceScale);
+                if (delayMs > 0) await wait(delayMs);
+              }
+              await box.press('Enter', { timeout: 3000 });
+              await page
+                .waitForURL(
+                  (u) => u.origin === 'https://www.facebook.com' && /search/i.test(u.pathname),
+                  {
+                    timeout: 5000,
+                  },
+                )
+                .catch(() => {});
+              return page.url();
+            },
+            // 输入框搜索属于尽力而为的导航辅助：未跳到搜索页时改走搜索 URL，不触发准备步骤重连
+            async () => true,
+          );
+          const landed = new URL(page.url());
+          typed = landed.origin === 'https://www.facebook.com' && /search/i.test(landed.pathname);
+        }
+      } catch (err) {
+        if (isBumperFatal(err)) throw err;
+      }
+      if (!typed) {
+        await navigate(fallbackSearchUrl);
+      }
+    };
     let groupsEntered = 0;
     let skippedGroups = 0;
     let lastGroupError = '';
@@ -1659,75 +1798,8 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             );
             break;
           }
-          await navigate(
-            'https://www.facebook.com/groups/search/groups/?q=' + encodeURIComponent(group.name),
-          );
-          const deadline = Date.now() + 6000;
-          let targetHref: string | null = null;
-          while (Date.now() < deadline && !targetHref) {
-            guard();
-            const found = await readGroupBumper(page, { groupId: group.id });
-            targetHref = found.groupEntryCSS ? group.id : null;
-            if (!targetHref) await wait(400);
-          }
-          if (targetHref) {
-            navigationChain = [
-              'https://www.facebook.com/groups/' + encodeURIComponent(group.id) + '/',
-            ];
-            try {
-              await op(
-                '打开搜索到的小组',
-                async () => {
-                  const refreshed = await readGroupBumper(page, { groupId: group.id });
-                  if (!refreshed.groupEntryCSS) throw Error('搜索入口未找到');
-                  const entry = page.locator(refreshed.groupEntryCSS).first();
-                  await centerBumperControl(entry, this.paceScale);
-                  await entry.click({ timeout: 4000 });
-                  await page.waitForURL(
-                    (url) =>
-                      url.origin === 'https://www.facebook.com' &&
-                      /^\/groups\/(?!search(?:\/|$))[^/]+/.test(url.pathname),
-                    { timeout: 15000 },
-                  );
-                  return page.url();
-                },
-                async () => new URL(page.url()).origin === 'https://www.facebook.com',
-              );
-            } catch (err) {
-              if (isBumperFatal(err)) throw err;
-              await navigate(`https://www.facebook.com/groups/${encodeURIComponent(group.id)}/`);
-            }
-          } else await navigate(`https://www.facebook.com/groups/${encodeURIComponent(group.id)}/`);
-          let surface = await readGroupBumper(page, { groupId: group.id });
+          const isPageBumperMode = group.id === '-';
           let effectiveGroupId = group.id;
-          if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
-            const redirected = navigationChain.some((url) => {
-              const u = new URL(url);
-              return (
-                u.origin === 'https://www.facebook.com' &&
-                u.pathname.replace(/\/$/, '').toLowerCase() === '/groups/' + group.id.toLowerCase()
-              );
-            });
-            const final = new URL(surface.url),
-              nativeId = /^\/groups\/([^/]+)\/?$/.exec(final.pathname)?.[1];
-            if (
-              redirected &&
-              nativeId &&
-              final.origin === 'https://www.facebook.com' &&
-              surface.groupIds.includes(nativeId.toLowerCase())
-            )
-              effectiveGroupId = nativeId;
-          }
-          if (!surface.groupIds.includes(effectiveGroupId.toLowerCase()))
-            throw Error('小组标识与目标不一致，未执行顶贴');
-          if (surface.avatarUrl) await updateAvatar('groups', group.id, surface.avatarUrl);
-          if (surface.groupTitle && (!group.name.trim() || group.name === group.id)) {
-            await updateMetadata('groups', group.id, {
-              name: surface.groupTitle,
-              avatarUrl: surface.avatarUrl,
-            });
-            group.name = surface.groupTitle;
-          }
           const dismissWelcomeDialogIfNeeded = async (
             s?: Awaited<ReturnType<typeof readGroupBumper>>,
           ) => {
@@ -1752,7 +1824,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             return true;
           };
           const joinGroupIfNeeded = async (s?: Awaited<ReturnType<typeof readGroupBumper>>) => {
-            if (scanOnly) return false;
+            if (scanOnly || isPageBumperMode) return false;
             const currentSurface =
               s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
             if (!currentSurface.joinGroupCSS) return false;
@@ -1787,12 +1859,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             await dismissWelcomeDialogIfNeeded();
             return true;
           };
-          await dismissWelcomeDialogIfNeeded(surface);
-          await joinGroupIfNeeded(surface);
-          if (settings.searchMode === 'time_sort')
-            await navigate(
-              `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
-            );
           const waitForFeed = async (pageId?: string) => {
             const startedAt = Date.now();
             const until = startedAt + 12000;
@@ -1841,32 +1907,277 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             if (observed.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
             return observed;
           };
-          let initialFeed = await waitForFeed();
-          if (await joinGroupIfNeeded(initialFeed)) {
-            if (settings.searchMode === 'time_sort') {
+          let surface!: Awaited<ReturnType<typeof readGroupBumper>>;
+          let initialFeed!: Awaited<ReturnType<typeof readGroupBumper>>;
+          if (!isPageBumperMode) {
+            const fallbackGroupUrl =
+              settings.searchMode === 'time_sort'
+                ? `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/?sorting_setting=CHRONOLOGICAL`
+                : `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/`;
+            let navigatedChronological = false;
+            if (!isPlaceholderTargetName(group.name, group.id)) {
+              await searchViaInputOrUrl(
+                group.name,
+                'https://www.facebook.com/groups/search/groups/?q=' +
+                  encodeURIComponent(group.name),
+              );
+              const deadline = Date.now() + 6000;
+              let targetHref: string | null = null;
+              while (Date.now() < deadline && !targetHref) {
+                guard();
+                const found = await readGroupBumper(page, {
+                  groupId: group.id,
+                  groupName: group.name,
+                });
+                targetHref = found.groupEntryCSS ? group.id : null;
+                if (!targetHref) await wait(400);
+              }
+              if (targetHref) {
+                navigationChain = [
+                  'https://www.facebook.com/groups/' + encodeURIComponent(group.id) + '/',
+                ];
+                try {
+                  await op(
+                    '打开搜索到的小组',
+                    async () => {
+                      const refreshed = await readGroupBumper(page, {
+                        groupId: group.id,
+                        groupName: group.name,
+                      });
+                      if (!refreshed.groupEntryCSS) throw Error('搜索入口未找到');
+                      const entry = page.locator(refreshed.groupEntryCSS).first();
+                      await centerBumperControl(entry, this.paceScale);
+                      const preClickPause = Math.round(
+                        (300 + Math.floor(Math.random() * 301)) * this.paceScale,
+                      );
+                      if (preClickPause > 0) await wait(preClickPause);
+                      await entry.click({ timeout: 4000 });
+                      await page.waitForURL(
+                        (url) =>
+                          url.origin === 'https://www.facebook.com' &&
+                          /^\/groups\/(?!search(?:\/|$))[^/]+/.test(url.pathname),
+                        { timeout: 15000 },
+                      );
+                      return page.url();
+                    },
+                    async () => new URL(page.url()).origin === 'https://www.facebook.com',
+                  );
+                } catch (err) {
+                  if (isBumperFatal(err)) throw err;
+                  await navigate(fallbackGroupUrl);
+                  navigatedChronological = settings.searchMode === 'time_sort';
+                }
+              } else {
+                await navigate(fallbackGroupUrl);
+                navigatedChronological = settings.searchMode === 'time_sort';
+              }
+            } else {
+              await navigate(fallbackGroupUrl);
+              navigatedChronological = settings.searchMode === 'time_sort';
+            }
+            surface = await readGroupBumper(page, { groupId: group.id });
+            if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
+              const redirected = navigationChain.some((url) => {
+                const u = new URL(url);
+                return (
+                  u.origin === 'https://www.facebook.com' &&
+                  u.pathname.replace(/\/$/, '').toLowerCase() ===
+                    '/groups/' + group.id.toLowerCase()
+                );
+              });
+              const final = new URL(surface.url),
+                nativeId = /^\/groups\/([^/]+)\/?$/.exec(final.pathname)?.[1];
+              if (
+                redirected &&
+                nativeId &&
+                final.origin === 'https://www.facebook.com' &&
+                surface.groupIds.includes(nativeId.toLowerCase())
+              )
+                effectiveGroupId = nativeId;
+            }
+            if (!surface.groupIds.includes(effectiveGroupId.toLowerCase()))
+              throw Error('小组标识与目标不一致，未执行顶贴');
+            if (surface.avatarUrl) await updateAvatar('groups', group.id, surface.avatarUrl);
+            if (surface.groupTitle && (!group.name.trim() || group.name === group.id)) {
+              await updateMetadata('groups', group.id, {
+                name: surface.groupTitle,
+                avatarUrl: surface.avatarUrl,
+              });
+              group.name = surface.groupTitle;
+            }
+            await dismissWelcomeDialogIfNeeded(surface);
+            const joinedEarly = await joinGroupIfNeeded(surface);
+            if (
+              settings.searchMode === 'time_sort' &&
+              (!navigatedChronological ||
+                joinedEarly ||
+                !surface.url.includes('sorting_setting=CHRONOLOGICAL'))
+            ) {
               await navigate(
                 `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
               );
-              initialFeed = await waitForFeed();
-            } else {
-              initialFeed = await readGroupBumper(page, { groupId: effectiveGroupId });
             }
+            initialFeed = await waitForFeed();
+            if (await joinGroupIfNeeded(initialFeed)) {
+              if (settings.searchMode === 'time_sort') {
+                await navigate(
+                  `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
+                );
+                initialFeed = await waitForFeed();
+              } else {
+                initialFeed = await readGroupBumper(page, { groupId: effectiveGroupId });
+              }
+            }
+            if (
+              !initialFeed.posts.length &&
+              !initialFeed.restricted &&
+              settings.searchMode === 'time_sort' &&
+              page.url().includes('sorting_setting=CHRONOLOGICAL')
+            ) {
+              // 未加入/入组待审核的公开小组常不开放时间排序流，但默认流可读：回退一次默认小组页
+              await navigate(
+                `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/`,
+              );
+              initialFeed = await waitForFeed();
+            }
+            if (initialFeed.groupTitle && (!group.name.trim() || group.name === group.id)) {
+              await updateMetadata('groups', group.id, {
+                name: initialFeed.groupTitle,
+                avatarUrl: initialFeed.avatarUrl,
+              });
+              group.name = initialFeed.groupTitle;
+            }
+            if (!initialFeed.posts.length)
+              throw Error(initialFeed.loading ? '小组内容加载超时' : '小组暂无可访问帖子');
+            callbacks.status('正在扫描 · ' + group.name);
+            groupsEntered++;
           }
-          if (initialFeed.groupTitle && (!group.name.trim() || group.name === group.id)) {
-            await updateMetadata('groups', group.id, {
-              name: initialFeed.groupTitle,
-              avatarUrl: initialFeed.avatarUrl,
-            });
-            group.name = initialFeed.groupTitle;
-          }
-          if (!initialFeed.posts.length)
-            throw Error(initialFeed.loading ? '小组内容加载超时' : '小组暂无可访问帖子');
-          callbacks.status('正在扫描 · ' + group.name);
-          groupsEntered++;
-          const feeds = settings.searchMode === 'page_group_feed' ? pages : [null];
+          const feeds = isPageBumperMode
+            ? pages
+            : settings.searchMode === 'page_group_feed'
+              ? pages
+              : [null];
           for (const feed of feeds) {
             let resolvedPageId = feed?.id;
-            if (feed && !/^\d+$/.test(feed.id)) {
+            let pageOwnerAuthorId: string | null = null;
+            if (isPageBumperMode && feed) {
+              operationContext = {
+                groupId: '-',
+                groupName: '专页主页',
+                pageId: feed.id,
+                pageName: feed.name,
+              };
+              const pageQuota = await this.repo.eligibility(accountId, profileId, '');
+              if (pageQuota.today >= settings.dailyMaxLikesPerAccount) {
+                quotaReached = true;
+                callbacks.status(
+                  `今日已达上限 (${pageQuota.today}/${settings.dailyMaxLikesPerAccount})`,
+                  pageQuota.today,
+                );
+                break;
+              }
+              callbacks.status(`正在查找专页 · ${feed.name}`, pageQuota.today);
+              const fallbackPageUrl = buildBumperTargetUrl('pages', feed.id);
+              if (!isPlaceholderTargetName(feed.name, feed.id)) {
+                await searchViaInputOrUrl(
+                  feed.name,
+                  'https://www.facebook.com/search/pages/?q=' + encodeURIComponent(feed.name),
+                );
+                const deadline = Date.now() + 6000;
+                let foundPageEntry = false;
+                while (Date.now() < deadline && !foundPageEntry) {
+                  guard();
+                  const found = await readGroupBumper(page, {
+                    groupId: '-',
+                    pageId: feed.id,
+                    pageName: feed.name,
+                  });
+                  foundPageEntry = !!found.groupEntryCSS;
+                  if (!foundPageEntry) await wait(400);
+                }
+                if (foundPageEntry) {
+                  try {
+                    await op(
+                      '打开搜索到的小组',
+                      async () => {
+                        const refreshed = await readGroupBumper(page, {
+                          groupId: '-',
+                          pageId: feed.id,
+                          pageName: feed.name,
+                        });
+                        if (!refreshed.groupEntryCSS) throw Error('专页搜索入口未找到');
+                        const entry = page.locator(refreshed.groupEntryCSS).first();
+                        await centerBumperControl(entry, this.paceScale);
+                        const preClickPause = Math.round(
+                          (300 + Math.floor(Math.random() * 301)) * this.paceScale,
+                        );
+                        if (preClickPause > 0) await wait(preClickPause);
+                        await entry.click({ timeout: 4000 });
+                        // 未离开搜索页即视为失败，进入 catch 走专页链接兜底
+                        await page.waitForURL(
+                          (url) =>
+                            url.origin === 'https://www.facebook.com' &&
+                            !/^\/search(?:\/|$)/i.test(url.pathname),
+                          { timeout: 15000 },
+                        );
+                        return page.url();
+                      },
+                      async () => {
+                        const u = new URL(page.url());
+                        return (
+                          u.origin === 'https://www.facebook.com' &&
+                          !/^\/search(?:\/|$)/i.test(u.pathname)
+                        );
+                      },
+                    );
+                  } catch (err) {
+                    if (isBumperFatal(err)) throw err;
+                    await navigate(fallbackPageUrl);
+                  }
+                } else {
+                  await navigate(fallbackPageUrl);
+                }
+              } else {
+                await navigate(fallbackPageUrl);
+              }
+              const onWrongPageSurface = () =>
+                /^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname);
+              if (onWrongPageSurface()) await navigate(fallbackPageUrl);
+              if (onWrongPageSurface()) {
+                skippedGroups++;
+                lastGroupError = '未能进入专页主页';
+                callbacks.status('跳过专页 · 未能进入专页主页 · ' + feed.name);
+                continue;
+              }
+              const pageFeed = await waitForFeed(feed.id);
+              const pageAvatar = pageFeed.pageAvatarUrl ?? pageFeed.avatarUrl;
+              if (pageAvatar) await updateAvatar('pages', feed.id, pageAvatar);
+              if (pageFeed.groupTitle && isPlaceholderTargetName(feed.name, feed.id)) {
+                await updateMetadata('pages', feed.id, {
+                  name: pageFeed.groupTitle,
+                  avatarUrl: pageAvatar,
+                });
+                feed.name = pageFeed.groupTitle;
+              }
+              if (!pageFeed.posts.length) {
+                skippedGroups++;
+                lastGroupError = pageFeed.loading ? '专页内容加载超时' : '专页暂无可访问帖子';
+                callbacks.status('跳过专页 · ' + feed.name);
+                continue;
+              }
+              initialFeed = pageFeed;
+              // 只有在当前时间线上确认了专页自身的数字作者 ID 后，才过滤他人访客贴
+              pageOwnerAuthorId =
+                pageFeed.posts.find(
+                  (p) =>
+                    /^\d+$/.test(p.authorId ?? '') &&
+                    (bumperAuthorMatch(p, feed) ||
+                      (!isPlaceholderTargetName(feed.name, feed.id) &&
+                        p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
+                )?.authorId ?? null;
+              groupsEntered++;
+              callbacks.status('正在扫描专页 · ' + feed.name);
+            } else if (feed && !/^\d+$/.test(feed.id)) {
               const currentPath = new URL(page.url()).pathname;
               const onGroupMainFeed =
                 !/\/user\/|\/search\/?/.test(currentPath) &&
@@ -1894,7 +2205,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               }
               resolvedPageId = match.authorId;
             }
-            if (feed) {
+            if (!isPageBumperMode && feed) {
               await navigate(
                 `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/user/${encodeURIComponent(resolvedPageId ?? feed.id)}/`,
               );
@@ -1947,18 +2258,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               counts = new Map<string, number>();
             let empty = 0,
               oldPosts = 0;
+            const maxScanForTarget = isPageBumperMode
+              ? (settings.maxPostsPerPage ?? 3)
+              : settings.maxPostsPerGroupPage;
             for (
               let scroll = 0;
               scroll <
-                (feed
-                  ? Math.max(3, settings.maxPostsPerGroupPage * 2)
-                  : Math.max(12, settings.maxPostsPerGroupPage * 2)) && empty < 5;
+                (feed ? Math.max(3, maxScanForTarget * 2) : Math.max(12, maxScanForTarget * 2)) &&
+              empty < 5;
               scroll++
             ) {
               guard();
               await assertIdentity();
               surface =
-                scroll === 0 && !feed && !scanOnly
+                scroll === 0 && (!feed || isPageBumperMode) && !scanOnly
                   ? initialFeed
                   : await readGroupBumper(page, {
                       groupId: effectiveGroupId,
@@ -1987,19 +2300,37 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               if (feed && surface.pageAvatarUrl)
                 await updateAvatar('pages', feed.id, surface.pageAvatarUrl);
               if (surface.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
-              if (!surface.groupIds.includes(effectiveGroupId.toLowerCase()))
+              if (
+                isPageBumperMode &&
+                /^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname)
+              )
+                throw Error('当前页面不是专页主页，未执行顶贴');
+              if (!isPageBumperMode && !surface.groupIds.includes(effectiveGroupId.toLowerCase()))
                 throw Error('当前小组已变化');
               let fresh = 0;
               for (const post of surface.posts) {
                 if (seen.has(post.postId)) continue;
-                if (!post.authorId && !post.authorName.trim()) continue;
-                const target = (feed ? [feed] : pages).find((p) =>
-                  bumperAuthorMatch(
-                    post,
-                    feed && resolvedPageId ? { ...p, id: resolvedPageId } : p,
-                  ),
+                if (!isPageBumperMode && !post.authorId && !post.authorName.trim()) continue;
+                const target =
+                  isPageBumperMode && feed
+                    ? isForeignPagePost(post, feed, pageOwnerAuthorId)
+                      ? undefined
+                      : feed
+                    : (feed ? [feed] : pages).find((p) =>
+                        bumperAuthorMatch(
+                          post,
+                          feed && resolvedPageId ? { ...p, id: resolvedPageId } : p,
+                        ),
+                      );
+                const isPostHydrated = Boolean(
+                  post.likeCSS ||
+                  post.commentButtonCSS ||
+                  post.commentCSS ||
+                  post.authorAliases.length > 0,
                 );
                 if (!target) {
+                  // 未水合的屏下卡片暂不计入已见，等滚动水合后再判定作者
+                  if (!isPostHydrated) continue;
                   seen.add(post.postId);
                   fresh++;
                   if (
@@ -2012,7 +2343,12 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   else if (!post.pinned) oldPosts = 0;
                   continue;
                 }
-                if (settings.searchMode !== 'random_browse' && post.ageHours === null) continue;
+                if (
+                  !isPageBumperMode &&
+                  settings.searchMode !== 'random_browse' &&
+                  post.ageHours === null
+                )
+                  continue;
                 seen.add(post.postId);
                 fresh++;
                 if (
@@ -2052,25 +2388,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   target.name = post.authorName.trim();
                 }
                 const scanned = counts.get(target.id) ?? 0;
-                if (scanned >= settings.maxPostsPerGroupPage) continue;
+                if (scanned >= maxScanForTarget) continue;
                 counts.set(target.id, scanned + 1);
                 if (
+                  !isPageBumperMode &&
                   settings.searchMode !== 'random_browse' &&
                   (post.ageHours === null || post.ageHours > settings.maxPostAgeHours)
                 ) {
                   filteredByAgePosts++;
                   continue;
                 }
-                let claimWait = 0;
-                const maxClaimWait = Math.round(1000 * this.paceScale);
-                while (this.postClaims.has(post.postId) && claimWait < maxClaimWait) {
-                  guard();
-                  await wait(100);
-                  claimWait += 100;
-                }
-                if (this.postClaims.has(post.postId)) continue;
                 guard();
-                this.postClaims.add(post.postId);
                 let chosen: Awaited<ReturnType<SqliteGroupBumperRepository['pickComment']>> = null;
                 try {
                   const q = await this.repo.eligibility(accountId, profileId, post.postId);
@@ -2152,6 +2480,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     if (!s.visible || !s.ready) throw Error('目标帖子页面尚未可见就绪');
                     const p = s.posts.find((p) => p.postId === post.postId);
                     if (s.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
+                    if (isPageBumperMode) {
+                      if (!p) throw Error('目标帖子或作者已变化');
+                      return p;
+                    }
                     if (
                       !s.groupIds.includes(effectiveGroupId.toLowerCase()) ||
                       !p ||
@@ -2167,6 +2499,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   await op(
                     post.hasVideo ? '观看目标视频' : '浏览目标帖子',
                     async () => {
+                      const postDiscoveredAtMs = performance.now();
+                      const maxWatchMs = Math.round(180_000 * this.paceScale);
+                      const deadlineMs = postDiscoveredAtMs + maxWatchMs;
                       const anchorCSS =
                         post.videoCSS ??
                         post.likeCSS ??
@@ -2176,123 +2511,116 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       if (anchorCSS) {
                         await centerBumperControl(page.locator(anchorCSS).first(), this.paceScale);
                       }
-                      if (post.hasVideo) {
-                        callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
-                        if (post.videoCSS) {
-                          try {
-                            await page
-                              .locator(post.videoCSS)
-                              .first()
-                              .evaluate((el) => {
-                                if (el instanceof HTMLVideoElement) {
-                                  el.muted = true;
-                                  if (el.paused) void el.play().catch(() => {});
-                                }
-                              });
-                          } catch {}
-                        }
-                        let current = await checkPost();
-                        const knownShort =
-                          typeof current.videoDuration === 'number' &&
-                          current.videoDuration > 0 &&
-                          current.videoDuration <= 90;
-                        const minWatchMs = Math.round(10000 * this.paceScale);
-                        const maxWaitMs = Math.round(
-                          (knownShort
-                            ? Math.ceil((current.videoDuration ?? 15) * 1000) + 5000
-                            : 25000 + Math.floor(Math.random() * 20001)) * this.paceScale,
+                      // 居中后重新读取一次：屏下卡片水合后才暴露视频/点赞栏
+                      const refreshedPost = await checkPost().catch(() => post);
+                      if (!post.videoCSS && refreshedPost.videoCSS) {
+                        await centerBumperControl(
+                          page.locator(refreshedPost.videoCSS).first(),
+                          this.paceScale,
                         );
+                      }
+                      const videoCSS = refreshedPost.videoCSS ?? post.videoCSS;
+                      if (post.hasVideo || refreshedPost.hasVideo) {
+                        callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
+                        if (!videoCSS) {
+                          const fallbackDwell = Math.round(3500 * this.paceScale);
+                          await paceWait(fallbackDwell / (this.paceScale || 1));
+                          return true;
+                        }
+                        try {
+                          await page
+                            .locator(videoCSS)
+                            .first()
+                            .evaluate((el) => {
+                              if (el instanceof HTMLVideoElement) {
+                                el.muted = true;
+                                if (el.paused && !el.ended) void el.play().catch(() => {});
+                              }
+                            });
+                        } catch {}
                         const stepMs = Math.max(10, Math.round(1000 * this.paceScale));
-                        const sample = (p: BumperPost): BumperVideoSample => ({
-                          time: p.videoCurrentTime ?? 0,
-                          frames: p.videoFrames ?? 0,
-                          source: p.videoCurrentSrc ?? '',
-                          paused: p.videoPaused ?? true,
-                          ended: p.videoEnded ?? false,
-                          ready: p.videoReadyState ?? 0,
-                        });
-                        let watchedMs = 0,
-                          frameOnlyGrantedMs = 0;
-                        let previous = sample(current),
-                          sampledAt = performance.now(),
-                          lastProgress = sampledAt;
-                        const until =
-                          sampledAt + maxWaitMs + Math.max(8000, 15000 * this.paceScale);
-                        const requiredMs = knownShort
-                          ? Math.min(minWatchMs, (current.videoDuration ?? 10) * 1000)
-                          : maxWaitMs;
-                        let recovered = false;
-                        while (performance.now() < until) {
+                        let offscreenTicks = 0;
+                        while (performance.now() < deadlineMs) {
                           guard();
                           await paceWait(stepMs / (this.paceScale || 1));
-                          current = await checkPost();
-                          const at = performance.now(),
-                            next = sample(current);
-                          const credit = bumperVideoCredit(
-                            previous,
-                            next,
-                            at - sampledAt,
-                            stepMs,
-                            frameOnlyGrantedMs,
-                          );
-                          if (credit.sourceChanged) throw Error('目标视频源已变化，未继续互动');
-                          watchedMs += credit.grantedMs;
-                          frameOnlyGrantedMs = credit.frameOnlyGrantedMs;
-                          if (credit.grantedMs > 0) lastProgress = at;
-                          previous = next;
-                          sampledAt = at;
-                          if (watchedMs >= requiredMs && (!knownShort || next.ended)) break;
-                          if (next.ended && watchedMs > 0 && knownShort) break;
-                          if (at - lastProgress > 8000 && !recovered && current.videoCSS) {
-                            recovered = true;
-                            await page
-                              .locator(current.videoCSS)
-                              .first()
-                              .evaluate((el) => {
-                                if (el instanceof HTMLVideoElement && el.paused)
-                                  void el.play().catch(() => {});
-                              });
-                          }
-                        }
-                        if (
-                          watchedMs < requiredMs &&
-                          !(knownShort && current.videoEnded && watchedMs > 0)
-                        )
-                          throw Error('视频未完成有效观看，已跳过当前帖');
-                      } else {
-                        callbacks.status(`正在浏览帖子 · ${group.name} · ${target.name}`, q.today);
-                        const totalDwell = Math.round(
-                          (10000 + Math.floor(Math.random() * 8001)) * this.paceScale,
-                        );
-                        let elapsed = 0;
-                        while (elapsed < totalDwell) {
-                          const slice = Math.min(
-                            totalDwell - elapsed,
-                            Math.max(
-                              10,
-                              Math.round(
-                                (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
-                              ),
-                            ),
-                          );
-                          await paceWait(slice / (this.paceScale || 1));
-                          elapsed += slice;
-                          guard();
-                          if (elapsed < totalDwell) {
-                            if (Math.random() < 0.5) {
-                              const delta =
-                                (Math.random() < 0.5 ? 1 : -1) *
-                                (30 + Math.floor(Math.random() * 51));
-                              await page.mouse.wheel(0, delta);
-                            } else {
-                              await page.mouse?.move?.(
-                                280 + Math.floor(Math.random() * 360),
-                                220 + Math.floor(Math.random() * 280),
-                                { steps: 4 },
-                              );
+                          const nextPost = await checkPost().catch(() => null);
+                          if (!nextPost) break;
+
+                          let offscreen = false;
+                          const activeVideoCSS = nextPost.videoCSS ?? videoCSS;
+                          if (activeVideoCSS) {
+                            try {
+                              offscreen = await page
+                                .locator(activeVideoCSS)
+                                .first()
+                                .evaluate((el) => {
+                                  if (!(el instanceof HTMLVideoElement)) return false;
+                                  const rect = el.getBoundingClientRect();
+                                  const vh = window.innerHeight || 800;
+                                  const isOff = rect.bottom < vh * 0.25 || rect.top > vh * 0.75;
+                                  if (!isOff) {
+                                    el.muted = true;
+                                    if (el.paused && !el.ended) void el.play().catch(() => {});
+                                  }
+                                  return isOff;
+                                });
+                            } catch {
+                              offscreen = false;
                             }
                           }
+
+                          if (offscreen) {
+                            offscreenTicks += 1;
+                            if (
+                              offscreenTicks >= 5 &&
+                              performance.now() < deadlineMs &&
+                              activeVideoCSS
+                            ) {
+                              await centerBumperControl(
+                                page.locator(activeVideoCSS).first(),
+                                this.paceScale,
+                              ).catch(() => {});
+                              try {
+                                await page
+                                  .locator(activeVideoCSS)
+                                  .first()
+                                  .evaluate((el) => {
+                                    if (el instanceof HTMLVideoElement) {
+                                      el.muted = true;
+                                      if (el.paused && !el.ended) void el.play().catch(() => {});
+                                    }
+                                  });
+                              } catch {}
+                              offscreenTicks = 0;
+                            }
+                          } else {
+                            offscreenTicks = 0;
+                          }
+
+                          const durationReached =
+                            typeof nextPost.videoDuration === 'number' &&
+                            nextPost.videoDuration > 0 &&
+                            typeof nextPost.videoCurrentTime === 'number' &&
+                            nextPost.videoCurrentTime >=
+                              Math.max(0.5, nextPost.videoDuration - 0.8);
+                          if (
+                            nextPost.videoEnded === true ||
+                            durationReached ||
+                            performance.now() >= deadlineMs
+                          ) {
+                            break;
+                          }
                         }
+                      } else {
+                        callbacks.status(
+                          `正在浏览目标帖子 · ${group.name} · ${target.name}`,
+                          q.today,
+                        );
+                        const totalDwell = Math.round(
+                          (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
+                        );
+                        await paceWait(totalDwell / (this.paceScale || 1));
+                        guard();
                         const latest = await checkPost();
                         const latestAnchor =
                           latest.likeCSS ??
@@ -2331,9 +2659,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                           const current = await checkPost();
                           if (current.liked) return false;
                           if (!current.likeCSS) throw Error('点赞入口未找到');
-                          const button = page.locator(current.likeCSS).first();
-                          await centerBumperControl(button, this.paceScale);
-                          await button.click({ timeout: 4000 });
+                          try {
+                            const button = page.locator(current.likeCSS).first();
+                            await centerBumperControl(button, this.paceScale);
+                            await button.click({ timeout: 4000 });
+                          } catch {
+                            // React 重渲染导致选择器失效：重新读取后重试一次
+                            guard();
+                            const retried = await checkPost();
+                            if (retried.liked) return false;
+                            if (!retried.likeCSS) throw Error('点赞入口未找到');
+                            const again = page.locator(retried.likeCSS).first();
+                            await centerBumperControl(again, this.paceScale);
+                            await again.click({ timeout: 4000 });
+                          }
                           return true;
                         },
                         async (clicked) => {
@@ -2370,11 +2709,21 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       await op(
                         '展开评论',
                         async () => {
-                          const button = page
-                            .locator(current.commentButtonCSS ?? '[data-wb-missing-control]')
-                            .first();
-                          await centerBumperControl(button, this.paceScale);
-                          await button.click({ timeout: 4000 });
+                          try {
+                            const button = page
+                              .locator(current.commentButtonCSS ?? '[data-wb-missing-control]')
+                              .first();
+                            await centerBumperControl(button, this.paceScale);
+                            await button.click({ timeout: 4000 });
+                          } catch {
+                            guard();
+                            const retried = await checkPost();
+                            if (retried.commentCSS) return true;
+                            if (!retried.commentButtonCSS) throw Error('评论入口未找到');
+                            const again = page.locator(retried.commentButtonCSS).first();
+                            await centerBumperControl(again, this.paceScale);
+                            await again.click({ timeout: 4000 });
+                          }
                           return true;
                         },
                         async () => !!(await checkPost()).commentCSS,
@@ -2460,16 +2809,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     data: { groupId: group.id, postId: post.postId },
                   });
                 } finally {
-                  this.postClaims.delete(post.postId);
                   if (chosen) this.commentClaims.delete(chosen.id);
                 }
               }
-              if (oldPosts >= 3) break;
-              if (
-                (feed ? [feed] : pages).every(
-                  (p) => (counts.get(p.id) ?? 0) >= settings.maxPostsPerGroupPage,
-                )
-              )
+              if (!isPageBumperMode && oldPosts >= 3) break;
+              if ((feed ? [feed] : pages).every((p) => (counts.get(p.id) ?? 0) >= maxScanForTarget))
                 break;
               empty = fresh ? 0 : empty + 1;
               await op(

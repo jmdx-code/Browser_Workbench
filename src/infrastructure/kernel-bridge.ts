@@ -2354,7 +2354,7 @@ export class KernelBridge implements KernelBridgeHooks {
             Date.now() - attachStarted > 15_000
           )
             throw error;
-          await facebook.assertIdentity();
+          await facebook?.assertIdentity();
           session.lease.check();
           await new Promise<void>((resolve) => setTimeout(resolve, 200));
         }
@@ -2695,7 +2695,7 @@ export class KernelBridge implements KernelBridgeHooks {
           if (!sameBinding(record.binding, binding) || record.state !== 'DISPATCHING')
             throw Error('KERNEL_OPERATION_BEGIN_REJECTED');
           await inputFence?.();
-          const executeTimeoutMs = allowTargetMiss ? 45_000 : 180_000;
+          const executeTimeoutMs = allowTargetMiss ? 45_000 : 210_000;
           let executeTimer: ReturnType<typeof setTimeout> | undefined;
           const value = await Promise.race([
             work(),

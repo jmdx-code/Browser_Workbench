@@ -238,7 +238,7 @@ globalThis.wo50 = {
       bundle: true,
       write: false,
       format: 'iife',
-      define: { __BUNDLED_EXTENSION_VERSION__: JSON.stringify('0.3.73') },
+      define: { __BUNDLED_EXTENSION_VERSION__: JSON.stringify('0.3.74') },
       platform: 'browser',
       logLevel: 'silent',
     });
@@ -478,7 +478,7 @@ test('WO51: actual worker HELLO and reload acknowledge bundled version despite n
     await tick();
     const hello = ws.sent.find((m) => m.type === 'HELLO');
     assert.ok(hello);
-    assert.equal(hello.extensionVersion, '0.3.73');
+    assert.equal(hello.extensionVersion, '0.3.74');
     h.api.prepared(randomUUID());
     h.api.setKernel({ freeze: async () => {}, isStopUnconfirmed: () => false });
     ws.message({
@@ -487,7 +487,7 @@ test('WO51: actual worker HELLO and reload acknowledge bundled version despite n
       connectionEpoch: h.api.state.epoch,
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(ws.sent.find((m) => m.type === 'EXTENSION_RELOADING')?.extensionVersion, '0.3.73');
+    assert.equal(ws.sent.find((m) => m.type === 'EXTENSION_RELOADING')?.extensionVersion, '0.3.74');
   } finally {
     h.cleanup();
   }

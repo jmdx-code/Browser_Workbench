@@ -8,6 +8,8 @@ export const BumperSettings = z
     searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']).default('time_sort'),
     maxPostAgeHours: z.number().int().min(1).max(720).default(24),
     maxPostsPerGroupPage: z.number().int().min(1).max(50).default(5),
+    maxPostsPerPage: z.number().int().min(1).max(50).default(3),
+    maxConcurrentProfiles: z.number().int().min(1).max(50).default(8),
     dailyMaxLikesPerAccount: z.number().int().min(1).max(500).default(20),
     maxLikesPerPost: z.number().int().min(1).max(500).default(50),
     likeProbability: z.number().int().min(0).max(100).default(100),
@@ -118,6 +120,12 @@ export const StartBumper = z
     pageIds: z.array(GroupIdString).min(1).max(500),
   })
   .strict();
+export const StartPageBumper = z
+  .object({
+    profileIds: z.array(Id).min(1).max(500),
+    pageIds: z.array(GroupIdString).min(1).max(500),
+  })
+  .strict();
 export interface BumperProfileStat {
   today: number;
   session: number;
@@ -138,6 +146,9 @@ export interface BumperState {
   statusText: string;
   profileCounts: Record<string, BumperProfileStat>;
   dailyStats?: BumperDailyStat[];
+  pageBumperRunning?: boolean;
+  pageBumperStatusText?: string;
+  pageBumperProfileCounts?: Record<string, BumperProfileStat>;
 }
 
 export function extractBumperPageId(raw: string): string {

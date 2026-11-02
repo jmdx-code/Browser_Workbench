@@ -679,7 +679,16 @@ export class ExtensionKernelChannel {
         try {
           return await executor.send(request.target, request.method, request.params);
         } catch (error) {
-          if ((input || executor.reviewRequired) && this.activeOperation) {
+          const isBenignScrollPreconditionError =
+            request.method === 'DOM.scrollIntoViewIfNeeded' &&
+            /Node is detached from document|Could not find node|Node does not have a layout object|Cannot find context/i.test(
+              error instanceof Error ? error.message : String(error),
+            );
+          if (
+            (input || executor.reviewRequired) &&
+            !isBenignScrollPreconditionError &&
+            this.activeOperation
+          ) {
             const binding = this.activeOperation;
             executor.revokeFiles();
             this.activeOperation = undefined;

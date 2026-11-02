@@ -13,5 +13,7 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/multi-browser-memory-existing-readers.test.ts',
   'tests/multi-browser-memory-optimization.test.ts',
   'tests/group-bumper-hardening.test.ts',
+  'tests/wo60b-bumper-fixes.test.ts',
+  'tests/wo61-video-and-concurrency.test.ts',
   'tests/finder-list-ui.test.tsx',
 ]);

@@ -76,7 +76,7 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
   ready();
   const manager = new ExtensionUpdates(
     core,
-    '0.3.73',
+    '0.3.74',
     'fixture',
     async (id) =>
       opening ||
@@ -115,7 +115,7 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
     await core.claimFixtureKernel(peer, owner);
     const idleManager = new ExtensionUpdates(
       core,
-      '0.3.73',
+      '0.3.74',
       'fixture',
       async (id) =>
         core.hasPendingControlOrOperation(id) ||

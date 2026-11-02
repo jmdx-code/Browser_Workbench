@@ -6,9 +6,9 @@ import { profileTaskResultLabel } from '../../shared/profile-task-result.js';
 import type { TaskRuntimeOverview } from '../../shared/task-contracts.js';
 import { isErroredPausedPlan, taskReasonDescription } from '../../shared/task-issues.js';
 import { taskTimingLabel } from '../../shared/task-timing.js';
+import { buildFeatureNavItems } from './feature-nav-items.js';
 import type {
   FeatureModuleId,
-  FeatureNavItem,
   ProfileActivityDescriptor,
   SelectionControlSummary,
 } from './module-contracts.js';
@@ -26,6 +26,9 @@ export interface ProfileActivityProjectionInput {
   tasks?: z.infer<typeof TaskRuntimeOverview> | null | undefined;
   bumperCounts?: Record<string, BumperProfileStat> | undefined;
   bumperRunningIds?: readonly string[] | undefined;
+  /** 当前顶贴视图对应的模块（小组顶贴 / 专页顶贴），决定徽标文字。 */
+  bumperModuleId?: 'group-bumper' | 'page-bumper' | undefined;
+  pageBumperRunningIds?: readonly string[] | undefined;
   groupInviterCounts?: Record<string, GroupInviterProfileStat> | null | undefined;
   groupInviterRunningIds?: readonly string[] | undefined;
 }
@@ -53,14 +56,16 @@ export function projectProfileActivity(
   if (input.bumperCounts && (input.bumperCounts[profileId] || !inviterRunning)) {
     const stat = input.bumperCounts[profileId];
     const running = Boolean(stat?.running || bumperRunning);
+    const bumperModule = input.bumperModuleId ?? 'group-bumper';
+    const bumperLabel = bumperModule === 'page-bumper' ? '专页顶贴' : '小组顶贴';
     return {
-      moduleId: 'group-bumper',
-      moduleLabel: '小组顶贴',
+      moduleId: bumperModule,
+      moduleLabel: bumperLabel,
       running,
       tone: running ? 'run' : 'ok',
       text: `今日 ${stat?.today ?? 0} · 本轮 ${stat?.session ?? 0} · ${stat?.status ?? '未运行'}`,
       tooltipLines: [
-        `小组顶贴：今日 ${stat?.today ?? 0} 次 · 本轮 ${stat?.session ?? 0} 次 · ${stat?.status ?? '未运行'}`,
+        `${bumperLabel}：今日 ${stat?.today ?? 0} 次 · 本轮 ${stat?.session ?? 0} 次 · ${stat?.status ?? '未运行'}`,
       ],
     };
   }
@@ -167,13 +172,15 @@ export function projectProfileActivity(
   // 4. Background running module projection
   if (moduleRunning) {
     const isBumper = bumperRunning;
+    const isPage = isBumper && input.pageBumperRunningIds?.includes(profileId) === true;
+    const label = isPage ? '专页顶贴' : isBumper ? '小组顶贴' : '小组邀请人';
     return {
-      moduleId: isBumper ? 'group-bumper' : 'group-inviter',
-      moduleLabel: isBumper ? '小组顶贴' : '小组邀请人',
+      moduleId: isPage ? 'page-bumper' : isBumper ? 'group-bumper' : 'group-inviter',
+      moduleLabel: label,
       running: true,
       tone: 'run',
-      text: `${isBumper ? '小组顶贴' : '小组邀请人'} · 运行中`,
-      tooltipLines: [`${isBumper ? '小组顶贴' : '小组邀请人'}正在后台运行`],
+      text: `${label} · 运行中`,
+      tooltipLines: [`${label}正在后台运行`],
     };
   }
 
@@ -181,7 +188,9 @@ export function projectProfileActivity(
   if (lastResult && lastStatus) {
     const sourceModule: FeatureModuleId =
       lastResult.source === 'group-bumper'
-        ? 'group-bumper'
+        ? lastResult.name === '专页顶贴'
+          ? 'page-bumper'
+          : 'group-bumper'
         : lastResult.source === 'group-inviter'
           ? 'group-inviter'
           : 'active-accounts';
@@ -190,9 +199,11 @@ export function projectProfileActivity(
       moduleLabel:
         sourceModule === 'group-bumper'
           ? '小组顶贴'
-          : sourceModule === 'group-inviter'
-            ? '小组邀请人'
-            : '活跃账号',
+          : sourceModule === 'page-bumper'
+            ? '专页顶贴'
+            : sourceModule === 'group-inviter'
+              ? '小组邀请人'
+              : '活跃账号',
       running: false,
       tone: lastStatus.tone,
       text: lastStatus.text,
@@ -286,53 +297,7 @@ export function extractInviterRunningIds(
     .map(([id]) => id);
 }
 
-export function buildFeatureNavItems({
-  activeAccountRunningCount,
-  groupInviterRunning,
-  inviterRunningCount,
-  groupBumperRunning,
-  bumperRunningCount,
-  attentionCount,
-}: {
-  activeAccountRunningCount: number;
-  groupInviterRunning: boolean;
-  inviterRunningCount: number;
-  groupBumperRunning: boolean;
-  bumperRunningCount: number;
-  attentionCount: number;
-}): FeatureNavItem[] {
-  return [
-    {
-      id: 'active-accounts',
-      group: 'automation',
-      title: '活跃账号',
-      icon: 'active-accounts',
-      runningCount: activeAccountRunningCount,
-    },
-    {
-      id: 'group-inviter',
-      group: 'automation',
-      title: '小组邀请人',
-      icon: 'group-inviter',
-      runningCount: groupInviterRunning ? Math.max(1, inviterRunningCount) : 0,
-    },
-    {
-      id: 'group-bumper',
-      group: 'automation',
-      title: '小组顶贴',
-      icon: 'group-bumper',
-      runningCount: groupBumperRunning ? Math.max(1, bumperRunningCount) : 0,
-    },
-    {
-      id: 'records',
-      group: 'monitor',
-      title: '执行记录',
-      icon: 'records',
-      badgeCount: attentionCount,
-      badgeTone: 'err',
-    },
-  ];
-}
+export { buildFeatureNavItems } from './feature-nav-items.js';
 
 export function buildWorkbenchProjection({
   viewKind,
@@ -344,21 +309,33 @@ export function buildWorkbenchProjection({
   attentionCount,
   message,
 }: {
-  viewKind: 'home' | 'edit' | 'records' | 'group-inviter' | 'group-bumper';
+  viewKind: 'home' | 'edit' | 'records' | 'group-inviter' | 'group-bumper' | 'page-bumper';
   profiles: readonly Profile[] | undefined;
   selected: ReadonlySet<string>;
   tasks: z.infer<typeof TaskRuntimeOverview> | null | undefined;
   groupBumper:
-    { running: boolean; profileCounts: Record<string, BumperProfileStat> } | null | undefined;
+    | {
+        running: boolean;
+        profileCounts: Record<string, BumperProfileStat>;
+        pageBumperRunning?: boolean | undefined;
+        pageBumperProfileCounts?: Record<string, BumperProfileStat> | undefined;
+      }
+    | null
+    | undefined;
   groupInviter:
     { running: boolean; profileCounts: Record<string, GroupInviterProfileStat> } | null | undefined;
   attentionCount: number;
   message: string;
 }) {
   const plans = tasks?.plans ?? [];
-  const bumperRunningIds = Object.entries(groupBumper?.profileCounts ?? {})
+  const groupBumperRunningIds = Object.entries(groupBumper?.profileCounts ?? {})
     .filter(([, stat]) => stat.running)
     .map(([id]) => id);
+  const pageBumperRunningIds = Object.entries(groupBumper?.pageBumperProfileCounts ?? {})
+    .filter(([, stat]) => stat.running)
+    .map(([id]) => id);
+  // 顶贴模块整体运行中的浏览器（小组 + 专页），用于忙碌判定与按 ID 停止。
+  const bumperRunningIds = [...new Set([...groupBumperRunningIds, ...pageBumperRunningIds])];
   const inviterRunningIds = extractInviterRunningIds(groupInviter);
   const activeAccountRunningCount = new Set(
     plans
@@ -379,20 +356,32 @@ export function buildWorkbenchProjection({
           ? '小组邀请人'
           : viewKind === 'group-bumper'
             ? '小组顶贴'
-            : '执行记录';
+            : viewKind === 'page-bumper'
+              ? '专页顶贴'
+              : '执行记录';
   const navItems = buildFeatureNavItems({
     activeAccountRunningCount,
     groupInviterRunning: Boolean(groupInviter?.running),
     inviterRunningCount: inviterRunningIds.length,
     groupBumperRunning: Boolean(groupBumper?.running),
-    bumperRunningCount: bumperRunningIds.length,
+    bumperRunningCount: groupBumperRunningIds.length,
+    pageBumperRunningCount: groupBumper?.pageBumperRunning
+      ? Math.max(1, pageBumperRunningIds.length)
+      : 0,
     attentionCount,
   });
   const projectionInput: ProfileActivityProjectionInput = {
     activeModule,
     tasks,
-    bumperCounts: viewKind === 'group-bumper' ? groupBumper?.profileCounts : undefined,
+    bumperCounts:
+      viewKind === 'group-bumper'
+        ? groupBumper?.profileCounts
+        : viewKind === 'page-bumper'
+          ? (groupBumper?.pageBumperProfileCounts ?? {})
+          : undefined,
+    bumperModuleId: viewKind === 'page-bumper' ? 'page-bumper' : 'group-bumper',
     bumperRunningIds,
+    pageBumperRunningIds,
     groupInviterCounts: viewKind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null,
     groupInviterRunningIds: inviterRunningIds,
   };

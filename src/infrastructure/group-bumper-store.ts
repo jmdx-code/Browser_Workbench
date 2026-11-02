@@ -139,8 +139,15 @@ function ensureBumperSettingsDefault50(db: DatabaseSync) {
       'ALTER TABLE group_bumper_settings ADD COLUMN default_max_likes_50_applied INTEGER NOT NULL DEFAULT 0;',
     );
   }
+  if (!columns.includes('default_max_concurrent_8_applied')) {
+    db.exec(
+      'ALTER TABLE group_bumper_settings ADD COLUMN default_max_concurrent_8_applied INTEGER NOT NULL DEFAULT 0;',
+    );
+  }
   const row = db
-    .prepare('SELECT body, default_max_likes_50_applied FROM group_bumper_settings WHERE id=1')
+    .prepare(
+      'SELECT body, default_max_likes_50_applied, default_max_concurrent_8_applied FROM group_bumper_settings WHERE id=1',
+    )
     .get();
   if (!row) return;
   if (Number(row.default_max_likes_50_applied ?? 0) === 0) {
@@ -150,9 +157,24 @@ function ensureBumperSettingsDefault50(db: DatabaseSync) {
       db.prepare(
         'UPDATE group_bumper_settings SET body=?, default_max_likes_50_applied=1 WHERE id=1',
       ).run(JSON.stringify(next));
+      row.body = JSON.stringify(next);
     } catch {
       db.prepare(
         'UPDATE group_bumper_settings SET default_max_likes_50_applied=1 WHERE id=1',
+      ).run();
+    }
+  }
+  if (Number(row.default_max_concurrent_8_applied ?? 0) === 0) {
+    try {
+      const parsed = BumperSettings.parse(JSON.parse(String(row.body ?? '{}')));
+      const next =
+        parsed.maxConcurrentProfiles === 4 ? { ...parsed, maxConcurrentProfiles: 8 } : parsed;
+      db.prepare(
+        'UPDATE group_bumper_settings SET body=?, default_max_concurrent_8_applied=1 WHERE id=1',
+      ).run(JSON.stringify(next));
+    } catch {
+      db.prepare(
+        'UPDATE group_bumper_settings SET default_max_concurrent_8_applied=1 WHERE id=1',
       ).run();
     }
   }
@@ -165,12 +187,98 @@ function formatLocalYmd(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+export function syncSharedGroupTables(db: DatabaseSync): void {
+  const hasInviter = Boolean(
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'")
+      .get(),
+  );
+  const hasBumper = Boolean(
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
+      .get(),
+  );
+  if (!hasInviter || !hasBumper) return;
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO group_bumper_groups(group_id,group_name,avatar_url,created_at,updated_at,sort_order)
+     SELECT group_id,group_name,avatar_url,created_at,updated_at,
+            (SELECT COALESCE(MAX(sort_order),-1) FROM group_bumper_groups)+ROW_NUMBER() OVER(ORDER BY sort_order,created_at DESC,group_id)
+       FROM group_inviter_groups
+      WHERE group_id NOT IN (SELECT group_id FROM group_bumper_groups)`,
+  ).run();
+  db.prepare(
+    `INSERT INTO group_inviter_groups(group_id,group_name,avatar_url,created_at,updated_at,sort_order)
+     SELECT group_id,group_name,avatar_url,created_at,updated_at,
+            (SELECT COALESCE(MAX(sort_order),-1) FROM group_inviter_groups)+ROW_NUMBER() OVER(ORDER BY sort_order,created_at DESC,group_id)
+       FROM group_bumper_groups
+      WHERE group_id NOT IN (SELECT group_id FROM group_inviter_groups)`,
+  ).run();
+  const shared = db
+    .prepare(
+      `SELECT i.group_id,
+              i.group_name AS inviter_name,
+              i.avatar_url AS inviter_avatar,
+              i.updated_at AS inviter_updated,
+              b.group_name AS bumper_name,
+              b.avatar_url AS bumper_avatar,
+              b.updated_at AS bumper_updated
+         FROM group_inviter_groups i
+         JOIN group_bumper_groups b ON b.group_id = i.group_id`,
+    )
+    .all() as Array<{
+    group_id: string;
+    inviter_name: string;
+    inviter_avatar: string | null;
+    inviter_updated: number | null;
+    bumper_name: string;
+    bumper_avatar: string | null;
+    bumper_updated: number | null;
+  }>;
+  const updateInviter = db.prepare(
+    'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
+  );
+  const updateBumper = db.prepare(
+    'UPDATE group_bumper_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
+  );
+  for (const row of shared) {
+    const id = String(row.group_id);
+    const iName = String(row.inviter_name ?? '').trim();
+    const bName = String(row.bumper_name ?? '').trim();
+    const bumperNewer = Number(row.bumper_updated ?? 0) >= Number(row.inviter_updated ?? 0);
+    const iPlaceholder = isPlaceholderTargetName(iName, id);
+    const bPlaceholder = isPlaceholderTargetName(bName, id);
+    // 名称统一：一侧占位取另一侧真实名；两侧都是真实名时按更新时间取较新一侧（支持任一模块改名）
+    const unifiedName =
+      iPlaceholder && !bPlaceholder
+        ? bName
+        : bPlaceholder && !iPlaceholder
+          ? iName
+          : (bumperNewer ? bName || iName : iName || bName) || id;
+    const nextIName = unifiedName;
+    const nextBName = unifiedName;
+    // 两表头像统一为同一个值：本地 data:image 优先（防倒退），否则取最近更新一侧的外链，避免双向互换。
+    const unifiedAvatar = bumperNewer
+      ? mergedAvatar(row.inviter_avatar, row.bumper_avatar)
+      : mergedAvatar(row.bumper_avatar, row.inviter_avatar);
+    const nextIAvatar = unifiedAvatar;
+    const nextBAvatar = unifiedAvatar;
+    if (nextIName !== row.inviter_name || nextIAvatar !== row.inviter_avatar) {
+      updateInviter.run(nextIName, nextIAvatar, now, id);
+    }
+    if (nextBName !== row.bumper_name || nextBAvatar !== row.bumper_avatar) {
+      updateBumper.run(nextBName, nextBAvatar, now, id);
+    }
+  }
+}
+
 export class SqliteGroupBumperRepository {
   constructor(private readonly db: DatabaseSync) {
     ensureTargetColumns(db, 'group_bumper_groups');
     ensureTargetColumns(db, 'group_bumper_pages');
     ensureProfileTaskResultTable(db);
     ensureBumperSettingsDefault50(db);
+    syncSharedGroupTables(db);
   }
   getOperation(operationId: string): BumperOperationValue | null {
     const r = this.db
@@ -423,6 +531,7 @@ export class SqliteGroupBumperRepository {
         const effectiveName = item.name.trim() || item.id;
         stmt.run(item.id, effectiveName, now, now, item.folderId ?? null);
       }
+      if (kind === 'groups') syncSharedGroupTables(this.db);
       return this.targets(kind);
     });
   }
@@ -502,6 +611,56 @@ export class SqliteGroupBumperRepository {
             '_id=?',
         )
         .run(id, name, originalId);
+      if (kind === 'groups') {
+        const hasInviter = Boolean(
+          this.db
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'",
+            )
+            .get(),
+        );
+        if (hasInviter) {
+          if (id !== originalId) {
+            const dupInviter = this.db
+              .prepare('SELECT * FROM group_inviter_groups WHERE group_id=?')
+              .get(id);
+            if (dupInviter) {
+              this.db.prepare('DELETE FROM group_inviter_groups WHERE group_id=?').run(originalId);
+            } else {
+              this.db
+                .prepare('UPDATE group_inviter_groups SET group_id=? WHERE group_id=?')
+                .run(id, originalId);
+            }
+          }
+          // 同步把本次解析出的名称与头像写给邀请人侧，避免随后按更新时间统一时被旧值反向覆盖
+          const inviterRow = this.db
+            .prepare('SELECT avatar_url FROM group_inviter_groups WHERE group_id=?')
+            .get(id) as { avatar_url?: string | null } | undefined;
+          if (inviterRow) {
+            const inviterAvatar = mergedAvatar(
+              inviterRow.avatar_url == null ? null : String(inviterRow.avatar_url),
+              avatar,
+            );
+            const resolvedAt = Date.now();
+            if (!isPlaceholderTargetName(name, id))
+              this.db
+                .prepare(
+                  'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
+                )
+                .run(name, inviterAvatar, resolvedAt, id);
+            else
+              this.db
+                .prepare(
+                  'UPDATE group_inviter_groups SET avatar_url=?, updated_at=? WHERE group_id=?',
+                )
+                .run(inviterAvatar, resolvedAt, id);
+            this.db
+              .prepare('UPDATE group_bumper_groups SET updated_at=? WHERE group_id=?')
+              .run(resolvedAt, id);
+          }
+          syncSharedGroupTables(this.db);
+        }
+      }
       return true;
     });
   }
@@ -509,13 +668,32 @@ export class SqliteGroupBumperRepository {
   deleteTargets(kind: 'groups' | 'pages', input: unknown) {
     const { ids } = BumperIdsInput.parse(input),
       prefix = kind === 'groups' ? 'group' : 'page';
-    return Number(
-      this.db
-        .prepare(
-          `DELETE FROM group_bumper_${kind} WHERE ${prefix}_id IN (SELECT value FROM json_each(?))`,
-        )
-        .run(JSON.stringify(ids)).changes,
-    );
+    return transaction(this.db, () => {
+      const deleted = Number(
+        this.db
+          .prepare(
+            `DELETE FROM group_bumper_${kind} WHERE ${prefix}_id IN (SELECT value FROM json_each(?))`,
+          )
+          .run(JSON.stringify(ids)).changes,
+      );
+      if (kind === 'groups') {
+        const hasInviter = Boolean(
+          this.db
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'",
+            )
+            .get(),
+        );
+        if (hasInviter) {
+          this.db
+            .prepare(
+              'DELETE FROM group_inviter_groups WHERE group_id IN (SELECT value FROM json_each(?))',
+            )
+            .run(JSON.stringify(ids));
+        }
+      }
+      return deleted;
+    });
   }
   updateAvatar(kind: 'groups' | 'pages', id: string, avatarUrl: string) {
     const trimmed = typeof avatarUrl === 'string' ? avatarUrl.trim() : '';
@@ -531,6 +709,7 @@ export class SqliteGroupBumperRepository {
     this.db
       .prepare(`UPDATE ${table} SET avatar_url=?,updated_at=? WHERE ${prefix}_id=?`)
       .run(trimmed, Date.now(), id);
+    if (kind === 'groups') syncSharedGroupTables(this.db);
   }
   importGroupsFromInviter() {
     const now = Date.now();

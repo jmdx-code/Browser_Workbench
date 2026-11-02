@@ -13,7 +13,7 @@ import { useCardColors } from './card-colors.js';
 import { DiagnosticFeedbackModal } from './diagnostic-feedback-modal.js';
 import { Editor, type EditorHandle } from './editor.js';
 import { FeatureNavRail } from './feature-nav-rail.js';
-import { GroupBumperPage } from './group-bumper-page.js';
+import { GroupBumperPage, PageBumperPage } from './group-bumper-page.js';
 import { GroupInviterPage } from './group-inviter-page.js';
 import { IconClose } from './icons.js';
 import { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
@@ -42,7 +42,8 @@ type View =
   | { kind: 'edit'; row: SavedCombination }
   | { kind: 'records' }
   | { kind: 'group-inviter' }
-  | { kind: 'group-bumper' };
+  | { kind: 'group-bumper' }
+  | { kind: 'page-bumper' };
 function App() {
   const { workspace, error, refresh } = useWorkspace();
   const inspections = useInspections();
@@ -81,13 +82,18 @@ function App() {
     refreshBumper();
     const timer = setInterval(
       refreshBumper,
-      view.kind === 'group-bumper' || groupBumper?.running ? 2000 : 6000,
+      view.kind === 'group-bumper' ||
+        view.kind === 'page-bumper' ||
+        groupBumper?.running ||
+        groupBumper?.pageBumperRunning
+        ? 2000
+        : 6000,
     );
     return () => {
       live = false;
       clearInterval(timer);
     };
-  }, [view.kind, groupBumper?.running]);
+  }, [view.kind, groupBumper?.running, groupBumper?.pageBumperRunning]);
   const [groupInviter, setGroupInviter] = useState<GroupInviterState | null>(null);
   const [groupInviterLoaded, setGroupInviterLoaded] = useState(false);
   const resourceGeneration = useRef(0);
@@ -262,7 +268,13 @@ function App() {
             }
             activities={projectedActivities}
             selectionControls={projectedControls}
-            bumperCounts={view.kind === 'group-bumper' ? groupBumper?.profileCounts : undefined}
+            bumperCounts={
+              view.kind === 'group-bumper'
+                ? groupBumper?.profileCounts
+                : view.kind === 'page-bumper'
+                  ? (groupBumper?.pageBumperProfileCounts ?? {})
+                  : undefined
+            }
             bumperRunningIds={bumperRunningIds}
             groupInviterCounts={
               view.kind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null
@@ -333,7 +345,22 @@ function App() {
                 state={groupBumper}
                 selected={selected}
                 profiles={workspace.profiles}
-                onState={setGroupBumper}
+                onState={(next) => {
+                  setGroupBumper(next);
+                  void refreshGroupInviter();
+                }}
+                onMessage={setMessage}
+              />
+            )}
+            {view.kind === 'page-bumper' && (
+              <PageBumperPage
+                state={groupBumper}
+                selected={selected}
+                profiles={workspace.profiles}
+                onState={(next) => {
+                  setGroupBumper(next);
+                  void refreshGroupInviter();
+                }}
                 onMessage={setMessage}
               />
             )}
@@ -346,11 +373,19 @@ function App() {
                 busy={busy}
                 onAddGroups={async (items) => {
                   setGroupInviter(await api.addInviterGroups({ items }));
+                  void api
+                    .bumperState()
+                    .then(setGroupBumper)
+                    .catch(() => {});
                   setMessage(`已保存 ${items.length} 个小组，正在后台获取小组头像`);
                 }}
                 onDeleteGroups={(groupIds) =>
                   mutate(async () => {
                     setGroupInviter(await api.deleteInviterGroups({ groupIds }));
+                    void api
+                      .bumperState()
+                      .then(setGroupBumper)
+                      .catch(() => {});
                     return `已删除 ${groupIds.length} 个小组`;
                   })
                 }

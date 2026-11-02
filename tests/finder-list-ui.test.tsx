@@ -165,6 +165,38 @@ describe('shared Finder UI', () => {
     expect(selected().has('1')).toBe(true);
     expect(selected().has('2')).toBe(true);
   });
+  it('text selection on name or ID prevents row drag and does not toggle row checkbox on click', async () => {
+    const selected = await mount();
+    const row1 = host.querySelector('[data-finder-id="1"]')!;
+    const nameEl = row1.querySelector('.finder-row-name')!;
+    const codeEl = row1.querySelector('code')!;
+    expect(nameEl.textContent).toBe('条目1');
+    expect(codeEl.textContent).toBe('1');
+
+    // Mousedown on name prevents dragstart on the row
+    await act(async () => {
+      nameEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    });
+    const dragEvent = new Event('dragstart', { bubbles: true, cancelable: true });
+    Object.defineProperty(dragEvent, 'dataTransfer', {
+      value: { setData: vi.fn(), setDragImage: vi.fn() },
+    });
+    await act(async () => {
+      row1.dispatchEvent(dragEvent);
+    });
+    expect(dragEvent.defaultPrevented).toBe(true);
+    await act(async () => {
+      window.dispatchEvent(new MouseEvent('mouseup'));
+    });
+
+    // Non-empty text selection blocks row click from toggling checkbox
+    const getSelectionSpy = vi
+      .spyOn(window, 'getSelection')
+      .mockReturnValue({ toString: () => '条目1' } as unknown as Selection);
+    await click(row1);
+    expect(selected().has('1')).toBe(false);
+    getSelectionSpy.mockRestore();
+  });
 });
 it('Sidebar has one compact move/cleanup/stop toolbar and stops all three task kinds', async () => {
   const selected = new Set(['00000000-0000-4000-8000-000000000001']);
