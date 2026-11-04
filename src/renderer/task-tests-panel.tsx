@@ -7,6 +7,7 @@ import { api } from './api.js';
 import { taskReasonDescription } from './task-alerts.js';
 import { ConfirmDialog } from './confirm-dialog.js';
 import { IconMinus, IconPlus } from './icons.js';
+import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import { MAX_CONCURRENT_PROFILES } from '../shared/task-capacity.js';
 
 type BrowseModule = TestRequest['module'];
@@ -441,41 +442,44 @@ function TaskTestDialog({
           {acceptMode === 'count' && (
             <label>
               接受数量（个）
-              <input
-                aria-label="好友请求接受数量"
-                type="number"
-                min="1"
-                max="500"
-                value={maxAccepts}
+              <ControlledNumberInput
+                ariaLabel="好友请求接受数量"
+                min={1}
+                max={500}
+                defaultValue={2}
+                value={Number(maxAccepts) || 2}
                 disabled={busy}
-                onChange={(e) => setMaxAccepts(e.target.value)}
+                onChange={(v) => setMaxAccepts(String(v))}
+                onCommit={(v) => setMaxAccepts(String(v))}
               />
             </label>
           )}
           <label>
             最长等待时长（分钟）
-            <input
-              aria-label="单项测试时长"
-              type="number"
-              min="1"
-              max="240"
-              value={minutes}
+            <ControlledNumberInput
+              ariaLabel="单项测试时长"
+              min={1}
+              max={240}
+              defaultValue={15}
+              value={Number(minutes) || 15}
               disabled={busy}
-              onChange={(e) => setMinutes(e.target.value)}
+              onChange={(v) => setMinutes(String(v))}
+              onCommit={(v) => setMinutes(String(v))}
             />
           </label>
         </>
       ) : (
         <label>
           浏览时长（分钟）
-          <input
-            aria-label="单项测试时长"
-            type="number"
-            min="1"
-            max="240"
-            value={minutes}
+          <ControlledNumberInput
+            ariaLabel="单项测试时长"
+            min={1}
+            max={240}
+            defaultValue={1}
+            value={Number(minutes) || 1}
             disabled={busy}
-            onChange={(e) => setMinutes(e.target.value)}
+            onChange={(v) => setMinutes(String(v))}
+            onCommit={(v) => setMinutes(String(v))}
           />
         </label>
       )}
@@ -484,25 +488,29 @@ function TaskTestDialog({
           <div className="schedule-times">
             <label>
               随机点赞上限（0 为不点赞）
-              <input
-                type="number"
-                min="0"
-                max="100"
-                value={maxLikes}
+              <ControlledNumberInput
+                ariaLabel="随机点赞上限"
+                min={0}
+                max={100}
+                defaultValue={0}
+                value={Number(maxLikes) || 0}
                 disabled={busy}
-                onChange={(e) => setMaxLikes(e.target.value)}
+                onChange={(v) => setMaxLikes(String(v))}
+                onCommit={(v) => setMaxLikes(String(v))}
               />
             </label>
             {Number(maxLikes) > 0 && (
               <label>
                 触发概率 (%)
-                <input
-                  type="number"
-                  min="1"
-                  max="100"
-                  value={likeProbability}
+                <ControlledNumberInput
+                  ariaLabel="触发概率"
+                  min={1}
+                  max={100}
+                  defaultValue={35}
+                  value={Number(likeProbability) || 35}
                   disabled={busy}
-                  onChange={(e) => setLikeProbability(e.target.value)}
+                  onChange={(v) => setLikeProbability(String(v))}
+                  onCommit={(v) => setLikeProbability(String(v))}
                 />
               </label>
             )}
@@ -511,12 +519,15 @@ function TaskTestDialog({
             <>
               <label>
                 目标最低点赞量（赞）
-                <input
-                  type="number"
-                  min="0"
-                  value={minLikeCount}
+                <ControlledNumberInput
+                  ariaLabel="目标最低点赞量"
+                  min={0}
+                  max={1_000_000}
+                  defaultValue={0}
+                  value={Number(minLikeCount) || 0}
                   disabled={busy}
-                  onChange={(e) => setMinLikeCount(e.target.value)}
+                  onChange={(v) => setMinLikeCount(String(v))}
+                  onCommit={(v) => setMinLikeCount(String(v))}
                 />
               </label>
               <label>

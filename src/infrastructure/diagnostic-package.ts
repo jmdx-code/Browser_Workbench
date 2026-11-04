@@ -6,6 +6,15 @@ import { crc32, deflateRawSync } from 'node:zlib';
 import type { TaskRepository } from '../domain/tasks.js';
 import type { TaskTabRepository } from '../domain/task-tabs.js';
 import { ProductError } from '../domain/workspace.js';
+import { mapAsync } from '../shared/async-collections.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
+import type { Core } from '../bridge/core.js';
+import type { KernelBridge } from './kernel-bridge.js';
+import type { WorkspaceService } from '../application/workspace-service.js';
+import type { TaskService } from '../application/task-service.js';
+import type { GroupInviterService } from '../application/group-inviter-service.js';
+import type { GroupBumperService } from '../application/group-bumper-service.js';
+import type { GroupPosterService } from '../application/group-poster-service.js';
 
 export interface ZipEntryInput {
   name: string;
@@ -324,6 +333,10 @@ export interface BuildDiagnosticPackageOptions {
     state: unknown;
     logs: unknown[];
   } | null;
+  groupPoster?: {
+    state: unknown;
+    logs: unknown[];
+  } | null;
   tasksRepository: TaskRepository;
   taskTabsRepository?: TaskTabRepository;
   devDiagFlush: () => Promise<void>;
@@ -369,6 +382,7 @@ export async function buildDiagnosticFeedbackPackage(
     combinations: options.combinations,
     groupInviter: options.groupInviter,
     groupBumper: options.groupBumper,
+    groupPoster: options.groupPoster ?? null,
   };
 
   // 2. Build 2-task-ledger.json (latest 30 plans sorted by updatedAt DESC)
@@ -493,5 +507,195 @@ export async function buildDiagnosticFeedbackPackage(
     sizeBytes: zipBuffer.length,
     entryId: options.entryId,
     at: options.at,
+  };
+}
+
+export interface CreateDiagnosticSnapshotBuilderDeps {
+  dataDir: string;
+  softwareVersion: string;
+  extensionVersion: string;
+  workspaceService: WorkspaceService;
+  taskService: TaskService;
+  groupInviterService: GroupInviterService;
+  getGroupBumperService: () => GroupBumperService | undefined;
+  groupPosterService: GroupPosterService;
+  tasksRepository: TaskRepository;
+  taskTabsRepository?: TaskTabRepository;
+  core: Core;
+  getMainKernel: () => KernelBridge | undefined;
+  controllerLoopDelay: {
+    count: number;
+    max: number;
+    percentile(p: number): number;
+  };
+  devDiagFlush: () => Promise<void>;
+  devDiagFilePath: string;
+}
+
+export function createDiagnosticSnapshotBuilder(deps: CreateDiagnosticSnapshotBuilderDeps) {
+  return async (diagInput?: {
+    note?: string;
+    uiContext?: string;
+    targetDir?: string;
+    reveal?: boolean;
+  }): Promise<DiagnosticPackageResult> => {
+    const { note, uiContext, targetDir, reveal } = diagInput ?? {};
+    const groupBumperService = deps.getGroupBumperService();
+    const mainKernel = deps.getMainKernel();
+    const [wsSnapshot, runtime, inviterState, inviterLogs, posterState, posterLogs] =
+      await Promise.all([
+        deps.workspaceService.snapshot(),
+        deps.taskService.runtimeOverview(),
+        deps.groupInviterService.state(),
+        deps.groupInviterService.logs('', undefined, 300),
+        deps.groupPosterService.state(),
+        deps.groupPosterService.logs('', undefined, undefined),
+      ]);
+    const bumperState = groupBumperService ? await groupBumperService.state() : null;
+    const bumperLogs = groupBumperService
+      ? await groupBumperService.logs('', undefined, undefined, 300)
+      : [];
+    const activePlans = await mapAsync(runtime.plans.slice(-16), async (plan) => {
+      const activeStep = await deps.tasksRepository.currentStepForPlan?.(
+        plan.id,
+        plan.round,
+        plan.position,
+      );
+      const rawOps = deps.tasksRepository.recentOperations
+        ? await deps.tasksRepository.recentOperations(plan.id, 6)
+        : [];
+      const recentOps = rawOps.map((op) => ({
+        id: op.id,
+        kind: op.action.kind,
+        status: op.status,
+        disposition: op.disposition ?? null,
+        updatedAt: op.updatedAt,
+      }));
+      const matched = wsSnapshot.profiles.find((p) => p.id === plan.profileId);
+      return {
+        id: plan.id,
+        profileId: plan.profileId,
+        profileName: matched?.alias || matched?.browserName || plan.profileId.slice(0, 8),
+        combinationName: plan.snapshot.name,
+        state: plan.state,
+        reason: plan.reason,
+        round: plan.round,
+        position: plan.position,
+        activeStep: activeStep
+          ? {
+              id: activeStep.id,
+              type: activeStep.spec.type,
+              status: activeStep.status,
+              progress: activeStep.progress,
+            }
+          : null,
+        recentOps,
+      };
+    });
+    const profileSummaries = wsSnapshot.profiles.map((p) => {
+      const peer = deps.core.peers.get(p.id);
+      return {
+        id: p.id,
+        name: p.alias || p.browserName || p.id.slice(0, 8),
+        alias: p.alias ?? '',
+        browserName: p.browserName ?? '',
+        online: p.online,
+        phase: p.phase,
+        synced: p.synced,
+        unresolved: p.unresolved,
+        extensionVersion: peer?.extensionVersion ?? null,
+        accountState: p.account.state,
+        accountId: p.account.id ?? null,
+        accountName: p.account.name ?? null,
+        profileWindowFocused: peer?.profileWindowFocused ?? null,
+        focusedWindowAt: peer?.focusedWindowAt ?? null,
+        presentationRecoverySupported:
+          peer?.capabilities?.includes('task-presentation-recovery-v1') ?? false,
+        kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-50) : [],
+      };
+    });
+    const loopDelaySummary = {
+      resolutionMs: 20,
+      samples: deps.controllerLoopDelay.count,
+      maxSampleIntervalMs: deps.controllerLoopDelay.count
+        ? deps.controllerLoopDelay.max / 1e6
+        : null,
+      p99SampleIntervalMs: deps.controllerLoopDelay.count
+        ? deps.controllerLoopDelay.percentile(99) / 1e6
+        : null,
+    };
+    const entry = devDiag.record({
+      level: 'SNAPSHOT',
+      category: 'SNAPSHOT',
+      event: 'USER_MANUAL_SNAPSHOT',
+      reason: note?.trim() || uiContext?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
+      data: {
+        softwareVersion: deps.softwareVersion,
+        uiContext: uiContext?.trim() || '',
+        controllerLoopDelay: loopDelaySummary,
+        controllerMemory: process.memoryUsage(),
+        settings: runtime.settings,
+        profiles: profileSummaries,
+        plans: activePlans,
+        plansTruncated: runtime.plans.length > activePlans.length,
+        groupInviter: {
+          running: inviterState.running,
+          runId: inviterState.runId,
+          statusText: inviterState.statusText,
+          profileCounts: inviterState.profileCounts,
+        },
+        groupBumper: bumperState
+          ? {
+              running: bumperState.running,
+              pageBumperRunning: bumperState.pageBumperRunning,
+              statusText: bumperState.statusText,
+              pageBumperStatusText: bumperState.pageBumperStatusText,
+              profileCounts: bumperState.profileCounts,
+              pageBumperProfileCounts: bumperState.pageBumperProfileCounts,
+            }
+          : null,
+        groupPoster: {
+          running: posterState.running,
+          statusText: posterState.statusText,
+          profileCounts: posterState.profileCounts,
+        },
+      },
+    });
+    const combinationsSummary = wsSnapshot.combinations.map((row) => ({
+      id: row.id,
+      version: row.version,
+      revision: row.revision,
+      updatedAt: row.updatedAt,
+      saved: row.saved
+        ? {
+            name: row.saved.name,
+            note: row.saved.note,
+            randomOrder: row.saved.randomOrder,
+            loop: row.saved.loop,
+            steps: row.saved.steps,
+          }
+        : null,
+    }));
+    return await buildDiagnosticFeedbackPackage({
+      dataDir: deps.dataDir,
+      softwareVersion: deps.softwareVersion,
+      extensionVersion: deps.extensionVersion,
+      note,
+      uiContext,
+      targetDir,
+      reveal,
+      entryId: entry.id,
+      at: entry.at,
+      controllerLoopDelay: loopDelaySummary,
+      profiles: profileSummaries,
+      combinations: combinationsSummary,
+      groupInviter: { state: inviterState, logs: inviterLogs },
+      groupBumper: bumperState ? { state: bumperState, logs: bumperLogs } : null,
+      groupPoster: { state: posterState, logs: posterLogs.slice(0, 50) },
+      tasksRepository: deps.tasksRepository,
+      taskTabsRepository: deps.taskTabsRepository,
+      devDiagFlush: deps.devDiagFlush,
+      devDiagFilePath: deps.devDiagFilePath,
+    });
   };
 }

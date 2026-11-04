@@ -1,9 +1,14 @@
 import { FinderTargetList, orderedFinderItems } from './finder-target-list.js';
 import type { TargetFolder } from '../shared/target-list.js';
+import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
 import { useEffect, useRef, useState } from 'react';
 import type { GroupInviterState } from '../shared/group-inviter.js';
 import { IconClose, IconPlay, IconPlus, IconStop } from './icons.js';
+import {
+  ControlledNumberInput,
+  type ControlledNumberInputHandle,
+} from './modules/shared/controlled-number-input.js';
 
 type GridColumn = 0 | 1;
 type GridRange = { r1: number; c1: GridColumn; r2: number; c2: GridColumn };
@@ -488,6 +493,7 @@ export function GroupInviterPage({
   onSaveInvitesPerGroup,
   onStart,
   onStop,
+  onMessage,
 }: {
   state: GroupInviterState | null;
   loaded: boolean;
@@ -501,11 +507,18 @@ export function GroupInviterPage({
   onSaveInvitesPerGroup: (invitesPerGroup: number) => Promise<void>;
   onStart: (groupIds: string[], invitesPerGroup: number) => Promise<void>;
   onStop: () => Promise<void>;
+  onMessage?: (msg: string) => void;
 }) {
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
+  const [refreshingAvatars, setRefreshingAvatars] = useState(false);
   const [folders, setFolders] = useState<TargetFolder[]>([]);
   const [addFolder, setAddFolder] = useState<string | null>(null);
   const [invitesInput, setInvitesInput] = useState<number>(state?.invitesPerGroup ?? 30);
+  const [concurrencyInput, setConcurrencyInput] = useState<number>(
+    state?.maxConcurrentProfiles ?? 4,
+  );
+  const invitesInputRef = useRef<ControlledNumberInputHandle>(null);
+  const concurrencyInputRef = useRef<ControlledNumberInputHandle>(null);
   const [addingModalOpen, setAddingModalOpen] = useState(false);
   const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
     Array.from({ length: 5 }, () => makeDraftRow()),
@@ -517,7 +530,10 @@ export function GroupInviterPage({
     if (state?.invitesPerGroup !== undefined) {
       setInvitesInput(state.invitesPerGroup);
     }
-  }, [state?.invitesPerGroup]);
+    if (state?.maxConcurrentProfiles !== undefined) {
+      setConcurrencyInput(state.maxConcurrentProfiles);
+    }
+  }, [state?.invitesPerGroup, state?.maxConcurrentProfiles]);
 
   // Keep selectedGroups pruned to existing groups
   useEffect(() => {
@@ -531,6 +547,7 @@ export function GroupInviterPage({
 
   const groups = state?.groups ?? [];
   const isRunning = Boolean(state?.running);
+  const idleSelected = [...selectedProfileIds].filter((id) => !state?.profileCounts?.[id]?.running);
   const totalInvitedAcrossGroups = groups.reduce((sum, item) => sum + item.totalInvitedCount, 0);
 
   function openAddModal() {
@@ -598,26 +615,88 @@ export function GroupInviterPage({
             title="每个账号进入每个小组单次最多邀请的好友人数（默认 30）"
           >
             <span>每组邀请</span>
-            <input
-              type="number"
+            <ControlledNumberInput
+              ref={invitesInputRef}
+              ariaLabel="每组邀请"
               min={1}
               max={200}
+              defaultValue={30}
               disabled={busy || isRunning}
               value={invitesInput}
-              onChange={(event) => setInvitesInput(Number(event.target.value))}
-              onBlur={() => {
-                const normalized = normalizeInvitesCount(invitesInput);
+              onChange={setInvitesInput}
+              onCommit={(normalized) => {
                 setInvitesInput(normalized);
                 if (state && normalized !== state.invitesPerGroup) {
-                  void onSaveInvitesPerGroup(normalized);
+                  return onSaveInvitesPerGroup(normalized);
                 }
               }}
             />
             <span>人</span>
           </label>
+          <label
+            className="group-inviter-limit-field"
+            title="同时运行的最大浏览器并发数（默认 4，范围 1-50）"
+          >
+            <span>最大并发</span>
+            <ControlledNumberInput
+              ref={concurrencyInputRef}
+              ariaLabel="最大并发"
+              min={1}
+              max={50}
+              defaultValue={4}
+              disabled={busy}
+              value={concurrencyInput}
+              onChange={setConcurrencyInput}
+              onCommit={(normalized) => {
+                setConcurrencyInput(normalized);
+                if (state && normalized !== state.maxConcurrentProfiles) {
+                  return api
+                    .saveGroupInviterSettings({ maxConcurrentProfiles: normalized })
+                    .then(() => onRefresh())
+                    .catch(() => {});
+                }
+              }}
+            />
+          </label>
+          <label className="group-inviter-limit-field" title="所有账号邀请完成后播放提示音">
+            <input
+              type="checkbox"
+              aria-label="完成后播放提示音"
+              disabled={busy}
+              checked={state?.playSoundOnComplete !== false}
+              onChange={(e) => {
+                void api
+                  .saveGroupInviterSettings({ playSoundOnComplete: e.target.checked })
+                  .then(() => onRefresh())
+                  .catch(() => {});
+              }}
+            />
+            <span>完成后播放提示音</span>
+          </label>
           <button className="btn" type="button" disabled={busy} onClick={openAddModal}>
             <IconPlus size={14} /> 添加小组
           </button>
+          {isRunning && idleSelected.length > 0 && (
+            <button
+              className="btn btn-primary"
+              type="button"
+              disabled={busy || idleSelected.length === 0 || selectedGroups.size === 0}
+              onClick={() => {
+                void (async () => {
+                  const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
+                  await concurrencyInputRef.current?.flush();
+                  await onStart(
+                    orderedFinderItems(groups, folders)
+                      .filter((g) => selectedGroups.has(g.groupId))
+                      .map((g) => g.groupId),
+                    normalizeInvitesCount(flushedInvites),
+                  );
+                })();
+              }}
+            >
+              ▶ 追加运行已选闲置号 ({idleSelected.length})
+            </button>
+          )}
           {isRunning ? (
             <button
               className="btn btn-danger"
@@ -639,14 +718,18 @@ export function GroupInviterPage({
                     ? '请先在右侧表格勾选小组'
                     : `使用已选的 ${selectedProfileIds.size} 个账号向 ${selectedGroups.size} 个小组随机错峰邀请好友`
               }
-              onClick={() =>
-                void onStart(
-                  orderedFinderItems(groups, folders)
-                    .filter((g) => selectedGroups.has(g.groupId))
-                    .map((g) => g.groupId),
-                  normalizeInvitesCount(invitesInput),
-                )
-              }
+              onClick={() => {
+                void (async () => {
+                  const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
+                  await concurrencyInputRef.current?.flush();
+                  await onStart(
+                    orderedFinderItems(groups, folders)
+                      .filter((g) => selectedGroups.has(g.groupId))
+                      .map((g) => g.groupId),
+                    normalizeInvitesCount(flushedInvites),
+                  );
+                })();
+              }}
             >
               <IconPlay size={12} /> 开始运行
               {selectedProfileIds.size > 0 && selectedGroups.size > 0
@@ -657,10 +740,20 @@ export function GroupInviterPage({
         </div>
       </div>
 
-      {state?.statusText && (
-        <div className={'group-inviter-banner' + (isRunning ? ' is-running' : '')} role="status">
+      {(state?.avatarRefreshStatusText || state?.statusText) && (
+        <div
+          className={
+            'group-inviter-banner' +
+            (isRunning || state?.groupAvatarRefreshing ? ' is-running' : '')
+          }
+          role="status"
+        >
           <span className="banner-dot" />
-          <span>{state.statusText}</span>
+          <span>
+            {state?.groupAvatarRefreshing && state.avatarRefreshStatusText
+              ? state.avatarRefreshStatusText
+              : state?.statusText}
+          </span>
           <span className="banner-hint">
             已选账号 {selectedProfileIds.size} 个 · 已选小组 {selectedGroups.size} 个
           </span>
@@ -671,10 +764,10 @@ export function GroupInviterPage({
         <p className="muted records-empty">正在读取小组库…</p>
       ) : (
         <FinderTargetList
-          listKind="inviter_groups"
-          title="目标小组列表"
+          listKind="shared_groups"
+          title="小组列表"
           countLabel="累计被邀请人数"
-          disabled={busy || isRunning}
+          disabled={busy}
           items={groups.map((g) => ({
             id: g.groupId,
             name: g.groupName,
@@ -688,6 +781,50 @@ export function GroupInviterPage({
           onDelete={onDeleteGroups}
           onChanged={onRefresh}
           onFolders={setFolders}
+          tools={
+            <button className="btn btn-sm" type="button" disabled={busy} onClick={openAddModal}>
+              ＋ 添加小组
+            </button>
+          }
+          moreItems={[
+            refreshingAvatars || state?.groupAvatarRefreshing
+              ? {
+                  label: '停止刷新头像',
+                  disabled: busy,
+                  onSelect: () => {
+                    void api
+                      .stopRefreshGroupInviterGroups()
+                      .then((next) => {
+                        onMessage?.(next.avatarRefreshStatusText || '已停止读取小组资料');
+                        return onRefresh();
+                      })
+                      .catch((err) => {
+                        onMessage?.(err instanceof Error ? err.message : String(err));
+                      })
+                      .finally(() => setRefreshingAvatars(false));
+                  },
+                }
+              : {
+                  label: '刷新头像',
+                  disabled: busy || isRunning || groups.length === 0,
+                  onSelect: () => {
+                    setRefreshingAvatars(true);
+                    void api
+                      .refreshGroupInviterGroups(
+                        selectedGroups.size ? { ids: [...selectedGroups] } : {},
+                      )
+                      .then((next) => {
+                        const msg = next.avatarRefreshStatusText || next.statusText;
+                        if (msg) onMessage?.(msg);
+                        return onRefresh();
+                      })
+                      .catch((err) => {
+                        onMessage?.(err instanceof Error ? err.message : String(err));
+                      })
+                      .finally(() => setRefreshingAvatars(false));
+                  },
+                },
+          ]}
         />
       )}
 

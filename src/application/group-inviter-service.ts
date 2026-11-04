@@ -4,12 +4,20 @@ import {
   GroupInviterState,
   StartGroupInviterRequest,
   StopGroupInviterProfilesRequest,
+  type GroupInviterSettings,
   type InviterGroupRow,
   type GroupInviterProfileStat,
   type GroupInviteLogRow,
 } from '../shared/group-inviter.js';
+import {
+  isTargetIncomplete,
+  type BumperRefreshResult,
+  type BumperTarget,
+} from '../shared/group-bumper.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { ProfileTaskResultValue } from '../shared/task-contracts.js';
+import { admitProfilesForStart } from './profile-start-admission.js';
+import type { FeatureExecutionRegistry } from './feature-execution-registry.js';
 
 export interface GroupInviterRepository {
   hasInvitesForOperation?(
@@ -35,9 +43,15 @@ export interface GroupInviterRepository {
     groupId: string,
     metadata: { groupName?: string | null; avatarUrl?: string | null },
   ): Awaitable<void>;
+  applyResolvedGroupMetadata?(
+    rawGroupId: string,
+    metadata: { canonicalId?: string | null; name?: string | null; avatarUrl?: string | null },
+  ): Awaitable<void>;
   deleteGroups(input: unknown): Awaitable<number>;
   getInvitesPerGroup(): Awaitable<number>;
   setInvitesPerGroup(input: unknown): Awaitable<number>;
+  getSettings?(): Awaitable<GroupInviterSettings>;
+  saveSettings?(input: unknown): Awaitable<GroupInviterSettings>;
   getInvitedFriendIdsForGroup(groupId: string): Awaitable<Set<string>>;
   recordInvites(
     entries: ReadonlyArray<{
@@ -74,7 +88,7 @@ export interface GroupInviterBrowserRunner {
   resolveGroupMetadata?(
     group: InviterGroupRow,
     allowIdleBrowser: boolean,
-  ): Promise<{ groupName?: string | null; avatarUrl?: string | null }>;
+  ): Promise<{ groupName?: string | null; avatarUrl?: string | null; canonicalId?: string | null }>;
   inviteForGroup(
     profileId: string,
     group: InviterGroupRow,
@@ -97,6 +111,7 @@ interface ActiveRunState {
   failedProfiles: Set<string>;
   unconfirmedStops: Set<string>;
   workersFinished: boolean;
+  runningBatches: number;
 }
 
 const randInt = (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1));
@@ -142,23 +157,58 @@ export function buildStaggeredGroupQueues(
 export class GroupInviterService {
   private activeRun: ActiveRunState | null = null;
   private startingProfiles = new Set<string>();
+  private admittingProfiles = new Set<string>();
   private startingCancelled = new Set<string>();
   private startGeneration = 0;
   private lastRun: ActiveRunState | null = null;
   private avatarFetching = new Set<string>();
+  private groupAvatarRefreshing = false;
+  private avatarRefreshStatusText = '';
+  private avatarRefreshAbort: AbortController | null = null;
+  private slotsInUse = 0;
+  private fallbackMaxConcurrentProfiles = 4;
+  private fallbackPlaySoundOnComplete = true;
+  private featureExecution?: FeatureExecutionRegistry;
+
+  setFeatureExecutionRegistry(registry: FeatureExecutionRegistry): void {
+    this.featureExecution = registry;
+  }
+
+  private async readSettings(): Promise<GroupInviterSettings> {
+    if (this.repo.getSettings) {
+      const settings = await this.repo.getSettings();
+      this.fallbackMaxConcurrentProfiles = settings.maxConcurrentProfiles;
+      this.fallbackPlaySoundOnComplete = settings.playSoundOnComplete;
+      return settings;
+    }
+    const invitesPerGroup = await this.repo.getInvitesPerGroup();
+    return {
+      invitesPerGroup,
+      maxConcurrentProfiles: this.fallbackMaxConcurrentProfiles,
+      playSoundOnComplete: this.fallbackPlaySoundOnComplete,
+    };
+  }
 
   constructor(
     private readonly repo: GroupInviterRepository,
     private readonly runner?: GroupInviterBrowserRunner,
     private readonly assertStartAllowed: () => void = () => {},
+    private readonly refreshAvatars?: (
+      items: BumperTarget[],
+      options?: { signal?: AbortSignal; onUpdated?: () => void },
+    ) => Promise<BumperRefreshResult | void>,
+    private readonly stopAvatarRefresh?: () => void,
   ) {}
 
   hasActiveExecution(): boolean {
-    return this.activeRun !== null || this.startingProfiles.size > 0;
+    return (
+      this.activeRun !== null || this.startingProfiles.size > 0 || this.admittingProfiles.size > 0
+    );
   }
   async state(): Promise<GroupInviterState> {
     const groups = await this.repo.listGroups();
-    const invitesPerGroup = await this.repo.getInvitesPerGroup();
+    const settings = await this.readSettings();
+    const invitesPerGroup = settings.invitesPerGroup;
     const totalsByProfile = await this.repo.getTotalInvitedByProfile();
     const run = this.activeRun ?? this.lastRun;
     const profileCounts: Record<string, GroupInviterProfileStat> = {};
@@ -179,6 +229,7 @@ export class GroupInviterService {
       profileCounts[pid] = {
         sessionInvited: run?.sessionCounts.get(pid) ?? 0,
         totalInvited: totalsByProfile.get(pid) ?? 0,
+        running: this.isProfileRunning(pid),
         ...(status ? { status } : {}),
       };
     }
@@ -186,7 +237,13 @@ export class GroupInviterService {
     return GroupInviterState.parse({
       groups,
       invitesPerGroup,
+      maxConcurrentProfiles: settings.maxConcurrentProfiles,
+      playSoundOnComplete: settings.playSoundOnComplete,
       running: this.activeRun !== null || this.startingProfiles.size > 0,
+      groupAvatarRefreshing: this.groupAvatarRefreshing || this.avatarFetching.size > 0,
+      ...(this.avatarRefreshStatusText
+        ? { avatarRefreshStatusText: this.avatarRefreshStatusText }
+        : {}),
       runId: run?.id ?? null,
       startedAt: run?.startedAt ?? null,
       finishedAt: this.activeRun ? null : (this.lastRun?.finishedAt ?? null),
@@ -196,13 +253,8 @@ export class GroupInviterService {
   }
 
   async addGroups(input: unknown): Promise<GroupInviterState> {
-    const groups = await this.repo.upsertGroups(input);
-    const task = this.fetchMissingAvatars();
-    if (groups.some((g) => g.groupName === g.groupId)) {
-      await Promise.race([task, sleep(2500)]);
-    } else {
-      void task;
-    }
+    await this.repo.upsertGroups(input);
+    void this.fetchMissingAvatars();
     return await this.state();
   }
 
@@ -212,7 +264,31 @@ export class GroupInviterService {
   }
 
   async updateSettings(input: unknown): Promise<GroupInviterState> {
-    await this.repo.setInvitesPerGroup(input);
+    if (this.repo.saveSettings) {
+      await this.repo.saveSettings(input);
+    } else {
+      const raw =
+        typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {};
+      if (typeof raw.maxConcurrentProfiles === 'number') {
+        this.fallbackMaxConcurrentProfiles = Math.max(
+          1,
+          Math.min(50, Math.round(raw.maxConcurrentProfiles)),
+        );
+      }
+      if (typeof raw.playSoundOnComplete === 'boolean') {
+        this.fallbackPlaySoundOnComplete = raw.playSoundOnComplete;
+      }
+      if (
+        typeof raw.invitesPerGroup === 'number' ||
+        !('maxConcurrentProfiles' in raw || 'playSoundOnComplete' in raw)
+      ) {
+        await this.repo.setInvitesPerGroup(
+          typeof raw.invitesPerGroup === 'number'
+            ? { invitesPerGroup: raw.invitesPerGroup }
+            : input,
+        );
+      }
+    }
     return await this.state();
   }
 
@@ -234,12 +310,18 @@ export class GroupInviterService {
 
   isProfileRunning(profileId: string): boolean {
     const run = this.activeRun;
-    return this.startingProfiles.has(profileId) || run?.activeProfiles.has(profileId) === true;
+    return (
+      this.admittingProfiles.has(profileId) ||
+      this.startingProfiles.has(profileId) ||
+      run?.activeProfiles.has(profileId) === true
+    );
   }
 
   async stop(): Promise<GroupInviterState> {
     this.startGeneration++;
-    for (const id of this.startingProfiles) this.startingCancelled.add(id);
+    for (const id of [...this.startingProfiles, ...this.admittingProfiles]) {
+      this.startingCancelled.add(id);
+    }
     if (this.activeRun) {
       this.activeRun.cancelled = true;
       for (const pid of this.activeRun.activeProfiles) {
@@ -260,7 +342,11 @@ export class GroupInviterService {
 
   async stopProfiles(input: unknown): Promise<GroupInviterState> {
     const { profileIds } = StopGroupInviterProfilesRequest.parse(input);
-    for (const id of profileIds) if (this.startingProfiles.has(id)) this.startingCancelled.add(id);
+    for (const id of profileIds) {
+      if (this.startingProfiles.has(id) || this.admittingProfiles.has(id)) {
+        this.startingCancelled.add(id);
+      }
+    }
     const run = this.activeRun;
     if (run) {
       for (const pid of profileIds) {
@@ -288,7 +374,15 @@ export class GroupInviterService {
   async start(input: unknown): Promise<GroupInviterState> {
     const req = StartGroupInviterRequest.parse(input);
     this.assertStartAllowed();
-    if (this.activeRun || this.startingProfiles.size) {
+    const requestedUnique = [...new Set(req.profileIds)];
+    const candidateProfiles = requestedUnique.filter(
+      (id) => !this.isProfileRunning(id) && !this.admittingProfiles.has(id),
+    );
+    if (
+      this.startingProfiles.size > 0 ||
+      this.admittingProfiles.size > 0 ||
+      (this.activeRun && candidateProfiles.length === 0)
+    ) {
       throw new ProductError(
         'GROUP_INVITER_ALREADY_RUNNING',
         '小组邀请人正在运行中，请等待完成或先点击停止',
@@ -296,14 +390,56 @@ export class GroupInviterService {
       );
     }
     const generation = this.startGeneration;
-    this.startingProfiles = new Set(req.profileIds);
-    const starting = this.startingProfiles;
-    this.startingCancelled.clear();
+    for (const id of candidateProfiles) {
+      this.admittingProfiles.add(id);
+      this.startingCancelled.delete(id);
+    }
+    let admittedBatch: Set<string> | null = null;
     try {
-      if (req.invitesPerGroup !== undefined) {
-        await this.repo.setInvitesPerGroup({ invitesPerGroup: req.invitesPerGroup });
+      const admission = await admitProfilesForStart({
+        requestedProfileIds: candidateProfiles,
+        currentModuleId: 'group-inviter',
+        isAlreadyRunningInCurrentModule: (id) =>
+          this.startingProfiles.has(id) || this.activeRun?.activeProfiles.has(id) === true,
+        busyModuleLabelsForProfile: async (id) =>
+          this.featureExecution
+            ? await this.featureExecution.busyModuleLabels([id], 'group-inviter')
+            : [],
+        isProfileBusyInOtherModule: async (id) => {
+          if (
+            this.featureExecution &&
+            (await this.featureExecution.isProfileBusy(id, 'group-inviter'))
+          ) {
+            return true;
+          }
+          return Boolean(await this.runner?.isProfileBusy?.(id));
+        },
+        isProfileReady: (id) => (this.runner ? this.runner.isProfileReady(id) : true),
+      });
+
+      for (const id of candidateProfiles) {
+        this.admittingProfiles.delete(id);
       }
-      const invitesPerGroup = await this.repo.getInvitesPerGroup();
+      admittedBatch = new Set(admission.admittedProfileIds);
+      this.startingProfiles = admittedBatch;
+
+      if (
+        req.invitesPerGroup !== undefined ||
+        req.maxConcurrentProfiles !== undefined ||
+        req.playSoundOnComplete !== undefined
+      ) {
+        await this.updateSettings({
+          ...(req.invitesPerGroup !== undefined ? { invitesPerGroup: req.invitesPerGroup } : {}),
+          ...(req.maxConcurrentProfiles !== undefined
+            ? { maxConcurrentProfiles: req.maxConcurrentProfiles }
+            : {}),
+          ...(req.playSoundOnComplete !== undefined
+            ? { playSoundOnComplete: req.playSoundOnComplete }
+            : {}),
+        });
+      }
+      const settings = await this.readSettings();
+      const invitesPerGroup = settings.invitesPerGroup;
       const allGroups = new Map((await this.repo.listGroups()).map((g) => [g.groupId, g]));
       const selectedGroups = req.groupIds
         .map((id) => allGroups.get(id))
@@ -312,36 +448,35 @@ export class GroupInviterService {
         throw new ProductError('GROUP_INVITER_GROUPS_EMPTY', '未找到选中的小组，请刷新后重试', 404);
       }
 
-      const uniqueProfiles = [...new Set(req.profileIds)];
+      const uniqueProfiles = candidateProfiles;
       const profileStatus = new Map<string, string>();
+      for (const item of admission.skippedBusy) {
+        profileStatus.set(item.profileId, item.reason);
+      }
+      for (const item of admission.skippedOffline) {
+        profileStatus.set(item.profileId, item.reason);
+      }
+      const skippedBusy = admission.skippedBusy.length;
+      const skippedOffline = admission.skippedOffline.length;
       const eligibleProfiles: string[] = [];
-      let skippedBusy = 0;
-      let skippedOffline = 0;
 
-      for (const id of uniqueProfiles) {
+      for (const id of admission.admittedProfileIds) {
         if (generation !== this.startGeneration || this.startingCancelled.has(id)) {
           profileStatus.set(id, '已停止');
           continue;
         }
-        if (await this.runner?.isProfileBusy?.(id)) {
-          profileStatus.set(id, '跳过：正在执行其他任务');
-          skippedBusy++;
-        } else if (this.runner && !this.runner.isProfileReady(id)) {
-          profileStatus.set(id, '跳过：浏览器未连接');
-          skippedOffline++;
-        } else {
-          profileStatus.set(id, '准备中');
-          eligibleProfiles.push(id);
-        }
+        profileStatus.set(id, '准备中');
+        eligibleProfiles.push(id);
       }
 
-      if (eligibleProfiles.length === 0) {
+      if (admission.admittedProfileIds.length === 0) {
         throw new ProductError(
           'GROUP_INVITER_PROFILES_UNAVAILABLE',
           skippedBusy > 0 && skippedOffline > 0
             ? `所选浏览器中 ${skippedBusy} 个正在执行其他任务、${skippedOffline} 个未连接，无法启动`
             : skippedBusy > 0
-              ? '所选浏览器正在执行其他任务，请先停止原任务或选择空闲浏览器'
+              ? (admission.skippedBusy[0]?.reason ??
+                '所选浏览器正在执行其他任务，请先停止原任务或选择空闲浏览器')
               : '所选浏览器未连接，请先打开对应浏览器',
           409,
         );
@@ -357,25 +492,47 @@ export class GroupInviterService {
         skippedBusy > 0 ? `跳过 ${skippedBusy} 个运行中` : '',
         skippedOffline > 0 ? `跳过 ${skippedOffline} 个未连接` : '',
       ].filter(Boolean);
-      const run: ActiveRunState = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-        startedAt: Date.now(),
-        finishedAt: null,
-        cancelled: false,
-        cancelledProfiles: new Set<string>(),
-        activeProfiles: new Set<string>(eligibleProfiles),
-        statusText:
-          `正在运行：${eligibleProfiles.length} 个账号 × ${selectedGroups.length} 个小组（每组最多 ${invitesPerGroup} 人）` +
-          (skippedNotes.length ? `（已自动${skippedNotes.join('、')}）` : ''),
-        sessionCounts: new Map(uniqueProfiles.map((id) => [id, 0])),
-        submittedProfiles: new Map(),
-        profileStatus,
-        failedProfiles: new Set<string>(),
-        unconfirmedStops: new Set<string>(),
-        workersFinished: false,
-      };
-      this.assertStartAllowed();
-      this.activeRun = run;
+
+      let run = this.activeRun;
+      if (run) {
+        for (const id of uniqueProfiles) {
+          if (!run.sessionCounts.has(id)) run.sessionCounts.set(id, 0);
+          const st = profileStatus.get(id);
+          if (st) run.profileStatus.set(id, st);
+        }
+        for (const id of eligibleProfiles) {
+          run.cancelledProfiles.delete(id);
+          run.failedProfiles.delete(id);
+          run.activeProfiles.add(id);
+        }
+        run.workersFinished = false;
+        run.runningBatches += 1;
+        run.statusText =
+          `正在运行：${run.activeProfiles.size} 个账号 × ${selectedGroups.length} 个小组（每组最多 ${invitesPerGroup} 人）` +
+          (skippedNotes.length ? `（已自动${skippedNotes.join('、')}）` : '');
+      } else {
+        run = {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+          startedAt: Date.now(),
+          finishedAt: null,
+          cancelled: false,
+          cancelledProfiles: new Set<string>(),
+          activeProfiles: new Set<string>(eligibleProfiles),
+          statusText:
+            `正在运行：${eligibleProfiles.length} 个账号 × ${selectedGroups.length} 个小组（每组最多 ${invitesPerGroup} 人）` +
+            (skippedNotes.length ? `（已自动${skippedNotes.join('、')}）` : ''),
+          sessionCounts: new Map(uniqueProfiles.map((id) => [id, 0])),
+          submittedProfiles: new Map(),
+          profileStatus,
+          failedProfiles: new Set<string>(),
+          unconfirmedStops: new Set<string>(),
+          workersFinished: false,
+          runningBatches: 1,
+        };
+        this.assertStartAllowed();
+        this.activeRun = run;
+      }
+
       devDiag.record({
         level: 'INFO',
         category: 'GROUP_INVITER',
@@ -391,19 +548,26 @@ export class GroupInviterService {
       });
 
       this.startingProfiles.clear();
-      void this.executeRun(run, eligibleProfiles, selectedGroups, invitesPerGroup).catch(
-        (error: unknown) => {
-          devDiag.record({
-            level: 'ERROR',
-            category: 'GROUP_INVITER',
-            event: 'GROUP_INVITER_RUN_ERROR',
-            reason: error instanceof Error ? error.message.slice(0, 200) : 'UNKNOWN',
-          });
-        },
-      );
+      void this.executeRun(
+        run,
+        eligibleProfiles,
+        selectedGroups,
+        invitesPerGroup,
+        settings.maxConcurrentProfiles,
+      ).catch((error: unknown) => {
+        devDiag.record({
+          level: 'ERROR',
+          category: 'GROUP_INVITER',
+          event: 'GROUP_INVITER_RUN_ERROR',
+          reason: error instanceof Error ? error.message.slice(0, 200) : 'UNKNOWN',
+        });
+      });
       return await this.state();
     } finally {
-      if (this.startingProfiles === starting) {
+      for (const id of candidateProfiles) {
+        this.admittingProfiles.delete(id);
+      }
+      if (admittedBatch && this.startingProfiles === admittedBatch) {
         this.startingProfiles.clear();
         this.startingCancelled.clear();
       }
@@ -411,7 +575,7 @@ export class GroupInviterService {
   }
 
   private finishRun(run: ActiveRunState) {
-    if (!run.workersFinished || run.activeProfiles.size) return;
+    if (!run.workersFinished || run.runningBatches > 0 || run.activeProfiles.size) return;
     run.finishedAt = Date.now();
     this.lastRun = run;
     if (this.activeRun === run) this.activeRun = null;
@@ -452,37 +616,136 @@ export class GroupInviterService {
     this.finishRun(run);
   }
 
-  private async fetchMissingAvatars(): Promise<void> {
-    if (!this.runner) return;
-    const missing = (await this.repo.listGroups()).filter(
-      (g) => (!g.avatarUrl || g.groupName === g.groupId) && !this.avatarFetching.has(g.groupId),
+  private async fetchMissingAvatars(selectedIds?: readonly string[]): Promise<void> {
+    if (!this.refreshAvatars && !this.runner) return;
+    if (this.hasActiveExecution()) {
+      this.avatarRefreshStatusText = '运行中暂不刷新头像，停止任务后可点击「刷新头像」补齐';
+      return;
+    }
+    const allGroups = await this.repo.listGroups();
+    const idSet = selectedIds && selectedIds.length > 0 ? new Set(selectedIds) : null;
+    const missing = allGroups.filter(
+      (g) =>
+        (idSet
+          ? idSet.has(g.groupId)
+          : isTargetIncomplete({
+              id: g.groupId,
+              name: g.groupName,
+              avatarUrl: g.avatarUrl,
+            })) && !this.avatarFetching.has(g.groupId),
     );
-    if (missing.length === 0) return;
+    if (missing.length === 0) {
+      if (idSet) {
+        this.avatarRefreshStatusText = '未找到需要刷新的小组';
+      }
+      return;
+    }
 
-    for (const group of missing) {
-      this.avatarFetching.add(group.groupId);
+    const abortController = new AbortController();
+    this.avatarRefreshAbort = abortController;
+    this.groupAvatarRefreshing = true;
+    this.avatarRefreshStatusText = `正在刷新 ${missing.length} 个小组资料…`;
+
+    if (this.refreshAvatars) {
+      for (const g of missing) this.avatarFetching.add(g.groupId);
       try {
-        if (this.runner.resolveGroupMetadata) {
-          const meta = await this.runner.resolveGroupMetadata(group, this.activeRun === null);
-          if (meta.groupName || meta.avatarUrl) {
-            if (this.repo.updateGroupMetadata) {
-              await this.repo.updateGroupMetadata(group.groupId, meta);
-            } else if (meta.avatarUrl) {
-              await this.repo.updateGroupAvatar(group.groupId, meta.avatarUrl);
-            }
-          }
+        const targets: BumperTarget[] = missing.map((g) => ({
+          id: g.groupId,
+          name: g.groupName,
+          avatarUrl: g.avatarUrl,
+          folderId: g.folderId ?? null,
+          sortOrder: g.sortOrder ?? 0,
+          totalBumpedCount: g.totalInvitedCount ?? 0,
+          createdAt: g.createdAt,
+          updatedAt: g.updatedAt,
+        }));
+        const res = await this.refreshAvatars(targets, {
+          signal: abortController.signal,
+        });
+        if (abortController.signal.aborted) {
+          this.avatarRefreshStatusText = '已停止刷新小组头像';
+        } else if (res) {
+          this.avatarRefreshStatusText =
+            `读取资料：已更新 ${res.updated} 项` +
+            (res.needsBrowser ? `，${res.needsBrowser} 项需闲置已登录浏览器才能补齐` : '') +
+            (res.failed ? `，${res.failed} 项未能完整读取` : '') +
+            (res.error ? `（${res.error}）` : '');
         } else {
-          const avatar = await this.runner.fetchGroupAvatar(group, this.activeRun === null);
-          if (avatar) {
-            await this.repo.updateGroupAvatar(group.groupId, avatar);
-          }
+          this.avatarRefreshStatusText = '刷新小组头像完成';
         }
       } catch {
-        // Ignore background avatar errors; avatar will also be captured during actual run
+        if (abortController.signal.aborted) {
+          this.avatarRefreshStatusText = '已停止刷新小组头像';
+        }
       } finally {
-        this.avatarFetching.delete(group.groupId);
+        for (const g of missing) this.avatarFetching.delete(g.groupId);
+        if (this.avatarRefreshAbort === abortController) {
+          this.avatarRefreshAbort = null;
+          this.groupAvatarRefreshing = false;
+        }
+      }
+      return;
+    }
+
+    try {
+      for (const group of missing) {
+        if (abortController.signal.aborted) break;
+        this.avatarFetching.add(group.groupId);
+        try {
+          if (this.runner?.resolveGroupMetadata) {
+            const meta = await this.runner.resolveGroupMetadata(group, this.activeRun === null);
+            if (abortController.signal.aborted) break;
+            if (meta.canonicalId || meta.groupName || meta.avatarUrl) {
+              if (this.repo.applyResolvedGroupMetadata) {
+                await this.repo.applyResolvedGroupMetadata(group.groupId, {
+                  canonicalId: meta.canonicalId ?? null,
+                  name: meta.groupName ?? null,
+                  avatarUrl: meta.avatarUrl ?? null,
+                });
+              } else if (this.repo.updateGroupMetadata) {
+                await this.repo.updateGroupMetadata(group.groupId, meta);
+              } else if (meta.avatarUrl) {
+                await this.repo.updateGroupAvatar(group.groupId, meta.avatarUrl);
+              }
+            }
+          } else if (this.runner) {
+            const avatar = await this.runner.fetchGroupAvatar(group, this.activeRun === null);
+            if (abortController.signal.aborted) break;
+            if (avatar) {
+              await this.repo.updateGroupAvatar(group.groupId, avatar);
+            }
+          }
+        } catch {
+          // Ignore background avatar errors; avatar will also be captured during actual run
+        } finally {
+          this.avatarFetching.delete(group.groupId);
+        }
+      }
+      if (!abortController.signal.aborted) {
+        this.avatarRefreshStatusText = '刷新小组头像完成';
+      }
+    } finally {
+      if (this.avatarRefreshAbort === abortController) {
+        this.avatarRefreshAbort = null;
+        this.groupAvatarRefreshing = false;
       }
     }
+  }
+
+  async refreshGroups(ids?: readonly string[]): Promise<GroupInviterState> {
+    const work = this.fetchMissingAvatars(ids);
+    await Promise.race([work, sleep(20)]);
+    return await this.state();
+  }
+
+  async stopRefreshGroups(): Promise<GroupInviterState> {
+    this.avatarRefreshAbort?.abort(new Error('FACEBOOK_METADATA_BATCH_ABORTED'));
+    this.avatarRefreshAbort = null;
+    this.stopAvatarRefresh?.();
+    this.groupAvatarRefreshing = false;
+    this.avatarFetching.clear();
+    this.avatarRefreshStatusText = '已停止刷新小组头像';
+    return await this.state();
   }
 
   private async executeRun(
@@ -490,6 +753,7 @@ export class GroupInviterService {
     profileIds: readonly string[],
     groups: readonly InviterGroupRow[],
     invitesPerGroup: number,
+    maxConcurrentProfiles = 4,
   ): Promise<void> {
     try {
       if (!this.runner || !this.runner.isAvailable()) {
@@ -498,8 +762,8 @@ export class GroupInviterService {
           run.failedProfiles.add(id);
           run.profileStatus.set(id, run.statusText);
           await this.saveResult(run, id);
+          run.activeProfiles.delete(id);
         }
-        run.activeProfiles.clear();
         return;
       }
       const runner = this.runner;
@@ -525,8 +789,23 @@ export class GroupInviterService {
         },
       };
 
+      this.fallbackMaxConcurrentProfiles = Math.max(1, maxConcurrentProfiles);
       const runWorkerForProfile = async (profileId: string, startupDelay: number) => {
+        let slotAcquired = false;
         try {
+          while (
+            this.slotsInUse >= Math.max(1, this.fallbackMaxConcurrentProfiles) &&
+            !isProfileCancelled(profileId)
+          ) {
+            run.profileStatus.set(profileId, '排队等待并发槽位…');
+            await sleep(50);
+          }
+          if (isProfileCancelled(profileId)) {
+            run.profileStatus.set(profileId, '已停止');
+            return;
+          }
+          this.slotsInUse++;
+          slotAcquired = true;
           if (startupDelay > 0) {
             await sleep(startupDelay);
           }
@@ -572,11 +851,7 @@ export class GroupInviterService {
                 },
               });
             } catch (err) {
-              if (
-                err instanceof ProductError &&
-                err.code === 'GROUP_INVITER_GROUP_UNINVITABLE' &&
-                pending.length > 0
-              ) {
+              if (err instanceof ProductError && err.code === 'GROUP_INVITER_GROUP_UNINVITABLE') {
                 run.profileStatus.set(profileId, err.message);
                 devDiag.record({
                   level: 'INFO',
@@ -586,7 +861,9 @@ export class GroupInviterService {
                   reason: err.code,
                   data: { runId: run.id, groupId: group.groupId },
                 });
-                await sleep(1000);
+                if (pending.length > 0) {
+                  await sleep(1000);
+                }
                 continue;
               }
               run.failedProfiles.add(profileId);
@@ -661,6 +938,9 @@ export class GroupInviterService {
             error instanceof Error ? error.message.slice(0, 100) : '执行失败',
           );
         } finally {
+          if (slotAcquired) {
+            this.slotsInUse = Math.max(0, this.slotsInUse - 1);
+          }
           if (!run.unconfirmedStops.has(profileId)) {
             // Keep occupancy through durable result save as well as native drain.
             try {
@@ -681,20 +961,25 @@ export class GroupInviterService {
         }),
       );
 
-      const totalSession = [...run.sessionCounts.values()].reduce((a, b) => a + b, 0);
-      run.statusText = run.cancelled
-        ? `已停止 · 本次共邀请 ${totalSession} 位好友`
-        : `${run.failedProfiles.size ? '运行结束（存在失败，请查看账号状态）' : [...run.submittedProfiles.values()].some((n) => n > 0) ? '运行结束（存在待核对，请查看账号状态）' : '运行完成'} · 本次共邀请 ${totalSession} 位好友`;
-      if (run.unconfirmedStops.size) run.statusText = '停止未确认，仍保留浏览器占用；请重试停止';
-      devDiag.record({
-        level: 'INFO',
-        category: 'GROUP_INVITER',
-        event: 'GROUP_INVITER_FINISH',
-        durationMs: Date.now() - run.startedAt,
-        data: { runId: run.id, cancelled: run.cancelled, totalSession },
-      });
+      if (run.activeProfiles.size === 0) {
+        const totalSession = [...run.sessionCounts.values()].reduce((a, b) => a + b, 0);
+        run.statusText = run.cancelled
+          ? `已停止 · 本次共邀请 ${totalSession} 位好友`
+          : `${run.failedProfiles.size ? '运行结束（存在失败，请查看账号状态）' : [...run.submittedProfiles.values()].some((n) => n > 0) ? '运行结束（存在待核对，请查看账号状态）' : '运行完成'} · 本次共邀请 ${totalSession} 位好友`;
+        if (run.unconfirmedStops.size) run.statusText = '停止未确认，仍保留浏览器占用；请重试停止';
+        devDiag.record({
+          level: 'INFO',
+          category: 'GROUP_INVITER',
+          event: 'GROUP_INVITER_FINISH',
+          durationMs: Date.now() - run.startedAt,
+          data: { runId: run.id, cancelled: run.cancelled, totalSession },
+        });
+      }
     } finally {
-      run.workersFinished = true;
+      run.runningBatches = Math.max(0, run.runningBatches - 1);
+      if (run.runningBatches === 0) {
+        run.workersFinished = true;
+      }
       this.finishRun(run);
     }
   }

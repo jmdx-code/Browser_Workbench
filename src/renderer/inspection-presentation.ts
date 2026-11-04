@@ -1,6 +1,7 @@
 import type { Profile } from '../shared/contracts.js';
 import type { Inspection, InspectionReasonCode } from '../shared/profile-inspection.js';
-import { isFacebookAvatarURL } from '../shared/account-display.js';
+import { isRenderableAccountAvatar } from '../shared/account-state-policy.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
 
 function hasRetainedDisplay(profile: Profile, row: Inspection | undefined, available: boolean) {
   return (
@@ -43,21 +44,30 @@ export function inspectionAvatarURL(
   available: boolean,
   now = Date.now(),
 ): string | null {
-  if (
-    ['logged-out', 'restricted', 'verification'].includes(profile.account.state) ||
-    (row && ['logged-out', 'restricted', 'verification'].includes(row.account.state))
-  )
+  const effectiveState =
+    row && ['logged-out', 'restricted', 'verification'].includes(row.account.state)
+      ? row.account.state
+      : profile.account.state;
+  if (effectiveState === 'logged-out') {
     return null;
+  }
+  if (['restricted', 'verification'].includes(effectiveState)) {
+    return profile.account.avatar &&
+      isLocalAvatar(profile.account.avatar) &&
+      (!row || row.profileId === profile.id)
+      ? profile.account.avatar
+      : null;
+  }
   if (
     profile.account.avatar &&
-    isFacebookAvatarURL(profile.account.avatar) &&
+    isRenderableAccountAvatar(profile.account.avatar) &&
     (!row || row.profileId === profile.id)
   )
     return profile.account.avatar;
   if (
     hasRetainedDisplay(profile, row, available) &&
     profile.account.avatar &&
-    isFacebookAvatarURL(profile.account.avatar)
+    isRenderableAccountAvatar(profile.account.avatar)
   )
     return profile.account.avatar;
   return hasCurrentDisplay(profile, row, available, now)

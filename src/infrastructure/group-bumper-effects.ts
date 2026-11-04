@@ -81,6 +81,7 @@ export interface BumperPost {
 export interface BumperSurface {
   url: string;
   groupIds: string[];
+  pageIds?: string[];
   groupTitle?: string | null;
   avatarUrl: string | null;
   pageAvatarUrl: string | null;
@@ -89,6 +90,7 @@ export interface BumperSurface {
   restricted: boolean;
   loading: boolean;
   groupEntryCSS: string | null;
+  groupEntryMatchedBy?: 'id' | 'name' | null;
   joinGroupCSS?: string | null;
   welcomeDismissCSS?: string | null;
   posts: BumperPost[];
@@ -311,12 +313,48 @@ export function projectGroupBumper(input: {
     return null;
   };
   const groupIds = new Set<string>();
+  const pageIds = new Set<string>();
+  let groupEntryMatchedBy: 'id' | 'name' | null = null;
+  const reservedPageSegment =
+    /^(?:search|groups|watch|marketplace|gaming|friends|bookmarks|notifications|messages|events|memories|saved|settings|help|login|checkpoint|reel|reels|stories|photo|photos|videos|permalink|posts|hashtag|share|l\.php)$/i;
   const route = /^\/groups\/([^/]+)/.exec(location.pathname)?.[1];
   if (route) groupIds.add(decodeURIComponent(route).toLowerCase());
   const canonical = document.querySelector<HTMLLinkElement>('link[rel="canonical"]')?.href;
   if (canonical) {
     const id = /\/groups\/([^/]+)/.exec(canonical)?.[1];
     if (id) groupIds.add(id.toLowerCase());
+  }
+  if (!/^\/(?:search|groups)(?:\/|$)/i.test(location.pathname)) {
+    if (location.pathname === '/profile.php') {
+      const pid = new URLSearchParams(location.search).get('id');
+      if (pid) pageIds.add(pid.toLowerCase());
+    } else {
+      const seg = /^\/([^/]+)/.exec(location.pathname)?.[1];
+      if (seg && !reservedPageSegment.test(seg)) {
+        pageIds.add(decodeURIComponent(seg).toLowerCase());
+      }
+    }
+    const metaValues = [
+      canonical,
+      ...Array.from(document.querySelectorAll<HTMLMetaElement>('meta[property^="al:"]')).map(
+        (m) => m.content,
+      ),
+    ];
+    for (const raw of metaValues) {
+      if (!raw) continue;
+      for (const re of [
+        /\/profile\.php\?[^#]*?\bid=(\d+)/i,
+        /fb:\/\/page\/(\d+)/i,
+        /fb:\/\/profile\/(\d+)/i,
+      ]) {
+        const m = re.exec(raw)?.[1];
+        if (m) pageIds.add(m.toLowerCase());
+      }
+      const slug = /facebook\.com\/([^/?#]+)/i.exec(raw)?.[1];
+      if (slug && slug.toLowerCase() !== 'profile.php' && !reservedPageSegment.test(slug)) {
+        pageIds.add(decodeURIComponent(slug).toLowerCase());
+      }
+    }
   }
   let groupEntryCSS: string | null = null;
   document
@@ -399,7 +437,6 @@ export function projectGroupBumper(input: {
         continue;
       }
       if (u.origin !== 'https://www.facebook.com') continue;
-      const cleanPath = u.pathname.replace(/\/$/, '').toLowerCase();
       const text = (link.textContent ?? '').trim().toLowerCase();
       if (pageMode && input.pageId) {
         const isPageHome =
@@ -407,43 +444,81 @@ export function projectGroupBumper(input: {
           (/^\/[^/]+\/?$/.test(u.pathname) && !reservedPagePath.test(u.pathname));
         if (!isPageHome) continue;
         const pageId = input.pageId;
-        const idHit =
-          cleanPath === '/' + pageId.toLowerCase() ||
-          (u.pathname === '/profile.php' && u.searchParams.get('id') === pageId) ||
-          chain(link).some((f) => {
-            const entity = obj(
-              f.props.page ??
-                f.props.profile ??
-                f.props.user ??
-                f.props.entity ??
-                f.props['page$key'] ??
-                f.props['profile$key'],
-            );
-            const decodedEntityId = typeof entity.__id === 'string' ? decodeId(entity.__id) : null;
-            return entity.id === pageId || entity.__id === pageId || decodedEntityId === pageId;
-          });
+        const linkIds = new Set<string>();
+        if (u.pathname === '/profile.php') {
+          const qid = u.searchParams.get('id');
+          if (qid) linkIds.add(qid.toLowerCase());
+        } else {
+          const seg = /^\/([^/]+)\/?$/.exec(u.pathname)?.[1];
+          if (seg && !reservedPageSegment.test(seg)) {
+            linkIds.add(decodeURIComponent(seg).toLowerCase());
+          }
+        }
+        for (const f of chain(link, 48)) {
+          if (/ActorHovercard/.test(f.name) && typeof f.props.actorID === 'string') {
+            const aid = f.props.actorID.trim().toLowerCase();
+            if (aid) linkIds.add(aid);
+          }
+          const entity = obj(
+            f.props.page ??
+              f.props.profile ??
+              f.props.user ??
+              f.props.entity ??
+              f.props.actor ??
+              f.props.node ??
+              f.props['page$key'] ??
+              f.props['profile$key'],
+          );
+          const decodedEntityId = typeof entity.__id === 'string' ? decodeId(entity.__id) : null;
+          for (const candidate of [entity.id, entity.__id, decodedEntityId]) {
+            if (typeof candidate === 'string' && candidate.trim()) {
+              linkIds.add(candidate.trim().toLowerCase());
+            }
+          }
+        }
+        const idHit = linkIds.has(pageId.toLowerCase());
         if (idHit) {
           idMatched = link;
           break;
         }
+        const numericLinkIds = [...linkIds].filter((x) => /^\d+$/.test(x));
+        if (/^\d+$/.test(pageId) && numericLinkIds.length > 0 && !numericLinkIds.includes(pageId)) {
+          continue;
+        }
         if (!nameMatched && pageNameKey && text === pageNameKey) nameMatched = link;
       } else {
         if (!/^\/groups\/(?!search(?:\/|$))[^/]+\/?$/i.test(u.pathname)) continue;
-        const idHit =
-          cleanPath === '/groups/' + input.groupId.toLowerCase() ||
-          chain(link).some((f) => {
-            const entity = obj(f.props.group ?? f.props.entity ?? f.props['group$key']);
+        const linkGroupIds = new Set<string>();
+        const pathGroupSeg = /^\/groups\/([^/]+)\/?$/i.exec(u.pathname)?.[1];
+        if (pathGroupSeg) linkGroupIds.add(decodeURIComponent(pathGroupSeg).toLowerCase());
+        for (const f of chain(link, 48)) {
+          const entity = obj(f.props.group ?? f.props.entity ?? f.props['group$key']);
+          if (
+            entity.__typename === 'Group' ||
+            /Group/.test(f.name) ||
+            f.props.group != null ||
+            f.props['group$key'] != null
+          ) {
             const decodedEntityId = typeof entity.__id === 'string' ? decodeId(entity.__id) : null;
-            return (
-              (entity.id === input.groupId ||
-                entity.__id === input.groupId ||
-                decodedEntityId === input.groupId) &&
-              (entity.__typename === 'Group' || /Group/.test(f.name))
-            );
-          });
+            for (const candidate of [entity.id, entity.__id, decodedEntityId]) {
+              if (typeof candidate === 'string' && candidate.trim()) {
+                linkGroupIds.add(candidate.trim().toLowerCase());
+              }
+            }
+          }
+        }
+        const idHit = linkGroupIds.has(input.groupId.toLowerCase());
         if (idHit) {
           idMatched = link;
           break;
+        }
+        const numericGroupIds = [...linkGroupIds].filter((x) => /^\d+$/.test(x));
+        if (
+          /^\d+$/.test(input.groupId) &&
+          numericGroupIds.length > 0 &&
+          !numericGroupIds.includes(input.groupId)
+        ) {
+          continue;
         }
         if (!nameMatched && groupNameKey && text === groupNameKey) nameMatched = link;
       }
@@ -452,6 +527,7 @@ export function projectGroupBumper(input: {
     if (entryLink) {
       entryLink.setAttribute('data-wb-bumper-group', '1');
       groupEntryCSS = '[data-wb-bumper-group="1"]';
+      groupEntryMatchedBy = idMatched ? 'id' : 'name';
     }
   }
   const posts: BumperPost[] = [];
@@ -490,7 +566,35 @@ export function projectGroupBumper(input: {
     cards.set(el, card ?? null);
     return card;
   };
+  const isTopLevelCommentEditor = (el: Element) => {
+    if (
+      !el.matches(
+        '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"],textarea',
+      ) ||
+      Boolean(el.closest('[role="banner"]'))
+    ) {
+      return false;
+    }
+    const frames = chain(el, 100);
+    const insideExistingCommentOrReply = frames.some(
+      (f) =>
+        /CometUFICommentRow|CometUFICommentWrapper/.test(f.name) &&
+        (record(f.props.comment) || (typeof f.props.depth === 'number' && f.props.depth > 0)),
+    );
+    if (insideExistingCommentOrReply) return false;
+    return frames.some(
+      (f) =>
+        (/CometUFIComposerInputWithActionsForLexical/.test(f.name) &&
+          (f.props.commentAction === 'ADD' || f.props.commentAction == null) &&
+          (f.props.depth === 0 || f.props.depth == null)) ||
+        (/CometUFICommentRow/.test(f.name) &&
+          f.props.isComposer === true &&
+          !record(f.props.comment) &&
+          (f.props.depth === 0 || f.props.depth == null)),
+    );
+  };
   const commentRow = (el: Element) =>
+    !isTopLevelCommentEditor(el) &&
     chain(el, 100).some((f) => /CometUFICommentRow|CometUFICommentWrapper/.test(f.name));
   const roots = new Set<Element>();
   for (const seed of Array.from(
@@ -564,7 +668,12 @@ export function projectGroupBumper(input: {
         return true;
       if (!owner) {
         const nearestArticle = el.closest('[role="article"]');
-        if (nearestArticle && nearestArticle !== article) return false;
+        if (
+          nearestArticle &&
+          nearestArticle !== article &&
+          (!article.contains(nearestArticle) || commentRow(nearestArticle))
+        )
+          return false;
         if (
           feedback &&
           chain(el, 100).some((f) => {
@@ -590,7 +699,7 @@ export function projectGroupBumper(input: {
           m[1]?.toLowerCase() !== input.groupId.toLowerCase()
         )
           return null;
-        return (
+        const rawCandidate =
           m?.[2] ??
           /^\/reel\/(\d+)/i.exec(u.pathname)?.[1] ??
           u.searchParams.get('story_fbid') ??
@@ -598,18 +707,17 @@ export function projectGroupBumper(input: {
           /^\/(?!groups(?:\/|$))[^/]+\/(?:posts|videos|permalink)\/(\d+)/i.exec(u.pathname)?.[1] ??
           (/^\/(?:watch|video\.php)\/?$/i.test(u.pathname) ? u.searchParams.get('v') : null) ??
           (/^\/photo(?:\.php|\/)?$/i.test(u.pathname) ? u.searchParams.get('fbid') : null) ??
-          null
-        );
+          null;
+        return rawCandidate && /^\d+$/.test(rawCandidate) ? rawCandidate : null;
       } catch {
         return null;
       }
     };
+    const existingPostId = article.getAttribute('data-wb-bumper-post');
     const storyPostId = text(primaryNative.post_id ?? primaryStory.post_id) || decodeId(storyKey);
-    if (input.targetPostId && storyPostId && storyPostId !== input.targetPostId) continue;
-    if (input.targetPostId && !storyPostId) {
-      const linked = links.map((a) => linkId(a.href)).filter(Boolean);
-      if (linked.length && !linked.includes(input.targetPostId)) continue;
-    }
+    const candidatePostIds = new Set<string>();
+    if (existingPostId && /^\d+$/.test(existingPostId)) candidatePostIds.add(existingPostId);
+    if (storyPostId && /^\d+$/.test(storyPostId)) candidatePostIds.add(storyPostId);
     const controls = Array.from(
       article.querySelectorAll<HTMLElement>('[role="button"],button,[role="textbox"]'),
     );
@@ -625,7 +733,7 @@ export function projectGroupBumper(input: {
       loading = true;
       continue;
     }
-    let postId: string | null = storyPostId,
+    let postId: string | null = storyPostId && /^\d+$/.test(storyPostId) ? storyPostId : null,
       timeText = '',
       created: number | null = null,
       feedbackId: string | null =
@@ -644,6 +752,7 @@ export function projectGroupBumper(input: {
     for (const link of links.filter(belongsToStory)) {
       const candidateId = linkId(link.href);
       if (candidateId) {
+        candidatePostIds.add(candidateId);
         if (/\/photo(?:\.php|\/|\?)/i.test(link.href) && !/pcb\.\d+/.test(link.href)) {
           fallbackPhotoId ??= candidateId;
         } else {
@@ -653,6 +762,7 @@ export function projectGroupBumper(input: {
       keepTime(link.getAttribute('aria-label'));
       keepTime(link.textContent);
     }
+    if (fallbackPhotoId) candidatePostIds.add(fallbackPhotoId);
     postId ??= fallbackPhotoId;
     const timeSeen = new Set<unknown>();
     let timeBudget = 0;
@@ -670,7 +780,11 @@ export function projectGroupBumper(input: {
     for (const f of frames) {
       const p = f.props;
       if (/GHLLink|CometLink|FDSLink|BaseLink/.test(f.name)) {
-        postId ??= linkId(p.href ?? obj(p.link).url);
+        const fiberLinkId = linkId(p.href ?? obj(p.link).url);
+        if (fiberLinkId) {
+          candidatePostIds.add(fiberLinkId);
+          postId ??= fiberLinkId;
+        }
         keepTime(p.label);
         keepTime(p['aria-label']);
       }
@@ -681,8 +795,13 @@ export function projectGroupBumper(input: {
       if (typeof group === 'string') groupIds.add(group.toLowerCase());
       const story = obj(p.story ?? p.feedUnit),
         native = typeof story.__id === 'string' ? relayRecord(f.element, story.__id) : {};
-      if (/CometFeedUnitCard|CometFeedUnitErrorBoundary|CometFeedStory|UFIStory/.test(f.name))
-        postId ??= decodeId(story.id ?? story.__id);
+      if (/CometFeedUnitCard|CometFeedUnitErrorBoundary|CometFeedStory|UFIStory/.test(f.name)) {
+        const storyDecodedId = decodeId(story.id ?? story.__id);
+        if (storyDecodedId && /^\d+$/.test(storyDecodedId)) {
+          candidatePostIds.add(storyDecodedId);
+          postId ??= storyDecodedId;
+        }
+      }
       pinned ||=
         story.is_pinned === true ||
         native.is_pinned === true ||
@@ -697,9 +816,18 @@ export function projectGroupBumper(input: {
         feedbackId ??= text(fb.id ?? fb.__id) || null;
       }
     }
-    postId ??= decodeId(feedbackId);
-    if (!postId || !/^\d+$/.test(postId) || (input.targetPostId && postId !== input.targetPostId))
-      continue;
+    const decodedFbId = decodeId(feedbackId);
+    if (decodedFbId && /^\d+$/.test(decodedFbId)) {
+      candidatePostIds.add(decodedFbId);
+      postId ??= decodedFbId;
+    }
+    if (existingPostId && /^\d+$/.test(existingPostId)) candidatePostIds.add(existingPostId);
+    if (postId && /^\d+$/.test(postId)) candidatePostIds.add(postId);
+    if (input.targetPostId) {
+      if (!candidatePostIds.has(input.targetPostId)) continue;
+      postId = input.targetPostId;
+    }
+    if (!postId || !/^\d+$/.test(postId)) continue;
     if (seenPostIds.has(postId)) continue;
     seenPostIds.add(postId);
     const actorRefs = obj(primaryNative.actors).__refs;
@@ -774,11 +902,24 @@ export function projectGroupBumper(input: {
         if (
           /CometUFIComposerInputWithActionsForLexicalInner/.test(f.name) &&
           f.props.commentAction === 'ADD' &&
-          el.matches('[role="textbox"][contenteditable="true"]')
+          el.matches('[role="textbox"][contenteditable="true"]') &&
+          !el.closest('[role="banner"]') &&
+          visible(el)
         )
           comment = el;
       }
     for (const el of controls.filter(belongsToStory)) {
+      if (
+        !comment &&
+        el.matches(
+          '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
+        ) &&
+        !el.closest('[role="banner"]') &&
+        !commentRow(el) &&
+        visible(el)
+      ) {
+        comment = el;
+      }
       if (!el.matches('[role="button"],button') || commentRow(el)) continue;
       const hasConflictingFeedback =
         !!feedbackId &&
@@ -805,11 +946,86 @@ export function projectGroupBumper(input: {
       )
         openComment = el;
     }
+    if (!comment) {
+      comment = Array.from(
+        article.querySelectorAll<HTMLElement>(
+          '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
+        ),
+      ).filter(
+        (el) =>
+          belongsToStory(el) && !el.closest('[role="banner"]') && !commentRow(el) && visible(el),
+      )[0];
+    }
+    let matchedDialog: HTMLElement | undefined;
+    if (!comment || !like || input.targetPostId === postId) {
+      const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).filter(
+        (d) =>
+          visible(d) &&
+          !/notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') ?? '') &&
+          !d.hasAttribute('data-wb-bumper-welcome-dismiss') &&
+          !d.querySelector('[data-wb-bumper-welcome-dismiss]'),
+      );
+      matchedDialog = dialogs
+        .filter((d) => {
+          const dialogLinks = Array.from(d.querySelectorAll<HTMLAnchorElement>('a[href]'));
+          if (dialogLinks.some((a) => candidatePostIds.has(linkId(a.href) ?? ''))) return true;
+          const dialogEls = [
+            d,
+            ...Array.from(
+              d.querySelectorAll<HTMLElement>('[role="button"],button,[role="textbox"],a[href]'),
+            ).slice(0, 80),
+          ];
+          if (
+            dialogEls.some((el) =>
+              chain(el).some((f) => {
+                const fb = obj(f.props.feedback);
+                const fid = text(fb.id ?? fb.__id ?? f.props.feedbackID ?? f.props.feedbackId);
+                if (feedbackId && fid && fid === feedbackId) return true;
+                const story = obj(f.props.story ?? f.props.feedUnit);
+                const sid = decodeId(story.id ?? story.__id) || text(story.post_id);
+                return !!sid && candidatePostIds.has(sid);
+              }),
+            )
+          )
+            return true;
+          if (
+            input.targetPostId === postId &&
+            Array.from(
+              d.querySelectorAll<HTMLElement>(
+                '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
+              ),
+            ).filter((el) => !el.closest('[role="banner"]') && !commentRow(el) && visible(el))
+              .length > 0
+          )
+            return true;
+          return false;
+        })
+        .at(-1);
+      if (matchedDialog) {
+        if (!comment) {
+          comment = Array.from(
+            matchedDialog.querySelectorAll<HTMLElement>(
+              '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
+            ),
+          ).filter((el) => !el.closest('[role="banner"]') && !commentRow(el) && visible(el))[0];
+        }
+        if (!like) {
+          like =
+            matchedDialog.querySelector<HTMLElement>(
+              '[role="button"][data-ad-rendering-role="like_button"],button[data-ad-rendering-role="like_button"]',
+            ) ??
+            matchedDialog
+              .querySelector<HTMLElement>('[data-ad-rendering-role="like_button"]')
+              ?.closest<HTMLElement>('[role="button"],button') ??
+            undefined;
+        }
+      }
+    }
     article.setAttribute('data-wb-bumper-post', postId);
     if (like) {
       liked ||=
         like.getAttribute('aria-pressed') === 'true' ||
-        /^(?:Remove Like|Liked|取消赞|取消讚|已赞|已讚)/i.test(
+        /^(?:Remove\s+|Liked|取消赞|取消讚|已赞|已讚|Love|Care|Haha|Wow|Sad|Angry|大爱|大心|超愛|超爱|抱抱|加油|笑趴|哈|哇|心碎|心疼|呜|嗚|怒|အရမ်းကြိုက်တယ်|ဂရုစိုက်တယ်|ဟားဟား|ဝိုး|ဝမ်းနည်းတယ်|ဒေါသထွက်တယ်|Yêu\s*thích|Thương\s*thương|Buồn|Phẫn\s*nộ|รักเลย|ห่วงใย|ฮ่าๆ|ว้าว|เศร้า|โกรธ)/i.test(
           like.getAttribute('aria-label') ?? '',
         );
       like.setAttribute('data-wb-bumper-like', postId);
@@ -817,7 +1033,11 @@ export function projectGroupBumper(input: {
     comment?.setAttribute('data-wb-bumper-comment', postId);
     openComment?.setAttribute('data-wb-bumper-open-comment', postId);
     const comments: BumperPost['comments'] = [];
-    for (const row of Array.from(article.querySelectorAll('[role="article"],li'))) {
+    const commentContainers = [
+      ...Array.from(article.querySelectorAll('[role="article"],li')),
+      ...(matchedDialog ? Array.from(matchedDialog.querySelectorAll('[role="article"],li')) : []),
+    ];
+    for (const row of commentContainers) {
       const c = chain(row)
         .map((f) => obj(f.props.comment))
         .map((c) => (typeof c.__id === 'string' ? { ...relayRecord(row, c.__id), ...c } : c))
@@ -842,16 +1062,19 @@ export function projectGroupBumper(input: {
       authorAvatarUrl ??= imageURL(link);
       if (authorAvatarUrl) break;
     }
+    const candidateVideos = Array.from(article.querySelectorAll<HTMLVideoElement>('video')).filter(
+      (v) => !commentRow(v),
+    );
     const videoEl =
-      Array.from(article.querySelectorAll<HTMLVideoElement>('video'))
-        .filter(belongsToStory)
-        .find(visible) ??
-      Array.from(article.querySelectorAll<HTMLVideoElement>('video')).find(belongsToStory);
+      candidateVideos.filter(belongsToStory).find(visible) ??
+      candidateVideos.find(visible) ??
+      candidateVideos.find(belongsToStory) ??
+      candidateVideos[0];
     const hasVideoContainer =
       !!videoEl ||
       frames.some((f) => /CometVideoPlayer|VideoPlayer|TahoeVideo/i.test(f.name)) ||
       !!article.querySelector(
-        '[data-pagelet*="video" i],[aria-label*="Play video" i],[aria-label*="播放视频"]',
+        '[data-pagelet*="video" i],[aria-label*="Play video" i],[aria-label*="播放视频"],[aria-label*="播放影片"],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
       );
     let hasVideo = false,
       videoCurrentTime = 0,
@@ -1067,6 +1290,7 @@ export function projectGroupBumper(input: {
   return {
     url: location.href,
     groupIds: [...groupIds],
+    pageIds: [...pageIds],
     groupTitle,
     avatarUrl,
     pageAvatarUrl,
@@ -1077,6 +1301,7 @@ export function projectGroupBumper(input: {
     restricted,
     loading,
     groupEntryCSS,
+    groupEntryMatchedBy,
     joinGroupCSS,
     welcomeDismissCSS,
     posts,

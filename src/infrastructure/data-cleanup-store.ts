@@ -153,6 +153,7 @@ export class SqliteDataCleanup {
   removeBatch(input: unknown, maximum = 250) {
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 250)
       throw Error('CLEANUP_BATCH_INVALID');
+    const scope = RecordCleanupScope.parse(input);
     const { where, params } = this.selection(input);
     return transaction(this.db, () => {
       const result = this.db
@@ -173,8 +174,70 @@ export class SqliteDataCleanup {
         .all(JSON.stringify(result.map((r) => r.step_id)))
         .map((r) => String(r.job_id));
       if (affected.length) this.purgeHiddenPlans(affected);
+      if (scope.before !== undefined && !scope.stepIds) {
+        this.purgeExpiredFeatureOperationsByCutoff(scope.before, scope.profileId);
+      }
       return result.length;
     });
+  }
+  purgeExpiredFeatureOperations(input: unknown): number {
+    const scope = RecordCleanupScope.parse(input);
+    if (scope.stepIds || scope.before === undefined) return 0;
+    return transaction(this.db, () =>
+      this.purgeExpiredFeatureOperationsByCutoff(scope.before as number, scope.profileId),
+    );
+  }
+  private purgeExpiredFeatureOperationsByCutoff(before: number, profileId?: string): number {
+    let removed = 0;
+    const hasBumperOps = this.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_bumper_operations'",
+      )
+      .get();
+    if (hasBumperOps) {
+      if (profileId) {
+        removed += Number(
+          this.db
+            .prepare(
+              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND updated_at < ? AND profile_id = ?",
+            )
+            .run(before, profileId).changes,
+        );
+      } else {
+        removed += Number(
+          this.db
+            .prepare(
+              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND updated_at < ?",
+            )
+            .run(before).changes,
+        );
+      }
+    }
+    const hasPosterOps = this.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_poster_operations'",
+      )
+      .get();
+    if (hasPosterOps) {
+      if (profileId) {
+        removed += Number(
+          this.db
+            .prepare(
+              "DELETE FROM group_poster_operations WHERE kernel_settled = 1 AND status IN ('VERIFIED', 'NOT_APPLIED') AND updated_at < ? AND profile_id = ?",
+            )
+            .run(before, profileId).changes,
+        );
+      } else {
+        removed += Number(
+          this.db
+            .prepare(
+              "DELETE FROM group_poster_operations WHERE kernel_settled = 1 AND status IN ('VERIFIED', 'NOT_APPLIED') AND updated_at < ?",
+            )
+            .run(before).changes,
+        );
+      }
+    }
+    return removed;
   }
   private purgeHiddenPlans(affectedJobIds?: string[]) {
     const rows = this.db
@@ -239,6 +302,38 @@ export class SqliteDataCleanup {
       .get();
     if (Number(row?.n))
       throw new ProductError('RESET_TASKS_ACTIVE', '请先停止当前正在运行或等待启动的任务', 409);
+    const hasPosterOps = this.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_poster_operations'",
+      )
+      .get();
+    if (hasPosterOps) {
+      const unsettledPoster = this.db
+        .prepare('SELECT count(*) AS n FROM group_poster_operations WHERE kernel_settled = 0')
+        .get();
+      if (Number(unsettledPoster?.n))
+        throw new ProductError(
+          'RESET_POSTER_UNSETTLED',
+          '小组发帖存在未结清的内核操作锁，请先停止或等待恢复结清',
+          409,
+        );
+    }
+    const hasBumperOps = this.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_bumper_operations'",
+      )
+      .get();
+    if (hasBumperOps) {
+      const unsettledBumper = this.db
+        .prepare("SELECT count(*) AS n FROM group_bumper_operations WHERE status <> 'SETTLED'")
+        .get();
+      if (Number(unsettledBumper?.n))
+        throw new ProductError(
+          'RESET_BUMPER_UNSETTLED',
+          '顶贴模块存在未结清的内核操作锁，请先停止或等待恢复结清',
+          409,
+        );
+    }
   }
   compact() {
     this.assertResettable();

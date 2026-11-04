@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { z } from 'zod';
 import type { Profile } from '../shared/contracts.js';
 import { api } from './api.js';
+import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import {
   defaultWindowLayout,
   WindowLayoutOverview,
@@ -135,20 +136,25 @@ export function WindowLayoutPanel({
           </label>
           {settings.reservedArea && (
             <>
-              {(['x', 'y', 'width', 'height'] as const).map((key) => (
-                <label key={key}>
-                  {{ x: '距屏幕左侧', y: '距屏幕顶部', width: '宽度', height: '高度' }[key]}
-                  （逻辑像素）
-                  <input
-                    type="number"
-                    min={key === 'width' || key === 'height' ? 100 : 0}
-                    step={1}
-                    value={
-                      key === 'x' || key === 'y' ? area[key] - display.workArea[key] : area[key]
-                    }
-                    onChange={(e) => {
-                      const value = e.target.valueAsNumber;
-                      if (Number.isFinite(value))
+              {(['x', 'y', 'width', 'height'] as const).map((key) => {
+                const labelText = {
+                  x: '距屏幕左侧',
+                  y: '距屏幕顶部',
+                  width: '宽度',
+                  height: '高度',
+                }[key];
+                const currentVal =
+                  key === 'x' || key === 'y' ? area[key] - display.workArea[key] : area[key];
+                return (
+                  <label key={key}>
+                    {labelText}（逻辑像素）
+                    <ControlledNumberInput
+                      ariaLabel={`${labelText}（逻辑像素）`}
+                      min={key === 'width' || key === 'height' ? 100 : 0}
+                      max={10000}
+                      defaultValue={currentVal}
+                      value={currentVal}
+                      onChange={(value) => {
                         setSettings({
                           ...settings,
                           reservedArea: {
@@ -156,10 +162,20 @@ export function WindowLayoutPanel({
                             [key]: value + (key === 'x' || key === 'y' ? display.workArea[key] : 0),
                           },
                         });
-                    }}
-                  />
-                </label>
-              ))}
+                      }}
+                      onCommit={(value) => {
+                        setSettings({
+                          ...settings,
+                          reservedArea: {
+                            ...area,
+                            [key]: value + (key === 'x' || key === 'y' ? display.workArea[key] : 0),
+                          },
+                        });
+                      }}
+                    />
+                  </label>
+                );
+              })}
               <button
                 className="btn"
                 type="button"

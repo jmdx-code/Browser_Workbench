@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { Id } from './contracts.js';
+import { extractFacebookGroupId, extractFacebookPageId } from './facebook-target-id.js';
 import { GroupIdString, GroupNameString, AVATAR_URL_MAX_LENGTH } from './group-inviter.js';
 export { AVATAR_URL_MAX_LENGTH };
+
+export const BumperReactionType = z.enum(['like', 'love', 'care', 'haha', 'wow', 'sad', 'angry']);
+export type BumperReactionType = z.infer<typeof BumperReactionType>;
 
 export const BumperSettings = z
   .object({
@@ -15,9 +19,19 @@ export const BumperSettings = z
     likeProbability: z.number().int().min(0).max(100).default(100),
     commentProbability: z.number().int().min(0).max(100).default(30),
     consumeCommentOnUse: z.boolean().default(false),
+    enableSound: z.boolean().default(false),
+    useLongPressReaction: z.boolean().default(false),
+    reactionTypes: z.array(BumperReactionType).min(1).max(7).default(['care', 'love', 'like']),
   })
   .strict();
-export type BumperSettings = z.infer<typeof BumperSettings>;
+export type BumperSettings = Omit<
+  z.infer<typeof BumperSettings>,
+  'enableSound' | 'useLongPressReaction' | 'reactionTypes'
+> & {
+  enableSound?: boolean;
+  useLongPressReaction?: boolean;
+  reactionTypes?: BumperReactionType[];
+};
 export const BumperTarget = z.object({
   id: GroupIdString,
   name: GroupNameString,
@@ -42,7 +56,12 @@ export function isPlaceholderTargetName(
 ): boolean {
   const trimmedName = typeof name === 'string' ? name.trim() : '';
   const trimmedId = typeof id === 'string' ? id.trim() : '';
-  return !trimmedName || trimmedName === trimmedId;
+  return (
+    !trimmedName ||
+    trimmedName === trimmedId ||
+    trimmedName === `Group ${trimmedId}` ||
+    trimmedName === `小组 ${trimmedId}`
+  );
 }
 
 export function isLocalAvatar(url: string | null | undefined): boolean {
@@ -76,7 +95,49 @@ export const BumperTargetsInput = z
       .array(
         z
           .object({
-            id: GroupIdString,
+            id: z.preprocess(
+              (v) =>
+                typeof v === 'string' ? extractFacebookGroupId(v) || extractFacebookPageId(v) : v,
+              GroupIdString,
+            ),
+            name: z.string().trim().max(200, '名字过长').optional().default(''),
+            folderId: z.string().nullable().optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(500),
+  })
+  .strict();
+export const BumperGroupTargetsInput = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            id: z.preprocess(
+              (v) => (typeof v === 'string' ? extractFacebookGroupId(v) : v),
+              GroupIdString,
+            ),
+            name: z.string().trim().max(200, '名字过长').optional().default(''),
+            folderId: z.string().nullable().optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(500),
+  })
+  .strict();
+export const BumperPageTargetsInput = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            id: z.preprocess(
+              (v) => (typeof v === 'string' ? extractFacebookPageId(v) : v),
+              GroupIdString,
+            ),
             name: z.string().trim().max(200, '名字过长').optional().default(''),
             folderId: z.string().nullable().optional(),
           })
@@ -87,10 +148,14 @@ export const BumperTargetsInput = z
   })
   .strict();
 export const BumperIdsInput = z.object({ ids: z.array(GroupIdString).min(1).max(500) }).strict();
+export const BumperScope = z.enum(['group', 'page']);
+export type BumperScope = z.infer<typeof BumperScope>;
+
 export const BumperCommentsInput = z
   .object({
     texts: z.array(z.string().trim().min(1).max(8000)).max(5000),
     consumeCommentOnUse: z.boolean(),
+    scope: BumperScope.optional(),
   })
   .strict();
 export interface BumperComment {
@@ -98,6 +163,7 @@ export interface BumperComment {
   text: string;
   usedCount: number;
   createdAt: number;
+  scope?: BumperScope;
 }
 export interface BumperLog {
   id: string;
@@ -112,6 +178,7 @@ export interface BumperLog {
   liked: boolean;
   commentText: string | null;
   bumpedAt: number;
+  sourceMode?: BumperScope;
 }
 export const StartBumper = z
   .object({
@@ -136,34 +203,42 @@ export interface BumperDailyStat {
   date: string; // yyyy-mm-dd（本地时区日期）
   count: number;
 }
+export interface BumperPendingOperation {
+  id: string;
+  profileId: string;
+  accountId: string;
+  groupId: string;
+  groupName: string;
+  pageId: string;
+  pageName: string;
+  postId: string;
+  actionKind: 'like' | 'comment';
+  reason: string;
+  updatedAt: number;
+}
 export interface BumperState {
   groups: BumperTarget[];
   pages: BumperTarget[];
   settings: BumperSettings;
+  pageSettings?: BumperSettings;
   comments: BumperComment[];
+  pageComments?: BumperComment[];
   total: number;
+  pageTotal?: number;
   running: boolean;
   statusText: string;
   profileCounts: Record<string, BumperProfileStat>;
   dailyStats?: BumperDailyStat[];
+  pageDailyStats?: BumperDailyStat[];
   pageBumperRunning?: boolean;
   pageBumperStatusText?: string;
   pageBumperProfileCounts?: Record<string, BumperProfileStat>;
+  metadataRefreshing?: boolean;
+  groupAvatarRefreshing?: boolean;
+  pageAvatarRefreshing?: boolean;
+  pendingReviewOperations?: BumperPendingOperation[];
 }
 
 export function extractBumperPageId(raw: string): string {
-  const value = raw.trim();
-  try {
-    const u = new URL(/^https?:\/\//i.test(value) ? value : 'https://' + value);
-    if (!/(^|\.)facebook\.com$/i.test(u.hostname)) return value;
-    if (u.pathname === '/profile.php' && u.searchParams.get('id'))
-      return u.searchParams.get('id') ?? value;
-    const segments = u.pathname.split('/').filter(Boolean);
-    const user = segments.indexOf('user');
-    if (user >= 0 && segments[user + 1]) return decodeURIComponent(segments[user + 1] ?? value);
-    if (segments[0] === 'pages' && segments[2]) return decodeURIComponent(segments[2]);
-    return decodeURIComponent(segments[0] ?? value);
-  } catch {
-    return value;
-  }
+  return extractFacebookPageId(raw);
 }

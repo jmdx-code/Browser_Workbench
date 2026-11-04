@@ -6,6 +6,7 @@ import type { TaskRecord, TaskRuntimeOverview } from '../shared/task-contracts.j
 import type { Inspection } from '../shared/profile-inspection.js';
 import type { GroupInviteLogRow, GroupInviterState } from '../shared/group-inviter.js';
 import type { BumperLog, BumperState } from '../shared/group-bumper.js';
+import type { PosterLog, PosterState } from '../shared/group-poster.js';
 import { attentionPlans, taskReasonDescription } from './task-alerts.js';
 import { groupTaskRecords, endedTask } from '../domain/task-run-records.js';
 import { runSummary, stepResultLabel } from './task-record-summary.js';
@@ -63,6 +64,7 @@ export function TaskRecordsPage({
   groupInviterState,
   groupBumperState,
   onGroupBumperState,
+  groupPosterState,
   onNotify,
 }: {
   runtime: z.infer<typeof TaskRuntimeOverview> | null;
@@ -75,6 +77,7 @@ export function TaskRecordsPage({
   groupInviterState?: GroupInviterState | null | undefined;
   groupBumperState?: BumperState | null | undefined;
   onGroupBumperState?: ((next: BumperState) => void) | undefined;
+  groupPosterState?: PosterState | null | undefined;
   onNotify?: ((msg: string) => void) | undefined;
 }) {
   const [moduleTab, setModuleTab] = useState<ActivityRecordModuleFilter>('all');
@@ -82,6 +85,7 @@ export function TaskRecordsPage({
   const [selectedBumperIds, setSelectedBumperIds] = useState<Set<string>>(new Set());
   const [inviterLogs, setInviterLogs] = useState<GroupInviteLogRow[]>([]);
   const [bumperLogs, setBumperLogs] = useState<BumperLog[]>([]);
+  const [posterLogs, setPosterLogs] = useState<PosterLog[]>([]);
   const [bumperBusy, setBumperBusy] = useState(false);
 
   const deleting = useRef(new Set<string>());
@@ -150,7 +154,7 @@ export function TaskRecordsPage({
     return () => clearInterval(timer);
   }, []);
 
-  // Load inviter & bumper logs for cross-module center
+  // Load inviter, bumper & poster logs for cross-module center
   useEffect(() => {
     let active = true;
     void api
@@ -165,6 +169,12 @@ export function TaskRecordsPage({
         if (active && Array.isArray(list)) setBumperLogs(list);
       })
       .catch(() => {});
+    void api
+      .posterLogs('')
+      .then((list) => {
+        if (active && Array.isArray(list)) setPosterLogs(list);
+      })
+      .catch(() => {});
     return () => {
       active = false;
     };
@@ -173,7 +183,11 @@ export function TaskRecordsPage({
     groupInviterState?.running,
     groupInviterState?.finishedAt,
     groupBumperState?.running,
+    groupBumperState?.pageBumperRunning,
     groupBumperState?.total,
+    groupBumperState?.pageTotal,
+    groupPosterState?.running,
+    groupPosterState?.total,
   ]);
 
   const rowsRef = useRef<TaskRecord[]>([]);
@@ -362,6 +376,8 @@ export function TaskRecordsPage({
     inviterLogs,
     bumperState: groupBumperState,
     bumperLogs,
+    posterState: groupPosterState,
+    posterLogs,
     profileId: filterId,
     moduleFilter: moduleTab,
     statusFilter: filter,
@@ -369,17 +385,18 @@ export function TaskRecordsPage({
     now,
   });
 
+  const nonActiveTotal =
+    unifiedFeed.moduleCounts['group-inviter'] +
+    unifiedFeed.moduleCounts['group-bumper'] +
+    unifiedFeed.moduleCounts['page-bumper'] +
+    unifiedFeed.moduleCounts['group-poster'];
+
   // For moduleTab === 'active-accounts', use exact backend counts; for other tabs, use unifiedFeed.statusCounts
   const displayedStatusCounts: Record<Filter, number> =
     moduleTab === 'active-accounts'
       ? counts
       : {
-          all:
-            moduleTab === 'all'
-              ? counts.all +
-                unifiedFeed.moduleCounts['group-inviter'] +
-                unifiedFeed.moduleCounts['group-bumper']
-              : unifiedFeed.statusCounts.all,
+          all: moduleTab === 'all' ? counts.all + nonActiveTotal : unifiedFeed.statusCounts.all,
           running:
             moduleTab === 'all'
               ? counts.running +
@@ -415,20 +432,24 @@ export function TaskRecordsPage({
     setExporting(true);
     try {
       const allRecords: TaskRecord[] = [];
-      let cursor: string | undefined;
-      while (true) {
-        const res = await api.taskRecords({
-          ...(filterId ? { profileId: filterId } : {}),
-          status: apiStatus,
-          ...(query.trim() ? { query: query.trim() } : {}),
-          ...(cursor ? { cursor } : {}),
-          groupBy: 'run',
-          limit: 200,
-        });
-        allRecords.push(...res.records);
-        if (!res.nextCursor) break;
-        cursor = res.nextCursor;
+      if (moduleTab === 'all' || moduleTab === 'active-accounts') {
+        let cursor: string | undefined;
+        while (true) {
+          const res = await api.taskRecords({
+            ...(filterId ? { profileId: filterId } : {}),
+            status: apiStatus,
+            ...(query.trim() ? { query: query.trim() } : {}),
+            ...(cursor ? { cursor } : {}),
+            groupBy: 'run',
+            limit: 200,
+          });
+          allRecords.push(...res.records);
+          if (!res.nextCursor) break;
+          cursor = res.nextCursor;
+        }
       }
+      const q = query.trim().toLowerCase();
+      const visibleIds = new Set(unifiedFeed.items.map((i) => i.id));
       const payload = {
         format: 'browser-workbench-task-records',
         version: 2,
@@ -457,8 +478,43 @@ export function TaskRecordsPage({
           planCreatedAt: new Date(row.planCreatedAt).toISOString(),
           planUpdatedAt: new Date(row.planUpdatedAt).toISOString(),
         })),
-        inviterLogs: inviterLogs.filter((l) => !filterId || l.profileId === filterId),
-        bumperLogs: bumperLogs.filter((l) => !filterId || l.profileId === filterId),
+        inviterLogs:
+          moduleTab === 'all' || moduleTab === 'group-inviter'
+            ? inviterLogs.filter(
+                (l) =>
+                  (!filterId || l.profileId === filterId) &&
+                  (visibleIds.has(`inviter-log:${l.id}`) ||
+                    (!q && (filter === 'all' || filter === 'completed'))),
+              )
+            : [],
+        bumperLogs:
+          moduleTab === 'all' || moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
+            ? bumperLogs.filter(
+                (l) =>
+                  (!filterId || l.profileId === filterId) &&
+                  (visibleIds.has(`bumper-log:${l.id}`) ||
+                    (!q &&
+                      (filter === 'all' || filter === 'completed') &&
+                      (moduleTab === 'all' ||
+                        (moduleTab === 'page-bumper'
+                          ? l.sourceMode === 'page' || l.groupId === '-'
+                          : l.sourceMode !== 'page' && l.groupId !== '-')))),
+              )
+            : [],
+        posterLogs:
+          moduleTab === 'all' || moduleTab === 'group-poster'
+            ? posterLogs
+                .filter(
+                  (l) =>
+                    (!filterId || l.profileId === filterId) &&
+                    (visibleIds.has(`poster-log:${l.id}`) ||
+                      (!q &&
+                        (filter === 'all' ||
+                          (filter === 'attention' && l.postId === 'pending_approval') ||
+                          (filter === 'completed' && l.postId !== 'pending_approval')))),
+                )
+                .map(({ accountAvatar: _a, groupAvatar: _g, ...rest }) => rest)
+            : [],
       };
       const url = URL.createObjectURL(
         new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }),
@@ -487,16 +543,12 @@ export function TaskRecordsPage({
   ];
 
   const moduleTabs: [ActivityRecordModuleFilter, string, number][] = [
-    [
-      'all',
-      '全部模块',
-      counts.all +
-        unifiedFeed.moduleCounts['group-inviter'] +
-        unifiedFeed.moduleCounts['group-bumper'],
-    ],
+    ['all', '全部模块', counts.all + nonActiveTotal],
     ['active-accounts', '活跃账号', counts.all],
     ['group-inviter', '小组邀请人', unifiedFeed.moduleCounts['group-inviter']],
     ['group-bumper', '小组顶贴', unifiedFeed.moduleCounts['group-bumper']],
+    ['page-bumper', '专页顶贴', unifiedFeed.moduleCounts['page-bumper']],
+    ['group-poster', '小组发帖', unifiedFeed.moduleCounts['group-poster']],
   ];
 
   function renderActiveAccountGroupRow(
@@ -773,7 +825,10 @@ export function TaskRecordsPage({
             className={'btn btn-icon' + (exporting ? ' is-busy' : '')}
             title={exporting ? '正在导出…' : '导出当前筛选全部执行记录（JSON）'}
             aria-label="导出任务记录"
-            disabled={(!rows.length && !inviterLogs.length && !bumperLogs.length) || exporting}
+            disabled={
+              (!rows.length && !inviterLogs.length && !bumperLogs.length && !posterLogs.length) ||
+              exporting
+            }
             onClick={() => void exportRows()}
           >
             <IconDownload />

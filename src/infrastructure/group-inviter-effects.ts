@@ -358,7 +358,9 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
   close?.el.setAttribute('data-wb-group-close-btn', '1');
   const preferredMenu = menuItems.find((entry) => entry.preferred);
   if (preferredMenu) menus[preferredMenu.index]?.setAttribute('data-wb-group-invite-menuitem', '1');
-  const cookie = document.cookie.match(/(?:^|;\s*)c_user=(\d{5,25})/);
+  const cookie =
+    document.cookie.match(/(?:^|;\s*)i_user=(\d{5,25})/) ??
+    document.cookie.match(/(?:^|;\s*)c_user=(\d{5,25})/);
   let scriptUserId: string | null = null;
   if (!cookie?.[1]) {
     const timeOrigin = performance.timeOrigin;
@@ -366,7 +368,8 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     if (cached?.timeOrigin === timeOrigin && cached.id) scriptUserId = cached.id;
     else {
       for (const script of Array.from(document.scripts)) {
-        const match = /"USER_ID":"(\d{5,25})"/.exec(script.textContent ?? '');
+        const text = script.textContent ?? '';
+        const match = /"ACTOR_ID":"(\d{5,25})"/.exec(text) ?? /"USER_ID":"(\d{5,25})"/.exec(text);
         if (match?.[1]) {
           scriptUserId = match[1];
           break;

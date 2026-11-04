@@ -18,6 +18,7 @@ type Entry = {
   connection: InspectionConnection;
   row: Inspection;
   cancelled: boolean;
+  lastAccountId?: string | null;
   display: { name: string | null; avatar: string | null };
 };
 
@@ -247,6 +248,10 @@ export class ProfileInspectionService {
           connection,
           row,
           cancelled: false,
+          lastAccountId:
+            old && !old.cancelled && old.connection.connectionEpoch === connection.connectionEpoch
+              ? (old.lastAccountId ?? old.row.account.id)
+              : null,
           display:
             old && !old.cancelled && old.connection.connectionEpoch === connection.connectionEpoch
               ? { ...old.display }
@@ -322,12 +327,21 @@ export class ProfileInspectionService {
           ? await this.avatarLookup?.(observed.account.id)
           : null;
       this.current(entry);
+      const sameActorAsDisplay =
+        Boolean(observed.account.id) &&
+        (!entry.lastAccountId || entry.lastAccountId === observed.account.id);
       const account = {
         ...observed.account,
         name: observed.account.name ?? (nativeName?.success ? nativeName.data : null),
         avatar:
-          observed.account.state === 'logged-in' ? (graphAvatar ?? avatar?.url ?? null) : null,
+          observed.account.state === 'logged-in'
+            ? (graphAvatar ??
+              avatar?.url ??
+              (sameActorAsDisplay ? entry.display.avatar : null) ??
+              null)
+            : null,
       };
+      entry.lastAccountId = account.id;
       entry.display =
         observed.account.state === 'logged-in'
           ? { name: account.name, avatar: account.avatar }
@@ -374,7 +388,7 @@ export class ProfileInspectionService {
           nameObservation: null,
         });
         this.onObserved?.(entry.connection.profileId, account);
-        this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 120000);
+        this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 30_000);
         return;
       }
       entry.row = {
@@ -388,6 +402,68 @@ export class ProfileInspectionService {
       };
       if (entry.row.reason === 'INSPECTION_DOCUMENT_NOT_READY')
         this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 15000);
+    }
+  }
+  syncExternalObservation(
+    profileId: string,
+    account: {
+      state: 'unknown' | 'logged-in' | 'logged-out' | 'restricted' | 'verification';
+      id?: string | null;
+      name?: string | null;
+      avatar?: string | null;
+    },
+  ) {
+    if (this.closing) return;
+    let entry = this.entries.get(profileId);
+    if (!entry || entry.cancelled) {
+      const connection = this.port.connection(profileId);
+      if (!connection) return;
+      entry = {
+        connection,
+        cancelled: false,
+        display: { name: account.name ?? null, avatar: account.avatar ?? null },
+        row: ProfileInspection.parse({
+          profileId,
+          state: 'OBSERVED',
+          account: unknown(),
+          avatarObservation: null,
+          nameObservation: null,
+          checkedAt: this.now(),
+          reason: '',
+        }),
+      };
+      this.entries.set(profileId, entry);
+    }
+    if (['logged-out', 'restricted', 'verification'].includes(account.state)) {
+      entry.display = { name: null, avatar: null };
+      entry.row = {
+        ...entry.row,
+        state: 'OBSERVED',
+        checkedAt: this.now(),
+        account: { state: account.state, id: null, name: null, avatar: null },
+      };
+      this.nextAutomaticRead.set(profileId, this.now() + 30_000);
+      return;
+    }
+    if (account.state === 'logged-in') {
+      const prevId = entry.row.account.id ?? entry.lastAccountId ?? null;
+      const identityChanged = Boolean(account.id && prevId && account.id !== prevId);
+      const nextId = account.id ?? prevId ?? null;
+      const nextName = account.name ?? (identityChanged ? null : entry.display.name);
+      const nextAvatar = account.avatar ?? (identityChanged ? null : entry.display.avatar);
+      entry.lastAccountId = nextId;
+      entry.display = { name: nextName, avatar: nextAvatar };
+      entry.row = {
+        ...entry.row,
+        state: 'OBSERVED',
+        checkedAt: this.now(),
+        account: {
+          state: 'logged-in',
+          id: nextId,
+          name: nextName,
+          avatar: nextAvatar,
+        },
+      };
     }
   }
   async close() {

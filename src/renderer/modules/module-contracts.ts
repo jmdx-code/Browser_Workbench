@@ -3,7 +3,7 @@ import type { Step } from '../../shared/contracts.js';
 import type { Progress, TaskCommand, TaskStepBudget } from '../../shared/task-contracts.js';
 
 export type FeatureModuleId =
-  'active-accounts' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'records';
+  'active-accounts' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'group-poster' | 'records';
 
 export type StepBudget = z.infer<typeof TaskStepBudget>;
 

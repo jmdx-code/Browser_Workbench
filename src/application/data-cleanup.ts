@@ -34,6 +34,7 @@ export class DataCleanupService {
         scope: RecordCleanup,
       ): Awaitable<{ eligible: number; protected: number; bytes: number }>;
       removeBatch(scope: RecordCleanup, maximum?: number): Awaitable<number>;
+      purgeExpiredFeatureOperations?(scope: RecordCleanup): Awaitable<number>;
       assertResettable(): Awaitable<void>;
       compact(): Awaitable<{ completed: boolean }>;
     },
@@ -115,6 +116,9 @@ export class DataCleanupService {
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (n < 100) break;
       }
+      if (this.repository.purgeExpiredFeatureOperations) {
+        deleted += await this.repository.purgeExpiredFeatureOperations(ticket.selection.scope);
+      }
       return {
         deleted,
         bytes: 0,
@@ -149,6 +153,9 @@ export class DataCleanupService {
           removed = await this.repository.removeBatch(scope, 100);
           await new Promise<void>((resolve) => setImmediate(resolve));
         } while (removed === 100);
+        if (this.repository.purgeExpiredFeatureOperations) {
+          await this.repository.purgeExpiredFeatureOperations(scope);
+        }
       }
       if (settings.automaticLogs) {
         const files = await this.logs.preview(Date.now() - settings.logRetentionDays * 86400000);

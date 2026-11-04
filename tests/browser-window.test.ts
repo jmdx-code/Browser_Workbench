@@ -88,12 +88,14 @@ test('cleanupTabs falls back to lightweight CLEANUP_EXTRA_TABS when browser is b
     () => {},
   );
   peer.extensionVersion = '0.3.59';
+  peer.phase = 'PAUSED';
+  peer.synced = true;
   peer.capabilities = ['browser-window-reveal-v1', 'kernel-workspace-cleanup-v1'];
   const service = new BridgeBrowserWindow(
     core,
     {
       list: async () => [],
-      hasProfilePlanInStates: async () => true,
+      hasProfilePlanInStates: async () => false,
     },
     async () => ({
       profileId: peer.profileId,
@@ -101,7 +103,7 @@ test('cleanupTabs falls back to lightweight CLEANUP_EXTRA_TABS when browser is b
       focused: true as const,
     }),
     async () => {
-      throw Error('should not call full consolidate while RUNNING');
+      throw Error('KERNEL_RPC_FALLBACK');
     },
   );
   try {

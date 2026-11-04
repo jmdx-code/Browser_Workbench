@@ -9,6 +9,7 @@ import {
 } from '../shared/contracts.js';
 import { api } from './api.js';
 import { DraftSession } from './draft-session.js';
+import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 
 import { marketplaceCategories } from '../shared/marketplace-categories.js';
@@ -417,14 +418,14 @@ export function Editor({
                   <label>
                     接受数量
                     <div className="unit-field">
-                      <input
-                        type="number"
+                      <ControlledNumberInput
+                        ariaLabel="接受数量"
                         min={1}
                         max={500}
+                        defaultValue={step.maxAccepts}
                         value={step.maxAccepts}
-                        onChange={(event) =>
-                          stepChange(step.id, { maxAccepts: Number(event.target.value) })
-                        }
+                        onChange={(maxAccepts) => stepChange(step.id, { maxAccepts })}
+                        onCommit={(maxAccepts) => stepChange(step.id, { maxAccepts })}
                       />
                       <span>个</span>
                     </div>
@@ -433,14 +434,14 @@ export function Editor({
                 <label>
                   最长执行时间
                   <div className="unit-field">
-                    <input
-                      type="number"
+                    <ControlledNumberInput
+                      ariaLabel="最长执行时间"
                       min={1}
                       max={240}
+                      defaultValue={step.durationMinutes}
                       value={step.durationMinutes}
-                      onChange={(event) =>
-                        stepChange(step.id, { durationMinutes: Number(event.target.value) })
-                      }
+                      onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
+                      onCommit={(durationMinutes) => stepChange(step.id, { durationMinutes })}
                     />
                     <span>分钟</span>
                   </div>
@@ -454,14 +455,14 @@ export function Editor({
                 <label>
                   浏览时间
                   <div className="unit-field">
-                    <input
-                      type="number"
+                    <ControlledNumberInput
+                      ariaLabel="浏览时间"
                       min={1}
                       max={240}
+                      defaultValue={step.durationMinutes}
                       value={step.durationMinutes}
-                      onChange={(event) =>
-                        stepChange(step.id, { durationMinutes: Number(event.target.value) })
-                      }
+                      onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
+                      onCommit={(durationMinutes) => stepChange(step.id, { durationMinutes })}
                     />
                     <span>分钟</span>
                   </div>
@@ -535,19 +536,14 @@ export function Editor({
                         <label>
                           随机点赞上限
                           <div className="unit-field">
-                            <input
-                              type="number"
+                            <ControlledNumberInput
+                              ariaLabel="随机点赞上限"
                               min={0}
                               max={100}
+                              defaultValue={step.maxLikes}
                               value={step.maxLikes}
-                              onChange={(event) =>
-                                stepChange(step.id, {
-                                  maxLikes: Math.max(
-                                    0,
-                                    Math.min(100, Number(event.target.value) || 0),
-                                  ),
-                                })
-                              }
+                              onChange={(maxLikes) => stepChange(step.id, { maxLikes })}
+                              onCommit={(maxLikes) => stepChange(step.id, { maxLikes })}
                             />
                             <span>个</span>
                           </div>
@@ -555,16 +551,15 @@ export function Editor({
                         <label>
                           目标点赞量至少
                           <div className="unit-field">
-                            <input
-                              type="number"
+                            <ControlledNumberInput
+                              ariaLabel="目标点赞量至少"
                               min={0}
+                              max={1_000_000}
+                              defaultValue={step.minLikeCount}
                               value={step.minLikeCount}
                               disabled={step.maxLikes === 0}
-                              onChange={(event) =>
-                                stepChange(step.id, {
-                                  minLikeCount: Math.max(0, Number(event.target.value) || 0),
-                                })
-                              }
+                              onChange={(minLikeCount) => stepChange(step.id, { minLikeCount })}
+                              onCommit={(minLikeCount) => stepChange(step.id, { minLikeCount })}
                             />
                             <span>赞</span>
                           </div>
@@ -573,18 +568,17 @@ export function Editor({
                         <label>
                           单帖触发概率
                           <div className="unit-field">
-                            <input
-                              type="number"
+                            <ControlledNumberInput
+                              ariaLabel="单帖触发概率"
                               min={1}
                               max={100}
+                              defaultValue={step.likeProbability ?? 35}
                               value={step.likeProbability ?? 35}
-                              onChange={(event) =>
-                                stepChange(step.id, {
-                                  likeProbability: Math.max(
-                                    1,
-                                    Math.min(100, Math.round(Number(event.target.value) || 35)),
-                                  ),
-                                })
+                              onChange={(likeProbability) =>
+                                stepChange(step.id, { likeProbability })
+                              }
+                              onCommit={(likeProbability) =>
+                                stepChange(step.id, { likeProbability })
                               }
                             />
                             <span>%</span>
@@ -641,12 +635,14 @@ export function Editor({
                 <label>
                   {step.destination === 'story' ? '每个账号快拍数' : '每个账号发帖数'}
                   <div className="unit-field">
-                    <input
-                      type="number"
+                    <ControlledNumberInput
+                      ariaLabel={step.destination === 'story' ? '每个账号快拍数' : '每个账号发帖数'}
                       min={1}
                       max={20}
+                      defaultValue={step.count}
                       value={step.count}
-                      onChange={(e) => stepChange(step.id, { count: Number(e.target.value) })}
+                      onChange={(count) => stepChange(step.id, { count })}
+                      onCommit={(count) => stepChange(step.id, { count })}
                     />
                     <span>条</span>
                   </div>
@@ -721,14 +717,14 @@ export function Editor({
         {value.loop.mode === 'finite' && (
           <label>
             总轮数
-            <input
-              type="number"
+            <ControlledNumberInput
+              ariaLabel="总轮数"
               min={1}
               max={10000}
+              defaultValue={value.loop.rounds}
               value={value.loop.rounds}
-              onChange={(event) =>
-                change({ ...value, loop: { mode: 'finite', rounds: Number(event.target.value) } })
-              }
+              onChange={(rounds) => change({ ...value, loop: { mode: 'finite', rounds } })}
+              onCommit={(rounds) => change({ ...value, loop: { mode: 'finite', rounds } })}
             />
           </label>
         )}

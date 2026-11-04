@@ -5,7 +5,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { FinderTargetList } from '../src/renderer/finder-target-list.js';
 import { GroupInviterPage } from '../src/renderer/group-inviter-page.js';
 import { GroupBumperPage } from '../src/renderer/group-bumper-page.js';
+import { GroupPosterPage } from '../src/renderer/group-poster-page.js';
 import { BumperSettings } from '../src/shared/group-bumper.js';
+import { PosterSettings } from '../src/shared/group-poster.js';
+import { normalizeTargetToken } from '../src/renderer/select-by-ids-dialog.js';
 import { Sidebar } from '../src/renderer/sidebar.js';
 import { FeatureNavRail } from '../src/renderer/feature-nav-rail.js';
 import { CombinationList } from '../src/renderer/combination-list.js';
@@ -25,6 +28,10 @@ vi.mock('../src/renderer/api.js', () => ({
     cleanupProfileTabs: vi.fn(),
     bumperAction: vi.fn(),
     bumperLogs: vi.fn(),
+    posterAction: vi.fn(),
+    posterState: vi.fn(),
+    posterLogs: vi.fn(),
+    refreshGroupInviterGroups: vi.fn(),
   },
 }));
 let root: Root;
@@ -565,12 +572,9 @@ it('FinderTargetList SelectByIdsDialog parses URLs, previews unmatched IDs, supp
   await click(folderToggle ?? null);
   expect(host.querySelector('[data-finder-id="222333"]')).toBeNull();
 
-  // Open SelectByIdsDialog via ⋯ menu
-  await click(host.querySelector('[aria-label="更多目标小组列表操作"]'));
+  // Open SelectByIdsDialog via outer toolbar button
   await click(
-    [...host.querySelectorAll('[role="menuitem"]')].find((b) =>
-      b.textContent?.includes('按 ID 选中'),
-    ) ?? null,
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('按 ID 选中')) ?? null,
   );
   const textarea = host.querySelector<HTMLTextAreaElement>('[aria-label="批量输入 ID"]');
   expect(textarea).toBeTruthy();
@@ -595,11 +599,8 @@ it('FinderTargetList SelectByIdsDialog parses URLs, previews unmatched IDs, supp
   expect(host.querySelector('[data-finder-id="222333"]')).toBeTruthy();
 
   // Reopen and test 覆盖选中
-  await click(host.querySelector('[aria-label="更多目标小组列表操作"]'));
   await click(
-    [...host.querySelectorAll('[role="menuitem"]')].find((b) =>
-      b.textContent?.includes('按 ID 选中'),
-    ) ?? null,
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('按 ID 选中')) ?? null,
   );
   const textarea2 = host.querySelector<HTMLTextAreaElement>('[aria-label="批量输入 ID"]');
   await act(async () => {
@@ -1137,3 +1138,133 @@ for (const [activeCount, pausedCount] of [
     ).toBe(true);
   });
 }
+
+it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selection, no outer 7-day pills, shared_groups URL parsing, compact matrix with column resizers, floating + button, and binary thumbnail route', async () => {
+  expect(
+    normalizeTargetToken(
+      'shared_groups',
+      'https://www.facebook.com/groups/3017439278594998/?ref=share',
+    ),
+  ).toBe('3017439278594998');
+
+  const posterGroups = [
+    {
+      id: '3017439278594998',
+      name: 'Myanmar Group 1',
+      avatarUrl: null,
+      folderId: null,
+      sortOrder: 0,
+      totalBumpedCount: 2,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: '1834045181273689',
+      name: 'Myanmar Group 2',
+      avatarUrl: null,
+      folderId: null,
+      sortOrder: 1,
+      totalBumpedCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
+  const posterMaterials = [
+    {
+      id: 'mat-thumb-1',
+      caption: 'Amen test caption',
+      mediaSource: 'D:\\videos\\clip.mp4',
+      background: 'plain' as const,
+      localFilePath: 'D:\\videos\\clip.mp4',
+      mediaKind: 'video' as const,
+      cacheStatus: 'ready' as const,
+      cacheError: null,
+      hasThumbnail: true,
+      selected: true,
+      usedCount: 0,
+      sortOrder: 0,
+      createdAt: 1,
+      updatedAt: 777888,
+    },
+  ];
+  const posterStatePayload = {
+    groups: posterGroups,
+    materials: posterMaterials,
+    settings: PosterSettings.parse({}),
+    total: 2,
+    running: false,
+    statusText: '请选择账号、目标小组和发帖素材',
+    profileCounts: {},
+    dailyStats: [{ date: '2026-11-04', count: 2 }],
+  };
+  vi.mocked(api.posterAction).mockResolvedValue(posterStatePayload);
+  vi.mocked(api.posterState).mockResolvedValue(posterStatePayload);
+  vi.mocked(api.posterLogs).mockResolvedValue([]);
+
+  await act(async () =>
+    root.render(
+      <GroupPosterPage
+        state={posterStatePayload}
+        selected={new Set()}
+        onState={() => {}}
+        onMessage={() => {}}
+      />,
+    ),
+  );
+
+  // 1. 4-char title "小组列表" and 0 default selected groups (never auto-selects 2/2)
+  const toolbarTitle = host.querySelector('.finder-toolbar > strong')?.textContent;
+  expect(toolbarTitle).toBe('小组列表');
+  expect(host.textContent).toContain('已选 0/2');
+  expect(host.textContent).toContain('▶ 开始发帖 (已选0号 × 0组 × 1素材)');
+
+  // 2. Outer 7-day pills removed from main page header
+  expect(host.querySelector('.bumper-sticky-header .poster-daily-pills')).toBeNull();
+
+  // 3. Outer "按 ID 选中" button works with shared_groups Facebook URLs
+  const selectIdsBtn = [...host.querySelectorAll('.finder-toolbar button')].find((b) =>
+    b.textContent?.includes('按 ID 选中'),
+  );
+  expect(selectIdsBtn).toBeTruthy();
+  await click(selectIdsBtn ?? null);
+  const textarea = host.querySelector<HTMLTextAreaElement>('[aria-label="批量输入 ID"]');
+  await act(async () => {
+    if (textarea) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(textarea, 'https://www.facebook.com/groups/3017439278594998/');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+  expect(host.textContent).toContain('已识别 1 个去重 ID · 匹配到 1 项');
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('覆盖选中 (1)')) ??
+      null,
+  );
+  expect(host.textContent).toContain('已选 1/2');
+
+  // 4. "刷新头像" is inside ⋯ menu and calls api.posterAction('groups/refresh', { ids: [...] })
+  const moreBtn = host.querySelector('.finder-toolbar button[aria-label="更多小组列表操作"]');
+  await click(moreBtn);
+  const refreshAvatarBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '刷新头像',
+  );
+  expect(refreshAvatarBtn).toBeTruthy();
+  await click(refreshAvatarBtn ?? null);
+  expect(api.posterAction).toHaveBeenCalledWith('groups/refresh', { ids: ['3017439278594998'] });
+
+  // 5. PosterMaterialMatrix streamlined buttons, column resizers, floating + button, no bottom hint, and binary thumbnail img
+  expect(host.textContent).not.toContain('填入测试素材');
+  expect(host.textContent).not.toContain('复制整表');
+  expect(host.textContent).not.toContain('显示 1 / 1 行 · 支持从 Excel');
+  expect(host.querySelectorAll('.poster-col-resizer').length).toBe(5);
+  expect(host.querySelector('.poster-floating-add-row-btn')?.textContent?.trim()).toMatch(
+    /^[+＋]$/,
+  );
+  const thumbImg = host.querySelector<HTMLImageElement>(
+    'img[src*="/api/workspace/group-poster/materials/thumbnail"]',
+  );
+  expect(thumbImg).toBeTruthy();
+  expect(thumbImg?.getAttribute('src')).toContain('id=mat-thumb-1&v=777888');
+  expect(thumbImg?.getAttribute('loading')).toBe('lazy');
+});

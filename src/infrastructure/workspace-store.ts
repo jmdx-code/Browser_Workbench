@@ -1,9 +1,19 @@
 import { finderListMigration, SqliteTargetLists } from './target-list-store.js';
 import {
+  SqliteTargetLibraryRepository,
+  unifiedTargetLibraryMigration,
+} from './target-library-store.js';
+import {
   groupBumperOperationsMigration,
   groupBumperMigration,
   SqliteGroupBumperRepository,
 } from './group-bumper-store.js';
+import {
+  SqliteGroupPosterRepository,
+  rebuildGroupPosterOperationsEpochTextMigration,
+  stage3OperationsAndDecouplingMigration,
+  stage4MediaAndPolishMigration,
+} from './group-poster-store.js';
 import { profileTaskResultMigration } from './profile-task-result-migration.js';
 import { DEFAULT_CONCURRENT_PROFILES } from '../shared/task-capacity.js';
 import { groupInviterConfirmationMigration } from './group-inviter-store.js';
@@ -63,6 +73,11 @@ import { assertArchiveSourcesAvailable } from './material-archive-source-protect
 import { SqliteFacebookSubmissionObservationRepository } from './facebook-submission-observation-store.js';
 import { SqliteGroupInviterRepository } from './group-inviter-store.js';
 import {
+  type AccountCacheUpdateInput,
+  mergeAccountCacheUpdate,
+} from '../shared/account-state-policy.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
+import {
   ProductError,
   type CachedProfileAccount,
   WorkspaceRepository as CompatibleWorkspaceRepository,
@@ -87,7 +102,14 @@ import {
   type SavedCombination,
 } from '../shared/contracts.js';
 
-const migrations = [
+type MigrationSpec =
+  | string
+  | {
+      readonly run: (db: DatabaseSync) => void;
+      readonly rebuild?: boolean;
+    };
+
+const migrations: readonly MigrationSpec[] = [
   [
     'CREATE TABLE groups(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,color TEXT NOT NULL,sort_order INTEGER NOT NULL)',
     'CREATE TABLE profile_metadata(profile_id TEXT PRIMARY KEY,group_id TEXT REFERENCES groups(id),alias TEXT)',
@@ -148,6 +170,71 @@ const migrations = [
     "CREATE INDEX IF NOT EXISTS task_events_notification_due ON task_events(sequence, type) WHERE type IN ('FAILED', 'COMPLETED')",
   ].join(';'),
   groupBumperOperationsMigration,
+  {
+    rebuild: true,
+    run: (db) => {
+      db.exec(`
+        DROP TRIGGER IF EXISTS profile_task_result_terminal;
+        CREATE TABLE profile_task_results_next (
+          profile_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL CHECK(source IN ('task', 'group-inviter', 'group-bumper', 'page-bumper', 'group-poster')),
+          run_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('COMPLETED', 'FAILED', 'STOPPED')),
+          reason TEXT NOT NULL,
+          finished_at INTEGER NOT NULL,
+          failed_steps INTEGER NOT NULL DEFAULT 0,
+          skipped_steps INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO profile_task_results_next
+        SELECT
+          profile_id,
+          CASE
+            WHEN source = 'group-bumper' AND name = '小组发帖' THEN 'group-poster'
+            WHEN source = 'group-bumper' AND name = '专页顶贴' THEN 'page-bumper'
+            ELSE source
+          END,
+          run_id, name, state, reason, finished_at, failed_steps, skipped_steps
+        FROM profile_task_results;
+        DROP TABLE profile_task_results;
+        ALTER TABLE profile_task_results_next RENAME TO profile_task_results;
+        CREATE TRIGGER profile_task_result_terminal AFTER INSERT ON task_events
+          WHEN NEW.type IN ('COMPLETED', 'FAILED', 'STOPPED') BEGIN
+          INSERT INTO profile_task_results
+            SELECT profile_id, 'task', id, json_extract(snapshot, '$.name'), state, reason, NEW.created_at,
+              (SELECT count(*) FROM task_steps WHERE job_id = NEW.job_id AND json_extract(outcome, '$.kind') = 'FAILED'),
+              (SELECT count(*) FROM task_steps WHERE job_id = NEW.job_id AND json_extract(outcome, '$.kind') = 'SKIPPED')
+            FROM task_plans WHERE id = NEW.job_id AND state IN ('COMPLETED', 'FAILED', 'STOPPED')
+          ON CONFLICT(profile_id) DO UPDATE SET
+            source = excluded.source, run_id = excluded.run_id, name = excluded.name,
+            state = excluded.state, reason = excluded.reason, finished_at = excluded.finished_at,
+            failed_steps = excluded.failed_steps, skipped_steps = excluded.skipped_steps;
+        END;
+      `);
+    },
+  },
+  {
+    rebuild: true,
+    run: (db) => {
+      unifiedTargetLibraryMigration(db);
+    },
+  },
+  {
+    run: (db) => {
+      stage3OperationsAndDecouplingMigration(db);
+    },
+  },
+  {
+    run: (db) => {
+      stage4MediaAndPolishMigration(db);
+    },
+  },
+  {
+    rebuild: true,
+    run: (db) => {
+      rebuildGroupPosterOperationsEpochTextMigration(db);
+    },
+  },
 ];
 export const workspaceSchemaVersion = migrations.length;
 
@@ -318,8 +405,10 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly archivePreparation: SqliteMaterialArchivePreparationRepository;
   readonly archiveExecution: SqliteMaterialArchiveExecutionRepository;
   readonly submissionObservations: SqliteFacebookSubmissionObservationRepository;
+  readonly targetLibrary: SqliteTargetLibraryRepository;
   readonly groupInviter: SqliteGroupInviterRepository;
   readonly groupBumper: SqliteGroupBumperRepository;
+  readonly groupPoster: SqliteGroupPosterRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
@@ -342,8 +431,10 @@ export class WorkspaceStore implements WorkspaceRepository {
       this.archivePreparation,
     );
     this.submissionObservations = new SqliteFacebookSubmissionObservationRepository(db);
+    this.targetLibrary = new SqliteTargetLibraryRepository(db);
     this.groupInviter = new SqliteGroupInviterRepository(db);
     this.groupBumper = new SqliteGroupBumperRepository(db);
+    this.groupPoster = new SqliteGroupPosterRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -367,24 +458,30 @@ export class WorkspaceStore implements WorkspaceRepository {
         db.exec('PRAGMA wal_checkpoint(PASSIVE)');
       } catch {}
       for (let next = version; next < migrations.length; next++) {
-        const sql = migrations[next];
-        if (!sql) throw new Error('MIGRATION_MISSING');
+        const entry = migrations[next];
+        if (!entry) throw new Error('MIGRATION_MISSING');
         const rebuild =
-          sql === materialUsageMigration ||
-          sql === taskStepOutcomeMigration ||
-          sql === taskPageLifecycleMigration;
+          typeof entry === 'string'
+            ? entry === materialUsageMigration ||
+              entry === taskStepOutcomeMigration ||
+              entry === taskPageLifecycleMigration
+            : Boolean(entry.rebuild);
         if (rebuild) db.exec('PRAGMA foreign_keys=OFF');
         db.exec('BEGIN IMMEDIATE');
         try {
-          if (
-            sql !== cleanupQuotaMigration ||
-            !db
-              .prepare('PRAGMA table_info(data_cleanup_settings)')
-              .all()
-              .some((column) => column.name === 'history_max_count')
-          )
-            if (next === 43) finderListMigration(db);
-            else db.exec(sql);
+          if (typeof entry === 'string') {
+            if (
+              entry !== cleanupQuotaMigration ||
+              !db
+                .prepare('PRAGMA table_info(data_cleanup_settings)')
+                .all()
+                .some((column) => column.name === 'history_max_count')
+            )
+              if (next === 43) finderListMigration(db);
+              else db.exec(entry);
+          } else {
+            entry.run(db);
+          }
           if (rebuild && db.prepare('PRAGMA foreign_key_check').all().length)
             throw Error('MATERIAL_USAGE_MIGRATION_FOREIGN_KEY_FAILED');
           db.exec('PRAGMA user_version=' + (next + 1));
@@ -510,9 +607,11 @@ export class WorkspaceStore implements WorkspaceRepository {
       }
       const delMeta = this.stmt('DELETE FROM profile_metadata WHERE profile_id=?');
       const delCache = this.stmt('DELETE FROM profile_account_cache WHERE profile_id=?');
+      const delResult = this.stmt('DELETE FROM profile_task_results WHERE profile_id=?');
       for (const id of uniqueIds) {
         delMeta.run(id);
         delCache.run(id);
+        delResult.run(id);
       }
       return uniqueIds.length;
     });
@@ -547,6 +646,16 @@ export class WorkspaceStore implements WorkspaceRepository {
           const state = (
             validStates.has(rawState) ? rawState : 'unknown'
           ) as Profile['account']['state'];
+          const rawAvatar =
+            row.avatar_url === null || row.avatar_url === undefined ? null : String(row.avatar_url);
+          const avatar =
+            rawAvatar && isLocalAvatar(rawAvatar)
+              ? state === 'logged-out'
+                ? null
+                : rawAvatar
+              : ['logged-out', 'restricted', 'verification'].includes(state)
+                ? null
+                : rawAvatar;
           return [
             String(row.profile_id),
             {
@@ -559,51 +668,23 @@ export class WorkspaceStore implements WorkspaceRepository {
                 row.account_name === null || row.account_name === undefined
                   ? null
                   : String(row.account_name),
-              avatar:
-                ['logged-out', 'restricted', 'verification'].includes(state) ||
-                row.avatar_url === null ||
-                row.avatar_url === undefined
-                  ? null
-                  : String(row.avatar_url),
+              avatar,
               avatarUpdatedAt: Number(row.avatar_updated_at ?? 0),
             },
           ];
         }),
     );
   }
-  updateProfileAccountCache(profileId: string, update: Partial<CachedProfileAccount>): void {
-    const existing = this.profileAccountCache().get(profileId) ?? {
-      state: 'unknown' as const,
-      id: null,
-      name: null,
-      avatar: null,
-      avatarUpdatedAt: 0,
-    };
-    const nextState = update.state ?? existing.state;
-    const isAbnormal = ['logged-out', 'restricted', 'verification'].includes(nextState);
-    const nextId = update.id !== undefined ? update.id : existing.id;
-    const nextName = update.name !== undefined ? update.name : existing.name;
-    const nextAvatar = isAbnormal
-      ? null
-      : update.avatar !== undefined
-        ? update.avatar
-        : existing.avatar;
-    if (
-      existing.state === nextState &&
-      existing.id === nextId &&
-      existing.name === nextName &&
-      existing.avatar === nextAvatar &&
-      update.avatarUpdatedAt === undefined
-    ) {
+  updateProfileAccountCache(profileId: string, update: AccountCacheUpdateInput): void {
+    const existing = this.profileAccountCache().get(profileId);
+    const merged = mergeAccountCacheUpdate({
+      existing,
+      incoming: update,
+    });
+    if (!merged.changed && update.avatarUpdatedAt === undefined) {
       return;
     }
     this.transaction(() => {
-      const nextUpdatedAt =
-        update.avatarUpdatedAt !== undefined
-          ? update.avatarUpdatedAt
-          : update.avatar !== undefined && update.avatar !== null
-            ? Date.now()
-            : existing.avatarUpdatedAt;
       this.stmt(
         `INSERT INTO profile_account_cache(profile_id,account_state,account_id,account_name,avatar_url,avatar_updated_at)
            VALUES(?,?,?,?,?,?)
@@ -613,7 +694,14 @@ export class WorkspaceStore implements WorkspaceRepository {
              account_name=excluded.account_name,
              avatar_url=excluded.avatar_url,
              avatar_updated_at=excluded.avatar_updated_at`,
-      ).run(profileId, nextState, nextId, nextName, nextAvatar, nextUpdatedAt);
+      ).run(
+        profileId,
+        merged.next.state,
+        merged.next.id,
+        merged.next.name,
+        merged.next.avatar,
+        merged.next.avatarUpdatedAt,
+      );
     });
   }
   combinations() {

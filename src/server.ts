@@ -1,7 +1,23 @@
 import { recoverBumperOperations } from './infrastructure/group-bumper-recovery.js';
+import {
+  fetchAndLocalizeAccountAvatar,
+  scheduleStartupAccountAvatarLocalization,
+} from './infrastructure/group-bumper-avatar.js';
+import { isLocalAvatar } from './shared/group-bumper.js';
 import { GroupBumperService } from './application/group-bumper-service.js';
-import { FeatureExecutionRegistry } from './application/feature-execution-registry.js';
+import { GroupPosterService } from './application/group-poster-service.js';
+import {
+  FeatureExecutionRegistry,
+  ensureFeatureExecutionRegistry,
+} from './application/feature-execution-registry.js';
+import { createGlobalAccountAbnormalReporter } from './application/account-abnormal-reporter.js';
 import { GroupBumperBrowserAdapter } from './infrastructure/group-bumper-runner.js';
+import { TargetMetadataRefreshService } from './infrastructure/target-metadata-refresh.js';
+import {
+  FilesystemPosterMediaPreparer,
+  GroupPosterBrowserAdapter,
+  recoverPosterOperations,
+} from './infrastructure/group-poster-runner.js';
 import { mediaRuntimeComponent } from './infrastructure/media-runtime-component.js';
 import { SoftwareUpdateService } from './application/software-update-service.js';
 import { taskBlocksSoftwareUpdate } from './domain/software-update.js';
@@ -18,7 +34,6 @@ import {
   prepareWorkspaceReset,
   applyPendingWorkspaceReset,
 } from './infrastructure/workspace-reset.js';
-import { mapAsync } from './shared/async-collections.js';
 import path from 'node:path';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { FilesystemRuntimeLog } from './infrastructure/runtime-log.js';
@@ -72,7 +87,7 @@ import { GroupInviterBrowserAdapter } from './infrastructure/group-inviter-runne
 import { devDiag } from './shared/dev-diagnostics.js';
 import { DevDiagnosticsFileWriter } from './infrastructure/dev-diagnostics-writer.js';
 import {
-  buildDiagnosticFeedbackPackage,
+  createDiagnosticSnapshotBuilder,
   revealDiagnosticPackage,
 } from './infrastructure/diagnostic-package.js';
 
@@ -228,6 +243,8 @@ try {
             const kernel = new KernelBridge(core, tasks);
             kernel.recoverBumperWorkspace = (peer, guard) =>
               recoverBumperOperations(kernel, peer, repository.groupBumper, guard);
+            kernel.recoverPosterWorkspace = (peer, guard) =>
+              recoverPosterOperations(kernel, peer, repository.groupPoster, guard);
             const layout = new WindowLayoutService(
               () => layoutDisplays,
               {
@@ -268,38 +285,75 @@ try {
               (id, at) => layout.visible(id, at),
             );
             windowLayout = layout;
+            const localizeAvatar = (url: string, key: string) =>
+              fetchAndLocalizeAccountAvatar(url, undefined, key).catch(() => null);
             kernel.setAccountObserver({
               shouldRefreshAvatar: async (profileId, accountId) => {
                 const cached = (await repository.profileAccountCache()).get(profileId);
                 return (
-                  !cached?.avatar ||
-                  cached.id !== accountId ||
-                  Date.now() - (cached.avatarUpdatedAt ?? 0) >= 6 * 3600_000
+                  !isLocalAvatar(cached?.avatar) ||
+                  cached?.id !== accountId ||
+                  Date.now() - (cached?.avatarUpdatedAt ?? 0) >= 6 * 3600_000
                 );
               },
               onObserved: async (profileId, account) => {
-                await repository.updateProfileAccountCache(profileId, account);
-                if (account.state === 'logged-in' && account.id && !account.avatar) {
-                  const cached = (await repository.profileAccountCache()).get(profileId);
-                  if (
-                    !cached?.avatar ||
-                    cached.id !== account.id ||
-                    Date.now() - (cached.avatarUpdatedAt ?? 0) >= 6 * 3600_000
-                  ) {
-                    const accountId = account.id;
-                    void graphAvatar
-                      .lookup(accountId)
-                      .then(async (url) => {
-                        if (url) {
-                          await repository.updateProfileAccountCache(profileId, {
-                            state: 'logged-in',
-                            id: accountId,
-                            avatar: url,
-                          });
-                        }
-                      })
-                      .catch(() => {});
-                  }
+                const previous = (await repository.profileAccountCache()).get(profileId);
+                let resolvedAvatar = account.avatar;
+                if (resolvedAvatar && !isLocalAvatar(resolvedAvatar)) {
+                  const localized = await localizeAvatar(
+                    resolvedAvatar,
+                    `${profileId}:${account.id ?? ''}`,
+                  );
+                  if (localized) resolvedAvatar = localized;
+                  else if (isLocalAvatar(previous?.avatar) && previous?.id === account.id)
+                    resolvedAvatar = previous?.avatar ?? null;
+                }
+                await repository.updateProfileAccountCache(profileId, {
+                  ...account,
+                  ...(resolvedAvatar !== undefined ? { avatar: resolvedAvatar } : {}),
+                });
+                const latest = (await repository.profileAccountCache()).get(profileId);
+                const effectiveAvatar =
+                  latest?.avatar ??
+                  (resolvedAvatar !== undefined
+                    ? resolvedAvatar
+                    : previous?.id === account.id
+                      ? previous?.avatar
+                      : null);
+                inspection?.syncExternalObservation(profileId, {
+                  ...account,
+                  ...(effectiveAvatar !== undefined ? { avatar: effectiveAvatar } : {}),
+                });
+                const staleAvatar =
+                  !isLocalAvatar(previous?.avatar) ||
+                  previous?.id !== account.id ||
+                  Date.now() - (previous?.avatarUpdatedAt ?? 0) >= 6 * 3600_000;
+                if (
+                  account.state === 'logged-in' &&
+                  account.id &&
+                  !isLocalAvatar(effectiveAvatar) &&
+                  staleAvatar
+                ) {
+                  const accountId = account.id;
+                  void graphAvatar
+                    .lookup(accountId)
+                    .then(async (url) => {
+                      if (!url) return;
+                      const finalAvatar =
+                        (await localizeAvatar(url, `${profileId}:${accountId}`)) ?? url;
+                      await repository.updateProfileAccountCache(profileId, {
+                        state: 'logged-in',
+                        id: accountId,
+                        avatar: finalAvatar,
+                        liveConfirmedLoggedIn: true,
+                      });
+                      inspection?.syncExternalObservation(profileId, {
+                        state: 'logged-in',
+                        id: accountId,
+                        avatar: finalAvatar,
+                      });
+                    })
+                    .catch(() => {});
                 }
               },
             });
@@ -320,14 +374,34 @@ try {
               Date.now,
               (accountId) => graphAvatar.lookup(accountId),
               async (profileId, account) => {
+                let resolvedAvatar =
+                  account.state === 'logged-out'
+                    ? null
+                    : ['restricted', 'verification'].includes(account.state)
+                      ? undefined
+                      : account.avatar;
+                if (resolvedAvatar && !isLocalAvatar(resolvedAvatar)) {
+                  const localized = await localizeAvatar(
+                    resolvedAvatar,
+                    `${profileId}:${account.id ?? ''}`,
+                  );
+                  if (localized) resolvedAvatar = localized;
+                }
                 await repository.updateProfileAccountCache(profileId, {
                   state: account.state,
                   ...(account.id ? { id: account.id } : {}),
                   ...(account.name ? { name: account.name } : {}),
-                  avatar: ['logged-out', 'restricted', 'verification'].includes(account.state)
-                    ? null
-                    : account.avatar,
+                  ...(resolvedAvatar !== undefined ? { avatar: resolvedAvatar } : {}),
+                  liveConfirmedLoggedIn: account.state === 'logged-in',
                 });
+                if (resolvedAvatar && isLocalAvatar(resolvedAvatar)) {
+                  inspection?.syncExternalObservation(profileId, {
+                    state: account.state,
+                    id: account.id,
+                    name: account.name,
+                    avatar: resolvedAvatar,
+                  });
+                }
               },
             );
             if (process.env.WORKBENCH_DIAGNOSTICS !== '1')
@@ -411,6 +485,7 @@ try {
       ? [process.env.BRIDGE_ALLOWED_EXTENSION_ID]
       : [identity.extensionId, 'penkjbecaaekdcpbpcfjekhikhjhoaai'],
     appRoutes: ({ core, store, tasks }) => {
+      const featureExecution = new FeatureExecutionRegistry();
       backups = new WorkspaceBackupService(
         repository.tasks,
         new FilesystemWorkspaceBackupWriter(
@@ -420,10 +495,7 @@ try {
           dataDir,
         ),
         new FilesystemWorkspaceRestore(dataDir),
-        () =>
-          (publishingRuntime?.hasActiveExecution() ?? false) ||
-          groupInviterService.hasActiveExecution() ||
-          groupBumperService?.hasActiveExecution() === true,
+        () => featureExecution.hasAnyActiveExecution(),
       );
       const workspaceService = new WorkspaceService(
         repository,
@@ -436,21 +508,21 @@ try {
           (id) => mainKernel?.presentationStatus(id) ?? null,
         ),
       );
+      const assertSystemIdle = () => {
+        dataCleanup?.assertNotResetting();
+        backups?.assertIdle();
+        softwareUpdate?.assertIdle();
+      };
       const taskService = new TaskService(
         repository.tasks,
         () => publishingRuntime,
-        () => {
-          dataCleanup?.assertNotResetting();
-          backups?.assertIdle();
-          softwareUpdate?.assertIdle();
-        },
+        assertSystemIdle,
         () => featureEvidence,
         () => {
           void publishingRuntime?.tick().catch(() => {});
         },
       );
       let groupBumperService: GroupBumperService | undefined;
-      const featureExecution = new FeatureExecutionRegistry();
       featureExecution.register({
         id: 'active-accounts',
         label: '活跃账号',
@@ -466,48 +538,59 @@ try {
           ]);
         },
         hasActiveExecution: () => publishingRuntime?.hasActiveExecution() === true,
-      });
-      const groupInviterService = new GroupInviterService(
-        repository.groupInviter,
-        new GroupInviterBrowserAdapter(
-          repository.groupInviter,
-          () => mainKernel,
-          () => core,
-          async (profileId) => {
-            const p = await new BridgeProfileSource(
-              core,
-              store,
-              tasks,
-              inspection,
-              browserLabels,
-            ).profile(profileId);
-            return (
-              p?.account.id ?? (await repository.profileAccountCache()).get(profileId)?.id ?? null
-            );
-          },
-          (profileId) => featureExecution.isProfileBusy(profileId, 'group-inviter'),
-        ),
-        () => {
-          dataCleanup?.assertNotResetting();
-          backups?.assertIdle();
-          softwareUpdate?.assertIdle();
-        },
-      );
-      featureExecution.register({
-        id: 'group-inviter',
-        label: '小组邀请人',
-        isProfileRunning: (profileId) => groupInviterService.isProfileRunning(profileId),
-        hasActiveExecution: () => groupInviterService.hasActiveExecution(),
         stopProfiles: async (profileIds) => {
-          await groupInviterService.stopProfiles({ profileIds: [...profileIds] });
+          await Promise.all(profileIds.map((id) => taskService.stopActiveProfile(id)));
+        },
+      });
+      const accountAbnormalReporter = createGlobalAccountAbnormalReporter({
+        updateProfileAccountCache: (profileId, patch) =>
+          repository.updateProfileAccountCache(profileId, {
+            state: patch.state,
+            scope: patch.scope,
+            ...(patch.accountId !== undefined ? { id: patch.accountId } : {}),
+            ...(patch.name !== undefined ? { name: patch.name } : {}),
+            ...(patch.avatar !== undefined ? { avatar: patch.avatar } : {}),
+          }),
+        syncExternalObservation: (profileId, patch) => {
+          inspection?.syncExternalObservation(profileId, {
+            state: patch.state,
+            ...(patch.accountId !== undefined ? { id: patch.accountId } : {}),
+            ...(patch.name !== undefined ? { name: patch.name } : {}),
+            ...(patch.avatar !== undefined ? { avatar: patch.avatar } : {}),
+          });
         },
       });
       const bumperAdapter = new GroupBumperBrowserAdapter(
         repository.groupBumper,
         () => mainKernel,
         () => core,
-        (id) => featureExecution.isProfileBusy(id, 'group-bumper'),
+        async (id) => {
+          for (const participant of featureExecution.participants()) {
+            if (participant.id === 'group-bumper' || participant.id === 'page-bumper') continue;
+            if (await participant.isProfileRunning(id)) return true;
+          }
+          return false;
+        },
+        1,
+        accountAbnormalReporter,
       );
+      const targetMetadataRefresh = new TargetMetadataRefreshService(bumperAdapter);
+      const groupInviterService = new GroupInviterService(
+        repository.groupInviter,
+        new GroupInviterBrowserAdapter(
+          repository.groupInviter,
+          () => mainKernel,
+          () => core,
+          undefined,
+          (profileId) => featureExecution.isProfileBusy(profileId, 'group-inviter'),
+          targetMetadataRefresh,
+          accountAbnormalReporter,
+        ),
+        assertSystemIdle,
+        (items, options) => targetMetadataRefresh.refreshTargetBatch('groups', items, options),
+        () => targetMetadataRefresh.stopRefresh('groups'),
+      );
+      groupInviterService.setFeatureExecutionRegistry(featureExecution);
       groupBumperService = new GroupBumperService(
         repository.groupBumper,
         bumperAdapter,
@@ -515,24 +598,52 @@ try {
           comments: await repository.groupBumper.comments(),
           total: await repository.groupBumper.total(),
         }),
-        () => {
-          dataCleanup?.assertNotResetting();
-          backups?.assertIdle();
-          softwareUpdate?.assertIdle();
-        },
-        (kind, items, options) => bumperAdapter.refreshTargetBatch(kind, items, options),
+        assertSystemIdle,
+        (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
+        undefined,
+        (kind) => targetMetadataRefresh.stopRefresh(kind),
       );
-
-      featureExecution.register({
-        id: 'group-bumper',
-        label: '小组顶贴',
-        isProfileRunning: (profileId) => groupBumperService?.isProfileRunning(profileId) === true,
-        hasActiveExecution: () => groupBumperService?.hasActiveExecution() === true,
-        stopProfiles: async (profileIds) => {
-          await groupBumperService?.stop([...profileIds]);
-        },
-      });
+      groupBumperService.setFeatureExecutionRegistry(featureExecution);
       const mediaComponent = mediaRuntimeComponent(dataDir);
+      const posterAdapter = new GroupPosterBrowserAdapter(
+        repository.groupBumper,
+        () => mainKernel,
+        () => core,
+        (id) => featureExecution.isProfileBusy(id, 'group-poster'),
+        1,
+        repository.groupPoster,
+        accountAbnormalReporter,
+      );
+      const groupPosterService = new GroupPosterService(
+        repository.groupPoster,
+        posterAdapter,
+        new FilesystemPosterMediaPreparer(
+          path.join(uploadCacheRoot, 'group-poster-media'),
+          fetch,
+          mediaComponent,
+        ),
+        featureExecution,
+        assertSystemIdle,
+        (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
+        () => targetMetadataRefresh.stopRefresh('groups'),
+      );
+      ensureFeatureExecutionRegistry(featureExecution, {
+        groupInviter: groupInviterService,
+        groupBumper: groupBumperService,
+        groupPoster: groupPosterService,
+      });
+      const posterCacheStartupTimer = setTimeout(
+        () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
+        30_000,
+      ).unref();
+      const posterCacheIntervalTimer = setInterval(
+        () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
+        6 * 3600_000,
+      ).unref();
+      process.once('exit', () => {
+        clearTimeout(posterCacheStartupTimer);
+        clearInterval(posterCacheIntervalTimer);
+      });
       const updaterBackend = new SoftwareUpdateBackend({
         root,
         dataDir,
@@ -544,8 +655,7 @@ try {
         bundledExtension.version,
         productExtensionDirectory(),
         async (id) =>
-          groupBumperService?.isProfileRunning(id) === true ||
-          groupInviterService.isProfileRunning(id) ||
+          (await featureExecution.isProfileBusy(id)) ||
           publishingRuntime?.hasExecutionOrOpening(id) === true ||
           core.hasPendingControlOrOperation(id) ||
           (await store.unresolved(id)).length > 0 ||
@@ -567,23 +677,22 @@ try {
           assertCanApply: async () => {
             if (!process.parentPort)
               throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中执行更新', 409);
-            if (
-              groupBumperService?.hasActiveExecution() === true ||
-              groupInviterService.hasActiveExecution() ||
-              publishingRuntime?.hasActiveExecution() ||
-              (await repository.tasks.livePlans()).some((p) =>
-                taskBlocksSoftwareUpdate(
-                  p.state,
-                  core.peers.get(p.profileId)?.online === true,
-                  publishingRuntime?.hasOwner(p.profileId) === true,
-                ),
-              )
-            )
+            const activeLabels = await featureExecution.activeModuleLabels();
+            const hasLiveTaskPlan = (await repository.tasks.livePlans()).some((p) =>
+              taskBlocksSoftwareUpdate(
+                p.state,
+                core.peers.get(p.profileId)?.online === true,
+                publishingRuntime?.hasOwner(p.profileId) === true,
+              ),
+            );
+            if (activeLabels.length > 0 || hasLiveTaskPlan) {
+              const moduleSuffix = activeLabels.length > 0 ? `（${activeLabels.join('、')}）` : '';
               throw new ProductError(
                 'UPDATE_TASKS_ACTIVE',
-                '当前有任务正在运行，请先暂停或停止任务后再执行一键更新',
+                `当前有任务正在运行${moduleSuffix}，请先暂停或停止任务后再执行一键更新`,
                 409,
               );
+            }
             backups?.assertIdle();
           },
           restart: () => {
@@ -623,12 +732,14 @@ try {
             }
           : undefined,
         async () => {
-          if (publishingRuntime?.hasActiveExecution())
-            throw new ProductError('RESET_TASKS_ACTIVE', '请先停止当前正在执行的任务', 409);
-          if (groupBumperService?.hasActiveExecution())
-            throw new ProductError('RESET_BUMPER_ACTIVE', '请先停止小组顶贴任务', 409);
-          if ((await groupInviterService.state()).running)
-            throw new ProductError('RESET_INVITER_ACTIVE', '请先停止小组邀请任务', 409);
+          const activeLabels = await featureExecution.activeModuleLabels();
+          if (activeLabels.length > 0) {
+            throw new ProductError(
+              'RESET_TASKS_ACTIVE',
+              `请先停止当前正在执行的任务（${activeLabels.join('、')}）`,
+              409,
+            );
+          }
         },
         () => {
           mediaComponent.assertIdle();
@@ -676,9 +787,7 @@ try {
               );
             return mainKernel.consolidateFacebookWorkspace(peer, preferActiveTab);
           },
-          (profileId) =>
-            groupInviterService.isProfileRunning(profileId) ||
-            groupBumperService?.isProfileRunning(profileId) === true,
+          (profileId) => featureExecution.isProfileBusy(profileId),
         ),
         new MaterialCacheManagement(
           repository.cacheCleanup,
@@ -692,156 +801,23 @@ try {
           cacheDirectory: uploadCacheRoot,
         }),
         groupInviterService,
-        async (diagInput) => {
-          const note = diagInput?.note;
-          const uiContext = diagInput?.uiContext;
-          const wsSnapshot = await workspaceService.snapshot();
-          const runtime = await taskService.runtimeOverview();
-          const activePlans = await mapAsync(runtime.plans.slice(-16), async (plan) => {
-            const activeStep = await repository.tasks.currentStepForPlan(
-              plan.id,
-              plan.round,
-              plan.position,
-            );
-            const recentOps = (await repository.tasks.recentOperations(plan.id, 6)).map((op) => ({
-              id: op.id,
-              kind: op.action.kind,
-              status: op.status,
-              disposition: op.disposition ?? null,
-              updatedAt: op.updatedAt,
-            }));
-            return {
-              id: plan.id,
-              profileId: plan.profileId,
-              profileName:
-                wsSnapshot.profiles.find((p) => p.id === plan.profileId)?.alias ||
-                wsSnapshot.profiles.find((p) => p.id === plan.profileId)?.browserName ||
-                plan.profileId.slice(0, 8),
-              combinationName: plan.snapshot.name,
-              state: plan.state,
-              reason: plan.reason,
-              round: plan.round,
-              position: plan.position,
-              activeStep: activeStep
-                ? {
-                    id: activeStep.id,
-                    type: activeStep.spec.type,
-                    status: activeStep.status,
-                    progress: activeStep.progress,
-                  }
-                : null,
-              recentOps,
-            };
-          });
-          const profileSummaries = wsSnapshot.profiles.map((p) => {
-            const peer = core.peers.get(p.id);
-            return {
-              id: p.id,
-              name: p.alias || p.browserName || p.id.slice(0, 8),
-              alias: p.alias ?? '',
-              browserName: p.browserName ?? '',
-              online: p.online,
-              phase: p.phase,
-              synced: p.synced,
-              unresolved: p.unresolved,
-              extensionVersion: peer?.extensionVersion ?? null,
-              accountState: p.account.state,
-              accountId: p.account.id ?? null,
-              accountName: p.account.name ?? null,
-              profileWindowFocused: peer?.profileWindowFocused ?? null,
-              focusedWindowAt: peer?.focusedWindowAt ?? null,
-              presentationRecoverySupported:
-                peer?.capabilities?.includes('task-presentation-recovery-v1') ?? false,
-              kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-50) : [],
-            };
-          });
-          const inviterState = await groupInviterService.state();
-          const inviterLogs = await groupInviterService.logs('', undefined, 300);
-          const bumperState = groupBumperService ? await groupBumperService.state() : null;
-          const bumperLogs = groupBumperService
-            ? await groupBumperService.logs('', undefined, undefined, 300)
-            : [];
-          const loopDelaySummary = {
-            resolutionMs: 20,
-            samples: controllerLoopDelay.count,
-            maxSampleIntervalMs: controllerLoopDelay.count ? controllerLoopDelay.max / 1e6 : null,
-            p99SampleIntervalMs: controllerLoopDelay.count
-              ? controllerLoopDelay.percentile(99) / 1e6
-              : null,
-          };
-          const entry = devDiag.record({
-            level: 'SNAPSHOT',
-            category: 'SNAPSHOT',
-            event: 'USER_MANUAL_SNAPSHOT',
-            reason: note?.trim() || uiContext?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
-            data: {
-              softwareVersion,
-              uiContext: uiContext?.trim() || '',
-              controllerLoopDelay: loopDelaySummary,
-              controllerMemory: process.memoryUsage(),
-              settings: runtime.settings,
-              profiles: profileSummaries,
-              plans: activePlans,
-              plansTruncated: runtime.plans.length > activePlans.length,
-              groupInviter: {
-                running: inviterState.running,
-                runId: inviterState.runId,
-                statusText: inviterState.statusText,
-                profileCounts: inviterState.profileCounts,
-              },
-              groupBumper: bumperState
-                ? {
-                    running: bumperState.running,
-                    statusText: bumperState.statusText,
-                    profileCounts: bumperState.profileCounts,
-                  }
-                : null,
-            },
-          });
-          const combinationsSummary = wsSnapshot.combinations.map((row) => ({
-            id: row.id,
-            version: row.version,
-            revision: row.revision,
-            updatedAt: row.updatedAt,
-            saved: row.saved
-              ? {
-                  name: row.saved.name,
-                  note: row.saved.note,
-                  randomOrder: row.saved.randomOrder,
-                  loop: row.saved.loop,
-                  steps: row.saved.steps,
-                }
-              : null,
-          }));
-          return await buildDiagnosticFeedbackPackage({
-            dataDir,
-            softwareVersion,
-            extensionVersion: bundledExtension.version,
-            note,
-            uiContext,
-            targetDir: diagInput?.targetDir,
-            reveal: diagInput?.reveal,
-            entryId: entry.id,
-            at: entry.at,
-            controllerLoopDelay: loopDelaySummary,
-            profiles: profileSummaries,
-            combinations: combinationsSummary,
-            groupInviter: {
-              state: inviterState,
-              logs: inviterLogs,
-            },
-            groupBumper: bumperState
-              ? {
-                  state: bumperState,
-                  logs: bumperLogs,
-                }
-              : null,
-            tasksRepository: repository.tasks,
-            taskTabsRepository: repository.taskTabs,
-            devDiagFlush: () => devDiagWriter.flush(),
-            devDiagFilePath: devDiagWriter.filePath,
-          });
-        },
+        createDiagnosticSnapshotBuilder({
+          dataDir,
+          softwareVersion,
+          extensionVersion: bundledExtension.version,
+          workspaceService,
+          taskService,
+          groupInviterService,
+          getGroupBumperService: () => groupBumperService,
+          groupPosterService,
+          tasksRepository: repository.tasks,
+          taskTabsRepository: repository.taskTabs,
+          core,
+          getMainKernel: () => mainKernel,
+          controllerLoopDelay,
+          devDiagFlush: () => devDiagWriter.flush(),
+          devDiagFilePath: devDiagWriter.filePath,
+        }),
         dataCleanup,
         windowLayout,
         mediaComponent,
@@ -849,6 +825,8 @@ try {
         groupBumperService,
         (fileName, targetDir) => revealDiagnosticPackage(dataDir, fileName, targetDir),
         featureExecution,
+        groupPosterService,
+        (id) => Boolean(core.peers.get(id)?.online),
       );
       return async (...args) => {
         const [req] = args;
@@ -916,9 +894,16 @@ const notificationTimer = setInterval(async () => {
 console.log('Browser Workbench dashboard: ' + bridge.origin);
 process.parentPort?.postMessage({ type: 'READY', origin: bridge.origin });
 let shuttingDown = false;
+const startupAvatarLocalization = scheduleStartupAccountAvatarLocalization({
+  repository,
+  inspection,
+  isShuttingDown: () => shuttingDown,
+  graphAvatarLookup: (accountId) => graphAvatar.lookup(accountId),
+});
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  startupAvatarLocalization.cancel();
   controllerLoopDelay.disable();
   if (notificationTimer) clearInterval(notificationTimer);
   clearInterval(cleanupTimer);

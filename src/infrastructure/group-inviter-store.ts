@@ -1,9 +1,11 @@
-import { ensureTargetColumns } from './target-list-store.js';
-import { mergedAvatar, syncSharedGroupTables } from './group-bumper-store.js';
-import { isLocalAvatar, isPlaceholderTargetName } from '../shared/group-bumper.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { transaction } from './sqlite-transaction.js';
+import {
+  ensureTargetLibrarySchema,
+  SqliteTargetLibraryRepository,
+  type ResolvedTargetMetadataInput,
+} from './target-library-store.js';
 import { ProfileTaskResult } from '../shared/task-contracts.js';
 import {
   InviterGroupRow,
@@ -22,54 +24,69 @@ ALTER TABLE group_inviter_logs ADD COLUMN operation_id TEXT;
 `;
 
 export function ensureGroupInviterSchema(db: DatabaseSync): void {
+  ensureTargetLibrarySchema(db);
   db.exec(
     [
-      'CREATE TABLE IF NOT EXISTS group_inviter_groups(group_id TEXT PRIMARY KEY, group_name TEXT NOT NULL, avatar_url TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)',
-      'CREATE TABLE IF NOT EXISTS group_inviter_logs(id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, account_id TEXT NOT NULL, friend_id TEXT NOT NULL, friend_name TEXT NOT NULL, group_id TEXT NOT NULL, invited_at INTEGER NOT NULL, UNIQUE(group_id, friend_id))',
+      `CREATE TABLE IF NOT EXISTS group_inviter_logs(
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        friend_id TEXT NOT NULL,
+        friend_name TEXT NOT NULL DEFAULT '',
+        group_id TEXT NOT NULL,
+        invited_at INTEGER NOT NULL,
+        confirmation TEXT NOT NULL DEFAULT 'CONFIRMED' CHECK(confirmation IN ('PENDING','CONFIRMED')),
+        operation_id TEXT,
+        UNIQUE(group_id, friend_id)
+      )`,
       'CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_group ON group_inviter_logs(group_id)',
       'CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_profile ON group_inviter_logs(profile_id)',
       'CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_account ON group_inviter_logs(account_id)',
-      'CREATE TABLE IF NOT EXISTS group_inviter_settings(id INTEGER PRIMARY KEY CHECK(id=1), invites_per_group INTEGER NOT NULL DEFAULT 30 CHECK(invites_per_group BETWEEN 1 AND 200))',
+      'CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_invited_at ON group_inviter_logs(invited_at DESC)',
+      `CREATE TABLE IF NOT EXISTS group_inviter_settings(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        invites_per_group INTEGER NOT NULL DEFAULT 30 CHECK(invites_per_group BETWEEN 1 AND 200),
+        max_concurrent_profiles INTEGER NOT NULL DEFAULT 4 CHECK(max_concurrent_profiles BETWEEN 1 AND 50),
+        play_sound_on_complete INTEGER NOT NULL DEFAULT 1
+      )`,
       'INSERT OR IGNORE INTO group_inviter_settings(id, invites_per_group) VALUES(1, 30)',
     ].join('; '),
   );
-  ensureTargetColumns(db, 'group_inviter_groups');
-  syncLocalAvatarsFromBumper(db);
-  syncSharedGroupTables(db);
 }
 
-export function syncLocalAvatarsFromBumper(db: DatabaseSync): void {
-  const hasBumperTable = Boolean(
-    db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
-      .get(),
-  );
-  if (!hasBumperTable) return;
-  const rows = db
-    .prepare(
-      `SELECT i.group_id, i.avatar_url AS inviter_avatar, b.avatar_url AS bumper_avatar
-         FROM group_inviter_groups i
-         JOIN group_bumper_groups b ON b.group_id = i.group_id`,
-    )
-    .all() as Array<{
-    group_id: string;
-    inviter_avatar: string | null;
-    bumper_avatar: string | null;
-  }>;
-  const update = db.prepare('UPDATE group_inviter_groups SET avatar_url=? WHERE group_id=?');
-  for (const row of rows) {
-    if (isLocalAvatar(row.bumper_avatar) && !isLocalAvatar(row.inviter_avatar)) {
-      const merged = mergedAvatar(row.inviter_avatar, row.bumper_avatar);
-      if (merged && merged !== row.inviter_avatar) {
-        update.run(merged, String(row.group_id));
-      }
-    }
+export function migrateGroupInviterSchema(db: DatabaseSync): void {
+  ensureGroupInviterSchema(db);
+  const logCols = db.prepare('PRAGMA table_info(group_inviter_logs)').all();
+  if (!logCols.some((c) => c.name === 'confirmation')) {
+    db.exec(
+      "ALTER TABLE group_inviter_logs ADD COLUMN confirmation TEXT NOT NULL DEFAULT 'CONFIRMED' CHECK(confirmation IN ('PENDING','CONFIRMED'))",
+    );
   }
+  if (!logCols.some((c) => c.name === 'operation_id')) {
+    db.exec('ALTER TABLE group_inviter_logs ADD COLUMN operation_id TEXT');
+  }
+  const settingCols = db.prepare('PRAGMA table_info(group_inviter_settings)').all();
+  if (!settingCols.some((c) => c.name === 'max_concurrent_profiles')) {
+    db.exec(
+      'ALTER TABLE group_inviter_settings ADD COLUMN max_concurrent_profiles INTEGER NOT NULL DEFAULT 4 CHECK(max_concurrent_profiles BETWEEN 1 AND 50)',
+    );
+  }
+  if (!settingCols.some((c) => c.name === 'play_sound_on_complete')) {
+    db.exec(
+      'ALTER TABLE group_inviter_settings ADD COLUMN play_sound_on_complete INTEGER NOT NULL DEFAULT 1',
+    );
+  }
+  db.exec(
+    'INSERT OR IGNORE INTO group_inviter_settings(id, invites_per_group, max_concurrent_profiles, play_sound_on_complete) VALUES(1, 30, 4, 1)',
+  );
 }
 
 export class SqliteGroupInviterRepository {
+  private readonly targetLibrary: SqliteTargetLibraryRepository;
+
   constructor(private readonly db: DatabaseSync) {
     ensureGroupInviterSchema(db);
+    this.targetLibrary = new SqliteTargetLibraryRepository(db);
   }
 
   saveProfileResult(input: unknown): void {
@@ -97,15 +114,15 @@ export class SqliteGroupInviterRepository {
   listGroups(): InviterGroupRow[] {
     const rows = this.db
       .prepare(
-        `SELECT g.group_id, g.group_name, g.avatar_url, g.created_at, g.updated_at, g.folder_id,g.sort_order,
-                COALESCE(c.cnt, 0) AS total_invited_count
-           FROM group_inviter_groups g
+        `SELECT g.group_id, g.group_name, g.avatar_url, g.created_at, g.updated_at, g.folder_id, g.sort_order,
+                MAX(g.invited_count, COALESCE(c.cnt, 0)) AS total_invited_count
+           FROM shared_facebook_groups g
            LEFT JOIN (
              SELECT group_id, COUNT(*) AS cnt
                FROM group_inviter_logs WHERE confirmation='CONFIRMED'
               GROUP BY group_id
            ) c ON c.group_id = g.group_id
-          ORDER BY g.sort_order ASC,g.created_at DESC,g.group_id ASC`,
+          ORDER BY g.sort_order ASC, g.created_at DESC, g.group_id ASC`,
       )
       .all();
 
@@ -125,122 +142,96 @@ export class SqliteGroupInviterRepository {
 
   upsertGroups(input: unknown): InviterGroupRow[] {
     const parsed = AddInviterGroupsRequest.parse(input);
-    const now = Date.now();
-    return transaction(this.db, () => {
-      const stmt = this.db.prepare(
-        `INSERT INTO group_inviter_groups(group_id, group_name, avatar_url, created_at, updated_at,folder_id,sort_order)
-         VALUES(?, ?, NULL, ?, ?,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM group_inviter_groups))
-         ON CONFLICT(group_id) DO UPDATE SET
-           group_name = CASE WHEN excluded.group_name = excluded.group_id AND group_inviter_groups.group_name <> '' THEN group_inviter_groups.group_name ELSE excluded.group_name END,
-           updated_at = excluded.updated_at`,
-      );
-      for (const item of parsed.items) {
-        const effectiveName = item.groupName.trim() || item.groupId;
-        stmt.run(item.groupId, effectiveName, now, now, item.folderId ?? null);
-      }
-      syncSharedGroupTables(this.db);
-      return this.listGroups();
-    });
+    this.targetLibrary.upsertGroups(
+      parsed.items.map((item) => ({
+        id: item.groupId,
+        name: item.groupName.trim() || item.groupId,
+        folderId: item.folderId ?? null,
+      })),
+    );
+    return this.listGroups();
   }
 
   updateGroupMetadata(
     groupId: string,
     metadata: { groupName?: string | null; avatarUrl?: string | null },
   ): void {
-    const current = this.db
-      .prepare('SELECT group_name, avatar_url FROM group_inviter_groups WHERE group_id=?')
-      .get(groupId) as { group_name?: string; avatar_url?: string | null } | undefined;
-    if (!current) return;
-    const curName = String(current.group_name ?? '');
-    const curAvatar = current.avatar_url == null ? null : String(current.avatar_url);
-    const nextName =
-      metadata.groupName?.trim() && (!curName || curName === groupId)
-        ? metadata.groupName.trim()
-        : curName || groupId;
-    const nextAvatar = mergedAvatar(curAvatar, metadata.avatarUrl);
-    const now = Date.now();
-    this.db
-      .prepare(
-        'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
-      )
-      .run(nextName, nextAvatar, now, groupId);
-    if (!isPlaceholderTargetName(nextName, groupId)) {
-      const hasBumper = Boolean(
-        this.db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
-          .get(),
-      );
-      if (hasBumper) {
-        // 名称与头像一并写给顶贴侧（同一时间戳下统一不会把新头像反向覆盖成旧值）
-        const bumperRow = this.db
-          .prepare('SELECT avatar_url FROM group_bumper_groups WHERE group_id=?')
-          .get(groupId) as { avatar_url?: string | null } | undefined;
-        const bumperAvatar = mergedAvatar(
-          bumperRow?.avatar_url == null ? null : String(bumperRow.avatar_url),
-          nextAvatar,
-        );
-        this.db
-          .prepare(
-            'UPDATE group_bumper_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
-          )
-          .run(nextName, bumperAvatar, now, groupId);
-      }
-    }
-    syncSharedGroupTables(this.db);
+    this.targetLibrary.applyResolvedTargetMetadata('group', groupId, {
+      name: metadata.groupName ?? null,
+      avatarUrl: metadata.avatarUrl ?? null,
+    });
   }
 
   updateGroupAvatar(groupId: string, avatarUrl: string): void {
     const trimmed = avatarUrl.trim();
     if (!trimmed) return;
-    const existing = this.db
-      .prepare('SELECT avatar_url FROM group_inviter_groups WHERE group_id=?')
-      .get(groupId) as { avatar_url?: string | null } | undefined;
-    if (!existing) return;
-    const curAvatar = existing.avatar_url == null ? null : String(existing.avatar_url);
-    const nextAvatar = mergedAvatar(curAvatar, trimmed);
-    if (!nextAvatar || nextAvatar === curAvatar) return;
-    this.db
-      .prepare('UPDATE group_inviter_groups SET avatar_url=?, updated_at=? WHERE group_id=?')
-      .run(nextAvatar, Date.now(), groupId);
-    syncSharedGroupTables(this.db);
+    this.targetLibrary.applyResolvedTargetMetadata('group', groupId, {
+      avatarUrl: trimmed,
+    });
+  }
+
+  applyResolvedGroupMetadata(rawGroupId: string, metadata: ResolvedTargetMetadataInput): void {
+    this.targetLibrary.applyResolvedTargetMetadata('group', rawGroupId, metadata);
   }
 
   deleteGroups(input: unknown): number {
     const parsed = DeleteInviterGroupsRequest.parse(input);
     return transaction(this.db, () => {
-      const stmt = this.db.prepare('DELETE FROM group_inviter_groups WHERE group_id=?');
-      const hasBumper = Boolean(
-        this.db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
-          .get(),
-      );
-      const delBumper = hasBumper
-        ? this.db.prepare('DELETE FROM group_bumper_groups WHERE group_id=?')
-        : null;
+      const stmt = this.db.prepare('DELETE FROM shared_facebook_groups WHERE group_id=?');
       let deleted = 0;
       for (const id of new Set(parsed.groupIds)) {
         const res = stmt.run(id);
         deleted += Number(res.changes ?? 0);
-        delBumper?.run(id);
       }
       return deleted;
     });
   }
 
-  getInvitesPerGroup(): number {
+  getSettings(): {
+    invitesPerGroup: number;
+    maxConcurrentProfiles: number;
+    playSoundOnComplete: boolean;
+  } {
     const row = this.db
-      .prepare('SELECT invites_per_group FROM group_inviter_settings WHERE id=1')
+      .prepare(
+        'SELECT invites_per_group, max_concurrent_profiles, play_sound_on_complete FROM group_inviter_settings WHERE id=1',
+      )
       .get();
-    const val = Number(row?.invites_per_group ?? 30);
-    return Number.isInteger(val) && val >= 1 && val <= 200 ? val : 30;
+    const invites = Number(row?.invites_per_group ?? 30);
+    const concurrent = Number(row?.max_concurrent_profiles ?? 4);
+    const playSound = Number(row?.play_sound_on_complete ?? 1) === 1;
+    return {
+      invitesPerGroup: Number.isInteger(invites) && invites >= 1 && invites <= 200 ? invites : 30,
+      maxConcurrentProfiles:
+        Number.isInteger(concurrent) && concurrent >= 1 && concurrent <= 50 ? concurrent : 4,
+      playSoundOnComplete: playSound,
+    };
+  }
+
+  saveSettings(input: unknown): {
+    invitesPerGroup: number;
+    maxConcurrentProfiles: number;
+    playSoundOnComplete: boolean;
+  } {
+    const parsed = UpdateGroupInviterSettingsRequest.parse(input);
+    const current = this.getSettings();
+    const nextInvites = parsed.invitesPerGroup ?? current.invitesPerGroup;
+    const nextConcurrent = parsed.maxConcurrentProfiles ?? current.maxConcurrentProfiles;
+    const nextPlaySound = parsed.playSoundOnComplete ?? current.playSoundOnComplete;
+    this.db
+      .prepare(
+        'UPDATE group_inviter_settings SET invites_per_group=?, max_concurrent_profiles=?, play_sound_on_complete=? WHERE id=1',
+      )
+      .run(nextInvites, nextConcurrent, nextPlaySound ? 1 : 0);
+    return this.getSettings();
+  }
+
+  getInvitesPerGroup(): number {
+    return this.getSettings().invitesPerGroup;
   }
 
   setInvitesPerGroup(input: unknown): number {
-    const parsed = UpdateGroupInviterSettingsRequest.parse(input);
-    this.db
-      .prepare('UPDATE group_inviter_settings SET invites_per_group=? WHERE id=1')
-      .run(parsed.invitesPerGroup);
-    return this.getInvitesPerGroup();
+    return this.saveSettings(input).invitesPerGroup;
   }
 
   getInvitedFriendIdsForGroup(groupId: string): Set<string> {
@@ -334,6 +325,7 @@ export class SqliteGroupInviterRepository {
               operationId,
             );
           if (Number(confirmed.changes) !== 1) throw Error('GROUP_INVITER_RESERVATION_MISMATCH');
+          this.targetLibrary.incrementGroupInvitedCount(item.groupId, 1);
           inserted++;
           continue;
         }
@@ -346,7 +338,11 @@ export class SqliteGroupInviterRepository {
           item.groupId,
           item.invitedAt ?? now,
         );
-        inserted += Number(res.changes ?? 0);
+        const changes = Number(res.changes ?? 0);
+        if (changes > 0) {
+          this.targetLibrary.incrementGroupInvitedCount(item.groupId, changes);
+          inserted += changes;
+        }
       }
       return inserted;
     });

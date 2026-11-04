@@ -4,6 +4,8 @@ import type { DataCleanupService } from '../../application/data-cleanup.js';
 import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
 import type { GroupBumperService } from '../../application/group-bumper-service.js';
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
+import type { GroupPosterService } from '../../application/group-poster-service.js';
+import { handleGroupPosterRoutes } from './group-poster-routes.js';
 import type { NativeReviewService } from '../../application/native-review.js';
 import type { ProfileInspectionService } from '../../application/profile-inspection.js';
 import type { TaskService } from '../../application/task-service.js';
@@ -42,6 +44,7 @@ export interface FeatureModuleRouteContext {
   cleanup?: DataCleanupService | undefined;
   groupInviter?: GroupInviterService | undefined;
   groupBumper?: GroupBumperService | undefined;
+  groupPoster?: GroupPosterService | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
 }
 
@@ -60,8 +63,13 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
     cleanup,
     groupInviter,
     groupBumper,
+    groupPoster,
     featureExecution,
   } = ctx;
+
+  if (await handleGroupPosterRoutes({ req, res, route, input, json, cleanup, groupPoster })) {
+    return true;
+  }
 
   if (route === '/api/workspace/target-lists/folders' && req.method === 'GET') {
     const kind = TargetListKind.parse(
@@ -86,6 +94,8 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
     if (req.method === 'GET' && action === 'logs') {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const before = url.searchParams.get('before');
+      const rawMode = url.searchParams.get('sourceMode');
+      const sourceMode = rawMode === 'group' || rawMode === 'page' ? rawMode : undefined;
       json(
         res,
         200,
@@ -93,6 +103,8 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
           url.searchParams.get('search') ?? '',
           before ? z.coerce.number().finite().nonnegative().parse(before) : undefined,
           url.searchParams.get('beforeId') ?? undefined,
+          200,
+          sourceMode,
         ),
       );
       return true;
@@ -166,6 +178,28 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
   ) {
     cleanup?.assertNotResetting();
     json(res, 200, await groupInviter.deleteGroups(input));
+    return true;
+  }
+  if (
+    req.method === 'POST' &&
+    route === '/api/workspace/group-inviter/groups/refresh' &&
+    groupInviter
+  ) {
+    cleanup?.assertNotResetting();
+    const parsed = z
+      .object({ ids: z.array(z.string().min(1)).max(500).optional() })
+      .strict()
+      .parse(input ?? {});
+    json(res, 200, await groupInviter.refreshGroups(parsed.ids));
+    return true;
+  }
+  if (
+    req.method === 'POST' &&
+    route === '/api/workspace/group-inviter/groups/refresh-stop' &&
+    groupInviter
+  ) {
+    cleanup?.assertNotResetting();
+    json(res, 200, await groupInviter.stopRefreshGroups());
     return true;
   }
   if (req.method === 'POST' && route === '/api/workspace/group-inviter/settings' && groupInviter) {
@@ -301,22 +335,19 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
         [...new Set(value.profileIds)].map(async (profileId) => {
           inspection?.invalidate(profileId);
           try {
+            let stoppedAny = false;
             if (
               featureExecution &&
               (await featureExecution.stopProfilesAcrossModules([profileId]))
             ) {
+              stoppedAny = true;
+            }
+            if (await tasks?.stopActiveProfile(profileId)) {
+              stoppedAny = true;
+            }
+            if (stoppedAny) {
               return { profileId, requested: true as const };
             }
-            const inviterRunning =
-              groupInviter?.isProfileRunning(profileId) === true ||
-              groupBumper?.isProfileRunning(profileId) === true;
-            if (inviterRunning) {
-              await groupInviter?.stopProfiles({ profileIds: [profileId] });
-              if (groupBumper?.isProfileRunning(profileId)) await groupBumper.stop([profileId]);
-            }
-            if (await tasks?.stopActiveProfile(profileId))
-              return { profileId, requested: true as const };
-            if (inviterRunning) return { profileId, requested: true as const };
             const result = (await service.stopProfiles([profileId]))[0];
             if (!result) throw Error('停止结果缺失，请重新读取任务状态');
             return result;
@@ -335,6 +366,16 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
     case '/api/workspace/profiles/delete': {
       cleanup?.assertNotResetting();
       const value = DeleteProfiles.parse(input);
+      if (featureExecution) {
+        const busyLabels = await featureExecution.busyModuleLabels(value.profileIds);
+        if (busyLabels.length > 0) {
+          throw new ProductError(
+            'PROFILE_TASK_ACTIVE',
+            `请先停止该浏览器的运行任务（${busyLabels.join('、')}）后再删除`,
+            409,
+          );
+        }
+      }
       const activePlan = await someAsync(
         value.profileIds,
         async (profileId) =>
@@ -349,18 +390,6 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
       );
       if (activePlan)
         throw new ProductError('PROFILE_TASK_ACTIVE', '请先停止该浏览器的运行任务后再删除', 409);
-      if (
-        value.profileIds.some(
-          (id) =>
-            groupInviter?.isProfileRunning(id) === true ||
-            groupBumper?.isProfileRunning(id) === true,
-        )
-      )
-        throw new ProductError(
-          'PROFILE_TASK_ACTIVE',
-          '请先停止小组邀请人任务后再删除该浏览器',
-          409,
-        );
       const result = await service.deleteProfiles(value.profileIds);
       json(res, 200, { deleted: true, ...result });
       return true;

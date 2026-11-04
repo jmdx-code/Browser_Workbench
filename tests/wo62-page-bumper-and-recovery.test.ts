@@ -3,6 +3,7 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { projectGroupBumper } from '../src/infrastructure/group-bumper-effects.js';
+import { awaitFacebookTaskDocument } from '../src/infrastructure/facebook-task-document-ready.js';
 import {
   bumperSetupLabels,
   bumperSetupKinds,
@@ -10,7 +11,10 @@ import {
   recoverBumperOperations,
 } from '../src/infrastructure/group-bumper-recovery.js';
 import { BumperSettings } from '../src/shared/group-bumper.js';
-import { GroupBumperBrowserAdapter } from '../src/infrastructure/group-bumper-runner.js';
+import {
+  GroupBumperBrowserAdapter,
+  sameBumperFeedbackId,
+} from '../src/infrastructure/group-bumper-runner.js';
 import {
   SqliteGroupBumperRepository,
   groupBumperMigration,
@@ -86,8 +90,6 @@ it('WO62-1: bumperSetupLabels includes 打开搜索结果 -> setup_navigate, and
 it('WO62-2: recoverBumperOperations auto-settles pending operations (including legacy submit_comment/submit_like and setup_*) without throwing 存在待核对操作', async () => {
   const db = new DatabaseSync(':memory:');
   try {
-    db.exec(groupBumperMigration);
-    db.exec(groupBumperOperationsMigration);
     const repo = new SqliteGroupBumperRepository(db);
     const profileId = randomUUID();
     const makeBinding = (label: string): Binding => ({
@@ -230,9 +232,8 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
           {
             postId,
             postUrl: `https://www.facebook.com/${author}/videos/${postId}/`,
-            // Different authorId on Page timeline (e.g. collaborator/shared post) should still be bumped in page mode
-            authorId: '999888777',
-            authorName: 'Collaborator',
+            authorId: author,
+            authorName: 'TargetPage',
             authorAliases: [],
             authorAvatarUrl: null,
             pinned: false,
@@ -302,7 +303,14 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
     close: async () => {},
     retryClose: async () => {},
   };
-  const peer = { online: true, synced: true, epoch: 'epoch', profileId: 'p', capabilities: [] };
+  const peer = {
+    online: true,
+    synced: true,
+    phase: 'PAUSED',
+    epoch: 'epoch',
+    profileId: 'p',
+    capabilities: [],
+  };
   const kernel = {
     withSummary: async (_p: unknown, run: (port: unknown) => unknown) =>
       run({
@@ -383,4 +391,163 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
   expect(inspectAttempts).toBeGreaterThanOrEqual(2);
   expect(bottomScrolled).toBe(true);
   expect(recorded).toEqual([postId]);
+});
+
+it('WO63-1: awaitFacebookTaskDocument with retainedPage=true accepts Page URLs and Page post URLs as home scope', async () => {
+  for (const pageUrl of [
+    'https://www.facebook.com/100085926219692',
+    'https://www.facebook.com/100085926219692/posts/1104463835761147/',
+  ]) {
+    const observedScopes: string[] = [];
+    await awaitFacebookTaskDocument(
+      {
+        send: async () => ({
+          result: {
+            value: JSON.stringify({ url: pageUrl, ready: 'complete' }),
+          },
+        }),
+      },
+      1,
+      () => {},
+      {
+        retainedPage: true,
+        observe: ({ scope }) => {
+          observedScopes.push(scope);
+        },
+      },
+    );
+    expect(observedScopes).toEqual(['home']);
+  }
+});
+
+it('WO63-2: projectGroupBumper on search results rejects conflicting numeric IDs in nameMatched, allows non-conflicting slug nameMatched, and matches ActorHovercard actorID as id', () => {
+  vi.stubGlobal('location', new URL('https://www.facebook.com/search/pages/?q=TargetName'));
+  const targetPageId = '100085926219692';
+
+  // Case 1: Same-name links with conflicting numeric IDs (via URL query id or ActorHovercard) must NOT match
+  document.body.innerHTML = `
+    <main>
+      <a id="impostor-url" href="https://www.facebook.com/profile.php?id=61599999999999">TargetName</a>
+      <a id="impostor-hover" href="https://www.facebook.com/ImpostorSlug">TargetName</a>
+    </main>
+  `;
+  document.querySelectorAll('a').forEach(box);
+  const impostorHover = document.getElementById('impostor-hover')!;
+  Reflect.set(impostorHover, '__reactFiber$test', {
+    type: { displayName: 'CometSSRMultipassBoundary' },
+    memoizedProps: {},
+    return: {
+      type: { displayName: 'ActorHovercard' },
+      memoizedProps: { actorID: '61588888888888' },
+      return: null,
+    },
+  });
+
+  const rejected = projectGroupBumper({
+    groupId: '-',
+    pageId: targetPageId,
+    pageName: 'TargetName',
+  });
+  expect(rejected.groupEntryCSS).toBeNull();
+  expect(rejected.groupEntryMatchedBy).toBeNull();
+
+  // Case 2: Same-name custom slug link without conflicting numeric ID matches as 'name'
+  document.body.innerHTML = `
+    <main>
+      <a id="slug-link" href="https://www.facebook.com/SomePageSlug">TargetName</a>
+    </main>
+  `;
+  document.querySelectorAll('a').forEach(box);
+  const nameHit = projectGroupBumper({
+    groupId: '-',
+    pageId: targetPageId,
+    pageName: 'TargetName',
+  });
+  expect(nameHit.groupEntryCSS).toBe('[data-wb-bumper-group="1"]');
+  expect(nameHit.groupEntryMatchedBy).toBe('name');
+
+  // Case 3: Link with ActorHovercard.props.actorID matching targetPageId matches as 'id'
+  document.body.innerHTML = `
+    <main>
+      <a id="impostor-slug" href="https://www.facebook.com/OtherSlug">TargetName</a>
+      <a id="real-hover" href="https://www.facebook.com/RealPageSlug">TargetName</a>
+    </main>
+  `;
+  document.querySelectorAll('a').forEach(box);
+  const realHover = document.getElementById('real-hover')!;
+  Reflect.set(realHover, '__reactFiber$test', {
+    type: { displayName: 'ActorHovercard' },
+    memoizedProps: { actorID: targetPageId },
+    return: null,
+  });
+  const idHit = projectGroupBumper({
+    groupId: '-',
+    pageId: targetPageId,
+    pageName: 'TargetName',
+  });
+  expect(idHit.groupEntryCSS).toBe('[data-wb-bumper-group="1"]');
+  expect(idHit.groupEntryMatchedBy).toBe('id');
+  expect(realHover.getAttribute('data-wb-bumper-group')).toBe('1');
+});
+
+it('WO64-1: BumperSettings defaults enableSound=false, persists enableSound=true, and sameBumperFeedbackId matches Base64/plain/numeric feedback IDs', () => {
+  expect(BumperSettings.parse({}).enableSound).toBe(false);
+  expect(BumperSettings.parse({ enableSound: true }).enableSound).toBe(true);
+
+  const db = new DatabaseSync(':memory:');
+  try {
+    const repo = new SqliteGroupBumperRepository(db);
+    expect(repo.settings().enableSound).toBe(false);
+    const saved = repo.saveSettings({ ...repo.settings(), enableSound: true });
+    expect(saved.enableSound).toBe(true);
+    expect(repo.settings().enableSound).toBe(true);
+  } finally {
+    db.close();
+  }
+
+  const b64 = btoa('feedback:1104463835761147');
+  expect(sameBumperFeedbackId(b64, 'feedback:1104463835761147')).toBe(true);
+  expect(sameBumperFeedbackId(b64, '1104463835761147')).toBe(true);
+  expect(sameBumperFeedbackId('feedback:1104463835761147', b64)).toBe(true);
+  expect(sameBumperFeedbackId(b64, btoa('feedback:9999999999999999'))).toBe(false);
+});
+
+it('WO64-2: projectGroupBumper with targetPostId does not skip post when /photo/?fbid or /videos/ links exist and primary postId comes from feedbackId, and extracts commentCSS from [role="dialog"]', () => {
+  const feedbackPostId = '1104463835761147';
+  const b64Feedback = btoa(`feedback:${feedbackPostId}`);
+
+  const card = article(`
+    <a href="https://www.facebook.com/profile.php?id=100085621666905">TargetPage</a>
+    <a href="https://www.facebook.com/photo/?fbid=888880001">Photo</a>
+    <a href="https://www.facebook.com/TargetPage/videos/999990002/">Video</a>
+    <button id="like-btn" role="button" data-ad-rendering-role="like_button">Like</button>
+    <button id="comment-open-btn" role="button" data-ad-rendering-role="comment_button">Comment</button>
+  `);
+  const likeBtn = card.querySelector('#like-btn')!;
+  Reflect.set(likeBtn, '__reactFiber$test', {
+    type: { displayName: 'CometUFIReactButtonBase' },
+    memoizedProps: { feedback: { id: b64Feedback } },
+    return: null,
+  });
+
+  // Also mount a visible post detail modal [role="dialog"] containing a comment textbox
+  const dialog = document.createElement('div');
+  dialog.setAttribute('role', 'dialog');
+  dialog.innerHTML = `
+    <div id="dialog-editor" role="textbox" contenteditable="true"></div>
+  `;
+  document.body.append(dialog);
+  [dialog, ...dialog.querySelectorAll('*')].forEach(box);
+
+  const rechecked = projectGroupBumper({
+    groupId: '-',
+    pageId: '100085621666905',
+    targetPostId: feedbackPostId,
+  });
+  expect(rechecked.posts).toHaveLength(1);
+  expect(rechecked.posts[0]?.postId).toBe(feedbackPostId);
+  expect(rechecked.posts[0]?.commentCSS).toBe(`[data-wb-bumper-comment="${feedbackPostId}"]`);
+  expect(document.getElementById('dialog-editor')?.getAttribute('data-wb-bumper-comment')).toBe(
+    feedbackPostId,
+  );
 });

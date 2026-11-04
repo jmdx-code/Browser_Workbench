@@ -38,9 +38,34 @@ test('migration44 preserves old43 profiles, target rows and logs while initializ
   store.groupBumper.upsertTargets('pages', { items: [{ id: '103', name: '主页' }] });
   store.close();
   const db = new DatabaseSync(file);
+  db.exec(`
+    CREATE TABLE group_inviter_groups (
+      group_id TEXT PRIMARY KEY,
+      group_name TEXT NOT NULL,
+      avatar_url TEXT,
+      total_invited_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO group_inviter_groups (group_id, group_name, avatar_url, total_invited_count, created_at, updated_at)
+    SELECT group_id, group_name, avatar_url, invited_count, created_at, updated_at FROM shared_facebook_groups WHERE group_id = '101';
+    CREATE TABLE group_bumper_groups (
+      group_id TEXT PRIMARY KEY,
+      group_name TEXT NOT NULL,
+      avatar_url TEXT,
+      total_bumped_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO group_bumper_groups (group_id, group_name, avatar_url, total_bumped_count, created_at, updated_at)
+    SELECT group_id, group_name, avatar_url, bumped_count, created_at, updated_at FROM shared_facebook_groups WHERE group_id = '102';
+    DROP TABLE shared_facebook_groups;
+  `);
+  db.exec('DROP INDEX IF EXISTS idx_group_bumper_pages_folder_sort;');
   db.exec('ALTER TABLE profile_metadata DROP COLUMN sort_order;DROP TABLE target_list_folders;');
-  for (const t of ['group_inviter_groups', 'group_bumper_groups', 'group_bumper_pages'])
-    db.exec(`ALTER TABLE ${t} DROP COLUMN folder_id;ALTER TABLE ${t} DROP COLUMN sort_order;`);
+  db.exec(
+    'ALTER TABLE group_bumper_pages DROP COLUMN folder_id;ALTER TABLE group_bumper_pages DROP COLUMN sort_order;',
+  );
   db.exec('PRAGMA user_version=43');
   db.close();
   store = await WorkspaceStore.open(file);
@@ -49,7 +74,7 @@ test('migration44 preserves old43 profiles, target rows and logs while initializ
     assert.equal(store.profileMetadata().get(id)?.groupId, group.id);
     assert.equal(store.profileMetadata().get(id)?.order, 0);
     assert.equal(store.groupInviter.listGroups()[0]?.folderId, null);
-    assert.equal(store.groupBumper.targets('groups')[0]?.id, '102');
+    assert.ok(store.groupBumper.targets('groups').some((g) => g.id === '102'));
     assert.equal(store.groupBumper.targets('pages')[0]?.id, '103');
     const check = new DatabaseSync(file, { readOnly: true });
     assert.deepEqual(check.prepare('PRAGMA foreign_key_check').all(), []);

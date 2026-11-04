@@ -27,7 +27,9 @@ export async function endInvitationSetupOperations(
   reconcileOperationIds?: ReadonlySet<string>,
 ) {
   await guard();
-  const protectedIds = await kernel.recoverBumperWorkspace?.(peer, guard);
+  const bumperProtected = await kernel.recoverBumperWorkspace?.(peer, guard);
+  const posterProtected = await kernel.recoverPosterWorkspace?.(peer, guard);
+  const protectedIds = new Set<string>([...(bumperProtected ?? []), ...(posterProtected ?? [])]);
   let inventory = await kernel.withSummary(peer, (port) => port.inventory());
   await guard();
   for (const operation of inventory.operations.filter(kernelOperationPending)) {

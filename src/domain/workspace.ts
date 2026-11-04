@@ -43,7 +43,7 @@ export interface WorkspaceRepository {
   profileAccountCache?(): Awaitable<Map<string, CachedProfileAccount>>;
   updateProfileAccountCache?(
     profileId: string,
-    update: Partial<CachedProfileAccount>,
+    update: import('../shared/account-state-policy.js').AccountCacheUpdateInput,
   ): Awaitable<void>;
   combinations(): Awaitable<SavedCombination[]>;
   createCombination(value: Combination): Awaitable<SavedCombination>;

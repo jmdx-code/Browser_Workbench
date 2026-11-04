@@ -2,14 +2,29 @@ import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { ProductError } from '../domain/workspace.js';
 import { transaction } from './sqlite-transaction.js';
-import { TargetListCommand, TargetListKind, type TargetFolder } from '../shared/target-list.js';
-const tables = {
-  inviter_groups: ['group_inviter_groups', 'group_id'],
-  bumper_groups: ['group_bumper_groups', 'group_id'],
+import {
+  normalizeTargetListKind,
+  TargetListCommand,
+  TargetListKind,
+  type NormalizedTargetListKind,
+  type TargetFolder,
+} from '../shared/target-list.js';
+
+const legacyV44Tables = [
+  'group_inviter_groups',
+  'group_bumper_groups',
+  'group_bumper_pages',
+] as const;
+
+const normalizedTables: Record<NormalizedTargetListKind, readonly [string, string]> = {
+  shared_groups: ['shared_facebook_groups', 'group_id'],
   bumper_pages: ['group_bumper_pages', 'page_id'],
-} as const;
+};
+
+const allowedTargetTables = new Set<string>([...legacyV44Tables, 'shared_facebook_groups']);
+
 export function ensureTargetColumns(db: DatabaseSync, table: string) {
-  if (!Object.values(tables).some((t) => t[0] === table)) throw Error('TARGET_TABLE_INVALID');
+  if (!allowedTargetTables.has(table)) throw Error('TARGET_TABLE_INVALID');
   const columns = db.prepare(`PRAGMA table_info(${table})`).all();
   if (!columns.length) return;
   if (!columns.some((c) => c.name === 'folder_id'))
@@ -21,6 +36,7 @@ export function ensureTargetColumns(db: DatabaseSync, table: string) {
     );
   }
 }
+
 export function finderListMigration(db: DatabaseSync) {
   if (
     !db
@@ -36,25 +52,27 @@ export function finderListMigration(db: DatabaseSync) {
   db.exec(
     `CREATE TABLE IF NOT EXISTS target_list_folders(id TEXT PRIMARY KEY,list_kind TEXT NOT NULL CHECK(list_kind IN ('inviter_groups','bumper_groups','bumper_pages')),name TEXT NOT NULL,sort_order INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS idx_target_list_folders_kind ON target_list_folders(list_kind,sort_order)`,
   );
-  for (const [table] of Object.values(tables)) ensureTargetColumns(db, table);
+  for (const table of legacyV44Tables) ensureTargetColumns(db, table);
 }
+
 export class SqliteTargetLists {
   constructor(private readonly db: DatabaseSync) {}
   folders(kind: TargetListKind): TargetFolder[] {
-    TargetListKind.parse(kind);
+    const normalizedKind = normalizeTargetListKind(TargetListKind.parse(kind));
     return this.db
       .prepare(
         'SELECT id,list_kind listKind,name,sort_order sortOrder,created_at createdAt FROM target_list_folders WHERE list_kind=? ORDER BY sort_order,created_at,id',
       )
-      .all(kind) as unknown as TargetFolder[];
+      .all(normalizedKind) as unknown as TargetFolder[];
   }
   command(input: unknown) {
     const c = TargetListCommand.parse(input);
     return transaction(this.db, () => {
       if (c.action === 'create') {
+        const listKind = normalizeTargetListKind(c.listKind);
         this.db
           .prepare('INSERT INTO target_list_folders VALUES(?,?,?,?,?)')
-          .run(randomUUID(), c.listKind, c.name, this.folders(c.listKind).length, Date.now());
+          .run(randomUUID(), listKind, c.name, this.folders(listKind).length, Date.now());
         return;
       }
       if (c.action === 'rename' || c.action === 'delete') {
@@ -65,8 +83,10 @@ export class SqliteTargetLists {
         if (c.action === 'rename')
           this.db.prepare('UPDATE target_list_folders SET name=? WHERE id=?').run(c.name, c.id);
         else {
-          const [table] = tables[folder.list_kind as TargetListKind];
-          const [targetTable, key] = tables[folder.list_kind as TargetListKind];
+          const folderKind = normalizeTargetListKind(
+            TargetListKind.parse(String(folder.list_kind)),
+          );
+          const [targetTable, key] = normalizedTables[folderKind];
           const items = this.db
             .prepare(
               `SELECT ${key} id FROM ${targetTable} WHERE folder_id=? ORDER BY sort_order,created_at DESC,${key}`,
@@ -75,12 +95,12 @@ export class SqliteTargetLists {
           let next = Number(
             this.db
               .prepare(
-                `SELECT COALESCE(MAX(sort_order),-1)+1 n FROM ${table} WHERE folder_id IS NULL`,
+                `SELECT COALESCE(MAX(sort_order),-1)+1 n FROM ${targetTable} WHERE folder_id IS NULL`,
               )
               .get()?.n,
           );
           const move = this.db.prepare(
-            `UPDATE ${table} SET folder_id=NULL,sort_order=? WHERE ${key}=?`,
+            `UPDATE ${targetTable} SET folder_id=NULL,sort_order=? WHERE ${key}=?`,
           );
           for (const item of items) move.run(next++, String(item.id));
           this.db.prepare('DELETE FROM target_list_folders WHERE id=?').run(c.id);
@@ -88,7 +108,8 @@ export class SqliteTargetLists {
         return;
       }
       if (c.action === 'reorder-folders') {
-        const known = new Set(this.folders(c.listKind).map((f) => f.id));
+        const listKind = normalizeTargetListKind(c.listKind);
+        const known = new Set(this.folders(listKind).map((f) => f.id));
         if (
           c.orderedFolderIds.length !== known.size ||
           new Set(c.orderedFolderIds).size !== known.size ||
@@ -99,12 +120,13 @@ export class SqliteTargetLists {
         c.orderedFolderIds.forEach((id, i) => stmt.run(i, id));
         return;
       }
-      const [table, key] = tables[c.listKind];
+      const listKind = normalizeTargetListKind(c.listKind);
+      const [table, key] = normalizedTables[listKind];
       if (
         c.folderId &&
         !this.db
           .prepare('SELECT 1 FROM target_list_folders WHERE id=? AND list_kind=?')
-          .get(c.folderId, c.listKind)
+          .get(c.folderId, listKind)
       )
         throw new ProductError('FOLDER_NOT_FOUND', '目标分组不存在', 404);
       const ids = [...new Set(c.orderedItemIds)];

@@ -34,10 +34,11 @@ export const facebookIdentityProjection = PageReadRequest.parse({
     },
     {
       key: 'accountAvatars',
-      selector: '[role="banner"] img, [role="navigation"] a[href*="profile.php"] img',
+      selector:
+        '[role="banner"] :is(image, img), [role="navigation"] a[href*="profile.php"] :is(image, img)',
       limit: 8,
       text: false,
-      attributes: ['src', 'alt'],
+      attributes: ['src', 'alt', 'xlink:href', 'href'],
     },
     {
       key: 'loginForm',

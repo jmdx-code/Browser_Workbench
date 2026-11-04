@@ -71,6 +71,24 @@ function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
           <path d="M12 20v-5M9.5 17.5 12 15l2.5 2.5" />
         </svg>
       );
+    case 'group-poster':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+      );
     case 'records':
       return <IconCheckList size={16} />;
   }

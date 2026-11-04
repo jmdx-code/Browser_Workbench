@@ -4,7 +4,11 @@ import {
   type BumperOperationValue,
 } from '../shared/bumper-operation.js';
 import { sameBinding } from '../shared/task-execution.js';
-import { ensureTargetColumns } from './target-list-store.js';
+import {
+  ensureTargetLibrarySchema,
+  mergedAvatar,
+  SqliteTargetLibraryRepository,
+} from './target-library-store.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -15,36 +19,15 @@ import {
   BumperTargetsInput,
   BumperIdsInput,
   BumperCommentsInput,
-  isCompleteNumericId,
-  isLocalAvatar,
-  isPlaceholderTargetName,
   type BumperTarget,
   type BumperComment,
   type BumperLog,
   type BumperDailyStat,
+  type BumperPendingOperation,
+  type BumperScope,
 } from '../shared/group-bumper.js';
 
-function isHttpAvatarUrl(url: string | null | undefined): url is string {
-  return (
-    typeof url === 'string' &&
-    /^https?:\/\//i.test(url.trim()) &&
-    !/\/rsrc\.php\//i.test(url) &&
-    !/\/emoji\.php\//i.test(url)
-  );
-}
-
-export function mergedAvatar(
-  existingAvatar: string | null | undefined,
-  incomingAvatar: string | null | undefined,
-): string | null {
-  if (typeof incomingAvatar === 'string' && isLocalAvatar(incomingAvatar))
-    return incomingAvatar.trim();
-  if (typeof existingAvatar === 'string' && isLocalAvatar(existingAvatar))
-    return existingAvatar.trim();
-  if (isHttpAvatarUrl(incomingAvatar)) return incomingAvatar.trim();
-  if (isHttpAvatarUrl(existingAvatar)) return existingAvatar.trim();
-  return null;
-}
+export { mergedAvatar };
 
 // New migration only: the existing 1..42 migrations and task evidence stay unchanged.
 export const groupBumperMigration = `
@@ -76,81 +59,14 @@ CREATE TABLE IF NOT EXISTS group_bumper_operations(
 CREATE INDEX IF NOT EXISTS idx_group_bumper_operations_profile_status ON group_bumper_operations(profile_id,status);
 `;
 
-function ensureProfileTaskResultTable(db: DatabaseSync) {
-  const row = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='profile_task_results'")
-    .get() as { sql?: string } | undefined;
-  if (!row?.sql) {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS profile_task_results(
-        profile_id TEXT PRIMARY KEY,
-        source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper')),
-        run_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')),
-        reason TEXT NOT NULL,
-        finished_at INTEGER NOT NULL,
-        failed_steps INTEGER NOT NULL DEFAULT 0,
-        skipped_steps INTEGER NOT NULL DEFAULT 0
-      );
-    `);
-    return;
-  }
-  if (!row.sql.includes("'group-bumper'")) {
-    transaction(db, () => {
-      db.exec(`
-        DROP TRIGGER IF EXISTS profile_task_result_terminal;
-        CREATE TABLE profile_task_results_next(
-          profile_id TEXT PRIMARY KEY,
-          source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper')),
-          run_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')),
-          reason TEXT NOT NULL,
-          finished_at INTEGER NOT NULL,
-          failed_steps INTEGER NOT NULL DEFAULT 0,
-          skipped_steps INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO profile_task_results_next SELECT * FROM profile_task_results;
-        DROP TABLE profile_task_results;
-        ALTER TABLE profile_task_results_next RENAME TO profile_task_results;
-        CREATE TRIGGER profile_task_result_terminal AFTER INSERT ON task_events
-          WHEN NEW.type IN ('COMPLETED','FAILED','STOPPED') BEGIN
-          INSERT INTO profile_task_results
-            SELECT profile_id,'task',id,json_extract(snapshot,'$.name'),state,reason,NEW.created_at,
-              (SELECT count(*) FROM task_steps WHERE job_id=NEW.job_id AND json_extract(outcome,'$.kind')='FAILED'),
-              (SELECT count(*) FROM task_steps WHERE job_id=NEW.job_id AND json_extract(outcome,'$.kind')='SKIPPED')
-            FROM task_plans WHERE id=NEW.job_id AND state IN ('COMPLETED','FAILED','STOPPED')
-          ON CONFLICT(profile_id) DO UPDATE SET source=excluded.source,run_id=excluded.run_id,
-            name=excluded.name,state=excluded.state,reason=excluded.reason,finished_at=excluded.finished_at,failed_steps=excluded.failed_steps,skipped_steps=excluded.skipped_steps;
-        END;
-      `);
-    });
-  }
-}
-
-function ensureBumperSettingsDefault50(db: DatabaseSync) {
-  const columns = db
-    .prepare('PRAGMA table_info(group_bumper_settings)')
-    .all()
-    .map((r) => String(r.name));
-  if (!columns.includes('default_max_likes_50_applied')) {
-    db.exec(
-      'ALTER TABLE group_bumper_settings ADD COLUMN default_max_likes_50_applied INTEGER NOT NULL DEFAULT 0;',
-    );
-  }
-  if (!columns.includes('default_max_concurrent_8_applied')) {
-    db.exec(
-      'ALTER TABLE group_bumper_settings ADD COLUMN default_max_concurrent_8_applied INTEGER NOT NULL DEFAULT 0;',
-    );
-  }
+function applyBumperSettingsFlagUpgradeIfPending(db: DatabaseSync) {
   const row = db
     .prepare(
       'SELECT body, default_max_likes_50_applied, default_max_concurrent_8_applied FROM group_bumper_settings WHERE id=1',
     )
     .get();
   if (!row) return;
-  if (Number(row.default_max_likes_50_applied ?? 0) === 0) {
+  if (Number(row.default_max_likes_50_applied ?? 1) === 0) {
     try {
       const parsed = BumperSettings.parse(JSON.parse(String(row.body ?? '{}')));
       const next = parsed.maxLikesPerPost === 10 ? { ...parsed, maxLikesPerPost: 50 } : parsed;
@@ -164,7 +80,7 @@ function ensureBumperSettingsDefault50(db: DatabaseSync) {
       ).run();
     }
   }
-  if (Number(row.default_max_concurrent_8_applied ?? 0) === 0) {
+  if (Number(row.default_max_concurrent_8_applied ?? 1) === 0) {
     try {
       const parsed = BumperSettings.parse(JSON.parse(String(row.body ?? '{}')));
       const next =
@@ -180,6 +96,24 @@ function ensureBumperSettingsDefault50(db: DatabaseSync) {
   }
 }
 
+export function migrateBumperSettingsDefault50(db: DatabaseSync) {
+  const columns = db
+    .prepare('PRAGMA table_info(group_bumper_settings)')
+    .all()
+    .map((r) => String(r.name));
+  if (!columns.includes('default_max_likes_50_applied')) {
+    db.exec(
+      'ALTER TABLE group_bumper_settings ADD COLUMN default_max_likes_50_applied INTEGER NOT NULL DEFAULT 0;',
+    );
+  }
+  if (!columns.includes('default_max_concurrent_8_applied')) {
+    db.exec(
+      'ALTER TABLE group_bumper_settings ADD COLUMN default_max_concurrent_8_applied INTEGER NOT NULL DEFAULT 0;',
+    );
+  }
+  applyBumperSettingsFlagUpgradeIfPending(db);
+}
+
 function formatLocalYmd(date: Date): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -187,98 +121,115 @@ function formatLocalYmd(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-export function syncSharedGroupTables(db: DatabaseSync): void {
-  const hasInviter = Boolean(
-    db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'")
-      .get(),
-  );
-  const hasBumper = Boolean(
-    db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_bumper_groups'")
-      .get(),
-  );
-  if (!hasInviter || !hasBumper) return;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO group_bumper_groups(group_id,group_name,avatar_url,created_at,updated_at,sort_order)
-     SELECT group_id,group_name,avatar_url,created_at,updated_at,
-            (SELECT COALESCE(MAX(sort_order),-1) FROM group_bumper_groups)+ROW_NUMBER() OVER(ORDER BY sort_order,created_at DESC,group_id)
-       FROM group_inviter_groups
-      WHERE group_id NOT IN (SELECT group_id FROM group_bumper_groups)`,
-  ).run();
-  db.prepare(
-    `INSERT INTO group_inviter_groups(group_id,group_name,avatar_url,created_at,updated_at,sort_order)
-     SELECT group_id,group_name,avatar_url,created_at,updated_at,
-            (SELECT COALESCE(MAX(sort_order),-1) FROM group_inviter_groups)+ROW_NUMBER() OVER(ORDER BY sort_order,created_at DESC,group_id)
-       FROM group_bumper_groups
-      WHERE group_id NOT IN (SELECT group_id FROM group_inviter_groups)`,
-  ).run();
-  const shared = db
-    .prepare(
-      `SELECT i.group_id,
-              i.group_name AS inviter_name,
-              i.avatar_url AS inviter_avatar,
-              i.updated_at AS inviter_updated,
-              b.group_name AS bumper_name,
-              b.avatar_url AS bumper_avatar,
-              b.updated_at AS bumper_updated
-         FROM group_inviter_groups i
-         JOIN group_bumper_groups b ON b.group_id = i.group_id`,
-    )
-    .all() as Array<{
-    group_id: string;
-    inviter_name: string;
-    inviter_avatar: string | null;
-    inviter_updated: number | null;
-    bumper_name: string;
-    bumper_avatar: string | null;
-    bumper_updated: number | null;
-  }>;
-  const updateInviter = db.prepare(
-    'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
-  );
-  const updateBumper = db.prepare(
-    'UPDATE group_bumper_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
-  );
-  for (const row of shared) {
-    const id = String(row.group_id);
-    const iName = String(row.inviter_name ?? '').trim();
-    const bName = String(row.bumper_name ?? '').trim();
-    const bumperNewer = Number(row.bumper_updated ?? 0) >= Number(row.inviter_updated ?? 0);
-    const iPlaceholder = isPlaceholderTargetName(iName, id);
-    const bPlaceholder = isPlaceholderTargetName(bName, id);
-    // 名称统一：一侧占位取另一侧真实名；两侧都是真实名时按更新时间取较新一侧（支持任一模块改名）
-    const unifiedName =
-      iPlaceholder && !bPlaceholder
-        ? bName
-        : bPlaceholder && !iPlaceholder
-          ? iName
-          : (bumperNewer ? bName || iName : iName || bName) || id;
-    const nextIName = unifiedName;
-    const nextBName = unifiedName;
-    // 两表头像统一为同一个值：本地 data:image 优先（防倒退），否则取最近更新一侧的外链，避免双向互换。
-    const unifiedAvatar = bumperNewer
-      ? mergedAvatar(row.inviter_avatar, row.bumper_avatar)
-      : mergedAvatar(row.bumper_avatar, row.inviter_avatar);
-    const nextIAvatar = unifiedAvatar;
-    const nextBAvatar = unifiedAvatar;
-    if (nextIName !== row.inviter_name || nextIAvatar !== row.inviter_avatar) {
-      updateInviter.run(nextIName, nextIAvatar, now, id);
-    }
-    if (nextBName !== row.bumper_name || nextBAvatar !== row.bumper_avatar) {
-      updateBumper.run(nextBName, nextBAvatar, now, id);
-    }
+export function ensureGroupBumperDecouplingSchema(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS page_bumper_settings(
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  const hasPageRow = db.prepare('SELECT 1 FROM page_bumper_settings WHERE id = 1').get();
+  if (!hasPageRow) {
+    const groupRow = db.prepare('SELECT body FROM group_bumper_settings WHERE id = 1').get() as
+      { body?: string } | undefined;
+    const initialBody = typeof groupRow?.body === 'string' ? groupRow.body : '{}';
+    db.prepare(
+      'INSERT OR IGNORE INTO page_bumper_settings(id, value, updated_at) VALUES(1, ?, ?)',
+    ).run(initialBody, Date.now());
   }
+
+  const commentCols = db.prepare('PRAGMA table_info(group_bumper_comments)').all();
+  if (!commentCols.some((c) => c.name === 'scope')) {
+    db.exec(
+      "ALTER TABLE group_bumper_comments ADD COLUMN scope TEXT NOT NULL DEFAULT 'group' CHECK(scope IN ('group', 'page'))",
+    );
+  }
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_group_bumper_comments_scope ON group_bumper_comments(scope, created_at, id)',
+  );
+
+  const logCols = db.prepare('PRAGMA table_info(group_bumper_logs)').all();
+  if (!logCols.some((c) => c.name === 'source_mode')) {
+    db.exec(
+      "ALTER TABLE group_bumper_logs ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'group' CHECK(source_mode IN ('group', 'page'))",
+    );
+  }
+  db.exec(
+    "UPDATE group_bumper_logs SET source_mode = 'page' WHERE group_id = '-' AND source_mode != 'page'",
+  );
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_source_mode_bumped ON group_bumper_logs(source_mode, bumped_at DESC)',
+  );
 }
 
 export class SqliteGroupBumperRepository {
+  private readonly targetLibrary: SqliteTargetLibraryRepository;
+
   constructor(private readonly db: DatabaseSync) {
-    ensureTargetColumns(db, 'group_bumper_groups');
-    ensureTargetColumns(db, 'group_bumper_pages');
-    ensureProfileTaskResultTable(db);
-    ensureBumperSettingsDefault50(db);
-    syncSharedGroupTables(db);
+    ensureTargetLibrarySchema(db);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS group_bumper_comments(
+        id TEXT PRIMARY KEY,
+        comment_text TEXT NOT NULL,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'group' CHECK(scope IN ('group','page'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_comments_scope
+        ON group_bumper_comments(scope, created_at, id);
+      CREATE TABLE IF NOT EXISTS group_bumper_logs(
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        page_id TEXT NOT NULL,
+        page_name TEXT NOT NULL,
+        post_id TEXT NOT NULL,
+        post_url TEXT NOT NULL,
+        liked INTEGER NOT NULL DEFAULT 0,
+        comment_text TEXT,
+        bumped_at INTEGER NOT NULL,
+        source_mode TEXT NOT NULL DEFAULT 'group' CHECK(source_mode IN ('group','page'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_post ON group_bumper_logs(post_id);
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_account_time ON group_bumper_logs(account_id,bumped_at);
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_profile_post ON group_bumper_logs(profile_id,post_id);
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_bumped_at ON group_bumper_logs(bumped_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_source_mode_bumped ON group_bumper_logs(source_mode, bumped_at DESC);
+      CREATE TABLE IF NOT EXISTS group_bumper_settings(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        body TEXT NOT NULL,
+        default_max_likes_50_applied INTEGER NOT NULL DEFAULT 1,
+        default_max_concurrent_8_applied INTEGER NOT NULL DEFAULT 1
+      );
+      INSERT OR IGNORE INTO group_bumper_settings(id,body) VALUES(1,'{}');
+      CREATE TABLE IF NOT EXISTS page_bumper_settings(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT OR IGNORE INTO page_bumper_settings(id,value,updated_at) VALUES(1,'{}',0);
+      CREATE TABLE IF NOT EXISTS profile_task_results(
+        profile_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper','page-bumper','group-poster')),
+        run_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')),
+        reason TEXT NOT NULL,
+        finished_at INTEGER NOT NULL,
+        failed_steps INTEGER NOT NULL DEFAULT 0,
+        skipped_steps INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    db.exec(groupBumperOperationsMigration);
+    try {
+      applyBumperSettingsFlagUpgradeIfPending(db);
+    } catch {
+      // Ignore during intermediate pre-v50 migration steps before flag columns exist
+    }
+    this.targetLibrary = new SqliteTargetLibraryRepository(db);
   }
   getOperation(operationId: string): BumperOperationValue | null {
     const r = this.db
@@ -499,243 +450,98 @@ export class SqliteGroupBumperRepository {
       .run(JSON.stringify(settings));
     return settings;
   }
-  targets(kind: 'groups' | 'pages'): BumperTarget[] {
-    const prefix = kind === 'groups' ? 'group' : 'page';
-    return this.db
-      .prepare(
-        `SELECT * FROM group_bumper_${kind} ORDER BY sort_order,created_at DESC,${prefix}_id`,
-      )
-      .all()
-      .map((r) => ({
-        folderId: r.folder_id == null ? null : String(r.folder_id),
-        sortOrder: Number(r.sort_order),
-        id: String(r[`${prefix}_id`]),
-        name: String(r[`${prefix}_name`]),
-        avatarUrl: r.avatar_url == null ? null : String(r.avatar_url),
-        totalBumpedCount: Number(r.total_bumped_count),
-        createdAt: Number(r.created_at),
-        updatedAt: Number(r.updated_at),
-      }));
+  pageSettings(): BumperSettings {
+    const row = this.db.prepare('SELECT value FROM page_bumper_settings WHERE id=1').get() as
+      { value?: string } | undefined;
+    try {
+      return BumperSettings.parse(JSON.parse(String(row?.value ?? '{}')));
+    } catch {
+      return BumperSettings.parse({});
+    }
   }
-  upsertTargets(kind: 'groups' | 'pages', input: unknown) {
-    const { items } = BumperTargetsInput.parse(input),
-      prefix = kind === 'groups' ? 'group' : 'page',
-      now = Date.now();
-    return transaction(this.db, () => {
-      const stmt = this.db.prepare(
-        `INSERT INTO group_bumper_${kind}(${prefix}_id,${prefix}_name,created_at,updated_at,folder_id,sort_order) VALUES(?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM group_bumper_${kind})) ON CONFLICT(${prefix}_id) DO UPDATE SET ${prefix}_name=CASE WHEN excluded.${prefix}_name=excluded.${prefix}_id AND group_bumper_${kind}.${prefix}_name<>'' THEN group_bumper_${kind}.${prefix}_name ELSE excluded.${prefix}_name END,updated_at=excluded.updated_at`,
-      );
-      for (const item of items) {
-        const effectiveName = item.name.trim() || item.id;
-        stmt.run(item.id, effectiveName, now, now, item.folderId ?? null);
-      }
-      if (kind === 'groups') syncSharedGroupTables(this.db);
-      return this.targets(kind);
-    });
+  savePageSettings(input: unknown): BumperSettings {
+    const settings = BumperSettings.parse(input);
+    this.db
+      .prepare('UPDATE page_bumper_settings SET value=?, updated_at=? WHERE id=1')
+      .run(JSON.stringify(settings), Date.now());
+    return settings;
+  }
+  targets(kind: 'groups' | 'pages'): BumperTarget[] {
+    return kind === 'groups'
+      ? this.targetLibrary.listBumperGroups()
+      : this.targetLibrary.listPages();
+  }
+  upsertTargets(kind: 'groups' | 'pages', input: unknown): BumperTarget[] {
+    const { items } = BumperTargetsInput.parse(input);
+    const mapped = items.map((item) => ({
+      id: item.id,
+      name: item.name.trim() || item.id,
+      folderId: item.folderId ?? null,
+    }));
+    if (kind === 'groups') {
+      this.targetLibrary.upsertGroups(mapped);
+      return this.targetLibrary.listBumperGroups();
+    }
+    return this.targetLibrary.upsertPages(mapped);
   }
   applyResolvedTargetMetadata(
     kind: 'groups' | 'pages',
     originalId: string,
     resolved: { canonicalId?: string | null; name?: string | null; avatarUrl?: string | null },
   ): boolean {
-    const prefix = kind === 'groups' ? 'group' : 'page',
-      table = 'group_bumper_' + kind;
-    return transaction(this.db, () => {
-      const current = this.db
-        .prepare('SELECT * FROM ' + table + ' WHERE ' + prefix + '_id=?')
-        .get(originalId);
-      if (!current) return false;
-      const id =
-        resolved.canonicalId && isCompleteNumericId(resolved.canonicalId)
-          ? resolved.canonicalId.trim()
-          : originalId;
-      const existing =
-        id !== originalId
-          ? this.db.prepare('SELECT * FROM ' + table + ' WHERE ' + prefix + '_id=?').get(id)
-          : undefined;
-      const resolvedName = resolved.name?.trim() ?? '';
-      const existingName = existing ? String(existing[prefix + '_name'] ?? '').trim() : '';
-      const currentName = String(current[prefix + '_name'] ?? '').trim();
-      const name =
-        resolvedName &&
-        !isPlaceholderTargetName(resolvedName, id) &&
-        !isPlaceholderTargetName(resolvedName, originalId)
-          ? resolvedName
-          : existingName && !isPlaceholderTargetName(existingName, id)
-            ? existingName
-            : currentName && !isPlaceholderTargetName(currentName, originalId)
-              ? currentName
-              : resolvedName || existingName || currentName || id;
-      const currentAvatar = current.avatar_url == null ? null : String(current.avatar_url);
-      const duplicateAvatar = existing?.avatar_url == null ? null : String(existing.avatar_url);
-      const baseAvatar = mergedAvatar(duplicateAvatar, currentAvatar);
-      const avatar = mergedAvatar(baseAvatar, resolved.avatarUrl);
-      if (existing) {
-        this.db
-          .prepare(
-            'UPDATE ' +
-              table +
-              ' SET ' +
-              prefix +
-              '_name=?,avatar_url=?,total_bumped_count=total_bumped_count+?,updated_at=? WHERE ' +
-              prefix +
-              '_id=?',
-          )
-          .run(name, avatar, Number(current.total_bumped_count ?? 0), Date.now(), id);
-        this.db.prepare('DELETE FROM ' + table + ' WHERE ' + prefix + '_id=?').run(originalId);
-      } else {
-        this.db
-          .prepare(
-            'UPDATE ' +
-              table +
-              ' SET ' +
-              prefix +
-              '_id=?,' +
-              prefix +
-              '_name=?,avatar_url=?,updated_at=? WHERE ' +
-              prefix +
-              '_id=?',
-          )
-          .run(id, name, avatar, Date.now(), originalId);
-      }
-      this.db
-        .prepare(
-          'UPDATE group_bumper_logs SET ' +
-            prefix +
-            '_id=?,' +
-            prefix +
-            '_name=? WHERE ' +
-            prefix +
-            '_id=?',
-        )
-        .run(id, name, originalId);
-      if (kind === 'groups') {
-        const hasInviter = Boolean(
-          this.db
-            .prepare(
-              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'",
-            )
-            .get(),
-        );
-        if (hasInviter) {
-          if (id !== originalId) {
-            const dupInviter = this.db
-              .prepare('SELECT * FROM group_inviter_groups WHERE group_id=?')
-              .get(id);
-            if (dupInviter) {
-              this.db.prepare('DELETE FROM group_inviter_groups WHERE group_id=?').run(originalId);
-            } else {
-              this.db
-                .prepare('UPDATE group_inviter_groups SET group_id=? WHERE group_id=?')
-                .run(id, originalId);
-            }
-          }
-          // 同步把本次解析出的名称与头像写给邀请人侧，避免随后按更新时间统一时被旧值反向覆盖
-          const inviterRow = this.db
-            .prepare('SELECT avatar_url FROM group_inviter_groups WHERE group_id=?')
-            .get(id) as { avatar_url?: string | null } | undefined;
-          if (inviterRow) {
-            const inviterAvatar = mergedAvatar(
-              inviterRow.avatar_url == null ? null : String(inviterRow.avatar_url),
-              avatar,
-            );
-            const resolvedAt = Date.now();
-            if (!isPlaceholderTargetName(name, id))
-              this.db
-                .prepare(
-                  'UPDATE group_inviter_groups SET group_name=?, avatar_url=?, updated_at=? WHERE group_id=?',
-                )
-                .run(name, inviterAvatar, resolvedAt, id);
-            else
-              this.db
-                .prepare(
-                  'UPDATE group_inviter_groups SET avatar_url=?, updated_at=? WHERE group_id=?',
-                )
-                .run(inviterAvatar, resolvedAt, id);
-            this.db
-              .prepare('UPDATE group_bumper_groups SET updated_at=? WHERE group_id=?')
-              .run(resolvedAt, id);
-          }
-          syncSharedGroupTables(this.db);
-        }
-      }
-      return true;
-    });
+    return this.targetLibrary.applyResolvedTargetMetadata(kind, originalId, resolved);
   }
 
-  deleteTargets(kind: 'groups' | 'pages', input: unknown) {
-    const { ids } = BumperIdsInput.parse(input),
-      prefix = kind === 'groups' ? 'group' : 'page';
+  deleteTargets(kind: 'groups' | 'pages', input: unknown): number {
+    const { ids } = BumperIdsInput.parse(input);
     return transaction(this.db, () => {
-      const deleted = Number(
+      if (kind === 'groups') {
+        return Number(
+          this.db
+            .prepare(
+              'DELETE FROM shared_facebook_groups WHERE group_id IN (SELECT value FROM json_each(?))',
+            )
+            .run(JSON.stringify(ids)).changes,
+        );
+      }
+      return Number(
         this.db
           .prepare(
-            `DELETE FROM group_bumper_${kind} WHERE ${prefix}_id IN (SELECT value FROM json_each(?))`,
+            'DELETE FROM group_bumper_pages WHERE page_id IN (SELECT value FROM json_each(?))',
           )
           .run(JSON.stringify(ids)).changes,
       );
-      if (kind === 'groups') {
-        const hasInviter = Boolean(
-          this.db
-            .prepare(
-              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_inviter_groups'",
-            )
-            .get(),
-        );
-        if (hasInviter) {
-          this.db
-            .prepare(
-              'DELETE FROM group_inviter_groups WHERE group_id IN (SELECT value FROM json_each(?))',
-            )
-            .run(JSON.stringify(ids));
-        }
-      }
-      return deleted;
     });
   }
   updateAvatar(kind: 'groups' | 'pages', id: string, avatarUrl: string) {
     const trimmed = typeof avatarUrl === 'string' ? avatarUrl.trim() : '';
-    if (!isLocalAvatar(trimmed) && !isHttpAvatarUrl(trimmed)) return;
-    const prefix = kind === 'groups' ? 'group' : 'page';
-    const table = `group_bumper_${kind}`;
-    const existing = this.db
-      .prepare(`SELECT avatar_url FROM ${table} WHERE ${prefix}_id=?`)
-      .get(id) as { avatar_url?: string | null } | undefined;
-    if (!existing) return;
-    const currentAvatar = existing.avatar_url == null ? null : String(existing.avatar_url);
-    if (isLocalAvatar(currentAvatar) && !isLocalAvatar(trimmed)) return;
-    this.db
-      .prepare(`UPDATE ${table} SET avatar_url=?,updated_at=? WHERE ${prefix}_id=?`)
-      .run(trimmed, Date.now(), id);
-    if (kind === 'groups') syncSharedGroupTables(this.db);
+    if (!trimmed) return;
+    this.targetLibrary.applyResolvedTargetMetadata(kind, id, {
+      avatarUrl: trimmed,
+    });
   }
-  importGroupsFromInviter() {
-    const now = Date.now();
-    return Number(
-      this.db
-        .prepare(
-          `INSERT INTO group_bumper_groups(group_id,group_name,avatar_url,created_at,updated_at,sort_order) SELECT group_id,group_name,avatar_url,?,?,(SELECT COALESCE(MAX(sort_order),-1) FROM group_bumper_groups)+ROW_NUMBER() OVER(ORDER BY sort_order,created_at DESC,group_id) FROM group_inviter_groups WHERE 1 ON CONFLICT(group_id) DO UPDATE SET group_name=excluded.group_name,avatar_url=CASE WHEN group_bumper_groups.avatar_url LIKE 'data:image/%' AND (excluded.avatar_url IS NULL OR excluded.avatar_url NOT LIKE 'data:image/%') THEN group_bumper_groups.avatar_url ELSE COALESCE(excluded.avatar_url,group_bumper_groups.avatar_url) END,updated_at=excluded.updated_at`,
-        )
-        .run(now, now).changes,
-    );
-  }
-  comments(): BumperComment[] {
+  comments(scope: BumperScope = 'group'): BumperComment[] {
     return this.db
-      .prepare('SELECT * FROM group_bumper_comments ORDER BY created_at,id')
-      .all()
+      .prepare('SELECT * FROM group_bumper_comments WHERE scope=? ORDER BY created_at,id')
+      .all(scope)
       .map((r) => ({
         id: String(r.id),
         text: String(r.comment_text),
         usedCount: Number(r.used_count),
         createdAt: Number(r.created_at),
+        scope: r.scope === 'page' ? 'page' : 'group',
       }));
   }
-  saveComments(input: unknown) {
-    const { texts, consumeCommentOnUse } = BumperCommentsInput.parse(input);
+  saveComments(input: unknown, scopeOverride?: BumperScope) {
+    const parsed = BumperCommentsInput.parse(input);
+    const scope: BumperScope = scopeOverride ?? parsed.scope ?? 'group';
+    const { texts, consumeCommentOnUse } = parsed;
     return transaction(this.db, () => {
-      const existing = new Map(this.comments().map((r) => [r.text, r]));
-      this.db.prepare('DELETE FROM group_bumper_comments').run();
-      const add = this.db.prepare('INSERT INTO group_bumper_comments VALUES(?,?,?,?)');
+      const existing = new Map(this.comments(scope).map((r) => [r.text, r]));
+      this.db.prepare('DELETE FROM group_bumper_comments WHERE scope=?').run(scope);
+      const add = this.db.prepare(
+        'INSERT INTO group_bumper_comments(id,comment_text,used_count,created_at,scope) VALUES(?,?,?,?,?)',
+      );
       for (const text of new Set(texts)) {
         const previous = existing.get(text);
         add.run(
@@ -743,16 +549,22 @@ export class SqliteGroupBumperRepository {
           text,
           previous?.usedCount ?? 0,
           previous?.createdAt ?? Date.now(),
+          scope,
         );
       }
-      this.saveSettings({ ...this.settings(), consumeCommentOnUse });
-      return this.comments();
+      if (scope === 'page') {
+        this.savePageSettings({ ...this.pageSettings(), consumeCommentOnUse });
+      } else {
+        this.saveSettings({ ...this.settings(), consumeCommentOnUse });
+      }
+      return this.comments(scope);
     });
   }
   pickComment(
     postId: string,
     random = Math.random(),
     excludeIds: ReadonlyArray<string> = [],
+    scope: BumperScope = 'group',
   ): BumperComment | null {
     const excluded = new Set(excludeIds);
     const used = new Set(
@@ -763,20 +575,33 @@ export class SqliteGroupBumperRepository {
         .all(postId)
         .map((r) => String(r.comment_text)),
     );
-    const all = this.comments().filter((r) => !excluded.has(r.id)),
+    const all = this.comments(scope).filter((r) => !excluded.has(r.id)),
       unused = all.filter((r) => !used.has(r.text));
-    const pool = unused.length ? unused : this.settings().consumeCommentOnUse ? [] : all;
+    const consumeOnUse =
+      scope === 'page'
+        ? this.pageSettings().consumeCommentOnUse
+        : this.settings().consumeCommentOnUse;
+    const pool = unused.length ? unused : consumeOnUse ? [] : all;
     return pool[Math.min(pool.length - 1, Math.max(0, Math.floor(random * pool.length)))] ?? null;
   }
-  eligibility(accountId: string, profileId: string, postId: string, now = Date.now()) {
+  eligibility(
+    accountId: string,
+    profileId: string,
+    postId: string,
+    nowOrSourceMode: number | BumperScope = Date.now(),
+    maybeSourceMode?: BumperScope,
+  ) {
+    const now = typeof nowOrSourceMode === 'number' ? nowOrSourceMode : Date.now();
+    const sourceMode: BumperScope =
+      typeof nowOrSourceMode === 'string' ? nowOrSourceMode : (maybeSourceMode ?? 'group');
     const date = new Date(now);
     date.setHours(0, 0, 0, 0);
     const today = Number(
       this.db
         .prepare(
-          'SELECT COUNT(*) n FROM group_bumper_logs WHERE (account_id=? OR profile_id=?) AND bumped_at>=?',
+          'SELECT COUNT(*) n FROM group_bumper_logs WHERE (account_id=? OR profile_id=?) AND bumped_at>=? AND source_mode=?',
         )
-        .get(accountId, profileId, date.getTime())?.n ?? 0,
+        .get(accountId, profileId, date.getTime(), sourceMode)?.n ?? 0,
     );
     const postCount = Number(
       this.db
@@ -792,7 +617,7 @@ export class SqliteGroupBumperRepository {
         )
         .get(postId, accountId, profileId),
     );
-    const settings = this.settings();
+    const settings = sourceMode === 'page' ? this.pageSettings() : this.settings();
     return {
       today,
       postCount,
@@ -820,15 +645,18 @@ export class SqliteGroupBumperRepository {
         liked: z.boolean(),
         commentText: z.string().nullable(),
         bumpedAt: z.number().int(),
+        sourceMode: z.enum(['group', 'page']).optional(),
       })
       .strict()
       .parse(input);
     if (!row.liked && !row.commentText) return false;
+    const sourceMode: BumperScope = row.sourceMode ?? (row.groupId === '-' ? 'page' : 'group');
     return transaction(this.db, () => {
       const previous = this.db.prepare('SELECT * FROM group_bumper_logs WHERE id=?').get(row.id);
       if (
         !previous &&
-        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt).duplicate
+        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt, sourceMode)
+          .duplicate
       )
         return false;
       if (
@@ -841,7 +669,12 @@ export class SqliteGroupBumperRepository {
       const commentNew = !!row.commentText && !previous?.comment_text;
       this.db
         .prepare(
-          `INSERT INTO group_bumper_logs VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET liked=MAX(liked,excluded.liked),comment_text=COALESCE(comment_text,excluded.comment_text)`,
+          `INSERT INTO group_bumper_logs(
+             id,profile_id,account_id,group_id,group_name,page_id,page_name,post_id,post_url,liked,comment_text,bumped_at,source_mode
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET
+             liked=MAX(liked,excluded.liked),
+             comment_text=COALESCE(comment_text,excluded.comment_text)`,
         )
         .run(
           row.id,
@@ -856,19 +689,22 @@ export class SqliteGroupBumperRepository {
           row.liked ? 1 : 0,
           row.commentText,
           row.bumpedAt,
+          sourceMode,
         );
-      if (!previous)
-        for (const [kind, prefix, id] of [
-          ['groups', 'group', row.groupId],
-          ['pages', 'page', row.pageId],
-        ])
-          this.db
-            .prepare(
-              `UPDATE group_bumper_${kind} SET total_bumped_count=total_bumped_count+1 WHERE ${prefix}_id=?`,
-            )
-            .run(id ?? '');
+      if (!previous) {
+        if (row.groupId && row.groupId !== '-') {
+          this.targetLibrary.incrementGroupBumpedCount(row.groupId, 1);
+        }
+        if (row.pageId) {
+          this.targetLibrary.incrementPageBumpedCount(row.pageId, 1);
+        }
+      }
       if (commentNew && commentId) {
-        if (this.settings().consumeCommentOnUse)
+        const consumeOnUse =
+          sourceMode === 'page'
+            ? this.pageSettings().consumeCommentOnUse
+            : this.settings().consumeCommentOnUse;
+        if (consumeOnUse)
           this.db
             .prepare('DELETE FROM group_bumper_comments WHERE id=? AND comment_text=?')
             .run(commentId, row.commentText);
@@ -882,15 +718,27 @@ export class SqliteGroupBumperRepository {
       return !previous;
     });
   }
-  logs(search = '', limit = 200, before?: number, beforeId = '\uffff'): BumperLog[] {
+  logs(
+    search = '',
+    limit = 200,
+    before?: number,
+    beforeId = '\uffff',
+    sourceMode: BumperScope | 'all' = 'all',
+  ): BumperLog[] {
     return this.db
       .prepare(
-        `SELECT * FROM group_bumper_logs WHERE (bumped_at<? OR (bumped_at=? AND id<?)) AND (?='' OR instr(lower(group_name||' '||page_name||' '||page_id||' '||account_id||' '||COALESCE(comment_text,'')),lower(?))>0) ORDER BY bumped_at DESC,id DESC LIMIT ?`,
+        `SELECT * FROM group_bumper_logs
+          WHERE (bumped_at<? OR (bumped_at=? AND id<?))
+            AND (?='all' OR source_mode=?)
+            AND (?='' OR instr(lower(group_name||' '||page_name||' '||page_id||' '||account_id||' '||COALESCE(comment_text,'')),lower(?))>0)
+          ORDER BY bumped_at DESC,id DESC LIMIT ?`,
       )
       .all(
         before ?? Date.now(),
         before ?? Date.now(),
         beforeId,
+        sourceMode,
+        sourceMode,
         search,
         search,
         Math.max(1, Math.min(1000, limit)),
@@ -908,24 +756,37 @@ export class SqliteGroupBumperRepository {
         liked: r.liked === 1,
         commentText: r.comment_text == null ? null : String(r.comment_text),
         bumpedAt: Number(r.bumped_at),
+        sourceMode: r.source_mode === 'page' ? 'page' : 'group',
       }));
   }
-  total() {
-    return Number(this.db.prepare('SELECT COUNT(*) n FROM group_bumper_logs').get()?.n ?? 0);
+  total(sourceMode: BumperScope | 'all' = 'all') {
+    if (sourceMode === 'all') {
+      return Number(this.db.prepare('SELECT COUNT(*) n FROM group_bumper_logs').get()?.n ?? 0);
+    }
+    return Number(
+      this.db
+        .prepare('SELECT COUNT(*) n FROM group_bumper_logs WHERE source_mode=?')
+        .get(sourceMode)?.n ?? 0,
+    );
   }
-  todayCounts(): Record<string, number> {
+  todayCounts(sourceMode: BumperScope | 'all' = 'group'): Record<string, number> {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     return Object.fromEntries(
       this.db
         .prepare(
-          'SELECT profile_id,COUNT(*) n FROM group_bumper_logs WHERE bumped_at>=? GROUP BY profile_id',
+          `SELECT profile_id,COUNT(*) n FROM group_bumper_logs
+            WHERE bumped_at>=? AND (?='all' OR source_mode=?)
+            GROUP BY profile_id`,
         )
-        .all(today.getTime())
+        .all(today.getTime(), sourceMode, sourceMode)
         .map((r) => [String(r.profile_id), Number(r.n)]),
     );
   }
-  weeklyDailyCounts(now = Date.now()): BumperDailyStat[] {
+  weeklyDailyCounts(
+    now = Date.now(),
+    sourceMode: BumperScope | 'all' = 'group',
+  ): BumperDailyStat[] {
     const base = new Date(now);
     base.setHours(0, 0, 0, 0);
     const tomorrow = new Date(base);
@@ -946,8 +807,12 @@ export class SqliteGroupBumperRepository {
     }
 
     const rows = this.db
-      .prepare('SELECT bumped_at FROM group_bumper_logs WHERE bumped_at >= ? AND bumped_at < ?')
-      .all(startMs, endMs);
+      .prepare(
+        `SELECT bumped_at FROM group_bumper_logs
+          WHERE bumped_at >= ? AND bumped_at < ?
+            AND (?='all' OR source_mode=?)`,
+      )
+      .all(startMs, endMs, sourceMode, sourceMode);
     for (const r of rows) {
       const ymd = formatLocalYmd(new Date(Number(r.bumped_at)));
       if (buckets.has(ymd)) {
@@ -957,17 +822,71 @@ export class SqliteGroupBumperRepository {
 
     return days.map((date) => ({ date, count: buckets.get(date) ?? 0 }));
   }
+  pendingReviewOperations(limit = 100): BumperPendingOperation[] {
+    return this.db
+      .prepare(
+        `SELECT operation_id, profile_id, account_id, group_id, group_name, page_id, page_name, post_id, action_kind, reason, updated_at
+           FROM group_bumper_operations
+          WHERE status = 'PENDING_REVIEW'
+          ORDER BY updated_at DESC, operation_id DESC
+          LIMIT ?`,
+      )
+      .all(Math.max(1, Math.min(500, limit)))
+      .map((r) => ({
+        id: String(r.operation_id),
+        profileId: String(r.profile_id),
+        accountId: String(r.account_id),
+        groupId: String(r.group_id),
+        groupName: String(r.group_name),
+        pageId: String(r.page_id),
+        pageName: String(r.page_name),
+        postId: String(r.post_id),
+        actionKind: String(r.action_kind).includes('comment') ? 'comment' : 'like',
+        reason: String(r.reason ?? ''),
+        updatedAt: Number(r.updated_at ?? 0),
+      }));
+  }
   deleteLogs(input: unknown) {
-    const { ids, all } = z
-      .object({ ids: z.array(z.uuid()).max(1000).default([]), all: z.boolean().default(false) })
+    const { ids, all, sourceMode } = z
+      .object({
+        ids: z.array(z.uuid()).max(1000).default([]),
+        all: z.boolean().default(false),
+        sourceMode: z.enum(['group', 'page', 'all']).optional(),
+      })
       .strict()
       .parse(input);
-    return Number(
-      this.db
-        .prepare(
-          'DELETE FROM group_bumper_logs WHERE ?=1 OR id IN (SELECT value FROM json_each(?))',
-        )
-        .run(all ? 1 : 0, JSON.stringify(ids)).changes,
-    );
+    const mode = sourceMode ?? 'all';
+    return transaction(this.db, () => {
+      const changes = Number(
+        this.db
+          .prepare(
+            `DELETE FROM group_bumper_logs
+              WHERE (?=1 AND (?='all' OR source_mode=?))
+                 OR id IN (SELECT value FROM json_each(?))`,
+          )
+          .run(all ? 1 : 0, mode, mode, JSON.stringify(ids)).changes,
+      );
+      if (changes > 0) {
+        this.db
+          .prepare(
+            `UPDATE shared_facebook_groups
+                SET bumped_count = (
+                  SELECT COUNT(*) FROM group_bumper_logs
+                   WHERE group_bumper_logs.group_id = shared_facebook_groups.group_id
+                )`,
+          )
+          .run();
+        this.db
+          .prepare(
+            `UPDATE group_bumper_pages
+                SET total_bumped_count = (
+                  SELECT COUNT(*) FROM group_bumper_logs
+                   WHERE group_bumper_logs.page_id = group_bumper_pages.page_id
+                )`,
+          )
+          .run();
+      }
+      return changes;
+    });
   }
 }

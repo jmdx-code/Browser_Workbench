@@ -288,7 +288,7 @@ export type RuntimeRequest = z.infer<typeof TaskRuntimeRequest>;
 export const ProfileTaskResult = z
   .object({
     profileId: Id,
-    source: z.enum(['task', 'group-inviter', 'group-bumper']),
+    source: z.enum(['task', 'group-inviter', 'group-bumper', 'page-bumper', 'group-poster']),
     runId: z.string().min(1).max(200),
     name: z.string().max(300),
     state: z.enum(['COMPLETED', 'FAILED', 'STOPPED']),

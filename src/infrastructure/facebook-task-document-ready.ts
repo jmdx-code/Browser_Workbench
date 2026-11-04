@@ -92,14 +92,11 @@ export async function awaitFacebookTaskDocument(
             kernelFacebookReadURL(document.url) &&
             !classifyFacebookAbnormalUrl(document.url)) ||
           (options.retainedPage === true &&
-            (FacebookBrowseURL.safeParse(document.url).success ||
-              facebookMarketplaceUnavailableURL(document.url) ||
-              /^https:\/\/www\.facebook\.com\/friends(?:\/(?:requests|suggestions|list|birthdays|friendlist)?\/?)?(?:\?.*)?$/.test(
-                document.url,
-              ) ||
-              /^https:\/\/www\.facebook\.com\/(?:groups|search|profile\.php|notifications|saved|memories|events|bookmarks)(?:\/[^?#]*)?(?:\?.*)?$/.test(
-                document.url,
-              ))))
+            ((kernelFacebookReadURL(document.url) &&
+              !classifyFacebookAbnormalUrl(document.url) &&
+              !/^https:\/\/www\.facebook\.com\/messages(?:\/|$|\?)/i.test(document.url)) ||
+              FacebookBrowseURL.safeParse(document.url).success ||
+              facebookMarketplaceUnavailableURL(document.url))))
           ? 'home'
           : document.url === 'about:blank' && !homeSeen
             ? 'initial-blank'

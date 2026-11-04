@@ -81,7 +81,6 @@ test('schema 43 adds only bumper data, target CRUD and inviter import preserve e
     const r = store.groupBumper;
     store.groupInviter.upsertGroups({ items: [{ groupId: '12345', groupName: 'original' }] });
     store.groupInviter.updateGroupAvatar('12345', 'https://example.com/avatar.jpg');
-    assert.equal(r.importGroupsFromInviter(), 1);
     assert.equal(r.targets('groups')[0]?.avatarUrl, 'https://example.com/avatar.jpg');
     r.upsertTargets('groups', { items: [{ id: '12345', name: 'updated' }] });
     assert.equal(r.targets('groups')[0]?.name, 'updated');
@@ -723,7 +722,7 @@ test('WO60: append run starts only idle profiles and keeps running profiles unto
     for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
       await new Promise((x) => setTimeout(x, 10));
     const result = store.tasks.runtimeSnapshot().profileResults?.find((row) => row.profileId === c);
-    assert.equal(result?.source, 'group-bumper');
+    assert.equal(result?.source, 'page-bumper');
     assert.equal(result?.name, '专页顶贴');
   }));
 

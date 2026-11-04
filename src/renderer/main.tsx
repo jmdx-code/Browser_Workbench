@@ -2,24 +2,19 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import type { Profile, SavedCombination } from '../shared/contracts.js';
 import type { DesktopBridge } from '../shared/desktop.js';
-import type { BumperState } from '../shared/group-bumper.js';
-import type { GroupInviterState } from '../shared/group-inviter.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 import type { TaskCommand } from '../shared/task-contracts.js';
 import { ActiveAccountsPage } from './active-accounts-page.js';
 import { api } from './api.js';
-import { AppMenu } from './app-menu.js';
 import { useCardColors } from './card-colors.js';
-import { DiagnosticFeedbackModal } from './diagnostic-feedback-modal.js';
 import { Editor, type EditorHandle } from './editor.js';
 import { FeatureNavRail } from './feature-nav-rail.js';
-import { GroupBumperPage, PageBumperPage } from './group-bumper-page.js';
+import { GroupBumperPage } from './group-bumper-page.js';
 import { GroupInviterPage } from './group-inviter-page.js';
-import { IconClose } from './icons.js';
+import { GroupPosterPage } from './group-poster-page.js';
 import { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
-import { NameDialog } from './name-dialog.js';
-import { RecordDetailDrawer } from './record-detail.js';
-import { ResourceTableEditor, type ResourceEditorHandle } from './resource-table-editor.js';
+import { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
+import type { ResourceEditorHandle } from './resource-table-editor.js';
 import { SidebarResizer } from './sidebar-resizer.js';
 import { Sidebar } from './sidebar.js';
 import { useSoftwareUpdate } from './software-update-panel.js';
@@ -28,6 +23,7 @@ import { TaskRecordsPage } from './task-records.js';
 import { useInspections } from './use-inspections.js';
 import { useTasks } from './use-tasks.js';
 import { useWorkspace } from './use-workspace.js';
+import { WorkbenchOverlays } from './workbench-overlays.js';
 import { WorkbenchTopbar } from './workbench-topbar.js';
 import './style.css';
 import './design-system.css';
@@ -43,7 +39,9 @@ type View =
   | { kind: 'records' }
   | { kind: 'group-inviter' }
   | { kind: 'group-bumper' }
-  | { kind: 'page-bumper' };
+  | { kind: 'page-bumper' }
+  | { kind: 'group-poster' };
+type DetailTarget = { profileId: string; planId: string; round?: number };
 function App() {
   const { workspace, error, refresh } = useWorkspace();
   const inspections = useInspections();
@@ -52,11 +50,7 @@ function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [view, setView] = useState<View>({ kind: 'home' });
   const [recordFilter, setRecordFilter] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{
-    profileId: string;
-    planId: string;
-    round?: number;
-  } | null>(null);
+  const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [diagModalOpen, setDiagModalOpen] = useState(false);
   const updates = useSoftwareUpdate();
@@ -71,50 +65,21 @@ function App() {
   const [resourceSummaries, setResourceSummaries] = useState<ResourceUsageSummaryValue[] | null>(
     null,
   );
-  const [groupBumper, setGroupBumper] = useState<BumperState | null>(null);
-  useEffect(() => {
-    let live = true;
-    const refreshBumper = () =>
-      void api
-        .bumperState()
-        .then((next) => live && setGroupBumper(next))
-        .catch(() => {});
-    refreshBumper();
-    const timer = setInterval(
-      refreshBumper,
-      view.kind === 'group-bumper' ||
-        view.kind === 'page-bumper' ||
-        groupBumper?.running ||
-        groupBumper?.pageBumperRunning
-        ? 2000
-        : 6000,
-    );
-    return () => {
-      live = false;
-      clearInterval(timer);
-    };
-  }, [view.kind, groupBumper?.running, groupBumper?.pageBumperRunning]);
-  const [groupInviter, setGroupInviter] = useState<GroupInviterState | null>(null);
-  const [groupInviterLoaded, setGroupInviterLoaded] = useState(false);
+  const mods = useFeatureModulesPolling(view.kind);
+  const {
+    groupBumper,
+    setGroupBumper,
+    groupInviter,
+    setGroupInviter,
+    groupPoster,
+    setGroupPoster,
+  } = mods;
   const resourceGeneration = useRef(0);
   async function applyUpdate() {
     if (resourceEditor.current && !(await resourceEditor.current.persist())) return;
     if (editor.current && !(await editor.current.persist())) return;
     await updates.apply();
   }
-  const refreshGroupInviter = useCallback(async () => {
-    await api
-      .groupInviterState()
-      .then(setGroupInviter)
-      .catch(() => {})
-      .finally(() => setGroupInviterLoaded(true));
-  }, []);
-  useEffect(() => {
-    void refreshGroupInviter();
-    const intervalMs = view.kind === 'group-inviter' || groupInviter?.running ? 2000 : 6000;
-    const timer = setInterval(() => void refreshGroupInviter(), intervalMs);
-    return () => clearInterval(timer);
-  }, [refreshGroupInviter, view.kind, groupInviter?.running]);
   const refreshResources = useCallback(async () => {
     const generation = ++resourceGeneration.current;
     await api
@@ -192,9 +157,14 @@ function App() {
   const plans = tasks.runtime?.plans ?? [];
   const attentionCount = workspace ? attentionPlans(plans, workspace.profiles).length : 0;
   const onlineCount = workspace?.profiles.filter((row) => row.online).length ?? 0;
-  const restartDisabled = plans.some((plan) =>
-    ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state),
-  );
+  const restartDisabled =
+    plans.some((plan) => ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state)) ||
+    Boolean(
+      groupInviter?.running ||
+      groupBumper?.running ||
+      groupBumper?.pageBumperRunning ||
+      groupPoster?.running,
+    );
   const projection = buildWorkbenchProjection({
     viewKind: view.kind,
     profiles: workspace?.profiles,
@@ -202,15 +172,10 @@ function App() {
     tasks: tasks.runtime,
     groupBumper,
     groupInviter,
+    groupPoster,
     attentionCount,
     message,
   });
-  const { bumperRunningIds, inviterRunningIds, projectedActivities, projectedControls } =
-    projection;
-  const detailProfile = detail
-    ? workspace?.profiles.find((row) => row.id === detail.profileId)
-    : undefined;
-  const failedMessage = /失败|错误|未完成|不能|无法|请先|未确认/.test(message);
   return (
     <div className="app">
       <WorkbenchTopbar
@@ -266,8 +231,8 @@ function App() {
             onShow={(id) =>
               void mutate(() => api.showBrowser(id).then(() => '已显示对应浏览器页面'))
             }
-            activities={projectedActivities}
-            selectionControls={projectedControls}
+            activities={projection.projectedActivities}
+            selectionControls={projection.projectedControls}
             bumperCounts={
               view.kind === 'group-bumper'
                 ? groupBumper?.profileCounts
@@ -275,17 +240,20 @@ function App() {
                   ? (groupBumper?.pageBumperProfileCounts ?? {})
                   : undefined
             }
-            bumperRunningIds={bumperRunningIds}
+            bumperRunningIds={projection.bumperRunningIds}
             groupInviterCounts={
               view.kind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null
             }
-            groupInviterRunningIds={inviterRunningIds}
+            groupInviterRunningIds={projection.inviterRunningIds}
             onStopModules={(ids) =>
               void mutate(async () => {
-                const bIds = ids.filter((id) => bumperRunningIds.includes(id));
+                const bIds = ids.filter((id) => projection.bumperRunningIds.includes(id));
                 if (bIds.length)
                   setGroupBumper(await api.bumperAction('stop', { profileIds: bIds }));
-                const inviteIds = ids.filter((id) => !bumperRunningIds.includes(id));
+                const pIds = ids.filter((id) => projection.posterRunningIds.includes(id));
+                if (pIds.length)
+                  setGroupPoster(await api.posterAction('stop', { profileIds: pIds }));
+                const inviteIds = ids.filter((id) => projection.inviterRunningIds.includes(id));
                 if (inviteIds.length)
                   setGroupInviter(await api.stopGroupInviterProfiles({ profileIds: inviteIds }));
                 return `已发送停止 ${ids.length} 个浏览器的小组任务指令`;
@@ -315,7 +283,7 @@ function App() {
                 cardColors={cardColors}
                 busy={busy}
                 resourceSummaries={resourceSummaries}
-                selectionControls={projectedControls}
+                selectionControls={projection.projectedControls}
                 onSetResourceSummaries={setResourceSummaries}
                 onOpenResources={setResourceRow}
                 onEditCombination={(row) => setView({ kind: 'edit', row })}
@@ -337,29 +305,33 @@ function App() {
                 groupInviterState={groupInviter}
                 groupBumperState={groupBumper}
                 onGroupBumperState={setGroupBumper}
+                groupPosterState={groupPoster}
                 onNotify={setMessage}
               />
             )}
-            {view.kind === 'group-bumper' && (
+            {(view.kind === 'group-bumper' || view.kind === 'page-bumper') && (
               <GroupBumperPage
+                key={view.kind}
+                mode={view.kind}
                 state={groupBumper}
                 selected={selected}
                 profiles={workspace.profiles}
                 onState={(next) => {
                   setGroupBumper(next);
-                  void refreshGroupInviter();
+                  void mods.refreshGroupInviter();
+                  mods.refreshPoster();
                 }}
                 onMessage={setMessage}
               />
             )}
-            {view.kind === 'page-bumper' && (
-              <PageBumperPage
-                state={groupBumper}
+            {view.kind === 'group-poster' && (
+              <GroupPosterPage
+                state={groupPoster}
                 selected={selected}
                 profiles={workspace.profiles}
                 onState={(next) => {
-                  setGroupBumper(next);
-                  void refreshGroupInviter();
+                  setGroupPoster(next);
+                  void mods.refreshGroupInviter();
                 }}
                 onMessage={setMessage}
               />
@@ -368,24 +340,20 @@ function App() {
               <GroupInviterPage
                 state={groupInviter}
                 onRefresh={async () => setGroupInviter(await api.groupInviterState())}
-                loaded={groupInviterLoaded}
+                loaded={mods.groupInviterLoaded}
                 selectedProfileIds={selected}
                 busy={busy}
                 onAddGroups={async (items) => {
                   setGroupInviter(await api.addInviterGroups({ items }));
-                  void api
-                    .bumperState()
-                    .then(setGroupBumper)
-                    .catch(() => {});
+                  void api.bumperState().then(setGroupBumper, () => {});
+                  void api.posterState().then(setGroupPoster, () => {});
                   setMessage(`已保存 ${items.length} 个小组，正在后台获取小组头像`);
                 }}
                 onDeleteGroups={(groupIds) =>
                   mutate(async () => {
                     setGroupInviter(await api.deleteInviterGroups({ groupIds }));
-                    void api
-                      .bumperState()
-                      .then(setGroupBumper)
-                      .catch(() => {});
+                    void api.bumperState().then(setGroupBumper, () => {});
+                    void api.posterState().then(setGroupPoster, () => {});
                     return `已删除 ${groupIds.length} 个小组`;
                   })
                 }
@@ -394,18 +362,21 @@ function App() {
                 }
                 onStart={(groupIds, invitesPerGroup) =>
                   mutate(async () => {
-                    const targetIds = [...selected].sort();
+                    const targetIds = (
+                      groupInviter?.running
+                        ? [...selected].filter((id) => !groupInviter.profileCounts[id]?.running)
+                        : [...selected]
+                    ).sort();
                     const next = await api.startGroupInviter({
                       profileIds: targetIds,
                       groupIds,
                       invitesPerGroup,
                     });
                     setGroupInviter(next);
-                    const skippedCount = targetIds.filter((id) =>
+                    const skipped = targetIds.filter((id) =>
                       next.profileCounts[id]?.status?.startsWith('跳过'),
                     ).length;
-                    const startedCount = Math.max(0, targetIds.length - skippedCount);
-                    return `已启动小组邀请人：${startedCount} 个账号 × ${groupIds.length} 个小组${skippedCount > 0 ? `（已自动跳过 ${skippedCount} 个不可用或运行中账号）` : ''}`;
+                    return `已启动小组邀请人：${Math.max(0, targetIds.length - skipped)} 个账号 × ${groupIds.length} 个小组${skipped > 0 ? `（已自动跳过 ${skipped} 个不可用或运行中账号）` : ''}`;
                   })
                 }
                 onStop={() =>
@@ -414,6 +385,7 @@ function App() {
                     return '已发送停止小组邀请人指令';
                   })
                 }
+                onMessage={setMessage}
               />
             )}
             {view.kind === 'edit' && (
@@ -435,94 +407,41 @@ function App() {
           </main>
         </div>
       )}
-      {message && (
-        <div className={'toast' + (failedMessage ? ' toast-warn' : '')} role="status">
-          <span>{message}</span>
-          <button
-            className="btn btn-icon btn-ghost"
-            onClick={() => setMessage('')}
-            aria-label="关闭提示"
-          >
-            <IconClose size={14} />
-          </button>
-        </div>
-      )}
-      {detail && workspace && (
-        <RecordDetailDrawer
-          profile={detailProfile}
-          planId={detail.planId}
-          round={detail.round}
-          plan={plans.find((plan) => plan.id === detail.planId)}
-          workspace={workspace}
-          inspection={inspections.rows.find((row) => row.profileId === detail.profileId)}
-          inspectionAvailable={inspections.available}
-          inspectionError={inspections.error}
-          busy={busy}
-          onClose={() => setDetail(null)}
-          onCommand={commandPlans}
-          onRename={setAliasing}
-          onReadInspections={() => void inspections.refresh()}
-          onCheck={checkProfiles}
-          onResources={(combinationId) => {
-            const row = workspace.combinations.find((value) => value.id === combinationId);
-            if (row) setResourceRow(row);
-            else setMessage('原任务组合已不在当前列表，请查看原任务记录。');
-          }}
-        />
-      )}
-      {menuOpen && workspace && (
-        <AppMenu
-          initialSection={updateMenu ? 'update' : undefined}
-          updateStatus={updates.status}
-          onUpdateStatus={updates.setStatus}
-          onApplyUpdate={applyUpdate}
-          updateError={updates.error}
-          profiles={workspace.profiles}
-          selected={selected}
-          runtime={tasks.runtime}
-          busy={busy}
-          restartDisabled={restartDisabled}
-          onClose={() => {
-            setMenuOpen(false);
-            setUpdateMenu(false);
-          }}
-          onRefresh={() => {
-            tasks.refresh();
-            void refresh();
-          }}
-          onRestart={() =>
-            void mutate(async () => {
-              await api.restartSoftware();
-              return '软件正在重启，请稍候';
-            })
-          }
-        />
-      )}
-      {resourceRow && (
-        <ResourceTableEditor
-          ref={resourceEditor}
-          key={resourceRow.id}
-          combination={resourceRow}
-          onClose={() => setResourceRow(null)}
-          onSaved={refreshResources}
-        />
-      )}
-      {aliasing && (
-        <NameDialog
-          title="浏览器别名"
-          initial={aliasing.alias}
-          onClose={() => setAliasing(null)}
-          onSubmit={async (alias) => {
-            await api.rename(aliasing.id, alias);
-            await refresh();
-          }}
-        />
-      )}
-      <DiagnosticFeedbackModal
-        open={diagModalOpen}
-        uiContext={projection.diagUiContext}
-        onClose={() => setDiagModalOpen(false)}
-        onNotify={setMessage}
+      <WorkbenchOverlays
+        workspace={workspace}
+        message={message}
+        onMessage={setMessage}
+        detail={detail}
+        onCloseDetail={() => setDetail(null)}
+        plans={plans}
+        inspections={inspections}
+        busy={busy}
+        onCommand={commandPlans}
+        onRename={setAliasing}
+        onCheck={checkProfiles}
+        onOpenResource={setResourceRow}
+        menuOpen={menuOpen}
+        updateMenu={updateMenu}
+        onCloseMenu={() => {
+          setMenuOpen(false);
+          setUpdateMenu(false);
+        }}
+        updates={updates}
+        onApplyUpdate={applyUpdate}
+        selected={selected}
+        runtime={tasks.runtime}
+        restartDisabled={restartDisabled}
+        onRefreshTasks={tasks.refresh}
+        mutate={mutate}
+        resourceRow={resourceRow}
+        resourceEditorRef={resourceEditor}
+        onSavedResource={refreshResources}
+        aliasing={aliasing}
+        onCloseAliasing={() => setAliasing(null)}
+        onRefreshWorkspace={() => refresh()}
+        diagModalOpen={diagModalOpen}
+        diagUiContext={projection.diagUiContext}
+        onCloseDiagModal={() => setDiagModalOpen(false)}
       />
     </div>
   );

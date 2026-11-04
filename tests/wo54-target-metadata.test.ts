@@ -531,7 +531,6 @@ test('WO55 anti-regression prevents external URL or null from overwriting locali
       items: [{ groupId: '12345', groupName: 'Imported Name' }],
     });
     s.groupInviter.updateGroupAvatar('12345', 'https://scontent.xx.fbcdn.net/external.jpg');
-    r.importGroupsFromInviter();
     assert.equal(r.targets('groups')[0]?.avatarUrl, localAvatar);
   }));
 

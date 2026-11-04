@@ -14,7 +14,7 @@ export class WorkspaceBackupService {
     private readonly tasks: TaskRepository,
     private readonly writer: WorkspaceBackupWriter,
     private readonly restore?: WorkspaceRestorePort,
-    private readonly active?: () => boolean,
+    private readonly active?: () => boolean | Promise<boolean>,
   ) {}
   assertIdle() {
     if (this.restorePrepared)
@@ -29,7 +29,7 @@ export class WorkspaceBackupService {
   private async assertStopped() {
     if (
       this.active
-        ? this.active()
+        ? await this.active()
         : (await this.tasks.livePlans()).some(
             (plan) =>
               ['RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state) ||

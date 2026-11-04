@@ -1,8 +1,6 @@
-import {
-  invitationDigest,
-  prepareFacebookWorkspace,
-  endInvitationSetupOperations,
-} from './facebook-workspace-preparation.js';
+import { invitationDigest, prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
+import { FacebookGroupSessionHelper } from './facebook-group-session.js';
+import { dismissUnexpectedFacebookOverlays } from './facebook-overlay-dismisser.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { randomUUID, createHash } from 'node:crypto';
@@ -21,7 +19,15 @@ import {
   readGroupInvitationState,
   inviteDialogSelector,
 } from './group-inviter-effects.js';
-import { parseTargetMetadataFromHtml, resolveBumperTargetMetadata } from './group-bumper-avatar.js';
+import { fetchAndLocalizeAvatar, resolveBumperTargetMetadata } from './group-bumper-avatar.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
+import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
+import {
+  inferAbnormalScopeFromUrl,
+  inferAbnormalStateFromCodeOrMessage,
+  type GlobalAccountAbnormalReporter,
+} from '../application/account-abnormal-reporter.js';
+import type { TargetMetadataRefreshService } from './target-metadata-refresh.js';
 import type { Page, Request, Response, Locator } from 'playwright-core';
 import type { Binding } from '../shared/task-execution.js';
 import type { GroupInvitationState, InvitationMenuItem } from './group-inviter-effects.js';
@@ -465,9 +471,15 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     private readonly repo: GroupInviterRepository,
     private readonly getKernel: () => KernelBridge | undefined,
     private readonly getCore: () => Core | undefined,
-    private readonly getProfileAccountId: (profileId: string) => Awaitable<string | null>,
+    _getProfileAccountId?: (profileId: string) => Awaitable<string | null>,
     private readonly checkProfileBusy?: (profileId: string) => Awaitable<boolean>,
+    private readonly targetMetadataRefresh?: TargetMetadataRefreshService,
+    private onAccountAbnormal?: GlobalAccountAbnormalReporter,
   ) {}
+
+  setAccountAbnormalReporter(reporter: GlobalAccountAbnormalReporter) {
+    this.onAccountAbnormal = reporter;
+  }
 
   isAvailable(): boolean {
     return Boolean(this.getKernel() && this.getCore());
@@ -494,103 +506,29 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
   async resolveGroupMetadata(
     group: InviterGroupRow,
     allowIdleBrowser: boolean,
-  ): Promise<{ groupName?: string | null; avatarUrl?: string | null }> {
-    const httpMeta = await resolveBumperTargetMetadata('groups', group.groupId);
-    let groupName = httpMeta.name;
-    let avatarUrl = httpMeta.avatarUrl;
-    if ((!groupName || !avatarUrl) && allowIdleBrowser) {
-      const idleMeta = await this.fetchGroupMetadataViaIdleBrowser(group);
-      groupName ??= idleMeta.groupName ?? null;
-      avatarUrl ??= idleMeta.avatarUrl ?? null;
-    }
-    return { groupName, avatarUrl };
-  }
-
-  private async fetchGroupMetadataViaIdleBrowser(
-    group: InviterGroupRow,
-  ): Promise<{ groupName: string | null; avatarUrl: string | null }> {
-    const kernel = this.getKernel();
-    const core = this.getCore();
-    if (!kernel || !core) return { groupName: null, avatarUrl: null };
-
-    const peer = [...core.peers.values()].find((p) => p.online && p.synced && p.phase === 'PAUSED');
-    if (!peer) return { groupName: null, avatarUrl: null };
-
-    try {
-      const inv = await kernel.withSummary(peer, (port) => port.inventory());
-      const readyTabs = inv.tabs.filter((t) => t.state === 'READY' && t.proof);
-      const mainProof =
-        (inv.workspaceMain &&
-          readyTabs.find((t) => t.proof?.ownershipId === inv.workspaceMain?.ownershipId)?.proof) ||
-        readyTabs[0]?.proof;
-      if (!mainProof) return { groupName: null, avatarUrl: null };
-
-      const accountId = await this.getProfileAccountId(peer.profileId);
-      if (!accountId || !/^\d{5,25}$/.test(accountId) || (await this.isProfileBusy(peer.profileId)))
-        return { groupName: null, avatarUrl: null };
-      const conn = await kernel.connectFacebook(
-        peer,
-        accountId,
-        () => {
-          if (core.peers.get(peer.profileId) !== peer || !peer.online || !peer.synced)
-            throw Error('GROUP_INVITER_CONNECTION_CHANGED');
-        },
-        mainProof,
+  ): Promise<{
+    groupName?: string | null;
+    avatarUrl?: string | null;
+    canonicalId?: string | null;
+  }> {
+    if (this.targetMetadataRefresh) {
+      const resolved = await this.targetMetadataRefresh.resolveTargetMetadata(
+        'groups',
+        group.groupId,
+        allowIdleBrowser,
       );
-      const activeProof = conn.proof || mainProof;
-      try {
-        const page = conn.browser.contexts()[0]?.pages()[0];
-        if (!page) return { groupName: null, avatarUrl: null };
-        const evaluated = await page.evaluate(async (gid) => {
-          const cover = document.querySelector(
-            'a[aria-label="Cover photo"] img, a[aria-label="封面照片"] img',
-          );
-          let avatarUrl: string | null = null;
-          let groupName: string | null = null;
-          if (location.href.includes(`/groups/${gid}`)) {
-            avatarUrl = cover?.getAttribute('src') ?? null;
-            groupName =
-              document.querySelector('main h1, [role="main"] h1')?.textContent?.trim() ?? null;
-          } else {
-            const link = document.querySelector(`a[href*="/groups/${gid}"]`);
-            const img = link?.querySelector('img, svg image');
-            avatarUrl =
-              img?.getAttribute('src') ||
-              img?.getAttribute('xlink:href') ||
-              img?.getAttribute('href') ||
-              null;
-          }
-          let html = '';
-          if (!avatarUrl || !groupName) {
-            try {
-              const res = await fetch(
-                `https://www.facebook.com/groups/${encodeURIComponent(gid)}/`,
-                {
-                  credentials: 'include',
-                  headers: { Accept: 'text/html,application/xhtml+xml' },
-                },
-              );
-              if (res.ok) html = (await res.text()).slice(0, 260000);
-            } catch {}
-          }
-          return { avatarUrl, groupName, html };
-        }, group.groupId);
-        const parsed = evaluated.html
-          ? parseTargetMetadataFromHtml(evaluated.html, 'groups', group.groupId)
-          : { name: null, avatarUrl: null };
-        return {
-          groupName: evaluated.groupName || parsed.name,
-          avatarUrl: evaluated.avatarUrl || parsed.avatarUrl,
-        };
-      } finally {
-        await conn.close();
-        if (activeProof) {
-          await kernel.revealOwnedFacebookPage(peer, activeProof).catch(() => {});
-        }
-      }
-    } catch {
-      return { groupName: null, avatarUrl: null };
+      return {
+        canonicalId: resolved.canonicalId,
+        groupName: resolved.name,
+        avatarUrl: resolved.avatarUrl,
+      };
     }
+    const httpMeta = await resolveBumperTargetMetadata('groups', group.groupId);
+    return {
+      canonicalId: httpMeta.canonicalId,
+      groupName: httpMeta.name,
+      avatarUrl: httpMeta.avatarUrl,
+    };
   }
 
   private async execBoundOp<T>(
@@ -755,6 +693,21 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           if (item.id && item.invited) confirmed.set(item.id, item);
       }
       const evidence = sending ? { ...state, items: [...confirmed.values()] } : state;
+      if (label === 'enter-group' && !/^\d+$/.test(scope.groupId)) {
+        try {
+          const currentUrl = new URL(evidence.url);
+          const candidateId = currentUrl.pathname.split('/')[2] ?? '';
+          if (
+            currentUrl.origin === 'https://www.facebook.com' &&
+            currentUrl.pathname.split('/')[1] === 'groups' &&
+            /^\d{5,25}$/.test(candidateId)
+          ) {
+            scope.groupId = candidateId;
+          }
+        } catch {
+          // ignore malformed URL during transition
+        }
+      }
       if (groupInvitationEffect(label, evidence, scope.groupId, accountId, res.value)) {
         observed = evidence;
         break;
@@ -846,8 +799,15 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     guard();
     await callbacks.setProfileStatus(profileId, `正在连接 · ${group.groupName.slice(0, 12)}`);
 
-    await endInvitationSetupOperations(kernel, peer, guard, true);
-    const prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard);
+    let prepared: Awaited<ReturnType<typeof prepareFacebookWorkspace>>;
+    try {
+      prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
+    } catch (prepErr) {
+      if (!FacebookGroupSessionHelper.isTransientPrepareError(prepErr)) throw prepErr;
+      await sleep(500);
+      guard();
+      prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
+    }
     guard();
     if (prepared.inventory.operations.some(kernelOperationPending))
       throw new ProductError(
@@ -858,6 +818,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     const mainProof = prepared.proof;
 
     await callbacks.setProfileStatus(profileId, '打开首页 · 读取当前登录账号');
+    await FacebookGroupSessionHelper.waitPeerPaused(peer, guard, 10_000);
     const identity =
       (await kernel.inspectIdleFacebookPage(peer, guard, false, true)) ??
       (await kernel.inspectFacebookIdentity(
@@ -876,11 +837,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     const conn = await kernel.connectFacebook(peer, boundAccountId, guard, proof);
     const stopRequestId = randomUUID();
     const selectedInMemory = new Set<string>();
+    let effectiveGroupId = group.groupId;
 
     try {
       const page = conn.browser.contexts()[0]?.pages()[0];
       if (!page) throw Error('BROWSER_PAGE_MISSING');
-      this.scopes.set(conn, {
+      await kernel.observeExternalPageAccount?.(profileId, page, identity.actor)?.catch(() => {});
+      const scopeRef = {
         guard,
         activate: async () => {
           guard();
@@ -889,12 +852,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           return result;
         },
         page,
-        groupId: group.groupId,
+        groupId: effectiveGroupId,
         jobId: randomUUID(),
         stepId: randomUUID(),
         stopId: stopRequestId,
-        pendingSetup: new Map(),
-      });
+        pendingSetup: new Map<string, Binding>(),
+      };
+      this.scopes.set(conn, scopeRef);
 
       const effectiveAccountId = boundAccountId;
       const atGroup = () => {
@@ -902,7 +866,8 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         return (
           route.origin === 'https://www.facebook.com' &&
           route.pathname.split('/')[1] === 'groups' &&
-          route.pathname.split('/')[2] === group.groupId
+          (route.pathname.split('/')[2] === effectiveGroupId ||
+            route.pathname.split('/')[2] === scopeRef.groupId)
         );
       };
 
@@ -919,7 +884,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         });
       }
 
-      // Step 2: Capture cover / avatar and title on the group page if still missing
+      // Step 2: Capture cover / avatar, title, and canonical group ID on 302 redirect
       const pageMeta = await page
         .evaluate(() => {
           const img = document.querySelector(
@@ -939,14 +904,33 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             ? pageMeta.coverSrc
             : null;
       const groupTitle = pageMeta && typeof pageMeta === 'object' ? pageMeta.groupTitle : null;
-      if (this.repo.updateGroupMetadata && (coverSrc || groupTitle)) {
-        await this.repo.updateGroupMetadata(group.groupId, {
-          avatarUrl: coverSrc?.startsWith('https://') ? coverSrc : null,
-          groupName: groupTitle,
-        });
-      } else if (coverSrc && coverSrc.startsWith('https://')) {
-        await this.repo.updateGroupAvatar(group.groupId, coverSrc);
-      }
+      const rawAvatarCandidate = coverSrc?.startsWith('https://') ? coverSrc : null;
+      const localizedCover = rawAvatarCandidate
+        ? isLocalAvatar(group.avatarUrl)
+          ? group.avatarUrl
+          : ((await fetchAndLocalizeAvatar(rawAvatarCandidate).catch(() => null)) ??
+            rawAvatarCandidate)
+        : null;
+      const redirectResolution = await FacebookGroupSessionHelper.syncCanonicalGroupRedirect({
+        currentUrl: page.url(),
+        rawGroupId: group.groupId,
+        groupName: groupTitle,
+        avatarUrl: localizedCover,
+        applyResolvedMetadata: async (rawId, resolved) => {
+          if (this.repo.applyResolvedGroupMetadata) {
+            await this.repo.applyResolvedGroupMetadata(rawId, resolved);
+          } else if (this.repo.updateGroupMetadata && (resolved.avatarUrl || resolved.name)) {
+            await this.repo.updateGroupMetadata(rawId, {
+              avatarUrl: resolved.avatarUrl ?? null,
+              groupName: resolved.name ?? null,
+            });
+          } else if (resolved.avatarUrl) {
+            await this.repo.updateGroupAvatar(rawId, resolved.avatarUrl);
+          }
+        },
+      });
+      effectiveGroupId = redirectResolution.effectiveGroupId;
+      scopeRef.groupId = effectiveGroupId;
 
       if (callbacks.isCancelled(profileId)) return;
 
@@ -1039,12 +1023,48 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       };
 
       // The URL can arrive before React mounts the group's actions.
+      const checkPendingOrQuestions = async () =>
+        page
+          .evaluate(() => {
+            const pendingRx =
+              /^(?:Cancel request|Requested|Membership pending|Pending|取消请求|取消申請|已请求|已申請|待审核|待審核|等待批准|တောင်းဆိုထားသည်|တောင်းဆိုမှုကို ပယ်ဖျက်ပါ|Đã yêu cầu|Hủy yêu cầu|Chờ phê duyệt)$/i;
+            const questionRx =
+              /Answer questions|Membership questions|回答问题|回答問題|入组问题|入群问题|社團問題|မေးခွန်းများဖြေဆိုရန်|Trả lời câu hỏi/i;
+            const buttons = Array.from(
+              document.querySelectorAll<HTMLElement>('[role="button"], button'),
+            );
+            const hasPending = buttons.some((b) => {
+              const r = b.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0) return false;
+              const txt = (b.textContent ?? '').replace(/\s+/g, ' ').trim();
+              const aria = (b.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
+              return (
+                (txt.length > 0 && txt.length <= 40 && pendingRx.test(txt)) ||
+                (aria.length > 0 && aria.length <= 40 && pendingRx.test(aria))
+              );
+            });
+            const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
+            const hasQuestions = dialogs.some((d) => {
+              const r = d.getBoundingClientRect();
+              return r.width > 120 && r.height > 100 && questionRx.test(d.textContent ?? '');
+            });
+            return hasPending || hasQuestions;
+          })
+          .catch(() => false);
       const groupReadyDeadline = Date.now() + 15000;
       while (!(await (await inviteButton())?.isVisible()) && !(await joinBtnLoc.isVisible())) {
         guard();
         if (!atGroup())
           throw new ProductError('GROUP_INVITER_GROUP_CHANGED', '小组页面已跳转，未继续邀请', 409);
+        if (await checkPendingOrQuestions()) {
+          throw new ProductError(
+            'GROUP_INVITER_GROUP_UNINVITABLE',
+            `跳过：该群需管理员审核或回答入群问题 · ${group.groupName.slice(0, 10)}`,
+            409,
+          );
+        }
         await dismissNonInvitePopupIfNeeded();
+        await dismissUnexpectedFacebookOverlays(page, { keepSelector: '[role="checkbox"]' });
         if ((await (await inviteButton())?.isVisible()) || (await joinBtnLoc.isVisible())) break;
         if (Date.now() >= groupReadyDeadline) {
           const controls = await page.evaluate(() => ({
@@ -1206,7 +1226,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       await openDialog(true);
 
       // Step 5: Select up to invitesPerGroup deduplicated friends
-      const alreadyInvitedIds = await this.repo.getInvitedFriendIdsForGroup(group.groupId);
+      const alreadyInvitedIds = await this.repo.getInvitedFriendIdsForGroup(effectiveGroupId);
       const seenInModal = new Set<string>();
       const selectedBatch: Array<{ friendId: string; friendName: string }> = [];
       const alreadyInvitedSkippedSet = new Set<string>();
@@ -1243,7 +1263,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             !item.member &&
             !item.disabled &&
             !alreadyInvitedIds.has(item.id) &&
-            !this.selectingByGroup.get(group.groupId)?.has(item.id) &&
+            !this.selectingByGroup.get(effectiveGroupId)?.has(item.id) &&
             !seenInModal.has(item.id),
         );
         const item = reading.items[index];
@@ -1260,7 +1280,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           seenInModal.add(candidate.friendId);
 
           const checkedNow = await this.selectRecipient(
-            group.groupId,
+            effectiveGroupId,
             candidate.friendId,
             selectedInMemory,
             async () =>
@@ -1377,7 +1397,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
               page,
               profileId,
               operationId,
-              group.groupId,
+              effectiveGroupId,
               selectedIds,
               boundAccountId,
             );
@@ -1453,7 +1473,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                       accountId: effectiveAccountId,
                       friendId: f.friendId,
                       friendName: f.friendName,
-                      groupId: group.groupId,
+                      groupId: effectiveGroupId,
                       invitedAt: Date.now(),
                     })),
                   operationId,
@@ -1473,7 +1493,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                 collectInvitationConfirmations({
                   selectedIds,
                   accountId: boundAccountId,
-                  groupId: group.groupId,
+                  groupId: effectiveGroupId,
                   read: () => readGroupInvitationState(page, guard),
                   scroll: (s) => scrollInvitationList(page, s),
                   persist,
@@ -1555,12 +1575,12 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                 ...f,
                 profileId,
                 accountId: effectiveAccountId,
-                groupId: group.groupId,
+                groupId: effectiveGroupId,
               })),
             );
             // The durable PENDING rows now own deduplication, including after
             // cancellation or an unknown submit. No memory claim is needed.
-            this.releaseSelections(group.groupId, selectedInMemory);
+            this.releaseSelections(effectiveGroupId, selectedInMemory);
           },
         );
         submission = sent;
@@ -1605,8 +1625,28 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           });
         }
       }
+    } catch (runErr) {
+      const page = conn.browser.contexts()[0]?.pages()[0];
+      if (page) {
+        await kernel.observeExternalPageAccount?.(profileId, page, null)?.catch(() => {});
+        const currentUrl = page.url();
+        const scope = inferAbnormalScopeFromUrl(currentUrl);
+        if (scope === 'global_route') {
+          const msg = runErr instanceof Error ? runErr.message : String(runErr);
+          const abnormalState =
+            inferAbnormalStateFromCodeOrMessage(classifyFacebookAbnormalUrl(currentUrl) ?? msg) ??
+            'restricted';
+          await this.onAccountAbnormal?.({
+            profileId,
+            scope: 'global_route',
+            state: abnormalState,
+            reason: msg,
+          });
+        }
+      }
+      throw runErr;
     } finally {
-      this.releaseSelections(group.groupId, selectedInMemory);
+      this.releaseSelections(effectiveGroupId, selectedInMemory);
       conn.revokeInput('GROUP_INVITER_FINISH');
       const requestId = stopRequestId;
       try {

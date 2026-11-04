@@ -116,6 +116,22 @@ export function FinderTargetList({
     void loadFolders().catch((e) => setError(String(e)));
   }, [listKind]);
   useEffect(() => {
+    if (selected.size === 0) return;
+    const validIds = new Set(items.map((i) => i.id));
+    let hasStale = false;
+    for (const id of selected) {
+      if (!validIds.has(id)) {
+        hasStale = true;
+        break;
+      }
+    }
+    if (hasStale) {
+      const pruned = new Set([...selected].filter((id) => validIds.has(id)));
+      selectionRef.current = pruned;
+      onSelect(pruned);
+    }
+  }, [items, selected, onSelect]);
+  useEffect(() => {
     const stop = () => {
       paint.current = null;
       textSelectRef.current = false;
@@ -214,11 +230,6 @@ export function FinderTargetList({
   const menuItems: MenuItem[] = [
     ...(moreItems ?? []),
     {
-      label: '按 ID 选中…',
-      disabled: unavailable || items.length === 0,
-      onSelect: () => setSelectByIdsOpen(true),
-    },
-    {
       label: '＋ 新建分组…',
       disabled: unavailable,
       onSelect: () => setName({ name: '' }),
@@ -306,6 +317,14 @@ export function FinderTargetList({
             </button>
           )}
           {tools}
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={unavailable || items.length === 0}
+            onClick={() => setSelectByIdsOpen(true)}
+          >
+            按 ID 选中
+          </button>
           <PopoverMenu
             disabled={unavailable}
             label={'更多' + title + '操作'}

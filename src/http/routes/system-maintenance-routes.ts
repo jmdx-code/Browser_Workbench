@@ -1,8 +1,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { DataCleanupService } from '../../application/data-cleanup.js';
+import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
 import type { GroupBumperService } from '../../application/group-bumper-service.js';
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
+import type { GroupPosterService } from '../../application/group-poster-service.js';
 import type { MediaComponentPort } from '../../application/media-component.js';
 import type { SoftwareUpdateService } from '../../application/software-update-service.js';
 import type { TaskService } from '../../application/task-service.js';
@@ -35,6 +37,8 @@ export interface SystemMaintenanceRouteContext {
   maintenance?: WorkspaceMaintenance | undefined;
   groupInviter?: GroupInviterService | undefined;
   groupBumper?: GroupBumperService | undefined;
+  groupPoster?: GroupPosterService | undefined;
+  featureExecution?: FeatureExecutionRegistry | undefined;
   captureDiagnostics?:
     ((input?: DiagnosticCaptureInput) => Awaitable<DiagnosticCaptureOutput>) | undefined;
   revealDiagnostics?:
@@ -60,8 +64,7 @@ export async function handleSystemMaintenanceRoutes(
     backups,
     softwareControl,
     maintenance,
-    groupInviter,
-    groupBumper,
+    featureExecution,
     captureDiagnostics,
     revealDiagnostics,
     cleanup,
@@ -303,12 +306,15 @@ export async function handleSystemMaintenanceRoutes(
           '当前不是桌面软件，请使用正常软件入口',
           409,
         );
-      if (
-        (await tasks?.hasActiveExecution()) ||
-        groupInviter?.hasActiveExecution() ||
-        groupBumper?.hasActiveExecution()
-      )
-        throw new ProductError('TASKS_ACTIVE', '请先停止或暂停任务，再重启软件', 409);
+      const activeLabels = (await featureExecution?.activeModuleLabels()) ?? [];
+      if (activeLabels.length > 0 || (await tasks?.hasActiveExecution()))
+        throw new ProductError(
+          'TASKS_ACTIVE',
+          activeLabels.length > 0
+            ? `请先停止或暂停正在运行的任务（${activeLabels.join('、')}），再重启软件`
+            : '请先停止或暂停任务，再重启软件',
+          409,
+        );
       backups?.assertIdle();
       json(res, 200, { requested: true });
       softwareControl.restart();

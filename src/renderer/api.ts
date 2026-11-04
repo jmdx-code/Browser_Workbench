@@ -1,5 +1,6 @@
 import type { TargetListKind, TargetListCommand, TargetFolder } from '../shared/target-list.js';
 import type { BumperState, BumperLog } from '../shared/group-bumper.js';
+import type { PosterState, PosterLog } from '../shared/group-poster.js';
 import { MediaComponentStatus } from '../shared/media-component.js';
 import {
   SoftwareUpdateStatus,
@@ -159,14 +160,35 @@ export const api = {
   bumperState: async () => (await request('/group-bumper/state')) as BumperState,
   bumperAction: async (action: string, input: unknown = {}) =>
     (await request('/group-bumper/' + action, input)) as BumperState,
-  bumperLogs: async (search = '', before?: number, beforeId?: string) =>
+  bumperLogs: async (
+    search = '',
+    before?: number,
+    beforeId?: string,
+    sourceMode?: 'group' | 'page',
+  ) =>
     (await request(
       '/group-bumper/logs?' +
         new URLSearchParams({
           search,
           ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
+          ...(sourceMode ? { sourceMode } : {}),
         }),
     )) as BumperLog[],
+  posterState: async () => (await request('/group-poster/state')) as PosterState,
+  posterAction: async (action: string, input: unknown = {}) =>
+    (await request('/group-poster/' + action, input)) as PosterState,
+  posterLogs: async (search = '', before?: number, beforeId?: string) =>
+    (await request(
+      '/group-poster/logs?' +
+        new URLSearchParams({
+          search,
+          ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
+        }),
+    )) as PosterLog[],
+  savePosterMaterialThumbnail: async (id: string, thumbnailDataUrl: string) =>
+    (await request('/group-poster/materials/thumbnail', { id, thumbnailDataUrl })) as {
+      saved: boolean;
+    },
 
   softwareUpdateStatus: async () => SoftwareUpdateStatus.parse(await request('/update/status')),
   checkSoftwareUpdate: async () => SoftwareUpdateStatus.parse(await request('/update/check', {})),
@@ -610,6 +632,14 @@ export const api = {
   deleteInviterGroups: async (input: DeleteInviterGroupsRequest) =>
     GroupInviterState.parse(
       await request('/group-inviter/groups/delete', input, AbortSignal.timeout(15_000)),
+    ),
+  refreshGroupInviterGroups: async (input: { ids?: string[] } = {}) =>
+    GroupInviterState.parse(
+      await request('/group-inviter/groups/refresh', input, AbortSignal.timeout(60_000)),
+    ),
+  stopRefreshGroupInviterGroups: async () =>
+    GroupInviterState.parse(
+      await request('/group-inviter/groups/refresh-stop', {}, AbortSignal.timeout(10_000)),
     ),
   saveGroupInviterSettings: async (input: UpdateGroupInviterSettingsRequest) =>
     GroupInviterState.parse(

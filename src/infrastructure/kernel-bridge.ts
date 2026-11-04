@@ -462,6 +462,10 @@ export class KernelBridge implements KernelBridgeHooks {
     peer: Peer,
     guard: () => Awaitable<void>,
   ) => Promise<ReadonlySet<string>>;
+  recoverPosterWorkspace?: (
+    peer: Peer,
+    guard: () => Awaitable<void>,
+  ) => Promise<ReadonlySet<string>>;
 
   private arrangeWindow?: (profileId: string, guard: () => void) => Promise<void>;
   private exposedLayoutEnabled?: () => boolean;
@@ -763,6 +767,8 @@ export class KernelBridge implements KernelBridgeHooks {
         id?: string | null;
         name?: string | null;
         avatar?: string | null;
+        scope?: import('../shared/account-state-policy.js').AccountRestrictionScope;
+        liveConfirmedLoggedIn?: boolean;
       },
     ): Awaitable<void>;
   };
@@ -780,32 +786,88 @@ export class KernelBridge implements KernelBridgeHooks {
         let avatar: string | null | undefined = undefined;
         if (await this.accountObserver.shouldRefreshAvatar(profileId, actor.accountId)) {
           avatar = await page
-            .evaluate(() => {
-              const selectors = [
-                '[role="navigation"] svg image',
-                '[role="banner"] svg image',
-                '[aria-label*="Account" i] svg image',
-                '[aria-label*="账号"] svg image',
-                '[aria-label*="個人檔案"] svg image',
-                'a[href*="/profile.php"] svg image',
-                '[role="navigation"] img',
-                '[role="banner"] img',
-              ];
-              for (const sel of selectors) {
-                const nodes = Array.from(document.querySelectorAll(sel));
-                for (const node of nodes) {
-                  const src =
-                    node.getAttribute('xlink:href') ||
-                    node.getAttribute('href') ||
-                    node.getAttribute('src') ||
-                    '';
-                  if (src.startsWith('https://') && /fbcdn\.net|fbsbx\.com/i.test(src)) {
-                    return src;
+            .evaluate((expectedActorId) => {
+              const isValidCdn = (u: string) =>
+                u.startsWith('https://') &&
+                /fbcdn\.net|fbsbx\.com/i.test(u) &&
+                !/\/rsrc\.php\//i.test(u) &&
+                !/\/emoji\.php\//i.test(u);
+              // 1. 优先从页面 Relay JSON 脚本中按 expectedActorId 精确提取当前 actor 的 profile_picture.uri
+              const escapedId = expectedActorId.replace(/\D/g, '');
+              if (escapedId) {
+                const scripts = Array.from(
+                  document.querySelectorAll('script[type="application/json"][data-sjs]'),
+                );
+                const pattern = new RegExp(
+                  `"id"\\s*:\\s*"${escapedId}"[\\s\\S]{0,600}?"profile_picture"\\s*:\\s*\\{\\s*"uri"\\s*:\\s*"([^"]+)"`,
+                );
+                for (const s of scripts) {
+                  const txt = s.textContent ?? '';
+                  if (!txt.includes(escapedId) || !txt.includes('profile_picture')) continue;
+                  const m = pattern.exec(txt);
+                  if (m?.[1]) {
+                    const decoded = m[1]
+                      .replace(/\\\//g, '/')
+                      .replace(/\\u0026/g, '&')
+                      .replace(/\\u0025/g, '%');
+                    if (isValidCdn(decoded)) return decoded;
                   }
                 }
               }
+              // 2. 次选顶部 [role="banner"] 右上角当前账号控制按钮内的头像（按 aria-label 优先，其次取 banner 最右侧可见头像）
+              const bannerCandidates: Array<{ src: string; right: number; preferred: boolean }> =
+                [];
+              const bannerNodes = Array.from(
+                document.querySelectorAll('[role="banner"] svg image, [role="banner"] img'),
+              );
+              for (const node of bannerNodes) {
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                if (
+                  rect.width < 20 ||
+                  rect.height < 20 ||
+                  rect.top < 0 ||
+                  rect.top > 90 ||
+                  style.display === 'none' ||
+                  style.visibility === 'hidden'
+                )
+                  continue;
+                const src =
+                  node.getAttribute('xlink:href') ||
+                  node.getAttribute('href') ||
+                  node.getAttribute('src') ||
+                  '';
+                if (!isValidCdn(src)) continue;
+                const hostBtn = node.closest('[role="button"], a[role="link"]');
+                const label = (hostBtn?.getAttribute('aria-label') ?? '').toLowerCase();
+                const preferred =
+                  /account|profile|账号|个人主页|個人檔案|你的|အကောင့်|ပရိုဖိုင်/i.test(label);
+                bannerCandidates.push({ src, right: rect.right, preferred });
+              }
+              if (bannerCandidates.length > 0) {
+                bannerCandidates.sort((a, b) =>
+                  a.preferred !== b.preferred ? (a.preferred ? -1 : 1) : b.right - a.right,
+                );
+                return bannerCandidates[0]?.src ?? null;
+              }
+              // 3. 兜底：主内容区顶部发帖框左侧的当前身份头像
+              const composerNodes = Array.from(
+                document.querySelectorAll(
+                  '[role="main"] [role="region"] svg image, [role="main"] [role="region"] img',
+                ),
+              );
+              for (const node of composerNodes) {
+                const rect = node.getBoundingClientRect();
+                if (rect.width < 24 || rect.height < 24) continue;
+                const src =
+                  node.getAttribute('xlink:href') ||
+                  node.getAttribute('href') ||
+                  node.getAttribute('src') ||
+                  '';
+                if (isValidCdn(src)) return src;
+              }
               return null;
-            })
+            }, actor.accountId)
             .catch(() => null);
         }
         await this.accountObserver.onObserved(profileId, {
@@ -813,6 +875,7 @@ export class KernelBridge implements KernelBridgeHooks {
           id: actor.accountId,
           name: actor.name,
           ...(avatar ? { avatar } : {}),
+          liveConfirmedLoggedIn: true,
         });
         return;
       }
@@ -827,14 +890,6 @@ export class KernelBridge implements KernelBridgeHooks {
             document.querySelector('input[name="pass"]'),
           );
           if (/^\/login(?:\.php|\/|$)/.test(path) || hasLogin) return 'logged-out' as const;
-          const bodyText = (document.body?.innerText || '').slice(0, 2000);
-          if (
-            /account has been disabled|your account is disabled|we suspended your account|账号已被停用|账户已被停用|已停用你的账户/i.test(
-              bodyText,
-            )
-          ) {
-            return 'restricted' as const;
-          }
           return null;
         })
         .catch(() => null);
@@ -842,6 +897,7 @@ export class KernelBridge implements KernelBridgeHooks {
         await this.accountObserver.onObserved(profileId, {
           state: abnormal,
           avatar: null,
+          scope: 'global_route',
         });
       }
     } catch {
@@ -858,14 +914,17 @@ export class KernelBridge implements KernelBridgeHooks {
       if (actor) {
         let avatar: string | null | undefined = undefined;
         if (await this.accountObserver.shouldRefreshAvatar(profileId, actor.accountId)) {
-          const imgNodes = [
-            ...(page.rows.find((r) => r.key === 'profileControlImages')?.nodes ?? []),
-            ...(page.rows.find((r) => r.key === 'accountControlImages')?.nodes ?? []),
-          ];
+          const ownNodes = page.rows.find((r) => r.key === 'ownProfileImages')?.nodes ?? [];
+          const bannerNodes = page.rows.find((r) => r.key === 'accountAvatars')?.nodes ?? [];
+          const imgNodes = [...ownNodes, ...[...bannerNodes].reverse()];
           for (const n of imgNodes) {
             if (!n.visible) continue;
             const src = n.attributes['xlink:href'] || n.attributes.href || n.attributes.src || '';
-            if (src.startsWith('https://') && /fbcdn\.net|fbsbx\.com/i.test(src)) {
+            if (
+              src.startsWith('https://') &&
+              /fbcdn\.net|fbsbx\.com/i.test(src) &&
+              !/\/rsrc\.php\/|\/emoji\.php\//i.test(src)
+            ) {
               avatar = src;
               break;
             }
@@ -1408,6 +1467,7 @@ export class KernelBridge implements KernelBridgeHooks {
     assertIdentity: () => Awaitable<void>,
     retainedTab?: TabProof,
     storyAdmission = false,
+    files: readonly string[] = [],
   ) {
     ExecutionContext.shape.accountId.parse(accountId);
     if (!accountId.trim()) throw Error('FACEBOOK_ACTING_IDENTITY_REQUIRED');
@@ -1462,7 +1522,10 @@ export class KernelBridge implements KernelBridgeHooks {
         );
     }
     const idle = this.idlePages.get(peer.profileId);
-    if (idle) {
+    if (idle && files.length > 0) {
+      await idle.connection.close().catch(() => {});
+      this.idlePages.delete(peer.profileId);
+    } else if (idle) {
       if (
         idle.peer !== peer ||
         !retainedTab ||
@@ -1485,7 +1548,7 @@ export class KernelBridge implements KernelBridgeHooks {
       return idle.connection;
     }
     await assertIdentity();
-    return this.connectOwned(peer, [], retainedTab, {
+    return this.connectOwned(peer, files, retainedTab, {
       accountId,
       assertIdentity,
       ...(storyAdmission && retainedTab
@@ -1744,6 +1807,13 @@ export class KernelBridge implements KernelBridgeHooks {
         existingTab = reusedTab;
         try {
           if (!browseAdmission) {
+            if (
+              existingTab !== undefined &&
+              page.url() !== 'https://www.facebook.com/' &&
+              page.url() !== 'https://www.facebook.com/post/create'
+            ) {
+              await this.navigateRetainedPageHome(page, assertAllowed);
+            }
             const res = await readCurrentFacebookIdentity(page, assertAllowed);
             await this.observeExternalPageAccount(peer.profileId, page, res.actor);
             return res;
@@ -3277,6 +3347,27 @@ export class KernelBridge implements KernelBridgeHooks {
           released = true;
         } catch {
           session.record('open-failed-page:REVIEW');
+        }
+      }
+      if (
+        facebook &&
+        existingTab &&
+        !released &&
+        error instanceof Error &&
+        !error.message.includes('_UNKNOWN') &&
+        !session.hasRequestedMutation
+      ) {
+        try {
+          const requestId = randomUUID(),
+            stop = await session.request({ kind: 'stop' }, requestId);
+          if (stop.state === 'stopped' && stop.requestId === requestId) {
+            this.core.releaseFixtureKernel(peer, owner);
+            if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
+            session.record('open-failed-retained-page:STOPPED');
+            released = true;
+          }
+        } catch {
+          session.record('open-failed-retained-page:REVIEW');
         }
       }
       session.closing = true;

@@ -4,7 +4,14 @@ export function profileTaskResultLabel(result: ProfileTaskResultValue): {
   tone: 'warn' | 'err' | 'pause' | 'ok';
   text: string;
 } {
-  const defaultName = result.source === 'group-bumper' ? '小组顶贴' : result.name;
+  const defaultName =
+    result.source === 'group-bumper'
+      ? '小组顶贴'
+      : result.source === 'page-bumper'
+        ? '专页顶贴'
+        : result.source === 'group-poster'
+          ? '小组发帖'
+          : result.name;
   const name = (result.name.trim() || defaultName).replace(/^单项测试\s*·\s*/, '');
   if (
     result.source === 'group-inviter' &&
@@ -13,13 +20,18 @@ export function profileTaskResultLabel(result: ProfileTaskResultValue): {
   )
     return { tone: 'warn', text: '上次受限 · 需要手机验证或操作受限 · ' + name };
   if (
-    result.source === 'group-bumper' &&
+    (result.source === 'group-bumper' ||
+      result.source === 'page-bumper' ||
+      result.source === 'group-poster') &&
     result.state === 'FAILED' &&
     result.reason.startsWith('受限 ·')
   )
     return { tone: 'warn', text: '上次' + result.reason + ' · ' + name };
   if (
-    (result.source === 'group-inviter' || result.source === 'group-bumper') &&
+    (result.source === 'group-inviter' ||
+      result.source === 'group-bumper' ||
+      result.source === 'page-bumper' ||
+      result.source === 'group-poster') &&
     result.reason.includes('待核对')
   )
     return { tone: 'warn', text: result.reason + ' · ' + name };

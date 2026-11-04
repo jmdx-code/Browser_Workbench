@@ -17,9 +17,27 @@ export function useWorkspace() {
     });
     reader.current = current;
     void current.refresh();
-    const timer = setInterval(() => void current.refresh(), 1800);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const schedule = () => {
+      if (timer) clearInterval(timer);
+      const hidden = typeof document !== 'undefined' && document.hidden;
+      timer = setInterval(() => void current.refresh(), hidden ? 10_000 : 1800);
+    };
+    const onVisibility = () => {
+      schedule();
+      if (typeof document !== 'undefined' && !document.hidden) {
+        void current.refresh();
+      }
+    };
+    schedule();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibility);
+    }
     return () => {
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibility);
+      }
       current.dispose();
       if (reader.current === current) reader.current = null;
     };

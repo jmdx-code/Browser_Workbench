@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Id } from './contracts.js';
+import { extractFacebookGroupId } from './facebook-target-id.js';
 
 export const GroupIdString = z
   .string()
@@ -44,6 +45,7 @@ export const GroupInviterProfileStat = z
     sessionInvited: z.number().int().nonnegative(),
     totalInvited: z.number().int().nonnegative(),
     status: z.string().max(120).optional(),
+    running: z.boolean().optional(),
   })
   .strict();
 export type GroupInviterProfileStat = z.infer<typeof GroupInviterProfileStat>;
@@ -52,7 +54,11 @@ export const GroupInviterState = z
   .object({
     groups: z.array(InviterGroupRow),
     invitesPerGroup: z.number().int().min(1).max(200),
+    maxConcurrentProfiles: z.number().int().min(1).max(50).optional(),
+    playSoundOnComplete: z.boolean().optional(),
     running: z.boolean(),
+    groupAvatarRefreshing: z.boolean().optional(),
+    avatarRefreshStatusText: z.string().max(500).optional(),
     runId: z.string().nullable(),
     startedAt: z.number().nullable(),
     finishedAt: z.number().nullable(),
@@ -68,7 +74,10 @@ export const AddInviterGroupsRequest = z
       .array(
         z
           .object({
-            groupId: GroupIdString,
+            groupId: z.preprocess(
+              (v) => (typeof v === 'string' ? extractFacebookGroupId(v) : v),
+              GroupIdString,
+            ),
             groupName: z.string().trim().max(200, '小组名字过长').optional().default(''),
             folderId: z.string().nullable().optional(),
           })
@@ -87,9 +96,20 @@ export const DeleteInviterGroupsRequest = z
   .strict();
 export type DeleteInviterGroupsRequest = z.infer<typeof DeleteInviterGroupsRequest>;
 
+export const GroupInviterSettings = z
+  .object({
+    invitesPerGroup: z.number().int().min(1).max(200).default(20),
+    maxConcurrentProfiles: z.number().int().min(1).max(50).default(4),
+    playSoundOnComplete: z.boolean().default(true),
+  })
+  .strict();
+export type GroupInviterSettings = z.infer<typeof GroupInviterSettings>;
+
 export const UpdateGroupInviterSettingsRequest = z
   .object({
-    invitesPerGroup: z.number().int().min(1).max(200),
+    invitesPerGroup: z.number().int().min(1).max(200).optional(),
+    maxConcurrentProfiles: z.number().int().min(1).max(50).optional(),
+    playSoundOnComplete: z.boolean().optional(),
   })
   .strict();
 export type UpdateGroupInviterSettingsRequest = z.infer<typeof UpdateGroupInviterSettingsRequest>;
@@ -99,6 +119,8 @@ export const StartGroupInviterRequest = z
     profileIds: z.array(Id).min(1, '请在左侧勾选至少一个账号').max(200),
     groupIds: z.array(GroupIdString).min(1, '请在表格中勾选至少一个小组').max(500),
     invitesPerGroup: z.number().int().min(1).max(200).optional(),
+    maxConcurrentProfiles: z.number().int().min(1).max(50).optional(),
+    playSoundOnComplete: z.boolean().optional(),
   })
   .strict();
 export type StartGroupInviterRequest = z.infer<typeof StartGroupInviterRequest>;
@@ -111,15 +133,9 @@ export const StopGroupInviterProfilesRequest = z
 export type StopGroupInviterProfilesRequest = z.infer<typeof StopGroupInviterProfilesRequest>;
 
 export function extractGroupId(raw: string): string {
-  const value = raw.trim();
-  try {
-    const url = new URL(/^https?:\/\//i.test(value) ? value : 'https://' + value);
-    if (/(^|\.)facebook\.com$/i.test(url.hostname)) {
-      const match = /^\/groups\/([^/?#]+)/i.exec(url.pathname);
-      if (match?.[1]) return decodeURIComponent(match[1]);
-    }
-  } catch {
-    /* Plain IDs stay unchanged. */
+  const trimmed = raw.trim();
+  if (/^https?:\/\//i.test(trimmed) && !/(?:facebook\.com|fb\.com)/i.test(trimmed)) {
+    return trimmed;
   }
-  return value;
+  return extractFacebookGroupId(raw);
 }

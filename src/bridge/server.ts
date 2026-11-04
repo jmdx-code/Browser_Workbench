@@ -297,7 +297,10 @@ export async function startBridgeServer(options: BridgeServerOptions) {
           return json(res, 403, { error: 'ORIGIN_REJECTED' });
         const input = await body(
           req,
-          u.pathname === '/api/workspace/resource-tables/save' ? 4 * 1024 * 1024 : 131072,
+          u.pathname === '/api/workspace/resource-tables/save' ||
+            u.pathname === '/api/workspace/group-poster/materials/save'
+            ? 4 * 1024 * 1024
+            : 131072,
         );
         if (u.pathname === '/api/bridge-connections/recover') {
           const request = z.object({ id: z.uuid(), profileId: z.uuid() }).strict().parse(input);

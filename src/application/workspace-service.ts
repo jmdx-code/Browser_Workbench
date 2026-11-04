@@ -1,7 +1,9 @@
 import { mapAsync } from '../shared/async-collections.js';
+import { mergeAccountCacheUpdate } from '../shared/account-state-policy.js';
 import type { BrowserProfileSource, WorkspaceRepository } from '../domain/workspace.js';
 import { ProductError } from '../domain/workspace.js';
 import type { Workspace } from '../shared/contracts.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
 import { UpdateWorkspacePreferences } from '../shared/workspace-preferences.js';
 export class WorkspaceService {
   async preferences() {
@@ -33,39 +35,50 @@ export class WorkspaceService {
       profiles: await mapAsync(profiles, async (profile) => {
         const live = profile.account;
         let cached = accountCache.get(profile.id);
-        if (
-          this.repository.updateProfileAccountCache &&
-          (live.state !== 'unknown' || live.id || live.name || live.avatar)
-        ) {
-          const nextAvatar = ['logged-out', 'restricted', 'verification'].includes(live.state)
-            ? null
-            : live.avatar;
-          const nextId = live.id || cached?.id || null;
-          const nextName = live.name || cached?.name || null;
-          if (
-            !cached ||
-            cached.state !== live.state ||
-            cached.id !== nextId ||
-            cached.name !== nextName ||
-            cached.avatar !== nextAvatar
-          ) {
-            await this.repository.updateProfileAccountCache(profile.id, {
+        if (this.repository.updateProfileAccountCache && live.state !== 'unknown') {
+          const merged = mergeAccountCacheUpdate({
+            existing: cached,
+            incoming: {
               state: live.state,
               ...(live.id ? { id: live.id } : {}),
               ...(live.name ? { name: live.name } : {}),
-              avatar: nextAvatar,
+              ...(live.state === 'logged-out'
+                ? { avatar: null }
+                : live.avatar
+                  ? { avatar: live.avatar }
+                  : {}),
+              liveConfirmedLoggedIn: live.state === 'logged-in',
+            },
+          });
+          if (merged.changed) {
+            await this.repository.updateProfileAccountCache(profile.id, {
+              state: merged.next.state,
+              ...(merged.next.id ? { id: merged.next.id } : {}),
+              ...(merged.next.name ? { name: merged.next.name } : {}),
+              avatar: merged.next.avatar,
+              avatarUpdatedAt: merged.next.avatarUpdatedAt,
+              liveConfirmedLoggedIn: live.state === 'logged-in',
             });
-            cached = (await this.repository.profileAccountCache?.())?.get(profile.id) ?? {
-              state: live.state,
-              id: nextId,
-              name: nextName,
-              avatar: nextAvatar,
-            };
+            cached =
+              (await this.repository.profileAccountCache?.())?.get(profile.id) ?? merged.next;
             accountCache.set(profile.id, cached);
           }
         }
         const state = live.state !== 'unknown' ? live.state : (cached?.state ?? 'unknown');
-        const abnormal = ['logged-out', 'restricted', 'verification'].includes(state);
+        const useLiveIdentity =
+          live.state !== 'unknown' && (!cached?.id || !live.id || live.id === cached.id);
+        const preferredAvatar =
+          isLocalAvatar(cached?.avatar) && (!live.id || !cached?.id || live.id === cached.id)
+            ? cached.avatar
+            : ((useLiveIdentity ? live.avatar : null) ?? cached?.avatar ?? live.avatar ?? null);
+        const effectiveAvatar =
+          state === 'logged-out'
+            ? null
+            : ['restricted', 'verification'].includes(state)
+              ? isLocalAvatar(preferredAvatar)
+                ? preferredAvatar
+                : null
+              : preferredAvatar;
         return {
           ...profile,
           groupId: metadata.get(profile.id)?.groupId ?? null,
@@ -73,9 +86,9 @@ export class WorkspaceService {
           alias: metadata.get(profile.id)?.alias ?? profile.alias,
           account: {
             state,
-            id: live.id ?? cached?.id ?? null,
-            name: live.name ?? cached?.name ?? null,
-            avatar: abnormal ? null : (live.avatar ?? cached?.avatar ?? null),
+            id: (useLiveIdentity ? live.id : null) ?? cached?.id ?? live.id ?? null,
+            name: (useLiveIdentity ? live.name : null) ?? cached?.name ?? live.name ?? null,
+            avatar: effectiveAvatar,
           },
         };
       }).then((rows) =>

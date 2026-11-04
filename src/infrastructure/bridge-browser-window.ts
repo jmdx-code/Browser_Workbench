@@ -26,7 +26,7 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
       closedTabIds: number[];
       remainingTabCount: number;
     }>,
-    private readonly inviterBusy: (profileId: string) => boolean = () => false,
+    private readonly inviterBusy: (profileId: string) => boolean | Promise<boolean> = () => false,
   ) {}
 
   async consolidate(profileId: string, preferActiveTab = true) {
@@ -38,15 +38,16 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     const supportsExtraCleanup = marketplaceBridgeSupported(peer.extensionVersion, '0.3.59');
     this.active.add(profileId);
     try {
-      const isIdle = peer.phase === 'PAUSED' && peer.synced && !this.inviterBusy(profileId);
-      if (isIdle && this.consolidateTabs) {
+      if (peer.phase !== 'PAUSED' || !peer.synced)
+        throw new ProductError('BROWSER_BUSY', '浏览器正在执行或对账，请稍后再整理标签', 409);
+      if (await this.inviterBusy(profileId))
+        throw new ProductError('BROWSER_TASK_ACTIVE', '任务正在执行，请稍后再清理标签', 409);
+      await this.assertIdle(profileId, true);
+      if (this.consolidateTabs) {
         try {
-          await this.assertIdle(profileId, true);
-          if (!this.inviterBusy(profileId)) {
-            return await this.consolidateTabs(profileId, preferActiveTab);
-          }
+          return await this.consolidateTabs(profileId, preferActiveTab);
         } catch (error) {
-          if (!supportsExtraCleanup) throw error;
+          if (error instanceof ProductError || !supportsExtraCleanup) throw error;
         }
       }
       if (supportsExtraCleanup) {
@@ -58,14 +59,7 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
           remainingTabCount: res.remainingTabCount,
         };
       }
-      if (peer.phase !== 'PAUSED' || !peer.synced)
-        throw new ProductError('BROWSER_BUSY', '浏览器正在执行或对账，请稍后再整理标签', 409);
-      if (this.inviterBusy(profileId))
-        throw new ProductError('BROWSER_TASK_ACTIVE', '小组邀请正在执行，请稍后再清理标签', 409);
-      await this.assertIdle(profileId, true);
-      if (!this.consolidateTabs)
-        throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '当前服务未启用非主标签清理', 409);
-      return await this.consolidateTabs(profileId, preferActiveTab);
+      throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '当前服务未启用非主标签清理', 409);
     } finally {
       this.active.delete(profileId);
     }

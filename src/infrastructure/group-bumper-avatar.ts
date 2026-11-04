@@ -1,3 +1,4 @@
+import { MAX_ACCOUNT_AVATAR_BYTES } from '../shared/account-state-policy.js';
 import { isLocalAvatar, MAX_LOCAL_AVATAR_BYTES } from '../shared/group-bumper.js';
 
 export const MAX_AVATAR_DOWNLOAD_BYTES = 4 * 1024 * 1024; // 4MB
@@ -349,6 +350,102 @@ export async function fetchAndLocalizeAvatar(
   return null;
 }
 
+const accountAvatarSingleflight = new Map<string, Promise<string | null>>();
+
+export async function localizeAccountAvatarBytesToDataUrl(
+  bytes: Uint8Array,
+): Promise<string | null> {
+  if (!bytes || bytes.byteLength < 16 || bytes.byteLength > MAX_AVATAR_DOWNLOAD_BYTES) return null;
+  try {
+    const { createCanvas, loadImage } = await import('@napi-rs/canvas');
+    const image = await loadImage(Buffer.from(bytes));
+    const width = Number(image.width);
+    const height = Number(image.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 16 || height < 16)
+      return null;
+
+    for (const maxDim of [96, 80, 64]) {
+      const scale = Math.min(1, maxDim / Math.max(width, height));
+      const targetW = Math.max(1, Math.round(width * scale));
+      const targetH = Math.max(1, Math.round(height * scale));
+      const canvas = createCanvas(targetW, targetH);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(image, 0, 0, targetW, targetH);
+
+      for (const mime of ['image/webp', 'image/jpeg'] as const) {
+        for (const quality of [80, 65]) {
+          try {
+            const encoded =
+              mime === 'image/webp'
+                ? canvas.toBuffer('image/webp', quality)
+                : canvas.toBuffer('image/jpeg', quality);
+            const dataUrl = `data:${mime};base64,${Buffer.from(encoded).toString('base64')}`;
+            if (isLocalAvatar(dataUrl) && dataUrl.length <= MAX_ACCOUNT_AVATAR_BYTES) {
+              return dataUrl;
+            }
+          } catch {
+            /* Try next format or quality */
+          }
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchAndLocalizeAccountAvatar(
+  avatarUrl: string | null | undefined,
+  signal?: AbortSignal,
+  singleflightKey?: string,
+): Promise<string | null> {
+  if (typeof avatarUrl !== 'string') return null;
+  const trimmed = avatarUrl.trim();
+  if (!trimmed) return null;
+  if (isLocalAvatar(trimmed)) return trimmed;
+  if (
+    !/^https?:\/\//i.test(trimmed) ||
+    /\/rsrc\.php\//i.test(trimmed) ||
+    /\/emoji\.php\//i.test(trimmed)
+  )
+    return null;
+
+  const key = singleflightKey ? `${singleflightKey}|${trimmed}` : trimmed;
+  const existing = accountAvatarSingleflight.get(key);
+  if (existing) return existing;
+
+  const task = (async (): Promise<string | null> => {
+    const timeoutSignal = AbortSignal.timeout(6_000);
+    const effectiveSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    for (const ua of [EXTERNAL_HIT_UA, BROWSER_FALLBACK_UA]) {
+      if (effectiveSignal.aborted) return null;
+      try {
+        const response = await fetch(trimmed, {
+          signal: effectiveSignal,
+          headers: {
+            'User-Agent': ua,
+            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          },
+        });
+        const bytes = await readBoundedImageStream(response, effectiveSignal);
+        if (bytes) {
+          const localized = await localizeAccountAvatarBytesToDataUrl(bytes);
+          if (localized) return localized;
+        }
+      } catch {
+        /* Try fallback UA or return null */
+      }
+    }
+    return null;
+  })().finally(() => {
+    accountAvatarSingleflight.delete(key);
+  });
+
+  accountAvatarSingleflight.set(key, task);
+  return task;
+}
+
 export async function verifyTargetAvatar(
   url: string | null,
   timeoutMs: number,
@@ -441,4 +538,134 @@ export async function fetchBumperAvatar(
 ): Promise<string | null> {
   const resolved = await resolveBumperTargetMetadata(kind, id);
   return resolved.avatarUrl;
+}
+
+export interface StartupAccountAvatarLocalizationDeps {
+  repository: {
+    profileAccountCache():
+      | ReadonlyMap<
+          string,
+          { state: string; id?: string | null; name?: string | null; avatar?: string | null }
+        >
+      | Promise<
+          ReadonlyMap<
+            string,
+            { state: string; id?: string | null; name?: string | null; avatar?: string | null }
+          >
+        >;
+    updateProfileAccountCache(
+      profileId: string,
+      patch: { state: 'logged-in'; id?: string | null; avatar: string },
+    ): unknown;
+  };
+  inspection?: {
+    syncExternalObservation(
+      profileId: string,
+      observed: {
+        state: 'logged-in';
+        id?: string | null;
+        name?: string | null;
+        avatar: string;
+      },
+    ): void;
+  };
+  graphAvatarLookup?: (accountId: string) => Promise<string | null>;
+  delayMs?: number;
+  forceInTests?: boolean;
+  isShuttingDown: () => boolean;
+}
+
+export interface StartupAccountAvatarLocalizationHandle {
+  cancel(): void;
+}
+
+export function scheduleStartupAccountAvatarLocalization(
+  deps: StartupAccountAvatarLocalizationDeps,
+): StartupAccountAvatarLocalizationHandle {
+  if (
+    !deps.forceInTests &&
+    (process.env.WORKBENCH_DIAGNOSTICS === '1' || process.env.NODE_TEST_CONTEXT)
+  ) {
+    return { cancel: () => {} };
+  }
+  const abortController = new AbortController();
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        if (abortController.signal.aborted || deps.isShuttingDown()) return;
+        const entries = [...(await deps.repository.profileAccountCache()).entries()].filter(
+          ([, row]) =>
+            row.state === 'logged-in' &&
+            typeof row.avatar === 'string' &&
+            row.avatar.startsWith('https://'),
+        );
+        let cursor = 0;
+        const worker = async () => {
+          while (
+            !abortController.signal.aborted &&
+            !deps.isShuttingDown() &&
+            cursor < entries.length
+          ) {
+            const item = entries[cursor++];
+            if (!item) break;
+            const [profileId, row] = item;
+            if (!row.avatar) continue;
+            let localized = await fetchAndLocalizeAccountAvatar(
+              row.avatar,
+              abortController.signal,
+              `${profileId}:${row.id ?? ''}`,
+            ).catch(() => null);
+            if (
+              !localized &&
+              !abortController.signal.aborted &&
+              !deps.isShuttingDown() &&
+              row.id &&
+              /^\d+$/.test(row.id.trim()) &&
+              deps.graphAvatarLookup
+            ) {
+              const graphResult = await deps.graphAvatarLookup(row.id.trim()).catch(() => null);
+              if (graphResult && isLocalAvatar(graphResult)) {
+                localized = graphResult;
+              } else if (graphResult && graphResult.startsWith('https://')) {
+                localized = await fetchAndLocalizeAccountAvatar(
+                  graphResult,
+                  abortController.signal,
+                  `${profileId}:${row.id}`,
+                ).catch(() => null);
+              }
+            }
+            if (!localized || abortController.signal.aborted || deps.isShuttingDown()) continue;
+            const latest = (await deps.repository.profileAccountCache()).get(profileId);
+            if (
+              latest?.state === 'logged-in' &&
+              !isLocalAvatar(latest.avatar) &&
+              (!row.id || latest.id === row.id)
+            ) {
+              await deps.repository.updateProfileAccountCache(profileId, {
+                state: 'logged-in',
+                ...(latest.id ? { id: latest.id } : {}),
+                avatar: localized,
+              });
+              deps.inspection?.syncExternalObservation(profileId, {
+                state: 'logged-in',
+                id: latest.id,
+                name: latest.name,
+                avatar: localized,
+              });
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(3, entries.length) }, () => worker()));
+      } catch {
+        // Silent background localization; preserve existing remote avatar on any error.
+      }
+    })();
+  }, deps.delayMs ?? 5_000);
+  timer.unref();
+  return {
+    cancel: () => {
+      clearTimeout(timer);
+      abortController.abort();
+    },
+  };
 }
