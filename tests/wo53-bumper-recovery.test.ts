@@ -337,58 +337,69 @@ test('WO53: real video advancement, bounded frame-only evidence, frozen playback
     assert.equal(isBumperFatal(Error(reason)), true);
 });
 
-test('WO53: stop cannot allow restart while the original worker still has a pending continuation', async () => {
-  const id = randomUUID(),
-    t: BumperTarget = {
-      id: '123',
-      name: 'g',
-      avatarUrl: null,
-      folderId: null,
-      sortOrder: 0,
-      totalBumpedCount: 0,
-      createdAt: 0,
-      updatedAt: 0,
-    };
-  let finish!: () => void, began!: () => void;
-  const started = new Promise<void>((r) => {
-    began = r;
-  });
-  const blocked = new Promise<void>((r) => {
-    finish = r;
-  });
-  const service = new GroupBumperService(
-    {
-      targets: () => [t],
-      settings: () => BumperSettings.parse({}),
-      todayCounts: () => ({}),
-      saveProfileResult: () => {},
-    } as never,
-    {
-      ready: () => true,
-      busy: async () => false,
-      stop: async () => {},
-      hasControl: () => false,
-      run: async (_id, _groups, _pages, _settings, cb) => {
-        began();
-        await blocked;
-        assert.equal(cb.cancelled(), true);
+test(
+  'WO53: stop cannot allow restart while the original worker still has a pending continuation',
+  { timeout: 5000 },
+  async () => {
+    const id = randomUUID(),
+      t: BumperTarget = {
+        id: '123',
+        name: 'g',
+        avatarUrl: null,
+        folderId: null,
+        sortOrder: 0,
+        totalBumpedCount: 0,
+        createdAt: 0,
+        updatedAt: 0,
+      };
+    let finish!: () => void, began!: () => void;
+    const started = new Promise<void>((r) => {
+      began = r;
+    });
+    const blocked = new Promise<void>((r) => {
+      finish = r;
+    });
+    const service = new GroupBumperService(
+      {
+        targets: () => [t],
+        settings: () => BumperSettings.parse({}),
+        todayCounts: () => ({}),
+        saveProfileResult: () => {},
+      } as never,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        hasControl: () => false,
+        run: async (_id, _groups, _pages, _settings, cb) => {
+          began();
+          await blocked;
+          assert.equal(cb.cancelled(), true);
+        },
       },
-    },
-    async () => ({ comments: [], total: 0 }),
-    () => {},
-    undefined,
-    0,
-  );
-  const input = { profileIds: [id], groupIds: ['123'], pageIds: ['123'] };
-  await service.start(input);
-  await started;
-  await service.stop();
-  await assert.rejects(service.start(input), /正在运行/);
-  finish();
-  for (let i = 0; i < 30 && service.hasActiveExecution(); i++)
-    await new Promise((r) => setTimeout(r, 5));
-  assert.equal(service.hasActiveExecution(), false);
-});
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      undefined,
+      0,
+    );
+    const input = { profileIds: [id], groupIds: ['123'], pageIds: ['123'] };
+    await service.start(input);
+    await started;
+    let stopReturned = false;
+    const stopping = service.stop().then(() => {
+      stopReturned = true;
+    });
+    await new Promise<void>((r) => setImmediate(r));
+    assert.equal(stopReturned, false);
+    await assert.rejects(service.start(input), /正在运行/);
+    finish();
+    await stopping;
+    assert.equal(stopReturned, true);
+    for (let i = 0; i < 30 && service.hasActiveExecution(); i++)
+      await new Promise((r) => setTimeout(r, 5));
+    assert.equal(service.hasActiveExecution(), false);
+  },
+);
 
 test('WO53: a same-name candidate cannot replace a numeric Page identity without native canonical-ID evidence', async () => {
   const resolve = async (kind: 'groups' | 'pages', id: string) => {
