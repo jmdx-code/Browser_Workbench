@@ -121,6 +121,7 @@ class KernelRpcSession {
   identityFence: (() => Awaitable<void>) | undefined;
   readonly methods = new Set<string>();
   readonly methodCounts = new Map<string, number>();
+  readonly submissionCalls = { mousePress: 0, enter: 0 };
   nativeInputCount = 0;
   readonly trace: { at: number; event: string }[] = [];
   private mutationRequested = false;
@@ -432,6 +433,14 @@ class KernelRpcSession {
             throw error;
           }
         }
+        if (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed')
+          this.submissionCalls.mousePress++;
+        if (
+          method === 'Input.dispatchKeyEvent' &&
+          ['keyDown', 'rawKeyDown'].includes(String(params.type)) &&
+          (params.key === 'Enter' || params.code === 'Enter' || params.windowsVirtualKeyCode === 13)
+        )
+          this.submissionCalls.enter++;
         this.methods.add(method);
         this.methodCounts.set(method, (this.methodCounts.get(method) ?? 0) + 1);
         if (
@@ -3165,6 +3174,9 @@ export class KernelBridge implements KernelBridgeHooks {
           return [...session.methodCounts]
             .filter(([method]) => method.startsWith('Input.'))
             .reduce((sum, [, count]) => sum + count, 0);
+        },
+        get submissionCalls() {
+          return { ...session.submissionCalls };
         },
         get nativeMutationCalls() {
           return Object.fromEntries(

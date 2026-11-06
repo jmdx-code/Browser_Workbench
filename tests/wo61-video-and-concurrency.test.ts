@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { bumperNativeEvents } from './fixtures/bumper-native-events.js';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -117,6 +118,7 @@ it('WO61-2: video post finishes on videoEnded/duration, completes at 3min deadli
   const liked = new Set<string>();
   let mutations = 0;
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     viewportSize: () => ({ width: 1280, height: 800 }),
@@ -125,8 +127,8 @@ it('WO61-2: video post finishes on videoEnded/duration, completes at 3min deadli
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: {
       wheel: async () => {},
       move: async () => {},
@@ -181,7 +183,7 @@ it('WO61-2: video post finishes on videoEnded/duration, completes at 3min deadli
             videoPaused: false,
             videoReadyState: 4,
             videoCurrentSrc: 'blob:https://www.facebook.com/vid1',
-            videoFrames: 100,
+            videoFrames: 100 + checkPostCount,
             videoCurrentTime,
             videoDuration,
             videoCSS: input.targetPostId ? hydratedVideoCSS : null,
@@ -209,6 +211,7 @@ it('WO61-2: video post finishes on videoEnded/duration, completes at 3min deadli
         mutations++;
         if (selector === `[data-wb-bumper-like="${post1}"]`) {
           liked.add(post1);
+          nativeEvents.like('10000000001', 'fb-' + post1);
         }
       },
     }),

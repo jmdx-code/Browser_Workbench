@@ -6,8 +6,7 @@ import { facebookComposerProjection } from '../src/infrastructure/facebook-read-
 import {
   FACEBOOK_COMPOSER_SCOPE,
   FACEBOOK_COMPOSER_TEXT,
-  facebookComposerAdvanceSelector,
-  facebookComposerPostSelector,
+  facebookUILabelSelector,
 } from '../src/shared/facebook-ui.js';
 import type { PageProjection } from '../src/shared/page-read.js';
 import { postFixture, postRequest, postAction } from './fixtures/material-post.js';
@@ -61,7 +60,7 @@ test('private composer observer uses full original text and enforces Next/Submit
     if (original.action.kind !== 'click') throw Error('fixture');
     original.action.target = {
       scope: FACEBOOK_COMPOSER_SCOPE,
-      css: facebookComposerAdvanceSelector('zh_CN')!,
+      css: '[role="button"]' + facebookUILabelSelector(['下一页']),
     };
     const post = { intent, link: { ...original, sequence: 1 } };
     await observer.assert(page, original.action, post, () => {});
@@ -89,7 +88,10 @@ test('private composer observer uses full original text and enforces Next/Submit
     p.rows.find((row) => row.key === 'composerDisabledActions')!.nodes = [];
     const submit = {
       ...original.action,
-      target: { scope: FACEBOOK_COMPOSER_SCOPE, css: facebookComposerPostSelector('zh_CN') },
+      target: {
+        scope: FACEBOOK_COMPOSER_SCOPE,
+        css: '[role="button"]' + facebookUILabelSelector(['发布']),
+      },
     };
     await assert.rejects(
       observer.assert(

@@ -1,3 +1,4 @@
+import { bumperNativeEvents } from './fixtures/bumper-native-events.js';
 // @vitest-environment happy-dom
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import type { Page, Locator } from 'playwright-core';
@@ -327,6 +328,7 @@ it.each([
       hasVideo: false,
       comments: [],
     });
+    const nativeEvents = bumperNativeEvents();
     const page = {
       url: () => current,
       goto: async (url: string) => {
@@ -334,8 +336,8 @@ it.each([
         return null;
       },
       waitForURL: async () => {},
-      on: () => {},
-      off: () => {},
+      on: nativeEvents.on,
+      off: nativeEvents.off,
       mouse: {
         wheel: async () => {
           scrolls++;
@@ -354,7 +356,7 @@ it.each([
         return {
           url: current,
           groupIds: [groupInput],
-          avatarUrl: 'https://example.test/group-avatar.png',
+          avatarUrl: 'data:image/webp;base64,AAAA',
           pageAvatarUrl: null,
           ready: true,
           visible: true,
@@ -383,6 +385,7 @@ it.each([
           if (selector === '600000001') throw Error('locator.click: Timeout 4000ms');
           mutations++;
           liked.add(selector);
+          nativeEvents.like('10000000001', 'fb' + selector);
         },
       }),
     };
@@ -558,7 +561,8 @@ it('detects GraphQL 368/1404078 restriction errors and CometErrorDialog/Temporar
 
   const dlg = document.createElement('div');
   dlg.setAttribute('role', 'dialog');
-  dlg.textContent = 'You are Temporarily Blocked from performing this action';
+  dlg.textContent = 'ข้อความที่ไม่รู้จัก';
+  fiber(dlg, 'GroupsCometFeatureInterventionDialog.react', {});
   box(dlg);
   document.body.append(dlg);
   expect(projectGroupBumper({ groupId: group }).restricted).toBe(true);
@@ -572,6 +576,7 @@ it('page_group_feed resolves multiple non-numeric page slugs via group search an
   const liked = new Set<string>();
   let mutations = 0;
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     goto: async (url: string) => {
@@ -580,8 +585,8 @@ it('page_group_feed resolves multiple non-numeric page slugs via group search an
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: { wheel: async () => {} },
     evaluate: async (fn: Function, input: { groupId?: string; pageId?: string }) => {
       if (!input) return 'test-document';
@@ -639,6 +644,7 @@ it('page_group_feed resolves multiple non-numeric page slugs via group search an
       click: async () => {
         mutations++;
         liked.add(selector);
+        nativeEvents.like('10000000001', 'fb' + selector);
       },
     }),
   };
@@ -752,6 +758,8 @@ it('detects group welcome dialog and marks welcomeDismissCSS without flagging re
   box(btn);
   document.body.append(dlg);
 
+  dlg.setAttribute('aria-modal', 'true');
+  fiber(btn, 'FDSCircleButton.react', {});
   const state = projectGroupBumper({ groupId: group });
   expect(state.restricted).toBe(false);
   expect(state.welcomeDismissCSS).toBe('[data-wb-bumper-welcome-dismiss="1"]');
@@ -769,6 +777,7 @@ it('executes all human-like mouse.wheel/mouse.move inside connection.execute whe
   const visitedUrls: string[] = [];
   const clickedSelectors: string[] = [];
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     goto: async (url: string) => {
@@ -777,8 +786,8 @@ it('executes all human-like mouse.wheel/mouse.move inside connection.execute whe
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: {
       wheel: async () => {
         if (!inBoundLease) throw new Error('KERNEL_BOUND_INPUT_INACTIVE: wheel outside op');
@@ -792,6 +801,7 @@ it('executes all human-like mouse.wheel/mouse.move inside connection.execute whe
     },
     evaluate: async (fn: Function, input?: unknown) => {
       if (!input) return 'test-document';
+      if (fn.name === 'bumperDialogClosed') return !welcomeOpen;
       if (!input) return 'test-document';
       if (fn.name === 'projectGroupInvitationState')
         return {
@@ -875,6 +885,7 @@ it('executes all human-like mouse.wheel/mouse.move inside connection.execute whe
           return;
         }
         liked.add(selector);
+        nativeEvents.like('10000000001', 'fb' + selector);
       },
     }),
   };
@@ -984,6 +995,7 @@ it('reports transparent 0-bump reasons and throws when all groups fail to enter'
   let mode: 'fail_all' | 'no_author' | 'too_old' | 'cooldown' = 'fail_all';
   let current = '';
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     goto: async (url: string) => {
@@ -991,8 +1003,8 @@ it('reports transparent 0-bump reasons and throws when all groups fail to enter'
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: { wheel: async () => {}, move: async () => {} },
     evaluate: async (fn: Function, input?: unknown) => {
       if (!input) return 'test-document';
@@ -1427,6 +1439,8 @@ it('WO58: projectGroupBumper detects joinGroupCSS in group header and extracts [
     feedUnit: { id: btoa('Uzpf:VK:' + post), creation_time: Date.now() / 1000 - 3600 },
   });
 
+  const join = main.querySelector('#join-btn');
+  if (join) fiber(join, 'GroupsCometJoinForumButton.react', { testid: 'group-can-join-' + group });
   const surface = projectGroupBumper({ groupId: group });
   expect(surface.joinGroupCSS).toBe('[data-wb-bumper-join="1"]');
   expect(main.querySelector('#join-btn')?.getAttribute('data-wb-bumper-join')).toBe('1');
@@ -1449,6 +1463,7 @@ it('WO58: GroupBumperBrowserAdapter joins group before time_sort navigation and 
   const liked = new Set<string>();
   let mutations = 0;
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     viewportSize: () => ({ width: 1280, height: 800 }),
@@ -1460,8 +1475,8 @@ it('WO58: GroupBumperBrowserAdapter joins group before time_sort navigation and 
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: {
       wheel: async () => {},
       move: async () => {},
@@ -1529,6 +1544,7 @@ it('WO58: GroupBumperBrowserAdapter joins group before time_sort navigation and 
         }
         if (selector === `[data-wb-bumper-like="${post}"]`) {
           liked.add(post);
+          nativeEvents.like('10000000001', 'fb-' + post);
           actionOrder.push('click:like');
         }
       },
@@ -1683,6 +1699,8 @@ it('WO59: projectGroupBumper filters out sticky header join button with hidden/t
     toJSON: () => ({}),
   });
 
+  fiber(mainJoin, 'GroupsCometJoinForumButton.react', { testid: 'group-can-join-' + group });
+  fiber(stickyJoin, 'GroupsCometJoinForumButton.react', { testid: 'group-can-join-' + group });
   const surface = projectGroupBumper({ groupId: group });
   expect(surface.joinGroupCSS).toBe('[data-wb-bumper-join="1"]');
   expect(stickyJoin.getAttribute('data-wb-bumper-join')).toBeNull();
@@ -1695,6 +1713,9 @@ it('WO59: projectGroupBumper filters out sticky header join button with hidden/t
     </div>
   `;
   [main, ...main.querySelectorAll('*')].forEach(box);
+  const englishJoin = main.querySelector('#en-join');
+  if (englishJoin)
+    fiber(englishJoin, 'GroupsCometJoinForumButton.react', { testid: 'group-can-join-' + group });
   const enSurface = projectGroupBumper({ groupId: group });
   expect(enSurface.joinGroupCSS).toBe('[data-wb-bumper-join="1"]');
   expect(main.querySelector('#en-join')?.getAttribute('data-wb-bumper-join')).toBe('1');
@@ -1709,6 +1730,7 @@ it('WO59: GroupBumperBrowserAdapter joins group after waitForFeed when SPA entry
   const liked = new Set<string>();
   let mutations = 0;
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     viewportSize: () => ({ width: 1280, height: 800 }),
@@ -1720,8 +1742,8 @@ it('WO59: GroupBumperBrowserAdapter joins group after waitForFeed when SPA entry
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: {
       wheel: async () => {},
       move: async () => {},
@@ -1787,6 +1809,7 @@ it('WO59: GroupBumperBrowserAdapter joins group after waitForFeed when SPA entry
         }
         if (selector === `[data-wb-bumper-like="${post}"]`) {
           liked.add(post);
+          nativeEvents.like('10000000001', 'fb-' + post);
           actionOrder.push('click:like');
         }
       },

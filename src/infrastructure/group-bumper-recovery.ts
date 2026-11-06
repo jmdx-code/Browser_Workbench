@@ -94,7 +94,9 @@ export async function recoverBumperOperations(
         outcome: 'ENDED_UNKNOWN',
         evidenceDigest: bumperDigest({
           binding: op.binding,
-          reason: 'Non-submit bumper setup ended before reuse',
+          reason: row.actionKind.startsWith('submit_')
+            ? 'Execution ended; business submission remains unconfirmed'
+            : 'Non-submit bumper setup ended before reuse',
         }),
       });
     if (!resolution) continue;

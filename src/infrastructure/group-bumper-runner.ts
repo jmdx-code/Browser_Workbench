@@ -1,9 +1,12 @@
+import { watchBumperVideo } from './bumper-video.js';
 import type { BumperResolutionValue } from '../shared/bumper-operation.js';
 import {
   bumperSetupLabels,
   bumperSetupKinds,
   recoverBumperOperations,
 } from './group-bumper-recovery.js';
+import { BUMPER_REACTION_IDS, projectBumperReactionTarget } from './bumper-reaction-target.js';
+import { readBumperReactionFromServer } from './bumper-reaction-read.js';
 import { randomUUID, createHash } from 'node:crypto';
 import type { Page, Response, Request, Locator } from 'playwright-core';
 import type { Core } from '../bridge/core.js';
@@ -43,7 +46,6 @@ import {
 } from '../application/account-abnormal-reporter.js';
 import { readGroupInvitationState } from './group-inviter-effects.js';
 import { prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
-import { dismissUnexpectedFacebookOverlays } from './facebook-overlay-dismisser.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { Binding } from '../shared/task-execution.js';
@@ -115,14 +117,18 @@ export function confirmedBumperGraphQL(input: {
   feedbackId: string;
   kind: 'like' | 'comment';
   comment?: string;
+  expectedReactionId?: string;
   variables: unknown;
   status: number;
   body: string;
 }): boolean {
   const vars = object(object(input.variables).input);
   if (
+    !input.feedbackId.trim() ||
     input.status !== 200 ||
-    vars.actor_id !== input.actorId ||
+    (input.kind === 'like'
+      ? vars.actor_id !== input.actorId
+      : vars.actor_id != null && vars.actor_id !== input.actorId) ||
     !sameBumperFeedbackId(vars.feedback_id, input.feedbackId)
   )
     return false;
@@ -149,32 +155,56 @@ export function confirmedBumperGraphQL(input: {
     if (input.kind === 'like') {
       const feedback = object(object(data.feedback_react).feedback),
         info = object(feedback.viewer_feedback_reaction_info),
-        reactionId = object(info.reaction).id;
+        reactionId = info.id ?? object(info.reaction).id,
+        requestedReaction = vars.feedback_reaction_id,
+        viewerActor = object(feedback.viewer_actor).id;
       return (
-        sameBumperFeedbackId(feedback.id ?? vars.feedback_id, input.feedbackId) &&
+        sameBumperFeedbackId(feedback.id, input.feedbackId) &&
+        (viewerActor == null || viewerActor === input.actorId) &&
+        (!input.expectedReactionId ||
+          (requestedReaction === input.expectedReactionId &&
+            reactionId === input.expectedReactionId)) &&
+        requestedReaction !== '0' &&
+        requestedReaction !== 0 &&
+        (typeof requestedReaction !== 'string' ||
+          reactionId == null ||
+          requestedReaction === reactionId) &&
+        info.reaction_type !== 0 &&
         ((typeof info.reaction_type === 'number' && info.reaction_type > 0) ||
-          (typeof reactionId === 'string' && reactionId.length > 0))
+          (typeof reactionId === 'string' && /^[1-9]\d*$/.test(reactionId)))
       );
     }
-    const comment = object(object(data.comment_create).comment);
+    const created = object(data.comment_create);
+    const comment = object(object(created.feedback_comment_edge).node ?? created.comment);
     return (
+      normalizeBumperComment(String(object(vars.message).text ?? '')) ===
+        normalizeBumperComment(input.comment ?? '') &&
       typeof comment.id === 'string' &&
       comment.id.length > 0 &&
       object(comment.author).id === input.actorId &&
       normalizeBumperComment(String(object(comment.body).text ?? '')) ===
         normalizeBumperComment(input.comment ?? '') &&
-      sameBumperFeedbackId(object(comment.feedback).id ?? vars.feedback_id, input.feedbackId)
+      sameBumperFeedbackId(
+        object(created.feedback).id ??
+          (created.feedback_comment_edge ? undefined : vars.feedback_id),
+        input.feedbackId,
+      )
     );
   });
 }
 export function observeBumperGraphql(
   page: Page,
-  scope: Omit<Parameters<typeof confirmedBumperGraphQL>[0], 'variables' | 'status' | 'body'>,
+  scope: Omit<Parameters<typeof confirmedBumperGraphQL>[0], 'variables' | 'status' | 'body'> & {
+    profileId?: string;
+    postId?: string;
+  },
 ) {
   const requests = new Map<Request, unknown>();
   let closed = false;
   let confirmed = false;
   let restricted = false;
+  let failure = '';
+  let operationId: string | undefined;
   const pending = new Set<Promise<void>>();
   const request = (r: Request) => {
     if (r.method() !== 'POST' || !new URL(r.url()).pathname.startsWith('/api/graphql')) return;
@@ -189,7 +219,9 @@ export function observeBumperGraphql(
       const variables: unknown = JSON.parse(p.get('variables') ?? '{}');
       const vars = object(object(variables).input);
       if (
-        vars.actor_id !== scope.actorId ||
+        (scope.kind === 'like'
+          ? vars.actor_id !== scope.actorId
+          : vars.actor_id != null && vars.actor_id !== scope.actorId) ||
         !sameBumperFeedbackId(vars.feedback_id, scope.feedbackId) ||
         (scope.kind === 'comment' &&
           normalizeBumperComment(String(object(vars.message).text ?? '')) !==
@@ -206,17 +238,50 @@ export function observeBumperGraphql(
     if (!variables) return;
     const work = (async () => {
       try {
+        if (r.status() !== 200) failure = 'Facebook 互动请求失败（HTTP ' + r.status() + '）';
         const body = await r.text();
         if (closed || body.length > 512 * 1024) return;
+        {
+          try {
+            const chunks = body
+              .trim()
+              .replace(/^for\s*\(;;\);\s*/, '')
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line.replace(/^for\s*\(;;\);\s*/, '')) as unknown);
+            if (
+              chunks.some((chunk) => {
+                const errors = object(chunk).errors;
+                return errors != null && (!Array.isArray(errors) || errors.length > 0);
+              })
+            )
+              failure = 'Facebook 明确拒绝了本次互动';
+          } catch {
+            /* Unreadable evidence remains unknown. */
+          }
+        }
         if (isBumperGraphQLRestricted(body)) restricted = true;
+        if (
+          scope.kind === 'like' &&
+          scope.expectedReactionId &&
+          object(object(variables).input).feedback_reaction_id !== scope.expectedReactionId
+        )
+          failure = 'Facebook 实际提交的反应与配置不一致';
         confirmed ||= confirmedBumperGraphQL({ ...scope, variables, status: r.status(), body });
         devDiag.record({
           category: 'GROUP_BUMPER',
           event: 'BUMPER_NATIVE_RESULT',
+          ...(scope.profileId ? { profileId: scope.profileId } : {}),
+          ...(operationId ? { operationId } : {}),
           data: {
             kind: scope.kind,
             httpStatus: r.status(),
             feedbackMatched: confirmed,
+            postId: scope.postId,
+            feedbackId: scope.feedbackId,
+            actorId: scope.actorId,
+            expectedReactionId: scope.expectedReactionId,
+            failed: !!failure,
             restricted,
             bytes: body.length,
           },
@@ -233,6 +298,11 @@ export function observeBumperGraphql(
   return {
     confirmed: () => confirmed,
     restricted: () => restricted,
+    failed: () => !!failure,
+    failureReason: () => failure,
+    bindOperation: (id: string) => {
+      operationId = id;
+    },
     close: async () => {
       page.off('request', request);
       page.off('response', response);
@@ -273,6 +343,17 @@ export class BumperFatalError extends Error {
   }
 }
 export class BumperSetupUnconfirmed extends Error {}
+class BumperGroupSkipped extends Error {}
+function bumperDialogClosed(token: string) {
+  const dialog = document.querySelector('[data-wb-bumper-closing="' + token + '"]');
+  if (!dialog) return true;
+  const rect = dialog.getBoundingClientRect(),
+    style = getComputedStyle(dialog);
+  return (
+    rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden'
+  );
+}
+
 export class BumperMetadataAccountError extends Error {
   readonly scope: AccountAbnormalScope = 'global_route';
   readonly abnormalState: AccountAbnormalState;
@@ -291,6 +372,45 @@ function buildBumperTargetUrl(kind: 'groups' | 'pages', rawId: string): string {
     : /^\d+$/.test(rawId)
       ? 'https://www.facebook.com/profile.php?id=' + encodeURIComponent(rawId)
       : 'https://www.facebook.com/' + encodeURIComponent(rawId);
+}
+
+// The final profile route can map a classic Page ID to the User actor used by posts.
+export function canonicalBumperPageIdFromURL(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    if (
+      u.protocol !== 'https:' ||
+      !['www.facebook.com', 'facebook.com', 'm.facebook.com'].includes(u.hostname)
+    )
+      return null;
+    const id = /^\/profile\.php$/.test(u.pathname)
+      ? u.searchParams.get('id')
+      : (/^\/(?:people|pages)\/[^/]+\/(\d+)\/?$/.exec(u.pathname)?.[1] ??
+        /^\/(\d+)\/?$/.exec(u.pathname)?.[1]);
+    return id && /^\d{5,}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+export async function readBumperPageRedirect(page: Page, id: string): Promise<string | null> {
+  const result = await page.evaluate(async (rawId) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const response = await fetch(
+        /^\d+$/.test(rawId)
+          ? 'https://www.facebook.com/profile.php?id=' + encodeURIComponent(rawId)
+          : 'https://www.facebook.com/' + encodeURIComponent(rawId),
+        { credentials: 'include', redirect: 'follow', signal: controller.signal },
+      );
+      const result = { status: response.status, url: response.url };
+      await response.body?.cancel();
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }, id);
+  return result.status === 200 ? canonicalBumperPageIdFromURL(result.url) : null;
 }
 
 function isTransientNavigationEvalError(error: unknown): boolean {
@@ -392,14 +512,16 @@ function extractTargetCandidateInPage(input: {
     };
   }
 
-  let canonicalId: string | null = /^\d{5,}$/.test(expectedId) ? expectedId : null;
+  let canonicalId: string | null = null;
   if (targetKind === 'groups') {
     const m = /^\/groups\/(\d{5,})(?:\/|$)/.exec(location.pathname);
     if (m?.[1]) canonicalId ??= m[1];
   } else {
     const qId = new URLSearchParams(location.search).get('id');
     if (qId && /^\d{5,}$/.test(qId)) canonicalId ??= qId;
-    const m = /^\/(?:people|pages)\/[^/]+\/(\d{5,})(?:\/|$)/.exec(location.pathname);
+    const m =
+      /^\/(?:people|pages)\/[^/]+\/(\d{5,})(?:\/|$)/.exec(location.pathname) ??
+      /^\/(\d{5,})\/?$/.exec(location.pathname);
     if (m?.[1]) canonicalId ??= m[1];
   }
 
@@ -601,6 +723,64 @@ function extractTargetCandidateInPage(input: {
       visit(v, depth + 1);
     }
   };
+  // Read only the target entity and its picture references from the active Relay environment.
+  const hosts = mainRoot
+    ? [mainRoot, ...Array.from(mainRoot.querySelectorAll('h1,svg image,img')).slice(0, 40)]
+    : [];
+  const environments = new Set<unknown>();
+  for (const host of hosts) {
+    const fiberKey = Object.keys(host).find((k) => k.startsWith('__reactFiber$'));
+    let fiber = fiberKey ? (Reflect.get(host, fiberKey) as Record<string, unknown> | null) : null;
+    for (let depth = 0; fiber && depth < 100; depth++, fiber = fiber.return as typeof fiber) {
+      const props = fiber.memoizedProps as Record<string, unknown> | undefined;
+      if (!props) continue;
+      const value = props.value as Record<string, unknown> | undefined;
+      const queries = props.queries as Record<string, { environment?: unknown }> | undefined;
+      for (const env of [
+        props.environment,
+        value?.environment,
+        ...Object.values(queries ?? {}).map((q) => q?.environment),
+      ]) {
+        if (!env || environments.has(env)) continue;
+        environments.add(env);
+        try {
+          const source = (
+            env as {
+              getStore(): { getSource(): { get(id: string): Record<string, unknown> | null } };
+            }
+          )
+            .getStore()
+            .getSource();
+          const entity = source.get(canonicalId ?? expectedId);
+          if (
+            !entity ||
+            !['User', 'Page', 'Group'].includes(String(entity.__typename)) ||
+            String(entity.id ?? entity.__id) !== (canonicalId ?? expectedId)
+          )
+            continue;
+          const linked = new Set<string>();
+          const loadPictures = (v: unknown, depth = 0): void => {
+            if (!v || typeof v !== 'object' || depth > 8 || linked.size > 40) return;
+            const ref = (v as Record<string, unknown>).__ref;
+            if (typeof ref === 'string' && !linked.has(ref)) {
+              linked.add(ref);
+              const row = source.get(ref);
+              if (row) {
+                refs.set(ref, row);
+                loadPictures(row, depth + 1);
+              }
+            }
+            for (const child of Object.values(v)) loadPictures(child, depth + 1);
+          };
+          const scoped = Object.fromEntries(
+            Object.entries(entity).filter(([key]) => pictureKeyPattern.test(key)),
+          );
+          loadPictures(scoped);
+          visit(scoped);
+        } catch {}
+      }
+    }
+  }
   for (const s of Array.from(document.scripts)) {
     const text = s.textContent || '';
     if (!text || text.length > 2_000_000 || (!text.startsWith('{') && !text.includes('"__bbox"')))
@@ -768,7 +948,8 @@ export async function typeBumperComment(
   }
 }
 export async function executeBumperOperation<T>(input: {
-  connection: Pick<Connection, 'execute' | 'reconcile' | 'nativeMutationCalls'>;
+  connection: Pick<Connection, 'execute' | 'reconcile' | 'nativeMutationCalls'> &
+    Partial<Pick<Connection, 'submissionCalls'>>;
   binding: Binding;
   label: string;
   work: () => Promise<T>;
@@ -784,7 +965,14 @@ export async function executeBumperOperation<T>(input: {
   };
 }) {
   const conn = input.connection;
-  const mutations = () => Object.values(conn.nativeMutationCalls).reduce((n, c) => n + c, 0);
+  const mutations = () => {
+    if (!input.settlement?.auxiliary && conn.submissionCalls) {
+      return input.label === '发送评论'
+        ? conn.submissionCalls.enter
+        : conn.submissionCalls.mousePress;
+    }
+    return Object.values(conn.nativeMutationCalls).reduce((n, c) => n + c, 0);
+  };
   const before = mutations();
   const makeResolution = (
     outcome: BumperResolutionValue['outcome'],
@@ -1042,6 +1230,30 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               let lastObservedHref = '';
 
               try {
+                if (kind === 'pages') {
+                  const redirectedId = await readBumperPageRedirect(page, item.id).catch(
+                    () => null,
+                  );
+                  await peerGuard();
+                  if (itemController.signal.aborted) throw Error('FACEBOOK_METADATA_ITEM_TIMEOUT');
+                  bestCanonicalId = redirectedId ?? bestCanonicalId;
+                  if (
+                    redirectedId &&
+                    !isPlaceholderTargetName(item.name, item.id) &&
+                    isLocalAvatar(item.avatarUrl)
+                  ) {
+                    await options?.onItemResolved?.(item.id, {
+                      canonicalId: redirectedId,
+                      name: null,
+                      avatarUrl: item.avatarUrl,
+                    });
+                    updated++;
+                    itemCounted = true;
+                    processedCount++;
+                    nextItemIndex = i + 1;
+                    continue;
+                  }
+                }
                 if (i > startItemIndex) {
                   try {
                     await page.evaluate((u) => {
@@ -1130,6 +1342,14 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     bestRawAvatarUrl = candidateAvatar;
                   }
 
+                  if (probe.readyState === 'complete' && !bestName && !bestRawAvatarUrl) {
+                    const native = await readGroupBumper(page, {
+                      groupId: kind === 'groups' ? item.id : '-',
+                      pageId: kind === 'pages' ? (bestCanonicalId ?? item.id) : undefined,
+                    });
+                    if (native.restrictionReason)
+                      throw Error('TARGET_UNAVAILABLE: ' + native.restrictionReason);
+                  }
                   if (probe.unavailableTarget && !bestName && !bestRawAvatarUrl) {
                     break;
                   }
@@ -1440,7 +1660,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           name: meta.name ?? item.name,
           avatarUrl: meta.avatarUrl ?? (isLocalAvatar(item.avatarUrl) ? item.avatarUrl : null),
         };
-        if (!isTargetIncomplete(effectiveTarget)) {
+        if (kind !== 'pages' && !isTargetIncomplete(effectiveTarget)) {
           updatedIds.add(item.id);
         } else {
           browserQueue.push({
@@ -1597,7 +1817,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       )
         throw new BumperFatalError('浏览器连接已变化');
     };
-    await recoverBumperOperations(kernel, peer, this.repo, guard);
     const prepareAndConnect = async () => {
       const prepared = await prepareFacebookWorkspace(
         kernel,
@@ -1643,45 +1862,48 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       if (!identity) throw Error('未能确认 Facebook 登录身份');
       return identity;
     };
-    const runWithPrepareTimeout = async () => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([
-          prepareAndConnect(),
-          new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(Error('BUMPER_PREPARE_TIMEOUT')), 15000);
-            timer.unref?.();
-          }),
-        ]);
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-      }
+    const prepareConnection = async () => {
+      await recoverBumperOperations(kernel, peer, this.repo, guard);
+      const identity = await prepareAndConnect();
+      guard();
+      const connection = await kernel.connectFacebook(
+        peer,
+        identity.actor.accountId,
+        guard,
+        identity.proof,
+      );
+      return { identity, connection };
     };
-    let identity: Awaited<ReturnType<typeof prepareAndConnect>>;
+    let preparedConnection: Awaited<ReturnType<typeof prepareConnection>>;
     try {
-      identity = await runWithPrepareTimeout();
-    } catch (firstErr) {
-      if (isBumperFatal(firstErr)) throw firstErr;
-      const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-      if (
-        FacebookGroupSessionHelper.isTransientPrepareError(firstErr) ||
-        /BUMPER_PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE|KERNEL_PROFILE_NOT_IDLE|KERNEL_PEER_NOT_IDLE/i.test(
-          msg,
+      try {
+        preparedConnection = await prepareConnection();
+      } catch (firstError) {
+        guard();
+        if (
+          isBumperFatal(firstError) ||
+          !FacebookGroupSessionHelper.isTransientPrepareError(firstError) ||
+          (await this.isBusy(profileId))
         )
-      ) {
-        if (!(await this.isBusy(profileId))) {
-          await recoverBumperOperations(kernel, peer, this.repo, guard).catch(() => {});
-        }
+          throw firstError;
         await kernel.taskWindow?.(profileId).catch(() => {});
         await wait(Math.max(10, Math.round(1000 * this.paceScale)));
         guard();
-        identity = await runWithPrepareTimeout();
-      } else {
-        throw firstErr;
+        preparedConnection = await prepareConnection();
       }
+    } catch (error) {
+      devDiag.record({
+        level: 'WARN',
+        category: 'GROUP_BUMPER',
+        event: 'BUMPER_PREPARE_FAILED',
+        profileId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     }
+    const identity = preparedConnection.identity;
+    let conn = preparedConnection.connection;
     const accountId = identity.actor.accountId;
-    let conn = await kernel.connectFacebook(peer, accountId, guard, identity.proof);
     this.connections.set(profileId, conn);
     this.closing.set(profileId, {
       id: conn.stopRequestId,
@@ -1756,6 +1978,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         binding: Binding,
         resolution: BumperResolutionValue,
       ) => Promise<BumperResolutionValue | void>,
+      onPrepared?: (binding: Binding) => void,
     ) => {
       const submission = label === '点赞' || label === '发送评论';
       if (scanOnly && submission) throw new BumperFatalError('BUMPER_SCAN_SUBMISSION_DENIED');
@@ -1779,6 +2002,8 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               ? (bumperSetupKinds[index] ?? 'setup_navigate')
               : 'setup_navigate';
       await this.repo.prepareOperation({ binding, runId, actionKind, ...operationContext });
+      let reviewed = false;
+      onPrepared?.(binding);
       try {
         return await executeBumperOperation({
           connection: conn,
@@ -1796,6 +2021,8 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             },
             review: async (reason) => {
               await this.repo.markOperationReview(binding.operationId, reason);
+              reviewed = true;
+              callbacks.issue?.({ kind: 'pending', reason });
             },
           },
           assertCurrent: assertIdentity,
@@ -1803,6 +2030,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             this.connections.get(profileId) === conn ? this.stop(profileId) : Promise.resolve(),
         });
       } catch (error) {
+        if (submission && !reviewed)
+          callbacks.issue?.({
+            kind: 'failed',
+            reason: error instanceof Error ? error.message : String(error),
+          });
         if (!(error instanceof BumperSetupUnconfirmed)) throw error;
         // Dispose this uncertain setup only after a real stop, then resume with a fresh lease.
         callbacks.status('恢复准备步骤 · ' + label);
@@ -1942,6 +2174,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     };
     let groupsEntered = 0;
     let skippedGroups = 0;
+    let expectedGroupSkips = 0;
     let lastGroupError = '';
     let matchedAuthorPosts = 0;
     let filteredByAgePosts = 0;
@@ -1949,6 +2182,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     let sessionBumped = 0;
     let quotaReached = false;
     try {
+      // Resolve numeric Page aliases before preparing any business binding.
+      pages = pages.map((p) => ({ ...p }));
+      for (const target of pages) {
+        guard();
+        const canonicalId = await readBumperPageRedirect(page, target.id).catch(() => null);
+        guard();
+        if (canonicalId && canonicalId !== target.id) {
+          await updateMetadata('pages', target.id, { canonicalId });
+          target.id = canonicalId;
+        }
+      }
       for (const group of groups) {
         operationContext = { groupId: group.id, groupName: group.name };
         try {
@@ -1972,63 +2216,104 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             break;
           }
           let effectiveGroupId = group.id;
+          const rejectBlockedGroup = (surface: Awaited<ReturnType<typeof readGroupBumper>>) => {
+            if (surface.restricted)
+              throw new BumperFatalError(
+                '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
+              );
+            if (surface.groupJoinState === 'pending')
+              throw new BumperGroupSkipped('入组申请待审核');
+            if (surface.groupJoinState === 'questions')
+              throw new BumperGroupSkipped('小组需要回答入组问题');
+          };
           const dismissWelcomeDialogIfNeeded = async (
             s?: Awaited<ReturnType<typeof readGroupBumper>>,
           ) => {
-            const currentSurface =
-              s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
-            if (!currentSurface.welcomeDismissCSS) return false;
-            await op(
-              '关闭入组欢迎弹窗',
-              async () => {
-                const refreshed = await readGroupBumper(page, { groupId: effectiveGroupId });
-                const css = refreshed.welcomeDismissCSS ?? '[data-wb-bumper-welcome-dismiss="1"]';
-                const btn = page.locator(css).first();
-                await btn.click({ timeout: 4000 });
-                return true;
-              },
-              async () =>
-                !(await readGroupBumper(page, { groupId: effectiveGroupId })).welcomeDismissCSS,
-            ).catch((e) => {
-              if (isBumperFatal(e)) throw e;
-            });
-            await paceWait(800 + Math.floor(Math.random() * 700));
-            return true;
+            try {
+              guard();
+            } catch {
+              return false;
+            }
+            let current = s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
+            rejectBlockedGroup(current);
+            let closed = false;
+            for (let count = 0; current.welcomeDismissCSS && count < 3; count++) {
+              const token = randomUUID();
+              await op(
+                '关闭入组欢迎弹窗',
+                async () => {
+                  const next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                  rejectBlockedGroup(next);
+                  if (!next.welcomeDismissCSS) return false;
+                  const button = page.locator(next.welcomeDismissCSS).first();
+                  await button.evaluate((el, id) => {
+                    (
+                      el.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"]') ?? el
+                    ).setAttribute('data-wb-bumper-closing', id);
+                  }, token);
+                  await button.click({ timeout: 4000 });
+                  return true;
+                },
+                async (clicked) => {
+                  if (!clicked) return true;
+                  const until = Date.now() + 2000;
+                  do {
+                    guard();
+                    const next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                    rejectBlockedGroup(next);
+                    if (await page.evaluate(bumperDialogClosed, token)) return true;
+                    await wait(150);
+                  } while (Date.now() < until);
+                  return false;
+                },
+              );
+              closed = true;
+              current = await readGroupBumper(page, { groupId: effectiveGroupId });
+              rejectBlockedGroup(current);
+            }
+            if (current.blockingDialog) throw new BumperGroupSkipped('页面有未处理的阻断弹窗');
+            return closed;
           };
           const joinGroupIfNeeded = async (s?: Awaited<ReturnType<typeof readGroupBumper>>) => {
             if (scanOnly || isPageBumperMode) return false;
-            const currentSurface =
-              s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
-            if (!currentSurface.joinGroupCSS) return false;
+            const current = s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
+            rejectBlockedGroup(current);
+            if (current.groupJoinState === 'member' || !current.joinGroupCSS) return false;
             callbacks.status('正在加入小组 · ' + group.name);
+            let next = current;
             await op(
               '加入小组',
               async () => {
                 const refreshed = await readGroupBumper(page, { groupId: effectiveGroupId });
-                const css = refreshed.joinGroupCSS ?? '[data-wb-bumper-join="1"]';
-                const btn = page.locator(css).first();
+                rejectBlockedGroup(refreshed);
+                if (refreshed.groupJoinState === 'member') return false;
+                if (!refreshed.joinGroupCSS) throw Error('入组按钮已变化');
+                const btn = page.locator(refreshed.joinGroupCSS).first();
                 await centerBumperControl(btn, this.paceScale);
-                await btn.click({ timeout: 4000 }).catch(async () => {
-                  await btn.evaluate((el: HTMLElement) => el.click());
-                });
+                await btn.click({ timeout: 4000 });
                 return true;
               },
-              async () => {
-                const deadline = Date.now() + 5000;
-                while (Date.now() < deadline) {
+              async (clicked) => {
+                if (!clicked) return true;
+                const end = Date.now() + 6000;
+                do {
                   guard();
-                  const next = await readGroupBumper(page, { groupId: effectiveGroupId });
-                  if (next.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
-                  if (!next.joinGroupCSS || !!next.welcomeDismissCSS) return true;
-                  await wait(300);
-                }
-                return true;
+                  next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                  if (next.restricted)
+                    throw new BumperFatalError(
+                      '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
+                    );
+                  if (['member', 'pending', 'questions'].includes(next.groupJoinState ?? ''))
+                    return true;
+                  // Old test/adaptor versions have no membership field; retain their explicit observed transition.
+                  if (next.groupJoinState === undefined && !next.joinGroupCSS) return true;
+                  await wait(250);
+                } while (Date.now() < end);
+                return false;
               },
-            ).catch((e) => {
-              if (isBumperFatal(e)) throw e;
-            });
-            await paceWait(800 + Math.floor(Math.random() * 700));
-            await dismissWelcomeDialogIfNeeded();
+            );
+            rejectBlockedGroup(next);
+            await dismissWelcomeDialogIfNeeded(next);
             return true;
           };
           const waitForFeed = async (pageId?: string) => {
@@ -2089,7 +2374,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 ...(pageId ? { pageId } : {}),
               });
             }
-            if (observed.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
+            if (!scanOnly) rejectBlockedGroup(observed);
+            if (observed.restricted)
+              throw new BumperFatalError(
+                '受限 · ' + (observed.restrictionReason ?? '需要手机验证或操作受限'),
+              );
             return observed;
           };
           let surface!: Awaited<ReturnType<typeof readGroupBumper>>;
@@ -2410,12 +2699,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   (/^\d+$/.test(feed.id) ? feed.id : null);
               }
               const pageAvatar = pageFeed.pageAvatarUrl ?? pageFeed.avatarUrl;
-              const canonicalPageId =
-                !isCompleteNumericId(feed.id) &&
-                pageOwnerAuthorId &&
-                isCompleteNumericId(pageOwnerAuthorId)
-                  ? pageOwnerAuthorId
-                  : null;
+              const canonicalPageId = canonicalBumperPageIdFromURL(page.url());
               if (canonicalPageId) {
                 const resolvedName =
                   pageFeed.groupTitle && isPlaceholderTargetName(feed.name, feed.id)
@@ -2583,7 +2867,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 });
               if (feed && surface.pageAvatarUrl)
                 await updateAvatar('pages', feed.id, surface.pageAvatarUrl);
-              if (surface.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
+              if (surface.restricted)
+                throw new BumperFatalError(
+                  '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
+                );
               if (
                 isPageBumperMode &&
                 /^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname)
@@ -2828,9 +3115,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     });
                     if (!s.visible || !s.ready) throw Error('目标帖子页面尚未可见就绪');
                     const p = s.posts.find((p) => p.postId === post.postId);
-                    if (s.restricted) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
+                    if (s.restricted)
+                      throw new BumperFatalError(
+                        '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
+                      );
                     if (isPageBumperMode) {
-                      if (!p) throw Error('目标帖子或作者已变化');
+                      if (
+                        !p ||
+                        !bumperAuthorMatch(
+                          p,
+                          feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
+                        ) ||
+                        (post.feedbackId && !sameBumperFeedbackId(p.feedbackId, post.feedbackId))
+                      )
+                        throw Error('目标帖子或作者已变化');
                       return p;
                     }
                     if (
@@ -2844,14 +3142,16 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       throw Error('目标帖子或作者已变化');
                     return p;
                   };
-                  await dismissUnexpectedFacebookOverlays(page);
+                  await dismissWelcomeDialogIfNeeded();
+                  if (scanOnly) {
+                    callbacks.status('只读扫描 · ' + post.postId);
+                    continue;
+                  }
                   // Pre-like/comment mandatory human-like browsing dwell inside bound op
                   await op(
                     post.hasVideo ? '观看目标视频' : '浏览目标帖子',
                     async () => {
-                      const postDiscoveredAtMs = performance.now();
                       const maxWatchMs = Math.round(180_000 * this.paceScale);
-                      const deadlineMs = postDiscoveredAtMs + maxWatchMs;
                       const anchorCSS =
                         post.videoCSS ??
                         (post.hasVideo ? post.postCSS : null) ??
@@ -2863,226 +3163,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         await centerBumperControl(page.locator(anchorCSS).first(), this.paceScale);
                       }
                       // 居中后重新读取一次：屏下卡片水合后才暴露视频/点赞栏
-                      let refreshedPost = await checkPost().catch(() => post);
-                      if (
-                        (post.hasVideo || refreshedPost.hasVideo) &&
-                        !refreshedPost.videoCSS &&
-                        !post.videoCSS
-                      ) {
-                        const lazyDeadline = Date.now() + 3000;
-                        let clickedPlay = false;
-                        while (Date.now() < lazyDeadline && !refreshedPost.videoCSS) {
-                          guard();
-                          if (!clickedPlay && post.postCSS) {
-                            clickedPlay = true;
-                            await page
-                              .evaluate((cardSel) => {
-                                const card = document.querySelector(cardSel);
-                                const playBtn = card?.querySelector<HTMLElement>(
-                                  '[aria-label*="Play video" i],[aria-label*="播放视频"],[aria-label*="播放影片"]',
-                                );
-                                playBtn?.click();
-                              }, post.postCSS)
-                              .catch(() => {});
-                          }
-                          await paceWait(350);
-                          refreshedPost = await checkPost().catch(() => refreshedPost);
-                        }
-                      }
-                      if (!post.videoCSS && refreshedPost.videoCSS) {
-                        await centerBumperControl(
-                          page.locator(refreshedPost.videoCSS).first(),
-                          this.paceScale,
-                        );
-                      }
-                      const videoCSS = refreshedPost.videoCSS ?? post.videoCSS;
-                      const enableSound = Boolean(settings.enableSound);
+                      const refreshedPost = await checkPost().catch(() => post);
                       if (post.hasVideo || refreshedPost.hasVideo) {
                         callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
-                        if (!videoCSS) {
-                          const fallbackDwell = Math.round(3500 * this.paceScale);
-                          await paceWait(fallbackDwell / (this.paceScale || 1));
-                          return true;
-                        }
-                        if (enableSound && post.postCSS) {
-                          await page
-                            .evaluate((cardSel) => {
-                              const card = document.querySelector(cardSel);
-                              const unmute = card?.querySelector<HTMLElement>(
-                                '[aria-label*="Unmute" i],[aria-label*="取消静音"],[aria-label*="取消靜音"],[aria-label*="開啟聲音"],[aria-label*="开启声音"]',
-                              );
-                              unmute?.click();
-                            }, post.postCSS)
-                            .catch(() => {});
-                        }
-                        try {
-                          await page
-                            .locator(videoCSS)
-                            .first()
-                            .evaluate((el, sound) => {
-                              if (el instanceof HTMLVideoElement) {
-                                if (sound) {
-                                  el.loop = false;
-                                  el.muted = false;
-                                  el.defaultMuted = false;
-                                  if (el.volume < 0.5) el.volume = 0.8;
-                                  if (el.paused && !el.ended) {
-                                    void el.play().catch(() => {
-                                      el.muted = true;
-                                      void el
-                                        .play()
-                                        .then(() => {
-                                          el.muted = false;
-                                          if (el.volume < 0.5) el.volume = 0.8;
-                                        })
-                                        .catch(() => {});
-                                    });
-                                  }
-                                } else {
-                                  el.muted = true;
-                                  if (el.paused && !el.ended) void el.play().catch(() => {});
-                                }
-                              }
-                            }, enableSound);
-                        } catch {}
-                        const stepMs = Math.max(10, Math.round(1000 * this.paceScale));
-                        let offscreenTicks = 0;
-                        let missingPostTicks = 0;
-                        let stalledTicks = 0;
-                        let maxSeenCurrentTime = 0;
-                        while (performance.now() < deadlineMs) {
-                          guard();
-                          await paceWait(stepMs / (this.paceScale || 1));
-                          const nextPost = await checkPost().catch(() => null);
-                          if (!nextPost) {
-                            missingPostTicks += 1;
-                            if (missingPostTicks >= 3) break;
-                            continue;
-                          }
-                          missingPostTicks = 0;
-
-                          let offscreen = false;
-                          const activeVideoCSS = nextPost.videoCSS ?? videoCSS;
-                          if (activeVideoCSS) {
-                            try {
-                              offscreen = await page
-                                .locator(activeVideoCSS)
-                                .first()
-                                .evaluate((el, sound) => {
-                                  if (!(el instanceof HTMLVideoElement)) return false;
-                                  const rect = el.getBoundingClientRect();
-                                  const vh = window.innerHeight || 800;
-                                  const isOff = rect.bottom < vh * 0.25 || rect.top > vh * 0.75;
-                                  if (!isOff) {
-                                    el.muted = !sound;
-                                    if (sound && el.volume < 0.5) el.volume = 0.8;
-                                    if (el.paused && !el.ended) void el.play().catch(() => {});
-                                  }
-                                  return isOff;
-                                }, enableSound);
-                            } catch {
-                              offscreen = false;
-                            }
-                          }
-
-                          if (offscreen) {
-                            offscreenTicks += 1;
-                            if (
-                              offscreenTicks >= 5 &&
-                              performance.now() < deadlineMs &&
-                              activeVideoCSS
-                            ) {
-                              await centerBumperControl(
-                                page.locator(activeVideoCSS).first(),
-                                this.paceScale,
-                              ).catch(() => {});
-                              try {
-                                await page
-                                  .locator(activeVideoCSS)
-                                  .first()
-                                  .evaluate((el, sound) => {
-                                    if (el instanceof HTMLVideoElement) {
-                                      el.muted = !sound;
-                                      if (sound && el.volume < 0.5) el.volume = 0.8;
-                                      if (el.paused && !el.ended) void el.play().catch(() => {});
-                                    }
-                                  }, enableSound);
-                              } catch {}
-                              offscreenTicks = 0;
-                            }
-                          } else {
-                            offscreenTicks = 0;
-                          }
-
-                          if (nextPost.videoPaused === true && !nextPost.videoEnded) {
-                            stalledTicks += 1;
-                            if (activeVideoCSS) {
-                              await centerBumperControl(
-                                page.locator(activeVideoCSS).first(),
-                                this.paceScale,
-                              ).catch(() => {});
-                              try {
-                                await page
-                                  .locator(activeVideoCSS)
-                                  .first()
-                                  .evaluate((el, sound) => {
-                                    if (el instanceof HTMLVideoElement) {
-                                      el.muted = !sound;
-                                      if (sound && el.volume < 0.5) el.volume = 0.8;
-                                      if (el.paused && !el.ended) void el.play().catch(() => {});
-                                    }
-                                  }, enableSound);
-                              } catch {}
-                            }
-                            if (stalledTicks >= 4) break;
-                          } else {
-                            stalledTicks = 0;
-                          }
-
-                          if (
-                            typeof nextPost.videoCurrentTime === 'number' &&
-                            nextPost.videoCurrentTime > maxSeenCurrentTime
-                          ) {
-                            maxSeenCurrentTime = nextPost.videoCurrentTime;
-                          }
-                          const durationReached =
-                            typeof nextPost.videoDuration === 'number' &&
-                            nextPost.videoDuration >= 2 &&
-                            (maxSeenCurrentTime >= Math.max(0.5, nextPost.videoDuration - 1.2) ||
-                              (typeof nextPost.videoCurrentTime === 'number' &&
-                                nextPost.videoCurrentTime >=
-                                  Math.max(0.5, nextPost.videoDuration - 1.2)));
-                          const loopedAfterPlay =
-                            maxSeenCurrentTime >= 3 &&
-                            typeof nextPost.videoCurrentTime === 'number' &&
-                            nextPost.videoCurrentTime + 1.5 < maxSeenCurrentTime;
-                          if (
-                            nextPost.videoEnded === true ||
-                            durationReached ||
-                            loopedAfterPlay ||
-                            performance.now() >= deadlineMs
-                          ) {
-                            break;
-                          }
-                        }
-                        if (enableSound) {
-                          if (videoCSS) {
-                            try {
-                              await page
-                                .locator(videoCSS)
-                                .first()
-                                .evaluate((el) => {
-                                  if (el instanceof HTMLVideoElement) el.muted = true;
-                                });
-                            } catch {}
-                          }
-                          await page
-                            .evaluate(() => {
-                              for (const v of Array.from(document.querySelectorAll('video')))
-                                v.muted = true;
-                            })
-                            .catch(() => {});
-                        }
+                        await watchBumperVideo({
+                          page,
+                          initial: refreshedPost,
+                          readCurrent: checkPost,
+                          guard,
+                          sleep: (ms) => paceWait(ms / (this.paceScale || 1)),
+                          sound: Boolean(settings.enableSound),
+                          budgetMs: maxWatchMs,
+                          tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
+                          stallMs: Math.max(120, Math.round(12000 * this.paceScale)),
+                        });
                       } else {
                         callbacks.status(
                           `正在浏览目标帖子 · ${group.name} · ${target.name}`,
@@ -3110,12 +3204,15 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       return true;
                     },
                     async () => true,
-                  );
+                  ).catch((error) => {
+                    if (!callbacks.cancelled())
+                      callbacks.issue?.({
+                        kind: 'failed',
+                        reason: error instanceof Error ? error.message : String(error),
+                      });
+                    throw error;
+                  });
                   callbacks.status(`正在顶贴 · ${group.name} · ${target.name}`, q.today);
-                  if (scanOnly) {
-                    callbacks.status('只读扫描 · ' + post.postId);
-                    continue;
-                  }
                   let hydratedPost = await checkPost();
                   if (wantLike && !hydratedPost.liked && !hydratedPost.likeCSS) {
                     const bottomAnchor =
@@ -3133,19 +3230,50 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       hydratedPost = await checkPost().catch(() => hydratedPost);
                     }
                   }
+                  const readReactionPost = async () => {
+                    const current = await checkPost();
+                    if (current.reactionState !== 'unknown') return current;
+                    const fresh = await readBumperReactionFromServer(page, {
+                      actorId: accountId,
+                      postId: post.postId,
+                      feedbackId: current.feedbackId ?? '',
+                    });
+                    guard();
+                    if (fresh.state === 'unknown') throw Error('点赞状态暂未读清，未点击当前帖');
+                    return {
+                      ...current,
+                      reactionState: fresh.state,
+                      liked: fresh.state === 'active',
+                    };
+                  };
+                  if (wantLike && hydratedPost.reactionState === 'unknown')
+                    hydratedPost = await readReactionPost();
                   const doLike = wantLike && !hydratedPost.liked && !!hydratedPost.likeCSS;
                   if (doLike) {
+                    const reactionPool = settings.reactionTypes?.length
+                      ? settings.reactionTypes
+                      : (['care'] as const);
+                    const selectedReaction = settings.useLongPressReaction
+                      ? (reactionPool[Math.floor(Math.random() * reactionPool.length)] ?? 'care')
+                      : 'like';
+                    const expectedReactionId = BUMPER_REACTION_IDS[selectedReaction];
+                    const likePressBefore = conn.submissionCalls?.mousePress;
                     const native = observeBumperGraphql(page, {
                       actorId: accountId,
                       feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
                       kind: 'like',
+                      profileId,
+                      postId: post.postId,
+                      expectedReactionId,
                     });
                     try {
                       await op(
                         '点赞',
                         async () => {
-                          const current = await checkPost();
+                          const current = await readReactionPost();
                           if (current.liked) return false;
+                          if (current.reactionState === 'unknown')
+                            throw Error('点赞状态暂未读清，未点击当前帖');
                           if (!current.likeCSS) throw Error('点赞入口未找到');
                           const performLikeOrReaction = async (likeSelector: string) => {
                             let activeLikeSelector = likeSelector;
@@ -3163,451 +3291,63 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                                 activeLikeSelector = afterScroll.likeCSS;
                               }
                             }
-                            if (settings.useLongPressReaction === true) {
-                              const pool =
-                                settings.reactionTypes && settings.reactionTypes.length > 0
-                                  ? settings.reactionTypes
-                                  : (['care'] as const);
-                              const chosenType =
-                                pool[Math.floor(Math.random() * pool.length)] ?? 'care';
-                              const reactionMap: Record<
-                                string,
-                                { id: number; index: number; labels: string[] }
-                              > = {
-                                like: {
-                                  id: 1,
-                                  index: 0,
-                                  labels: [
-                                    'like',
-                                    '赞',
-                                    '讚',
-                                    'thích',
-                                    'ถูกใจ',
-                                    'ကြိုက်တယ်',
-                                    'suka',
-                                  ],
-                                },
-                                love: {
-                                  id: 2,
-                                  index: 1,
-                                  labels: [
-                                    'love',
-                                    '大爱',
-                                    '大心',
-                                    '超愛',
-                                    '超爱',
-                                    'yêu thích',
-                                    'รักเลย',
-                                    'အရမ်းကြိုက်တယ်',
-                                    'super',
-                                  ],
-                                },
-                                care: {
-                                  id: 16,
-                                  index: 2,
-                                  labels: [
-                                    'care',
-                                    '抱抱',
-                                    '加油',
-                                    'thương thương',
-                                    'ห่วงใย',
-                                    'ဂရုစိုက်တယ်',
-                                    'peduli',
-                                  ],
-                                },
-                                haha: {
-                                  id: 4,
-                                  index: 3,
-                                  labels: ['haha', '哈', '笑趴', 'ฮ่าๆ', 'ဟားဟား'],
-                                },
-                                wow: {
-                                  id: 3,
-                                  index: 4,
-                                  labels: ['wow', '哇', 'ว้าว', 'ဝိုး'],
-                                },
-                                sad: {
-                                  id: 7,
-                                  index: 5,
-                                  labels: [
-                                    'sad',
-                                    '心碎',
-                                    '呜',
-                                    '嗚',
-                                    '心疼',
-                                    'buồn',
-                                    'เศร้า',
-                                    'ဝမ်းနည်းတယ်',
-                                    'sedih',
-                                  ],
-                                },
-                                angry: {
-                                  id: 8,
-                                  index: 6,
-                                  labels: [
-                                    'angry',
-                                    '怒',
-                                    'phẫn nộ',
-                                    'โกรธ',
-                                    'ဒေါသထွက်တယ်',
-                                    'marah',
-                                  ],
-                                },
-                              };
-                              const baseSpec = reactionMap[chosenType] ?? {
-                                id: 16,
-                                index: 2,
-                                labels: ['care', '抱抱', '加油', 'ဂရုစိုက်တယ်'],
-                              };
-                              const target = {
-                                key: chosenType,
-                                ...baseSpec,
-                              };
-                              const triggerReactionHover = async (
-                                sel: string,
-                              ): Promise<boolean> => {
-                                await page
-                                  .locator(sel)
-                                  .first()
-                                  .hover({ timeout: 3000 })
-                                  .catch(() => {});
-                                const dispatched = await page
-                                  .evaluate((s) => {
-                                    const el = document.querySelector<HTMLElement>(s);
-                                    if (!el) return false;
-                                    const r = el.getBoundingClientRect();
-                                    const evInit: PointerEventInit = {
-                                      bubbles: true,
-                                      cancelable: true,
-                                      composed: true,
-                                      pointerType: 'mouse',
-                                      isPrimary: true,
-                                      relatedTarget: document.body,
-                                      clientX: r.left + r.width / 2,
-                                      clientY: r.top + r.height / 2,
-                                    };
-                                    el.dispatchEvent(new PointerEvent('pointerover', evInit));
-                                    el.dispatchEvent(new PointerEvent('pointerenter', evInit));
-                                    el.dispatchEvent(new MouseEvent('mouseover', evInit));
-                                    return true;
-                                  }, sel)
-                                  .catch(() => false);
-                                return dispatched === true;
-                              };
-
-                              let hovered = await triggerReactionHover(activeLikeSelector);
-                              if (!hovered) {
-                                const rehydrated = await checkPost().catch(() => null);
-                                if (rehydrated?.liked) return;
-                                if (rehydrated?.likeCSS) {
-                                  activeLikeSelector = rehydrated.likeCSS;
-                                  hovered = await triggerReactionHover(activeLikeSelector);
-                                }
-                              }
-
-                              const totalWaitMs = Math.max(
-                                80,
-                                Math.round(1400 * (this.paceScale || 1)),
-                              );
-                              const stepWaitMs = Math.max(
-                                20,
-                                Math.round(220 * (this.paceScale || 1)),
-                              );
-                              if (this.paceScale > 0) {
-                                await wait(Math.min(stepWaitMs, Math.round(350 * this.paceScale)));
-                              }
-                              const pollStart = Date.now();
-                              let rehoveredMidway = false;
-                              let foundReactionTarget = false;
-                              let attempt = 0;
-
-                              while (attempt === 0 || Date.now() - pollStart < totalWaitMs) {
-                                attempt += 1;
+                            if (selectedReaction !== 'like') {
+                              const hover = async () => {
                                 guard();
-                                foundReactionTarget = await page
-                                  .evaluate((spec) => {
-                                    document
-                                      .querySelectorAll('[data-wb-bumper-reaction-target]')
-                                      .forEach((n) =>
-                                        n.removeAttribute('data-wb-bumper-reaction-target'),
-                                      );
-                                    const isVis = (el: Element) => {
-                                      const r = el.getBoundingClientRect();
-                                      if (r.width <= 0 || r.height <= 0) return false;
-                                      const s = getComputedStyle(el);
-                                      return (
-                                        s.display !== 'none' &&
-                                        s.visibility !== 'hidden' &&
-                                        s.opacity !== '0'
-                                      );
-                                    };
-                                    const readFiberChain = (
-                                      el: Element,
-                                      maxDepth = 16,
-                                    ): Array<{ name: string; props: Record<string, unknown> }> => {
-                                      const key = Object.keys(el).find(
-                                        (k) =>
-                                          k.startsWith('__reactFiber$') ||
-                                          k.startsWith('__reactInternalInstance$') ||
-                                          k.startsWith('__reactProps$'),
-                                      );
-                                      if (!key) return [];
-                                      const out: Array<{
-                                        name: string;
-                                        props: Record<string, unknown>;
-                                      }> = [];
-                                      let cur: unknown = Reflect.get(el, key);
-                                      for (let depth = 0; cur && depth < maxDepth; depth++) {
-                                        if (typeof cur !== 'object' || cur === null) break;
-                                        const typeVal =
-                                          Reflect.get(cur, 'type') ??
-                                          Reflect.get(cur, 'elementType');
-                                        const name =
-                                          typeof typeVal === 'function' ||
-                                          (typeof typeVal === 'object' && typeVal !== null)
-                                            ? String(
-                                                Reflect.get(typeVal, 'displayName') ??
-                                                  Reflect.get(typeVal, 'name') ??
-                                                  '',
-                                              )
-                                            : typeof typeVal === 'string'
-                                              ? typeVal
-                                              : '';
-                                        const propsRaw =
-                                          Reflect.get(cur, 'memoizedProps') ??
-                                          Reflect.get(cur, 'pendingProps') ??
-                                          (key.startsWith('__reactProps$') ? cur : null);
-                                        const props =
-                                          typeof propsRaw === 'object' && propsRaw !== null
-                                            ? (propsRaw as Record<string, unknown>)
-                                            : {};
-                                        out.push({ name, props });
-                                        cur = Reflect.get(cur, 'return');
-                                      }
-                                      return out;
-                                    };
-
-                                    const summaryAriaRx =
-                                      /查看|心情的用户|Who reacted|See who reacted|អ្នកដែលបាន|ผู้ที่แสดงความรู้สึก|တုံ့ပြန်ခဲ့သူများ/i;
-                                    const isTopReactionsSummary = (el: Element): boolean => {
-                                      const tb = el.closest('[role="toolbar"]') ?? el;
-                                      const tbAria = (tb.getAttribute('aria-label') ?? '').trim();
-                                      if (summaryAriaRx.test(tbAria)) return true;
-                                      const checkChain = (node: Element) =>
-                                        readFiberChain(node, 16).some((f) =>
-                                          /CometUFITopReactionsRenderer|CometUFIClassicTopReactions/i.test(
-                                            f.name,
-                                          ),
-                                        );
-                                      return checkChain(el) || (tb !== el && checkChain(tb));
-                                    };
-
-                                    const allToolbars = Array.from(
-                                      document.querySelectorAll<HTMLElement>('[role="toolbar"]'),
-                                    ).filter((tb) => isVis(tb) && !isTopReactionsSummary(tb));
-
-                                    const fiberDockToolbars = allToolbars.filter((tb) => {
-                                      if (
-                                        readFiberChain(tb, 16).some((f) =>
-                                          /CometUFIReactionsMenuDock/i.test(f.name),
-                                        )
-                                      ) {
-                                        return true;
-                                      }
-                                      const firstBtn =
-                                        tb.querySelector<HTMLElement>('[role="button"]');
-                                      return Boolean(
-                                        firstBtn &&
-                                        readFiberChain(firstBtn, 16).some((f) =>
-                                          /CometUFIReactionsMenuDock|CometUFIReactionStrategy/i.test(
-                                            f.name,
-                                          ),
-                                        ),
-                                      );
-                                    });
-
-                                    const geometryDockToolbars = allToolbars.filter((tb) => {
-                                      if (summaryAriaRx.test(tb.getAttribute('aria-label') ?? '')) {
-                                        return false;
-                                      }
-                                      const btns = Array.from(
-                                        tb.querySelectorAll<HTMLElement>('[role="button"]'),
-                                      ).filter((b) => {
-                                        if (!isVis(b) || isTopReactionsSummary(b)) return false;
-                                        const r = b.getBoundingClientRect();
-                                        return (
-                                          r.width >= 26 &&
-                                          r.width <= 68 &&
-                                          r.height >= 26 &&
-                                          r.height <= 68
-                                        );
-                                      });
-                                      if (btns.length < 6 || btns.length > 7) return false;
-                                      const firstRect = btns[0]?.getBoundingClientRect();
-                                      return Boolean(
-                                        firstRect &&
-                                        btns.every(
-                                          (b) =>
-                                            Math.abs(
-                                              b.getBoundingClientRect().top - firstRect.top,
-                                            ) < 20,
-                                        ),
-                                      );
-                                    });
-
-                                    const dockToolbars =
-                                      fiberDockToolbars.length > 0
-                                        ? fiberDockToolbars
-                                        : geometryDockToolbars;
-                                    if (dockToolbars.length === 0) return false;
-
-                                    const dockButtons: HTMLElement[] = [];
-                                    for (const tb of dockToolbars) {
-                                      for (const b of Array.from(
-                                        tb.querySelectorAll<HTMLElement>('[role="button"]'),
-                                      )) {
-                                        if (!isVis(b) || isTopReactionsSummary(b)) continue;
-                                        const r = b.getBoundingClientRect();
-                                        if (
-                                          r.width >= 26 &&
-                                          r.width <= 68 &&
-                                          r.height >= 26 &&
-                                          r.height <= 68
-                                        ) {
-                                          dockButtons.push(b);
-                                        }
-                                      }
-                                    }
-                                    if (dockButtons.length === 0) return false;
-
-                                    // 1. Fiber exact match (depth < 16): reactionID / reactionType / reactionName
-                                    for (const btn of dockButtons) {
-                                      const frames = readFiberChain(btn, 16);
-                                      const matched = frames.some((f) => {
-                                        const reactionObj = f.props.reaction;
-                                        const nestedId =
-                                          typeof reactionObj === 'object' && reactionObj !== null
-                                            ? (Reflect.get(reactionObj, 'reactionID') ??
-                                              Reflect.get(reactionObj, 'reactionType') ??
-                                              Reflect.get(reactionObj, 'type'))
-                                            : undefined;
-                                        const rid = Number(
-                                          f.props.reactionID ?? f.props.reactionType ?? nestedId,
-                                        );
-                                        const rname = String(f.props.reactionName ?? '')
-                                          .trim()
-                                          .toLowerCase();
-                                        return (
-                                          rid === spec.id ||
-                                          (rname.length > 0 && rname === spec.key.toLowerCase())
-                                        );
-                                      });
-                                      if (matched) {
-                                        btn.setAttribute('data-wb-bumper-reaction-target', '1');
-                                        return true;
-                                      }
-                                    }
-
-                                    // 2. Exact aria-label match (strict equality only, never substring)
-                                    const lowerLabels = spec.labels.map((l) => l.toLowerCase());
-                                    for (const btn of dockButtons) {
-                                      const aria = (btn.getAttribute('aria-label') ?? '')
-                                        .trim()
-                                        .toLowerCase();
-                                      if (aria && lowerLabels.some((lbl) => aria === lbl)) {
-                                        btn.setAttribute('data-wb-bumper-reaction-target', '1');
-                                        return true;
-                                      }
-                                    }
-
-                                    // 3. Dock toolbar fixed slot index fallback (6 or 7 buttons)
-                                    for (const tb of dockToolbars) {
-                                      const btns = Array.from(
-                                        tb.querySelectorAll<HTMLElement>('[role="button"]'),
-                                      ).filter((b) => {
-                                        if (!isVis(b) || isTopReactionsSummary(b)) return false;
-                                        const r = b.getBoundingClientRect();
-                                        return (
-                                          r.width >= 26 &&
-                                          r.width <= 68 &&
-                                          r.height >= 26 &&
-                                          r.height <= 68
-                                        );
-                                      });
-                                      if (btns.length === 7 || btns.length === 6) {
-                                        btns.sort(
-                                          (a, b) =>
-                                            a.getBoundingClientRect().left -
-                                            b.getBoundingClientRect().left,
-                                        );
-                                        const sixSlotMap: Record<string, number> = {
-                                          like: 0,
-                                          love: 1,
-                                          care: 1,
-                                          haha: 2,
-                                          wow: 3,
-                                          sad: 4,
-                                          angry: 5,
-                                        };
-                                        const idx =
-                                          btns.length === 6
-                                            ? (sixSlotMap[spec.key] ?? spec.index)
-                                            : spec.index;
-                                        const chosenBtn = btns[idx];
-                                        if (chosenBtn) {
-                                          chosenBtn.setAttribute(
-                                            'data-wb-bumper-reaction-target',
-                                            '1',
-                                          );
-                                          return true;
-                                        }
-                                      }
-                                    }
-                                    return false;
-                                  }, target)
-                                  .catch(() => false);
-
-                                if (foundReactionTarget) break;
+                                await page
+                                  .locator(activeLikeSelector)
+                                  .first()
+                                  .hover({ timeout: 3000 });
+                              };
+                              await hover();
+                              const deadline =
+                                Date.now() + Math.max(80, Math.round(1800 * (this.paceScale || 1)));
+                              let target: string | null = null,
+                                rehovered = false;
+                              do {
+                                guard();
+                                target = await page.evaluate(projectBumperReactionTarget, {
+                                  postId: post.postId,
+                                  feedbackId: current.feedbackId ?? '',
+                                  reactionId: expectedReactionId,
+                                });
+                                if (target) break;
                                 if (this.paceScale === 0) break;
-                                if (
-                                  !rehoveredMidway &&
-                                  Date.now() - pollStart >= Math.floor(totalWaitMs / 2)
-                                ) {
-                                  rehoveredMidway = true;
-                                  const refreshed = await checkPost().catch(() => null);
-                                  if (refreshed?.liked) return;
-                                  if (refreshed?.likeCSS) {
-                                    activeLikeSelector = refreshed.likeCSS;
-                                  }
-                                  await triggerReactionHover(activeLikeSelector);
+                                if (!rehovered && Date.now() > deadline - 800) {
+                                  rehovered = true;
+                                  await hover();
                                 }
-                                await wait(stepWaitMs);
-                              }
-
-                              if (foundReactionTarget) {
-                                try {
-                                  await page
-                                    .locator('[data-wb-bumper-reaction-target="1"]')
-                                    .first()
-                                    .click({ timeout: 5000 });
-                                  return;
-                                } catch {
-                                  // fall through to direct click on like button
-                                }
-                              }
+                                await wait(180);
+                              } while (Date.now() < deadline);
+                              if (!target) throw Error('所选反应按钮未就绪，未改用其他反应');
+                              const beforeReactionPress = await readReactionPost();
+                              if (beforeReactionPress.liked) return;
+                              if (beforeReactionPress.reactionState === 'unknown')
+                                throw Error('点赞状态暂未读清，未点击当前帖');
+                              await page.locator(target).first().click({ timeout: 4000 });
+                              return;
                             }
+                            const beforePress = await readReactionPost();
+                            if (beforePress.liked) return;
+                            if (beforePress.reactionState === 'unknown')
+                              throw Error('点赞状态暂未读清，未点击当前帖');
                             await page.locator(activeLikeSelector).first().click({ timeout: 4000 });
                           };
                           try {
                             await performLikeOrReaction(current.likeCSS);
-                          } catch {
-                            // React 重渲染导致选择器失效：重新读取后重试一次
+                          } catch (error) {
+                            if (conn.submissionCalls?.mousePress !== likePressBefore) throw error;
+                            // Retry a stale selector only when no press was dispatched.
                             guard();
                             const retried = await checkPost();
                             if (retried.liked) return false;
                             if (!retried.likeCSS) throw Error('点赞入口未找到');
                             await performLikeOrReaction(retried.likeCSS);
                           }
-                          return true;
+                          return (
+                            likePressBefore === undefined ||
+                            conn.submissionCalls.mousePress > likePressBefore
+                          );
                         },
                         async (clicked) => {
                           if (!clicked) return true;
@@ -3616,12 +3356,41 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                             guard();
                             if (native.restricted())
                               throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
-                            if (native.confirmed() || (await checkPost()).liked) {
+                            if (native.failed()) throw Error(native.failureReason());
+                            if (native.confirmed()) {
                               record.liked = true;
                               consecutiveUnconfirmed = 0;
                               return true;
                             }
                             await wait(250);
+                          }
+                          const fresh = await readBumperReactionFromServer(page, {
+                            actorId: accountId,
+                            postId: post.postId,
+                            feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
+                          });
+                          guard();
+                          if (native.restricted())
+                            throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
+                          if (native.failed()) throw Error(native.failureReason());
+                          if (
+                            native.confirmed() ||
+                            (fresh.state === 'active' && fresh.reactionId === expectedReactionId)
+                          ) {
+                            record.liked = true;
+                            consecutiveUnconfirmed = 0;
+                            devDiag.record({
+                              category: 'GROUP_BUMPER',
+                              event: 'BUMPER_LIKE_READBACK',
+                              profileId,
+                              data: {
+                                postId: post.postId,
+                                feedbackId: fresh.feedbackId,
+                                reactionId: fresh.reactionId,
+                                state: fresh.state,
+                              },
+                            });
+                            return true;
                           }
                           consecutiveUnconfirmed++;
                           return false;
@@ -3629,11 +3398,12 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         async (value, binding, resolution) => {
                           if (record.liked) return persist(value, binding, resolution);
                         },
+                        (binding) => native.bindOperation(binding.operationId),
                       );
                     } finally {
                       await native.close();
                     }
-                    await dismissUnexpectedFacebookOverlays(page);
+                    await dismissWelcomeDialogIfNeeded();
                   }
                   if (doLike && chosen) {
                     await paceWait(3500 + Math.floor(Math.random() * 4001));
@@ -3712,12 +3482,13 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         },
                         async () => true,
                       );
-                      const before = new Set((await checkPost()).comments.map((c) => c.id));
                       const native = observeBumperGraphql(page, {
                         actorId: accountId,
                         feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
                         kind: 'comment',
                         comment: chosen.text,
+                        profileId,
+                        postId: post.postId,
                       });
                       try {
                         await op(
@@ -3729,60 +3500,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                               .locator(activeEditor)
                               .first()
                               .press('Enter', { timeout: 4000 });
-                            const totalPollMs = Math.max(
-                              80,
-                              Math.round(1800 * (this.paceScale || 1)),
-                            );
-                            const stepPollMs = Math.max(
-                              20,
-                              Math.round(180 * (this.paceScale || 1)),
-                            );
-                            const pollDeadline = Date.now() + totalPollMs;
-                            let editorCleared = false;
-                            while (Date.now() < pollDeadline) {
-                              guard();
-                              if (native.confirmed()) return true;
-                              editorCleared = await page
-                                .evaluate((editorSel) => {
-                                  const ed = document.querySelector<HTMLElement>(editorSel);
-                                  if (!ed) return true;
-                                  const txt = (ed.innerText ?? ed.textContent ?? '')
-                                    .replace(/[\u200B-\u200D\uFEFF]/g, '')
-                                    .replace(/\s+/g, ' ')
-                                    .trim();
-                                  return txt.length === 0;
-                                }, activeEditor)
-                                .catch(() => false);
-                              if (editorCleared) return true;
-                              if (this.paceScale === 0) break;
-                              await wait(stepPollMs);
-                            }
-                            if (!native.confirmed() && !editorCleared) {
-                              const clickedSubmit = await page
-                                .evaluate((editorSel) => {
-                                  const ed = document.querySelector<HTMLElement>(editorSel);
-                                  const scope =
-                                    ed?.closest('form') ??
-                                    ed?.closest('[role="dialog"]') ??
-                                    ed?.parentElement;
-                                  const btn = scope?.querySelector<HTMLElement>(
-                                    '#focused-state-composer-submit [role="button"]:not([aria-disabled="true"]), #focused-state-composer-submit button:not([disabled])',
-                                  );
-                                  if (btn && btn.getBoundingClientRect().width > 0) {
-                                    btn.click();
-                                    return true;
-                                  }
-                                  return false;
-                                }, activeEditor)
-                                .catch(() => false);
-                              if (!clickedSubmit) {
-                                await page
-                                  .locator(activeEditor)
-                                  .first()
-                                  .press('Enter', { timeout: 2000 })
-                                  .catch(() => {});
-                              }
-                            }
+                            // Dispatch once. A slow native response is not permission to resubmit.
                             return true;
                           },
                           async () => {
@@ -3791,16 +3509,8 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                               guard();
                               if (native.restricted())
                                 throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
-                              if (
-                                native.confirmed() ||
-                                (await checkPost()).comments.some(
-                                  (c) =>
-                                    !before.has(c.id) &&
-                                    c.authorId === accountId &&
-                                    normalizeBumperComment(c.text) ===
-                                      normalizeBumperComment(chosen?.text ?? ''),
-                                )
-                              ) {
+                              if (native.failed()) throw Error(native.failureReason());
+                              if (native.confirmed()) {
                                 record.commentText = chosen?.text ?? null;
                                 consecutiveUnconfirmed = 0;
                                 return true;
@@ -3811,12 +3521,13 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                             return false;
                           },
                           persist,
+                          (binding) => native.bindOperation(binding.operationId),
                         );
                       } finally {
                         await native.close();
                       }
                     } finally {
-                      await dismissUnexpectedFacebookOverlays(page);
+                      await dismissWelcomeDialogIfNeeded();
                     }
                   }
                   if (record.liked || record.commentText) {
@@ -3826,7 +3537,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   guard();
                   if (isBumperFatal(error)) throw error;
                   if (consecutiveUnconfirmed >= 3) {
-                    throw new BumperFatalError('连续 3 次互动未生效，疑似受限已保护性停止');
+                    throw new BumperFatalError(
+                      '连续 3 次互动结果未确认，本轮已结束，原操作保留待核对',
+                    );
                   }
                   devDiag.record({
                     level: 'WARN',
@@ -3837,7 +3550,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     data: { groupId: group.id, postId: post.postId },
                   });
                 } finally {
-                  await dismissUnexpectedFacebookOverlays(page);
+                  await dismissWelcomeDialogIfNeeded();
                   if (quotaReserved) {
                     this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
                   }
@@ -3905,8 +3618,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           guard();
           if (isBumperFatal(error)) throw error;
           skippedGroups++;
+          if (error instanceof BumperGroupSkipped) expectedGroupSkips++;
           lastGroupError = error instanceof Error ? error.message : String(error);
-          callbacks.status('跳过小组 · ' + group.name);
+          callbacks.status('跳过小组 · ' + group.name + ' · ' + lastGroupError);
           devDiag.record({
             level: 'WARN',
             category: 'GROUP_BUMPER',
@@ -3918,7 +3632,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         }
         await paceWait(4500 + Math.floor(Math.random() * 5001));
       }
-      if (!quotaReached && groupsEntered === 0 && skippedGroups > 0)
+      if (!quotaReached && groupsEntered === 0 && skippedGroups > expectedGroupSkips)
         throw new Error(`全部小组执行异常：${lastGroupError || '页面未就绪'}`);
       if (scanOnly) callbacks.status('已完成 · 0 次（只读扫描，无互动）');
       if (!quotaReached && !scanOnly) {

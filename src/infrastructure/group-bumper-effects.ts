@@ -63,6 +63,7 @@ export interface BumperPost {
   timeText: string;
   feedbackId: string | null;
   liked: boolean;
+  reactionState?: 'active' | 'none' | 'unknown';
   postCSS?: string | null;
   likeCSS: string | null;
   commentCSS: string | null;
@@ -72,6 +73,7 @@ export interface BumperPost {
   videoCurrentTime?: number;
   videoDuration?: number | null;
   videoCSS?: string | null;
+  videoPlayCSS?: string | null;
   videoPaused?: boolean;
   videoReadyState?: number;
   videoCurrentSrc?: string;
@@ -88,9 +90,12 @@ export interface BumperSurface {
   ready: boolean;
   visible: boolean;
   restricted: boolean;
+  restrictionReason?: string;
   loading: boolean;
   groupEntryCSS: string | null;
   groupEntryMatchedBy?: 'id' | 'name' | null;
+  groupJoinState?: 'unknown' | 'can-join' | 'member' | 'pending' | 'questions';
+  blockingDialog?: boolean;
   joinGroupCSS?: string | null;
   welcomeDismissCSS?: string | null;
   posts: BumperPost[];
@@ -253,23 +258,50 @@ export function projectGroupBumper(input: {
     const cached = relayCache.get(id);
     if (cached) return cached;
     for (const f of chain(element, 256)) {
-      const env = obj(obj(f.props.value).environment ?? f.props.environment);
-      if (typeof env.getStore !== 'function') continue;
-      try {
-        const store = obj(Reflect.apply(env.getStore, env, [])),
-          source = obj(
-            typeof store.getSource === 'function'
-              ? Reflect.apply(store.getSource, store, [])
-              : null,
-          );
-        if (typeof source.get === 'function') {
-          const row = obj(Reflect.apply(source.get, source, [id]));
-          relayCache.set(id, row);
-          return row;
-        }
-      } catch {}
+      const environments = [
+        obj(f.props.value).environment,
+        f.props.environment,
+        ...Object.values(obj(f.props.queries)).map((q) => obj(q).environment),
+      ];
+      for (const value of environments) {
+        const env = obj(value);
+        if (typeof env.getStore !== 'function') continue;
+        try {
+          const store = obj(Reflect.apply(env.getStore, env, [])),
+            source = obj(
+              typeof store.getSource === 'function'
+                ? Reflect.apply(store.getSource, store, [])
+                : null,
+            );
+          if (typeof source.get === 'function') {
+            const row = obj(Reflect.apply(source.get, source, [id]));
+            if (Object.keys(row).length) {
+              relayCache.set(id, row);
+              return row;
+            }
+          }
+        } catch {}
+      }
     }
     return {};
+  };
+  const reactionValue = (
+    root: Element,
+    value: unknown,
+    depth = 0,
+  ): 'active' | 'none' | 'unknown' => {
+    if (value === null) return 'none';
+    if (!record(value) || depth > 3) return 'unknown';
+    if (typeof value.__ref === 'string')
+      return reactionValue(root, relayRecord(root, value.__ref), depth + 1);
+    const id = text(value.id ?? obj(value.reaction).id);
+    if (value.reaction_type === 0 || id === '0') return 'none';
+    if (
+      /^[1-9]\d*$/.test(id) ||
+      (typeof value.reaction_type === 'number' && value.reaction_type > 0)
+    )
+      return 'active';
+    return 'unknown';
   };
   const imageURL = (root: Element | null): string | null => {
     if (!root) return null;
@@ -370,45 +402,66 @@ export function projectGroupBumper(input: {
       }
     });
   let joinGroupCSS: string | null = null;
+  let groupJoinState: BumperSurface['groupJoinState'] = 'unknown';
+  const currentGroupIds = new Set([input.groupId.toLowerCase(), ...groupIds]);
+  const groupRefMatches = (props: RecordValue) =>
+    [
+      props.groupID,
+      props.groupId,
+      obj(props.group).id,
+      obj(props.group).__id,
+      obj(props['group$key']).__id,
+    ].some((id) => typeof id === 'string' && currentGroupIds.has(id.toLowerCase()));
   if (/^\/groups\/(?!search(?:\/|$))[^/]+/i.test(location.pathname)) {
-    const headerButtons = Array.from(
+    const headers = Array.from(
       document.querySelectorAll<HTMLElement>(
-        'main [role="button"], main button, [role="main"] [role="button"], [role="main"] button',
+        'main h1,[role="main"] h1,main [role="button"],main button,[role="main"] [role="button"],[role="main"] button',
       ),
     ).filter(
       (el) =>
         visible(el) &&
         ancestorsVisible(el) &&
-        el.getAttribute('aria-disabled') !== 'true' &&
-        !el.closest('[role="feed"], [role="article"], [role="dialog"], [role="navigation"], nav'),
+        !el.closest('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav'),
     );
-    const joinCandidates = headerButtons.filter((el) => {
-      const raw = (el.getAttribute('aria-label') || el.textContent || '')
-        .replace(/\s+/g, ' ')
-        .trim();
+    const joinCandidates: HTMLElement[] = [];
+    for (const el of headers) {
+      for (const gid of currentGroupIds) {
+        const native = relayRecord(el, gid);
+        if (native.__typename !== 'Group' || (native.id !== gid && native.__id !== gid)) continue;
+        const state = text(native.viewer_join_state);
+        if (state === 'MEMBER') groupJoinState = 'member';
+        else if (groupJoinState !== 'member' && /PENDING|REQUESTED/.test(state))
+          groupJoinState = 'pending';
+        else if (groupJoinState === 'unknown' && state === 'CAN_JOIN') groupJoinState = 'can-join';
+      }
       if (
-        /^(?:Joined|已加入|Pending|待审核|待審核|Cancel request|取消请求|取消請求|Invite|邀请|邀請)$/i.test(
-          raw,
-        )
+        !el.matches('[role="button"],button') ||
+        el.getAttribute('aria-disabled') === 'true' ||
+        el.hasAttribute('disabled')
       )
-        return false;
-      if (
-        /^(?:Join group|Join|加入小组|加入小組|加入社團|加入社团|加入群组|加入群組|加入)$/i.test(
-          raw,
+        continue;
+      for (const f of chain(el, 70)) {
+        const marker = text(f.props.testid ?? f.props['data-testid']);
+        const matchedId = /^group-can-join-(\d+)$/.exec(marker)?.[1];
+        const actionRef = text(obj(f.props.action).__id);
+        const actionGroup = /^client:(\d+):join_action\(/.exec(actionRef)?.[1];
+        if (
+          /GroupsCometJoinForumButton/.test(f.name) &&
+          ((matchedId && currentGroupIds.has(matchedId)) ||
+            (actionGroup && currentGroupIds.has(actionGroup)))
         )
-      )
-        return true;
-      return chain(el, 16).some(
-        (f) =>
-          /GroupsCometJoinButton/i.test(f.name) &&
-          !/JOINED|REQUESTED/i.test(String(f.props.joinState ?? f.props.viewerJoinState ?? '')),
-      );
-    });
-    const joinBtn =
-      joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
-    if (joinBtn) {
-      joinBtn.setAttribute('data-wb-bumper-join', '1');
-      joinGroupCSS = '[data-wb-bumper-join="1"]';
+          joinCandidates.push(el);
+      }
+    }
+    // The current Relay membership wins over stale button props after a click.
+    if (groupJoinState === 'unknown' && joinCandidates.length) groupJoinState = 'can-join';
+    if (groupJoinState === 'can-join') {
+      const joinBtn =
+        joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
+      if (joinBtn) {
+        joinBtn.setAttribute('data-wb-bumper-join', '1');
+        joinGroupCSS = '[data-wb-bumper-join="1"]';
+      }
     }
   }
   if (/\/groups\/search|\/search/.test(location.pathname)) {
@@ -534,7 +587,7 @@ export function projectGroupBumper(input: {
   let loading = false;
   document
     .querySelectorAll(
-      '[data-wb-bumper-like],[data-wb-bumper-comment],[data-wb-bumper-open-comment],[data-wb-bumper-video]',
+      '[data-wb-bumper-like],[data-wb-bumper-comment],[data-wb-bumper-open-comment],[data-wb-bumper-video],[data-wb-bumper-video-play]',
     )
     .forEach((e) => {
       for (const attr of [
@@ -542,6 +595,7 @@ export function projectGroupBumper(input: {
         'data-wb-bumper-comment',
         'data-wb-bumper-open-comment',
         'data-wb-bumper-video',
+        'data-wb-bumper-video-play',
       ]) {
         if (!input.targetPostId || e.getAttribute(attr) === input.targetPostId) {
           e.removeAttribute(attr);
@@ -630,23 +684,87 @@ export function projectGroupBumper(input: {
     }
     roots.add(root);
   }
+  // A single-post dialog renders its UFI footer separately from FeedUnitCard.
+  // Bind both to the Story referenced by this dialog's own native query.
+  const singleDialogs = new Map<Element, { story: RecordValue; key: string }>();
+  for (const dialog of Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).filter(
+    visible,
+  )) {
+    const elements = [
+      dialog,
+      ...Array.from(dialog.querySelectorAll('[role="button"],[role="textbox"],a[href]')).slice(
+        0,
+        100,
+      ),
+    ];
+    for (const element of elements) {
+      const frame = chain(element, 256).find((f) => /CometSinglePostDialogRoot/.test(f.name));
+      const query = obj(obj(frame?.props.queries).singlePostDialogRootQueryReference);
+      const key = text(obj(query.variables).storyID);
+      const env = obj(query.environment);
+      if (!key || typeof env.getStore !== 'function') continue;
+      try {
+        const store = obj(Reflect.apply(env.getStore, env, []));
+        const source = obj(
+          typeof store.getSource === 'function' ? Reflect.apply(store.getSource, store, []) : null,
+        );
+        if (typeof source.get !== 'function') continue;
+        const story = obj(Reflect.apply(source.get, source, [key]));
+        const id = text(story.post_id);
+        if (!/^\d+$/.test(id) || (input.targetPostId && id !== input.targetPostId)) continue;
+        singleDialogs.set(dialog, { story, key });
+        relayCache.set(key, story);
+        const refs = obj(story.actors).__refs;
+        for (const id of [
+          text(obj(story.feedback).__ref),
+          ...(Array.isArray(refs) ? refs.filter((v): v is string => typeof v === 'string') : []),
+        ]) {
+          if (id) relayCache.set(id, obj(Reflect.apply(source.get, source, [id])));
+        }
+        roots.add(dialog);
+        break;
+      } catch {}
+    }
+  }
   const storyRoots = new Map<string | Element, Element>();
   for (const root of roots) {
     const card = cardFor(root);
-    const story = obj(card?.props.story ?? card?.props.feedUnit);
-    const key = text(story.__id ?? story.id) || root;
+    const single = singleDialogs.get(root);
+    const story = single?.story ?? obj(card?.props.story ?? card?.props.feedUnit);
+    const key = single?.key ?? (text(story.__id ?? story.id) || root);
     const previous = storyRoots.get(key);
     if (!previous || root.contains(previous)) storyRoots.set(key, root);
   }
   const articles = Array.from(storyRoots.values()).slice(0, 60);
   const seenPostIds = new Set<string>();
   for (const article of articles) {
-    const primaryCard = cardFor(article);
-    const primaryStory = obj(primaryCard?.props.story ?? primaryCard?.props.feedUnit);
-    const storyKey = text(primaryStory.__id ?? primaryStory.id);
-    const primaryNative = storyKey ? relayRecord(article, storyKey) : {};
+    const single = singleDialogs.get(article);
+    if (input.targetPostId && singleDialogs.size && !single) continue;
+    const primaryCard = single ? undefined : cardFor(article);
+    const primaryStory =
+      single?.story ?? obj(primaryCard?.props.story ?? primaryCard?.props.feedUnit);
+    const storyKey = single?.key ?? text(primaryStory.__id ?? primaryStory.id);
+    const primaryNative = single?.story ?? (storyKey ? relayRecord(article, storyKey) : {});
     const belongsToStory = (el: Element) => {
       if (commentRow(el)) return false;
+      if (single) {
+        const feedback = text(obj(primaryNative.feedback).__ref);
+        const bindings = chain(el, 100)
+          .map((f) =>
+            text(
+              obj(f.props.feedback).id ??
+                obj(f.props.feedback).__id ??
+                f.props.feedbackID ??
+                f.props.feedbackId,
+            ),
+          )
+          .filter(Boolean);
+        if (bindings.length) return !!feedback && bindings[0] === feedback;
+        const owner = cardFor(el);
+        const story = obj(owner?.props.story ?? owner?.props.feedUnit);
+        const key = text(story.__id ?? story.id);
+        return !key || key === storyKey;
+      }
       if (!primaryCard) return true;
       const owner = cardFor(el),
         story = obj(owner?.props.story ?? owner?.props.feedUnit);
@@ -743,6 +861,7 @@ export function projectGroupBumper(input: {
             obj(primaryStory.feedback).__id,
         ) || null,
       liked = false,
+      reactionState: 'active' | 'none' | 'unknown' = 'unknown',
       pinned = false;
     const keepTime = (value: unknown) => {
       const v = label(value).trim();
@@ -819,13 +938,13 @@ export function projectGroupBumper(input: {
     const decodedFbId = decodeId(feedbackId);
     if (decodedFbId && /^\d+$/.test(decodedFbId)) {
       candidatePostIds.add(decodedFbId);
-      postId ??= decodedFbId;
+      if (!storyPostId) postId = decodedFbId;
     }
     if (existingPostId && /^\d+$/.test(existingPostId)) candidatePostIds.add(existingPostId);
     if (postId && /^\d+$/.test(postId)) candidatePostIds.add(postId);
     if (input.targetPostId) {
-      if (!candidatePostIds.has(input.targetPostId)) continue;
-      postId = input.targetPostId;
+      // Links, attachments and old markers cannot rename a different native Story.
+      if (postId !== input.targetPostId) continue;
     }
     if (!postId || !/^\d+$/.test(postId)) continue;
     if (seenPostIds.has(postId)) continue;
@@ -884,18 +1003,23 @@ export function projectGroupBumper(input: {
           if (el.getAttribute('data-ad-rendering-role') === 'like_button' || !like) like = el;
           const fb = obj(f.props.feedback),
             native = feedbackId ? relayRecord(el, feedbackId) : {};
-          liked ||=
-            obj(fb.viewer_feedback_reaction_info).reaction_type != null ||
+          // The argument-qualified field belongs to the current actor. A cached
+          // default-actor reaction must not override an explicit current-actor null.
+          const nativeKey = [
+            'viewer_feedback_reaction_info(use_default_actor:false)',
+            'viewer_feedback_reaction_info',
+          ].find((key) => Object.prototype.hasOwnProperty.call(native, key));
+          if (nativeKey) reactionState = reactionValue(el, native[nativeKey]);
+          else if (Object.prototype.hasOwnProperty.call(fb, 'viewer_feedback_reaction_info'))
+            reactionState = reactionValue(el, fb.viewer_feedback_reaction_info);
+          else if (
             f.props.isReacted === true ||
             f.props.selected === true ||
             f.props.isSelected === true ||
-            f.props.pressed === true ||
-            Object.entries(native).some(
-              ([k, v]) =>
-                (k === 'viewer_feedback_reaction_info' ||
-                  k.startsWith('viewer_feedback_reaction_info(')) &&
-                v != null,
-            );
+            f.props.pressed === true
+          )
+            reactionState = 'active';
+          liked = reactionState === 'active';
         }
         if (/CometUFICommentAction/.test(f.name) && el.matches('[role="button"],button'))
           openComment = el;
@@ -961,14 +1085,12 @@ export function projectGroupBumper(input: {
       const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).filter(
         (d) =>
           visible(d) &&
-          !/notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') ?? '') &&
           !d.hasAttribute('data-wb-bumper-welcome-dismiss') &&
           !d.querySelector('[data-wb-bumper-welcome-dismiss]'),
       );
       matchedDialog = dialogs
         .filter((d) => {
-          const dialogLinks = Array.from(d.querySelectorAll<HTMLAnchorElement>('a[href]'));
-          if (dialogLinks.some((a) => candidatePostIds.has(linkId(a.href) ?? ''))) return true;
+          if (single && d === article) return true;
           const dialogEls = [
             d,
             ...Array.from(
@@ -983,19 +1105,9 @@ export function projectGroupBumper(input: {
                 if (feedbackId && fid && fid === feedbackId) return true;
                 const story = obj(f.props.story ?? f.props.feedUnit);
                 const sid = decodeId(story.id ?? story.__id) || text(story.post_id);
-                return !!sid && candidatePostIds.has(sid);
+                return sid === postId;
               }),
             )
-          )
-            return true;
-          if (
-            input.targetPostId === postId &&
-            Array.from(
-              d.querySelectorAll<HTMLElement>(
-                '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
-              ),
-            ).filter((el) => !el.closest('[role="banner"]') && !commentRow(el) && visible(el))
-              .length > 0
           )
             return true;
           return false;
@@ -1007,7 +1119,13 @@ export function projectGroupBumper(input: {
             matchedDialog.querySelectorAll<HTMLElement>(
               '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
             ),
-          ).filter((el) => !el.closest('[role="banner"]') && !commentRow(el) && visible(el))[0];
+          ).filter(
+            (el) =>
+              belongsToStory(el) &&
+              !el.closest('[role="banner"]') &&
+              !commentRow(el) &&
+              visible(el),
+          )[0];
         }
         if (!like) {
           like =
@@ -1023,11 +1141,12 @@ export function projectGroupBumper(input: {
     }
     article.setAttribute('data-wb-bumper-post', postId);
     if (like) {
-      liked ||=
-        like.getAttribute('aria-pressed') === 'true' ||
-        /^(?:Remove\s+|Liked|取消赞|取消讚|已赞|已讚|Love|Care|Haha|Wow|Sad|Angry|大爱|大心|超愛|超爱|抱抱|加油|笑趴|哈|哇|心碎|心疼|呜|嗚|怒|အရမ်းကြိုက်တယ်|ဂရုစိုက်တယ်|ဟားဟား|ဝိုး|ဝမ်းနည်းတယ်|ဒေါသထွက်တယ်|Yêu\s*thích|Thương\s*thương|Buồn|Phẫn\s*nộ|รักเลย|ห่วงใย|ฮ่าๆ|ว้าว|เศร้า|โกรธ)/i.test(
-          like.getAttribute('aria-label') ?? '',
-        );
+      if (reactionState === 'unknown' && like.getAttribute('aria-pressed') === 'false')
+        reactionState = 'none';
+      if (reactionState === 'unknown' && like.getAttribute('aria-pressed') === 'true') {
+        reactionState = 'active';
+        liked = true;
+      }
       like.setAttribute('data-wb-bumper-like', postId);
     }
     comment?.setAttribute('data-wb-bumper-comment', postId);
@@ -1074,12 +1193,29 @@ export function projectGroupBumper(input: {
       !!videoEl ||
       frames.some((f) => /CometVideoPlayer|VideoPlayer|TahoeVideo/i.test(f.name)) ||
       !!article.querySelector(
-        '[data-pagelet*="video" i],[aria-label*="Play video" i],[aria-label*="播放视频"],[aria-label*="播放影片"],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
+        '[data-pagelet*="video" i],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
       );
     let hasVideo = false,
       videoCurrentTime = 0,
       videoDuration: number | null = null,
       videoCSS: string | null = null;
+    let videoPlayCSS: string | null = null;
+    const playControl = controls
+      .filter(belongsToStory)
+      .find(
+        (el) =>
+          el.matches('[role="button"],button') &&
+          visible(el) &&
+          chain(el).some(
+            (f) =>
+              (/VideoPlayerPlayButton/.test(f.name) && f.props.isVisible !== false) ||
+              (/VideoPlayerPlaybackControlBase/.test(f.name) && f.props.playbackIcon === 'play'),
+          ),
+      );
+    if (playControl) {
+      playControl.setAttribute('data-wb-bumper-video-play', postId);
+      videoPlayCSS = '[data-wb-bumper-video-play="' + postId + '"]';
+    }
     if (videoEl || hasVideoContainer) {
       hasVideo = true;
       if (videoEl) {
@@ -1144,11 +1280,7 @@ export function projectGroupBumper(input: {
             '/posts/' +
             postId +
             '/',
-      authorId:
-        authorId ??
-        (input.pageId && location.pathname.includes('/user/' + input.pageId + '/')
-          ? input.pageId
-          : null),
+      authorId,
       authorName:
         (primaryActorId ? text(relayRecord(article, primaryActorId).name) : '') ||
         author?.textContent?.trim() ||
@@ -1160,6 +1292,7 @@ export function projectGroupBumper(input: {
       timeText,
       feedbackId,
       liked,
+      reactionState,
       postCSS: '[data-wb-bumper-post="' + postId + '"]',
       likeCSS: like ? '[data-wb-bumper-like="' + postId + '"]' : null,
       commentCSS: comment ? '[data-wb-bumper-comment="' + postId + '"]' : null,
@@ -1173,54 +1306,133 @@ export function projectGroupBumper(input: {
       videoCurrentTime,
       videoDuration,
       videoCSS,
+      videoPlayCSS,
       comments,
     });
   }
-  const restricted = Array.from(document.querySelectorAll('[role="dialog"]'))
-    .filter(visible)
-    .some(
-      (d) =>
-        /Temporarily Blocked|暂时被禁止|限制了某些活动|restrict certain activity|Try Again Later|稍后再试/i.test(
-          d.textContent ?? '',
-        ) ||
-        [d, ...Array.from(d.querySelectorAll('[role="button"],button'))].some((e) =>
-          chain(e).some(
-            (f) =>
-              /GroupsCometFeatureInterventionDialog|Checkpoint|CometErrorDialog|SentryBlockDialog/.test(
-                f.name,
-              ) || JSON.stringify(f.props.testid ?? '').includes('feature-intervention-ok-button'),
+  let restrictionReason: string | undefined;
+  if (posts.length === 0) {
+    const mainText =
+      document.querySelector('main,[role="main"]')?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+    for (const script of Array.from(document.querySelectorAll('script[type="application/json"]'))) {
+      const raw = script.textContent ?? '';
+      if (!raw.includes('CometErrorRoot.react') || !raw.includes('comet.error')) continue;
+      try {
+        const stack: unknown[] = [JSON.parse(raw)];
+        let budget = 25000;
+        while (stack.length && budget-- > 0) {
+          const item = stack.pop();
+          if (!record(item)) continue;
+          const view = obj(item.rootView),
+            props = obj(view.props);
+          if (
+            item.tracePolicy === 'comet.error' &&
+            obj(view.resource).__dr === 'CometErrorRoot.react'
+          ) {
+            const title = text(props.title),
+              body = text(props.body);
+            const routeURL = text(item.url);
+            const sameRoute = !routeURL || new URL(routeURL, location.href).href === location.href;
+            if (sameRoute && title && body && mainText.includes(title) && mainText.includes(body))
+              restrictionReason = title + ' · ' + body;
+          }
+          stack.push(...Object.values(item).filter((v) => v && typeof v === 'object'));
+        }
+      } catch {}
+      if (restrictionReason) break;
+    }
+  }
+  const restricted =
+    !!restrictionReason ||
+    Array.from(
+      document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]'),
+    )
+      .filter(visible)
+      .some(
+        (d) =>
+          !!d.querySelector('[data-testid="feature-intervention-ok-button"]') ||
+          [d, ...Array.from(d.querySelectorAll('[role="button"],button'))].some((e) =>
+            chain(e).some(
+              (f) =>
+                /GroupsCometFeatureInterventionDialog|Checkpoint|CometErrorDialog|SentryBlockDialog/.test(
+                  f.name,
+                ) ||
+                JSON.stringify(f.props.testid ?? '').includes('feature-intervention-ok-button'),
+            ),
           ),
-        ),
-    );
+      );
   let welcomeDismissCSS: string | null = null;
+  let blockingDialog = false;
   if (!restricted) {
-    for (const d of Array.from(document.querySelectorAll('[role="dialog"]')).filter(visible)) {
+    for (const d of Array.from(
+      document.querySelectorAll<HTMLElement>(
+        '[role="dialog"],[role="alertdialog"],[aria-modal="true"]',
+      ),
+    ).filter(visible)) {
+      const rect = d.getBoundingClientRect(),
+        vw = window.innerWidth || 1024,
+        vh = window.innerHeight || 768;
+      const center =
+        rect.left < vw * 0.5 &&
+        rect.right > vw * 0.5 &&
+        rect.top < vh * 0.5 &&
+        rect.bottom > vh * 0.5;
       if (
-        d.querySelector(
-          '[role="checkbox"],[role="textbox"],textarea,input:not([type="hidden"]),[contenteditable="true"]',
-        ) ||
-        /notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') ?? '')
+        d.getAttribute('aria-modal') !== 'true' &&
+        d.getAttribute('role') !== 'alertdialog' &&
+        !center
       )
         continue;
+      // A post's detail/comment dialog is the task surface, not an obstruction.
+      const nodes = [
+        d,
+        ...Array.from(
+          d.querySelectorAll<HTMLElement>('[role="button"],button,[role="textbox"]'),
+        ).slice(0, 120),
+      ];
+      const frames = nodes.flatMap((el) => chain(el, 90));
+      if (
+        frames.some((f) => {
+          const fb = obj(f.props.feedback),
+            fid = text(fb.id ?? fb.__id ?? f.props.feedbackID);
+          return !!fid && posts.some((p) => p.feedbackId === fid);
+        })
+      )
+        continue;
+      const fields = !!d.querySelector(
+        '[role="textbox"],textarea,input:not([type="hidden"]),[role="checkbox"],[role="radio"],[contenteditable="true"]',
+      );
+      const sameGroup = frames.some((f) => groupRefMatches(f.props));
+      const questions = frames.some((f) => /Groups.*MembershipQuestions/.test(f.name));
+      if (questions || (fields && sameGroup && groupJoinState !== 'member'))
+        groupJoinState = 'questions';
+      blockingDialog = true;
+      if (fields || groupJoinState === 'questions') continue;
       const buttons = Array.from(d.querySelectorAll<HTMLElement>('[role="button"],button')).filter(
-        visible,
+        (el) =>
+          visible(el) &&
+          el.getAttribute('aria-disabled') !== 'true' &&
+          !el.hasAttribute('disabled'),
       );
-      const isWelcomeDialog = /欢迎加入|歡迎加入|Welcome to|管理員團隊|管理员团队|Admin team/i.test(
-        d.textContent ?? '',
+      const close = buttons.filter((el) => {
+        const r = el.getBoundingClientRect();
+        const header =
+          r.top >= rect.top - 4 &&
+          r.top - rect.top <= 80 &&
+          (Math.abs(r.left - rect.left) <= 80 || Math.abs(rect.right - r.right) <= 80);
+        return header && chain(el, 30).some((f) => /FDSCircleButton/.test(f.name));
+      });
+      const primary = buttons.filter((el) =>
+        chain(el, 25).some((f) => /FDSButton/.test(f.name) && f.props.type === 'primary'),
       );
-      const continueBtn = buttons.find((b) =>
-        /^(?:继续|繼續|Continue|知道了|Got\s*it|OK|確定|确定)$/i.test(
-          (b.getAttribute('aria-label') || b.textContent || '').trim(),
-        ),
-      );
-      const explicitCloseBtn = buttons.find((b) =>
-        /^(?:Close|关闭|關閉)$/i.test((b.getAttribute('aria-label') || '').trim()),
-      );
-      const closeBtn = isWelcomeDialog
-        ? (continueBtn ?? explicitCloseBtn ?? buttons.at(-1))
-        : (continueBtn ?? explicitCloseBtn);
-      if (closeBtn) {
-        closeBtn.setAttribute('data-wb-bumper-welcome-dismiss', '1');
+      const target =
+        close.length === 1
+          ? close[0]
+          : sameGroup && groupJoinState === 'member' && primary.length === 1
+            ? primary[0]
+            : undefined;
+      if (target) {
+        target.setAttribute('data-wb-bumper-welcome-dismiss', '1');
         welcomeDismissCSS = '[data-wb-bumper-welcome-dismiss="1"]';
         break;
       }
@@ -1299,9 +1511,12 @@ export function projectGroupBumper(input: {
       (posts.length > 0 || !!document.querySelector('main,[role="main"]')),
     visible: document.visibilityState === 'visible',
     restricted,
+    ...(restrictionReason ? { restrictionReason } : {}),
     loading,
     groupEntryCSS,
     groupEntryMatchedBy,
+    groupJoinState,
+    blockingDialog,
     joinGroupCSS,
     welcomeDismissCSS,
     posts,

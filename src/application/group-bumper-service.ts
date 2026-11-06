@@ -101,6 +101,7 @@ export interface BumperRunner {
       cancelled(): boolean;
       status(text: string, today?: number): void;
       added(today: number): void;
+      issue?(issue: { kind: 'pending' | 'failed'; reason: string }): void;
     },
   ): Promise<void>;
   stop(id: string): Promise<void>;
@@ -705,6 +706,9 @@ export class GroupBumperService {
     const stat = targetProfiles.get(id);
     if (!stat) throw Error('BUMPER_PROFILE_STATE_MISSING');
     let failed = false;
+    let pending = 0;
+    let failedActions = 0;
+    let issueReason = '';
     let slot = false;
     const current = () => this.profileRunIds.get(id) === runId;
     try {
@@ -723,6 +727,12 @@ export class GroupBumperService {
             stat.status = text;
             if (today !== undefined) stat.today = today;
           },
+          issue: (issue) => {
+            if (!current() || targetProfiles.get(id) !== stat) return;
+            if (issue.kind === 'pending') pending++;
+            else failedActions++;
+            issueReason = issue.reason;
+          },
           added: (today) => {
             if (!current() || targetProfiles.get(id) !== stat) return;
             stat.session++;
@@ -730,14 +740,26 @@ export class GroupBumperService {
           },
         });
       }
-      if (!stat.status.startsWith('今日已达上限')) {
+      if (pending + failedActions > 0 && !this.cancelled.has(id)) {
+        const detail = [
+          pending ? `${pending} 项待核对` : '',
+          failedActions ? `${failedActions} 项未完成` : '',
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        stat.status = `本轮 ${stat.session} 次已确认 · ${detail} · ${issueReason}`;
+      } else if (!stat.status.startsWith('今日已达上限')) {
         if (this.cancelled.has(id)) stat.status = '已停止';
         else if (stat.session > 0 || !stat.status.startsWith('已完成 · 0 次'))
           stat.status = `已完成 · 本轮 ${stat.session} 次`;
       }
     } catch (e) {
-      failed = true;
-      stat.status = e instanceof Error ? e.message : '顶贴执行失败';
+      failed = !this.cancelled.has(id);
+      stat.status = this.cancelled.has(id)
+        ? '已停止'
+        : e instanceof Error
+          ? e.message
+          : '顶贴执行失败';
     } finally {
       if (slot) {
         if (mode === 'page-bumper') {
@@ -755,10 +777,14 @@ export class GroupBumperService {
             source: mode === 'page-bumper' ? 'page-bumper' : 'group-bumper',
             runId,
             name: mode === 'page-bumper' ? '专页顶贴' : '小组顶贴',
-            state: this.cancelled.has(id) ? 'STOPPED' : failed ? 'FAILED' : 'COMPLETED',
+            state: this.cancelled.has(id)
+              ? 'STOPPED'
+              : failed || pending + failedActions > 0
+                ? 'FAILED'
+                : 'COMPLETED',
             reason: stat.status,
             finishedAt: Date.now(),
-            failedSteps: failed ? 1 : 0,
+            failedSteps: pending + failedActions + (failed ? 1 : 0),
             skippedSteps: 0,
           });
         } catch {}
@@ -776,6 +802,9 @@ export class GroupBumperService {
     const ids = (
       profileIds ?? [...new Set([...this.active, ...this.starting, ...this.admitting])]
     ).filter((id) => !mode || this.modeOf(id) === mode || this.admittingModes.get(id) === mode);
+    const workers = ids
+      .map((id) => this.workers.get(id))
+      .filter((work): work is Promise<void> => work !== undefined);
     for (const id of ids) this.cancelled.add(id);
     await Promise.all(
       ids.map(async (id) => {
@@ -791,6 +820,7 @@ export class GroupBumperService {
         }
       }),
     );
+    await Promise.allSettled(workers);
     return this.state();
   }
 }

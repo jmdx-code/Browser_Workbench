@@ -32,6 +32,7 @@ import {
   type PostExecutionVerdict,
 } from '../shared/post-execution.js';
 import { FACEBOOK_COMPOSER_SCOPE, FACEBOOK_REEL_MAIN } from '../shared/facebook-ui.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
 
 // Decisions never perform input or settle a ledger. The original runner/dispatcher does both.
 // No readiness is inferred from the existence of this class: the real source must be complete.
@@ -470,10 +471,33 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
                                       surface?.phase === 'review-before-submit') &&
                                     reading.text === original.intent.snapshot.text
                               : false;
-    if (!applied)
-      return current < operation.updatedAt || current - operation.updatedAt >= 30_000
-        ? { kind: 'unknown', reason: 'FACEBOOK_POST_EFFECT_UNCONFIRMED' }
-        : { kind: 'wait', reason: 'FACEBOOK_POST_EFFECT_PENDING' };
+    if (!applied) {
+      if (current < operation.updatedAt || current - operation.updatedAt >= 30_000) {
+        const issues = reading.composerIssues ?? [];
+        devDiag.record({
+          level: 'WARN',
+          category: 'TASK_RUNNER',
+          event: 'POST_COMPOSER_EFFECT_UNCONFIRMED',
+          profileId: execution.plan.profileId,
+          planId: execution.plan.id,
+          reason: 'FACEBOOK_POST_EFFECT_UNCONFIRMED',
+          data: {
+            purpose,
+            phase: surface?.phase ?? null,
+            locale: reading.locale,
+            textLength: reading.text?.length ?? null,
+            issues,
+          },
+        });
+        return {
+          kind: 'unknown',
+          reason: (
+            'FACEBOOK_POST_EFFECT_UNCONFIRMED' + (issues.length ? ': ' + issues.join('；') : '')
+          ).slice(0, 200),
+        };
+      }
+      return { kind: 'wait', reason: 'FACEBOOK_POST_EFFECT_PENDING' };
+    }
     return {
       kind: 'verified',
       receipt: PostReceipt.parse({

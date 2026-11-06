@@ -617,6 +617,16 @@ export class SqliteGroupBumperRepository {
         )
         .get(postId, accountId, profileId),
     );
+    const pending = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM group_bumper_operations
+      WHERE post_id=? AND (account_id=? OR profile_id=?)
+        AND action_kind IN ('submit_like','submit_comment')
+        AND (status='PENDING_REVIEW' OR resolution_outcome='ENDED_UNKNOWN') LIMIT 1`,
+        )
+        .get(postId, accountId, profileId),
+    );
     const settings = sourceMode === 'page' ? this.pageSettings() : this.settings();
     return {
       today,
@@ -624,6 +634,7 @@ export class SqliteGroupBumperRepository {
       duplicate,
       allowed:
         !duplicate &&
+        !pending &&
         today < settings.dailyMaxLikesPerAccount &&
         postCount < settings.maxLikesPerPost,
     };
@@ -827,7 +838,8 @@ export class SqliteGroupBumperRepository {
       .prepare(
         `SELECT operation_id, profile_id, account_id, group_id, group_name, page_id, page_name, post_id, action_kind, reason, updated_at
            FROM group_bumper_operations
-          WHERE status = 'PENDING_REVIEW'
+          WHERE action_kind IN ('submit_like','submit_comment')
+            AND (status = 'PENDING_REVIEW' OR resolution_outcome = 'ENDED_UNKNOWN')
           ORDER BY updated_at DESC, operation_id DESC
           LIMIT ?`,
       )

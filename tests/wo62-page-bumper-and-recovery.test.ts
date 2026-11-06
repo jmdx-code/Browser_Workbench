@@ -1,3 +1,4 @@
+import { bumperNativeEvents } from './fixtures/bumper-native-events.js';
 // @vitest-environment happy-dom
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -195,6 +196,7 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
   const liked = new Set<string>();
   let mutations = 0;
 
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     viewportSize: () => ({ width: 1280, height: 800 }),
@@ -203,8 +205,8 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
       return null;
     },
     waitForURL: async () => {},
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: { wheel: async () => {}, move: async () => {} },
     keyboard: { type: async () => {}, insertText: async () => {} },
     evaluate: async (fn: Function, input?: { groupId?: string; targetPostId?: string }) => {
@@ -275,6 +277,7 @@ it('WO62-4: video post with likeCSS=null after watching scrolls bottomAnchor int
         mutations++;
         if (selector === `[data-wb-bumper-like="${postId}"]`) {
           liked.add(postId);
+          nativeEvents.like('10000000001', 'fb-' + postId);
         }
       },
     }),
@@ -538,6 +541,11 @@ it('WO64-2: projectGroupBumper with targetPostId does not skip post when /photo/
   `;
   document.body.append(dialog);
   [dialog, ...dialog.querySelectorAll('*')].forEach(box);
+  Reflect.set(document.getElementById('dialog-editor')!, '__reactFiber$test', {
+    type: { displayName: 'CometUFIComposerInner.react' },
+    memoizedProps: { feedback: { __id: b64Feedback } },
+    return: null,
+  });
 
   const rechecked = projectGroupBumper({
     groupId: '-',

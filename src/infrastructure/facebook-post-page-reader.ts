@@ -10,7 +10,6 @@ import { observeFacebookHomeName } from '../domain/facebook-name-analysis.js';
 import { observeFacebookComposerSurface } from '../domain/facebook-composer-analysis.js';
 import {
   FACEBOOK_UI_COPY,
-  normalizeFacebookUILocale,
   facebookUILabelSelector,
   type FacebookUILocale,
 } from '../shared/facebook-ui.js';
@@ -45,14 +44,23 @@ export async function readFacebookPostPage(
   const dialogLabel = projection.rows.find((row) => row.key === 'composerDialogs')?.nodes[0]
     ?.attributes['aria-label'];
   const dialogCopy = FACEBOOK_UI_COPY.find((copy) => copy.region === dialogLabel);
-  if (
-    dialogLabel &&
-    (!dialogCopy ||
-      (previousLocale && normalizeFacebookUILocale(previousLocale) !== dialogCopy.locale))
-  )
-    throw Error('FACEBOOK_COMPOSER_LOCALE_CONFLICT');
-  const locale = homeCopy?.locale ?? dialogCopy?.locale ?? previousLocale;
+  const locale = dialogCopy?.locale ?? homeCopy?.locale ?? previousLocale;
   const surface = observeFacebookComposerSurface(projection, locale);
+  const composerIssues: string[] = [];
+  for (const [key, label] of [
+    ['composerDialogs', '发帖编辑器'],
+    ['composerForms', '编辑表单'],
+    ['composerTextboxes', '正文输入框'],
+  ]) {
+    const nodes = projection.rows.find((row) => row.key === key)?.nodes ?? [];
+    if (!nodes.length) composerIssues.push('未找到' + label);
+    else if (nodes.length > 1) composerIssues.push(label + '存在多个候选');
+    else if (!nodes[0]?.visible) composerIssues.push(label + '尚未显示');
+  }
+  if (surface?.phase === 'ambiguous') composerIssues.push('发布与下一步控件同时出现，阶段未明确');
+  if (surface?.phase === 'unclassified')
+    composerIssues.push('编辑器已打开，发布或下一步控件尚未识别');
+  if (!surface && !composerIssues.length) composerIssues.push('编辑器阶段控件尚未就绪');
   let text: string | null = null;
   if (surface) {
     if (
@@ -117,6 +125,7 @@ export async function readFacebookPostPage(
     projection,
     locale,
     surface,
+    composerIssues,
     text,
     ...(background ? { background } : {}),
     opener: homeCopy

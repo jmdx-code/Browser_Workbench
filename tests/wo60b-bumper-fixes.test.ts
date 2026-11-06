@@ -1,3 +1,4 @@
+import { bumperNativeEvents } from './fixtures/bumper-native-events.js';
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { projectGroupBumper } from '../src/infrastructure/group-bumper-effects.js';
@@ -54,11 +55,13 @@ function harness(options: {
   surface: (url: string, input: SurfaceInput) => Record<string, unknown>;
   kernel?: Record<string, unknown>;
   onClick?: (selector: string) => void;
+  nativeResult?: 'error' | 'missing';
 }) {
   let current = '';
   const gotos: string[] = [];
   const clicks: string[] = [];
   let mutations = 0;
+  const nativeEvents = bumperNativeEvents();
   const page = {
     url: () => current,
     viewportSize: () => ({ width: 1280, height: 800 }),
@@ -71,8 +74,8 @@ function harness(options: {
     waitForURL: async (predicate: (u: URL) => boolean) => {
       if (!predicate(new URL(current))) throw Error('page.waitForURL: Timeout 15000ms exceeded.');
     },
-    on: () => {},
-    off: () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
     mouse: { wheel: async () => {}, move: async () => {} },
     keyboard: { type: async () => {}, insertText: async () => {} },
     evaluate: async (fn: unknown, input?: unknown) => {
@@ -83,6 +86,8 @@ function harness(options: {
           visible: true,
           verificationRequired: false,
         };
+      if (typeof fn === 'function' && fn.name === 'projectBumperReactionRead')
+        return { state: 'unknown' };
       if (!input || typeof input !== 'object') return typeof input === 'string' ? false : 'doc';
       return {
         url: current,
@@ -110,6 +115,16 @@ function harness(options: {
         mutations++;
         clicks.push(selector);
         options.onClick?.(selector);
+        const data = options.surface(current, {});
+        const posts = data.posts as { likeCSS?: string; feedbackId?: string }[] | undefined;
+        const post = posts?.find((p) => p.likeCSS === selector);
+        if (post?.feedbackId && options.nativeResult !== 'missing')
+          nativeEvents.like(
+            '10000000001',
+            post.feedbackId,
+            '1635855486666999',
+            options.nativeResult === 'error',
+          );
       },
     }),
   };
@@ -354,4 +369,77 @@ it('WO60-B: foreign visitor posts are filtered only after the page owner author 
   expect(isForeignPagePost({ authorId: null, authorName: '', authorAliases: [] }, page, '1')).toBe(
     false,
   );
+});
+
+it.each(['error', 'missing'] as const)(
+  'optimistic liked DOM with %s native evidence never creates a successful record or retries the input',
+  async (nativeResult) => {
+    vi.useFakeTimers();
+    let pressed = false;
+    const h = harness({
+      nativeResult,
+      onClick: () => {
+        pressed = true;
+      },
+      surface: () => ({ posts: [targetPost({ liked: pressed })] }),
+    });
+    const until = Date.now() + 20000;
+    const work = h.adapter
+      .run('p', [mkTarget(group)], [mkTarget(author)], settings({ useLongPressReaction: false }), {
+        cancelled: () => Date.now() >= until,
+        status: () => {},
+        added: () => {},
+      })
+      .catch((e) => {
+        if (!/已停止/.test(String(e))) throw e;
+      });
+    await vi.runAllTimersAsync();
+    await work;
+    expect(h.clicks.filter((s) => s.includes('bumper-like'))).toHaveLength(1);
+    expect(h.recorded).toEqual([]);
+  },
+);
+
+it('pending approval and membership questions skip only that group, then the next joined group still runs', async () => {
+  for (const firstState of ['pending', 'questions'] as const) {
+    vi.useFakeTimers();
+    const second = '222222222222222',
+      secondPost = '888888888888888';
+    const h = harness({
+      surface: (url) => {
+        const gid = url.includes('/groups/' + second) ? second : group;
+        return {
+          groupIds: [gid],
+          groupJoinState: gid === group ? firstState : 'member',
+          posts:
+            gid === second
+              ? [
+                  targetPost({
+                    postId: secondPost,
+                    postUrl: `https://www.facebook.com/groups/${second}/posts/${secondPost}/`,
+                    feedbackId: 'fb-' + secondPost,
+                    likeCSS: '[data-wb-bumper-like="' + secondPost + '"]',
+                  }),
+                ]
+              : [],
+        };
+      },
+    });
+    const statuses: string[] = [];
+    const work = h.adapter.run(
+      'p',
+      [mkTarget(group), mkTarget(second)],
+      [mkTarget(author)],
+      settings(),
+      { cancelled: () => false, status: (s) => statuses.push(s), added: () => {} },
+    );
+    await vi.runAllTimersAsync();
+    await work;
+    expect(h.recorded).toEqual([secondPost]);
+    expect(statuses.some((s) => s.includes(firstState === 'pending' ? '待审核' : '入组问题'))).toBe(
+      true,
+    );
+    expect(h.clicks.every((s) => !s.includes('bumper-join'))).toBe(true);
+    vi.useRealTimers();
+  }
 });

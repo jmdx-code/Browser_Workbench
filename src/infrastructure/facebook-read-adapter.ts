@@ -7,12 +7,19 @@ import {
   FACEBOOK_COMPOSER_FILES,
   FACEBOOK_COMPOSER_REVIEW_SCOPE,
   FACEBOOK_REEL_SCOPE,
+  FACEBOOK_POST_SETTINGS_LABELS,
   FACEBOOK_COMPOSER_ADVANCE_COPY,
   facebookUILabelSelector,
   facebookComposerPostLabels,
 } from '../shared/facebook-ui.js';
 
 const loginForm = 'form:has(input[name="email"]):has(input[type="password"])';
+const reviewActionsScope =
+  ':is([role="dialog"]' +
+  facebookUILabelSelector(FACEBOOK_POST_SETTINGS_LABELS) +
+  ',' +
+  FACEBOOK_REEL_SCOPE +
+  ')';
 
 // Page selectors are software-owned. Projection primitives remain generic in the extension.
 export const facebookIdentityProjection = PageReadRequest.parse({
@@ -192,11 +199,16 @@ export const facebookComposerProjection = PageReadRequest.parse({
         ],
         [
           'composerReviewHeadings',
-          ':is(' + FACEBOOK_COMPOSER_REVIEW_SCOPE + ', ' + FACEBOOK_REEL_SCOPE + ') h2',
+          ':is(' +
+            FACEBOOK_COMPOSER_REVIEW_SCOPE +
+            ', ' +
+            FACEBOOK_REEL_SCOPE +
+            ') :is(h2,[role="heading"])',
         ],
         [
           'composerReviewSubmits',
-          '[role="dialog"] [role="button"]' +
+          reviewActionsScope +
+            ' [role="button"]' +
             facebookUILabelSelector([
               ...facebookComposerPostLabels(),
               ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),
@@ -204,7 +216,8 @@ export const facebookComposerProjection = PageReadRequest.parse({
         ],
         [
           'composerReviewDisabled',
-          '[role="dialog"] [role="button"]' +
+          reviewActionsScope +
+            ' [role="button"]' +
             facebookUILabelSelector([
               ...facebookComposerPostLabels(),
               ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),

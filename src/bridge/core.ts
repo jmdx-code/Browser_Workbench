@@ -1,3 +1,4 @@
+import { devDiag } from '../shared/dev-diagnostics.js';
 import { randomUUID } from 'node:crypto';
 import {
   BridgeError,
@@ -399,8 +400,23 @@ export class Core {
       this.kernelOwners.has(peer.profileId) ||
       this.queuedIntents.get(peer.profileId) ||
       unresolved.length
-    )
+    ) {
+      devDiag.record({
+        level: 'WARN',
+        category: 'KERNEL_RPC',
+        event: 'KERNEL_PROFILE_NOT_IDLE',
+        profileId: peer.profileId,
+        data: {
+          current: this.current(peer),
+          phase: peer.phase,
+          synced: peer.synced,
+          owned: this.kernelOwners.has(peer.profileId),
+          queued: !!this.queuedIntents.get(peer.profileId),
+          unresolvedCount: unresolved.length,
+        },
+      });
       throw new BridgeError('KERNEL_PROFILE_NOT_IDLE');
+    }
     this.kernelOwners.set(peer.profileId, owner);
   }
   bindFixtureStopRequest(peer: Peer, owner: string, requestId: string): void {

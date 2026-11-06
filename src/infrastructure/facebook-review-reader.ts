@@ -34,11 +34,11 @@ export function projectFacebookReviewContent() {
         'form input[type="file"][multiple][accept*="image/"][accept*="video/"]',
       ),
       submits = Array.from(
-        root.querySelectorAll(
+        review.querySelectorAll(
           '[role="button"]:is([aria-label="发帖"],[aria-label="发布"],[aria-label="發佈"],[aria-label="發文"],[aria-label="Post"])',
         ),
       ).filter(visible),
-      headings = Array.from(review.querySelectorAll('h2')).filter(visible),
+      headings = Array.from(review.querySelectorAll('h2,[role="heading"]')).filter(visible),
       labels = Array.from(root.querySelectorAll('span[dir="auto"]')).filter(
         (e) => visible(e) && ['帖子预览', '貼文預覽', 'Post preview'].includes(e.textContent ?? ''),
       );
@@ -52,10 +52,10 @@ export function projectFacebookReviewContent() {
     if (
       forms.length === 1 &&
       edits.length === 1 &&
-      files.length === 1 &&
-      media.length === 1 &&
+      files.length <= 1 &&
+      media.length === files.length &&
       edit instanceof HTMLElement &&
-      input instanceof HTMLInputElement &&
+      (media.length === 0 || input instanceof HTMLInputElement) &&
       headings.length === 1 &&
       ['帖子设置', '貼文設定', 'Post settings'].includes(headings[0]?.textContent ?? '') &&
       submits.length === 1 &&
@@ -71,7 +71,7 @@ export function projectFacebookReviewContent() {
       if (text.length <= 100000 && rendered(preview.textContent ?? '') === rendered(text))
         composer = {
           text,
-          files: Array.from(input.files ?? [])
+          files: Array.from(input instanceof HTMLInputElement ? (input.files ?? []) : [])
             .slice(0, 21)
             .map((f) => ({ name: f.name, size: f.size })),
           media: [],

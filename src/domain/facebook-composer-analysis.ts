@@ -1,29 +1,24 @@
 import type { PageProjection } from '../shared/page-read.js';
 import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import {
-  FACEBOOK_UI_COPY,
   FACEBOOK_COMPOSER_SCOPE,
   FACEBOOK_COMPOSER_TEXT,
   FACEBOOK_COMPOSER_FILES,
   FACEBOOK_COMPOSER_REVIEW_SUBMIT,
   FACEBOOK_REEL_MAIN,
   FACEBOOK_REEL_TEXT,
-  facebookComposerPostSelector,
   facebookUILabelSelector,
   facebookComposerPostLabels,
   FACEBOOK_POST_SETTINGS_LABELS,
   FACEBOOK_REEL_EDIT_LABELS,
   FACEBOOK_REEL_SETTINGS_LABELS,
   facebookComposerAdvanceLabels,
-  normalizeFacebookUILocale,
-  facebookComposerAdvanceSelector,
   type FacebookUILocale,
 } from '../shared/facebook-ui.js';
 
 // Read-only candidate. Callers must independently prove purpose, current actor and original content.
 // Hidden native file inputs are normal; their owner form/textbox must be unique and visible.
-export function observeFacebookComposerSurface(page: PageProjection, locale?: FacebookUILocale) {
-  locale = normalizeFacebookUILocale(locale);
+export function observeFacebookComposerSurface(page: PageProjection, _locale?: FacebookUILocale) {
   const url = kernelFacebookReadURL(page.url) ? new URL(page.url) : null;
   const profileRoute =
     url?.pathname === '/profile.php' && /^\d{1,30}$/.test(url.searchParams.get('id') ?? '');
@@ -47,7 +42,6 @@ export function observeFacebookComposerSurface(page: PageProjection, locale?: Fa
     const unique = (key: string) => nodes(key).length === 1 && nodes(key)[0]?.visible;
     const editing = FACEBOOK_REEL_EDIT_LABELS.some((label) => label === heading[0]?.text);
     if (
-      !profileRoute ||
       !unique('composerDialogs') ||
       !unique('composerForms') ||
       !unique('composerReviewDialogs') ||
@@ -88,16 +82,17 @@ export function observeFacebookComposerSurface(page: PageProjection, locale?: Fa
       contentVerified: false as const,
     };
   }
-  if (reviews.length) {
+  if (
+    reviews.length &&
+    heading.length === 1 &&
+    FACEBOOK_POST_SETTINGS_LABELS.some((label) => label === heading[0]?.text)
+  ) {
     const unique = (key: string, visible: boolean) =>
       nodes(key).length === 1 && (!visible || nodes(key)[0]?.visible);
     if (
-      !profileRoute ||
       !unique('composerDialogs', true) ||
       !unique('composerForms', true) ||
       !unique('composerTextboxes', false) ||
-      !unique('composerAllFiles', false) ||
-      !unique('composerMediaFiles', false) ||
       !unique('composerReviewDialogs', true) ||
       !unique('composerReviewHeadings', true) ||
       !FACEBOOK_POST_SETTINGS_LABELS.some(
@@ -131,46 +126,37 @@ export function observeFacebookComposerSurface(page: PageProjection, locale?: Fa
     const row = nodes(key);
     if (row.length !== 1 || !row[0]?.visible) return null;
   }
-  const allFiles = nodes('composerAllFiles'),
-    mediaFiles = nodes('composerMediaFiles');
-  if (
-    allFiles.length !== 1 ||
-    mediaFiles.length !== 1 ||
-    allFiles[0]?.tag !== 'input' ||
-    mediaFiles[0]?.tag !== 'input'
-  )
-    return null;
-  const submits = nodes('composerSubmits'),
-    copy = FACEBOOK_UI_COPY.find((item) => item.locale === locale);
+  // Opening and typing do not require a file input. Upload readiness is checked
+  // by the media adapter only when the configured post actually contains media.
+  const submits = nodes('composerSubmits');
   const submitLabel = submits[0]?.attributes['aria-label'];
   const disabled = nodes('composerDisabledActions');
   const enabled = (label: string) =>
     page.rows.some((row) => row.key === 'composerDisabledActions') &&
     !disabled.some((node) => node.attributes['aria-label'] === label);
   const submit =
-    copy &&
     submits.length === 1 &&
     submits[0]?.visible &&
     typeof submitLabel === 'string' &&
-    facebookComposerPostLabels(copy.locale).includes(submitLabel)
+    facebookComposerPostLabels().includes(submitLabel)
       ? {
           scope: FACEBOOK_COMPOSER_SCOPE,
-          css: facebookComposerPostSelector(copy.locale),
+          css: '[role="button"]' + facebookUILabelSelector([submitLabel]),
           enabled: enabled(submitLabel),
         }
       : null;
   const advances = nodes('composerAdvances'),
-    advanceLabels = facebookComposerAdvanceLabels(locale),
-    advanceCSS = locale ? facebookComposerAdvanceSelector(locale) : null;
+    advanceLabels = facebookComposerAdvanceLabels();
+  const advanceLabel = advances[0]?.attributes['aria-label'];
   const advance =
     advanceLabels.length > 0 &&
-    advanceCSS &&
     advances.length === 1 &&
     advances[0]?.visible &&
-    advanceLabels.includes(advances[0].attributes['aria-label'] ?? '')
+    typeof advanceLabel === 'string' &&
+    advanceLabels.includes(advanceLabel)
       ? {
           scope: FACEBOOK_COMPOSER_SCOPE,
-          css: advanceCSS,
+          css: '[role="button"]' + facebookUILabelSelector([advanceLabel]),
           enabled: enabled(advances[0].attributes['aria-label'] ?? ''),
         }
       : null;

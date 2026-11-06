@@ -24,6 +24,7 @@ export interface FacebookPostPageReading {
   locale: FacebookUILocale | undefined;
   opener: z.infer<typeof Spec> | null;
   surface: ReturnType<typeof observeFacebookComposerSurface>;
+  composerIssues?: string[];
   text: string | null;
   audience?: ComposerAudience;
   background?: BackgroundReading;

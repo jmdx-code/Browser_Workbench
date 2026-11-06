@@ -248,6 +248,9 @@ test('native interaction response needs same actor/feedback, actual business sta
     confirmedBumperGraphQL({
       ...input,
       kind: 'comment',
+      variables: {
+        input: { actor_id: '10001', feedback_id: 'feedback123', message: { text: 'hello' } },
+      },
       comment: 'hello',
       body: JSON.stringify({
         data: {
@@ -831,4 +834,50 @@ test('WO60-B: pages/add and pages/refresh status is mirrored to pageBumperStatus
       await new Promise((x) => setTimeout(x, 10));
     const refreshed = await service.manage('pages/refresh', { ids: ['20001'] });
     assert.match(refreshed.pageBumperStatusText ?? '', /读取资料/);
+  }));
+
+test('stop revokes control immediately, waits for worker exit, and records a clean stopped reason after a closed-channel error', async () =>
+  fixture(async (store) => {
+    const repo = store.groupBumper;
+    repo.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    repo.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    const id = randomUUID();
+    let held = false,
+      nativeStopped = false,
+      exited = false;
+    const service = new GroupBumperService(
+      repo,
+      {
+        ready: () => true,
+        busy: async () => false,
+        hasControl: () => held,
+        run: async (_id, _g, _p, _s, cb) => {
+          held = true;
+          while (!cb.cancelled()) await new Promise((r) => setTimeout(r, 2));
+          await new Promise((r) => setTimeout(r, 30));
+          exited = true;
+          throw Error('KERNEL_CLOSED');
+        },
+        stop: async () => {
+          nativeStopped = true;
+          held = false;
+        },
+      },
+      async () => ({ comments: [], total: 0 }),
+      () => {},
+      undefined,
+      0,
+    );
+    await service.start({ profileIds: [id], groupIds: ['12345'], pageIds: ['20001'] });
+    const stop = service.stop([id]);
+    assert.equal(nativeStopped, true);
+    assert.equal(exited, false);
+    const state = await stop;
+    assert.equal(exited, true);
+    assert.equal(service.hasActiveExecution(), false);
+    assert.equal(state.profileCounts[id]?.status, '已停止');
+    const result = store.tasks.runtimeSnapshot().profileResults?.find((r) => r.profileId === id);
+    assert.equal(result?.state, 'STOPPED');
+    assert.equal(result?.reason, '已停止');
+    assert.equal(result?.failedSteps, 0);
   }));

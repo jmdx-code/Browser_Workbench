@@ -489,6 +489,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       locale: observation.locale,
       opener: observation.opener,
       surface: observation.surface,
+      composerIssues: observation.composerIssues,
       text: observation.text,
       ...(observation.background ? { background: observation.background } : {}),
     };

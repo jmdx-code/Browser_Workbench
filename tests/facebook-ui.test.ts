@@ -4,6 +4,9 @@ import { FACEBOOK_UI_COPY, matchFacebookHomeCopy } from '../src/shared/facebook-
 import { observeFacebookHomeName } from '../src/domain/facebook-name-analysis.js';
 import { observeFacebookHomeAvatar } from '../src/domain/facebook-avatar-analysis.js';
 import { observeFacebookComposerSurface } from '../src/domain/facebook-composer-analysis.js';
+import { readFacebookPostPage } from '../src/infrastructure/facebook-post-page-reader.js';
+import { projectFacebookReviewContent } from '../src/infrastructure/facebook-review-reader.js';
+import type { Page } from 'playwright-core';
 import {
   facebookComposerProjection,
   facebookDisplayInspectionProjection,
@@ -161,14 +164,8 @@ test('same composer structure handles arbitrary localized text and hidden native
   }
 });
 
-test('composer ambiguity, wrong documents and extra upload controls refuse candidate; locale mismatch cannot select submit', () => {
-  for (const key of [
-    'composerDialogs',
-    'composerForms',
-    'composerTextboxes',
-    'composerAllFiles',
-    'composerMediaFiles',
-  ]) {
+test('composer ambiguity and wrong documents refuse candidates; observed controls support mixed locales', () => {
+  for (const key of ['composerDialogs', 'composerForms', 'composerTextboxes']) {
     const p = composer(),
       first = row(p, key).nodes[0];
     assert.ok(first);
@@ -204,11 +201,11 @@ test('composer ambiguity, wrong documents and extra upload controls refuse candi
   }
   const p = composer();
   row(p, 'composerSubmits').nodes.push(element('div', { 'aria-label': 'Post' }));
-  assert.equal(observeFacebookComposerSurface(p, 'zh_CN')?.submit, null);
+  assert.ok(observeFacebookComposerSurface(p, 'zh_CN')?.submit);
   assert.ok(observeFacebookComposerSurface(p, 'my_MM')?.submit); // Actual mixed-language Burmese UI.
 });
 
-test('observed zh_CN 发帖 variant retains disabled state and refuses competing or foreign-locale submit targets', () => {
+test('observed submit retains disabled state and refuses competing targets across locales', () => {
   const p = composer();
   row(p, 'composerSubmits').nodes.push(element('div', { 'aria-label': '发帖' }));
   row(p, 'composerDisabledActions').nodes.push(element('div', { 'aria-label': '发帖' }));
@@ -216,7 +213,7 @@ test('observed zh_CN 发帖 variant retains disabled state and refuses competing
   assert.equal(observeFacebookComposerSurface(p, 'zh_CN')?.submit?.enabled, false);
   row(p, 'composerDisabledActions').nodes = [];
   assert.equal(observeFacebookComposerSurface(p, 'zh_CN')?.submit?.enabled, true);
-  assert.equal(observeFacebookComposerSurface(p, 'en_US')?.submit, null);
+  assert.ok(observeFacebookComposerSurface(p, 'en_US')?.submit);
   row(p, 'composerSubmits').nodes.push(element('div', { 'aria-label': '发布' }));
   assert.equal(observeFacebookComposerSurface(p, 'zh_CN')?.submit, null);
 });
@@ -236,7 +233,7 @@ test('observed profile composer distinguishes disabled Next from final Submit an
   row(p, 'composerDisabledActions').nodes.splice(0);
   result = observeFacebookComposerSurface(p, 'zh_CN');
   assert.equal(result?.advance?.enabled, true);
-  assert.equal(observeFacebookComposerSurface(p, 'en_US')?.advance, null);
+  assert.ok(observeFacebookComposerSurface(p, 'en_US')?.advance);
   row(p, 'composerSubmits').nodes.push(element('div', { 'aria-label': '发布' }));
   assert.equal(observeFacebookComposerSurface(p, 'zh_CN')?.phase, 'ambiguous');
   row(p, 'composerAdvances').nodes.splice(0);
@@ -267,5 +264,82 @@ test('localized profile review and Reels phases accept locale aliases without tr
     const result = observeFacebookComposerSurface(p, locale);
     assert.equal(result?.phase, 'reel-review-before-submit');
     assert.equal(result?.actingIdentityVerified, false);
+  }
+});
+
+test('ordinary composer with a broad Reels candidate remains a direct composer, including without upload inputs', () => {
+  const p = composer();
+  row(p, 'composerReviewDialogs').nodes.push(element('div'));
+  row(p, 'composerSubmits').nodes.push(element('div', { 'aria-label': '发布' }));
+  row(p, 'composerDisabledActions').nodes.push(element('div', { 'aria-label': '发布' }));
+  row(p, 'composerAllFiles').nodes = [];
+  row(p, 'composerMediaFiles').nodes = [];
+  assert.equal(observeFacebookComposerSurface(p)?.phase, 'direct-submit');
+  assert.equal(observeFacebookComposerSurface(p)?.submit?.enabled, false);
+  row(p, 'composerDisabledActions').nodes = [];
+  assert.equal(observeFacebookComposerSurface(p)?.submit?.enabled, true);
+  // A genuinely identified settings page still waits for its own controls.
+  row(p, 'composerReviewHeadings').nodes.push(element('h2', {}, true, '帖子设置'));
+  assert.equal(observeFacebookComposerSurface(p), null);
+});
+
+test('review action projection ignores Messenger controls and retains native composer disabled state', async () => {
+  const { Window } = await import('happy-dom');
+  const window = new Window();
+  try {
+    window.document.body.innerHTML = `<div role="dialog" aria-label="Messenger"><div role="button" aria-label="Post"></div></div>
+      <div role="dialog"><div role="form" aria-label="创建帖子"></div><div role="button" aria-label="发布" aria-disabled="true"></div></div>`;
+    for (const key of ['composerReviewSubmits', 'composerReviewDisabled']) {
+      const query = facebookComposerProjection.queries.find((q) => q.key === key)!;
+      const nodes = window.document.querySelectorAll(query.selector);
+      assert.equal(nodes.length, 1);
+      assert.equal(nodes[0]!.getAttribute('aria-label'), '发布');
+    }
+  } finally {
+    await window.happyDOM.close();
+  }
+});
+
+test('unrecognized dialog label does not reject an otherwise readable empty composer', async () => {
+  const request = PageReadRequest.parse({
+    queries: [
+      ...facebookDisplayInspectionProjection.queries,
+      ...facebookComposerProjection.queries.filter((q) => q.key !== 'loginForm'),
+    ],
+  });
+  const p = page(request);
+  for (const [key, tag] of [
+    ['composerDialogs', 'div'],
+    ['composerForms', 'form'],
+    ['composerTextboxes', 'div'],
+  ])
+    row(p, key!).nodes.push(
+      element(tag!, key === 'composerDialogs' ? { 'aria-label': 'Créer une publication' } : {}),
+    );
+  let calls = 0;
+  const fake = {
+    evaluate: async () => (++calls === 1 ? p : { url: p.url, timeOrigin: p.timeOrigin, text: '' }),
+  } as unknown as Page;
+  const reading = await readFacebookPostPage(fake, undefined, () => {});
+  assert.equal(reading.surface?.phase, 'unclassified');
+  assert.equal(reading.text, '');
+  assert.equal(reading.surface?.submit, null);
+  assert.ok(reading.composerIssues.includes('编辑器已打开，发布或下一步控件尚未识别'));
+});
+
+test('text-only review reads its actual caption without requiring an upload input', async () => {
+  const { Window } = await import('happy-dom');
+  const window = new Window();
+  try {
+    window.document.body.innerHTML = `<div role="dialog"><form><div role="textbox" contenteditable="true">hello</div></form>
+      <section><span dir="auto">Post preview</span><div>hello</div></section>
+      <div role="dialog" aria-label="Post settings"><h2>Post settings</h2><div role="button" aria-label="Post"></div></div></div>`;
+    window.HTMLElement.prototype.getBoundingClientRect = () => new window.DOMRect(0, 0, 100, 20);
+    const result = window.eval('(' + projectFacebookReviewContent.toString() + ')()');
+    assert.equal(result.composer?.text, 'hello');
+    assert.equal(result.composer?.files.length, 0);
+    assert.equal(result.composer?.uploaded, false);
+  } finally {
+    await window.happyDOM.close();
   }
 });
