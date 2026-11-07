@@ -94,7 +94,14 @@ export async function recoverPosterOperations(
     ]),
   );
   const inventory = await kernel.withSummary(peer, (port) => port.inventory());
-  for (const op of inventory.operations) {
+  const archived = kernel.archivedOperations
+    ? await kernel.archivedOperations(peer.profileId, [...known.keys()])
+    : [];
+  const nativeIds = new Set(inventory.operations.map((row) => row.binding.operationId));
+  for (const op of [
+    ...inventory.operations,
+    ...archived.filter((row) => !nativeIds.has(row.binding.operationId)),
+  ]) {
     await guard();
     let row = known.get(op.binding.operationId);
     if (!row && kernelOperationPending(op) && ['ACKNOWLEDGED', 'UNKNOWN'].includes(op.state)) {
@@ -194,6 +201,27 @@ export async function recoverPosterOperations(
     });
     await guard();
     await repo.markOperationKernelSettled(op.binding.operationId);
+  }
+  if (peer.capabilities?.includes('kernel-journal-collection-v1')) {
+    const found = new Set(
+      [...inventory.operations, ...archived].map((op) => op.binding.operationId),
+    );
+    for (const row of known.values()) {
+      if (found.has(row.binding.operationId)) continue;
+      await guard();
+      const resolution =
+        row.resolution ??
+        (await repo.setOperationResolution(row.binding.operationId, {
+          id: randomUUID(),
+          outcome: 'ENDED_UNKNOWN',
+          evidenceDigest: posterDigest({
+            binding: row.binding,
+            reason: 'Retired executor native receipt absent',
+          }),
+        }));
+      await kernel.withSummary(peer, (port) => port.notify(row.binding, resolution));
+      await repo.markOperationKernelSettled(row.binding.operationId);
+    }
   }
   return protectedIds;
 }

@@ -1700,6 +1700,18 @@ export class SqliteTaskRepository implements TaskRepository {
             : (preservedReason ?? 'OPERATION_RESULT_UNCONFIRMED'),
       );
       this.unlock(id);
+      // The execution has a confirmed stop and durable end notices. Keep any
+      // original UNKNOWN business result, but release its account-wide control.
+      this.db
+        .prepare(
+          "UPDATE task_outbox SET control_ended=1 WHERE job_id=? AND status='UNKNOWN' AND disposition IS NOT NULL",
+        )
+        .run(id);
+      this.db
+        .prepare(
+          "UPDATE material_reservations SET control_ended=1 WHERE job_id=? AND state='REVIEW'",
+        )
+        .run(id);
       return this.get(id);
     });
   }

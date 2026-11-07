@@ -28,7 +28,10 @@ import {
   decodeHtmlEntities,
   parseTargetMetadataFromHtml,
 } from '../src/infrastructure/group-bumper-avatar.js';
-import { confirmedBumperGraphQL } from '../src/infrastructure/group-bumper-runner.js';
+import {
+  claimBumperComment,
+  confirmedBumperGraphQL,
+} from '../src/infrastructure/group-bumper-runner.js';
 import {
   GroupBumperService,
   buildStaggeredBumperQueues,
@@ -96,6 +99,117 @@ test('schema 43 adds only bumper data, target CRUD and inviter import preserve e
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     db.close();
   }));
+for (const scope of ['group', 'page'] as const) {
+  test(`comment editor merges ${scope} edits without resurrecting consumed rows or deleting concurrent additions`, async () =>
+    fixture((store) => {
+      const r = store.groupBumper;
+      const original = r.saveComments(
+        { texts: ['consumed', 'kept', 'deleted'], consumeCommentOnUse: true },
+        scope,
+      );
+      const consumed = original.find((c) => c.text === 'consumed')!;
+      r.record(
+        log('70001', '10001', { liked: false, commentText: consumed.text, sourceMode: scope }),
+        consumed.id,
+      );
+      const current = r.comments(scope);
+      r.saveComments(
+        {
+          texts: [...current.map((c) => c.text), 'concurrent addition'],
+          consumeCommentOnUse: true,
+        },
+        scope,
+      );
+      const keptId = r.comments(scope).find((c) => c.text === 'kept')!.id;
+      const after = r.saveComments(
+        {
+          texts: ['consumed', 'kept', 'new edit'],
+          consumeCommentOnUse: true,
+          baseComments: original.map(({ id, text }) => ({ id, text })),
+        },
+        scope,
+      );
+      assert.deepEqual(after.map((c) => c.text).sort(), [
+        'concurrent addition',
+        'kept',
+        'new edit',
+      ]);
+      assert.equal(after.find((c) => c.text === 'kept')!.id, keptId);
+      const unchanged = r.saveComments(
+        {
+          texts: original.map((c) => c.text),
+          consumeCommentOnUse: true,
+          baseComments: original.map(({ id, text }) => ({ id, text })),
+        },
+        scope,
+      );
+      assert.equal(
+        unchanged.some((c) => c.text === 'consumed'),
+        false,
+      );
+      assert.equal(
+        unchanged.some((c) => c.text === 'deleted'),
+        false,
+      );
+      const reopened = r.comments(scope);
+      const readded = r.saveComments(
+        {
+          texts: [...reopened.map((c) => c.text), 'consumed'],
+          consumeCommentOnUse: true,
+          baseComments: reopened.map(({ id, text }) => ({ id, text })),
+        },
+        scope,
+      );
+      assert.ok(readded.some((c) => c.text === 'consumed'));
+      const otherScope = scope === 'group' ? 'page' : 'group';
+      assert.equal(r.comments(otherScope).length, 0);
+    }));
+}
+
+test('parallel comment selection rechecks claims after real persistence reads, reselects, and releases for retry', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'wb-comment-claims-'));
+  const client = await PersistenceClient.open(dir);
+  try {
+    const r = client.workspace.groupBumper;
+    const claims = new Set<string>();
+    const choose = (postId: string) =>
+      claimBumperComment(
+        claims,
+        (ids) => r.pickComment(postId, 0, ids, 'group'),
+        () => {},
+      );
+    await r.saveComments({ texts: ['one use'], consumeCommentOnUse: true });
+    const single = await Promise.all([choose('80001'), choose('80002')]);
+    assert.equal(single.filter(Boolean).length, 1);
+    claims.clear();
+    await r.saveComments({ texts: ['one', 'two'], consumeCommentOnUse: true });
+    const pair = await Promise.all([choose('80003'), choose('80004')]);
+    assert.equal(pair.filter(Boolean).length, 2);
+    assert.notEqual(pair[0]!.id, pair[1]!.id);
+    claims.delete(pair[0]!.id);
+    assert.equal((await choose('80005'))?.id, pair[0]!.id);
+    const cancelClaims = new Set<string>();
+    let cancelled = false;
+    await assert.rejects(
+      claimBumperComment(
+        cancelClaims,
+        async () => {
+          cancelled = true;
+          return pair[0]!;
+        },
+        () => {
+          if (cancelled) throw Error('stopped');
+        },
+      ),
+      /stopped/,
+    );
+    assert.equal(cancelClaims.size, 0);
+  } finally {
+    await client.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('same account OR profile cannot repeat a post; per-post and local-day limits are distinct', async () =>
   fixture((store) => {
     const r = store.groupBumper;

@@ -692,3 +692,66 @@ test('historical orphan ACK and proofless creation recover through original STOP
     }
   });
 });
+
+test('collection through the real bridge/channel retains pending receipts and archived notices remain reconcilable', async () => {
+  const f = await summaryHarness();
+  try {
+    f.peer.capabilities!.push('kernel-journal-collection-v1', 'kernel-unknown-end-v1');
+    const first = {
+      id: randomUUID(),
+      outcome: 'VERIFIED' as const,
+      evidenceDigest: '1'.repeat(64),
+    };
+    await f.journal.reconcile(f.binding, first);
+    for (let i = 0; i < 999; i++) {
+      const b = { ...f.binding, operationId: randomUUID() };
+      await f.journal.begin(b);
+      await f.journal.finish(b, 'ACKNOWLEDGED');
+      await f.journal.reconcile(b, { ...first, id: randomUUID() });
+    }
+    const pending = { ...f.binding, operationId: randomUUID() };
+    await f.journal.begin(pending);
+    await f.journal.finish(pending, 'ACKNOWLEDGED');
+    await f.bridge.withSummary(f.peer, async (port) => {
+      const inv = await port.inventory();
+      assert.equal(inv.operations.length, 201);
+      assert.ok(inv.operations.some((r) => r.binding.operationId === pending.operationId));
+      assert.deepEqual(await port.notify(f.binding, first), {
+        binding: f.binding,
+        resolution: first,
+      });
+    });
+    assert.equal(
+      (await f.bridge.archivedOperations(f.peer.profileId, [f.binding.operationId])).length,
+      1,
+    );
+    assert.equal(f.nativeCalls(), 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test('obsolete executor conclusions can be retired after native receipt loss without executing any input', async () => {
+  const f = await summaryHarness();
+  try {
+    f.peer.capabilities!.push('kernel-journal-collection-v1', 'kernel-unknown-end-v1');
+    const missing = { ...f.binding, operationId: randomUUID() };
+    const end = {
+      id: randomUUID(),
+      outcome: 'ENDED_UNKNOWN' as const,
+      evidenceDigest: 'd'.repeat(64),
+    };
+    await f.bridge.withSummary(f.peer, async (port) => {
+      assert.deepEqual(await port.notify(missing, end), { binding: missing, resolution: end });
+      const row =
+        (await port.inventory()).operations.find(
+          (r) => r.binding.operationId === missing.operationId,
+        ) ?? (await f.bridge.archivedOperations(f.peer.profileId, [missing.operationId]))[0];
+      assert.equal(row?.state, 'UNKNOWN');
+      assert.equal(row?.disposition?.id, end.id);
+    });
+    assert.equal(f.nativeCalls(), 0);
+  } finally {
+    await f.close();
+  }
+});

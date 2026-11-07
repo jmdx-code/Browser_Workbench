@@ -160,6 +160,13 @@ export function GroupBumperPage({
   );
   const [commentText, setCommentText] = useState(''),
     [consume, setConsume] = useState(false);
+  const commentBaseRef = useRef<Array<{ id: string; text: string }>>([]);
+  const commentDirtyRef = useRef(false);
+  useEffect(() => {
+    if (modal !== 'comments' || commentDirtyRef.current) return;
+    commentBaseRef.current = effectiveComments.map(({ id, text }) => ({ id, text }));
+    setCommentText(effectiveComments.map((c) => c.text).join('\n'));
+  }, [modal, effectiveComments]);
   const [logs, setLogs] = useState<BumperLog[]>([]),
     [logSearch, setLogSearch] = useState(''),
     [logScopeFilter, setLogScopeFilter] = useState<'current' | 'all'>('current'),
@@ -207,6 +214,8 @@ export function GroupBumperPage({
     setAddFolder(null);
     if (kind === 'groups' || kind === 'pages') setRows(Array.from({ length: 5 }, blank));
     if (kind === 'comments') {
+      commentBaseRef.current = effectiveComments.map(({ id, text }) => ({ id, text }));
+      commentDirtyRef.current = false;
       setCommentText(effectiveComments.map((c) => c.text).join('\n'));
       setConsume(settings?.consumeCommentOnUse ?? false);
     }
@@ -666,7 +675,10 @@ export function GroupBumperPage({
                   className="bumper-comments"
                   aria-label="留言话术"
                   value={commentText}
-                  onChange={(e) => setCommentText(e.target.value)}
+                  onChange={(e) => {
+                    commentDirtyRef.current = true;
+                    setCommentText(e.target.value);
+                  }}
                 />
                 <label>
                   <input
@@ -677,7 +689,13 @@ export function GroupBumperPage({
                   留言使用后自动从列表移除
                 </label>
                 <div className="bumper-modal-footer">
-                  <button className="btn" onClick={() => setCommentText('')}>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      commentDirtyRef.current = true;
+                      setCommentText('');
+                    }}
+                  >
                     清空列表
                   </button>
                   <button
@@ -690,6 +708,7 @@ export function GroupBumperPage({
                           .map((s) => s.trim())
                           .filter(Boolean),
                         consumeCommentOnUse: consume,
+                        baseComments: commentBaseRef.current,
                       }).then((next) => {
                         if (next) setModal(null);
                       })

@@ -1,5 +1,12 @@
 import { DatabaseSync, backup } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { DispatchBinding, sameBinding, type Binding } from '../shared/task-execution.js';
+import {
+  KernelOperationRecord,
+  kernelOperationPending,
+  type KernelRecord,
+} from '../shared/kernel-state.js';
 import {
   Action,
   BridgeError,
@@ -19,13 +26,14 @@ export type RecordRow = {
   updatedAt: number;
   legacyFixture: number;
 };
+export const bridgeSchemaVersion = 3;
 export class Store {
   readonly db: DatabaseSync;
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA busy_timeout=5000');
     const schema = (this.db.prepare('PRAGMA user_version').get() as any).user_version;
-    if (schema > 2) {
+    if (schema > bridgeSchemaVersion) {
       this.db.close();
       throw new BridgeError('DATABASE_VERSION_TOO_NEW');
     }
@@ -58,7 +66,10 @@ export class Store {
       this.db.exec(
         'CREATE INDEX IF NOT EXISTS operations_updated_at ON operations(updatedAt DESC)',
       );
-      this.db.exec('PRAGMA user_version=2; COMMIT');
+      this.db
+        .exec(`CREATE TABLE IF NOT EXISTS kernel_operation_watermarks(profile_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS kernel_operation_receipts(profile_id TEXT NOT NULL,operation_id TEXT NOT NULL,binding TEXT NOT NULL,sequence INTEGER,receipt TEXT,PRIMARY KEY(profile_id,operation_id));
+        PRAGMA user_version=3; COMMIT`);
     } catch (error) {
       this.db.exec('ROLLBACK');
       this.db.close();
@@ -72,6 +83,105 @@ export class Store {
     this.db
       .prepare("UPDATE operations SET status='CANCELLED',updatedAt=? WHERE status='PREPARED'")
       .run(Date.now());
+  }
+  kernelOperationSequence(value: Binding, floor = 0): number {
+    const binding = DispatchBinding.parse(value);
+    z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(floor);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const old = this.db
+        .prepare('SELECT * FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?')
+        .get(binding.profileId, binding.operationId);
+      if (old && !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), binding))
+        throw Error('KERNEL_OPERATION_ID_CONFLICT');
+      if (old?.receipt && old.sequence === null) throw Error('KERNEL_OPERATION_RETIRED');
+      let sequence: number;
+      if (old?.sequence != null) sequence = Number(old.sequence);
+      else {
+        const prior = this.db
+          .prepare('SELECT high_water FROM kernel_operation_watermarks WHERE profile_id=?')
+          .get(binding.profileId);
+        sequence = Math.max(Number(prior?.high_water ?? 0), floor) + 1;
+        if (!Number.isSafeInteger(sequence)) throw Error('KERNEL_OPERATION_SEQUENCE_EXHAUSTED');
+        this.db
+          .prepare(
+            'INSERT INTO kernel_operation_watermarks VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET high_water=excluded.high_water',
+          )
+          .run(binding.profileId, sequence);
+        this.db
+          .prepare(
+            'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence) VALUES(?,?,?,?)',
+          )
+          .run(binding.profileId, binding.operationId, JSON.stringify(binding), sequence);
+      }
+      this.db.exec('COMMIT');
+      return sequence;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  archiveKernelReceipts(profileId: string, input: KernelRecord[]): void {
+    z.uuid().parse(profileId);
+    const records = z.array(KernelOperationRecord).max(200).parse(input);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of records) {
+        if (row.binding.profileId !== profileId || kernelOperationPending(row))
+          throw Error('KERNEL_ARCHIVE_NOT_TERMINAL');
+        const old = this.db
+          .prepare(
+            'SELECT binding,receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
+          )
+          .get(profileId, row.binding.operationId);
+        if (
+          old &&
+          !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), row.binding)
+        )
+          throw Error('KERNEL_OPERATION_ID_CONFLICT');
+        if (old?.receipt) {
+          const prior = KernelOperationRecord.parse(JSON.parse(String(old.receipt)));
+          for (const key of ['resolution', 'disposition'] as const) {
+            const a = prior[key],
+              b = row[key];
+            if (
+              a &&
+              (!b ||
+                a.id !== b.id ||
+                a.outcome !== b.outcome ||
+                a.evidenceDigest !== b.evidenceDigest)
+            )
+              throw Error('KERNEL_ARCHIVE_CONFLICT');
+          }
+        }
+        this.db
+          .prepare(
+            'INSERT INTO kernel_operation_receipts VALUES(?,?,?,?,?) ON CONFLICT(profile_id,operation_id) DO UPDATE SET receipt=excluded.receipt',
+          )
+          .run(
+            profileId,
+            row.binding.operationId,
+            JSON.stringify(row.binding),
+            row.operationSequence ?? null,
+            JSON.stringify(row),
+          );
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  kernelReceipts(profileId: string, operationIds: readonly string[]): KernelRecord[] {
+    z.uuid().parse(profileId);
+    z.array(z.uuid()).max(3000).parse(operationIds);
+    if (!operationIds.length) return [];
+    return this.db
+      .prepare(
+        'SELECT receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id IN (SELECT value FROM json_each(?)) AND receipt IS NOT NULL',
+      )
+      .all(profileId, JSON.stringify(operationIds))
+      .map((r) => KernelOperationRecord.parse(JSON.parse(String(r.receipt))));
   }
   prepare(intent: Intent): { row: RecordRow; fresh: boolean } {
     const action = JSON.stringify(Action.parse(intent.action));

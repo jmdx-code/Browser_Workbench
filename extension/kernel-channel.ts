@@ -355,10 +355,47 @@ export class ExtensionKernelChannel {
         'endUnknownOperation',
         'withdrawTaskTab',
         'withdrawIdleTaskTab',
+        'collectOperations',
+        'acknowledgeSessionEnd',
+        'retireOperation',
       ].includes(request.kind)
     )
       throw Error('KERNEL_SUMMARY_INPUT_REJECTED');
     switch (request.kind) {
+      case 'retireOperation': {
+        if (
+          !this.summaryOnly ||
+          (request.binding.connectionEpoch === request.connectionEpoch &&
+            request.binding.leaseId === request.leaseId) ||
+          request.binding.profileId !== this.context().profileId
+        )
+          throw Error('KERNEL_RETIREMENT_CONTEXT_REJECTED');
+        const stop = await this.stopExecutor(request.requestId);
+        if (stop.state !== 'stopped' || this.activeInputs || !this.context().valid)
+          throw Error('KERNEL_END_STOP_UNCONFIRMED');
+        await this.journal.retireOperation(request.binding, request.resolution);
+        return KernelJsonObject.parse({
+          binding: request.binding,
+          resolution: request.resolution,
+          stop,
+          inventory: await this.journal.snapshot(),
+          retired: true,
+        });
+      }
+      case 'acknowledgeSessionEnd': {
+        if (!this.summaryOnly || this.activeOperation || this.activeInputs)
+          throw Error('KERNEL_SESSION_END_BUSY');
+        await this.journal.acknowledgeSessionEnd(request.browserSessionEpoch);
+        return { acknowledged: true };
+      }
+      case 'collectOperations': {
+        if (!(this.summaryOnly && executor.state === 'stopped' && !this.stopUnconfirmed))
+          executor.lease.check();
+        if (this.activeOperation || this.activeInputs) throw Error('KERNEL_COLLECTION_BUSY');
+        return {
+          collected: await this.journal.collect(request.records, request.browserSessionEpoch),
+        };
+      }
       case 'inspectTaskWindow':
       case 'positionTaskWindow': {
         const stamp = executor.lease.check();
@@ -471,7 +508,10 @@ export class ExtensionKernelChannel {
       case 'create':
         return await executor.create(request.url, request.ownershipId, request.foreground);
       case 'inventory':
-        executor.lease.check();
+        // STOP revokes input, not read-only receipt reconciliation in the same
+        // authenticated summary channel.
+        if (!(this.summaryOnly && executor.state === 'stopped' && !this.stopUnconfirmed))
+          executor.lease.check();
         return (await (backend.inventory?.() ?? this.journal.snapshot())) as KernelJsonObject;
       case 'observeFacebookIdentity':
         return KernelJsonObject.parse({
@@ -520,7 +560,7 @@ export class ExtensionKernelChannel {
           request.binding.generation !== stamp.generation
         )
           throw Error('KERNEL_OPERATION_CONTEXT_REJECTED');
-        const result = await this.journal.begin(request.binding);
+        const result = await this.journal.begin(request.binding, request.operationSequence);
         try {
           executor.lease.check(stamp);
           if (executor.state !== 'running' || !this.context().valid) throw Error('KERNEL_FENCED');

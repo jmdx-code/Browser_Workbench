@@ -39,8 +39,8 @@ try {
   if (existsSync(journal)) {
     const previous = new DatabaseSync(journal, { readOnly: true });
     try {
-      if (Number(previous.prepare('PRAGMA user_version').get()?.user_version) < 2)
-        await backup(previous, path.join(config.directory, 'before-v2-' + Date.now() + '.sqlite'));
+      if (Number(previous.prepare('PRAGMA user_version').get()?.user_version) < 3)
+        await backup(previous, path.join(config.directory, 'before-v3-' + Date.now() + '.sqlite'));
     } finally {
       previous.close();
     }

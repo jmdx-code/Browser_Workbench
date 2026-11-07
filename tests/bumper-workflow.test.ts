@@ -258,3 +258,108 @@ it('stop interrupts watching before another read or recovery input', async () =>
   await vi.runAllTimersAsync();
   await pending;
 });
+
+it('deep video logger resolves the same complete Story card without taking an adjacent author', () => {
+  header('MEMBER');
+  const a = document.createElement('article');
+  a.setAttribute('role', 'article');
+  a.innerHTML = `<div id="inner"><a href="/groups/${gid}/posts/${postId}/">x</a></div><a href="/groups/${gid}/user/${actor}/">Page</a><button data-ad-rendering-role="like_button">anything</button>`;
+  document.querySelector('main')!.append(a);
+  for (const e of [a, ...a.querySelectorAll('*')]) rect(e);
+  const story = {
+    __id: btoa('actor:VK:' + postId),
+    post_id: postId,
+    actors: [{ id: actor }],
+    feedback: { id: 'feedback-' + postId },
+    creation_time: Date.now() / 1000,
+  };
+  const card = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story },
+    return: null,
+  };
+  Reflect.set(a, '__reactFiber$test', card);
+  const link = a.querySelector('#inner a')!;
+  let chain: unknown = card;
+  for (let i = 0; i < 270; i++) chain = { type: 'div', memoizedProps: {}, return: chain };
+  chain = {
+    type: { displayName: 'CometFeedStoryClickLoggerContainer.react' },
+    memoizedProps: { story: { __id: story.__id, post_id: postId } },
+    return: chain,
+  };
+  Reflect.set(link, '__reactFiber$test', chain);
+  fiber(a.querySelector('#inner')!, 'div', {}, card);
+  fiber(
+    a.querySelector('button')!,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'feedback-' + postId } },
+    card,
+  );
+  const p = projectGroupBumper({ groupId: gid }).posts.find((p) => p.postId === postId);
+  expect(p?.authorId).toBe(actor);
+  expect(p?.likeCSS).not.toBeNull();
+  // Changing the enclosing native Story must never fill this video's missing author.
+  card.memoizedProps.story = {
+    ...story,
+    __id: btoa('other'),
+    post_id: '999999999999999',
+    actors: [{ id: '100000000000000' }],
+  };
+  const after = projectGroupBumper({ groupId: gid }).posts.find((p) => p.postId === postId);
+  expect(after?.authorId).not.toBe('100000000000000');
+});
+
+it('post-dialog cleanup closes only the owned Story and verifies disappearance', async () => {
+  const { closeBumperPostDialog } = await import('../src/infrastructure/group-bumper-runner.js');
+  let own = true,
+    presses = 0;
+  const other = '999999999999999';
+  const read = async () =>
+    ({
+      postDialogs: [
+        ...(own ? [{ postId, feedbackId: 'fb', css: '#own' }] : []),
+        { postId: other, feedbackId: 'other', css: '#other' },
+      ],
+    }) as ReturnType<
+      (typeof import('../src/infrastructure/group-bumper-effects.js'))['readGroupBumper']
+    >;
+  await closeBumperPostDialog({
+    postId,
+    page: {
+      keyboard: {
+        press: async (key: string) => {
+          expect(key).toBe('Escape');
+          presses++;
+          own = false;
+        },
+      },
+    } as unknown as Page,
+    guard: () => {},
+    read,
+    run: async (work, verify) => {
+      const v = await work();
+      return verify(v);
+    },
+  });
+  expect(presses).toBe(1);
+  expect((await read()).postDialogs?.map((d) => d.postId)).toEqual([other]);
+});
+it('an unclosed owned dialog stops before any following-post input', async () => {
+  vi.useFakeTimers();
+  const { closeBumperPostDialog } = await import('../src/infrastructure/group-bumper-runner.js');
+  const read = async () =>
+    ({ postDialogs: [{ postId, feedbackId: 'fb', css: '#own' }] }) as ReturnType<
+      (typeof import('../src/infrastructure/group-bumper-effects.js'))['readGroupBumper']
+    >;
+  const pending = expect(
+    closeBumperPostDialog({
+      postId,
+      page: { keyboard: { press: async () => {} } } as unknown as Page,
+      guard: () => {},
+      read,
+      run: async (work, verify) => verify(await work()),
+    }),
+  ).rejects.toThrow('未能关闭');
+  await vi.runAllTimersAsync();
+  await pending;
+});

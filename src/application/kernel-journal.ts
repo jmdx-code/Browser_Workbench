@@ -4,6 +4,7 @@ import {
   OwnedTabProof,
   type KernelState,
   type TabProof,
+  type KernelRecord,
   kernelOperationPending,
 } from '../shared/kernel-state.js';
 import { OperationDisposition, type Disposition } from '../shared/task-ending.js';
@@ -80,6 +81,11 @@ export class KernelJournal {
         tabs: [],
       };
       const changedSession = next.browserSessionEpoch !== browserSessionEpoch;
+      if (changedSession) {
+        next.previousBrowserSessionEpoch = next.browserSessionEpoch;
+        next.browserSessionStartedAt = Date.now();
+        for (const row of next.operations) row.executionEnded = true;
+      }
       next.browserSessionEpoch = browserSessionEpoch;
       for (const row of next.operations)
         if (row.state === 'DISPATCHING') {
@@ -101,7 +107,10 @@ export class KernelJournal {
   snapshot(): Promise<KernelState> {
     return this.serialized(async () => structuredClone(this.current()));
   }
-  begin(input: Binding): Promise<{ fresh: boolean; record: KernelState['operations'][number] }> {
+  begin(
+    input: Binding,
+    operationSequence?: number,
+  ): Promise<{ fresh: boolean; record: KernelState['operations'][number] }> {
     const binding = DispatchBinding.parse(input);
     return this.serialized(async () => {
       const next = structuredClone(this.current());
@@ -109,7 +118,20 @@ export class KernelJournal {
       const old = next.operations.find((row) => row.binding.operationId === binding.operationId);
       if (old) {
         if (!sameBinding(old.binding, binding)) throw Error('KERNEL_OPERATION_ID_CONFLICT');
+        if (old.operationSequence !== operationSequence)
+          throw Error('KERNEL_OPERATION_SEQUENCE_CONFLICT');
         return { fresh: false, record: old };
+      }
+      if (operationSequence === undefined && next.operationHighWater !== undefined)
+        throw Error('KERNEL_OPERATION_SEQUENCE_REQUIRED');
+      if (operationSequence !== undefined) {
+        if (
+          !Number.isSafeInteger(operationSequence) ||
+          operationSequence <= (next.operationHighWater ?? 0)
+        )
+          throw Error('KERNEL_OPERATION_RETIRED');
+        next.version = 2;
+        next.operationHighWater = operationSequence;
       }
       if (
         next.operations.some(
@@ -118,10 +140,41 @@ export class KernelJournal {
         )
       )
         throw Error('KERNEL_OPERATION_REVIEW_REQUIRED');
-      const record = { binding, state: 'DISPATCHING' as const, reason: '', resolution: null };
+      const record = {
+        binding,
+        state: 'DISPATCHING' as const,
+        reason: '',
+        resolution: null,
+        ...(operationSequence === undefined ? {} : { operationSequence }),
+      };
       next.operations.push(record);
       await this.commit(next);
       return { fresh: true, record };
+    });
+  }
+  /** The caller has durably archived these exact terminal receipts first. */
+  collect(records: KernelRecord[], browserSessionEpoch: string): Promise<number> {
+    return this.serialized(async () => {
+      const next = structuredClone(this.current());
+      if (next.browserSessionEpoch !== browserSessionEpoch)
+        throw Error('KERNEL_COLLECTION_CONTEXT_CHANGED');
+      const ids = new Set<string>();
+      for (const value of records) {
+        const expected = KernelOperationRecord.parse(value);
+        const row = next.operations.find(
+          (r) => r.binding.operationId === expected.binding.operationId,
+        );
+        if (!row) continue; // A repeated collection after a lost reply is harmless.
+        if (kernelOperationPending(row) || JSON.stringify(row) !== JSON.stringify(expected))
+          throw Error('KERNEL_COLLECTION_RECEIPT_MISMATCH');
+        ids.add(row.binding.operationId);
+      }
+      if (!ids.size) return 0;
+      next.version = 2;
+      next.operationHighWater ??= 0;
+      next.operations = next.operations.filter((r) => !ids.has(r.binding.operationId));
+      await this.commit(next);
+      return ids.size;
     });
   }
   finish(input: Binding, state: 'ACKNOWLEDGED' | 'UNKNOWN', reason = ''): Promise<void> {
@@ -197,6 +250,62 @@ export class KernelJournal {
         throw Error('KERNEL_END_NOT_REQUIRED');
       if (record.state === 'DISPATCHING') record.state = 'UNKNOWN';
       record.disposition = disposition;
+      await this.commit(next);
+    });
+  }
+  acknowledgeSessionEnd(browserSessionEpoch: string): Promise<void> {
+    return this.serialized(async () => {
+      const next = structuredClone(this.current());
+      if (
+        next.browserSessionEpoch !== browserSessionEpoch ||
+        next.operations.some((row) => row.executionEnded && kernelOperationPending(row))
+      )
+        throw Error('KERNEL_SESSION_END_UNCONFIRMED');
+      if (!next.previousBrowserSessionEpoch) return;
+      delete next.previousBrowserSessionEpoch;
+      await this.commit(next);
+    });
+  }
+  /** A stopped, obsolete executor may retain a controller's durable conclusion,
+   * even when the old native receipt is absent. This never dispatches input. */
+  retireOperation(
+    input: Binding,
+    resolution: NonNullable<KernelRecord['resolution']> | Disposition,
+  ): Promise<void> {
+    const binding = DispatchBinding.parse(input);
+    return this.serialized(async () => {
+      const next = structuredClone(this.current());
+      if (binding.profileId !== next.profileId) throw Error('KERNEL_OPERATION_PROFILE_MISMATCH');
+      let row = next.operations.find((r) => r.binding.operationId === binding.operationId);
+      if (row && !sameBinding(row.binding, binding)) throw Error('KERNEL_OPERATION_ID_CONFLICT');
+      if (!row) {
+        row = {
+          binding,
+          state: 'UNKNOWN',
+          reason: 'CONTROLLER_SETTLEMENT_AFTER_EXECUTION_ENDED',
+          resolution: null,
+          executionEnded: true,
+        };
+        next.operations.push(row);
+      }
+      const old = resolution.outcome === 'ENDED_UNKNOWN' ? row.disposition : row.resolution;
+      if (old) {
+        if (
+          old.id !== resolution.id ||
+          old.outcome !== resolution.outcome ||
+          old.evidenceDigest !== resolution.evidenceDigest
+        )
+          throw Error('KERNEL_RECONCILIATION_CONFLICT');
+        return;
+      }
+      if (resolution.outcome === 'ENDED_UNKNOWN') {
+        row.disposition = OperationDisposition.parse(resolution);
+        if (row.state === 'DISPATCHING') row.state = 'UNKNOWN';
+      } else {
+        row.resolution = KernelOperationRecord.shape.resolution.unwrap().parse(resolution);
+        row.state = 'RECONCILED';
+      }
+      row.executionEnded = true;
       await this.commit(next);
     });
   }

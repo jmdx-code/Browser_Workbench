@@ -78,7 +78,33 @@ export const KernelRequest = z.discriminatedUnion('kind', [
       preferActiveTab: z.boolean().optional(),
     })
     .strict(),
-  z.object({ ...header, kind: z.literal('beginOperation'), binding: DispatchBinding }).strict(),
+  z
+    .object({
+      ...header,
+      kind: z.literal('beginOperation'),
+      binding: DispatchBinding,
+      operationSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...header,
+      kind: z.literal('collectOperations'),
+      records: z.array(KernelOperationRecord).max(200),
+      browserSessionEpoch: z.uuid(),
+    })
+    .strict(),
+  z
+    .object({ ...header, kind: z.literal('acknowledgeSessionEnd'), browserSessionEpoch: z.uuid() })
+    .strict(),
+  z
+    .object({
+      ...header,
+      kind: z.literal('retireOperation'),
+      binding: DispatchBinding,
+      resolution: z.union([KernelOperationRecord.shape.resolution.unwrap(), OperationDisposition]),
+    })
+    .strict(),
   z.object({ ...header, kind: z.literal('withdrawTaskTab'), proof: OwnedTabProof }).strict(),
   z.object({ ...header, kind: z.literal('withdrawIdleTaskTab'), record: OwnedTabRecord }).strict(),
   z

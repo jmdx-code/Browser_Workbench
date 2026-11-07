@@ -391,3 +391,45 @@ it('rejects comment, disabled, absent and ambiguous reaction controls instead of
     projectBumperReactionTarget({ ...scope, reactionId: BUMPER_REACTION_IDS.care }),
   ).toBeNull();
 });
+it('drains a matching response body at the deadline without another submission and remains bounded on missing evidence', async () => {
+  const page = new EventEmitter();
+  const observer = observeBumperGraphql(page as unknown as Page, { ...scope, kind: 'like' });
+  const request = {
+    method: () => 'POST',
+    url: () => 'https://www.facebook.com/api/graphql/',
+    postData: () =>
+      new URLSearchParams({
+        fb_api_req_friendly_name: 'CometUFIFeedbackReactMutation',
+        variables: JSON.stringify(variables),
+      }).toString(),
+  };
+  page.emit('request', request);
+  let finish!: (body: string) => void;
+  page.emit('response', {
+    request: () => request,
+    status: () => 200,
+    text: () =>
+      new Promise<string>((resolve) => {
+        finish = resolve;
+      }),
+  });
+  expect(observer.confirmed()).toBe(false);
+  const draining = observer.waitForEvidence(500);
+  setTimeout(() => finish(JSON.stringify(body())), 20);
+  await draining;
+  expect(observer.confirmed()).toBe(true);
+  await observer.close();
+  expect(page.listenerCount('request')).toBe(0);
+  const missing = observeBumperGraphql(page as unknown as Page, { ...scope, kind: 'like' });
+  page.emit('request', request);
+  const started = Date.now();
+  await missing.waitForEvidence(30);
+  expect(Date.now() - started).toBeLessThan(300);
+  expect(missing.confirmed()).toBe(false);
+  await expect(
+    missing.waitForEvidence(50, () => {
+      throw Error('stopped');
+    }),
+  ).rejects.toThrow('stopped');
+  await missing.close();
+});

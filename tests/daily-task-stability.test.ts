@@ -1325,7 +1325,7 @@ test('WO47-1/2/3: settlement indexes, bridge operations_updated_at index, persis
         assert.equal(
           (bridgeStore.db.prepare('PRAGMA user_version').get() as { user_version: number })
             .user_version,
-          2,
+          3,
         );
       } finally {
         bridgeStore.db.close();

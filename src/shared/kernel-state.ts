@@ -23,6 +23,8 @@ export const OwnedTabRecord = z
 export const KernelOperationRecord = z
   .object({
     binding: DispatchBinding,
+    operationSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    executionEnded: z.literal(true).optional(),
     state: z.enum(['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN', 'RECONCILED']),
     reason: z.string().max(200),
     disposition: OperationDisposition.optional(),
@@ -38,12 +40,15 @@ export const KernelOperationRecord = z
   .strict();
 export const KernelPersistentState = z
   .object({
-    version: z.literal(1),
+    version: z.union([z.literal(1), z.literal(2)]),
     profileId: z.uuid(),
     browserSessionEpoch: z.uuid(),
     operations: z.array(KernelOperationRecord).max(3000),
     tabs: z.array(OwnedTabRecord).max(500),
     workspaceMain: OwnedTabProof.optional(),
+    operationHighWater: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    previousBrowserSessionEpoch: z.uuid().optional(),
+    browserSessionStartedAt: z.number().int().nonnegative().optional(),
   })
   .strict()
   .superRefine((value, context) => {

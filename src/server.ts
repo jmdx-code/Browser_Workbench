@@ -1,4 +1,6 @@
 import { recoverBumperOperations } from './infrastructure/group-bumper-recovery.js';
+import { retireClosedKernelSession } from './infrastructure/kernel-session-retirement.js';
+const controllerStartedAt = Date.now();
 import {
   fetchAndLocalizeAccountAvatar,
   scheduleStartupAccountAvatarLocalization,
@@ -241,6 +243,8 @@ try {
       port === 18767 || process.env.WORKBENCH_SMOKE_WINDOW_LAYOUT === '1'
         ? ({ core, tasks }) => {
             const kernel = new KernelBridge(core, tasks);
+            kernel.retireClosedSession = (peer, port, state) =>
+              retireClosedKernelSession(repository, peer, port, state, controllerStartedAt);
             kernel.recoverBumperWorkspace = (peer, guard) =>
               recoverBumperOperations(kernel, peer, repository.groupBumper, guard);
             kernel.recoverPosterWorkspace = (peer, guard) =>

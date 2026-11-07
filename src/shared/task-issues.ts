@@ -75,6 +75,10 @@ const reasons: Record<string, { summary: string; next: string }> = {
     summary: '软件重启，未完成任务已自动结束',
     next: '保留已完成的步骤进度与记录；不会自动重放中断操作。',
   },
+  EXECUTION_INTERRUPTED: {
+    summary: '浏览器或工作台重启，旧任务已结束',
+    next: '已完成结果保留；可启动新任务，旧操作不会自动续跑。',
+  },
   SOFTWARE_RESTART_BROWSE_CANCELLED: {
     summary: '软件重启，未完成任务已自动结束',
     next: '保留已完成的步骤进度与记录；不会自动重放中断操作。',

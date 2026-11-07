@@ -71,7 +71,7 @@ test('WO-R1.1: group_poster_operations accepts real UUID connectionEpoch without
 });
 
 test('WO-R1.2: v0 -> v52, v47 -> v52, and v51 -> v52 migrations upgrade group_poster_operations.connection_epoch to TEXT, preserve rows, pass foreign_key_check, and run zero ALTER TABLE in constructors', async () => {
-  assert.equal(workspaceSchemaVersion, 52);
+  assert.equal(workspaceSchemaVersion, 53);
   const dir = mkdtempSync(path.join(tmpdir(), 'wb-wor1-mig-'));
   try {
     // 1. v0 -> v52 fresh database
@@ -82,7 +82,7 @@ test('WO-R1.2: v0 -> v52, v47 -> v52, and v51 -> v52 migrations upgrade group_po
     const rawFresh = new DatabaseSync(freshPath, { readOnly: true });
     assert.equal(
       (rawFresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
-      52,
+      workspaceSchemaVersion,
     );
     assert.deepEqual(rawFresh.prepare('PRAGMA foreign_key_check').all(), []);
     const freshCols = rawFresh
@@ -131,7 +131,7 @@ test('WO-R1.2: v0 -> v52, v47 -> v52, and v51 -> v52 migrations upgrade group_po
     const rawAfter47 = new DatabaseSync(v47Path, { readOnly: true });
     assert.equal(
       (rawAfter47.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
-      52,
+      workspaceSchemaVersion,
     );
     assert.deepEqual(rawAfter47.prepare('PRAGMA foreign_key_check').all(), []);
     rawAfter47.close();

@@ -156,6 +156,10 @@ export const BumperCommentsInput = z
     texts: z.array(z.string().trim().min(1).max(8000)).max(5000),
     consumeCommentOnUse: z.boolean(),
     scope: BumperScope.optional(),
+    baseComments: z
+      .array(z.object({ id: z.uuid(), text: z.string().trim().min(1).max(8000) }).strict())
+      .max(5000)
+      .optional(),
   })
   .strict();
 export interface BumperComment {

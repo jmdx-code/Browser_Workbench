@@ -72,8 +72,8 @@ export async function startBridgeServer(options: BridgeServerOptions) {
   if (existingDatabase && !options.store) {
     const previous = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      if ((previous.prepare('PRAGMA user_version').get() as any).user_version < 2)
-        await backupDatabase(previous, path.join(data, 'before-v2-' + Date.now() + '.sqlite'));
+      if ((previous.prepare('PRAGMA user_version').get() as any).user_version < 3)
+        await backupDatabase(previous, path.join(data, 'before-v3-' + Date.now() + '.sqlite'));
     } finally {
       previous.close();
     }

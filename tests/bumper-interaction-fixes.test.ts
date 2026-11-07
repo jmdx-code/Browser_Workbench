@@ -797,84 +797,90 @@ it('Case 5: dismissUnexpectedFacebookOverlays closes unexpected dialogs while ex
   expect(clickedIds).not.toContain('poster-close');
 });
 
-it('native single-post query binds the visible footer to its own Story, never a background link or reply editor', () => {
-  const targetPost = '123456789012345';
-  const targetActor = '61599999999999';
-  const parentFeedback = btoa('feedback:' + targetPost);
-  const storyKey = 'story:target';
-  const records: Record<string, Record<string, unknown>> = {
-    [storyKey]: {
-      __typename: 'Story',
-      post_id: targetPost,
-      actors: { __refs: [targetActor] },
-      feedback: { __ref: parentFeedback },
-      creation_time: Date.now() / 1000,
-    },
-    [targetActor]: { id: targetActor, name: 'Target actor' },
-    [parentFeedback]: { id: parentFeedback },
-  };
-  const environment = {
-    getStore: () => ({ getSource: () => ({ get: (id: string) => records[id] }) }),
-  };
-  document.body.innerHTML = `<main><article role="article"><a href="/someone/posts/${targetPost}/">shared target</a><button>background Like</button></article></main>
+it.each([false, true])(
+  'native single-post query binds its visible footer; same-Story background=%s',
+  (sameStory) => {
+    const targetPost = '123456789012345';
+    const targetActor = '61599999999999';
+    const parentFeedback = btoa('feedback:' + targetPost);
+    const storyKey = 'story:target';
+    const records: Record<string, Record<string, unknown>> = {
+      [storyKey]: {
+        __typename: 'Story',
+        post_id: targetPost,
+        actors: { __refs: [targetActor] },
+        feedback: { __ref: parentFeedback },
+        creation_time: Date.now() / 1000,
+      },
+      [targetActor]: { id: targetActor, name: 'Target actor' },
+      [parentFeedback]: { id: parentFeedback },
+    };
+    const environment = {
+      getStore: () => ({ getSource: () => ({ get: (id: string) => records[id] }) }),
+    };
+    document.body.innerHTML = `<main><article role="article"><a href="/someone/posts/${targetPost}/">shared target</a><button>background Like</button></article></main>
     <div role="dialog"><div id="body">target body</div><div id="footer"><button id="real-like" role="button">Like</button><div id="real-editor" role="textbox" contenteditable="true"></div><div id="reply" role="textbox" contenteditable="true"></div></div></div>`;
-  document.querySelectorAll('*').forEach((el) => setRect(el, { width: 400, height: 100 }));
-  const background = document.querySelector('article')!;
-  attachFiberChain(background, [
-    {
-      name: 'CometFeedUnitCard.react',
-      props: {
-        story: {
-          __id: 'background',
-          post_id: '999999999999999',
-          actors: [{ id: '100000000000001' }],
+    document.querySelectorAll('*').forEach((el) => setRect(el, { width: 400, height: 100 }));
+    const background = document.querySelector('article')!;
+    attachFiberChain(background, [
+      {
+        name: 'CometFeedUnitCard.react',
+        props: {
+          story: {
+            __id: sameStory ? storyKey : 'background',
+            post_id: sameStory ? targetPost : '999999999999999',
+            actors: [{ id: sameStory ? targetActor : '100000000000001' }],
+          },
         },
       },
-    },
-  ]);
-  const query = {
-    name: 'CometSinglePostDialogRoot.react',
-    props: {
-      queries: {
-        singlePostDialogRootQueryReference: { variables: { storyID: storyKey }, environment },
+    ]);
+    const query = {
+      name: 'CometSinglePostDialogRoot.react',
+      props: {
+        queries: {
+          singlePostDialogRootQueryReference: { variables: { storyID: storyKey }, environment },
+        },
       },
-    },
-  };
-  attachFiberChain(document.querySelector('[role="dialog"]')!, [query]);
-  attachFiberChain(document.getElementById('real-like')!, [
-    { name: 'CometUFIReactButtonBase.react', props: { feedback: { __id: parentFeedback } } },
-    query,
-  ]);
-  attachFiberChain(document.getElementById('real-editor')!, [
-    { name: 'CometUFIComposerInner.react', props: { feedback: { __id: parentFeedback } } },
-    { name: 'CometUFICommentRow.react', props: { isComposer: true, depth: 0 } },
-    query,
-  ]);
-  attachFiberChain(document.getElementById('reply')!, [
-    { name: 'CometUFICommentRow.react', props: { depth: 1, comment: { id: 'existing-comment' } } },
-    query,
-  ]);
-  const actual = projectGroupBumper({
-    groupId: '-',
-    pageId: targetActor,
-    targetPostId: targetPost,
-  });
-  expect(actual.posts).toHaveLength(1);
-  expect(actual.posts[0]).toMatchObject({
-    postId: targetPost,
-    authorId: targetActor,
-    authorName: 'Target actor',
-    feedbackId: parentFeedback,
-  });
-  expect(document.getElementById('real-editor')?.getAttribute('data-wb-bumper-comment')).toBe(
-    targetPost,
-  );
-  expect(document.getElementById('reply')?.hasAttribute('data-wb-bumper-comment')).toBe(false);
-  expect(background.hasAttribute('data-wb-bumper-post')).toBe(false);
-  expect(projectGroupBumper({ groupId: '-', targetPostId: '888888888888888' }).posts).toHaveLength(
-    0,
-  );
-});
+    };
+    attachFiberChain(document.querySelector('[role="dialog"]')!, [query]);
+    attachFiberChain(document.getElementById('real-like')!, [
+      { name: 'CometUFIReactButtonBase.react', props: { feedback: { __id: parentFeedback } } },
+      query,
+    ]);
+    attachFiberChain(document.getElementById('real-editor')!, [
+      { name: 'CometUFIComposerInner.react', props: { feedback: { __id: parentFeedback } } },
+      { name: 'CometUFICommentRow.react', props: { isComposer: true, depth: 0 } },
+      query,
+    ]);
+    attachFiberChain(document.getElementById('reply')!, [
+      {
+        name: 'CometUFICommentRow.react',
+        props: { depth: 1, comment: { id: 'existing-comment' } },
+      },
+      query,
+    ]);
+    const actual = projectGroupBumper({
+      groupId: '-',
+      pageId: targetActor,
+      targetPostId: targetPost,
+    });
+    expect(actual.posts).toHaveLength(1);
+    expect(actual.posts[0]).toMatchObject({
+      postId: targetPost,
+      authorId: targetActor,
+      authorName: 'Target actor',
+      feedbackId: parentFeedback,
+    });
+    expect(document.getElementById('real-editor')?.getAttribute('data-wb-bumper-comment')).toBe(
+      targetPost,
+    );
+    expect(document.getElementById('reply')?.hasAttribute('data-wb-bumper-comment')).toBe(false);
+    expect(background.hasAttribute('data-wb-bumper-post')).toBe(false);
+    expect(
+      projectGroupBumper({ groupId: '-', targetPostId: '888888888888888' }).posts,
+    ).toHaveLength(0);
+  },
+);
 
 it('a link to a target and an unrelated editable dialog cannot rename a different native Story', () => {
   document.body.innerHTML =
@@ -1002,4 +1008,26 @@ it('preparation exceeding fifteen seconds retains one attempt until it converges
   const owner = randomUUID();
   await core.claimFixtureKernel(peer, owner);
   core.releaseFixtureKernel(peer, owner);
+});
+it('moves an in-viewport control above an edge chat window without closing the chat or forcing input', async () => {
+  Object.defineProperty(window, 'innerHeight', { value: 698, configurable: true });
+  const button = document.createElement('button'),
+    chat = document.createElement('aside');
+  document.body.append(button, chat);
+  let top = 333;
+  const update = () => setRect(button, { left: 480, top, width: 70, height: 32 });
+  update();
+  vi.spyOn(document, 'elementFromPoint').mockImplementation((_x, y) => (y > 180 ? chat : button));
+  const scroll = vi.spyOn(window, 'scrollBy').mockImplementation(((options: ScrollToOptions) => {
+    top -= options.top ?? 0;
+    update();
+  }) as typeof window.scrollBy);
+  const locator = {
+    evaluate: async (fn: (el: HTMLElement) => boolean) => fn(button),
+  } as unknown as Locator;
+  expect(await revealBumperControlIfNeeded(locator, 0)).toBe(true);
+  expect(top).toBeGreaterThan(68);
+  expect(top + 32).toBeLessThan(180);
+  expect(scroll).toHaveBeenCalledTimes(1);
+  expect(chat.isConnected).toBe(true);
 });

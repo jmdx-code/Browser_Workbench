@@ -747,6 +747,71 @@ it('Sidebar SelectByIdsDialog matches FB ID, profile ID, and numeric browser sho
   );
 });
 
+for (const mode of ['group-bumper', 'page-bumper'] as const) {
+  for (const dirty of [false, true]) {
+    it(`comment editor ${mode} refreshes untouched text and preserves dirty edits with a save baseline (${dirty})`, async () => {
+      const original = [{ id, text: 'used comment', usedCount: 0, createdAt: 0 }];
+      const state = {
+        groups: [],
+        pages: [],
+        settings: BumperSettings.parse({ consumeCommentOnUse: true }),
+        pageSettings: BumperSettings.parse({ consumeCommentOnUse: true }),
+        comments: original,
+        pageComments: original,
+        total: 0,
+        running: false,
+        statusText: '',
+        profileCounts: {},
+      };
+      const render = async (next: typeof state) =>
+        act(async () =>
+          root.render(
+            <GroupBumperPage
+              mode={mode}
+              state={next}
+              selected={new Set()}
+              onState={() => {}}
+              onMessage={() => {}}
+            />,
+          ),
+        );
+      await render(state);
+      await click(
+        [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('留言列表')) ??
+          null,
+      );
+      const area = host.querySelector<HTMLTextAreaElement>('[aria-label="留言话术"]')!;
+      expect(area.value).toBe('used comment');
+      if (dirty) {
+        await act(async () => {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(
+            area,
+            'used comment\nnew edit',
+          );
+          area.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+      }
+      const next = { ...state, comments: [], pageComments: [] };
+      vi.mocked(api.bumperAction).mockResolvedValue(next);
+      await render(next);
+      expect(area.value).toBe(dirty ? 'used comment\nnew edit' : '');
+      await click(
+        [...host.querySelectorAll('.bumper-modal-footer button')].find(
+          (b) => b.textContent?.trim() === '保存',
+        ) ?? null,
+      );
+      expect(api.bumperAction).toHaveBeenCalledWith(
+        mode === 'page-bumper' ? 'page-comments' : 'comments',
+        {
+          texts: dirty ? ['used comment', 'new edit'] : [],
+          consumeCommentOnUse: true,
+          baseComments: dirty ? [{ id, text: 'used comment' }] : [],
+        },
+      );
+    });
+  }
+}
+
 it('FeatureNavRail supports collapsible rail persisted in localStorage, group folding, and module selection', async () => {
   window.localStorage.removeItem('workbench.nav-rail-collapsed.v1');
   const selectedModules: string[] = [];

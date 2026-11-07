@@ -17,6 +17,7 @@ export const bridgeCapabilities = [
   'media-surface-input',
   'fixture-kernel-v1',
   'kernel-journal-v1',
+  'kernel-journal-collection-v1',
   'facebook-readonly-v1',
   'facebook-readonly-v2',
   'facebook-native-identity-v1',
@@ -54,6 +55,7 @@ export function bridgeHelloCapabilities(supported: unknown) {
         'task-window-passive-layout-v1',
         'kernel-direct-operation-files-v1',
         'kernel-control-release-v1',
+        'kernel-journal-collection-v1',
         'browser-window-reveal-v1',
       ].includes(value) ||
         (Array.isArray(supported) && supported.includes(value))) &&

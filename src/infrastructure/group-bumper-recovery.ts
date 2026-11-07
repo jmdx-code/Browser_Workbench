@@ -18,6 +18,7 @@ export const bumperSetupLabels = [
   '展开评论',
   '填写评论',
   '浏览小组帖子',
+  '关闭帖子弹窗',
 ] as const;
 export const bumperSetupKinds = [
   'setup_navigate',
@@ -30,6 +31,7 @@ export const bumperSetupKinds = [
   'setup_expand_comment',
   'setup_fill_comment',
   'setup_scroll',
+  'setup_welcome',
 ] as const;
 export const bumperDigest = (value: unknown) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -49,7 +51,14 @@ export async function recoverBumperOperations(
     ]),
   );
   const inventory = await kernel.withSummary(peer, (port) => port.inventory());
-  for (const op of inventory.operations) {
+  const archived = kernel.archivedOperations
+    ? await kernel.archivedOperations(peer.profileId, [...known.keys()])
+    : [];
+  const nativeIds = new Set(inventory.operations.map((row) => row.binding.operationId));
+  for (const op of [
+    ...inventory.operations,
+    ...archived.filter((row) => !nativeIds.has(row.binding.operationId)),
+  ]) {
     await guard();
     let row = known.get(op.binding.operationId);
     if (!row && kernelOperationPending(op) && ['ACKNOWLEDGED', 'UNKNOWN'].includes(op.state)) {
@@ -126,6 +135,29 @@ export async function recoverBumperOperations(
     });
     await guard();
     await repo.markOperationSettled(op.binding.operationId);
+  }
+  // Some historical begins failed before the extension could save a row (e.g.
+  // its former 3000-item limit). End only control; retain the saved business result.
+  if (peer.capabilities?.includes('kernel-journal-collection-v1')) {
+    const found = new Set(
+      [...inventory.operations, ...archived].map((op) => op.binding.operationId),
+    );
+    for (const row of known.values()) {
+      if (found.has(row.binding.operationId)) continue;
+      await guard();
+      const resolution =
+        row.resolution ??
+        (await repo.setOperationResolution(row.binding.operationId, {
+          id: randomUUID(),
+          outcome: 'ENDED_UNKNOWN',
+          evidenceDigest: bumperDigest({
+            binding: row.binding,
+            reason: 'Retired executor native receipt absent',
+          }),
+        }));
+      await kernel.withSummary(peer, (port) => port.notify(row.binding, resolution));
+      await repo.markOperationSettled(row.binding.operationId);
+    }
   }
   return protectedIds;
 }

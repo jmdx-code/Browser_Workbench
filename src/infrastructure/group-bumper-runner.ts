@@ -24,6 +24,7 @@ import {
   type BumperSettings,
   type BumperTarget,
   type BumperLog,
+  type BumperComment,
 } from '../shared/group-bumper.js';
 import { FacebookGroupSessionHelper, InFlightBumperCoordinator } from './facebook-group-session.js';
 export { FacebookGroupSessionHelper, InFlightBumperCoordinator };
@@ -55,6 +56,64 @@ const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const digest = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+
+export class BumperPostReadIncomplete extends Error {
+  constructor() {
+    super('目标帖子资料尚未读全，未执行互动');
+  }
+}
+export function requireBumperPost(
+  post: BumperPost | undefined,
+  target: BumperTarget,
+  expectedFeedback: string | null,
+): BumperPost {
+  if (
+    !post ||
+    (!post.authorId && !post.authorAliases?.length) ||
+    (expectedFeedback && !post.feedbackId)
+  )
+    throw new BumperPostReadIncomplete();
+  if (
+    !bumperAuthorMatch(post, target) ||
+    (expectedFeedback && !sameBumperFeedbackId(post.feedbackId, expectedFeedback))
+  )
+    throw Error('目标帖子或作者已变化');
+  return post;
+}
+
+export async function closeBumperPostDialog(input: {
+  page: Page;
+  postId: string;
+  guard(): void;
+  read(): Promise<Awaited<ReturnType<typeof readGroupBumper>>>;
+  run(
+    work: () => Promise<boolean>,
+    verify: (clicked: boolean) => Promise<boolean>,
+  ): Promise<unknown>;
+}) {
+  input.guard();
+  const current = await input.read();
+  if (!current.postDialogs?.some((d) => d.postId === input.postId)) return;
+  await input.run(
+    async () => {
+      input.guard();
+      const before = await input.read();
+      if (!before.postDialogs?.some((d) => d.postId === input.postId)) return false;
+      await input.page.keyboard.press('Escape');
+      return true;
+    },
+    async () => {
+      const until = Date.now() + 2000;
+      do {
+        input.guard();
+        if (!(await input.read()).postDialogs?.some((d) => d.postId === input.postId)) return true;
+        await wait(100);
+      } while (Date.now() < until);
+      // A failed close must not let the next post click behind this dialog.
+      throw new BumperFatalError('上一帖评论窗口未能关闭，本轮已停止');
+    },
+  );
+}
 
 export function isBumperGraphQLRestricted(body: string): boolean {
   let chunks: unknown[];
@@ -91,6 +150,28 @@ export function isBumperGraphQLRestricted(body: string): boolean {
 
 export function normalizeBumperComment(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+export async function claimBumperComment(
+  claims: Set<string>,
+  pick: (excludeIds: string[]) => BumperComment | null | Promise<BumperComment | null>,
+  guard: () => void,
+): Promise<BumperComment | null> {
+  const rejected = new Set<string>();
+  for (;;) {
+    guard();
+    const excluded = new Set([...claims, ...rejected]);
+    const candidate = await pick([...excluded]);
+    guard();
+    if (!candidate || excluded.has(candidate.id)) return null;
+    // Recheck after the asynchronous read, then claim without another await.
+    if (claims.has(candidate.id)) {
+      rejected.add(candidate.id);
+      continue;
+    }
+    claims.add(candidate.id);
+    return candidate;
+  }
 }
 
 function decodeBumperFeedbackDigits(val: string): string | null {
@@ -300,6 +381,18 @@ export function observeBumperGraphql(
     restricted: () => restricted,
     failed: () => !!failure,
     failureReason: () => failure,
+    waitForEvidence: async (timeoutMs: number, assertCurrent: () => void = () => {}) => {
+      // The matching response body may still be arriving at the verification
+      // deadline. Drain that request before recording UNKNOWN; never send again.
+      const end = Date.now() + timeoutMs;
+      while (!closed && requests.size > 0 && !confirmed && !failure && !restricted) {
+        assertCurrent();
+        const remaining = end - Date.now();
+        if (remaining <= 0) break;
+        await wait(Math.min(50, remaining));
+      }
+      assertCurrent();
+    },
     bindOperation: (id: string) => {
       operationId = id;
     },
@@ -867,20 +960,11 @@ export async function revealBumperControlIfNeeded(
   const didScroll = await locator.evaluate(
     (el) => {
       if (!(el instanceof HTMLElement)) return false;
-      const rect = el.getBoundingClientRect();
       const vh = window.innerHeight || document.documentElement.clientHeight || 800;
       const banner = document.querySelector('[role="banner"]');
       const bannerBottom = banner ? Math.max(0, banner.getBoundingClientRect().bottom) : 56;
       const topSafe = Math.min(Math.max(68, Math.ceil(bannerBottom + 12)), Math.floor(vh * 0.35));
       const bottomSafe = vh - 20;
-      if (rect.top >= topSafe && rect.bottom <= bottomSafe) {
-        return false;
-      }
-      const delta =
-        rect.bottom > bottomSafe
-          ? Math.ceil(rect.bottom - (vh - 28))
-          : Math.floor(rect.top - (topSafe + 16));
-      if (Math.abs(delta) < 2) return false;
       let scroller: HTMLElement | null = el.parentElement;
       while (scroller && scroller !== document.body && scroller !== document.documentElement) {
         const style = getComputedStyle(scroller);
@@ -888,13 +972,39 @@ export async function revealBumperControlIfNeeded(
           /(?:auto|scroll|overlay)/i.test(style.overflowY) &&
           scroller.scrollHeight > scroller.clientHeight + 4
         ) {
-          scroller.scrollBy({ top: delta, behavior: 'instant' });
-          return true;
+          break;
         }
         scroller = scroller.parentElement;
       }
-      window.scrollBy({ top: delta, behavior: 'instant' });
-      return true;
+      let moved = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const rect = el.getBoundingClientRect();
+        const hit = document.elementFromPoint?.(
+          (rect.left + rect.right) / 2,
+          (rect.top + rect.bottom) / 2,
+        );
+        const occluded = !!hit && hit !== el && !el.contains(hit);
+        if (rect.top >= topSafe && rect.bottom <= bottomSafe && !occluded) break;
+        // An edge chat window can cover an otherwise in-viewport control.
+        // Move the post above it rather than closing the user's chat or forcing a click.
+        const delta = occluded
+          ? Math.round((rect.top + rect.bottom) / 2 - (topSafe + 32))
+          : rect.bottom > bottomSafe
+            ? Math.ceil(rect.bottom - (vh - 28))
+            : Math.floor(rect.top - (topSafe + 16));
+        if (Math.abs(delta) < 2) break;
+        if (scroller && scroller !== document.body && scroller !== document.documentElement)
+          scroller.scrollBy({ top: delta, behavior: 'instant' });
+        else window.scrollBy({ top: delta, behavior: 'instant' });
+        moved = true;
+        const nextRect = el.getBoundingClientRect();
+        const nextHit = document.elementFromPoint?.(
+          (nextRect.left + nextRect.right) / 2,
+          (nextRect.top + nextRect.bottom) / 2,
+        );
+        if (!nextHit || nextHit === el || el.contains(nextHit)) break;
+      }
+      return moved;
     },
     undefined,
     { timeout: 4000 },
@@ -1807,6 +1917,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       });
     };
 
+    let issueCount = 0;
+    const reportIssue = (issue: Parameters<NonNullable<typeof callbacks.issue>>[0]) => {
+      issueCount++;
+      callbacks.issue?.(issue);
+    };
     const guard = () => {
       if (callbacks.cancelled()) throw new BumperFatalError('已停止');
       if (
@@ -2022,7 +2137,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             review: async (reason) => {
               await this.repo.markOperationReview(binding.operationId, reason);
               reviewed = true;
-              callbacks.issue?.({ kind: 'pending', reason });
+              reportIssue({ kind: 'pending', reason });
             },
           },
           assertCurrent: assertIdentity,
@@ -2031,7 +2146,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         });
       } catch (error) {
         if (submission && !reviewed)
-          callbacks.issue?.({
+          reportIssue({
             kind: 'failed',
             reason: error instanceof Error ? error.message : String(error),
           });
@@ -2989,6 +3104,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 let chosen: Awaited<ReturnType<SqliteGroupBumperRepository['pickComment']>> = null;
                 let postClaimed = false;
                 let quotaReserved = false;
+                const issueCountBeforePost = issueCount;
                 try {
                   if (
                     !scanOnly &&
@@ -3021,14 +3137,18 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   const wantLike = !post.liked && Math.random() * 100 < settings.likeProbability;
                   chosen =
                     Math.random() * 100 < settings.commentProbability
-                      ? await this.repo.pickComment(
-                          post.postId,
-                          Math.random(),
-                          [...this.commentClaims],
-                          sourceMode,
+                      ? await claimBumperComment(
+                          this.commentClaims,
+                          (excludeIds) =>
+                            this.repo.pickComment(
+                              post.postId,
+                              Math.random(),
+                              excludeIds,
+                              sourceMode,
+                            ),
+                          guard,
                         )
                       : null;
-                  if (chosen) this.commentClaims.add(chosen.id);
                   if (!scanOnly && !wantLike && !chosen) continue;
                   if (
                     !scanOnly &&
@@ -3107,40 +3227,33 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     return saved;
                   };
                   const checkPost = async (): Promise<BumperPost> => {
-                    await assertIdentity();
-                    const s = await readGroupBumper(page, {
-                      groupId: effectiveGroupId,
-                      ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
-                      targetPostId: post.postId,
-                    });
-                    if (!s.visible || !s.ready) throw Error('目标帖子页面尚未可见就绪');
-                    const p = s.posts.find((p) => p.postId === post.postId);
-                    if (s.restricted)
-                      throw new BumperFatalError(
-                        '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
-                      );
-                    if (isPageBumperMode) {
-                      if (
-                        !p ||
-                        !bumperAuthorMatch(
+                    for (let attempt = 0; ; attempt++) {
+                      await assertIdentity();
+                      const s = await readGroupBumper(page, {
+                        groupId: effectiveGroupId,
+                        ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
+                        targetPostId: post.postId,
+                      });
+                      if (!s.visible || !s.ready) throw Error('目标帖子页面尚未可见就绪');
+                      const p = s.posts.find((p) => p.postId === post.postId);
+                      if (s.restricted)
+                        throw new BumperFatalError(
+                          '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
+                        );
+                      if (!isPageBumperMode && !s.groupIds.includes(effectiveGroupId.toLowerCase()))
+                        throw Error('目标帖子或作者已变化');
+                      try {
+                        return requireBumperPost(
                           p,
                           feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
-                        ) ||
-                        (post.feedbackId && !sameBumperFeedbackId(p.feedbackId, post.feedbackId))
-                      )
-                        throw Error('目标帖子或作者已变化');
-                      return p;
+                          post.feedbackId,
+                        );
+                      } catch (error) {
+                        if (!(error instanceof BumperPostReadIncomplete) || attempt > 0)
+                          throw error;
+                        await wait(200);
+                      }
                     }
-                    if (
-                      !s.groupIds.includes(effectiveGroupId.toLowerCase()) ||
-                      !p ||
-                      !bumperAuthorMatch(
-                        p,
-                        feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
-                      )
-                    )
-                      throw Error('目标帖子或作者已变化');
-                    return p;
                   };
                   await dismissWelcomeDialogIfNeeded();
                   if (scanOnly) {
@@ -3163,7 +3276,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         await centerBumperControl(page.locator(anchorCSS).first(), this.paceScale);
                       }
                       // 居中后重新读取一次：屏下卡片水合后才暴露视频/点赞栏
-                      const refreshedPost = await checkPost().catch(() => post);
+                      const refreshedPost = await checkPost();
                       if (post.hasVideo || refreshedPost.hasVideo) {
                         callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
                         await watchBumperVideo({
@@ -3206,7 +3319,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     async () => true,
                   ).catch((error) => {
                     if (!callbacks.cancelled())
-                      callbacks.issue?.({
+                      reportIssue({
                         kind: 'failed',
                         reason: error instanceof Error ? error.message : String(error),
                       });
@@ -3364,6 +3477,15 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                             }
                             await wait(250);
                           }
+                          await native.waitForEvidence(2000, guard);
+                          if (native.restricted())
+                            throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
+                          if (native.failed()) throw Error(native.failureReason());
+                          if (native.confirmed()) {
+                            record.liked = true;
+                            consecutiveUnconfirmed = 0;
+                            return true;
+                          }
                           const fresh = await readBumperReactionFromServer(page, {
                             actorId: accountId,
                             postId: post.postId,
@@ -3517,6 +3639,15 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                               }
                               await wait(250);
                             }
+                            await native.waitForEvidence(2000, guard);
+                            if (native.restricted())
+                              throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
+                            if (native.failed()) throw Error(native.failureReason());
+                            if (native.confirmed()) {
+                              record.commentText = chosen?.text ?? null;
+                              consecutiveUnconfirmed = 0;
+                              return true;
+                            }
                             consecutiveUnconfirmed++;
                             return false;
                           },
@@ -3536,6 +3667,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 } catch (error) {
                   guard();
                   if (isBumperFatal(error)) throw error;
+                  if (issueCount === issueCountBeforePost)
+                    reportIssue({
+                      kind: 'failed',
+                      reason: error instanceof Error ? error.message : String(error),
+                    });
                   if (consecutiveUnconfirmed >= 3) {
                     throw new BumperFatalError(
                       '连续 3 次互动结果未确认，本轮已结束，原操作保留待核对',
@@ -3550,14 +3686,31 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     data: { groupId: group.id, postId: post.postId },
                   });
                 } finally {
-                  await dismissWelcomeDialogIfNeeded();
-                  if (quotaReserved) {
-                    this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
+                  // Release local claims even when closing the native dialog fails.
+                  try {
+                    if (!callbacks.cancelled() && peer.online && peer.epoch === epoch) {
+                      await closeBumperPostDialog({
+                        page,
+                        postId: post.postId,
+                        guard,
+                        read: () =>
+                          readGroupBumper(page, {
+                            groupId: effectiveGroupId,
+                            targetPostId: post.postId,
+                          }),
+                        run: (work, verify) => op('关闭帖子弹窗', work, verify),
+                      });
+                      await dismissWelcomeDialogIfNeeded();
+                    }
+                  } finally {
+                    if (quotaReserved) {
+                      this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
+                    }
+                    if (postClaimed) {
+                      this.inFlightCoordinator.releasePost(accountId, post.postId);
+                    }
+                    if (chosen) this.commentClaims.delete(chosen.id);
                   }
-                  if (postClaimed) {
-                    this.inFlightCoordinator.releasePost(accountId, post.postId);
-                  }
-                  if (chosen) this.commentClaims.delete(chosen.id);
                 }
               }
               if (!isPageBumperMode && oldPosts >= 3) break;

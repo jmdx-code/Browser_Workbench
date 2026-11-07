@@ -96,6 +96,8 @@ export interface BumperSurface {
   groupEntryMatchedBy?: 'id' | 'name' | null;
   groupJoinState?: 'unknown' | 'can-join' | 'member' | 'pending' | 'questions';
   blockingDialog?: boolean;
+  /** Native Story IDs of visible single-post dialogs, independent of UI language. */
+  postDialogs?: { postId: string; feedbackId: string | null; css: string }[];
   joinGroupCSS?: string | null;
   welcomeDismissCSS?: string | null;
   posts: BumperPost[];
@@ -608,15 +610,35 @@ export function projectGroupBumper(input: {
   const cardFor = (el: Element) => {
     if (cards.has(el)) return cards.get(el) ?? undefined;
     const frames = chain(el, 256);
-    const card =
-      frames.find(
+    const fullCard = (rows: typeof frames) =>
+      rows.find(
         (f) =>
           /CometFeedUnitCard|CometFeedUnitErrorBoundary/.test(f.name) &&
           record(f.props.story ?? f.props.feedUnit),
-      ) ??
-      frames.find(
-        (f) => /CometFeedStoryClickLoggerContainer/.test(f.name) && record(f.props.story),
       );
+    let card = fullCard(frames);
+    const logger = frames.find(
+      (f) => /CometFeedStoryClickLoggerContainer/.test(f.name) && record(f.props.story),
+    );
+    // Deep video children may reach only their internal logger. Search nearby
+    // DOM hosts for the complete card, but never borrow an adjacent Story.
+    if (!card && logger) {
+      const story = obj(logger.props.story);
+      const storyId = text(story.__id ?? story.id ?? story.post_id);
+      let parent = el.parentElement;
+      for (let depth = 0; storyId && parent && depth < 8; depth++, parent = parent.parentElement) {
+        const candidate = fullCard(chain(parent, 256));
+        const candidateStory = obj(candidate?.props.story ?? candidate?.props.feedUnit);
+        if (
+          candidate &&
+          text(candidateStory.__id ?? candidateStory.id ?? candidateStory.post_id) === storyId
+        ) {
+          card = candidate;
+          break;
+        }
+      }
+    }
+    card ??= logger;
     cards.set(el, card ?? null);
     return card;
   };
@@ -713,6 +735,7 @@ export function projectGroupBumper(input: {
         const id = text(story.post_id);
         if (!/^\d+$/.test(id) || (input.targetPostId && id !== input.targetPostId)) continue;
         singleDialogs.set(dialog, { story, key });
+        dialog.setAttribute('data-wb-bumper-post-dialog', id);
         relayCache.set(key, story);
         const refs = obj(story.actors).__refs;
         for (const id of [
@@ -733,7 +756,14 @@ export function projectGroupBumper(input: {
     const story = single?.story ?? obj(card?.props.story ?? card?.props.feedUnit);
     const key = single?.key ?? (text(story.__id ?? story.id) || root);
     const previous = storyRoots.get(key);
-    if (!previous || root.contains(previous)) storyRoots.set(key, root);
+    // A portal dialog and its background feed card can share the same Story.
+    // Prefer the dialog's native-query-bound surface over the background copy.
+    if (
+      !previous ||
+      (singleDialogs.has(root) && !singleDialogs.has(previous)) ||
+      (singleDialogs.has(root) === singleDialogs.has(previous) && root.contains(previous))
+    )
+      storyRoots.set(key, root);
   }
   const articles = Array.from(storyRoots.values()).slice(0, 60);
   const seenPostIds = new Set<string>();
@@ -1517,6 +1547,11 @@ export function projectGroupBumper(input: {
     groupEntryMatchedBy,
     groupJoinState,
     blockingDialog,
+    postDialogs: [...singleDialogs].map(([, { story }]) => ({
+      postId: text(story.post_id),
+      feedbackId: text(obj(story.feedback).__ref) || null,
+      css: `[data-wb-bumper-post-dialog="${text(story.post_id)}"]`,
+    })),
     joinGroupCSS,
     welcomeDismissCSS,
     posts,

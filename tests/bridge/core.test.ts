@@ -13,7 +13,7 @@ test('fresh and existing journals index current profile status without changing 
       .prepare('EXPLAIN QUERY PLAN SELECT * FROM operations WHERE profileId=? AND status IN (?,?)')
       .all(randomUUID(), 'UNKNOWN', 'ACKNOWLEDGED');
     assert.ok(plan.some((row) => String(row.detail).includes('operations_profile_status')));
-    assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 2);
+    assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 3);
     assert.deepEqual(store.unresolved(randomUUID()), []);
   } finally {
     store.close();

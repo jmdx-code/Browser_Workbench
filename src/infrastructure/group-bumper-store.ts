@@ -535,14 +535,27 @@ export class SqliteGroupBumperRepository {
   saveComments(input: unknown, scopeOverride?: BumperScope) {
     const parsed = BumperCommentsInput.parse(input);
     const scope: BumperScope = scopeOverride ?? parsed.scope ?? 'group';
-    const { texts, consumeCommentOnUse } = parsed;
+    const { texts, consumeCommentOnUse, baseComments } = parsed;
     return transaction(this.db, () => {
       const existing = new Map(this.comments(scope).map((r) => [r.text, r]));
+      let nextTexts = new Set(texts);
+      if (baseComments) {
+        const baseIds = new Set(baseComments.map((r) => r.id));
+        const baseTexts = new Set(baseComments.map((r) => r.text));
+        // Apply the user's edits to today's list. Unchanged rows consumed since
+        // the editor opened stay removed; concurrent additions stay present.
+        nextTexts = new Set(
+          [...existing.values()]
+            .filter((r) => !baseIds.has(r.id) || nextTexts.has(r.text))
+            .map((r) => r.text),
+        );
+        for (const text of texts) if (!baseTexts.has(text)) nextTexts.add(text);
+      }
       this.db.prepare('DELETE FROM group_bumper_comments WHERE scope=?').run(scope);
       const add = this.db.prepare(
         'INSERT INTO group_bumper_comments(id,comment_text,used_count,created_at,scope) VALUES(?,?,?,?,?)',
       );
-      for (const text of new Set(texts)) {
+      for (const text of nextTexts) {
         const previous = existing.get(text);
         add.run(
           previous?.id ?? randomUUID(),

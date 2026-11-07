@@ -12,6 +12,7 @@ import {
   type RestoreStatus,
 } from '../shared/workspace-backup.js';
 import { workspaceSchemaVersion } from './workspace-store.js';
+import { bridgeSchemaVersion } from '../bridge/store.js';
 import { FilesystemWorkspaceBackupWriter } from './workspace-backup-writer.js';
 
 const names = ['workspace.sqlite', 'journal.sqlite'] as const;
@@ -65,7 +66,8 @@ async function inspect(directory: string) {
     const db = new DatabaseSync(file, { readOnly: true });
     try {
       const version = db.prepare('PRAGMA user_version').get()?.user_version;
-      const maximum = record.name === 'workspace.sqlite' ? workspaceSchemaVersion : 2;
+      const maximum =
+        record.name === 'workspace.sqlite' ? workspaceSchemaVersion : bridgeSchemaVersion;
       if (typeof version !== 'number' || version < 1 || version > maximum)
         throw Error('备份版本不兼容，请使用同版或更新的软件');
       if (

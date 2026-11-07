@@ -1,4 +1,5 @@
 import { finderListMigration, SqliteTargetLists } from './target-list-store.js';
+import { taskSessionEndMigration } from './task-session-end-migration.js';
 import {
   SqliteTargetLibraryRepository,
   unifiedTargetLibraryMigration,
@@ -233,6 +234,11 @@ const migrations: readonly MigrationSpec[] = [
     rebuild: true,
     run: (db) => {
       rebuildGroupPosterOperationsEpochTextMigration(db);
+    },
+  },
+  {
+    run: (db) => {
+      db.exec(taskSessionEndMigration);
     },
   },
 ];

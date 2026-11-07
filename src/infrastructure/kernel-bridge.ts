@@ -87,7 +87,23 @@ import {
   PositionRecoveryGate,
 } from '../application/presentation-focus-gate.js';
 
+export interface KernelSummaryPort {
+  profileId: string;
+  inventory(): Promise<import('../shared/kernel-state.js').KernelState>;
+  stopCurrent(
+    requestId: string,
+    proofs?: readonly TabProof[],
+    incompleteTabs?: readonly TabRecord[],
+  ): Promise<import('../shared/task-ending.js').CurrentStop>;
+  notify(
+    binding: Binding,
+    resolution: Resolution,
+  ): Promise<import('../shared/settlement.js').NoticeReceipt>;
+}
+
 class KernelRpcSession {
+  journalSize = 0;
+  operationHighWater = 0;
   private readonly pending = new Map<
     string,
     {
@@ -984,6 +1000,78 @@ export class KernelBridge implements KernelBridgeHooks {
     private readonly watches: WatchTasks,
   ) {}
 
+  retireClosedSession?: (
+    peer: Peer,
+    port: KernelSummaryPort,
+    state: import('../shared/kernel-state.js').KernelState,
+  ) => Promise<void>;
+  private readonly retiredPeers = new WeakSet<Peer>();
+
+  async archivedOperations(
+    profileId: string,
+    operationIds: readonly string[],
+  ): Promise<KernelRecord[]> {
+    if (!this.core.store.kernelReceipts) return [];
+    const result: KernelRecord[] = [];
+    for (let i = 0; i < operationIds.length; i += 200)
+      result.push(
+        ...(await this.core.store.kernelReceipts(profileId, operationIds.slice(i, i + 200))),
+      );
+    return result;
+  }
+  private async archivedNotice(binding: Binding, resolution: Resolution) {
+    const rows = await this.archivedOperations(binding.profileId, [binding.operationId]);
+    return rows.some(
+      (row) =>
+        sameBinding(row.binding, binding) &&
+        [row.resolution, row.disposition].some(
+          (value) =>
+            value &&
+            sameNotice({ binding, resolution }, { binding: row.binding, resolution: value }),
+        ),
+    );
+  }
+  private async maintainJournal(peer: Peer, session: KernelRpcSession, value?: unknown) {
+    let state = KernelPersistentState.parse(
+      value ?? (await session.request({ kind: 'inventory' })),
+    );
+    if (state.profileId !== peer.profileId) throw Error('KERNEL_COLLECTION_PROFILE_MISMATCH');
+    session.journalSize = state.operations.length;
+    session.operationHighWater = state.operationHighWater ?? 0;
+    if (
+      !peer.capabilities?.includes('kernel-journal-collection-v1') ||
+      (state.operations.length < 1000 &&
+        !state.operations.some((row) => row.executionEnded && !kernelOperationPending(row)))
+    )
+      return state;
+    const terminal = state.operations.filter((row) => !kernelOperationPending(row));
+    const retired = terminal.filter((row) => row.executionEnded);
+    const retiredIds = new Set(retired.map((row) => row.binding.operationId));
+    const eligible = [
+      ...retired,
+      ...terminal
+        .filter((row) => !retiredIds.has(row.binding.operationId))
+        .slice(0, Math.max(0, terminal.length - retired.length - 200)),
+    ];
+    for (let i = 0; i < eligible.length; i += 200) {
+      const batch = eligible.slice(i, i + 200);
+      // Receipt durability precedes native deletion. Recovery can query this copy
+      // even if the controller crashes before its module marks the op settled.
+      await this.core.store.archiveKernelReceipts(peer.profileId, batch);
+      const reply = await session.request({
+        kind: 'collectOperations',
+        records: batch,
+        browserSessionEpoch: state.browserSessionEpoch,
+      });
+      if (typeof reply.collected !== 'number') throw Error('KERNEL_COLLECTION_UNCONFIRMED');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    if (eligible.length)
+      state = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+    session.journalSize = state.operations.length;
+    return state;
+  }
+
   async readFacebookPage(
     peer: Peer,
     input: PageProjectionRequest,
@@ -1236,22 +1324,7 @@ export class KernelBridge implements KernelBridgeHooks {
       throw error;
     }
   }
-  async withSummary<T>(
-    peer: Peer,
-    work: (port: {
-      profileId: string;
-      inventory(): Promise<import('../shared/kernel-state.js').KernelState>;
-      stopCurrent(
-        requestId: string,
-        proofs?: readonly TabProof[],
-        incompleteTabs?: readonly TabRecord[],
-      ): Promise<import('../shared/task-ending.js').CurrentStop>;
-      notify(
-        binding: Binding,
-        resolution: Resolution,
-      ): Promise<import('../shared/settlement.js').NoticeReceipt>;
-    }) => Promise<T>,
-  ): Promise<T> {
+  async withSummary<T>(peer: Peer, work: (port: KernelSummaryPort) => Promise<T>): Promise<T> {
     if (!peer.capabilities?.includes('kernel-journal-v1') || this.watches.busy(peer.profileId))
       throw Error('KERNEL_SUMMARY_UNAVAILABLE');
     const idle = this.idlePages.get(peer.profileId);
@@ -1330,12 +1403,12 @@ export class KernelBridge implements KernelBridgeHooks {
       const inventory = async () => {
         if (closed) throw Error('SUMMARY_SESSION_CLOSED');
         assertCurrent();
-        const result = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        const result = await this.maintainJournal(peer, session);
         assertCurrent();
         if (result.profileId !== peer.profileId) throw Error('SUMMARY_PROFILE_MISMATCH');
         return result;
       };
-      const value = await work({
+      const port: KernelSummaryPort = {
         profileId: peer.profileId,
         inventory,
         stopCurrent: async (requestId, proofs = [], incompleteTabs = []) => {
@@ -1380,6 +1453,39 @@ export class KernelBridge implements KernelBridgeHooks {
           if (closed || binding.profileId !== peer.profileId)
             throw Error('SUMMARY_NOTIFICATION_PROFILE_REJECTED');
           const expected = SettlementReceipt.parse({ binding, resolution });
+          if (await this.archivedNotice(binding, resolution)) return expected;
+          if (
+            peer.capabilities?.includes('kernel-journal-collection-v1') &&
+            (binding.connectionEpoch !== peer.epoch || binding.leaseId !== session.stamp.leaseId)
+          ) {
+            session.closing = true;
+            const reply = await session.request(
+              { kind: 'retireOperation', binding, resolution },
+              resolution.id,
+            );
+            const stop = KernelJsonObject.parse(reply.stop);
+            const receipt = SettlementReceipt.parse({
+              binding: reply.binding,
+              resolution: reply.resolution,
+            });
+            const state = KernelPersistentState.parse(reply.inventory);
+            const remote = state.operations.find(
+              (row) => row.binding.operationId === binding.operationId,
+            );
+            if (
+              reply.retired !== true ||
+              stop.state !== 'stopped' ||
+              stop.requestId !== resolution.id ||
+              !sameNotice(expected, receipt) ||
+              !remote ||
+              ![remote.resolution, remote.disposition].some(
+                (value) =>
+                  value && sameNotice(expected, { binding: remote.binding, resolution: value }),
+              )
+            )
+              throw Error('KERNEL_RETIREMENT_RECEIPT_MISMATCH');
+            return receipt;
+          }
           if (resolution.outcome === 'ENDED_UNKNOWN') {
             if (!peer.capabilities?.includes('kernel-unknown-end-v1'))
               throw Error('KERNEL_END_EXTENSION_UPDATE_REQUIRED');
@@ -1429,7 +1535,22 @@ export class KernelBridge implements KernelBridgeHooks {
             throw Error('SUMMARY_NOTICE_INVENTORY_MISMATCH');
           return receipt;
         },
-      });
+      };
+      if (
+        this.retireClosedSession &&
+        !this.retiredPeers.has(peer) &&
+        peer.capabilities?.includes('kernel-journal-collection-v1')
+      ) {
+        const before = await inventory();
+        await this.retireClosedSession(peer, port, before);
+        if (before.previousBrowserSessionEpoch)
+          await session.request({
+            kind: 'acknowledgeSessionEnd',
+            browserSessionEpoch: before.browserSessionEpoch,
+          });
+        this.retiredPeers.add(peer);
+      }
+      const value = await work(port);
       assertCurrent();
       closed = true;
       session.closing = true;
@@ -2388,6 +2509,8 @@ export class KernelBridge implements KernelBridgeHooks {
       await facebook?.assertIdentity();
       const backend = session.backend();
       const persistent = peer.capabilities?.includes('kernel-journal-v1') ?? false;
+      if (persistent && peer.capabilities?.includes('kernel-journal-collection-v1'))
+        await this.maintainJournal(peer, session);
       if (existingTab && (!persistent || existingTab.profileId !== peer.profileId))
         throw Error('KERNEL_TAB_ADOPTION_UNAVAILABLE');
       const ownershipId = existingTab?.ownershipId ?? randomUUID();
@@ -2768,7 +2891,21 @@ export class KernelBridge implements KernelBridgeHooks {
         session.resourceGuard = resourceGuard;
         const inputCountBefore = session.nativeInputCount;
         try {
-          const begin = await session.request({ kind: 'beginOperation', binding });
+          let operationSequence: number | undefined;
+          if (peer.capabilities?.includes('kernel-journal-collection-v1')) {
+            if (session.journalSize >= 1000) await this.maintainJournal(peer, session);
+            operationSequence = await this.core.store.kernelOperationSequence(
+              binding,
+              session.operationHighWater,
+            );
+          }
+          const begin = await session.request({
+            kind: 'beginOperation',
+            binding,
+            ...(operationSequence === undefined ? {} : { operationSequence }),
+          });
+          session.journalSize++;
+          session.operationHighWater = operationSequence ?? session.operationHighWater;
           const record = KernelOperationRecord.parse(begin.record);
           if (begin.fresh !== true) throw Error('KERNEL_OPERATION_ALREADY_RECORDED');
           if (!sameBinding(record.binding, binding) || record.state !== 'DISPATCHING')
@@ -3124,6 +3261,7 @@ export class KernelBridge implements KernelBridgeHooks {
           binding: Binding,
           resolution: NonNullable<KernelRecord['resolution']>,
         ) => {
+          if (await this.archivedNotice(binding, resolution)) return { binding, resolution };
           const result = await session.request({ kind: 'reconcileOperation', binding, resolution });
           const receipt = SettlementReceipt.parse({
             binding: result.binding,
