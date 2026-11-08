@@ -112,7 +112,20 @@ export function projectFacebookBackground(input: {
     return { ...base, phase: roots.length ? ('ambiguous' as const) : ('absent' as const) };
   const root = roots[0],
     edits = Array.from(root.querySelectorAll('[role="textbox"][contenteditable="true"]')).filter(
-      visible,
+      (el) => {
+        // Creator scrolls the editor above the viewport when opening lower options.
+        // Its rendered draft still determines the background; input targets retain
+        // their own viewport/visibility checks below.
+        const r = el.getBoundingClientRect(),
+          s = getComputedStyle(el);
+        return (
+          r.width > 0 &&
+          r.height > 0 &&
+          s.display !== 'none' &&
+          s.visibility !== 'hidden' &&
+          !el.closest('[aria-hidden="true"]')
+        );
+      },
     );
   if (edits.length !== 1 || !edits[0] || !base.ready)
     return { ...base, phase: 'ambiguous' as const };

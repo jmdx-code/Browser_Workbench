@@ -217,7 +217,7 @@ test('story composer checks fresh privacy, complete original text and exact targ
   }, false);
 });
 
-test('finite story sampling records only the original actor and full text request; a response never fabricates publication', async () => {
+test('story settlement requires the exact native creation response; translated or missing toasts do not override it', async () => {
   await postFixture(async (store, _file, catalog) => {
     const r = await postRequest(store, catalog, { accountId: '12345' });
     await store.materials.reserve(r);
@@ -368,7 +368,7 @@ test('finite story sampling records only the original actor and full text reques
           () => {},
         )
       ).kind,
-      'wait',
+      'verified',
     );
     notice.notices = ['Story posted'];
     const published = await observer.verify(
@@ -407,7 +407,7 @@ test('finite story sampling records only the original actor and full text reques
           () => {},
         )
       ).kind,
-      'wait',
+      'verified',
     );
     notice.url = 'https://www.facebook.com/stories';
     notice.timeOrigin++;
@@ -420,7 +420,7 @@ test('finite story sampling records only the original actor and full text reques
           () => {},
         )
       ).kind,
-      'wait',
+      'verified',
     );
     observer.stop();
     assert.equal(emitter.listenerCount('request'), 0);

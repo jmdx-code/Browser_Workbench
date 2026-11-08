@@ -19,12 +19,11 @@ import {
   isNativeTextStoryRequest,
   isNativeMediaStoryRequest,
   parseNativeStoryCreation,
-  readStoryPublishedNotice,
   nativeStoryResultURL,
   type NativeStoryCreation,
 } from './facebook-story-native-result.js';
 import { matchesOriginalStoryMedia } from '../domain/facebook-story-media.js';
-import { matchesDerivedStoryCaption } from '../domain/facebook-story-video.js';
+import { matchesStoryContent } from '../domain/facebook-story-video.js';
 
 const hash = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 // Diagnostic projection only, never publication evidence. Bodies, credentials, audience
@@ -131,8 +130,8 @@ export function matchStoryResearchRequest(
   }
 }
 
-// One original submit: native creation correlation and its fresh final UI notice are both
-// required. No response status, input ACK or own-story text alone can settle publication.
+// One original submit: the matching native mutation must return a complete created story
+// for the original actor. A translated transient toast is not publication evidence.
 export class FacebookStorySubmissionObserver
   implements FacebookSubmissionInputObserver, FacebookPostBusinessObserver
 {
@@ -190,8 +189,7 @@ export class FacebookStorySubmissionObserver
         ? story.phase !== 'text-editor'
         : !matchesOriginalStoryMedia(story, original.intent) || story.textEditing) ||
       story.privacy?.phase !== 'CLOSED' ||
-      (story.text !== original.intent.snapshot.text &&
-        !matchesDerivedStoryCaption(story, original.intent)) ||
+      !matchesStoryContent(story, original.intent) ||
       !story.submit?.enabled
     )
       throw Error('STORY_SUBMISSION_NOT_READY');
@@ -314,7 +312,18 @@ export class FacebookStorySubmissionObserver
           values,
         });
       })()
-        .catch(() => {})
+        .catch(async (error: unknown) => {
+          await emit({
+            event: 'STORY_NATIVE_RESPONSE_UNAVAILABLE',
+            operationId: operation.id,
+            jobId: operation.jobId,
+            status: response.status(),
+            reason:
+              error instanceof Error
+                ? error.message.split('\n')[0]?.slice(0, 180)
+                : 'RESPONSE_READ_FAILED',
+          });
+        })
         .finally(() => active.pending.delete(work));
       active.pending.add(work);
     };
@@ -353,8 +362,7 @@ export class FacebookStorySubmissionObserver
       current.privacy?.phase !== 'CLOSED' ||
       (original.intent.snapshot.format !== 'text' &&
         (!matchesOriginalStoryMedia(current, original.intent) || current.textEditing)) ||
-      (current.text !== original.intent.snapshot.text &&
-        !matchesDerivedStoryCaption(current, original.intent)) ||
+      !matchesStoryContent(current, original.intent) ||
       (this.active?.videoId !== null &&
         this.active?.videoId !== undefined &&
         current.videoTransfer?.videoId !== this.active.videoId) ||
@@ -379,10 +387,7 @@ export class FacebookStorySubmissionObserver
     const active = this.active;
     if (active.conflicting) return { kind: 'unknown', reason: 'STORY_NATIVE_RESULT_CONFLICT' };
     if (page !== active.page) return { kind: 'unknown', reason: 'STORY_ORIGINAL_PAGE_REQUIRED' };
-    if (
-      active.accepted &&
-      (await readStoryPublishedNotice(page, active.timeOrigin, guard, active.accepted))
-    ) {
+    if (active.accepted) {
       await guard();
       await active.guard();
       return {

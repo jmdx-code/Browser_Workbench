@@ -4,6 +4,7 @@ import { audienceTarget } from '../src/domain/facebook-audience.js';
 import {
   ComposerAudienceReading,
   privacyTargets,
+  clearAudienceDefaultTarget,
   type ComposerAudience,
 } from '../src/shared/facebook-audience.js';
 
@@ -41,8 +42,11 @@ test('fixed private configuration chooses only observed controls on an empty ori
 test('confirmation cannot alter default privacy, proceed during loading, or overwrite a foreign draft', () => {
   const menu = reading({ phase: 'MENU', selfSelected: true });
   assert.ok(audienceTarget(menu, 'CONFIRM_AUDIENCE'));
+  assert.deepEqual(
+    audienceTarget({ ...menu, defaultChecked: true }, 'CONFIRM_AUDIENCE'),
+    clearAudienceDefaultTarget,
+  );
   for (const patch of [
-    { defaultChecked: true },
     { defaultChecked: null },
     { selfSelected: false },
     { confirmEnabled: false },

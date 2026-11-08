@@ -9,11 +9,22 @@ import { storyPrivacyTargets } from '../shared/facebook-story-privacy.js';
 import { readFacebookStoryPage } from './facebook-story-page-reader.js';
 import { readFacebookHomePreparation } from './facebook-home-preparation.js';
 import { matchesOriginalStoryMedia } from '../domain/facebook-story-media.js';
-import { matchesDerivedStoryCaption } from '../domain/facebook-story-video.js';
+import { matchesStoryContent } from '../domain/facebook-story-video.js';
 import { storyMediaTextFinish } from '../shared/facebook-story.js';
+import { isEmptyStoryEditor } from '../domain/facebook-story-preparation.js';
 
 export class FacebookStoryComposerObserver implements FacebookPostComposerObserver {
-  constructor(private readonly read = readFacebookStoryPage) {}
+  constructor(
+    private readonly read = readFacebookStoryPage,
+    private readonly audience: (post: {
+      intent: PostIntent;
+      link: PostLink;
+    }) => Awaitable<string> = () => 'friends',
+    private readonly canRestart: (post: {
+      intent: PostIntent;
+      link: PostLink;
+    }) => Awaitable<boolean> = () => false,
+  ) {}
   async assert(
     page: Page,
     action: Action,
@@ -26,6 +37,12 @@ export class FacebookStoryComposerObserver implements FacebookPostComposerObserv
     if (media && !['single-image', 'video'].includes(post.intent.snapshot.format))
       throw Error('STORY_SINGLE_MEDIA_FORMAT_REQUIRED');
     if (post.link.purpose === 'PREPARE_STORY') {
+      const story = await this.read(page, guard);
+      await guard();
+      if (isEmptyStoryEditor(story) && (await this.canRestart(post))) {
+        await guard();
+        return;
+      }
       const home = await readFacebookHomePreparation(page, guard);
       await guard();
       if (!home.safe) throw Error('STORY_PREPARATION_BLOCKED');
@@ -69,7 +86,12 @@ export class FacebookStoryComposerObserver implements FacebookPostComposerObserv
         story.privacy.friendsEnabled
       )
         target = storyPrivacyTargets.selectFriends;
-      else if (story.privacy.draftSelection === 'FRIENDS') {
+      else if (
+        story.privacy.draftSelection === 'FRIENDS' ||
+        (purpose === 'CLOSE_AUDIENCE' &&
+          story.privacy.draftSelection !== null &&
+          (await this.audience(post)) === 'preserve-current')
+      ) {
         if (purpose === 'CONFIRM_AUDIENCE' && story.privacy.saveEnabled)
           target = storyPrivacyTargets.save;
         if (purpose === 'CLOSE_AUDIENCE' && story.privacy.cancelEnabled)
@@ -117,8 +139,7 @@ export class FacebookStoryComposerObserver implements FacebookPostComposerObserv
       if (
         purpose === 'SUBMIT' &&
         !story.textEditing &&
-        (story.text === post.intent.snapshot.text ||
-          matchesDerivedStoryCaption(story, post.intent)) &&
+        matchesStoryContent(story, post.intent) &&
         story.submit?.enabled
       )
         target = { css: story.submit.css };

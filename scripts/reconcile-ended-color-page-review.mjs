@@ -51,7 +51,7 @@ const origin = 'http://127.0.0.1:18767';
 const cookie = (await fetch(origin + '/workbench/')).headers.get('set-cookie')?.split(';')[0];
 assert.ok(cookie);
 const response = await fetch(origin + '/api/workspace/tasks', {
-  headers: { cookie, 'x-workbench-task-contract': '4' },
+  headers: { cookie, 'x-workbench-task-contract': '5' },
 });
 assert.ok(response.ok);
 const overview = await response.json();

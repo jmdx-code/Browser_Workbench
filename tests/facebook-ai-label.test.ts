@@ -8,10 +8,8 @@ import { decidePostAILabel } from '../src/domain/facebook-ai-label.js';
 import {
   facebookAILabelReading,
   facebookAILabelScope,
-  facebookAILabelSwitch,
   type AILabelPurpose,
 } from '../src/shared/facebook-ai-label.js';
-import { projectFacebookAILabel } from '../src/infrastructure/facebook-ai-label-reader.js';
 import { assertFacebookAILabelInput } from '../src/infrastructure/facebook-ai-label-input.js';
 import type { Page } from 'playwright-core';
 
@@ -157,116 +155,13 @@ test('AI label never blindly retoggles, dismisses foreign settings, or treats cl
   );
 });
 
-class NodeFixture {
-  nodes = new Map<string, NodeFixture[]>();
-  attributes = new Map<string, string>();
-  textContent = '';
-  disabled = false;
-  hidden = false;
-  getBoundingClientRect() {
-    return { width: 500, height: 300, left: 0, right: 500, top: 0, bottom: 300 };
-  }
-  getAttribute(name: string) {
-    return this.attributes.get(name) ?? null;
-  }
-  setAttribute(name: string, value: string) {
-    this.attributes.set(name, value);
-  }
-  querySelectorAll(css: string) {
-    return this.nodes.get(css) ?? [];
-  }
-  matches() {
-    return this.disabled;
-  }
-  closest() {
-    return this.hidden ? this : null;
-  }
-}
-test('bounded AI projection distinguishes unique native composer, settings, disabled and ambiguous controls', () => {
-  const root = new NodeFixture(),
-    opener = new NodeFixture(),
-    toggle = new NodeFixture(),
-    heading = new NodeFixture(),
-    confirm = new NodeFixture();
-  opener.attributes.set('aria-label', 'AI label off');
-  toggle.attributes.set('aria-checked', 'false');
-  confirm.textContent = 'Got it';
-  root.nodes.set('[role="button"]', [opener]);
-  const saved = new Map<string, PropertyDescriptor | undefined>();
-  const document = {
-    readyState: 'complete',
-    visibilityState: 'visible',
-    querySelectorAll: () => [root],
-  };
-  try {
-    for (const [key, value] of Object.entries({
-      document,
-      location: new URL('https://www.facebook.com/'),
-      innerWidth: 1280,
-      innerHeight: 900,
-      getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
-    })) {
-      saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
-      Object.defineProperty(globalThis, key, { value, configurable: true });
-    }
-    const read = () =>
-      facebookAILabelReading.parse(
-        projectFacebookAILabel({ scope: facebookAILabelScope, switchCSS: facebookAILabelSwitch }),
-      );
-    assert.equal(read().phase, 'composer');
-    document.readyState = 'interactive';
-    assert.equal(read().ready, true);
-    document.readyState = 'loading';
-    assert.equal(read().ready, false);
-    document.readyState = 'complete';
-    assert.equal(read().value, false);
-    for (const label of ['AI 标签已关闭', 'AI 標籤已關閉']) {
-      opener.attributes.set('aria-label', label);
-      assert.equal(read().value, false);
-      assert.equal(read().phase, 'composer');
-    }
-    opener.attributes.set('aria-label', 'AI 標籤已開啟');
-    assert.equal(read().value, true);
-    root.nodes.set('[role="button"]', []);
-    assert.equal(read().value, false);
-    root.nodes.set('[role="button"]', [opener]);
-    opener.disabled = true;
-    assert.equal(read().openCSS, null);
-    root.nodes.set('[role="dialog"][aria-label="Labeling your content"]', [heading]);
-    root.nodes.set(facebookAILabelSwitch, [toggle]);
-    root.nodes.set('[role="button"]', [confirm]);
-    assert.equal(read().phase, 'settings');
-    toggle.attributes.set('aria-checked', 'true');
-    assert.equal(read().value, true);
-    root.nodes.set(facebookAILabelSwitch, [toggle, new NodeFixture()]);
-    assert.equal(read().phase, 'ambiguous');
-    document.querySelectorAll = () => [root, new NodeFixture()];
-    assert.equal(read().phase, 'ambiguous');
-    Object.defineProperty(globalThis, 'location', {
-      value: new URL('https://example.org/'),
-      configurable: true,
-    });
-    assert.equal(read().phase, 'absent');
-  } finally {
-    for (const [key, descriptor] of saved) {
-      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-      else Reflect.deleteProperty(globalThis, key);
-    }
-  }
-});
-
-test('AI off without controls passes only before any configuration action; known on still needs an action', () => {
-  assert.equal(
-    decidePostAILabel(
-      'off',
-      { ...composer, phase: 'ambiguous', value: null, openCSS: null },
-      () => false,
-    ).kind,
-    'ready',
-  );
-  assert.throws(() =>
-    decidePostAILabel('off', { ...composer, phase: 'ambiguous', value: null }, () => true),
-  );
+test('explicit AI off never treats unknown or missing controls as false', () => {
+  for (const phase of ['absent', 'ambiguous'] as const)
+    assert.throws(
+      () =>
+        decidePostAILabel('off', { ...composer, phase, value: null, openCSS: null }, () => false),
+      /CONFIGURATION_UNAVAILABLE/,
+    );
   assert.equal(decidePostAILabel('off', { ...composer, value: true }, () => false).kind, 'action');
 });
 

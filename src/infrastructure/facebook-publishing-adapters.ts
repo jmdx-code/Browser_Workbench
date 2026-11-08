@@ -1,3 +1,4 @@
+import { DirectMaterialUpload } from './direct-material-upload.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { postAILabelSetting } from '../domain/material-post.js';
 import { randomUUID } from 'node:crypto';
@@ -50,6 +51,7 @@ export class FacebookPublishingAdapters {
     }
   >();
   private closed = false;
+  private readonly directUploads = new DirectMaterialUpload();
   constructor(
     private readonly store: WorkspaceStore,
     private readonly directory: string,
@@ -60,7 +62,9 @@ export class FacebookPublishingAdapters {
     private readonly audiencePolicy: FacebookSubmissionAudiencePolicy = 'preserve-current',
     private readonly uploadDiagnostic?: (value: PostUploadDiagnostic) => void,
     private readonly submissionDiagnostic?: (value: PostSubmissionDiagnostic) => void,
-    private readonly authorizeOriginal: (original: FacebookPostOriginal) => void = () => {},
+    private readonly authorizeOriginal: (
+      original: FacebookPostOriginal,
+    ) => Awaitable<void> = () => {},
     selectSource: (execution: StepExecution) => Awaitable<string | undefined> = () => undefined,
     private readonly uploadCacheRoot?: string,
     private readonly storyAuthorized: (plan: Plan) => Awaitable<boolean> = () => false,
@@ -258,9 +262,13 @@ export class FacebookPublishingAdapters {
       async (page, binding, manifest, guard, enable) => {
         await guard();
         const original = await inputs.source.current(binding, guard);
-        this.authorizeOriginal(original);
-        const readingGuard = async () => {
-          this.authorizeOriginal(original);
+        await this.authorizeOriginal(original);
+        if (original.intent.snapshot.format !== 'video') {
+          video.stop();
+          return;
+        }
+        const assertUploadOwner = async () => {
+          await this.authorizeOriginal(original);
           const current = await this.store.tasks.get(plan.id),
             operation = await this.store.tasks.findOperation(plan.id, binding.operationId),
             step = (await this.store.tasks.steps(plan.id)).find(
@@ -302,11 +310,17 @@ export class FacebookPublishingAdapters {
             !sameExecution(ownerContext, binding)
           )
             throw Error('VIDEO_UPLOAD_ORIGINAL_OWNER_REVOKED');
-          await this.store.uploadStages.assertReady(manifest);
+        };
+        const readingGuard = async () => {
+          await assertUploadOwner();
+          if (manifest.sourcePaths)
+            await this.directUploads.verify(original.intent, binding, manifest, assertUploadOwner);
+          else await this.store.uploadStages.assertReady(manifest);
+          await assertUploadOwner();
         };
         await video.begin(page, binding, manifest, original.intent, readingGuard, enable);
         await guard();
-        this.authorizeOriginal(original);
+        await this.authorizeOriginal(original);
       },
       this.uploadCacheRoot,
       readStory,
@@ -331,7 +345,7 @@ export class FacebookPublishingAdapters {
     const authorizedGuard =
       (original: FacebookPostOriginal, guard: () => Awaitable<void>) => async () => {
         await guard();
-        this.authorizeOriginal(original);
+        await this.authorizeOriginal(original);
       };
     const aiLabelSetting = async (original: FacebookPostOriginal) => {
       const step = (await this.store.tasks.steps(plan.id)).find(

@@ -224,8 +224,7 @@ export function projectFacebookDocumentIdentity(
             !rawResult ||
             'errors' in result ||
             typeof final !== 'boolean' ||
-            (rawActor !== undefined &&
-              (!actor || at(rawActor, 'is_additional_profile_plus') !== false))
+            (rawActor !== undefined && !actor)
           ) {
             summary.abort |= 4;
             continue;
@@ -346,10 +345,14 @@ export function projectFacebookDocumentIdentity(
       // The observed suspense layout has no StoriesCreate preload. Its completed me/actor
       // pair must match the selected menu actor, and the actual creation shell must exist.
       const forms = Array.from(
-        document.querySelectorAll('[role="navigation"][aria-label="Stories Creation Form"]'),
+        document.querySelectorAll(
+          '[data-wb-story-form="1"],[role="navigation"][aria-label="Stories Creation Form"]',
+        ),
       );
       const previews = Array.from(
-        document.querySelectorAll('[role="main"][aria-label="Stories Creation Preview"]'),
+        document.querySelectorAll(
+          '[data-wb-story-preview="1"],[role="main"][aria-label="Stories Creation Preview"]',
+        ),
       );
       const visible = (el: Element) => {
         const rect = el.getBoundingClientRect(),

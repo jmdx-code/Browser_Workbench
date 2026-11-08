@@ -14,6 +14,7 @@ export type StoryPrivacyDecision =
 export function decideStoryFriendsPrivacy(
   checkpoint: StoryPrivacyCheckpoint,
   reading: StoryPrivacy | null,
+  audience: 'friends' | 'preserve-current' = 'friends',
 ): StoryPrivacyDecision {
   if (!reading || reading.phase === 'UNAVAILABLE')
     return { kind: 'wait', reason: 'STORY_PRIVACY_UNAVAILABLE' };
@@ -36,6 +37,10 @@ export function decideStoryFriendsPrivacy(
     return action('saveChange', reading.saveEnabled);
   if (reading.phase !== 'MENU') throw Error('STORY_PRIVACY_DIALOG_CLOSED');
   if (checkpoint === 'SELECT_FRIENDS') {
+    if (audience === 'preserve-current')
+      return action('close', reading.draftSelection !== null && reading.cancelEnabled);
+    if (reading.draftSelection !== 'FRIENDS' && !reading.friendsEnabled)
+      throw Error('STORY_FRIENDS_AUDIENCE_UNAVAILABLE');
     // Already-Friends still needs a verified close, but no redundant Save or range change.
     return reading.draftSelection === 'FRIENDS'
       ? action('close', reading.cancelEnabled)

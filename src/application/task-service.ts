@@ -1,4 +1,5 @@
 import { groupTaskRecords } from '../domain/task-run-records.js';
+import { isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { mapAsync, flatMapAsync } from '../shared/async-collections.js';
 import {
@@ -331,7 +332,8 @@ export class TaskService {
     const isRunning = ({ row, isCurrentStep }: { row: TaskRecord; isCurrentStep: boolean }) =>
       isCurrentStep &&
       ['QUEUED', 'RUNNING', 'PAUSING', 'PAUSED', 'STOPPING'].includes(row.planState);
-    const isCompleted = ({ row }: { row: TaskRecord }) => row.status === 'COMPLETED';
+    const isCompleted = ({ row }: { row: TaskRecord }) =>
+      isSuccessfulTaskStep(row.type, row.status, row.outcome);
     const isFailed = ({ row }: { row: TaskRecord }) =>
       row.status === 'FAILED' ||
       (row.status === 'ACTIVE' && row.planState === 'FAILED' && row.outcome?.kind !== 'SKIPPED');
@@ -371,7 +373,8 @@ export class TaskService {
       const groups = groupTaskRecords(allRows.map((x) => x.row)).filter((g) => matching.has(g.key));
       const meta = new Map(allRows.map((x) => [x.row.stepId, x]));
       const matches = (g: (typeof groups)[number], status: typeof request.status) => {
-        if (status === 'completed') return g.rows.every((r) => r.status === 'COMPLETED');
+        if (status === 'completed')
+          return g.rows.every((r) => isSuccessfulTaskStep(r.type, r.status, r.outcome));
         if (status === 'failed')
           return g.rows.some((r) => {
             const item = meta.get(r.stepId);
@@ -442,10 +445,14 @@ export class TaskService {
   }
   async history(input: unknown) {
     const request = TaskHistoryRequest.parse(input);
-    const all = (await this.repository.plansForProfile(request.profileId)).sort(
-      (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
-    );
-    const hidden = new Set((await this.repository.hiddenRecordIds?.()) ?? []);
+    const all = (
+      this.repository.historyPlans
+        ? await this.repository.historyPlans(request.profileId, request.planId)
+        : await this.repository.plansForProfile(request.profileId)
+    ).sort((a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id));
+    const hidden = this.repository.historyPlans
+      ? new Set<string>()
+      : new Set((await this.repository.hiddenRecordIds?.()) ?? []);
     const visible: typeof all = [];
     for (const plan of all) {
       if (['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state) && hidden.size) {
@@ -460,7 +467,11 @@ export class TaskService {
       if (explicit) visible.push(explicit);
     }
     const plans = visible.slice(0, 50);
-    const selected = request.planId ? plans.find((plan) => plan.id === request.planId) : plans[0];
+    const selected = request.planId ? visible.find((plan) => plan.id === request.planId) : plans[0];
+    if (selected && !plans.some((p) => p.id === selected.id)) {
+      plans.pop();
+      plans.push(selected);
+    }
     if (request.planId && !selected)
       throw new ProductError(
         'TASK_HISTORY_PLAN_UNAVAILABLE',
@@ -472,16 +483,22 @@ export class TaskService {
     const selectedSteps = selected
       ? await this.repository.steps(selected.id, request.round ?? selected.round)
       : [];
+    const finalRecords = selected
+      ? await this.repository.finalRecords?.(selected.id, request.round ?? selected.round)
+      : null;
     const times = new Map(
-      selected
-        ? projectTaskRecords(selected, selectedSteps, operations, events).map(({ row }) => [
-            row.stepId,
-            row,
-          ])
-        : [],
+      finalRecords
+        ? finalRecords.map((row) => [row.stepId, row] as const)
+        : selected
+          ? projectTaskRecords(selected, selectedSteps, operations, events).map(({ row }) => [
+              row.stepId,
+              row,
+            ])
+          : [],
     );
     // Read the original ledger. Raw input content, bindings and receipts are not UI evidence.
     return TaskHistory.parse({
+      ...(finalRecords ? { detailsReclaimed: true } : {}),
       profileId: request.profileId,
       plans: plans.map((plan) => ({
         id: plan.id,

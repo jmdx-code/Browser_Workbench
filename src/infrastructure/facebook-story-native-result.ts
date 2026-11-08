@@ -1,6 +1,4 @@
-import type { Awaitable } from '../domain/persistence.js';
 import { z } from 'zod';
-import type { Page } from 'playwright-core';
 
 const id = z.string().regex(/^\d{1,30}$/);
 const response = z.object({
@@ -126,7 +124,7 @@ export function isNativeMediaStoryRequest(
 }
 
 // This is the observed StoriesCreateMutation, not ordinary ComposerStoryCreateMutation.
-// Creation correlation alone does not settle publication; a fresh final UI notice is required.
+// Complete native creation is accepted only for the matched original request and actor.
 export function parseNativeStoryCreation(
   body: string,
   status: number,
@@ -134,101 +132,36 @@ export function parseNativeStoryCreation(
 ): NativeStoryCreation | null {
   if (status !== 200 || Buffer.byteLength(body, 'utf8') > 512 * 1024) return null;
   try {
-    const value = response.parse(JSON.parse(body.replace(/^for \(;;\);\s*/, '')));
-    const created = value.data.story_create;
-    const storyId = created.items[0]?.story.id;
-    const bucketId = created.viewer.actor.story_bucket.nodes[0]?.id;
-    if (
-      !storyId ||
-      !bucketId ||
-      created.viewer.actor.id !== actorId ||
-      !/^S:_ISC:\d{1,30}$/.test(Buffer.from(storyId, 'base64').toString('utf8')) ||
-      Buffer.from(Buffer.from(storyId, 'base64')).toString('base64') !== storyId
-    )
-      return null;
-    return { actorId, bucketId, storyId };
+    const chunks = body
+      .replace(/^for \(;;\);\s*/, '')
+      .split(/\r?\n/)
+      .filter((line) => line.trim());
+    if (!chunks.length || chunks.length > 32) return null;
+    let accepted: NativeStoryCreation | null = null;
+    for (const chunk of chunks) {
+      const raw: unknown = JSON.parse(chunk);
+      if (raw && typeof raw === 'object' && 'errors' in raw) return null;
+      const parsed = response.safeParse(raw);
+      if (!parsed.success) continue;
+      const created = parsed.data.data.story_create;
+      const storyId = created.items[0]?.story.id;
+      const bucketId = created.viewer.actor.story_bucket.nodes[0]?.id;
+      if (
+        !storyId ||
+        !bucketId ||
+        created.viewer.actor.id !== actorId ||
+        !/^S:_ISC:\d{1,30}$/.test(Buffer.from(storyId, 'base64').toString('utf8')) ||
+        Buffer.from(Buffer.from(storyId, 'base64')).toString('base64') !== storyId
+      )
+        return null;
+      const next = { actorId, bucketId, storyId };
+      if (accepted && JSON.stringify(accepted) !== JSON.stringify(next)) return null;
+      accepted = next;
+    }
+    return accepted;
   } catch {
     return null;
   }
-}
-
-export async function readStoryPublishedNotice(
-  page: Page,
-  timeOrigin: number,
-  guard: () => Awaitable<void>,
-  created?: NativeStoryCreation,
-) {
-  await guard();
-  const value = z
-    .object({
-      url: z.string(),
-      timeOrigin: z.number(),
-      ready: z.string(),
-      visible: z.boolean(),
-      notices: z.array(z.string()).max(10),
-      ownStoryLinks: z.array(z.string().max(2048)).max(4).default([]),
-    })
-    .parse(
-      await page.evaluate(() => ({
-        url: location.href,
-        timeOrigin: performance.timeOrigin,
-        ready: document.readyState,
-        visible: document.visibilityState === 'visible',
-        ownStoryLinks: Array.from(
-          document.querySelectorAll('a[aria-label="View your story"][href]'),
-        )
-          .filter((el) => {
-            const r = el.getBoundingClientRect(),
-              style = getComputedStyle(el);
-            return (
-              r.width > 0 &&
-              r.height > 0 &&
-              style.display !== 'none' &&
-              style.visibility !== 'hidden'
-            );
-          })
-          .slice(0, 4)
-          .map((el) => (el as HTMLAnchorElement).href),
-        notices: Array.from(document.querySelectorAll('[role="alert"]'))
-          .filter((el) => {
-            const r = el.getBoundingClientRect(),
-              style = getComputedStyle(el);
-            return (
-              r.width > 0 &&
-              r.height > 0 &&
-              style.display !== 'none' &&
-              style.visibility !== 'hidden'
-            );
-          })
-          .slice(0, 10)
-          .map((el) => el.textContent?.trim() ?? ''),
-      })),
-    );
-  await guard();
-  const homepageResult =
-    value.url === 'https://www.facebook.com/' &&
-    created &&
-    value.ownStoryLinks.filter((href) => {
-      try {
-        const url = new URL(href),
-          expected = new URL(nativeStoryResultURL(created));
-        return (
-          url.origin === expected.origin &&
-          url.pathname === expected.pathname &&
-          !url.username &&
-          !url.password
-        );
-      } catch {
-        return false;
-      }
-    }).length === 1;
-  return (
-    (value.url === 'https://www.facebook.com/stories' || homepageResult === true) &&
-    value.timeOrigin === timeOrigin &&
-    ['interactive', 'complete'].includes(value.ready) &&
-    value.visible &&
-    value.notices.filter((text) => text === 'Story posted').length === 1
-  );
 }
 
 export function nativeStoryResultURL(value: NativeStoryCreation) {

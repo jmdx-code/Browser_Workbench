@@ -13,6 +13,7 @@ import { admitProfilesForStart } from '../src/application/profile-start-admissio
 import { WorkspaceService } from '../src/application/workspace-service.js';
 import type { BrowserProfileSource } from '../src/domain/workspace.js';
 import { SqliteGroupPosterRepository } from '../src/infrastructure/group-poster-store.js';
+import { readRecordAvatar, recordAvatarURL } from '../src/infrastructure/record-avatar-store.js';
 import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { inspectionAvatarURL } from '../src/renderer/inspection-presentation.js';
 import { projectProfileActivity } from '../src/renderer/modules/profile-activity-projector.js';
@@ -352,8 +353,10 @@ test('WO-U1: SqliteGroupPosterRepository snapshots personal avatar on write with
     assert.equal(logs.length, 2);
     const pageLog = logs.find((l) => l.identityType === 'page');
     const personalLog = logs.find((l) => l.identityType === 'personal');
-    assert.equal(pageLog?.accountAvatar, pageAvatar);
-    assert.equal(personalLog?.accountAvatar, SAMPLE_LOCAL_WEBP);
+    assert.equal(pageLog?.accountAvatar, recordAvatarURL('page', '6155000999'));
+    assert.equal(personalLog?.accountAvatar, recordAvatarURL('account', '100000111'));
+    assert.equal(readRecordAvatar(db, 'page', '6155000999'), pageAvatar);
+    assert.equal(readRecordAvatar(db, 'account', '100000111'), SAMPLE_LOCAL_WEBP);
   } finally {
     db.close();
   }

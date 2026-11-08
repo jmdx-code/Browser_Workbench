@@ -1,3 +1,5 @@
+import { ensurePosterUsage, ensureRecordAvatars } from './record-retention-migration.js';
+import { recordAvatarURL, saveRecordAvatar } from './record-avatar-store.js';
 import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -264,6 +266,8 @@ export class SqliteGroupPosterRepository {
     ensureTargetLibrarySchema(this.db);
     this.db.exec(groupPosterMigration);
     this.db.exec(groupPosterOperationsMigration);
+    ensurePosterUsage(db);
+    ensureRecordAvatars(db);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS profile_task_results(
         profile_id TEXT PRIMARY KEY,
@@ -966,7 +970,7 @@ export class SqliteGroupPosterRepository {
   hasGroupPostedMaterial(groupId: string, materialId: string): boolean {
     if (
       this.db
-        .prepare('SELECT 1 FROM group_poster_logs WHERE group_id=? AND material_id=? LIMIT 1')
+        .prepare('SELECT 1 FROM group_poster_usage WHERE group_id=? AND material_id=? LIMIT 1')
         .get(groupId, materialId)
     ) {
       return true;
@@ -983,7 +987,7 @@ export class SqliteGroupPosterRepository {
   recordPost(input: PosterLog): boolean {
     return transaction(this.db, () => {
       const existing = this.db
-        .prepare('SELECT 1 FROM group_poster_logs WHERE id=? LIMIT 1')
+        .prepare('SELECT 1 FROM group_poster_usage WHERE log_id=? LIMIT 1')
         .get(input.id);
       if (existing) return false;
       let resolvedAccountAvatar = input.accountAvatar;
@@ -998,7 +1002,7 @@ export class SqliteGroupPosterRepository {
         if (hasCache) {
           const cachedRow = this.db
             .prepare(
-              'SELECT avatar_url FROM profile_account_cache WHERE profile_id=? AND (account_id=? OR account_id IS NULL) LIMIT 1',
+              'SELECT avatar_url FROM profile_account_cache WHERE profile_id=? AND account_id=? LIMIT 1',
             )
             .get(input.profileId, input.accountId) as { avatar_url?: string | null } | undefined;
           if (cachedRow?.avatar_url && String(cachedRow.avatar_url).trim()) {
@@ -1006,6 +1010,14 @@ export class SqliteGroupPosterRepository {
           }
         }
       }
+      saveRecordAvatar(
+        this.db,
+        input.identityType === 'page' ? 'page' : 'account',
+        input.accountId,
+        resolvedAccountAvatar,
+        input.postedAt,
+      );
+      saveRecordAvatar(this.db, 'group', input.groupId, input.groupAvatar, input.postedAt);
       this.db
         .prepare(
           `INSERT INTO group_poster_logs(
@@ -1018,11 +1030,11 @@ export class SqliteGroupPosterRepository {
           input.profileId,
           input.accountId,
           input.accountName,
-          resolvedAccountAvatar,
+          null,
           input.identityType,
           input.groupId,
           input.groupName,
-          input.groupAvatar,
+          null,
           input.materialId,
           input.captionPreview,
           input.postId,
@@ -1060,11 +1072,14 @@ export class SqliteGroupPosterRepository {
         profileId: String(r.profile_id),
         accountId: String(r.account_id),
         accountName: String(r.account_name ?? ''),
-        accountAvatar: r.account_avatar == null ? null : String(r.account_avatar),
+        accountAvatar: recordAvatarURL(
+          r.identity_type === 'page' ? 'page' : 'account',
+          String(r.account_id),
+        ),
         identityType: String(r.identity_type) === 'page' ? 'page' : 'personal',
         groupId: String(r.group_id),
         groupName: String(r.group_name ?? ''),
-        groupAvatar: r.group_avatar == null ? null : String(r.group_avatar),
+        groupAvatar: recordAvatarURL('group', String(r.group_id)),
         materialId: String(r.material_id),
         captionPreview: String(r.caption_preview ?? ''),
         postId: String(r.post_id),
@@ -1101,6 +1116,13 @@ export class SqliteGroupPosterRepository {
       .strict()
       .parse(input);
     return transaction(this.db, () => {
+      const usageChanges = Number(
+        this.db
+          .prepare(
+            'DELETE FROM group_poster_usage WHERE ?=1 OR log_id IN(SELECT value FROM json_each(?))',
+          )
+          .run(all ? 1 : 0, JSON.stringify(ids)).changes,
+      );
       const changes = Number(
         this.db
           .prepare(
@@ -1108,13 +1130,13 @@ export class SqliteGroupPosterRepository {
           )
           .run(all ? 1 : 0, JSON.stringify(ids)).changes,
       );
-      if (changes > 0) {
+      if (changes > 0 || usageChanges > 0) {
         this.db
           .prepare(
             `UPDATE shared_facebook_groups
                 SET posted_count = (
-                  SELECT COUNT(*) FROM group_poster_logs
-                   WHERE group_poster_logs.group_id = shared_facebook_groups.group_id
+                  SELECT COUNT(*) FROM group_poster_usage
+                   WHERE group_poster_usage.group_id = shared_facebook_groups.group_id
                 )`,
           )
           .run();
@@ -1133,7 +1155,7 @@ export class SqliteGroupPosterRepository {
     return Object.fromEntries(
       this.db
         .prepare(
-          'SELECT profile_id,COUNT(*) n FROM group_poster_logs WHERE posted_at>=? GROUP BY profile_id',
+          'SELECT profile_id,COUNT(*) n FROM group_poster_usage WHERE posted_at>=? GROUP BY profile_id',
         )
         .all(today.getTime())
         .map((r) => [String(r.profile_id), Number(r.n)]),
@@ -1161,7 +1183,7 @@ export class SqliteGroupPosterRepository {
     }
 
     const rows = this.db
-      .prepare('SELECT posted_at FROM group_poster_logs WHERE posted_at >= ? AND posted_at < ?')
+      .prepare('SELECT posted_at FROM group_poster_usage WHERE posted_at >= ? AND posted_at < ?')
       .all(startMs, endMs);
     for (const r of rows) {
       const ymd = formatLocalYmd(new Date(Number(r.posted_at)));

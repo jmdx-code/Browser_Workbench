@@ -1,10 +1,13 @@
 import { z } from 'zod';
 
-export const COMPOSER_AUDIENCE_SCOPE =
-  '[role="dialog"]:has(form [role="textbox"][contenteditable="true"])';
+export const COMPOSER_AUDIENCE_SCOPE = '[data-wb-audience-composer="1"]';
 export const AUDIENCE_GROUP_SCOPE = '[data-wb-audience-group="1"]';
 export const AUDIENCE_MENU_SCOPE = '[data-wb-audience-menu="1"]';
 export const AUDIENCE_DONE_CSS = '[data-wb-audience-done="1"]';
+export const clearAudienceDefaultTarget = {
+  scope: AUDIENCE_MENU_SCOPE,
+  css: '[data-wb-audience-default="1"]',
+} as const;
 export const privacyTargets = {
   OPEN_AUDIENCE: { scope: COMPOSER_AUDIENCE_SCOPE, css: '[data-wb-audience-open="1"]' },
   SELECT_SELF: { scope: AUDIENCE_GROUP_SCOPE, css: '[data-wb-audience-self="1"]' },
@@ -23,6 +26,7 @@ export const ComposerAudienceReading = z
     selfEnabled: z.boolean(),
     defaultChecked: z.boolean().nullable(),
     confirmEnabled: z.boolean(),
+    selfAvailable: z.boolean().optional(),
   })
   .strict();
 export type ComposerAudience = z.infer<typeof ComposerAudienceReading>;

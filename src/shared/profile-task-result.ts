@@ -39,6 +39,9 @@ export function profileTaskResultLabel(result: ProfileTaskResultValue): {
   if (result.state === 'STOPPED') return { tone: 'pause', text: '上次已停止 · ' + name };
   if (result.failedSteps > 0) return { tone: 'warn', text: '上次部分失败 · ' + name };
   if (result.skippedSteps > 0)
-    return { tone: 'warn', text: `上次完成（跳过${result.skippedSteps}项）· ${name}` };
+    return {
+      tone: result.source === 'task' && result.state === 'COMPLETED' ? 'ok' : 'warn',
+      text: `上次${result.source === 'task' && result.state === 'COMPLETED' ? '成功' : '完成'}（跳过${result.skippedSteps}项）· ${name}`,
+    };
   return { tone: 'ok', text: '上次成功 · ' + name };
 }

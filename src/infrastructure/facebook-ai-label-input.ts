@@ -18,11 +18,7 @@ export async function assertFacebookAILabelInput(
 ) {
   const purpose = original.link.purpose;
   const aiPurpose = postAILabelPurposes.find((value) => value === purpose);
-  if (
-    !aiPurpose &&
-    !['SET_TEXT', 'PREPARE_MEDIA', 'UPLOAD_MEDIA', 'ADVANCE_COMPOSER', 'SUBMIT'].includes(purpose)
-  )
-    return false;
+  if (!aiPurpose && purpose !== 'SUBMIT') return false;
   if (setting === 'preserve-current') {
     if (aiPurpose) throw Error('POST_AI_LABEL_STEP_REQUIRED');
     return false;
@@ -40,10 +36,12 @@ export async function assertFacebookAILabelInput(
   const valid =
     aiPurpose === 'OPEN_AI_LABEL'
       ? reading.phase === 'composer' && reading.value !== wanted && !!reading.openCSS
-      : reading.phase === 'settings' &&
-        (aiPurpose === 'SET_AI_LABEL'
-          ? reading.value !== wanted && reading.switchEnabled
-          : reading.value === wanted && reading.confirmEnabled);
+      : aiPurpose === 'SET_AI_LABEL'
+        ? (reading.phase === 'settings' ||
+            (reading.phase === 'composer' && reading.mode === 'inline')) &&
+          reading.value !== wanted &&
+          reading.switchEnabled
+        : reading.phase === 'settings' && reading.value === wanted && reading.confirmEnabled;
   const target = aiLabelTarget(aiPurpose, reading);
   if (
     !valid ||

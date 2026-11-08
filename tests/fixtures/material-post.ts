@@ -51,6 +51,7 @@ export function postRequest(
     followingSteps?: Step[];
     destination?: 'post' | 'story';
     audience?: 'preserve-current' | 'self' | 'friends';
+    aiLabel?: 'on' | 'off';
   } = {},
 ): ReservationRequest {
   const id = randomUUID(),
@@ -72,6 +73,7 @@ export function postRequest(
         type: 'post',
         ...(options.destination ? { destination: options.destination } : {}),
         ...(options.audience ? { audience: options.audience } : {}),
+        ...(options.aiLabel ? { aiLabel: options.aiLabel } : {}),
         resourceDirectory: catalog.directory,
         count: options.count ?? 1,
         allowRepeat: options.allowRepeat ?? false,

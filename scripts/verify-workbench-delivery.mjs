@@ -103,7 +103,7 @@ async function request(route, input, extra = {}) {
     method: input === undefined ? 'GET' : 'POST',
     headers: {
       cookie,
-      'x-workbench-task-contract': '4',
+      'x-workbench-task-contract': '5',
       'x-workbench-task-capacity': '2',
       'x-workbench-workspace-contract': '6',
       ...extra,

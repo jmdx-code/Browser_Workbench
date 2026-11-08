@@ -1867,6 +1867,7 @@ async function createMaterialSession(
       type?: string;
     }[] = [];
     let onNativeInput = (_type: string | undefined) => {};
+    let onIdentityRefresh = async () => {};
     const connect = h.kernel.connectFacebook.bind(h.kernel);
     h.kernel.connectFacebook = async (...args) => {
       const connection = await connect(...args),
@@ -1928,6 +1929,7 @@ async function createMaterialSession(
         ...h.authority,
         refreshIdentity: async (_page: unknown, guard: () => void) => {
           guard();
+          await onIdentityRefresh();
         },
         assertPostTarget: async (_action: unknown, post: FacebookPostTarget) => {
           targets.push(post);
@@ -1983,6 +1985,9 @@ async function createMaterialSession(
       },
       setNativeInput: (callback: typeof onNativeInput) => {
         onNativeInput = callback;
+      },
+      setIdentityRefresh: (callback: typeof onIdentityRefresh) => {
+        onIdentityRefresh = callback;
       },
       dispatch: async (purpose: Parameters<typeof postAction>[2]) => {
         const prepared = await postAction(h.workspace, request, purpose);
@@ -2101,6 +2106,27 @@ test('user stop between settings key down and key up cannot borrow completion pe
       ['keyDown'],
     );
     assert.equal(f.h.workspace.tasks.operations(f.h.plan.id).at(-1)?.status, 'UNKNOWN');
+  });
+});
+
+test('paired composer key release completes when key down navigates away from the old identity document', async () => {
+  await materialSessionFixture('text.txt', async (f) => {
+    let navigated = false;
+    f.setNativeInput((type) => {
+      if (type === 'keyDown') navigated = true;
+    });
+    f.setIdentityRefresh(async () => {
+      if (navigated)
+        throw Error('Execution context was destroyed, most likely because of a navigation');
+    });
+    await f.dispatch('OPEN_COMPOSER');
+    assert.deepEqual(
+      f.received.map((input) => input.type),
+      ['keyDown', 'keyUp'],
+    );
+    assert.equal(f.h.workspace.tasks.operations(f.h.plan.id).at(-1)?.status, 'ACKNOWLEDGED');
+    assert.equal(f.h.workspace.materialPosts.result(f.request.attemptId), null);
+    assert.equal(f.h.workspace.materials.reservation(f.request.attemptId).state, 'RESERVED');
   });
 });
 
@@ -2467,4 +2493,20 @@ test('WO53: ordinary global STOP reuses a bumper connection stop ID without an I
   } finally {
     await h.close();
   }
+});
+
+test('managed upload SDK failure records the exact preparation step before lifecycle STOP, without treating it as a submit', async () => {
+  await materialSessionFixture('image.png', async (f) => {
+    f.inputs.upload.send = async (_session, _binding, _guard, failure) => {
+      await failure?.('UPLOAD_STAGE_OWNER_REQUIRED');
+      throw Error('UPLOAD_STAGE_OWNER_REQUIRED');
+    };
+    await f.dispatch('UPLOAD_MEDIA');
+    const ending = f.h.workspace.tasks.stepEnding(f.h.plan.id);
+    assert.equal(ending?.stepId, f.request.stepId);
+    assert.equal(ending?.reason, 'UPLOAD_STAGE_OWNER_REQUIRED');
+    assert.equal(f.h.workspace.tasks.get(f.h.plan.id).controlConfirmed, true);
+    assert.equal(f.h.workspace.materialPosts.result(f.request.attemptId), null);
+    assert.equal(f.received.length, 0);
+  });
 });

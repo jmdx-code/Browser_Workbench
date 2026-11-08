@@ -73,6 +73,35 @@ export async function handleSystemMaintenanceRoutes(
     softwareUpdate,
   } = ctx;
 
+  if (cleanup && req.method === 'GET' && route === '/api/workspace/record-avatar') {
+    const url = new URL(req.url ?? '/', 'http://localhost'),
+      kind = z.enum(['account', 'page', 'group']).parse(url.searchParams.get('kind')),
+      id = z.string().min(1).max(200).parse(url.searchParams.get('id'));
+    const image = await cleanup.recordAvatar(kind, id);
+    const inline =
+      image && /^data:(image\/(?:jpeg|webp|png|gif));base64,([A-Za-z0-9+/=]+)$/.exec(image);
+    if (inline) {
+      res.writeHead(200, {
+        'content-type': inline[1] ?? 'image/jpeg',
+        'cache-control': 'private,max-age=300',
+        'x-content-type-options': 'nosniff',
+      });
+      res.end(Buffer.from(inline[2] ?? '', 'base64'));
+    } else if (image?.startsWith('https://')) {
+      res.writeHead(302, { location: image, 'cache-control': 'private,max-age=60' });
+      res.end();
+    } else {
+      res.writeHead(200, {
+        'content-type': 'image/svg+xml',
+        'cache-control': 'private,max-age=60',
+      });
+      res.end(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><circle cx="24" cy="24" r="24" fill="#e3e7ed"/><circle cx="24" cy="18" r="8" fill="#929aa6"/><path d="M9 43a15 15 0 0 1 30 0" fill="#929aa6"/></svg>',
+      );
+    }
+    return true;
+  }
+
   if (route === '/api/workspace/window-layout' && (req.method === 'GET' || req.method === 'POST')) {
     if (!windowLayout)
       throw new ProductError('WINDOW_LAYOUT_UNAVAILABLE', '窗口布局服务未加载', 409);

@@ -2222,6 +2222,43 @@ code {
 .loop-fields {
   background: var(--surface);
 }
+.editor .step-fields,
+.editor .post-fields,
+.editor .loop-fields {
+  display: flex;
+  align-items: center;
+  gap: 12px 20px;
+  overflow-x: auto;
+  padding-block: 2px;
+}
+.editor .step-fields > label,
+.editor .post-fields > label,
+.editor .loop-fields > label {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.editor .step-fields .unit-field,
+.editor .post-fields .unit-field {
+  flex: 0 0 104px;
+  width: 104px;
+}
+.editor .step-fields > label > input:not([type='checkbox']) {
+  width: 160px;
+}
+.editor .loop-fields > label > input:not([type='checkbox']) {
+  flex: 0 0 104px;
+  width: 104px;
+}
+.editor .step-fields select,
+.editor .post-fields select,
+.editor .loop-fields select {
+  width: auto;
+  max-width: 220px;
+}
 .editor-footer {
   position: sticky;
   bottom: -32px;

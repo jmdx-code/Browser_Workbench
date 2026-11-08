@@ -505,30 +505,30 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
       accountName: 'Personal User',
       accountAvatar: null,
       identityType: 'personal',
-      groupId: '3017439278594998',
-      groupName: 'Myanmar Group',
+      groupId: '300000000000001',
+      groupName: 'Sample Group',
       groupAvatar: null,
       materialId: 'mat-1',
       captionPreview: 'Amen',
       postId: '555666776',
-      postUrl: 'https://www.facebook.com/groups/3017439278594998/posts/555666776/',
+      postUrl: 'https://www.facebook.com/groups/300000000000001/posts/555666776/',
       postedAt: Date.now() - 1000,
     });
 
     store.groupPoster.recordPost({
       id: 'log-page-avatar',
       profileId: P021,
-      accountId: '61594502274210',
-      accountName: 'Hub of Spiritual Strength',
+      accountId: '61500000000002',
+      accountName: 'Sample Page',
       accountAvatar: 'data:image/webp;base64,REAL_LOCALIZED_PAGE_AVATAR',
       identityType: 'page',
-      groupId: '3017439278594998',
-      groupName: 'Myanmar Group',
+      groupId: '300000000000001',
+      groupName: 'Sample Group',
       groupAvatar: null,
       materialId: 'mat-1',
       captionPreview: 'Amen',
       postId: '555666777',
-      postUrl: 'https://www.facebook.com/groups/3017439278594998/posts/555666777/',
+      postUrl: 'https://www.facebook.com/groups/300000000000001/posts/555666777/',
       postedAt: Date.now(),
     });
 
@@ -536,9 +536,14 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
     const personalLog = logs.find((l) => l.id === 'log-personal-avatar');
     const pageLog = logs.find((l) => l.id === 'log-page-avatar');
     assert.equal(
-      personalLog?.accountAvatar,
+      store.dataCleanup.recordAvatar('account', '100000123456'),
       'data:image/webp;base64,UklGRkAAAABXRUJQVlA4IDQAAADQAQCdASoQABAAgA0JaQAA3AA/vuUAAA==',
     );
-    assert.equal(pageLog?.accountAvatar, 'data:image/webp;base64,REAL_LOCALIZED_PAGE_AVATAR');
+    assert.equal(
+      store.dataCleanup.recordAvatar('page', '61500000000002'),
+      'data:image/webp;base64,REAL_LOCALIZED_PAGE_AVATAR',
+    );
+    assert.match(personalLog?.accountAvatar ?? '', /record-avatar\?kind=account/);
+    assert.match(pageLog?.accountAvatar ?? '', /record-avatar\?kind=page/);
   });
 });

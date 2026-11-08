@@ -24,13 +24,13 @@ export function projectFacebookComposerAudience() {
     }
     return undefined;
   };
-  const fiberNode = (el: Element) => {
+  const fiberNode = (el: Element, fresh = false) => {
     const key = Object.keys(el).find(
       (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
     );
-    if (key) return Reflect.get(el, key) as unknown;
+    if (key && !fresh) return Reflect.get(el, key) as unknown;
     const cached = currentRootNode(rootNodes.get(el));
-    if (cached) {
+    if (cached && !fresh) {
       rootNodes.set(el, cached);
       return cached;
     }
@@ -52,11 +52,11 @@ export function projectFacebookComposerAudience() {
         if (f.sibling) stack.push(f.sibling);
       }
     }
-    return rootNodes.get(el);
+    return rootNodes.get(el) ?? (key ? Reflect.get(el, key) : undefined);
   };
-  const frames = (el: Element, limit = 40) => {
+  const frames = (el: Element, limit = 128, fresh = false) => {
     const out: { name: string; props: DOMRecord }[] = [];
-    let f: unknown = fiberNode(el);
+    let f: unknown = fiberNode(el, fresh);
     for (let i = 0; record(f) && i < limit; i++, f = f.return) {
       const t = f.type ?? f.elementType;
       const name =
@@ -87,21 +87,33 @@ export function projectFacebookComposerAudience() {
     e.getAttribute('aria-disabled') !== 'true' && !e.hasAttribute('disabled');
   for (const el of Array.from(
     document.querySelectorAll(
-      '[data-wb-audience-open],[data-wb-audience-menu],[data-wb-audience-group],[data-wb-audience-self],[data-wb-audience-done]',
+      '[data-wb-audience-open],[data-wb-audience-menu],[data-wb-audience-group],[data-wb-audience-self],[data-wb-audience-done],[data-wb-audience-default],[data-wb-audience-composer]',
     ),
   ))
     for (const attr of Array.from(el.attributes).filter((a) =>
       a.name.startsWith('data-wb-audience-'),
     ))
       el.removeAttribute(attr.name);
-  const editors = Array.from(
+  const allEditors = Array.from(
     document.querySelectorAll('[role="dialog"]:has(form [role="textbox"][contenteditable="true"])'),
-  ).filter(visible);
-  const root = editors.length === 1 ? editors[0] : undefined;
-  const boxes = Array.from(
+  );
+  const editors = allEditors.filter(visible);
+  const fullEditors = /^\/post\/create\/?$/.test(location.pathname)
+    ? Array.from(
+        document.querySelectorAll(
+          '[role="main"]:has(form [role="textbox"][contenteditable="true"])',
+        ),
+      ).filter(visible)
+    : [];
+  const editorRoots = editors.length
+    ? editors
+    : fullEditors.filter((el) => !fullEditors.some((child) => child !== el && el.contains(child)));
+  let root = editorRoots.length === 1 ? editorRoots[0] : undefined;
+  root?.setAttribute('data-wb-audience-composer', '1');
+  let boxes = Array.from(
     root?.querySelectorAll('form [role="textbox"][contenteditable="true"]') || [],
   );
-  const draftEmpty =
+  let draftEmpty =
     boxes.length === 1 && boxes[0]?.textContent === '' && !boxes[0]?.querySelector('img,video,a');
   const box = boxes[0];
   const groups = Array.from(
@@ -156,6 +168,11 @@ export function projectFacebookComposerAudience() {
       defaultControl &&
       doneControl
     ) {
+      menu.setAttribute('data-wb-audience-menu', '1');
+      group.setAttribute('data-wb-audience-group', '1');
+      (selfControl.labels?.[0] ?? selfControl).setAttribute('data-wb-audience-self', '1');
+      (defaultControl.labels?.[0] ?? defaultControl).setAttribute('data-wb-audience-default', '1');
+      doneControl.setAttribute('data-wb-audience-done', '1');
       phase = 'MENU';
       selfSelected = selfControl.checked;
       selfEnabled = enabled(selfControl);
@@ -189,74 +206,130 @@ export function projectFacebookComposerAudience() {
   const nativeOpen = Array.from(root?.querySelectorAll('[role="button"],button') ?? []).filter(
     (el) =>
       visible(el) &&
-      frames(el, 30).some((f) => f.name.includes('CometComposerPrivacySelectorButton.react')),
+      frames(el).some((f) =>
+        /CometComposerPrivacySelectorButton\.react|CometCreatorComposerPrivacySelectorEntryPointButton\.react/.test(
+          f.name,
+        ),
+      ),
   );
+  const optionFrames = (el: Element) => frames(el);
   const selfOption = (el: Element) => {
-    const chain = frames(el, 50);
+    const chain = optionFrames(el);
     return (
       chain.some((f) => f.name.includes('CometPrivacySelectorOptionBasic.react')) &&
-      chain.some((f) => {
-        const option = f.props.option;
-        return (
+      chain.some(
+        (f) =>
           f.name.includes('CometPrivacySelectorOption.react') &&
-          record(option) &&
-          option.post_param === '286958161406148'
-        );
-      })
+          record(f.props.option) &&
+          f.props.option.post_param === '286958161406148' &&
+          (f.props.option.info_type === undefined || f.props.option.info_type === 'BASIC'),
+      )
     );
   };
   const nativeMenus = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
     (el) =>
       visible(el) &&
-      Array.from(el.querySelectorAll('input[type="radio"]')).filter(selfOption).length === 1,
+      Array.from(el.querySelectorAll('input[type="radio"]')).some(
+        (radio) =>
+          visible((radio as HTMLInputElement).labels?.[0] ?? radio) &&
+          optionFrames(radio).some((f) => f.name.includes('CometPrivacySelectorOption.react')),
+      ),
   );
   const leafMenus = nativeMenus.filter(
     (el) => !nativeMenus.some((child) => child !== el && el.contains(child)),
   );
+  // Native modal privacy can aria-hide the unchanged composer behind it. Read that
+  // sole draft, but only the visible native privacy dialog supplies action targets.
+  if (!root && leafMenus.length === 1 && allEditors.length === 1) {
+    root = allEditors[0];
+    root?.setAttribute('data-wb-audience-composer', '1');
+    boxes = Array.from(
+      root?.querySelectorAll('form [role="textbox"][contenteditable="true"]') ?? [],
+    );
+    draftEmpty =
+      boxes.length === 1 && boxes[0]?.textContent === '' && !boxes[0]?.querySelector('img,video,a');
+  }
+  let selfAvailable: boolean | undefined;
   if (root && draftEmpty && leafMenus.length === 1 && leafMenus[0]) {
-    const menu = leafMenus[0],
-      self = Array.from(menu.querySelectorAll<HTMLInputElement>('input[type="radio"]')).find(
-        selfOption,
-      );
+    const menu = leafMenus[0];
+    const selfRows = Array.from(
+      menu.querySelectorAll<HTMLInputElement>('input[type="radio"]'),
+    ).filter((el) => visible(el.labels?.[0] ?? el) && selfOption(el));
+    const self = selfRows.length === 1 ? selfRows[0] : undefined;
     const group = self?.closest('[role="radiogroup"]') ?? menu;
     const defaults = Array.from(
       menu.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'),
-    ).filter((el) => el.value === 'default_privacy_checkbox');
+    ).filter(
+      (el) =>
+        el.value === 'default_privacy_checkbox' ||
+        frames(el).some((f) => f.name.includes('CometDefaultPrivacySelectorPickerFooter.react')),
+    );
     const done = Array.from(menu.querySelectorAll('[role="button"],button')).filter(
       (el) =>
         visible(el) &&
-        frames(el, 20).some(
+        frames(el, 32).some(
           (f) =>
             f.name.includes('FDSButton.react') &&
             f.props.type !== 'secondary' &&
             f.props.variant !== 'secondary',
         ),
     );
-    if (self && defaults.length === 1 && defaults[0] && done.length === 1 && done[0]) {
-      menu.setAttribute('data-wb-audience-menu', '1');
-      group.setAttribute('data-wb-audience-group', '1');
-      (self.labels?.[0] ?? self).setAttribute('data-wb-audience-self', '1');
-      done[0].setAttribute('data-wb-audience-done', '1');
-      phase = 'MENU';
-      selfSelected = self.checked;
-      selfEnabled = enabled(self);
-      defaultChecked = defaults[0].checked;
-      confirmEnabled = enabled(done[0]);
-      openEnabled = false;
-      audience = null;
-    }
+    const footer =
+      done.length === 1 && done[0]
+        ? frames(done[0]).find((f) => f.name.includes('CometPrivacySelectorPickerFooter.react'))
+            ?.props
+        : undefined;
+    menu.setAttribute('data-wb-audience-menu', '1');
+    group.setAttribute('data-wb-audience-group', '1');
+    (self?.labels?.[0] ?? self)?.setAttribute('data-wb-audience-self', '1');
+    if (defaults.length === 1 && defaults[0])
+      (defaults[0].labels?.[0] ?? defaults[0]).setAttribute('data-wb-audience-default', '1');
+    if (done.length === 1) done[0]?.setAttribute('data-wb-audience-done', '1');
+    phase = 'MENU';
+    selfAvailable = selfRows.length === 1;
+    selfSelected = self?.checked === true;
+    selfEnabled = !!self && enabled(self);
+    defaultChecked =
+      defaults.length === 1 && defaults[0]
+        ? defaults[0].checked
+        : footer?.showsDefaultAudienceCheckbox === false
+          ? false
+          : null;
+    confirmEnabled = done.length === 1 && !!done[0] && enabled(done[0]);
+    openEnabled = false;
+    audience = null;
   } else if (root && nativeOpen.length === 1 && nativeOpen[0] && leafMenus.length === 0) {
-    const control = nativeOpen[0];
+    const control = nativeOpen[0],
+      chain = frames(control, 128, true);
     control.setAttribute('data-wb-audience-open', '1');
-    const scope = frames(control, 30).find((f) =>
-      f.name.includes('CometComposerPrivacySelectorButton.react'),
-    )?.props.scope;
+    // Read the current draft privacy, never an initial-state value from an outer composer.
+    const isPrivacy = (v: unknown) => record(v) && typeof v.base_state === 'string';
+    const draft = chain
+      .map((f) => {
+        const value = f.props.value;
+        return f.name.includes('CometComposerViewStateContext') &&
+          record(value) &&
+          record(value.audience)
+          ? value.audience.privacy
+          : undefined;
+      })
+      .find(isPrivacy);
+    // Entry-point privacyRowInput can intentionally remain EVERYONE while the
+    // current draft and localPrivacyRow have already been saved as SELF.
+    const privacy =
+      draft ??
+      chain.map((f) => f.props.localPrivacyRow).find(isPrivacy) ??
+      chain.map((f) => f.props.privacyRowInput).find(isPrivacy);
     phase = 'COMPOSER';
     openEnabled = draftEmpty && enabled(control);
     audience =
-      record(scope) &&
-      record(scope.selected_option) &&
-      scope.selected_option.post_param === '286958161406148'
+      enabled(control) &&
+      record(privacy) &&
+      privacy.base_state === 'SELF' &&
+      Array.isArray(privacy.allow) &&
+      privacy.allow.length === 0 &&
+      Array.isArray(privacy.deny) &&
+      privacy.deny.length === 0
         ? 'SELF'
         : null;
   }
@@ -272,6 +345,7 @@ export function projectFacebookComposerAudience() {
     selfEnabled,
     defaultChecked,
     confirmEnabled,
+    ...(selfAvailable === undefined ? {} : { selfAvailable }),
   };
 }
 export async function readFacebookComposerAudience(page: Page, guard: () => Awaitable<void>) {

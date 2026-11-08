@@ -1,6 +1,7 @@
 import type { TaskRecord } from '../shared/task-contracts.js';
 import { endedTask } from '../domain/task-run-records.js';
 import { taskReasonDescription } from './task-alerts.js';
+import { isMarketplaceUnavailableSkip } from '../shared/task-step-outcome.js';
 
 type Step = Pick<TaskRecord, 'type' | 'destination' | 'status' | 'progress' | 'budget' | 'outcome'>;
 export const stepName = (step: Pick<Step, 'type' | 'destination'>) =>
@@ -16,6 +17,8 @@ export const stepName = (step: Pick<Step, 'type' | 'destination'>) =>
 const minutes = (ms: number) => `${Number((ms / 60000).toFixed(1))}m`;
 export function stepResultLabel(step: Step & { planState?: string }): string {
   const name = stepName(step);
+  if (isMarketplaceUnavailableSkip(step.type, step.status, step.outcome))
+    return `✓ ${name} · 当前身份不可用，已跳过`;
   if (step.status === 'FAILED')
     return `✕ ${name} · ${step.outcome ? (taskReasonDescription(step.outcome.reason)?.summary ?? step.outcome.reason) : '执行失败'}`;
   if (step.status === 'PENDING' || step.status === 'SKIPPED') return `— ${name}`;
@@ -41,6 +44,9 @@ export function runSummary(rows: readonly Step[]): string {
       published ? `发布 ${published} 条` : '',
     ]
       .filter(Boolean)
-      .join(' · ') || '暂无完成成果'
+      .join(' · ') ||
+    (rows.some((r) => isMarketplaceUnavailableSkip(r.type, r.status, r.outcome))
+      ? '商城不可用，已正常跳过'
+      : '暂无完成成果')
   );
 }

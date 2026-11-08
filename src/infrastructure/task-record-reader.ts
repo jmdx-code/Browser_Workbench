@@ -27,7 +27,9 @@ const finished = `CASE WHEN ${terminal} THEN ${expression('ef')} ELSE ${expressi
 const sort = `coalesce(${finished},${started},r.created_at)`;
 const current = `(r.status='ACTIVE' OR (r.status='PENDING' AND r.round=p.round AND r.position=p.position AND NOT (${terminal})))`;
 const running = `(${current} AND p.state IN ('QUEUED','RUNNING','PAUSING','PAUSED','STOPPING'))`;
-const completed = "r.status='COMPLETED'";
+// Same success rule as isSuccessfulTaskStep, evaluated within the existing indexed page query.
+const completed =
+  "(r.status='COMPLETED' OR (r.type='marketplace' AND r.status='SKIPPED' AND r.outcome_kind='SKIPPED' AND json_extract(r.payload,'$.outcome.reason')='MARKETPLACE_UNAVAILABLE'))";
 const failed =
   "(r.status='FAILED' OR (r.status='ACTIVE' AND p.state='FAILED' AND coalesce(r.outcome_kind,'')<>'SKIPPED'))";
 const review = `(( ${current} AND (p.state='REVIEW' OR EXISTS(SELECT 1 FROM task_outbox o WHERE o.job_id=p.id AND o.status='UNKNOWN' AND o.disposition IS NULL) OR (p.state='QUEUED' AND p.profile_id IN (SELECT value FROM json_each(?))) OR p.state IN ('PAUSING','STOPPING') OR (p.state='PAUSED' AND p.reason<>'' AND substr(p.reason,1,5)<>'USER_' AND substr(p.reason,1,7)<>'MANUAL_'))) OR r.business_unknown=1)`;
@@ -54,6 +56,9 @@ export class TaskRecordReader {
     private readonly getSteps: (id: string, round: number) => StepInstance[],
     private readonly token: () => string | null,
   ) {
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS task_run_summaries(job_id TEXT NOT NULL REFERENCES task_plans(id) ON DELETE CASCADE,round INTEGER NOT NULL,records TEXT NOT NULL,details_pruned INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,round))',
+    );
     beforeCommit(db, () => {
       // Live operation receipts only mark the current round dirty. Rebuilding that round on
       // every mouse/ACK/checkpoint would move history work onto the input hot path.
@@ -109,6 +114,59 @@ export class TaskRecordReader {
         round = Number(item.round),
         plan = this.getPlan(id),
         steps = this.getSteps(id, round);
+      const saved = this.db
+        .prepare('SELECT records,details_pruned FROM task_run_summaries WHERE job_id=? AND round=?')
+        .get(id, round);
+      if (saved?.details_pruned === 1) {
+        // Keep execution times from the final snapshot. A later explicit review
+        // may still update its step outcome/progress without the discarded logs.
+        const old = JSON.parse(String(saved.records)) as TaskRecord[];
+        const byId = new Map(steps.map((step) => [step.id, step]));
+        const updated = old.map((row) => {
+          const step = byId.get(row.stepId);
+          if (!step) return row;
+          const { outcome: _oldOutcome, ...base } = row;
+          return {
+            ...base,
+            status: step.status,
+            progress: step.progress,
+            ...(step.outcome ? { outcome: step.outcome } : {}),
+            planState: plan.state,
+            planReason: plan.reason,
+            planUpdatedAt: plan.updatedAt,
+          };
+        });
+        const json = JSON.stringify(updated);
+        const timingNeedsFreeze = this.db
+          .prepare(
+            'SELECT 1 FROM task_record_projection WHERE job_id=? AND round=? AND (lsu<>0 OR lfu<>0 OR esu<>0 OR efu<>0) LIMIT 1',
+          )
+          .get(id, round);
+        if (json !== saved.records || timingNeedsFreeze) {
+          for (const row of updated)
+            this.db
+              .prepare(
+                `UPDATE task_record_projection SET status=?,outcome_kind=?,business_unknown=?,payload=?,ls=?,lf=?,es=?,ef=?,lsu=0,lfu=0,esu=0,efu=0,stable_sort=? WHERE step_id=?`,
+              )
+              .run(
+                row.status,
+                row.outcome?.kind ?? null,
+                row.outcome?.kind === 'FAILED' && row.outcome.businessResult === 'UNKNOWN' ? 1 : 0,
+                JSON.stringify(row),
+                row.startedAt,
+                row.finishedAt,
+                row.startedAt,
+                row.finishedAt,
+                row.finishedAt ?? row.startedAt ?? row.planCreatedAt,
+                row.stepId,
+              );
+          this.db
+            .prepare('UPDATE task_run_summaries SET records=? WHERE job_id=? AND round=?')
+            .run(json, id, round);
+        }
+        this.db.prepare('DELETE FROM task_record_dirty WHERE job_id=? AND round=?').run(id, round);
+        continue;
+      }
       const ops = this.db
         .prepare(
           'SELECT o.step_id,o.created_at,o.updated_at,o.status,o.disposition FROM task_outbox o JOIN task_steps s ON s.id=o.step_id WHERE s.job_id=? AND s.round=?',
@@ -191,6 +249,12 @@ export class TaskRecordReader {
           stable ? (row.finishedAt ?? row.startedAt ?? row.planCreatedAt) : null,
         );
       });
+      if (round < plan.round || ['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state))
+        this.db
+          .prepare(
+            'INSERT INTO task_run_summaries(job_id,round,records) VALUES(?,?,?) ON CONFLICT(job_id,round) DO UPDATE SET records=excluded.records WHERE details_pruned=0',
+          )
+          .run(id, round, JSON.stringify(actual.filter((r) => !hidden.has(r.stepId))));
       this.db.prepare('DELETE FROM task_record_dirty WHERE job_id=? AND round=?').run(id, round);
     }
   }
@@ -314,7 +378,7 @@ export class TaskRecordReader {
       const cte = `WITH matching AS (SELECT DISTINCT r.job_id,r.round ${base}${where}),
         runs AS (SELECT r.job_id,r.round,count(*) AS step_count,max(${sort}) AS sort_time,max(r.created_at) AS created_at,
           max(${running}) AS running,
-          min(r.status='COMPLETED') AS completed,
+          min(${completed}) AS completed,
           max(${failed} OR (p.state='FAILED' AND r.round=p.round)) AS failed,
           max(${review}) AS review
           FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id
@@ -449,7 +513,7 @@ export class TaskRecordReader {
     const counts = {
       all: count('1=1', '1=1', false),
       running: count(running, "r.status IN ('ACTIVE','PENDING')", true),
-      completed: count(completed, "r.status='COMPLETED'", false),
+      completed: count(completed, "r.status IN ('COMPLETED','SKIPPED')", false),
       failed: count(failed, "r.status IN ('FAILED','ACTIVE')", true),
       review: count(review, "r.status IN ('ACTIVE','PENDING') OR r.business_unknown=1", true, true),
     };

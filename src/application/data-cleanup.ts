@@ -1,5 +1,9 @@
 import type { Awaitable } from '../domain/persistence.js';
-import type { CleanupConfiguration, RecordCleanup } from '../shared/data-cleanup.js';
+import type {
+  DetailBoundaryValue,
+  CleanupConfiguration,
+  RecordCleanup,
+} from '../shared/data-cleanup.js';
 import {
   CleanupSelection,
   ExecuteCleanup,
@@ -28,6 +32,12 @@ export class DataCleanupService {
   >();
   constructor(
     private readonly repository: {
+      reclaimHiddenRounds?(maximum?: number): Awaitable<number>;
+      detailHead?(maximum: number): Awaitable<DetailBoundaryValue[]>;
+      protectedOperationIds?(): Awaitable<string[]>;
+      pruneDetails?(input: unknown, maximum?: number): Awaitable<number>;
+      pruneResults?(bumper: number, poster: number, maximum?: number): Awaitable<number>;
+      recordAvatar?(kind: unknown, id: string): Awaitable<string | null>;
       settings(): Awaitable<CleanupConfiguration>;
       saveSettings(input: unknown): Awaitable<CleanupConfiguration>;
       preview(
@@ -49,7 +59,48 @@ export class DataCleanupService {
       { directory?: string; prepare(): Promise<unknown>; restart(): void } | undefined,
     private readonly assertStopped: () => Promise<void>,
     private readonly assertAvailable: () => void,
+    private readonly bridgeHistory?: {
+      detailHead(
+        maximum: number,
+        protectedIds: readonly string[],
+      ): Awaitable<DetailBoundaryValue[]>;
+      pruneDetails(
+        input: unknown,
+        protectedIds: readonly string[],
+        maximum?: number,
+      ): Awaitable<number>;
+    },
   ) {}
+  async recordAvatar(kind: unknown, id: string) {
+    return (await this.repository.recordAvatar?.(kind, id)) ?? null;
+  }
+  private async retainResultsAndDetails(settings: CleanupConfiguration) {
+    if (this.repository.pruneResults) {
+      while (
+        await this.repository.pruneResults(settings.bumperMaxCount, settings.posterMaxCount, 100)
+      )
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    if (!this.repository.detailHead || !this.repository.pruneDetails) return;
+    const protectedIds = (await this.repository.protectedOperationIds?.()) ?? [];
+    const heads = [
+      ...(await this.repository.detailHead(settings.detailMaxCount)),
+      ...((await this.bridgeHistory?.detailHead(settings.detailMaxCount, protectedIds)) ?? []),
+    ];
+    heads.sort((a, b) => b.at - a.at || (a.key < b.key ? 1 : a.key > b.key ? -1 : 0));
+    const boundary = heads[settings.detailMaxCount - 1];
+    if (boundary) {
+      let removed: number;
+      do {
+        removed = await this.repository.pruneDetails(boundary, 100);
+        removed += (await this.bridgeHistory?.pruneDetails(boundary, protectedIds, 100)) ?? 0;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } while (removed > 0);
+    }
+    if (this.repository.reclaimHiddenRounds)
+      while (await this.repository.reclaimHiddenRounds(100))
+        await new Promise<void>((resolve) => setImmediate(resolve));
+  }
   assertNotResetting() {
     if (this.resetting)
       throw new ProductError('RESET_PENDING', '工作台正在重置，请等待重新打开', 409);
@@ -135,7 +186,9 @@ export class DataCleanupService {
     if (
       settings.historyRetentionDays === null &&
       settings.historyMaxCount == null &&
-      !settings.automaticLogs
+      !settings.automaticLogs &&
+      !this.repository.pruneResults &&
+      !this.repository.pruneDetails
     )
       return;
     this.assertIdle();
@@ -157,6 +210,7 @@ export class DataCleanupService {
           await this.repository.purgeExpiredFeatureOperations(scope);
         }
       }
+      await this.retainResultsAndDetails(settings);
       if (settings.automaticLogs) {
         const files = await this.logs.preview(Date.now() - settings.logRetentionDays * 86400000);
         if (files.length) await this.logs.remove(files);

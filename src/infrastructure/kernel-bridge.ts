@@ -3202,6 +3202,9 @@ export class KernelBridge implements KernelBridgeHooks {
             maxTotalBufferSize: 2097152,
             maxResourceBufferSize: 524288,
             maxPostDataSize: 524288,
+            // Keep this bounded response across the native post-submit document navigation.
+            // The SDK page is already initialized; no paused target is waiting for resume here.
+            enableDurableMessages: true,
           });
           await check();
         },

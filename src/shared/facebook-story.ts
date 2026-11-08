@@ -12,6 +12,7 @@ export const FacebookStoryPage = z
     ready: z.boolean(),
     visible: z.boolean(),
     phase: z.enum(['entry', 'text-editor', 'media-editor', 'ambiguous']),
+    hasSelectedMedia: z.boolean().optional(),
     nativeVideoCanvas: z.literal(true).optional(),
     nativeVideoControls: z
       .object({ css: z.string().max(1000), enabled: z.boolean() })

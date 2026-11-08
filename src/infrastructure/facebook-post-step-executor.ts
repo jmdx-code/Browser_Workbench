@@ -3,7 +3,8 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { PostStepExecutor } from '../domain/post-execution.js';
 import type { StepExecution } from '../domain/browse-execution.js';
 import { audienceTarget } from '../domain/facebook-audience.js';
-import { decidePostAILabel } from '../domain/facebook-ai-label.js';
+import { clearAudienceDefaultTarget } from '../shared/facebook-audience.js';
+import { decidePostAILabel, aiLabelEffectObserved } from '../domain/facebook-ai-label.js';
 import type {
   FacebookPostPageSource,
   FacebookPostPageReading,
@@ -187,6 +188,8 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
       const audience = reading.audience;
       if (!audience || audience.ready === 'loading')
         return { kind: 'wait', reason: 'POST_AUDIENCE_LOADING' };
+      if (audience.phase === 'MENU' && audience.selfAvailable === false)
+        throw Error('POST_SELF_AUDIENCE_UNAVAILABLE');
       const purpose =
         audience.phase === 'COMPOSER'
           ? 'OPEN_AUDIENCE'
@@ -211,14 +214,18 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
       intent,
       execution.step.spec.type === 'post' ? execution.step.spec.aiLabel : undefined,
     );
-    if (effectiveAI !== 'preserve-current') {
+    const ensureAI = (): PostExecutionDecision | null => {
       const ai = decidePostAILabel(effectiveAI, reading.aiLabel, applied);
       if (ai.kind === 'wait') return { kind: 'wait', reason: 'POST_AI_LABEL_LOADING' };
       if (ai.kind === 'action') {
-        if (applied('SET_TEXT') || applied('UPLOAD_MEDIA') || applied('ADVANCE_COMPOSER'))
-          throw Error('POST_AI_LABEL_CHANGED_AFTER_CONTENT');
         return operation(ai.purpose, Action.parse({ kind: 'click', ...fields, target: ai.target }));
       }
+      return null;
+    };
+    // A push-page temporarily hides the composer; finish its native confirmation first.
+    if (reading.aiLabel?.phase === 'settings') {
+      const ai = ensureAI();
+      if (ai) return ai;
     }
     const surface = reading.surface;
     if (!surface || surface.phase === 'ambiguous')
@@ -334,6 +341,10 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
         }),
       );
     if (surface.advance) {
+      if (reading.aiLabel?.phase === 'composer') {
+        const ai = ensureAI();
+        if (ai) return ai;
+      }
       if (applied('ADVANCE_COMPOSER'))
         return { kind: 'wait', reason: 'FACEBOOK_POST_REVIEW_NOT_READY' };
       if (!surface.advance.enabled) return { kind: 'wait', reason: 'FACEBOOK_POST_NEXT_DISABLED' };
@@ -346,7 +357,9 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
         }),
       );
     }
-    if (surface.submit?.enabled && !applied('SUBMIT'))
+    if (surface.submit?.enabled && !applied('SUBMIT')) {
+      const ai = ensureAI();
+      if (ai) return ai;
       return operation(
         'SUBMIT',
         Action.parse({
@@ -355,6 +368,7 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
           target: { scope: surface.submit.scope, css: surface.submit.css },
         }),
       );
+    }
     return { kind: 'wait', reason: 'FACEBOOK_POST_SUBMIT_NOT_READY' };
   }
   async verify(
@@ -406,71 +420,64 @@ export class FacebookPostStepExecutor implements PostStepExecutor {
     if (!sameTabProof(original.intent.proof, reading.proof))
       throw Error('FACEBOOK_POST_VERIFICATION_PROOF_MISMATCH');
     const surface = reading.surface;
-    const wantedAI =
-      postAILabelSetting(
-        original.intent,
-        execution.step.spec.type === 'post' ? execution.step.spec.aiLabel : undefined,
-      ) === 'on';
-    const applied =
-      purpose === 'OPEN_AI_LABEL'
-        ? reading.aiLabel?.phase === 'settings' && reading.aiLabel.ready && reading.aiLabel.visible
-        : purpose === 'SET_AI_LABEL'
-          ? reading.aiLabel?.phase === 'settings' &&
-            reading.aiLabel.value === wantedAI &&
-            reading.aiLabel.ready &&
-            reading.aiLabel.visible
-          : purpose === 'CONFIRM_AI_LABEL'
-            ? reading.aiLabel?.phase === 'composer' &&
-              reading.aiLabel.value === wantedAI &&
-              reading.aiLabel.ready &&
-              reading.aiLabel.visible
-            : purpose === 'OPEN_BACKGROUND'
-              ? reading.text === '' &&
-                !!reading.background?.ready &&
-                !!reading.background.visible &&
-                (reading.background.options.length > 0 || !!reading.background.clearCSS)
-              : purpose === 'SET_BACKGROUND'
-                ? reading.text === '' &&
-                  !!reading.background?.ready &&
-                  !!reading.background.visible &&
-                  (requiresNativePostBackground(original.intent)
-                    ? reading.background.phase === 'solid' &&
-                      operation.action.kind === 'click' &&
-                      reading.background.selectedCSS === operation.action.target.css
-                    : reading.background.phase === 'plain')
-                : purpose === 'PREPARE_HOME'
-                  ? reading.url === 'https://www.facebook.com/' &&
-                    !!reading.opener &&
-                    !reading.surface &&
-                    !reading.homePreparation
-                  : purpose === 'OPEN_AUDIENCE'
-                    ? reading.audience?.phase === 'MENU' && reading.audience.draftEmpty
-                    : purpose === 'SELECT_SELF'
-                      ? reading.audience?.phase === 'MENU' &&
-                        reading.audience.selfSelected &&
-                        reading.audience.defaultChecked === false
-                      : purpose === 'CONFIRM_AUDIENCE'
-                        ? reading.audience?.phase === 'COMPOSER' &&
-                          reading.audience.audience === 'SELF' &&
-                          reading.audience.draftEmpty
-                        : purpose === 'OPEN_COMPOSER'
-                          ? surface && reading.text === ''
-                          : purpose === 'SET_TEXT'
-                            ? surface && reading.text === original.intent.snapshot.text
-                            : purpose === 'ADVANCE_COMPOSER'
-                              ? surface?.phase === 'reel-edit-before-review'
-                                ? original.intent.snapshot.format === 'video' &&
-                                  operation.action.kind === 'click' &&
-                                  operation.action.target.scope === FACEBOOK_COMPOSER_SCOPE
-                                : surface?.phase === 'reel-review-before-submit'
-                                  ? original.intent.snapshot.format === 'video' &&
-                                    operation.action.kind === 'click' &&
-                                    operation.action.target.scope === FACEBOOK_REEL_MAIN &&
-                                    reading.text === original.intent.snapshot.text
-                                  : (surface?.phase === 'direct-submit' ||
-                                      surface?.phase === 'review-before-submit') &&
-                                    reading.text === original.intent.snapshot.text
-                              : false;
+    const wantedAI = postAILabelSetting(
+      original.intent,
+      execution.step.spec.type === 'post' ? execution.step.spec.aiLabel : undefined,
+    );
+    const applied = ['OPEN_AI_LABEL', 'SET_AI_LABEL', 'CONFIRM_AI_LABEL'].includes(purpose)
+      ? aiLabelEffectObserved(purpose, reading.aiLabel, wantedAI)
+      : purpose === 'OPEN_BACKGROUND'
+        ? reading.text === '' &&
+          !!reading.background?.ready &&
+          !!reading.background.visible &&
+          (reading.background.options.length > 0 || !!reading.background.clearCSS)
+        : purpose === 'SET_BACKGROUND'
+          ? reading.text === '' &&
+            !!reading.background?.ready &&
+            !!reading.background.visible &&
+            (requiresNativePostBackground(original.intent)
+              ? reading.background.phase === 'solid' &&
+                operation.action.kind === 'click' &&
+                reading.background.selectedCSS === operation.action.target.css
+              : reading.background.phase === 'plain')
+          : purpose === 'PREPARE_HOME'
+            ? reading.url === 'https://www.facebook.com/' &&
+              !!reading.opener &&
+              !reading.surface &&
+              !reading.homePreparation
+            : purpose === 'OPEN_AUDIENCE'
+              ? reading.audience?.phase === 'MENU' && reading.audience.draftEmpty
+              : purpose === 'SELECT_SELF'
+                ? reading.audience?.phase === 'MENU' &&
+                  reading.audience.selfSelected &&
+                  reading.audience.defaultChecked !== null
+                : purpose === 'CONFIRM_AUDIENCE'
+                  ? operation.action.kind === 'click' &&
+                    operation.action.target.css === clearAudienceDefaultTarget.css
+                    ? reading.audience?.phase === 'MENU' &&
+                      reading.audience.selfSelected &&
+                      reading.audience.defaultChecked === false
+                    : reading.audience?.phase === 'COMPOSER' &&
+                      reading.audience.audience === 'SELF' &&
+                      reading.audience.draftEmpty
+                  : purpose === 'OPEN_COMPOSER'
+                    ? surface && reading.text === ''
+                    : purpose === 'SET_TEXT'
+                      ? surface && reading.text === original.intent.snapshot.text
+                      : purpose === 'ADVANCE_COMPOSER'
+                        ? surface?.phase === 'reel-edit-before-review'
+                          ? original.intent.snapshot.format === 'video' &&
+                            operation.action.kind === 'click' &&
+                            operation.action.target.scope === FACEBOOK_COMPOSER_SCOPE
+                          : surface?.phase === 'reel-review-before-submit'
+                            ? original.intent.snapshot.format === 'video' &&
+                              operation.action.kind === 'click' &&
+                              operation.action.target.scope === FACEBOOK_REEL_MAIN &&
+                              reading.text === original.intent.snapshot.text
+                            : (surface?.phase === 'direct-submit' ||
+                                surface?.phase === 'review-before-submit') &&
+                              reading.text === original.intent.snapshot.text
+                        : false;
     if (!applied) {
       if (current < operation.updatedAt || current - operation.updatedAt >= 30_000) {
         const issues = reading.composerIssues ?? [];

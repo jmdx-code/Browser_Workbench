@@ -288,7 +288,8 @@ export class FacebookPublishingRuntime {
   private publicStepAllowed(step: Step) {
     return step.type === 'post'
       ? step.destination === 'story'
-        ? this.featureAvailable('story') && step.audience === 'friends'
+        ? this.featureAvailable('story') &&
+          ['friends', 'preserve-current'].includes(step.audience ?? 'preserve-current')
         : this.featureAvailable('post')
       : this.featureAvailable(step.type);
   }
@@ -341,11 +342,10 @@ export class FacebookPublishingRuntime {
       return '快拍编辑、上传及最终发布尚未完成验收；不会使用普通帖子执行器代发';
     if (
       combination.steps.some(
-        (step) =>
-          step.type === 'post' && step.destination === 'story' && step.audience !== 'friends',
+        (step) => step.type === 'post' && step.destination === 'story' && step.audience === 'self',
       )
     )
-      return '快拍当前支持好友范围，请明确选择好友；不会替换保持当前或仅自己的设置';
+      return '快拍支持好友或保持当前范围，不支持仅自己';
     const names = {
       feed: '首页浏览',
       video: '视频浏览',

@@ -1017,6 +1017,12 @@ export class SqliteTargetLibraryRepository {
               )
               .run(canonicalId, finalName, cleanRawId);
           }
+          for (const table of ['group_bumper_effects', 'group_poster_usage']) {
+            if (tableExists(this.db, table))
+              this.db
+                .prepare(`UPDATE ${table} SET group_id = ? WHERE group_id = ?`)
+                .run(canonicalId, cleanRawId);
+          }
           if (tableExists(this.db, 'group_bumper_operations')) {
             this.db
               .prepare('UPDATE group_bumper_operations SET group_id = ? WHERE group_id = ?')
@@ -1038,17 +1044,23 @@ export class SqliteTargetLibraryRepository {
                   .get(canonicalId)?.cnt ?? 0,
               )
             : 0;
-          const calcBumped = tableExists(this.db, 'group_bumper_logs')
+          const bumperHistory = tableExists(this.db, 'group_bumper_effects')
+            ? 'group_bumper_effects'
+            : 'group_bumper_logs';
+          const posterHistory = tableExists(this.db, 'group_poster_usage')
+            ? 'group_poster_usage'
+            : 'group_poster_logs';
+          const calcBumped = tableExists(this.db, bumperHistory)
             ? Number(
                 this.db
-                  .prepare('SELECT COUNT(*) AS cnt FROM group_bumper_logs WHERE group_id = ?')
+                  .prepare(`SELECT COUNT(*) AS cnt FROM ${bumperHistory} WHERE group_id = ?`)
                   .get(canonicalId)?.cnt ?? 0,
               )
             : 0;
-          const calcPosted = tableExists(this.db, 'group_poster_logs')
+          const calcPosted = tableExists(this.db, posterHistory)
             ? Number(
                 this.db
-                  .prepare('SELECT COUNT(*) AS cnt FROM group_poster_logs WHERE group_id = ?')
+                  .prepare(`SELECT COUNT(*) AS cnt FROM ${posterHistory} WHERE group_id = ?`)
                   .get(canonicalId)?.cnt ?? 0,
               )
             : 0;
@@ -1164,6 +1176,10 @@ export class SqliteTargetLibraryRepository {
       const finalAvatar = mergedAvatar(baseAvatar, incomingAvatar);
 
       if (canonicalId !== cleanRawId) {
+        if (tableExists(this.db, 'group_bumper_effects'))
+          this.db
+            .prepare('UPDATE group_bumper_effects SET page_id = ? WHERE page_id = ?')
+            .run(canonicalId, cleanRawId);
         if (tableExists(this.db, 'group_bumper_logs')) {
           this.db
             .prepare('UPDATE group_bumper_logs SET page_id = ?, page_name = ? WHERE page_id = ?')
@@ -1174,10 +1190,13 @@ export class SqliteTargetLibraryRepository {
             .prepare('UPDATE group_bumper_operations SET page_id = ? WHERE page_id = ?')
             .run(canonicalId, cleanRawId);
         }
-        const calcPageBumped = tableExists(this.db, 'group_bumper_logs')
+        const bumperHistory = tableExists(this.db, 'group_bumper_effects')
+          ? 'group_bumper_effects'
+          : 'group_bumper_logs';
+        const calcPageBumped = tableExists(this.db, bumperHistory)
           ? Number(
               this.db
-                .prepare('SELECT COUNT(*) AS cnt FROM group_bumper_logs WHERE page_id = ?')
+                .prepare(`SELECT COUNT(*) AS cnt FROM ${bumperHistory} WHERE page_id = ?`)
                 .get(canonicalId)?.cnt ?? 0,
             )
           : 0;

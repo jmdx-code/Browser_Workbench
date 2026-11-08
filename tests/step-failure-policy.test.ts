@@ -36,3 +36,22 @@ test('native submission response/result failure ends only the failed post attemp
   ])
     assert.equal(postFailureRequiresEnding(reason), false, reason);
 });
+
+test('pre-submit setup failure is ended by its actual purpose while actor revocation and submit uncertainty retain their own flow', () => {
+  assert.equal(postFailureRequiresEnding('Execution context was destroyed', 'OPEN_COMPOSER'), true);
+  assert.equal(postFailureRequiresEnding('Execution context was destroyed', 'SUBMIT'), false);
+  assert.equal(
+    postFailureRequiresEnding('FACEBOOK_CURRENT_STORY_IDENTITY_UNCONFIRMED', 'PREPARE_STORY'),
+    true,
+  );
+  assert.equal(
+    postFailureRequiresEnding('FACEBOOK_NATIVE_ACCOUNT_CHANGED', 'OPEN_COMPOSER'),
+    false,
+  );
+  assert.equal(postFailureRequiresEnding('USER_STOP', 'OPEN_COMPOSER'), false);
+  assert.equal(postFailureRequiresEnding('UPLOAD_STAGE_OWNER_REQUIRED', 'UPLOAD_MEDIA'), true);
+  assert.equal(
+    postFailureRequiresEnding('FACEBOOK_ORIGINAL_POST_OWNER_REQUIRED', 'UPLOAD_MEDIA'),
+    false,
+  );
+});

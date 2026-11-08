@@ -203,6 +203,11 @@ test('reset rejects a linked root and malformed requests without touching source
 
 test('cleanup consumes confirmation tickets once, blocks races during reset, and respects disabled auto retention', async () => {
   const store = await WorkspaceStore.open(':memory:');
+  store.dataCleanup.saveSettings({
+    expectedRevision: 0,
+    historyRetentionDays: null,
+    historyMaxCount: null,
+  });
   let prepared = 0,
     restarted = 0,
     batches = 0;

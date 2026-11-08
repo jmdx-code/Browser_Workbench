@@ -11,4 +11,10 @@ export const TaskStepV2 = TaskStep.superRefine((value, issue) => {
   }
   if (value.outcome?.kind === 'SKIPPED' && value.outcome.dependencyStepId === value.id)
     issue.addIssue({ code: 'custom', message: 'STEP_SKIP_SELF_DEPENDENCY' });
+  if (
+    value.outcome?.kind === 'SKIPPED' &&
+    value.outcome.reason === 'MARKETPLACE_UNAVAILABLE' &&
+    value.spec.type !== 'marketplace'
+  )
+    issue.addIssue({ code: 'custom', message: 'MARKETPLACE_SKIP_STEP_REQUIRED' });
 });

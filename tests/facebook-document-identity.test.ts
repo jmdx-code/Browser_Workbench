@@ -424,6 +424,20 @@ test('software story reads accept observed versioned Relay module names without 
   }
 });
 
+test('story identity accepts an additional profile only when its completed creator and selected actor agree', () => {
+  for (const additional of [true, false]) {
+    const story = storyEntries();
+    story.first.data.viewer.actor.is_additional_profile_plus = additional;
+    const f = documentFixture((entries) => entries.splice(1, 1, ...story.rows));
+    try {
+      globalThis.location.href = 'https://www.facebook.com/stories/create/';
+      assert.equal(projectFacebookDocumentIdentity('story').actor?.accountId, sample.request.av);
+    } finally {
+      f.close();
+    }
+  }
+});
+
 test('story stream rejects incomplete, cross-key, duplicate, errored or conflicting creator records', () => {
   const mutations: ((s: ReturnType<typeof storyEntries>) => void)[] = [
     (s) => {
@@ -431,9 +445,6 @@ test('story stream rejects incomplete, cross-key, duplicate, errored or conflict
     },
     (s) => {
       s.first.data.viewer.actor.id = '99';
-    },
-    (s) => {
-      s.first.data.viewer.actor.is_additional_profile_plus = true;
     },
     (s) => {
       s.rows.push(s.rows[2]!);

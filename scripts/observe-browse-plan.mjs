@@ -32,7 +32,7 @@ async function request(route, input) {
     headers: {
       cookie,
       'x-workbench-runtime-contract': '1',
-      'x-workbench-task-contract': '4',
+      'x-workbench-task-contract': '5',
       'x-workbench-task-capacity': '2',
       'x-workbench-workspace-contract': '5',
       ...(input === undefined ? {} : { origin, 'content-type': 'application/json' }),

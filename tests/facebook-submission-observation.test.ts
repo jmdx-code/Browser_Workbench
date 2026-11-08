@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { readdir } from 'node:fs/promises';
+import { readdir, writeFile } from 'node:fs/promises';
+import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
+import { DirectMaterialUpload } from '../src/infrastructure/direct-material-upload.js';
 import path from 'node:path';
 import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { FacebookSubmissionObserver } from '../src/infrastructure/facebook-submission-observer.js';
@@ -584,4 +586,96 @@ test('matching own timeline text alone cannot settle: original native result cor
     assert.equal((await store.materials.reservation(request.attemptId)).state, 'PUBLISHED');
     assert.equal((await store.tasks.steps(request.jobId))[0]?.progress.published, 1);
   });
+});
+
+test('direct-original upload ACK retains its manifest without a stage owner, but only observed exact media can verify upload', async () => {
+  await postFixture(async (store, _file, catalog) => {
+    await writeFile(
+      path.join(catalog.directory, 'image.png'),
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    const indexed = store.materials.index(
+      await new FilesystemMaterialScanner().scan(catalog.directory),
+      randomUUID(),
+    );
+    const request = postRequest(store, indexed, { source: 'image.png' });
+    await store.materials.reserve(request);
+    const sent = dispatchedPost(store, request, 'UPLOAD_MEDIA');
+    const intent = (await store.materials.reservation(request.attemptId)).intent;
+    const direct = new DirectMaterialUpload();
+    const manifest = await direct.stage(intent, sent.binding, () => {});
+    await store.tasks.acknowledgeBound({
+      binding: sent.binding,
+      evidence: { sdkReturned: true, uploadManifest: manifest },
+    });
+    assert.equal((await store.uploadStages.list()).length, 0);
+    const operation = (await store.tasks.operations(request.jobId))[0]!;
+    const original = { intent, link: await store.materialPosts.link(operation.id) };
+    const effects: PostEffects = {
+      url: 'https://www.facebook.com/',
+      timeOrigin: 100,
+      ready: 'complete',
+      posts: [],
+      composer: {
+        text: intent.snapshot.text,
+        uploaded: true,
+        busy: false,
+        submitEnabled: true,
+        files: manifest.files.map((f) => ({ name: f.name, size: f.original.bytes })),
+        media: manifest.files.map((f) => ({ kind: 'image', name: f.name, ready: true })),
+      },
+    };
+    const observer = new DOMFacebookPostBusinessObserver(
+      store.submissionObservations,
+      store.uploadStages,
+      { ready: () => false, read: async () => null },
+      randomUUID,
+      async () => effects,
+    );
+    assert.equal(
+      (
+        await observer.verify(
+          {} as Page,
+          { ...operation, binding: sent.binding },
+          original,
+          () => {},
+        )
+      ).kind,
+      'verified',
+    );
+    effects.composer!.media = [];
+    assert.equal(
+      (
+        await observer.verify(
+          {} as Page,
+          { ...operation, binding: sent.binding },
+          original,
+          () => {},
+        )
+      ).kind,
+      'wait',
+    );
+    await assert.rejects(
+      () =>
+        observer.verify(
+          {} as Page,
+          {
+            ...operation,
+            binding: sent.binding,
+            receipt: {
+              binding: sent.binding,
+              evidence: { uploadManifest: { ...manifest, sourcePaths: ['C:/different.png'] } },
+            },
+          },
+          original,
+          () => {},
+        ),
+      /UPLOAD_SOURCE_MANIFEST_MISMATCH/,
+    );
+    assert.equal(await store.materialPosts.result(request.attemptId), null);
+    assert.equal((await store.materials.reservation(request.attemptId)).state, 'RESERVED');
+  }, false);
 });

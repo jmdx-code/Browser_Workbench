@@ -10,7 +10,8 @@ import {
   SqliteTargetLibraryRepository,
 } from './target-library-store.js';
 import type { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { ensureBumperEffects } from './record-retention-migration.js';
 import { z } from 'zod';
 import { transaction } from './sqlite-transaction.js';
 import { ProfileTaskResult } from '../shared/task-contracts.js';
@@ -224,6 +225,7 @@ export class SqliteGroupBumperRepository {
       );
     `);
     db.exec(groupBumperOperationsMigration);
+    ensureBumperEffects(db);
     try {
       applyBumperSettingsFlagUpgradeIfPending(db);
     } catch {
@@ -580,6 +582,14 @@ export class SqliteGroupBumperRepository {
     scope: BumperScope = 'group',
   ): BumperComment | null {
     const excluded = new Set(excludeIds);
+    const digests = new Set(
+      this.db
+        .prepare(
+          'SELECT comment_digest FROM group_bumper_effects WHERE post_id=? AND comment_digest IS NOT NULL',
+        )
+        .all(postId)
+        .map((r) => String(r.comment_digest)),
+    );
     const used = new Set(
       this.db
         .prepare(
@@ -589,7 +599,9 @@ export class SqliteGroupBumperRepository {
         .map((r) => String(r.comment_text)),
     );
     const all = this.comments(scope).filter((r) => !excluded.has(r.id)),
-      unused = all.filter((r) => !used.has(r.text));
+      unused = all.filter(
+        (r) => !used.has(r.text) && !digests.has(createHash('sha256').update(r.text).digest('hex')),
+      );
     const consumeOnUse =
       scope === 'page'
         ? this.pageSettings().consumeCommentOnUse
@@ -612,21 +624,21 @@ export class SqliteGroupBumperRepository {
     const today = Number(
       this.db
         .prepare(
-          'SELECT COUNT(*) n FROM group_bumper_logs WHERE (account_id=? OR profile_id=?) AND bumped_at>=? AND source_mode=?',
+          'SELECT COUNT(*) n FROM group_bumper_effects WHERE (account_id=? OR profile_id=?) AND applied_at>=? AND source_mode=?',
         )
         .get(accountId, profileId, date.getTime(), sourceMode)?.n ?? 0,
     );
     const postCount = Number(
       this.db
         .prepare(
-          'SELECT COUNT(*) n FROM group_bumper_logs WHERE post_id=? AND (liked=1 OR comment_text IS NOT NULL)',
+          'SELECT COUNT(*) n FROM group_bumper_effects WHERE post_id=? AND (liked=1 OR commented=1)',
         )
         .get(postId)?.n ?? 0,
     );
     const duplicate = Boolean(
       this.db
         .prepare(
-          'SELECT 1 FROM group_bumper_logs WHERE post_id=? AND (account_id=? OR profile_id=?) LIMIT 1',
+          'SELECT 1 FROM group_bumper_effects WHERE post_id=? AND (account_id=? OR profile_id=?) LIMIT 1',
         )
         .get(postId, accountId, profileId),
     );
@@ -715,6 +727,13 @@ export class SqliteGroupBumperRepository {
           row.bumpedAt,
           sourceMode,
         );
+      if (row.commentText)
+        this.db.prepare('UPDATE group_bumper_effects SET comment_digest=? WHERE log_id=?').run(
+          createHash('sha256')
+            .update(String(previous?.comment_text ?? row.commentText))
+            .digest('hex'),
+          row.id,
+        );
       if (!previous) {
         if (row.groupId && row.groupId !== '-') {
           this.targetLibrary.incrementGroupBumpedCount(row.groupId, 1);
@@ -799,8 +818,8 @@ export class SqliteGroupBumperRepository {
     return Object.fromEntries(
       this.db
         .prepare(
-          `SELECT profile_id,COUNT(*) n FROM group_bumper_logs
-            WHERE bumped_at>=? AND (?='all' OR source_mode=?)
+          `SELECT profile_id,COUNT(*) n FROM group_bumper_effects
+            WHERE applied_at>=? AND (?='all' OR source_mode=?)
             GROUP BY profile_id`,
         )
         .all(today.getTime(), sourceMode, sourceMode)
@@ -832,8 +851,8 @@ export class SqliteGroupBumperRepository {
 
     const rows = this.db
       .prepare(
-        `SELECT bumped_at FROM group_bumper_logs
-          WHERE bumped_at >= ? AND bumped_at < ?
+        `SELECT applied_at AS bumped_at FROM group_bumper_effects
+          WHERE applied_at >= ? AND applied_at < ?
             AND (?='all' OR source_mode=?)`,
       )
       .all(startMs, endMs, sourceMode, sourceMode);
@@ -882,6 +901,13 @@ export class SqliteGroupBumperRepository {
       .parse(input);
     const mode = sourceMode ?? 'all';
     return transaction(this.db, () => {
+      const usageChanges = Number(
+        this.db
+          .prepare(
+            "DELETE FROM group_bumper_effects WHERE (?=1 AND (?='all' OR source_mode=?)) OR log_id IN(SELECT value FROM json_each(?))",
+          )
+          .run(all ? 1 : 0, mode, mode, JSON.stringify(ids)).changes,
+      );
       const changes = Number(
         this.db
           .prepare(
@@ -891,13 +917,13 @@ export class SqliteGroupBumperRepository {
           )
           .run(all ? 1 : 0, mode, mode, JSON.stringify(ids)).changes,
       );
-      if (changes > 0) {
+      if (changes > 0 || usageChanges > 0) {
         this.db
           .prepare(
             `UPDATE shared_facebook_groups
                 SET bumped_count = (
-                  SELECT COUNT(*) FROM group_bumper_logs
-                   WHERE group_bumper_logs.group_id = shared_facebook_groups.group_id
+                  SELECT COUNT(*) FROM group_bumper_effects
+                   WHERE group_bumper_effects.group_id = shared_facebook_groups.group_id
                 )`,
           )
           .run();
@@ -905,8 +931,8 @@ export class SqliteGroupBumperRepository {
           .prepare(
             `UPDATE group_bumper_pages
                 SET total_bumped_count = (
-                  SELECT COUNT(*) FROM group_bumper_logs
-                   WHERE group_bumper_logs.page_id = group_bumper_pages.page_id
+                  SELECT COUNT(*) FROM group_bumper_effects
+                   WHERE group_bumper_effects.page_id = group_bumper_pages.page_id
                 )`,
           )
           .run();

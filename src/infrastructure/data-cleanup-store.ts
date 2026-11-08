@@ -6,6 +6,8 @@ import {
   SaveCleanupSettings,
 } from '../shared/data-cleanup.js';
 import { transaction } from './sqlite-transaction.js';
+import { SqliteRecordRetention } from './record-retention-store.js';
+import { readRecordAvatar, RecordAvatarKind } from './record-avatar-store.js';
 
 export const dataCleanupMigration = `
 CREATE TABLE task_record_deletions(step_id TEXT PRIMARY KEY,deleted_at INTEGER NOT NULL);
@@ -18,7 +20,7 @@ export const cleanupQuotaMigration =
 
 // Unresolved business evidence and material usage are retained. Fully deleted, ended
 // ordinary histories can be physically removed once all their records are selected.
-const purgeablePlan = `p.state IN ('COMPLETED','STOPPED','FAILED')
+export const purgeablePlan = `p.state IN ('COMPLETED','STOPPED','FAILED')
  AND NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id))
  AND NOT EXISTS(SELECT 1 FROM material_post_intents m WHERE m.job_id=p.id)
  AND NOT EXISTS(SELECT 1 FROM task_outbox o WHERE o.job_id=p.id AND o.status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED','UNKNOWN'))
@@ -68,10 +70,25 @@ export class SqliteDataCleanup {
     private readonly db: DatabaseSync,
     private readonly onInvalidate?: () => void,
   ) {}
+  detailHead(maximum: number) {
+    return new SqliteRecordRetention(this.db).detailHead(maximum);
+  }
+  protectedOperationIds() {
+    return new SqliteRecordRetention(this.db).protectedOperationIds();
+  }
+  pruneDetails(input: unknown, maximum = 100) {
+    return new SqliteRecordRetention(this.db).pruneDetails(input, maximum);
+  }
+  pruneResults(bumper: number, poster: number, maximum = 100) {
+    return new SqliteRecordRetention(this.db).pruneResults(bumper, poster, maximum);
+  }
+  recordAvatar(kind: unknown, id: string) {
+    return readRecordAvatar(this.db, RecordAvatarKind.parse(kind), id);
+  }
   settings() {
     const row = this.db
       .prepare(
-        'SELECT revision,history_retention_days AS historyRetentionDays,history_max_count AS historyMaxCount,automatic_logs, (SELECT log_retention_days FROM workspace_preferences WHERE id=1) AS logRetentionDays FROM data_cleanup_settings WHERE id=1',
+        'SELECT revision,history_retention_days AS historyRetentionDays,history_max_count AS historyMaxCount,automatic_logs,bumper_max_count,poster_max_count,detail_max_count, (SELECT log_retention_days FROM workspace_preferences WHERE id=1) AS logRetentionDays FROM data_cleanup_settings WHERE id=1',
       )
       .get();
     return CleanupSettings.parse({
@@ -80,6 +97,9 @@ export class SqliteDataCleanup {
       historyMaxCount: row?.historyMaxCount ?? null,
       logRetentionDays: row?.logRetentionDays,
       automaticLogs: row?.automatic_logs === 1,
+      bumperMaxCount: row?.bumper_max_count,
+      posterMaxCount: row?.poster_max_count,
+      detailMaxCount: row?.detail_max_count,
     });
   }
   saveSettings(input: unknown) {
@@ -87,7 +107,7 @@ export class SqliteDataCleanup {
     return transaction(this.db, () => {
       const result = this.db
         .prepare(
-          'UPDATE data_cleanup_settings SET revision=revision+1,history_retention_days=?,history_max_count=?,automatic_logs=? WHERE id=1 AND revision=?',
+          'UPDATE data_cleanup_settings SET revision=revision+1,history_retention_days=?,history_max_count=?,automatic_logs=?,bumper_max_count=?,poster_max_count=?,detail_max_count=? WHERE id=1 AND revision=?',
         )
         .run(
           request.historyRetentionDays,
@@ -95,11 +115,45 @@ export class SqliteDataCleanup {
             ? (this.settings().historyMaxCount ?? null)
             : request.historyMaxCount,
           request.automaticLogs ? 1 : 0,
+          request.bumperMaxCount ?? this.settings().bumperMaxCount,
+          request.posterMaxCount ?? this.settings().posterMaxCount,
+          request.detailMaxCount ?? this.settings().detailMaxCount,
           request.expectedRevision,
         );
       if (!result.changes)
         throw new ProductError('CLEANUP_SETTINGS_CHANGED', '清理设置已变化，请重新读取', 409);
       return this.settings();
+    });
+  }
+  reclaimHiddenRounds(maximum = 100): number {
+    return transaction(this.db, () => {
+      const rounds = this.db
+        .prepare(
+          `SELECT DISTINCT s.job_id,s.round FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE s.round<p.round
+        AND NOT EXISTS(SELECT 1 FROM task_steps v WHERE v.job_id=s.job_id AND v.round=s.round AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=v.id))
+        AND NOT EXISTS(SELECT 1 FROM task_outbox o JOIN task_steps v ON v.id=o.step_id WHERE v.job_id=s.job_id AND v.round=s.round)
+        AND NOT EXISTS(SELECT 1 FROM material_post_intents m JOIN task_steps v ON v.id=m.step_id WHERE v.job_id=s.job_id AND v.round=s.round)
+        AND NOT EXISTS(SELECT 1 FROM task_events e WHERE e.job_id=s.job_id AND (json_extract(e.detail,'$.round')=s.round OR json_extract(e.detail,'$.stepId') IN(SELECT id FROM task_steps v WHERE v.job_id=s.job_id AND v.round=s.round)))
+        LIMIT ?`,
+        )
+        .all(maximum);
+      for (const r of rounds) {
+        this.db
+          .prepare(
+            'DELETE FROM task_record_deletions WHERE step_id IN(SELECT id FROM task_steps WHERE job_id=? AND round=?)',
+          )
+          .run(r.job_id as string, r.round as number);
+        this.db
+          .prepare('DELETE FROM task_steps WHERE job_id=? AND round=?')
+          .run(r.job_id as string, r.round as number);
+        this.db
+          .prepare('DELETE FROM task_run_summaries WHERE job_id=? AND round=?')
+          .run(r.job_id as string, r.round as number);
+        this.db
+          .prepare('DELETE FROM task_record_dirty WHERE job_id=? AND round=?')
+          .run(r.job_id as string, r.round as number);
+      }
+      return rounds.length;
     });
   }
   private selection(input: unknown) {
@@ -124,7 +178,7 @@ export class SqliteDataCleanup {
       limits.push(`(s.job_id,s.round) IN (
         SELECT qs.job_id,qs.round FROM task_steps qs JOIN task_plans qp ON qp.id=qs.job_id
         LEFT JOIN task_record_projection qr ON qr.step_id=qs.id
-        WHERE qp.state IN ('STOPPED','COMPLETED','FAILED')
+        WHERE (qp.state IN ('STOPPED','COMPLETED','FAILED') OR qs.round<qp.round)
           AND NOT EXISTS(SELECT 1 FROM task_record_deletions qd WHERE qd.step_id=qs.id)
           ${scope.profileId ? 'AND qp.profile_id=?' : ''}
         GROUP BY qs.job_id,qs.round
@@ -144,7 +198,7 @@ export class SqliteDataCleanup {
     const { where, params } = this.selection(input);
     const row = this.db
       .prepare(
-        `SELECT count(*) AS total,coalesce(sum(p.state IN ('COMPLETED','STOPPED','FAILED')),0) AS eligible FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${where}`,
+        `SELECT count(*) AS total,coalesce(sum(p.state IN ('COMPLETED','STOPPED','FAILED') OR s.round<p.round),0) AS eligible FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${where}`,
       )
       .get(...params);
     const eligible = Number(row?.eligible ?? 0);
@@ -158,7 +212,7 @@ export class SqliteDataCleanup {
     return transaction(this.db, () => {
       const result = this.db
         .prepare(
-          `INSERT OR IGNORE INTO task_record_deletions SELECT s.id,? FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${where} AND p.state IN ('COMPLETED','STOPPED','FAILED') LIMIT ? RETURNING step_id`,
+          `INSERT OR IGNORE INTO task_record_deletions SELECT s.id,? FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${where} AND (p.state IN ('COMPLETED','STOPPED','FAILED') OR s.round<p.round) LIMIT ? RETURNING step_id`,
         )
         .all(Date.now(), ...params, maximum);
       // Remove selected display rows immediately; compact fully selected ordinary plans below.
@@ -199,7 +253,7 @@ export class SqliteDataCleanup {
         removed += Number(
           this.db
             .prepare(
-              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND updated_at < ? AND profile_id = ?",
+              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND resolution_outcome<>'ENDED_UNKNOWN' AND updated_at < ? AND profile_id = ?",
             )
             .run(before, profileId).changes,
         );
@@ -207,7 +261,7 @@ export class SqliteDataCleanup {
         removed += Number(
           this.db
             .prepare(
-              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND updated_at < ?",
+              "DELETE FROM group_bumper_operations WHERE status = 'SETTLED' AND resolution_outcome<>'ENDED_UNKNOWN' AND updated_at < ?",
             )
             .run(before).changes,
         );

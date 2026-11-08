@@ -1,5 +1,7 @@
 import { finderListMigration, SqliteTargetLists } from './target-list-store.js';
+import { recordRetentionMigration } from './record-retention-migration.js';
 import { taskSessionEndMigration } from './task-session-end-migration.js';
+import { marketplaceSkipMigration } from './marketplace-skip-migration.js';
 import {
   SqliteTargetLibraryRepository,
   unifiedTargetLibraryMigration,
@@ -239,6 +241,12 @@ const migrations: readonly MigrationSpec[] = [
   {
     run: (db) => {
       db.exec(taskSessionEndMigration);
+    },
+  },
+  { run: recordRetentionMigration },
+  {
+    run: (db) => {
+      db.exec(marketplaceSkipMigration);
     },
   },
 ];
@@ -513,6 +521,9 @@ export class WorkspaceStore implements WorkspaceRepository {
         db.exec('ALTER TABLE combinations ADD COLUMN deleted_at INTEGER DEFAULT NULL');
       db.exec(
         "CREATE TABLE IF NOT EXISTS profile_account_cache(profile_id TEXT PRIMARY KEY,account_state TEXT NOT NULL DEFAULT 'unknown',account_id TEXT,account_name TEXT,avatar_url TEXT,avatar_updated_at INTEGER NOT NULL DEFAULT 0)",
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS record_account_avatar ON profile_account_cache(account_id)',
       );
       const store = new WorkspaceStore(db);
       store.resourceTables.pruneConsumedRows();

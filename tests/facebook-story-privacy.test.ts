@@ -49,3 +49,23 @@ test('already Friends is closed without a redundant Save; unavailable or disable
   assert.throws(() => decideStoryFriendsPrivacy('CLOSE_VERIFIED', closed), /DIALOG_CLOSED/);
   assert.throws(() => decideStoryFriendsPrivacy('OPEN_INITIAL', menu), /UNEXPECTED_DIALOG/);
 });
+
+test('preserve current observes and closes Public/Custom without selecting Friends or saving', () => {
+  for (const draftSelection of ['PUBLIC', 'CUSTOM'] as const) {
+    const result = decideStoryFriendsPrivacy(
+      'SELECT_FRIENDS',
+      { ...menu, draftSelection, friendsEnabled: false },
+      'preserve-current',
+    );
+    assert.equal(result.kind === 'action' && result.action, 'close');
+    assert.throws(
+      () =>
+        decideStoryFriendsPrivacy('SELECT_FRIENDS', {
+          ...menu,
+          draftSelection,
+          friendsEnabled: false,
+        }),
+      /STORY_FRIENDS_AUDIENCE_UNAVAILABLE/,
+    );
+  }
+});

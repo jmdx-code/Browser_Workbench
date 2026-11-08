@@ -47,6 +47,10 @@ export type RuntimeProfile = Pick<
 export interface TaskRepository {
   readonly settlements?: SettlementRepository;
   hiddenRecordIds?(): Awaitable<string[]>;
+  finalRecords?(
+    id: string,
+    round: number,
+  ): Awaitable<import('../shared/task-contracts.js').TaskRecord[] | null>;
   recordsPage?(
     input: unknown,
     profiles: readonly import('./task-record-projection.js').RecordProfile[],
@@ -57,6 +61,7 @@ export interface TaskRepository {
   batchExists(batchId: string): Awaitable<boolean>;
   plansForBatch(batchId: string): Awaitable<Plan[]>;
   plansForProfile(profileId: string, states?: readonly Plan['state'][]): Awaitable<Plan[]>;
+  historyPlans?(profileId: string, selectedId?: string): Awaitable<Plan[]>;
   hasProfilePlanInStates(profileId: string, states: readonly Plan['state'][]): Awaitable<boolean>;
   hasPlanOrOperation?(jobId: string, operationId: string): Awaitable<boolean>;
   list(): Awaitable<Plan[]>;
@@ -78,6 +83,7 @@ export interface TaskRepository {
   noteRunningWait?(id: string, reason: string): Awaitable<void>;
   noteChildPageLifecycle?(binding: Binding, value: ChildPageLifecycle): Awaitable<void>;
   retainedTaskPage?(profileId: string): Awaitable<TabProof | null>;
+  canRestartStoryPage?(jobId: string, proof: TabProof): Awaitable<boolean>;
   reconcileRuntime(profiles: RuntimeProfile[]): Awaitable<void>;
   reconcileProfileRuntime?(profile: RuntimeProfile): Awaitable<void>;
   requestControl(id: string, mode: 'pause' | 'stop', reason?: string): Awaitable<Plan>;

@@ -4,59 +4,7 @@ import {
   parseNativeStoryCreation,
   isNativeTextStoryRequest,
   isNativeMediaStoryRequest,
-  readStoryPublishedNotice,
 } from '../src/infrastructure/facebook-story-native-result.js';
-import type { Page } from 'playwright-core';
-
-test('native home redirect confirms only the exact returned own-story link and current visible published notice', async () => {
-  const created = {
-    actorId: '456',
-    bucketId: '789',
-    storyId: Buffer.from('S:_ISC:123').toString('base64'),
-  };
-  const exact = 'https://www.facebook.com/stories/789/' + created.storyId + '/';
-  const valid = {
-    url: 'https://www.facebook.com/',
-    timeOrigin: 100,
-    ready: 'complete',
-    visible: true,
-    notices: ['Story posted'],
-    ownStoryLinks: [exact + '?source=story_tray'],
-  };
-  const check = (value: unknown, context = created) =>
-    readStoryPublishedNotice(
-      { evaluate: async () => value } as unknown as Page,
-      100,
-      () => {},
-      context,
-    );
-  assert.equal(await check(valid), true);
-  for (const changed of [
-    { ...valid, url: 'https://www.facebook.com/reel/' },
-    { ...valid, timeOrigin: 101 },
-    { ...valid, ready: 'loading' },
-    { ...valid, visible: false },
-    { ...valid, notices: [] },
-    { ...valid, notices: ['Story posted', 'Story posted'] },
-    { ...valid, ownStoryLinks: [] },
-    { ...valid, ownStoryLinks: [exact, exact] },
-    { ...valid, ownStoryLinks: [exact.replace('/789/', '/999/')] },
-    { ...valid, ownStoryLinks: [exact.replace('www.facebook.com', 'foreign.example')] },
-  ])
-    assert.equal(await check(changed), false);
-  assert.equal(
-    await readStoryPublishedNotice(
-      { evaluate: async () => valid } as unknown as Page,
-      100,
-      () => {},
-    ),
-    false,
-  );
-  assert.equal(
-    await check({ ...valid, url: 'https://www.facebook.com/stories', ownStoryLinks: [] }),
-    true,
-  );
-});
 
 const native = () => ({
   data: {
@@ -199,4 +147,30 @@ test('native story request cannot target another actor, audience, ordinary post 
   audience.stories.self.target_id = '123';
   params.set('variables', JSON.stringify(vars));
   assert.equal(isNativeTextStoryRequest(params.toString(), '456', 'exact text'), false);
+});
+
+test('native story final response supports anti-XSSI JSON chunks and rejects any errors or conflicting created IDs', () => {
+  const valid = native();
+  assert.equal(
+    parseNativeStoryCreation(
+      'for (;;);' + JSON.stringify({ data: {} }) + '\n' + JSON.stringify(valid),
+      200,
+      '456',
+    )?.bucketId,
+    '789',
+  );
+  assert.equal(
+    parseNativeStoryCreation(
+      JSON.stringify(valid) + '\n' + JSON.stringify({ errors: [{ message: 'rejected' }] }),
+      200,
+      '456',
+    ),
+    null,
+  );
+  const other = native();
+  other.data.story_create.items[0]!.story.id = Buffer.from('S:_ISC:124').toString('base64');
+  assert.equal(
+    parseNativeStoryCreation(JSON.stringify(valid) + '\n' + JSON.stringify(other), 200, '456'),
+    null,
+  );
 });

@@ -58,8 +58,8 @@ const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
 
 export class BumperPostReadIncomplete extends Error {
-  constructor() {
-    super('目标帖子资料尚未读全，未执行互动');
+  constructor(message = '目标帖子资料尚未读全，未执行互动') {
+    super(message);
   }
 }
 export function requireBumperPost(
@@ -945,13 +945,96 @@ export function isBumperFatal(error: unknown): boolean {
       ))
   );
 }
-export async function centerBumperControl(locator: Locator, paceScale = 1) {
+export async function centerBumperControl(locator: Locator, paceScale = 1, timeout = 4000) {
   await locator.evaluate(
     (el) => el.scrollIntoView({ block: 'center', inline: 'center' }),
     undefined,
-    { timeout: 4000 },
+    { timeout },
   );
   if (paceScale > 0) await wait(Math.max(1, Math.round(150 * paceScale)));
+}
+export async function prepareBumperPost(input: {
+  page: Pick<Page, 'locator'>;
+  readCurrent(): Promise<BumperPost>;
+  guard(): void;
+  candidateCardCSS?: string | null;
+  paceScale?: number;
+  timeoutMs?: number;
+}): Promise<BumperPost> {
+  const deadline = Date.now() + (input.timeoutMs ?? 12_000);
+  let hydrationScrollUsed = false;
+  while (Date.now() < deadline) {
+    input.guard();
+    try {
+      const current = await input.readCurrent();
+      input.guard();
+      const anchor =
+        current.videoCSS ??
+        current.postCSS ??
+        current.likeCSS ??
+        current.commentButtonCSS ??
+        current.commentCSS;
+      if (!anchor) throw new BumperPostReadIncomplete();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await centerBumperControl(
+        input.page.locator(anchor).first(),
+        input.paceScale ?? 1,
+        Math.min(750, remaining),
+      );
+      input.guard();
+      const after = await input.readCurrent();
+      input.guard();
+      if (!(after.likeCSS || after.commentButtonCSS || after.commentCSS || after.hasVideo))
+        throw new BumperPostReadIncomplete();
+      return after;
+    } catch (error) {
+      input.guard();
+      if (
+        !(error instanceof BumperPostReadIncomplete) &&
+        !(
+          error instanceof Error &&
+          /locator\.evaluate: Timeout|Element is not attached|Element was detached/i.test(
+            error.message,
+          )
+        )
+      )
+        throw error;
+      // A virtualized card can retain its host while its contents are unloaded.
+      // This fallback only scrolls that card; a fresh identity-checked read must
+      // still succeed before any interaction is allowed.
+      if (
+        error instanceof BumperPostReadIncomplete &&
+        !hydrationScrollUsed &&
+        input.candidateCardCSS
+      ) {
+        hydrationScrollUsed = true;
+        const remaining = deadline - Date.now();
+        if (remaining > 0) {
+          try {
+            await centerBumperControl(
+              input.page.locator(input.candidateCardCSS).first(),
+              input.paceScale ?? 1,
+              Math.min(750, remaining),
+            );
+          } catch (scrollError) {
+            if (!(
+              scrollError instanceof Error &&
+              /locator\.evaluate: Timeout|Element is not attached|Element was detached/i.test(
+                scrollError.message,
+              )
+            ))
+              throw scrollError;
+          }
+          input.guard();
+        }
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining > 0) await wait(Math.min(200, remaining));
+  }
+  input.guard();
+  throw new Error('目标帖子仍在加载或控件未就绪，本帖准备超时，未执行互动');
 }
 export async function revealBumperControlIfNeeded(
   locator: Locator,
@@ -3226,6 +3309,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     }
                     return saved;
                   };
+                  let expectedFeedbackId: string | null = null;
                   const checkPost = async (): Promise<BumperPost> => {
                     for (let attempt = 0; ; attempt++) {
                       await assertIdentity();
@@ -3234,19 +3318,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
                         targetPostId: post.postId,
                       });
-                      if (!s.visible || !s.ready) throw Error('目标帖子页面尚未可见就绪');
-                      const p = s.posts.find((p) => p.postId === post.postId);
                       if (s.restricted)
                         throw new BumperFatalError(
                           '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
                         );
+                      if (!s.visible || !s.ready)
+                        throw new BumperPostReadIncomplete('目标帖子页面尚未可见就绪');
+                      const p = s.posts.find((p) => p.postId === post.postId);
                       if (!isPageBumperMode && !s.groupIds.includes(effectiveGroupId.toLowerCase()))
                         throw Error('目标帖子或作者已变化');
                       try {
                         return requireBumperPost(
                           p,
                           feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
-                          post.feedbackId,
+                          expectedFeedbackId,
                         );
                       } catch (error) {
                         if (!(error instanceof BumperPostReadIncomplete) || attempt > 0)
@@ -3265,19 +3350,16 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     post.hasVideo ? '观看目标视频' : '浏览目标帖子',
                     async () => {
                       const maxWatchMs = Math.round(180_000 * this.paceScale);
-                      const anchorCSS =
-                        post.videoCSS ??
-                        (post.hasVideo ? post.postCSS : null) ??
-                        post.likeCSS ??
-                        post.commentButtonCSS ??
-                        post.commentCSS ??
-                        post.postCSS;
-                      if (anchorCSS) {
-                        await centerBumperControl(page.locator(anchorCSS).first(), this.paceScale);
-                      }
-                      // 居中后重新读取一次：屏下卡片水合后才暴露视频/点赞栏
-                      const refreshedPost = await checkPost();
-                      if (post.hasVideo || refreshedPost.hasVideo) {
+                      // A scan supplies a candidate ID, never a durable DOM locator.
+                      const refreshedPost = await prepareBumperPost({
+                        page,
+                        readCurrent: checkPost,
+                        guard,
+                        candidateCardCSS: post.postCSS,
+                        paceScale: this.paceScale,
+                      });
+                      expectedFeedbackId = refreshedPost.feedbackId;
+                      if (refreshedPost.hasVideo) {
                         callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
                         await watchBumperVideo({
                           page,

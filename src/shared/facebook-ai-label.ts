@@ -1,11 +1,9 @@
 import { z } from 'zod';
-import { FACEBOOK_COMPOSER_SCOPE } from './facebook-ui.js';
 
 export const PostAILabelSetting = z.enum(['preserve-current', 'on', 'off']);
 export type AILabelSetting = z.infer<typeof PostAILabelSetting>;
-export const facebookAILabelScope = FACEBOOK_COMPOSER_SCOPE;
-export const facebookAILabelSwitch =
-  '[role="switch"][data-wb-ai-label-switch="1"],[role="switch"][aria-label="Add AI label"]';
+export const facebookAILabelScope = '[data-wb-ai-label-scope="1"]';
+export const facebookAILabelSwitch = '[role="switch"][data-wb-ai-label-switch="1"]';
 export const facebookAILabelReading = z
   .object({
     url: z.string().max(2048),
@@ -17,6 +15,7 @@ export const facebookAILabelReading = z
     openCSS: z.string().max(200).nullable(),
     switchEnabled: z.boolean(),
     confirmEnabled: z.boolean(),
+    mode: z.enum(['dialog', 'inline']).optional(),
   })
   .strict()
   .superRefine((value, context) => {

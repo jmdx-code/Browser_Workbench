@@ -209,6 +209,8 @@ if (!process.versions.electron) {
       const { projectFacebookComposerAudience } =
         await import('../dist/src/infrastructure/facebook-composer-audience.js');
       const { audienceTarget } = await import('../dist/src/domain/facebook-audience.js');
+      const { clearAudienceDefaultTarget } =
+        await import('../dist/src/shared/facebook-audience.js');
       for (const label of ['Done', 'Done with privacy audience selection and close dialog']) {
         for (const duplicate of [false, true]) {
           const button = '<div role="button" aria-label="' + label + '">Done</div>';
@@ -226,8 +228,8 @@ if (!process.versions.electron) {
           assert.equal(privacy.phase, duplicate ? 'UNAVAILABLE' : 'MENU');
           assert.equal(audienceTarget(privacy, 'CONFIRM_AUDIENCE') !== null, !duplicate);
           assert.equal(
-            audienceTarget({ ...privacy, defaultChecked: true }, 'CONFIRM_AUDIENCE'),
-            null,
+            audienceTarget({ ...privacy, defaultChecked: true }, 'CONFIRM_AUDIENCE')?.css,
+            duplicate ? undefined : clearAudienceDefaultTarget.css,
           );
         }
       }

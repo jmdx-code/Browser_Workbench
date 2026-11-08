@@ -1,5 +1,21 @@
 // V1 fixed policy: transient admission/focus/loading waits are not step failures.
-export function postFailureRequiresEnding(reason: string): boolean {
+export function postFailureRequiresEnding(reason: string, purpose?: string): boolean {
+  if (reason.startsWith('POST_PREPARATION_TIMEOUT:')) return true;
+  if (purpose && purpose !== 'SUBMIT' && reason.startsWith('UPLOAD_STAGE_')) return true;
+  if (
+    purpose &&
+    purpose !== 'SUBMIT' &&
+    !/(?:ACCOUNT_(?:CHANGED|MISMATCH|VERIFICATION|RESTRICTED|LOGGED_OUT)|OWNER|REVOKED|CONTROL_|USER_|CONCURRENCY_LIMIT|STARTUP_BACKOFF|KERNEL_|CONNECTION_|LEASE_|SOFTWARE_RESTART)/.test(
+      reason,
+    )
+  )
+    return true;
+  if (
+    /^(?:FACEBOOK_CURRENT_STORY_IDENTITY_UNCONFIRMED|POST_SELF_AUDIENCE_UNAVAILABLE|STORY_FRIENDS_AUDIENCE_UNAVAILABLE|STORY_AUDIENCE_UNSUPPORTED)$/.test(
+      reason,
+    )
+  )
+    return true;
   if (
     /^POST_AI_LABEL_(?:CONFIGURATION_UNAVAILABLE|SETTINGS_CLOSED|CHANGED|CHANGED_AFTER_CONTENT|DOCUMENT_CHANGED|UNCONFIRMED_BEFORE_CONTENT|ACTION_UNCONFIRMED)$/.test(
       reason,

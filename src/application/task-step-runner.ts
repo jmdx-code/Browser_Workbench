@@ -1056,10 +1056,12 @@ export class TaskStepRunner {
       const failedStep = (await this.tasks.steps(jobId, current.round)).find(
         (step) => step.position === current.position,
       );
+      const marketplaceUnavailable =
+        failedStep?.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE';
       devDiag.record({
-        level: 'ERROR',
+        level: marketplaceUnavailable ? 'INFO' : 'ERROR',
         category: 'TASK_RUNNER',
-        event: 'STEP_RUNNER_ERROR',
+        event: marketplaceUnavailable ? 'STEP_CAPABILITY_SKIPPED' : 'STEP_RUNNER_ERROR',
         profileId: current.profileId,
         planId: jobId,
         stepId: failedStep?.id,
@@ -1096,8 +1098,17 @@ export class TaskStepRunner {
         }
         this.browseSelfHeals.delete(current.profileId);
       }
+      let failedPostPurpose: string | undefined;
+      if (failedStep?.spec.type === 'post' && operation && this.post) {
+        try {
+          failedPostPurpose = (await this.post.posts.link(operation.id)).purpose;
+        } catch {
+          /* A generic tab activation has no material-post link. Keep the original fault. */
+        }
+      }
       if (
-        (failedStep?.spec.type === 'post' && postFailureRequiresEnding(reason)) ||
+        (failedStep?.spec.type === 'post' &&
+          postFailureRequiresEnding(reason, failedPostPurpose)) ||
         (failedStep?.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE')
       )
         await this.tasks.noteStepFailure?.(jobId, failedStep.id, reason);
@@ -1297,10 +1308,23 @@ export class TaskStepRunner {
     );
     await assertCurrent();
     if (this.windowClosed(plan)) return await this.waitForWindow(plan);
+    const preparationKey = `${step.id}:preparation`;
     if (decision.kind === 'wait') {
+      if (
+        /^(?:STORY_(?:EDITOR|EMPTY_ENTRY|PRIVACY|TEXT|SUBMIT|MEDIA_INPUT|PREPARATION)|FACEBOOK_POST_(?:HOME|COMPOSER|NEXT|REVIEW|SUBMIT)|POST_AUDIENCE_LOADING)/.test(
+          decision.reason,
+        )
+      ) {
+        const now = this.clock.nowMilliseconds();
+        const started = this.postWaits.get(preparationKey) ?? now;
+        this.postWaits.set(preparationKey, started);
+        if (now < started || now - started >= 30_000)
+          throw Error(`POST_PREPARATION_TIMEOUT:${decision.reason}`.slice(0, 200));
+      }
       await this.tasks.noteRunningWait?.(plan.id, decision.reason);
       return this.result(plan, 'WAITING', decision.reason);
     }
+    this.postWaits.delete(preparationKey);
     if (decision.kind === 'reserve' || decision.kind === 'reserve-next') {
       const request = decision.request;
       if (

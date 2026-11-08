@@ -47,7 +47,11 @@ import {
   type Settings,
   type StepInstance,
 } from '../shared/task-contracts.js';
-import { TaskStepFailure, TaskStepSkip } from '../shared/task-step-outcome.js';
+import {
+  TaskStepFailure,
+  TaskStepSkip,
+  isMarketplaceUnavailableSkip,
+} from '../shared/task-step-outcome.js';
 import {
   emptyProgress,
   orderedSteps,
@@ -141,6 +145,16 @@ const CancelledBrowseReceipt = z
   .strict();
 export class SqliteTaskRepository implements TaskRepository {
   readonly recordReader: TaskRecordReader;
+  finalRecords(id: string, round: number) {
+    const row = this.db
+      .prepare(
+        'SELECT records FROM task_run_summaries WHERE job_id=? AND round=? AND details_pruned=1',
+      )
+      .get(id, round);
+    return row
+      ? (JSON.parse(String(row.records)) as import('../shared/task-contracts.js').TaskRecord[])
+      : null;
+  }
   private stmt(sql: string) {
     return prepareCached(this.db, sql);
   }
@@ -212,6 +226,51 @@ export class SqliteTaskRepository implements TaskRepository {
       "SELECT o.proof FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state='RELEASED' AND s.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1",
     ).get(profileId);
     return row ? OwnedTabProof.parse(JSON.parse(String(row.proof))) : null;
+  }
+  canRestartStoryPage(jobId: string, input: import('../shared/kernel-state.js').TabProof): boolean {
+    const proof = OwnedTabProof.parse(input),
+      plan = this.get(jobId);
+    if (plan.profileId !== proof.profileId || !plan.accountId || plan.state !== 'RUNNING')
+      return false;
+    // Read only the most recent prior owner of this exact page; never scan profile history
+    // or fall back to an older safe attempt past a newer, unresolved one.
+    const previous = this.stmt(
+      `SELECT o.job_id,o.account_id,o.proof,p.state
+      FROM task_tab_ownership o JOIN task_tab_state t USING(ownership_id,job_id)
+      JOIN task_plans p ON p.id=o.job_id
+      WHERE o.ownership_id=? AND o.job_id<>? AND t.state='RELEASED'
+      AND t.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1`,
+    ).get(proof.ownershipId, jobId);
+    if (
+      !previous ||
+      previous.state !== 'FAILED' ||
+      previous.account_id !== plan.accountId ||
+      !sameTabProof(OwnedTabProof.parse(JSON.parse(String(previous.proof))), proof)
+    )
+      return false;
+    const step = this.stmt(
+      `SELECT id,spec,outcome FROM task_steps WHERE job_id=?
+      AND status='FAILED' ORDER BY round DESC,position DESC LIMIT 1`,
+    ).get(String(previous.job_id));
+    if (!step) return false;
+    const spec = JSON.parse(String(step.spec)) as { type?: string; destination?: string };
+    const outcome = TaskStepFailure.safeParse(
+      step.outcome ? JSON.parse(String(step.outcome)) : null,
+    );
+    if (
+      spec.type !== 'post' ||
+      spec.destination !== 'story' ||
+      !outcome.success ||
+      outcome.data.submissionPhase !== 'BEFORE_SUBMIT' ||
+      outcome.data.businessResult !== 'NOT_PUBLISHED'
+    )
+      return false;
+    const attempt = this.stmt(
+      `SELECT i.attempt_id,v.outcome FROM material_post_intents i
+      LEFT JOIN material_attempt_verdicts v USING(attempt_id) WHERE i.job_id=? AND i.step_id=?
+      ORDER BY i.created_at DESC,i.attempt_id DESC LIMIT 1`,
+    ).get(String(previous.job_id), String(step.id));
+    return !attempt || attempt.outcome === 'NOT_PUBLISHED';
   }
   private state(id: string, state: Plan['state'], reason: string) {
     this.stmt('UPDATE task_plans SET state=?,reason=?,updated_at=? WHERE id=?').run(
@@ -373,6 +432,35 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.stmt('SELECT * FROM task_plans WHERE profile_id=? ORDER BY created_at,rowid')
       .all(profileId)
       .map((row) => this.parsePlanRow(row));
+  }
+  historyPlans(profileId: string, selectedId?: string): Plan[] {
+    const rows = this.db
+      .prepare(
+        `SELECT p.* FROM task_plans p WHERE p.profile_id=? AND
+      (p.state NOT IN ('STOPPED','COMPLETED','FAILED') OR NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round)
+       OR EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id)))
+      ORDER BY p.created_at DESC,p.id DESC LIMIT 51`,
+      )
+      .all(profileId);
+    if (selectedId && !rows.some((r) => r.id === selectedId)) {
+      const row = this.db
+        .prepare('SELECT * FROM task_plans WHERE id=? AND profile_id=?')
+        .get(selectedId, profileId);
+      if (row) {
+        const visible =
+          !['STOPPED', 'COMPLETED', 'FAILED'].includes(String(row.state)) ||
+          !this.db
+            .prepare('SELECT 1 FROM task_steps WHERE job_id=? AND round=? LIMIT 1')
+            .get(selectedId, Number(row.round)) ||
+          !!this.db
+            .prepare(
+              'SELECT 1 FROM task_steps s WHERE s.job_id=? AND s.round=? AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id) LIMIT 1',
+            )
+            .get(selectedId, Number(row.round));
+        if (visible || rows.length === 0) rows.push(row);
+      }
+    }
+    return rows.map((r) => this.parsePlanRow(r));
   }
   hasProfilePlanInStates(profileId: string, states: readonly Plan['state'][]): boolean {
     if (states.length === 0) return false;
@@ -1275,7 +1363,13 @@ export class SqliteTaskRepository implements TaskRepository {
         reason.slice(0, 200),
         id,
       );
-      this.event(id, 'STEP_FAILURE_INTENT', { stepId, reason });
+      this.event(
+        id,
+        step.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE'
+          ? 'STEP_SKIP_INTENT'
+          : 'STEP_FAILURE_INTENT',
+        { stepId, reason },
+      );
     });
   }
   requestStepEnd(id: string, stepId: string, reason: string): string {
@@ -1511,16 +1605,20 @@ export class SqliteTaskRepository implements TaskRepository {
       if (scope) {
         const step = this.currentStep(plan, scope.stepId);
         const post = step.spec.type === 'post';
+        const marketplaceUnavailable =
+          step.spec.type === 'marketplace' && scope.reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE';
         const skipped =
-          scope.reason === 'MATERIAL_NO_ELIGIBLE_RESOURCE' &&
-          step.progress.published === 0 &&
-          !this.operations(id).some((op) => op.stepId === step.id);
+          marketplaceUnavailable ||
+          (scope.reason === 'MATERIAL_NO_ELIGIBLE_RESOURCE' &&
+            step.progress.published === 0 &&
+            !this.operations(id).some((op) => op.stepId === step.id));
         const outcome = skipped
           ? TaskStepSkip.parse({
               version: 1,
               kind: 'SKIPPED',
-              reason: 'RESOURCE_EXHAUSTED',
+              reason: marketplaceUnavailable ? 'MARKETPLACE_UNAVAILABLE' : 'RESOURCE_EXHAUSTED',
               endedAt: this.dependencies.now(),
+              ...(marketplaceUnavailable ? { endingId, currentStop: stop } : {}),
             })
           : TaskStepFailure.parse({
               version: 1,
@@ -2183,7 +2281,10 @@ export class SqliteTaskRepository implements TaskRepository {
       if (readmit) this.state(id, 'QUEUED', 'NEXT_STEP_REQUIRES_ADMISSION');
     } else if (plan.snapshot.loop.mode === 'finite' && plan.round >= plan.snapshot.loop.rounds) {
       const failed = this.steps(id).some(
-        (step) => step.status === 'FAILED' || step.status === 'SKIPPED',
+        (step) =>
+          step.status === 'FAILED' ||
+          (step.status === 'SKIPPED' &&
+            !isMarketplaceUnavailableSkip(step.spec.type, step.status, step.outcome)),
       );
       this.state(id, failed ? 'FAILED' : 'COMPLETED', failed ? 'PARTIAL_STEP_FAILURE' : '');
       this.unlock(id);

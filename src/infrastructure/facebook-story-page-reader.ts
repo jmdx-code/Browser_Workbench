@@ -56,7 +56,7 @@ export function projectFacebookStoryPage() {
     }
     return rootNodes.get(el);
   };
-  const frames = (el: Element, limit = 40) => {
+  const frames = (el: Element, limit = 128) => {
     const out: { name: string; props: DOMRecord }[] = [];
     let f: unknown = fiberNode(el);
     for (let i = 0; record(f) && i < limit; i++, f = f.return) {
@@ -88,13 +88,23 @@ export function projectFacebookStoryPage() {
       style.visibility !== 'hidden'
     );
   };
+  const creatorOwner = (el: Element) => {
+    const owner = frames(el).find((f) => /StoriesCreate(?:\.react|FallbackRenderer)/.test(f.name));
+    return owner ? (owner.name.includes('FallbackRenderer') ? 'fallback' : 'active') : null;
+  };
+  const activeCreator = Array.from(
+    document.querySelectorAll('[role="main"],[role="button"],button'),
+  ).some((el) => visible(el) && creatorOwner(el) === 'active');
+  const owned = (el: Element) => !activeCreator || creatorOwner(el) !== 'fallback';
   const unique = (css: string) => {
-    const matches = Array.from(document.querySelectorAll(css)).filter(visible);
+    const matches = Array.from(document.querySelectorAll(css)).filter(
+      (el) => visible(el) && owned(el),
+    );
     return matches.length === 1 ? (matches[0] ?? null) : null;
   };
   for (const el of Array.from(
     document.querySelectorAll(
-      '[data-wb-story-preview],[data-wb-story-form],[data-wb-story-submit],[data-wb-story-text-entry],[data-wb-story-font],[data-wb-story-ai],[data-wb-story-add-text],[data-wb-story-privacy-open],[data-wb-story-privacy-dialog],[data-wb-story-privacy-friends],[data-wb-story-privacy-save],[data-wb-story-privacy-close],[data-wb-story-text-finish]',
+      '[data-wb-story-preview],[data-wb-story-form],[data-wb-story-submit],[data-wb-story-text-entry],[data-wb-story-font],[data-wb-story-ai],[data-wb-story-add-text],[data-wb-story-privacy-open],[data-wb-story-privacy-dialog],[data-wb-story-privacy-change],[data-wb-story-privacy-friends],[data-wb-story-privacy-save],[data-wb-story-privacy-close],[data-wb-story-text-finish]',
     ),
   ))
     for (const attr of Array.from(el.attributes).filter((a) => a.name.startsWith('data-wb-story-')))
@@ -112,24 +122,31 @@ export function projectFacebookStoryPage() {
     : [];
   const nativeMains = visibleMains.filter(
     (el) =>
-      frames(el, 60).some((f) => f.name.includes('StoriesCreate')) ||
+      (owned(el) && frames(el).some((f) => f.name.includes('StoriesCreate'))) ||
       (visibleMains.length === 1 &&
         el.querySelectorAll(
           'input[type="file"],[role="textbox"],img[src^="blob:"],video[src^="blob:"]',
         ).length > 0),
   );
-  const nativePreview = nativeMains.length === 1 ? (nativeMains[0] ?? null) : null;
+  const leafMains = nativeMains.filter(
+    (el) => !nativeMains.some((child) => child !== el && el.contains(child)),
+  );
+  const nativePreview = leafMains.length === 1 ? (leafMains[0] ?? null) : null;
   const navs = ready
     ? Array.from(document.querySelectorAll('[role="navigation"]')).filter(
-        (el) => visible(el) && frames(el, 60).some((f) => f.name.includes('StoriesCreate')),
+        (el) =>
+          visible(el) &&
+          owned(el) &&
+          frames(el).some((f) => f.name.includes('StoriesCreate')) &&
+          el.querySelectorAll('[role="button"],button,[role="switch"],[role="combobox"]').length >
+            0,
       )
     : [];
   const outerNavs = navs.filter(
     (el) => !navs.some((parent) => parent !== el && parent.contains(el)),
   );
-  const formRoot = outerNavs.length === 1 ? (outerNavs[0] ?? null) : null;
+  let formRoot = outerNavs.length === 1 ? (outerNavs[0] ?? null) : null;
   nativePreview?.setAttribute('data-wb-story-preview', '1');
-  formRoot?.setAttribute('data-wb-story-form', '1');
   const previewCSS = nativePreview
     ? '[data-wb-story-preview="1"]'
     : '[role="main"][aria-label="Stories Creation Preview"]';
@@ -140,13 +157,15 @@ export function projectFacebookStoryPage() {
     return el ? '[' + attr + '="1"]' : null;
   };
   const fds = (el: Element) =>
-    frames(el, 18).find((f) => f.name.includes('FDSButton.react'))?.props;
+    frames(el, 32).find((f) => f.name.includes('FDSButton.react'))?.props;
   const primary = (root: Element | null) => {
     const buttons = Array.from(root?.querySelectorAll('[role="button"],button') ?? []).filter(
       (el) => {
         const p = fds(el);
         return (
           visible(el) &&
+          owned(el) &&
+          !(preview && preview !== root && preview.contains(el)) &&
           p &&
           (p.type === 'primary' || (p.type === undefined && p.variant !== 'secondary'))
         );
@@ -158,17 +177,46 @@ export function projectFacebookStoryPage() {
     Array.from(el.querySelectorAll('svg')).some((svg) =>
       frames(svg, 12).some((f) => f.name.includes(name)),
     );
+  // The current creation form is a control pane, not the breadcrumb navigation.
+  const creationButtons = Array.from(document.querySelectorAll('[role="button"],button')).filter(
+    (el) =>
+      visible(el) &&
+      owned(el) &&
+      frames(el).some((f) => f.name.includes('StoriesCreate')) &&
+      !(preview && preview.contains(el)),
+  );
+  const settings = creationButtons.filter((el) => icon(el, 'FBNucleusSettingsFilled20Icon.react'));
+  const submits = creationButtons.filter((el) => {
+    const p = fds(el);
+    return p && (p.type === 'primary' || (p.type === undefined && p.variant !== 'secondary'));
+  });
+  if (submits.length === 1 && settings.length === 1) {
+    let pane = submits[0]?.parentElement ?? null;
+    while (pane && !pane.contains(settings[0] ?? null)) pane = pane.parentElement;
+    if (pane && pane !== document.body && pane !== document.documentElement) formRoot = pane;
+  }
+  if (!formRoot && settings.length === 1 && nativePreview) {
+    let pane = settings[0]?.parentElement ?? null;
+    while (
+      pane?.parentElement &&
+      pane.parentElement !== document.body &&
+      !pane.parentElement.contains(nativePreview)
+    )
+      pane = pane.parentElement;
+    if (pane && !pane.contains(nativePreview)) formRoot = pane;
+  }
+  formRoot?.setAttribute('data-wb-story-form', '1');
   const legacy = (csses: string[]) => {
     const matches = csses.flatMap((css) =>
       Array.from(document.querySelectorAll(css))
-        .filter(visible)
+        .filter((el) => visible(el) && owned(el))
         .map((el) => ({ el, css })),
     );
     const elements = [...new Set(matches.map((m) => m.el))];
     return elements.length === 1 ? (matches[0] ?? null) : null;
   };
   const nativeTextEditor =
-    !!text && frames(text, 60).some((f) => f.name.includes('StoriesCreateSATPPreview.react'));
+    !!text && frames(text).some((f) => f.name.includes('StoriesCreateSATPPreview.react'));
   const images =
     preview && !nativeTextEditor ? Array.from(preview.querySelectorAll('img')).filter(visible) : [];
   const videos = preview ? Array.from(preview.querySelectorAll('video')).filter(visible) : [];
@@ -216,6 +264,11 @@ export function projectFacebookStoryPage() {
   const overlayCSS = previewCSS + ' [role="textbox"]';
   const overlay = preview ? unique(overlayCSS) : null;
   const editingOverlay = overlay?.getAttribute('contenteditable') === 'true';
+  // This native inline text-tool panel uses role=dialog, but is not a privacy modal.
+  const overlayTools = (el: Element) =>
+    editingOverlay &&
+    owned(el) &&
+    frames(el).some((f) => f.name.includes('StoriesCreateTextOverlayEditingTools.react'));
   const submitLabels = ['分享到快拍', '分享到限時動態', 'Share to story'];
   const form = '[role="navigation"][aria-label="Stories Creation Form"] ';
   const fallbackSubmit = legacy(
@@ -239,7 +292,7 @@ export function projectFacebookStoryPage() {
   const addTextCandidates =
     phase === 'media-editor'
       ? Array.from(formRoot?.querySelectorAll('[role="button"],button') ?? []).filter(
-          (el) => visible(el) && icon(el, 'FBNucleusTextFilled20Icon.react'),
+          (el) => visible(el) && owned(el) && icon(el, 'FBNucleusTextFilled20Icon.react'),
         )
       : [];
   const fallbackAddText = Array.from(
@@ -269,7 +322,7 @@ export function projectFacebookStoryPage() {
           frames(el, 60).some((f) => f.name.includes('StoriesCreate')),
         ),
       ]),
-    ].filter(visible);
+    ].filter((el) => visible(el) && owned(el));
     if (nodes.length === 1 && nodes[0]) return { el: nodes[0], css: mark(nodes[0], attr) ?? '' };
     return legacy(labels.map((label) => '[role="' + role + '"][aria-label="' + label + '"]'));
   };
@@ -287,18 +340,32 @@ export function projectFacebookStoryPage() {
       ? { el: nativeFonts[0], css: mark(nativeFonts[0], 'data-wb-story-font') ?? '' }
       : scoped('combobox', ['字体样式', '字型樣式', 'Font style'], 'data-wb-story-font');
   const fontCSS = font?.css ?? '';
-  const aiControl = scoped(
-    'switch',
-    ['添加 AI 标签', '新增 AI 標籤', 'Add AI label'],
-    'data-wb-story-ai',
+  const nativeAI = Array.from(formRoot?.querySelectorAll('[role="switch"]') ?? []).filter(
+    (el) =>
+      visible(el) &&
+      owned(el) &&
+      frames(el).some((f) => {
+        const viewer = f.props.viewer;
+        return (
+          record(viewer) &&
+          record(viewer.__fragments) &&
+          Object.hasOwn(viewer.__fragments, 'StoriesCometGenAILabelSelector_viewer')
+        );
+      }),
   );
+  const aiControl =
+    nativeAI.length === 1 && nativeAI[0]
+      ? { el: nativeAI[0], css: mark(nativeAI[0], 'data-wb-story-ai') ?? '' }
+      : nativeAI.length > 1
+        ? null
+        : scoped('switch', ['添加 AI 标签', '新增 AI 標籤', 'Add AI label'], 'data-wb-story-ai');
   const aiCSS = aiControl?.css ?? '';
-  const ai = phase === 'text-editor' ? (aiControl?.el ?? null) : null;
+  const ai = ['text-editor', 'media-editor'].includes(phase) ? (aiControl?.el ?? null) : null;
   const checked = ai?.getAttribute('aria-checked');
   const entries =
     phase === 'entry'
       ? Array.from(preview?.querySelectorAll('[role="button"],button') ?? []).filter(
-          (el) => visible(el) && icon(el, 'FBNucleusTextFilled20Icon.react'),
+          (el) => visible(el) && owned(el) && icon(el, 'FBNucleusTextFilled20Icon.react'),
         )
       : [];
   const fallbackEntry = legacy(
@@ -321,6 +388,7 @@ export function projectFacebookStoryPage() {
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
       (el) =>
         visible(el) &&
+        !overlayTools(el) &&
         !(
           el.getAttribute('aria-label') === null &&
           el.querySelectorAll('[role="navigation"][aria-label="Stories Creation Form"]').length ===
@@ -420,15 +488,18 @@ export function projectFacebookStoryPage() {
   }
   if (ready && formRoot) {
     const openNodes = Array.from(formRoot.querySelectorAll('[role="button"],button')).filter(
-      (el) => visible(el) && icon(el, 'FBNucleusSettingsFilled20Icon.react'),
+      (el) => visible(el) && owned(el) && icon(el, 'FBNucleusSettingsFilled20Icon.react'),
     );
     const open = openNodes.length === 1 ? (openNodes[0] ?? null) : null;
     mark(open, 'data-wb-story-privacy-open');
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
-      (el) => visible(el) && !(el.contains(formRoot) && !!preview && el.contains(preview)),
+      (el) =>
+        visible(el) &&
+        !overlayTools(el) &&
+        !(el.contains(formRoot) && !!preview && el.contains(preview)),
     );
     const menus = dialogs.filter((el) =>
-      frames(el, 60).some((f) => f.name.includes('StoriesCometPrivacySelectorDialog.react')),
+      frames(el).some((f) => f.name.includes('StoriesCometPrivacySelectorDialog.react')),
     );
     if (!dialogs.length && open)
       privacy = {
@@ -521,6 +592,45 @@ export function projectFacebookStoryPage() {
         };
     }
   }
+  if (ready) {
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
+      (el) =>
+        visible(el) &&
+        !el.closest('[aria-hidden="true"]') &&
+        !overlayTools(el) &&
+        !(formRoot && el.contains(formRoot) && preview && el.contains(preview)),
+    );
+    // Changing an existing Story audience can open the native shared confirmation
+    // under the Story dispatcher. The executor accepts this stage only as the
+    // observed result of its original SELECT_FRIENDS operation, never on entry.
+    const changes = dialogs.filter((el) => {
+      const chain = frames(el, 140);
+      return (
+        chain.some((f) => f.name.includes('FDSConfirmationDialogImpl.react')) &&
+        chain.some((f) => f.name.includes('StoriesComposerDispatcherBridge.react'))
+      );
+    });
+    if (dialogs.length === 1 && changes.length === 1 && changes[0]) {
+      const change = changes[0];
+      const buttons = Array.from(change.querySelectorAll('[role="button"],button')).filter(visible);
+      const identified = (testid: string) => buttons.filter((el) => fds(el)?.testid === testid);
+      const saves = identified('CometConfirmationDialogConfirmButton');
+      const cancels = identified('CometConfirmationDialogCancelButton');
+      if (saves.length === 1 && cancels.length === 1) {
+        mark(change, 'data-wb-story-privacy-change');
+        mark(saves[0] ?? null, 'data-wb-story-privacy-save');
+        mark(cancels[0] ?? null, 'data-wb-story-privacy-close');
+        privacy = {
+          phase: 'CHANGE_CONFIRMATION',
+          draftSelection: null,
+          openEnabled: false,
+          friendsEnabled: false,
+          saveEnabled: enabled(saves[0] ?? null),
+          cancelEnabled: enabled(cancels[0] ?? null),
+        };
+      }
+    }
+  }
   const finish = preview ? Array.from(preview.querySelectorAll('h2')).filter(visible) : [];
   if (finish.length === 1) mark(finish[0], 'data-wb-story-text-finish');
   return {
@@ -547,6 +657,9 @@ export function projectFacebookStoryPage() {
           enabled: !addText.matches('[aria-disabled="true"],:disabled'),
         }
       : null,
+    hasSelectedMedia: Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[type="file"]'),
+    ).some((input) => (input.files?.length ?? 0) > 0),
     textEditing: !!editingOverlay,
     text:
       phase === 'media-editor'

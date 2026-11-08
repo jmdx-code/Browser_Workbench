@@ -9,6 +9,9 @@ import type { FacebookSubmissionObservationRepository } from '../domain/facebook
 import type { FacebookSubmissionResultSource } from '../domain/facebook-submission-result.js';
 import type { MaterialUploadStageRepository } from '../domain/material-upload-stages.js';
 import { sameBinding } from '../shared/task-execution.js';
+import { BoundReceipt } from '../shared/task-execution.js';
+import { UploadStageManifest } from '../shared/material-upload.js';
+import { DirectMaterialUpload } from './direct-material-upload.js';
 import { sameTabProof } from '../domain/task-tabs.js';
 import {
   FacebookPostResultCorrelation,
@@ -107,6 +110,7 @@ export type PostUploadDiagnostic = {
 };
 
 export class DOMFacebookPostBusinessObserver implements FacebookPostBusinessObserver {
+  private readonly directUploads = new DirectMaterialUpload();
   constructor(
     private readonly observations: FacebookSubmissionObservationRepository,
     private readonly stages: MaterialUploadStageRepository,
@@ -170,9 +174,25 @@ export class DOMFacebookPostBusinessObserver implements FacebookPostBusinessObse
           stage.owner.attemptId === original.intent.attemptId &&
           sameBinding(stage.owner.binding, operation.binding),
       );
-      const manifest = stages.length === 1 ? stages[0]?.manifest : null;
+      const acknowledgement = BoundReceipt.safeParse(operation.receipt);
+      const evidence =
+        acknowledgement.success && sameBinding(acknowledgement.data.binding, operation.binding)
+          ? acknowledgement.data.evidence
+          : null;
+      const direct =
+        evidence && typeof evidence === 'object' && !Array.isArray(evidence)
+          ? UploadStageManifest.safeParse(evidence.uploadManifest)
+          : null;
+      const manifest =
+        direct?.success && direct.data.sourcePaths
+          ? direct.data
+          : stages.length === 1
+            ? stages[0]?.manifest
+            : null;
       if (!manifest) return { kind: 'wait', reason: 'ORIGINAL_UPLOAD_MANIFEST_REQUIRED' };
-      await this.stages.assertReady(manifest);
+      if (manifest.sourcePaths)
+        await this.directUploads.verify(original.intent, operation.binding, manifest, guard);
+      else await this.stages.assertReady(manifest);
       const transfer = await this.videoUploads?.read(
         page,
         operation.binding,

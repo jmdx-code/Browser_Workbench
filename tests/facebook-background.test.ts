@@ -26,6 +26,9 @@ class FixtureNode {
   querySelector() {
     return null;
   }
+  closest() {
+    return null;
+  }
   querySelectorAll(css: string) {
     return this.nodes.get(css) ?? [];
   }
@@ -132,4 +135,25 @@ test('duplicate editors, disabled options, unsupported labels and foreign origin
     });
     assert.equal(project().phase, 'absent');
     assert.equal(project().options.length, 0);
+  }));
+
+test('scrolled native editor retains its real background state', () =>
+  fixture((_root, editor, painter) => {
+    editor.getBoundingClientRect = () => ({
+      width: 500,
+      height: 20,
+      top: -230,
+      left: 10,
+      right: 510,
+      bottom: -210,
+    });
+    const input = {
+      scope: facebookBackgroundScope,
+      openCSS: FACEBOOK_BACKGROUND_OPTIONS,
+      clearCSS: FACEBOOK_NO_BACKGROUND,
+      solids: nativeSolidBackgrounds,
+    };
+    assert.equal(projectFacebookBackground(input).phase, 'plain');
+    painter.backgroundColor = nativeSolidBackgrounds[0].color;
+    assert.equal(projectFacebookBackground(input).phase, 'solid');
   }));

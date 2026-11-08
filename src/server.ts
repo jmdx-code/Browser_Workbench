@@ -751,6 +751,7 @@ try {
           if (mutations > 1)
             throw new ProductError('DATA_WRITES_ACTIVE', '有其他操作正在保存，请稍后重试', 409);
         },
+        persistence.bridge,
       );
       const handler = workspaceApi(
         workspaceService,

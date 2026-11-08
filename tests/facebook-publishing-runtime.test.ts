@@ -101,7 +101,7 @@ test('next daily window resumes only a confirmed automatic window pause, never a
   }, false);
 });
 
-test('accepted stories are independent from ordinary posts, require friends and current bridge, and resume checks the original whole plan', async () => {
+test('accepted stories support friends and preserve-current independently of ordinary posts; bridge and whole-plan resume guards remain', async () => {
   await postFixture(async (workspace, file, catalog) => {
     const bridgeStore = new Store(':memory:'),
       core = new Core(bridgeStore),
@@ -182,11 +182,18 @@ test('accepted stories are independent from ordinary posts, require friends and 
         false,
       );
       assert.match(await runtime.unavailableReason(ordinary.saved!), /发布内容/);
-      for (const audience of [undefined, 'self', 'preserve-current'] as const)
-        assert.match(
+      for (const audience of [undefined, 'preserve-current'] as const)
+        assert.equal(
           await runtime.unavailableReason({ ...story.saved!, steps: [{ ...step, audience }] }),
-          /好友范围/,
+          '',
         );
+      assert.match(
+        await runtime.unavailableReason({
+          ...story.saved!,
+          steps: [{ ...step, audience: 'self' }],
+        }),
+        /不支持仅自己/,
+      );
       const before = await workspace.tasks.list();
       await assert.rejects(async () => await runtime.start(request), /插件0.3.33/);
       assert.deepEqual(await workspace.tasks.list(), before);

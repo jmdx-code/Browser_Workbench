@@ -51,6 +51,7 @@ const node = (text = '', attributes: Record<string, string> = {}, disabled = fal
     bottom: 90,
   }),
   matches: () => disabled,
+  closest: () => null,
   querySelectorAll: () => [],
 });
 

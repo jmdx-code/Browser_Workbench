@@ -75,6 +75,15 @@ export function projectFacebookPostEffects(
           ),
         ).filter(visible)
       : [];
+    // Creator's video card renders a thumbnail instead of a <video>. The thumbnail
+    // belongs to that same list item, not to an additional uploaded photo. The
+    // original causal video-transfer verifier still decides upload readiness.
+    const videoCards = new Set(
+      removals.map((el) => el.closest('[role="listitem"]')).filter(Boolean),
+    );
+    const photoImages = images.filter(
+      (image) => !videoCards.has(image.closest('[role="listitem"]')),
+    );
     const videos = Array.from(root.querySelectorAll('video')).filter(visible);
     // The observed homepage composer has a native form, no ARIA form/list, and a
     // unique attachment video. Its preview bytes/causal transfer are still required
@@ -109,7 +118,7 @@ export function projectFacebookPostEffects(
           .slice(0, 21)
           .map((f) => ({ name: f.name, size: f.size })),
         media: [
-          ...images.map((e) => ({
+          ...photoImages.map((e) => ({
             kind: 'image' as const,
             name: e.getAttribute('alt'),
             ready: (e as HTMLImageElement).complete && (e as HTMLImageElement).naturalWidth > 0,

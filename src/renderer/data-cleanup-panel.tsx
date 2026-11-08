@@ -343,6 +343,11 @@ export function DataCleanupPanel() {
   const [settings, setSettings] = useState<CleanupConfiguration | null>(null);
   const [autoLogs, setAutoLogs] = useState(false);
   const [maxCount, setMaxCount] = useState('');
+  const [caps, setCaps] = useState({
+    bumperMaxCount: '300000',
+    posterMaxCount: '100000',
+    detailMaxCount: '1000',
+  });
   const [days, setDays] = useState('30'),
     [automatic, setAutomatic] = useState(false),
     [logDate, setLogDate] = useState('');
@@ -366,6 +371,11 @@ export function DataCleanupPanel() {
         if (controller.signal.aborted) return;
         setSettings(config);
         setAutoLogs(config.automaticLogs);
+        setCaps({
+          bumperMaxCount: String(config.bumperMaxCount),
+          posterMaxCount: String(config.posterMaxCount),
+          detailMaxCount: String(config.detailMaxCount),
+        });
         setMaxCount(config.historyMaxCount == null ? '' : String(config.historyMaxCount));
         setAutomatic(config.historyRetentionDays !== null);
         setDays(String(config.historyRetentionDays ?? 30));
@@ -395,7 +405,7 @@ export function DataCleanupPanel() {
     <section aria-label="数据清理">
       <h3>数据清理</h3>
       <p>
-        日志删除会释放文件空间；普通任务全部记录删除后会清理原始历史，必要的未确认结果和素材使用数据保留。
+        超额自动回收最早的已结束记录。详细流水按全软件合计保留；防重复、素材使用和必要的未确认结果独立保存。
       </p>
       <div className="settings-form">
         <button disabled={busy} onClick={() => setSelection({ kind: 'logs' })}>
@@ -425,7 +435,7 @@ export function DataCleanupPanel() {
             checked={automatic}
             onChange={(e) => setAutomatic(e.target.checked)}
           />
-          自动清理已结束的列表记录
+          同时按天数清理活动记录
         </label>
         <label>
           保留天数{' '}
@@ -439,7 +449,7 @@ export function DataCleanupPanel() {
           />
         </label>
         <label>
-          保留最大条数{' '}
+          活动任务最终记录（次）{' '}
           <input
             type="number"
             aria-label="自动保留最大条数"
@@ -450,10 +460,35 @@ export function DataCleanupPanel() {
             onChange={(e) => setMaxCount(e.target.value)}
           />
         </label>
+        {(
+          [
+            ['bumperMaxCount', '顶贴最终记录（条）', 1000000],
+            ['posterMaxCount', '发帖最终记录（条）', 1000000],
+            ['detailMaxCount', '详细执行流水（条，全软件合计）', 100000],
+          ] as const
+        ).map(([key, label, max]) => (
+          <label key={key}>
+            {label}{' '}
+            <input
+              type="number"
+              min="1"
+              max={max}
+              aria-label={label}
+              value={caps[key]}
+              onChange={(e) => setCaps((v) => ({ ...v, [key]: e.target.value }))}
+            />
+          </label>
+        ))}
         <button
           disabled={
             busy ||
             !settings ||
+            Object.entries(caps).some(
+              ([key, v]) =>
+                !Number.isInteger(Number(v)) ||
+                Number(v) < 1 ||
+                Number(v) > (key === 'detailMaxCount' ? 100000 : 1000000),
+            ) ||
             (maxCount.trim() !== '' &&
               (!Number.isInteger(Number(maxCount)) ||
                 Number(maxCount) < 1 ||
@@ -469,6 +504,9 @@ export function DataCleanupPanel() {
                 historyRetentionDays: automatic ? Number(days) : null,
                 historyMaxCount: maxCount.trim() ? Number(maxCount) : null,
                 automaticLogs: autoLogs,
+                bumperMaxCount: Number(caps.bumperMaxCount),
+                posterMaxCount: Number(caps.posterMaxCount),
+                detailMaxCount: Number(caps.detailMaxCount),
               });
               setSettings(next);
               return '自动清理设置已保存';

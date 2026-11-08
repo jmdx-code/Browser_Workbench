@@ -159,6 +159,7 @@ const HistoryPlan = TaskPlan.pick({
   .strict();
 export const TaskHistory = z
   .object({
+    detailsReclaimed: z.boolean().optional(),
     profileId: Id,
     plans: z.array(HistoryPlan).max(50),
     selectedPlanId: Id.nullable(),

@@ -1,6 +1,8 @@
 import type { StoryPage } from '../shared/facebook-story.js';
 import type { PostIntent } from '../shared/material-index.js';
 import { matchesDerivedStoryCaption } from './facebook-story-video.js';
+import { sameExecution } from '../shared/task-execution.js';
+import { sameTabProof } from './task-tabs.js';
 
 export function matchesOriginalStoryMedia(story: StoryPage, intent: PostIntent) {
   if (matchesDerivedStoryCaption(story, intent)) return true;
@@ -12,6 +14,18 @@ export function matchesOriginalStoryMedia(story: StoryPage, intent: PostIntent) 
       : intent.snapshot.format === 'video'
         ? 'video'
         : null;
+  const transfer = story.videoTransfer;
+  if (
+    transfer &&
+    (!sameExecution(transfer.binding, intent.context) ||
+      !sameTabProof(transfer.proof, intent.proof) ||
+      transfer.attemptId !== intent.attemptId ||
+      transfer.fingerprint !== intent.fingerprint ||
+      transfer.digest !== file?.digest ||
+      transfer.bytes !== file?.bytes ||
+      transfer.receivedBytes !== file?.bytes)
+  )
+    return false;
   return (
     !!kind &&
     !!file &&

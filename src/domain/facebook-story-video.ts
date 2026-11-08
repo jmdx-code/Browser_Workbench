@@ -14,7 +14,10 @@ export function withStoryVideoTransfer(
     return story;
   const linked = { ...story, videoTransfer: transfer };
   if (
-    !transfer.derivation ||
+    transfer.receivedBytes !== transfer.bytes ||
+    (story.nativeVideoInput !== undefined &&
+      (story.nativeVideoInput.bytes !== transfer.bytes ||
+        story.nativeVideoInput.sha256 !== transfer.digest)) ||
     !story.nativeVideoCanvas ||
     !story.ready ||
     !story.visible ||
@@ -27,6 +30,18 @@ export function withStoryVideoTransfer(
     media: { kind: 'video', ready: true, bytes: transfer.bytes, sha256: transfer.digest },
     submit: story.nativeVideoControls,
   };
+}
+export function matchesStoryContent(story: StoryPage, intent: PostIntent) {
+  return (
+    story.text === intent.snapshot.text ||
+    matchesDerivedStoryCaption(story, intent) ||
+    (intent.snapshot.format === 'video' &&
+      intent.snapshot.text === '' &&
+      story.text === null &&
+      !story.textEditing &&
+      story.media?.kind === 'video' &&
+      story.media.ready)
+  );
 }
 export function matchesDerivedStoryCaption(story: StoryPage, intent: PostIntent) {
   const transfer = story.videoTransfer,

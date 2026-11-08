@@ -41,6 +41,7 @@ async function fixture(
   reelReview = false,
   privateAudience = false,
   aiLabel?: 'on' | 'off',
+  inlineAI = false,
 ) {
   const h = await browseHarness(store, 1, {
     name: '正式发布执行器隔离集成',
@@ -110,7 +111,13 @@ async function fixture(
     if (link.purpose === 'SET_AI_LABEL') ui.aiValue = !ui.aiValue;
     if (link.purpose === 'CONFIRM_AI_LABEL') ui.aiSettings = false;
     if (link.purpose === 'SELECT_SELF') ui.selfSelected = true;
-    if (link.purpose === 'CONFIRM_AUDIENCE') {
+    if (
+      link.purpose === 'CONFIRM_AUDIENCE' &&
+      operation.action.kind === 'click' &&
+      operation.action.target.css === '[data-wb-audience-default="1"]'
+    ) {
+      ui.defaultChecked = false;
+    } else if (link.purpose === 'CONFIRM_AUDIENCE') {
       assert.equal(ui.defaultChecked, false);
       ui.private = true;
       ui.audiencePhase = 'COMPOSER';
@@ -244,6 +251,7 @@ async function fixture(
                   : '[role="button"][aria-label="AI label ' + (ui.aiValue ? 'on' : 'off') + '"]',
                 switchEnabled: true,
                 confirmEnabled: true,
+                ...(inlineAI ? { mode: 'inline' as const, openCSS: null } : {}),
               },
             }
           : {}),
@@ -378,7 +386,7 @@ test('closing an independently opened editor ends this step without a new OPEN o
   }, false);
 });
 
-test('explicit AI label uses original operations and verified saved state before text, without repeating the switch', async () => {
+test('explicit AI label uses original operations after content and verifies before submission without repeating the switch', async () => {
   for (const setting of ['on', 'off'] as const) {
     await postFixture(async (store, _file, catalog) => {
       const f = await fixture(store, catalog, 1, false, false, true, setting);
@@ -395,10 +403,10 @@ test('explicit AI label uses original operations and verified saved state before
         'OPEN_AUDIENCE',
         'SELECT_SELF',
         'CONFIRM_AUDIENCE',
+        'SET_TEXT',
         'OPEN_AI_LABEL',
         'SET_AI_LABEL',
         'CONFIRM_AI_LABEL',
-        'SET_TEXT',
       ]);
       assert.equal(purposes.filter((p) => p === 'SET_AI_LABEL').length, 1);
       assert.equal(f.ui.aiValue, setting === 'on');
@@ -407,7 +415,7 @@ test('explicit AI label uses original operations and verified saved state before
   }
 });
 
-test('AI label changed after content ends this step before SUBMIT rather than reopening or retoggling', async () => {
+test('AI label changed after native confirmation ends this step before SUBMIT rather than retoggling', async () => {
   await postFixture(async (store, _file, catalog) => {
     const f = await fixture(store, catalog, 1, false, false, false, 'on');
     for (let i = 0; i < 25; i++) {
@@ -417,7 +425,7 @@ test('AI label changed after content ends this step before SUBMIT rather than re
           await store.tasks.operations(f.plan.id),
           async (op) =>
             op.status === 'VERIFIED' &&
-            (await store.materialPosts.link(op.id)).purpose === 'SET_TEXT',
+            (await store.materialPosts.link(op.id)).purpose === 'CONFIRM_AI_LABEL',
         )
       )
         break;
@@ -471,21 +479,22 @@ test('private configuration uses original outbox and independent effects before 
   });
 });
 
-test('checked default audience refuses confirmation and never reaches content or submit', async () => {
+test('checked default audience is cleared for this post before confirmation and publication', async () => {
   await postFixture(async (store, _file, catalog) => {
     const f = await fixture(store, catalog, 1, false, false, true);
     f.ui.defaultChecked = true;
-    for (let i = 0; i < 20 && (await store.tasks.get(f.plan.id)).state === 'RUNNING'; i++)
+    for (let i = 0; i < 40 && (await store.tasks.get(f.plan.id)).state === 'RUNNING'; i++)
       await f.runner.advance(f.plan.id);
     const purposes = await mapAsync(
       await store.tasks.operations(f.plan.id),
       async (op) => (await store.materialPosts.link(op.id)).purpose,
     );
-    assert.equal(purposes.includes('CONFIRM_AUDIENCE'), false);
-    assert.equal(purposes.includes('SET_TEXT'), false);
-    assert.equal(purposes.includes('SUBMIT'), false);
-    assert.equal(f.ui.private, false);
-    assert.equal((await store.tasks.steps(f.plan.id))[0]?.progress.published, 0);
+    assert.equal(purposes.filter((purpose) => purpose === 'CONFIRM_AUDIENCE').length, 2);
+    assert.equal(purposes.includes('SET_TEXT'), true);
+    assert.equal(purposes.includes('SUBMIT'), true);
+    assert.equal(f.ui.defaultChecked, false);
+    assert.equal(f.ui.private, true);
+    assert.equal((await store.tasks.steps(f.plan.id))[0]?.progress.published, 1);
   });
 });
 
@@ -765,7 +774,7 @@ test('resource-row AI drives the real executor even when the step asks for the o
           ops,
           async (op) =>
             op.status === 'VERIFIED' &&
-            (await store.materialPosts.link(op.id)).purpose === 'OPEN_COMPOSER',
+            (await store.materialPosts.link(op.id)).purpose === 'SET_TEXT',
         )
       )
         break;
@@ -870,3 +879,23 @@ test('managed table source requests AI observations for any explicit per-row on/
     assert.deepEqual(flags, [false, false, true, true]);
   });
 });
+for (const setting of ['on', 'off'] as const) {
+  test(`creator inline AI ${setting} uses one SET after content, without artificial OPEN/CONFIRM`, async () => {
+    await postFixture(async (store, _file, catalog) => {
+      const f = await fixture(store, catalog, 1, false, false, false, setting, true);
+      f.ui.aiValue = setting === 'off';
+      for (let i = 0; i < 40 && (await store.tasks.get(f.plan.id)).state === 'RUNNING'; i++)
+        await f.runner.advance(f.plan.id);
+      assert.equal((await store.tasks.get(f.plan.id)).state, 'COMPLETED');
+      const purposes = await mapAsync(
+        await store.tasks.operations(f.plan.id),
+        async (op) => (await store.materialPosts.link(op.id)).purpose,
+      );
+      assert.equal(purposes.filter((p) => p === 'SET_AI_LABEL').length, 1);
+      assert(!purposes.includes('OPEN_AI_LABEL') && !purposes.includes('CONFIRM_AI_LABEL'));
+      assert(purposes.indexOf('SET_TEXT') < purposes.indexOf('SET_AI_LABEL'));
+      assert(purposes.indexOf('SET_AI_LABEL') < purposes.indexOf('SUBMIT'));
+      assert.equal(f.ui.aiValue, setting === 'on');
+    }, false);
+  });
+}

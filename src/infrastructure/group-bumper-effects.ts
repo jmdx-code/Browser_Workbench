@@ -393,15 +393,12 @@ export function projectGroupBumper(input: {
   let groupEntryCSS: string | null = null;
   document
     .querySelectorAll(
-      '[data-wb-bumper-group],[data-wb-bumper-welcome-dismiss],[data-wb-bumper-join],[data-wb-bumper-post]',
+      '[data-wb-bumper-group],[data-wb-bumper-welcome-dismiss],[data-wb-bumper-join]',
     )
     .forEach((e) => {
       e.removeAttribute('data-wb-bumper-group');
       e.removeAttribute('data-wb-bumper-welcome-dismiss');
       e.removeAttribute('data-wb-bumper-join');
-      if (!input.targetPostId || e.getAttribute('data-wb-bumper-post') === input.targetPostId) {
-        e.removeAttribute('data-wb-bumper-post');
-      }
     });
   let joinGroupCSS: string | null = null;
   let groupJoinState: BumperSurface['groupJoinState'] = 'unknown';
@@ -587,23 +584,24 @@ export function projectGroupBumper(input: {
   }
   const posts: BumperPost[] = [];
   let loading = false;
-  document
-    .querySelectorAll(
-      '[data-wb-bumper-like],[data-wb-bumper-comment],[data-wb-bumper-open-comment],[data-wb-bumper-video],[data-wb-bumper-video-play]',
-    )
-    .forEach((e) => {
-      for (const attr of [
-        'data-wb-bumper-like',
-        'data-wb-bumper-comment',
-        'data-wb-bumper-open-comment',
-        'data-wb-bumper-video',
-        'data-wb-bumper-video-play',
-      ]) {
-        if (!input.targetPostId || e.getAttribute(attr) === input.targetPostId) {
-          e.removeAttribute(attr);
-        }
-      }
-    });
+  const markerFields = {
+    'data-wb-bumper-post': 'postCSS',
+    'data-wb-bumper-like': 'likeCSS',
+    'data-wb-bumper-comment': 'commentCSS',
+    'data-wb-bumper-open-comment': 'commentButtonCSS',
+    'data-wb-bumper-video': 'videoCSS',
+    'data-wb-bumper-video-play': 'videoPlayCSS',
+  } as const;
+  type Marker = keyof typeof markerFields;
+  const marks = new Map<Element, Map<Marker, { id: string | null; rank: number }>>();
+  const mark = (el: Element | undefined, attr: Marker, id: string, rank: number) => {
+    if (!el?.isConnected) return;
+    let entries = marks.get(el);
+    if (!entries) marks.set(el, (entries = new Map()));
+    const previous = entries.get(attr);
+    if (!previous || rank > previous.rank) entries.set(attr, { id, rank });
+    else if (previous.id !== id && rank === previous.rank) entries.set(attr, { id: null, rank });
+  };
   // Native feed cards need not have role=article; comment rows do. Resolve the
   // actual feed-card host before reading identity, author or action controls.
   const cards = new WeakMap<Element, ReturnType<typeof chain>[number] | null>();
@@ -620,6 +618,11 @@ export function projectGroupBumper(input: {
     const logger = frames.find(
       (f) => /CometFeedStoryClickLoggerContainer/.test(f.name) && record(f.props.story),
     );
+    if (card && logger && frames.indexOf(logger) < frames.indexOf(card)) {
+      const a = obj(card.props.story ?? card.props.feedUnit),
+        b = obj(logger.props.story);
+      if (text(a.__id ?? a.id ?? a.post_id) !== text(b.__id ?? b.id ?? b.post_id)) card = undefined;
+    }
     // Deep video children may reach only their internal logger. Search nearby
     // DOM hosts for the complete card, but never borrow an adjacent Story.
     if (!card && logger) {
@@ -795,7 +798,12 @@ export function projectGroupBumper(input: {
         const key = text(story.__id ?? story.id);
         return !key || key === storyKey;
       }
-      if (!primaryCard) return true;
+      if (!primaryCard) {
+        // A DOM shell must not absorb a nested native Story's author or UFI.
+        if (cardFor(el)) return false;
+        const nested = el.closest('[role="article"]');
+        return !(nested && nested !== article && article.contains(nested));
+      }
       const owner = cardFor(el),
         story = obj(owner?.props.story ?? owner?.props.feedUnit);
       const key = text(story.__id ?? story.id);
@@ -876,7 +884,14 @@ export function projectGroupBumper(input: {
       ...Array.from(article.querySelectorAll('span,abbr,time')).slice(0, 140),
     ]
       .filter(belongsToStory)
-      .flatMap((el) => chain(el).map((f) => ({ ...f, element: el })));
+      .flatMap((el) => {
+        const rows = chain(el);
+        const boundary = primaryCard ? rows.findIndex((f) => f.fiber === primaryCard.fiber) : -1;
+        return (boundary < 0 ? rows : rows.slice(0, boundary + 1)).map((f) => ({
+          ...f,
+          element: el,
+        }));
+      });
     if (frames.some((f) => /CometFeedGlimmer/.test(f.name))) {
       loading = true;
       continue;
@@ -1169,7 +1184,8 @@ export function projectGroupBumper(input: {
         }
       }
     }
-    article.setAttribute('data-wb-bumper-post', postId);
+    const markerRank = single ? 3 : primaryCard ? 2 : 1;
+    mark(article, 'data-wb-bumper-post', postId, markerRank);
     if (like) {
       if (reactionState === 'unknown' && like.getAttribute('aria-pressed') === 'false')
         reactionState = 'none';
@@ -1177,10 +1193,10 @@ export function projectGroupBumper(input: {
         reactionState = 'active';
         liked = true;
       }
-      like.setAttribute('data-wb-bumper-like', postId);
+      mark(like, 'data-wb-bumper-like', postId, markerRank);
     }
-    comment?.setAttribute('data-wb-bumper-comment', postId);
-    openComment?.setAttribute('data-wb-bumper-open-comment', postId);
+    mark(comment, 'data-wb-bumper-comment', postId, markerRank);
+    mark(openComment, 'data-wb-bumper-open-comment', postId, markerRank);
     const comments: BumperPost['comments'] = [];
     const commentContainers = [
       ...Array.from(article.querySelectorAll('[role="article"],li')),
@@ -1212,7 +1228,7 @@ export function projectGroupBumper(input: {
       if (authorAvatarUrl) break;
     }
     const candidateVideos = Array.from(article.querySelectorAll<HTMLVideoElement>('video')).filter(
-      (v) => !commentRow(v),
+      (v) => !commentRow(v) && belongsToStory(v),
     );
     const videoEl =
       candidateVideos.filter(belongsToStory).find(visible) ??
@@ -1222,9 +1238,11 @@ export function projectGroupBumper(input: {
     const hasVideoContainer =
       !!videoEl ||
       frames.some((f) => /CometVideoPlayer|VideoPlayer|TahoeVideo/i.test(f.name)) ||
-      !!article.querySelector(
-        '[data-pagelet*="video" i],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
-      );
+      Array.from(
+        article.querySelectorAll(
+          '[data-pagelet*="video" i],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
+        ),
+      ).some(belongsToStory);
     let hasVideo = false,
       videoCurrentTime = 0,
       videoDuration: number | null = null,
@@ -1243,13 +1261,13 @@ export function projectGroupBumper(input: {
           ),
       );
     if (playControl) {
-      playControl.setAttribute('data-wb-bumper-video-play', postId);
+      mark(playControl, 'data-wb-bumper-video-play', postId, markerRank);
       videoPlayCSS = '[data-wb-bumper-video-play="' + postId + '"]';
     }
     if (videoEl || hasVideoContainer) {
       hasVideo = true;
       if (videoEl) {
-        videoEl.setAttribute('data-wb-bumper-video', postId);
+        mark(videoEl, 'data-wb-bumper-video', postId, markerRank);
         videoCSS = '[data-wb-bumper-video="' + postId + '"]';
         videoCurrentTime = Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : 0;
         videoDuration =
@@ -1339,6 +1357,36 @@ export function projectGroupBumper(input: {
       videoPlayCSS,
       comments,
     });
+  }
+  // Commit only resolved posts. An empty loading read cannot revoke another
+  // post's live markers; callers still need a fresh, identity-checked projection.
+  const resolved = new Set(posts.map((p) => p.postId));
+  const assigned = new Set<string>();
+  for (const el of Array.from(
+    document.querySelectorAll(
+      Object.keys(markerFields)
+        .map((attr) => `[${attr}]`)
+        .join(','),
+    ),
+  ))
+    for (const attr of Object.keys(markerFields) as Marker[])
+      if (
+        resolved.has(el.getAttribute(attr) ?? '') &&
+        marks.get(el)?.get(attr)?.id !== el.getAttribute(attr)
+      )
+        el.removeAttribute(attr);
+  for (const [el, entries] of marks)
+    for (const [attr, owner] of entries)
+      if (owner.id && resolved.has(owner.id) && el.isConnected) {
+        if (el.getAttribute(attr) !== owner.id) el.setAttribute(attr, owner.id);
+        assigned.add(attr + ':' + owner.id);
+      }
+  for (let i = posts.length - 1; i >= 0; i--) {
+    const post = posts[i];
+    if (!post) continue;
+    for (const attr of Object.keys(markerFields) as Marker[])
+      if (!assigned.has(attr + ':' + post.postId)) post[markerFields[attr]] = null;
+    if (!post.postCSS) posts.splice(i, 1);
   }
   let restrictionReason: string | undefined;
   if (posts.length === 0) {

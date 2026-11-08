@@ -86,7 +86,7 @@ export function projectFacebookReelContent() {
   return {
     url: location.href,
     timeOrigin: performance.timeOrigin,
-    found: roots.length > 0,
+    found: phase !== null,
     phase,
     composer,
   };

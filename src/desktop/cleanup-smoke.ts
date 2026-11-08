@@ -27,6 +27,7 @@ export async function cleanupDesktopSmoke(
   )
     throw Error('CLEANUP_SMOKE_REQUIRES_GENERATED_TEMP_DIRECTORY');
   let cleanupUi = false;
+  let retentionUi: unknown;
   let releasePolish: unknown;
   if (process.env.WORKBENCH_SMOKE_RELEASE_POLISH === '1') {
     releasePolish = await window.webContents.executeJavaScript(`(async () => {
@@ -61,7 +62,7 @@ export async function cleanupDesktopSmoke(
   }
   if (process.env.WORKBENCH_SMOKE_CLEANUP_UI === '1') {
     await window.webContents.executeJavaScript(`(async () => {
-      const wait = async (find) => { const deadline=Date.now()+10000; while(Date.now()<deadline) {const found=find(); if(found)return found; await new Promise(r=>setTimeout(r,40));}throw Error('CLEANUP_UI_NOT_READY'); };
+      const wait = async (find) => { const deadline=Date.now()+10000; while(Date.now()<deadline) {const found=find(); if(found)return found; await new Promise(r=>setTimeout(r,40));}throw Error('CLEANUP_UI_NOT_READY:'+document.body.innerText.slice(-1800)); };
       document.querySelector('button[aria-label="打开菜单"]').click();
       const button=await wait(()=>[...document.querySelectorAll('aside[aria-label="软件菜单"] button')].find(b=>b.textContent.includes('日志与数据清理'))); button.click();
       await wait(()=>document.querySelector('section[aria-label="数据清理"]'));
@@ -69,18 +70,42 @@ export async function cleanupDesktopSmoke(
       if(document.querySelector('section[aria-label="数据清理"]').textContent.includes('自动清理')===false)throw Error('CLEANUP_CONTROLS_MISSING');
       [...document.querySelectorAll('button')].find(b=>b.textContent==='预览清空运行与诊断日志').click();
       const preview=await wait(()=>document.querySelector('dialog[open][aria-label="确认清理数据"]'));
-      await wait(()=>preview.textContent.includes('可清理')); [...preview.querySelectorAll('button')].find(b=>b.textContent==='取消').click();
+      await wait(()=>preview.textContent.includes('即将清理')); [...preview.querySelectorAll('button')].find(b=>b.textContent==='取消').click();
       const reset=[...document.querySelectorAll('button')].find(b=>b.textContent==='彻底重置工作台…');
       if(reset&&!reset.disabled){reset.click();const dialog=await wait(()=>document.querySelector('dialog[open][aria-label="彻底重置工作台"]'));const submit=[...dialog.querySelectorAll('button')].find(b=>b.textContent==='删除全部工作台数据并重启');if(!submit?.disabled)throw Error('RESET_CONFIRMATION_NOT_REQUIRED');[...dialog.querySelectorAll('button')].find(b=>b.textContent==='取消').click();}
       return true;
     })()`);
+    if (process.env.WORKBENCH_SMOKE_RECORD_RETENTION === '1') {
+      retentionUi = await window.webContents.executeJavaScript(`(async () => {
+        const expected={'自动保留最大条数':'10000','顶贴最终记录（条）':'300000','发帖最终记录（条）':'100000','详细执行流水（条，全软件合计）':'1000'};
+        for(const [label,value] of Object.entries(expected)){
+          const field=document.querySelector('input[aria-label="'+label+'"]');
+          if(!field||field.value!==value)throw Error('RETENTION_FIELD_'+label);
+        }
+        [...document.querySelectorAll('button')].find(b=>b.textContent==='保存自动清理设置').click();
+        const deadline=Date.now()+10000;
+        while(!document.querySelector('section[aria-label="数据清理"]').textContent.includes('自动清理设置已保存')){
+          if(Date.now()>deadline)throw Error('RETENTION_SAVE_TIMEOUT');
+          await new Promise(r=>setTimeout(r,40));
+        }
+        const avatarURL=${JSON.stringify(process.env.WORKBENCH_SMOKE_RECORD_AVATAR ?? '')};
+        let avatar=null;
+        if(avatarURL){
+          const img=new Image();img.src=avatarURL;
+          await img.decode();
+          if(!img.complete||img.naturalWidth<1)throw Error('RECORD_AVATAR_NOT_LOADED');
+          avatar={width:img.naturalWidth,height:img.naturalHeight};
+        }
+        return {fields:expected,saved:true,avatar};
+      })()`);
+    }
     await writeFile(report + '.cleanup.png', (await window.webContents.capturePage()).toPNG());
     await window.webContents.executeJavaScript(
       'document.querySelector(\'button[aria-label="关闭菜单"]\')?.click();true',
     );
     cleanupUi = true;
   }
-  if (process.env.WORKBENCH_SMOKE_RESET !== '1') return { cleanupUi, releasePolish };
+  if (process.env.WORKBENCH_SMOKE_RESET !== '1') return { cleanupUi, releasePolish, retentionUi };
   const phaseFile = report + '.reset-phase.json';
   let phase: { dataDir: string } | undefined;
   try {

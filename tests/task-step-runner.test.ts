@@ -1098,7 +1098,7 @@ test('schema6 forward migration backs up the original control intent without con
   });
 });
 
-test('unavailable marketplace records its step failure and confirms control before the existing ending coordinator can continue', async () => {
+test('unavailable marketplace records a normal skip intent and confirms control before the existing ending coordinator can continue', async () => {
   await settlementFixture(async (store) => {
     const h = await browseHarness(store, 1, {
       name: 'Marketplace denial continuation',
@@ -1126,9 +1126,7 @@ test('unavailable marketplace records its step failure and confirms control befo
     await h.runner.advance(plan.id);
     const steps = await store.tasks.steps(plan.id);
     assert.equal(steps[0]?.status, 'ACTIVE');
-    const failure = (await store.tasks.events(plan.id)).find(
-      (e) => e.type === 'STEP_FAILURE_INTENT',
-    );
+    const failure = (await store.tasks.events(plan.id)).find((e) => e.type === 'STEP_SKIP_INTENT');
     assert.equal(
       (failure?.detail as { reason?: string })?.reason,
       'FACEBOOK_MARKETPLACE_UNAVAILABLE',

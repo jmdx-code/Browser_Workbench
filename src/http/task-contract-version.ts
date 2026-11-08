@@ -24,11 +24,12 @@ export function assertTaskContract(
 ) {
   if (
     header !== undefined &&
-    (typeof header !== 'string' || !['1', '2', '3', '4'].includes(header))
+    (typeof header !== 'string' || !['1', '2', '3', '4', '5'].includes(header))
   )
     throw new ProductError('TASK_CONTRACT_UNSUPPORTED', '任务契约版本不兼容，请刷新软件页面', 409);
   if (
     header !== '4' &&
+    header !== '5' &&
     (steps.some((step) => step.spec?.type === 'post' && step.spec.aiLabel !== undefined) ||
       plans.some((plan) =>
         plan.snapshot.steps.some((step) => step.type === 'post' && step.aiLabel !== undefined),
@@ -42,6 +43,7 @@ export function assertTaskContract(
   if (
     header !== '3' &&
     header !== '4' &&
+    header !== '5' &&
     (steps.some((step) => step.spec?.type === 'post' && step.spec.audience === 'friends') ||
       plans.some((plan) =>
         plan.snapshot.steps.some((step) => step.type === 'post' && step.audience === 'friends'),
@@ -56,6 +58,7 @@ export function assertTaskContract(
     header !== '2' &&
     header !== '3' &&
     header !== '4' &&
+    header !== '5' &&
     (steps.some(
       (step) => step.status === 'FAILED' || step.status === 'SKIPPED' || step.outcome !== undefined,
     ) ||
@@ -66,6 +69,25 @@ export function assertTaskContract(
     throw new ProductError(
       'TASK_CONTRACT_UPGRADE_REQUIRED',
       '当前任务含新版步骤结果，请刷新软件页面',
+      409,
+    );
+  if (
+    header !== '5' &&
+    steps.some((step) => {
+      const outcome = step.outcome;
+      return (
+        outcome !== null &&
+        typeof outcome === 'object' &&
+        'kind' in outcome &&
+        outcome.kind === 'SKIPPED' &&
+        'reason' in outcome &&
+        outcome.reason === 'MARKETPLACE_UNAVAILABLE'
+      );
+    })
+  )
+    throw new ProductError(
+      'TASK_CONTRACT_UPGRADE_REQUIRED',
+      '商城正常跳过结果需要新版界面，请刷新软件页面',
       409,
     );
 }

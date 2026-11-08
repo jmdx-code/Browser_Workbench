@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { CleanupDialog } from './data-cleanup-panel.js';
 import { endedTask } from '../domain/task-run-records.js';
+import { isMarketplaceUnavailableSkip } from '../shared/task-step-outcome.js';
 import { runSummary, stepName } from './task-record-summary.js';
 import type { History, TaskCommand } from '../shared/task-contracts.js';
 import { api } from './api.js';
@@ -68,6 +69,7 @@ const events: Record<string, string> = {
   STEP_COMPLETED: '子任务完成',
   STEP_FAILED: '子任务失败',
   STEP_SKIPPED: '子任务已跳过',
+  STEP_SKIP_INTENT: '当前身份无法执行此步骤，准备正常跳过',
   STEP_CONTINUATION_READY: '独立后续步骤已就绪',
   CHILD_PAGE_REQUESTED: '已登记结果子页用途',
   CHILD_PAGE_READY: '结果子页归属已核对',
@@ -194,6 +196,9 @@ export function TaskHistoryPanel({
         <p className="muted" role="status">
           {exportNotice}
         </p>
+      )}
+      {history?.detailsReclaimed && (
+        <p className="muted">详细执行过程已按保留规则回收，最终结果与步骤状态仍保留。</p>
       )}
       {error && (
         <p role="alert" className="task-history-warning">
@@ -363,19 +368,21 @@ export function TaskHistoryPanel({
                       {step.position + 1}. {stepName(step)}
                     </span>
                     <span>
-                      {step.status === 'COMPLETED'
-                        ? '已完成'
-                        : step.status === 'FAILED'
-                          ? '本步骤失败'
-                          : step.status === 'SKIPPED'
-                            ? '已跳过'
-                            : step.status === 'ACTIVE'
-                              ? endedTask(plan.state)
-                                ? '已停止'
-                                : '进行中'
-                              : endedTask(plan.state)
-                                ? '未执行'
-                                : '等待执行'}
+                      {isMarketplaceUnavailableSkip(step.type, step.status, step.outcome)
+                        ? '正常跳过（商城不可用）'
+                        : step.status === 'COMPLETED'
+                          ? '已完成'
+                          : step.status === 'FAILED'
+                            ? '本步骤失败'
+                            : step.status === 'SKIPPED'
+                              ? '已跳过'
+                              : step.status === 'ACTIVE'
+                                ? endedTask(plan.state)
+                                  ? '已停止'
+                                  : '进行中'
+                                : endedTask(plan.state)
+                                  ? '未执行'
+                                  : '等待执行'}
                     </span>
                     <small>
                       目标{' '}

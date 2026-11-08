@@ -12,6 +12,7 @@ import { normalizeTargetToken } from '../src/renderer/select-by-ids-dialog.js';
 import { Sidebar } from '../src/renderer/sidebar.js';
 import { FeatureNavRail } from '../src/renderer/feature-nav-rail.js';
 import { CombinationList } from '../src/renderer/combination-list.js';
+import { TaskRecordsPage } from '../src/renderer/task-records.js';
 import { projectSelectionControls } from '../src/renderer/modules/profile-activity-projector.js';
 import {
   nudgeFinderIds,
@@ -19,8 +20,24 @@ import {
   rangeFinderSelection,
 } from '../src/renderer/finder-list-model.js';
 import { api } from '../src/renderer/api.js';
+import { newCombination, normalizeCombinationResources } from '../src/renderer/editor.js';
+import { CombinationSchema } from '../src/shared/contracts.js';
+
+it('new Story defaults to the native current audience while explicit saved Friends stays unchanged', () => {
+  const fresh = newCombination('story');
+  expect(fresh.steps[0]?.type === 'post' && fresh.steps[0].audience).toBe('preserve-current');
+  const saved = CombinationSchema.parse({
+    ...fresh,
+    steps: fresh.steps.map((s) => ({ ...s, audience: 'friends' })),
+  });
+  expect(normalizeCombinationResources(saved).steps[0]).toMatchObject({ audience: 'friends' });
+  expect(saved.steps[0]).toMatchObject({ audience: 'friends' });
+});
 vi.mock('../src/renderer/api.js', () => ({
   api: {
+    taskRecords: vi.fn(),
+    groupInviterLogs: vi.fn(),
+    cleanupSettings: vi.fn(),
     targetFolders: vi.fn(),
     targetListCommand: vi.fn(),
     reorderProfiles: vi.fn(),
@@ -37,6 +54,35 @@ vi.mock('../src/renderer/api.js', () => ({
 let root: Root;
 let host: HTMLDivElement;
 const id = 'f0000000-0000-4000-8000-000000000001';
+it('simplifying an edited marketplace removes invisible filters from the new draft without mutating the saved version', () => {
+  const saved = CombinationSchema.parse({
+    ...newCombination(),
+    steps: [
+      {
+        id,
+        type: 'marketplace',
+        durationMinutes: 7,
+        keyword: 'old search',
+        categoryId: '123',
+        minPrice: 10,
+        maxPrice: 100,
+        maxLikes: 0,
+        minLikeCount: 0,
+      },
+    ],
+  });
+  const original = structuredClone(saved);
+  const edited = normalizeCombinationResources(saved);
+  expect(saved).toEqual(original);
+  expect(edited.steps[0]).toEqual({
+    id,
+    type: 'marketplace',
+    durationMinutes: 7,
+    keyword: '',
+    maxLikes: 0,
+    minLikeCount: 0,
+  });
+});
 const rows = [1, 2, 3].map((n) => ({
   id: String(n),
   name: '条目' + n,
@@ -1332,4 +1378,71 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
   expect(thumbImg).toBeTruthy();
   expect(thumbImg?.getAttribute('src')).toContain('id=mat-thumb-1&v=777888');
   expect(thumbImg?.getAttribute('loading')).toBe('lazy');
+});
+
+it('marketplace unavailable skip renders a green completed run and follows completed/failed tabs', async () => {
+  const row = {
+    stepId: id,
+    planId: id,
+    profileId: id,
+    combinationId: id,
+    combinationName: '商城跳过验收',
+    combinationVersion: 1,
+    round: 1,
+    position: 0,
+    type: 'marketplace' as const,
+    status: 'SKIPPED' as const,
+    planState: 'COMPLETED' as const,
+    planReason: '',
+    outcome: {
+      version: 1 as const,
+      kind: 'SKIPPED' as const,
+      reason: 'MARKETPLACE_UNAVAILABLE' as const,
+      endedAt: 2,
+    },
+    progress: { revision: 0, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
+    budget: { kind: 'time' as const, milliseconds: 60000 },
+    startedAt: 1,
+    finishedAt: 2,
+    planCreatedAt: 1,
+    planUpdatedAt: 2,
+  };
+  vi.mocked(api.taskRecords).mockImplementation(async (request) => ({
+    records: request.status === 'failed' ? [] : [row],
+    total: request.status === 'failed' ? 0 : 1,
+    counts: { all: 1, running: 0, completed: 1, failed: 0, review: 0 },
+    nextCursor: null,
+    viewVersion: request.status ?? 'all',
+  }));
+  vi.mocked(api.groupInviterLogs).mockResolvedValue([]);
+  vi.mocked(api.cleanupSettings).mockRejectedValue(Error('not needed by this UI scenario'));
+  vi.mocked(api.bumperLogs).mockResolvedValue([]);
+  vi.mocked(api.posterLogs).mockResolvedValue([]);
+  await act(async () =>
+    root.render(
+      <TaskRecordsPage
+        runtime={null}
+        profiles={[]}
+        inspections={[]}
+        loaded={true}
+        filterId={null}
+        onClearFilter={() => {}}
+        onOpen={() => {}}
+      />,
+    ),
+  );
+  expect(host.querySelectorAll('.run-record-row.tone-ok')).toHaveLength(1);
+  expect(host.querySelectorAll('.run-step-pill.pill-ok')).toHaveLength(1);
+  expect(host.textContent).toContain('当前身份不可用，已跳过');
+  const completed = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.startsWith('已完成'),
+  );
+  await click(completed ?? null);
+  expect(vi.mocked(api.taskRecords).mock.calls.at(-1)?.[0].status).toBe('completed');
+  expect(host.querySelectorAll('.run-record-row.tone-ok')).toHaveLength(1);
+  const failed = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.startsWith('失败'),
+  );
+  await click(failed ?? null);
+  expect(host.querySelectorAll('.run-record-row')).toHaveLength(0);
 });

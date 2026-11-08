@@ -3,6 +3,9 @@ import { BusinessResolution } from '../shared/settlement.js';
 import { clickFacebookNativeTarget } from './facebook-native-click.js';
 import { waitForBrowseVisibility } from './facebook-browse-visibility.js';
 import { createHash } from 'node:crypto';
+import { postFailureRequiresEnding } from '../domain/step-failure-policy.js';
+import { isEmptyStoryEditor } from '../domain/facebook-story-preparation.js';
+import { restartEmptyStoryPage } from './facebook-story-restart.js';
 import type { Page } from 'playwright-core';
 import { readFacebookStoryPage } from './facebook-story-page-reader.js';
 import { withStoryVideoTransfer } from '../domain/facebook-story-video.js';
@@ -49,13 +52,13 @@ import { readFacebookEmptySurface } from './facebook-empty-surface-reader.js';
 import { readFacebookBrowsePage, type BrowsePage } from './facebook-browse-reader.js';
 import { readFacebookSubmissionAudience } from './facebook-submission-audience.js';
 import { readFacebookComposerAudience } from './facebook-composer-audience.js';
+import { clearAudienceDefaultTarget } from '../shared/facebook-audience.js';
 import { installAutomationPointer } from '../shared/automation-pointer.js';
 import { BrowseWheelStart } from '../shared/browse-execution.js';
 import { facebookBrowseSurface } from '../shared/facebook-browse-route.js';
 import { readFacebookHomePreparation } from './facebook-home-preparation.js';
 import {
   facebookBrowseNavigationSelector,
-  facebookStoryNavigationSelector,
   readFacebookBrowseNavigation,
 } from './facebook-native-browse-navigation.js';
 
@@ -328,6 +331,11 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
     const { page, proof, assertCurrent } = await this.postReadContext(execution, guard);
     await this.authority.refreshIdentity?.(page, assertCurrent, true);
     await assertCurrent();
+    const configureAI =
+      readAILabel ||
+      (execution.step.spec.type === 'post' &&
+        execution.step.spec.aiLabel !== undefined &&
+        execution.step.spec.aiLabel !== 'preserve-current');
     if (execution.step.spec.type === 'post' && execution.step.spec.destination === 'story') {
       if (requiredAudience) throw Error('STORY_POST_AUDIENCE_SCOPE_MISMATCH');
       let story = [
@@ -347,6 +355,10 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       await assertCurrent();
       const document = story ?? preparation?.page;
       if (!document) throw Error('STORY_DOCUMENT_REQUIRED');
+      const aiLabel =
+        configureAI && story ? await readFacebookAILabel(page, assertCurrent) : undefined;
+      if (aiLabel && (aiLabel.url !== document.url || aiLabel.timeOrigin !== document.timeOrigin))
+        throw Error('POST_AI_LABEL_DOCUMENT_CHANGED');
       return {
         context: structuredClone(this.context),
         proof: structuredClone(proof),
@@ -362,6 +374,10 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         surface: null,
         text: story?.text ?? null,
         ...(story ? { story } : {}),
+        ...(isEmptyStoryEditor(story) && this.tasks.canRestartStoryPage
+          ? { storyRestartAllowed: await this.tasks.canRestartStoryPage(this.plan.id, proof) }
+          : {}),
+        ...(aiLabel ? { aiLabel } : {}),
         ...(preparation
           ? { homePreparation: { safe: preparation.safe, reason: preparation.reason } }
           : {}),
@@ -389,11 +405,6 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         homePreparation: { safe: preparation.safe, reason: preparation.reason },
       };
     }
-    const configureAI =
-      readAILabel ||
-      (execution.step.spec.type === 'post' &&
-        execution.step.spec.aiLabel !== undefined &&
-        execution.step.spec.aiLabel !== 'preserve-current');
     const aiLabel = configureAI ? await readFacebookAILabel(page, assertCurrent) : undefined;
     await assertCurrent();
     if (aiLabel?.phase === 'settings') {
@@ -744,6 +755,14 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
     };
     const step = (await this.tasks.steps(this.plan.id)).find((row) => row.id === operation.stepId);
     if (!step) throw Error('FACEBOOK_MANAGED_STEP_REQUIRED');
+    let postPurpose: PostLink['purpose'] | undefined;
+    const inputFailure = async (reason: string) => {
+      // Record preparation failure before the SDK lifecycle confirms STOP. Unknown
+      // submissions and revoked identity/control retain their existing handling.
+      if (step.spec.type === 'post' && postFailureRequiresEnding(reason, postPurpose))
+        await this.tasks.noteStepFailure?.(this.plan.id, step.id, reason);
+      await this.failure?.(reason);
+    };
     const post = async (): Promise<FacebookPostTarget | undefined> => {
       if (step.spec.type !== 'post') {
         if (action.kind === 'typeText' || action.kind === 'uploadMedia')
@@ -761,6 +780,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       )
         throw Error('FACEBOOK_MATERIAL_OPERATION_MISMATCH');
       validatePostAction(current.intent, current.link.purpose, action);
+      postPurpose = current.link.purpose;
       return { intent: current.intent, link: current.link };
     };
     let appliedScrollDelta = 0;
@@ -826,6 +846,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
       await post(); // A wait must not let a settled/replaced reservation regain input authority.
     };
     let lastAssertedAt = 0;
+    let storyRestartDialogScope = false;
     const assertTargetCached = async (activationPreparation = false, force = false) => {
       if (
         !force &&
@@ -848,13 +869,20 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         this.connection,
         operation.binding,
         assertCurrent,
-        this.failure,
+        inputFailure,
         async (command) => {
           if (command.target.tabId !== proof.tabId) throw Error('FACEBOOK_MANAGED_TARGET_CHANGED');
           await assertTarget();
         },
       );
-      return { binding: result.binding, evidence: { sdkReturned: true, ownedTab: proof } };
+      return {
+        binding: result.binding,
+        evidence: {
+          sdkReturned: true,
+          ownedTab: proof,
+          ...(result.value.manifest.sourcePaths ? { uploadManifest: result.value.manifest } : {}),
+        },
+      };
     }
     const result = await this.connection
       .execute(
@@ -937,17 +965,32 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             }
             const selector =
               !submission ||
+              submission.link.purpose === 'PREPARE_STORY' ||
               (submission.link.purpose === 'PREPARE_HOME' &&
                 page.url() === 'https://www.facebook.com/')
                 ? null
-                : (facebookBrowseNavigationSelector(action.url) ??
-                  (submission.link.purpose === 'PREPARE_STORY'
-                    ? facebookStoryNavigationSelector(action.url, page.url())
-                    : null));
+                : facebookBrowseNavigationSelector(action.url);
             const target = selector
               ? await readFacebookBrowseNavigation(page, selector, assertCurrent)
               : null;
-            if (selector && target) {
+            if (
+              submission?.link.purpose === 'PREPARE_STORY' &&
+              isEmptyStoryEditor(await readFacebookStoryPage(page, assertCurrent))
+            ) {
+              if (!(await this.tasks.canRestartStoryPage?.(this.plan.id, proof)))
+                throw Error('STORY_FOREIGN_DRAFT');
+              await restartEmptyStoryPage(
+                page,
+                () => this.connection.navigateBoundPage(operation.binding, action, page.url()),
+                async () => {
+                  await assertCurrent();
+                  await post();
+                },
+                (active) => {
+                  storyRestartDialogScope = active;
+                },
+              );
+            } else if (selector && target) {
               if (step.spec.type === 'post') await page.bringToFront();
               browseNavigation = { selector, target };
               if (step.spec.type !== 'post') {
@@ -1175,6 +1218,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
               await locator.press('Enter', { timeout: 5_000 });
             } else if (
               submission &&
+              action.target.css !== clearAudienceDefaultTarget.css &&
               ['OPEN_AUDIENCE', 'CONFIRM_AUDIENCE', 'OPEN_BACKGROUND', 'SET_BACKGROUND'].includes(
                 submission.link.purpose,
               )
@@ -1195,7 +1239,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
           }
         },
         assertCurrent,
-        this.failure,
+        inputFailure,
         async (command) => {
           await assertCurrent();
           if (command.target.tabId !== proof.tabId) throw Error('FACEBOOK_MANAGED_TARGET_CHANGED');
@@ -1231,6 +1275,17 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             return;
           }
           const original = await post();
+          if (
+            storyRestartDialogScope &&
+            original?.link.purpose === 'PREPARE_STORY' &&
+            command.method === 'Page.handleJavaScriptDialog' &&
+            command.params.accept === true
+          ) {
+            // This beforeunload belongs to the already approved empty-editor navigation.
+            // Re-reading DOM while the native dialog blocks JavaScript would deadlock it.
+            await assertCurrent();
+            return;
+          }
           const key =
             original &&
             command.method === 'Input.dispatchKeyEvent' &&
@@ -1253,13 +1308,13 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
             key &&
             command.params.type === 'keyUp' &&
             pressedSettingsKeys.has(key) &&
-            this.authority.refreshIdentity &&
             this.materialInputs?.composer.assertRelease &&
             original
           ) {
             // Complete this operation's already-approved key press. The UI may now show its
             // effect, so the old button's precondition is no longer the release condition.
-            await this.authority.refreshIdentity(page, assertCurrent);
+            // The approved keyDown may replace the document. Finish its matching keyUp
+            // under the same live operation/STOP gate; observe the new editor afterwards.
             await assertCurrent();
             await post();
             await this.materialInputs.composer.assertRelease(page, action, original, assertCurrent);

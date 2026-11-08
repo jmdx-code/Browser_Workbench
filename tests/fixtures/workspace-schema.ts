@@ -8,7 +8,10 @@ import { materialUsageMigration } from '../../src/infrastructure/material-usage-
 import { taskMigration } from '../../src/infrastructure/task-migration.js';
 import { taskStepOutcomeMigration } from '../../src/infrastructure/task-step-outcome-migration.js';
 import { taskCapacityMigration } from '../../src/infrastructure/task-capacity-migration.js';
-import { physicalHistoryCleanupMigration } from '../../src/infrastructure/data-cleanup-store.js';
+import {
+  physicalHistoryCleanupMigration,
+  purgeablePlan,
+} from '../../src/infrastructure/data-cleanup-store.js';
 export const latestMigrationBackupMarker = '.before-v' + workspaceSchemaVersion + '-';
 // Generated downgrade fixtures only; never product databases or retained audit evidence.
 export const dropPhysicalCleanupSchema = [
@@ -123,7 +126,20 @@ export function assertSchemaDefinitionPreserved(
   const cleanupTrigger = statements(physicalHistoryCleanupMigration).find((sql) =>
     sql.startsWith('CREATE TRIGGER ' + String(definition.name) + ' '),
   );
-  if (definition.type === 'trigger' && cleanupTrigger) {
+  if (
+    ['retain_browse_intent', 'retain_dispatch_binding', 'retain_settlement_notice'].includes(
+      String(definition.name),
+    )
+  ) {
+    // Migration54 keeps the original whole-plan permission and adds a
+    // narrowly scoped settled-detail path after the final snapshot is saved.
+    assert.ok(actual);
+    assert.ok(String(actual.sql).includes(purgeablePlan));
+    assert.match(String(actual.sql), /a.details_pruned=1/);
+    assert.match(String(actual.sql), /o.status IN \('VERIFIED','FAILED','CANCELLED'\)/);
+    assert.match(String(actual.sql), /d.state<>'DELIVERED'/);
+    assert.ok(String(actual.sql).includes(String(definition.name).toUpperCase()));
+  } else if (definition.type === 'trigger' && cleanupTrigger) {
     assert.ok(actual);
     assert.equal(actual.sql, cleanupTrigger);
   } else if (definition.name === 'one_active_material_per_content') {
@@ -232,10 +248,12 @@ export function assertSchemaDefinitionPreserved(
     assert.deepEqual(
       {
         ...actual,
-        sql: String(actual.sql).replace(
-          ', history_max_count INTEGER CHECK(history_max_count BETWEEN 1 AND 100000)',
-          '',
-        ),
+        sql: String(actual.sql)
+          .replace(', history_max_count INTEGER CHECK(history_max_count BETWEEN 1 AND 100000)', '')
+          .replace(
+            /, (?:bumper_max_count|poster_max_count|detail_max_count) INTEGER NOT NULL DEFAULT \d+ CHECK\(\w+ BETWEEN 1 AND \d+\)/g,
+            '',
+          ),
       },
       definition,
     );

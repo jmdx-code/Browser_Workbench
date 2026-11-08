@@ -113,7 +113,6 @@ export function assertPostMediaPreparation(
     const step = StepSchema.parse(JSON.parse(String(raw?.spec)) as unknown);
     if (
       step.type !== 'post' ||
-      step.destination === 'story' ||
       !['on', 'off'].includes(postAILabelSetting(intent, step.aiLabel)) ||
       db
         .prepare("SELECT version FROM workspace_execution_contracts WHERE name='post-ai-label'")
@@ -127,11 +126,11 @@ export function assertPostMediaPreparation(
         )
         .get(intent.attemptId, value);
     if (
-      !verified('OPEN_COMPOSER') ||
-      (purpose !== 'OPEN_AI_LABEL' && !verified('OPEN_AI_LABEL')) ||
+      (!verified('OPEN_COMPOSER') && !(step.destination === 'story' && verified('UPLOAD_MEDIA'))) ||
+      (purpose === 'CONFIRM_AI_LABEL' && !verified('OPEN_AI_LABEL')) ||
       db
         .prepare(
-          "SELECT operation_id FROM material_post_operations WHERE attempt_id=? AND purpose IN ('SET_TEXT','PREPARE_MEDIA','UPLOAD_MEDIA','ADVANCE_COMPOSER','SUBMIT')",
+          "SELECT operation_id FROM material_post_operations WHERE attempt_id=? AND purpose='SUBMIT'",
         )
         .get(intent.attemptId)
     )
@@ -149,7 +148,13 @@ export function assertPostMediaPreparation(
       .get(intent.stepId, intent.jobId);
     const step = StepSchema.parse(JSON.parse(String(row?.spec)) as unknown);
     const story = step.type === 'post' && step.destination === 'story';
-    if (storyPurpose && (!story || step.audience !== 'friends'))
+    const storyAudience =
+      step.type === 'post' &&
+      ['friends', 'preserve-current'].includes(step.audience ?? 'preserve-current');
+    if (
+      storyPurpose &&
+      (!story || !storyAudience || (purpose === 'SELECT_FRIENDS' && step.audience !== 'friends'))
+    )
       throw Error('STORY_PRIVACY_STEP_REQUIRED');
     if (story && (purpose === 'SET_TEXT' || purpose === 'SUBMIT')) {
       const closed = db
@@ -157,7 +162,7 @@ export function assertPostMediaPreparation(
           "SELECT o.operation_id FROM material_post_operations o JOIN material_operation_verdicts v USING(operation_id) WHERE o.attempt_id=? AND o.purpose='CLOSE_AUDIENCE' AND v.outcome='APPLIED'",
         )
         .get(intent.attemptId);
-      if (step.audience !== 'friends' || !closed) throw Error('STORY_VERIFIED_AUDIENCE_REQUIRED');
+      if (!storyAudience || !closed) throw Error('STORY_VERIFIED_AUDIENCE_REQUIRED');
     }
   }
   if (intent.snapshot.format === 'text') return;

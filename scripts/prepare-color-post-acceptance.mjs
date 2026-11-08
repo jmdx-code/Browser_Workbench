@@ -33,7 +33,7 @@ async function request(route, input) {
     method: input === undefined ? 'GET' : 'POST',
     headers: {
       cookie,
-      'x-workbench-task-contract': '4',
+      'x-workbench-task-contract': '5',
       'x-workbench-workspace-contract': '6',
       ...(input === undefined ? {} : { origin, 'content-type': 'application/json' }),
     },

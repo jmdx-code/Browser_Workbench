@@ -91,7 +91,42 @@ test('canvas readiness requires original transfer and full source/caption lineag
     );
     assert.equal(
       withStoryVideoTransfer(story, { ...transfer, derivation: undefined }).phase,
+      'media-editor',
+    );
+    const originalTransfer = { ...transfer, derivation: undefined };
+    assert.equal(
+      withStoryVideoTransfer(story, { ...originalTransfer, receivedBytes: 99 }).phase,
       'ambiguous',
+    );
+    assert.equal(
+      withStoryVideoTransfer(
+        { ...story, nativeVideoInput: { bytes: 101, sha256: originalTransfer.digest } },
+        originalTransfer,
+      ).phase,
+      'ambiguous',
+    );
+    const originalPreview = withStoryVideoTransfer(
+      {
+        ...story,
+        nativeVideoInput: { bytes: originalTransfer.bytes, sha256: originalTransfer.digest },
+      },
+      originalTransfer,
+    );
+    assert.equal(originalPreview.phase, 'media-editor');
+    assert.equal(
+      matchesOriginalStoryMedia(originalPreview, {
+        ...intent,
+        snapshot: {
+          ...intent.snapshot,
+          text: '',
+          files: intent.snapshot.files.map((file) =>
+            file.role === 'video'
+              ? { ...file, bytes: originalTransfer.bytes, digest: originalTransfer.digest }
+              : file,
+          ),
+        },
+      }),
+      true,
     );
     for (const change of [
       { ...transfer, attemptId: randomUUID() },

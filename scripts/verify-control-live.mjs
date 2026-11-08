@@ -35,7 +35,7 @@ async function request(route, input) {
       origin,
       'content-type': 'application/json',
       'x-workbench-workspace-contract': '6',
-      'x-workbench-task-contract': '4',
+      'x-workbench-task-contract': '5',
       'x-workbench-task-capacity': '2',
       'x-workbench-runtime-contract': '1',
       'x-workbench-records-contract': '1',

@@ -1,3 +1,4 @@
+import { DetailBoundary, type DetailBoundaryValue } from '../shared/data-cleanup.js';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -15,6 +16,11 @@ import {
   type Status,
   type JournalEntry,
 } from './protocol.js';
+function terminalReceiptDigest(row: KernelRecord): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ resolution: row.resolution, disposition: row.disposition ?? null }))
+    .digest('hex');
+}
 export type RecordRow = {
   commandId: string;
   profileId: string;
@@ -25,8 +31,9 @@ export type RecordRow = {
   result: string | null;
   updatedAt: number;
   legacyFixture: number;
+  detailsPruned?: number;
 };
-export const bridgeSchemaVersion = 3;
+export const bridgeSchemaVersion = 4;
 export class Store {
   readonly db: DatabaseSync;
   constructor(path: string) {
@@ -69,7 +76,26 @@ export class Store {
       this.db
         .exec(`CREATE TABLE IF NOT EXISTS kernel_operation_watermarks(profile_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS kernel_operation_receipts(profile_id TEXT NOT NULL,operation_id TEXT NOT NULL,binding TEXT NOT NULL,sequence INTEGER,receipt TEXT,PRIMARY KEY(profile_id,operation_id));
-        PRAGMA user_version=3; COMMIT`);
+        PRAGMA user_version=4;`);
+      const receiptColumns = this.db
+        .prepare('PRAGMA table_info(kernel_operation_receipts)')
+        .all()
+        .map((r) => r.name);
+      if (!receiptColumns.includes('updated_at'))
+        this.db.exec(
+          'ALTER TABLE kernel_operation_receipts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0',
+        );
+      if (!receiptColumns.includes('retired'))
+        this.db.exec(
+          'ALTER TABLE kernel_operation_receipts ADD COLUMN retired INTEGER NOT NULL DEFAULT 0',
+        );
+      if (!receiptColumns.includes('receipt_digest'))
+        this.db.exec('ALTER TABLE kernel_operation_receipts ADD COLUMN receipt_digest TEXT');
+      if (!columns.some((c) => c.name === 'detailsPruned'))
+        this.db.exec('ALTER TABLE operations ADD COLUMN detailsPruned INTEGER NOT NULL DEFAULT 0');
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS kernel_receipt_retention ON kernel_operation_receipts(retired,updated_at);COMMIT',
+      );
     } catch (error) {
       this.db.exec('ROLLBACK');
       this.db.close();
@@ -94,7 +120,8 @@ export class Store {
         .get(binding.profileId, binding.operationId);
       if (old && !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), binding))
         throw Error('KERNEL_OPERATION_ID_CONFLICT');
-      if (old?.receipt && old.sequence === null) throw Error('KERNEL_OPERATION_RETIRED');
+      if (old?.retired === 1 || (old?.receipt && old.sequence === null))
+        throw Error('KERNEL_OPERATION_RETIRED');
       let sequence: number;
       if (old?.sequence != null) sequence = Number(old.sequence);
       else {
@@ -131,7 +158,7 @@ export class Store {
           throw Error('KERNEL_ARCHIVE_NOT_TERMINAL');
         const old = this.db
           .prepare(
-            'SELECT binding,receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
+            'SELECT binding,receipt,retired,receipt_digest FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
           )
           .get(profileId, row.binding.operationId);
         if (
@@ -139,6 +166,11 @@ export class Store {
           !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), row.binding)
         )
           throw Error('KERNEL_OPERATION_ID_CONFLICT');
+        if (old?.retired === 1) {
+          if (old.receipt_digest !== terminalReceiptDigest(row))
+            throw Error('KERNEL_ARCHIVE_CONFLICT');
+          continue;
+        }
         if (old?.receipt) {
           const prior = KernelOperationRecord.parse(JSON.parse(String(old.receipt)));
           for (const key of ['resolution', 'disposition'] as const) {
@@ -156,7 +188,7 @@ export class Store {
         }
         this.db
           .prepare(
-            'INSERT INTO kernel_operation_receipts VALUES(?,?,?,?,?) ON CONFLICT(profile_id,operation_id) DO UPDATE SET receipt=excluded.receipt',
+            'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence,receipt,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(profile_id,operation_id) DO UPDATE SET receipt=excluded.receipt',
           )
           .run(
             profileId,
@@ -164,6 +196,7 @@ export class Store {
             JSON.stringify(row.binding),
             row.operationSequence ?? null,
             JSON.stringify(row),
+            Date.now(),
           );
       }
       this.db.exec('COMMIT');
@@ -183,6 +216,66 @@ export class Store {
       .all(profileId, JSON.stringify(operationIds))
       .map((r) => KernelOperationRecord.parse(JSON.parse(String(r.receipt))));
   }
+  detailHead(maximum: number, protectedIds: readonly string[] = []): DetailBoundaryValue[] {
+    const excluded = JSON.stringify(protectedIds),
+      keep = z.number().int().min(1).max(100000).parse(maximum);
+    return this.db
+      .prepare(
+        `SELECT * FROM (
+ SELECT updatedAt at,'legacy:'||commandId key FROM operations WHERE detailsPruned=0 AND status IN ('VERIFIED','FAILED','CANCELLED','ABANDONED') AND operationId NOT IN(SELECT value FROM json_each(?))
+ UNION ALL SELECT updated_at,'kernel:'||profile_id||':'||operation_id FROM kernel_operation_receipts WHERE receipt IS NOT NULL AND retired=0 AND operation_id NOT IN(SELECT value FROM json_each(?))) ORDER BY at DESC,key DESC LIMIT ?`,
+      )
+      .all(excluded, excluded, keep)
+      .map((r) => ({ at: Number(r.at), key: String(r.key) }));
+  }
+  pruneDetails(input: unknown, protectedIds: readonly string[] = [], maximum = 100): number {
+    const boundary = DetailBoundary.parse(input),
+      excluded = JSON.stringify(protectedIds),
+      limit = z.number().int().min(1).max(200).parse(maximum);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM (
+ SELECT 'legacy' source,commandId id,updatedAt at,'legacy:'||commandId key FROM operations WHERE detailsPruned=0 AND status IN ('VERIFIED','FAILED','CANCELLED','ABANDONED') AND operationId NOT IN(SELECT value FROM json_each(?))
+ UNION ALL SELECT 'kernel',profile_id||':'||operation_id,updated_at,'kernel:'||profile_id||':'||operation_id FROM kernel_operation_receipts WHERE receipt IS NOT NULL AND retired=0 AND operation_id NOT IN(SELECT value FROM json_each(?))) WHERE (at,key)<(?,?) ORDER BY at,key LIMIT ?`,
+        )
+        .all(excluded, excluded, boundary.at, boundary.key, limit);
+      for (const r of rows) {
+        if (r.source === 'legacy') {
+          this.db
+            .prepare('UPDATE operations SET result=?,action=?,detailsPruned=1 WHERE commandId=?')
+            .run(
+              JSON.stringify({ detailsReclaimed: true }),
+              JSON.stringify({ kind: 'history-reclaimed' }),
+              r.id as string,
+            );
+          this.db.prepare('UPDATE reviews SET evidence=NULL WHERE commandId=?').run(r.id as string);
+        } else {
+          const [profileId, operationId] = String(r.id).split(':');
+          const old = this.db
+            .prepare(
+              'SELECT receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
+            )
+            .get(profileId ?? '', operationId ?? '');
+          this.db
+            .prepare(
+              'UPDATE kernel_operation_receipts SET receipt_digest=?,receipt=NULL,retired=1 WHERE profile_id=? AND operation_id=?',
+            )
+            .run(
+              terminalReceiptDigest(KernelOperationRecord.parse(JSON.parse(String(old?.receipt)))),
+              profileId ?? '',
+              operationId ?? '',
+            );
+        }
+      }
+      this.db.exec('COMMIT');
+      return rows.length;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   prepare(intent: Intent): { row: RecordRow; fresh: boolean } {
     const action = JSON.stringify(Action.parse(intent.action));
     const digest = createHash('sha256').update(action).digest('hex');
@@ -191,6 +284,7 @@ export class Store {
       .get(intent.profileId, intent.operationId) as RecordRow | undefined;
     if (old) {
       if (old.digest !== digest) throw new BridgeError('OPERATION_ID_CONFLICT');
+      if (old.detailsPruned) throw new BridgeError('OPERATION_DETAILS_RECLAIMED');
       return { row: old, fresh: false };
     }
     const row: RecordRow = {
@@ -222,8 +316,9 @@ export class Store {
     return { row, fresh: true };
   }
   get(id: string) {
-    return this.db.prepare('SELECT * FROM operations WHERE commandId=?').get(id) as
-      RecordRow | undefined;
+    return this.db
+      .prepare('SELECT * FROM operations WHERE commandId=? AND detailsPruned=0')
+      .get(id) as RecordRow | undefined;
   }
   cancelPrepared(profileId: string) {
     this.db
@@ -239,7 +334,7 @@ export class Store {
   }
   list() {
     return this.db
-      .prepare('SELECT * FROM operations ORDER BY updatedAt DESC LIMIT 100')
+      .prepare('SELECT * FROM operations WHERE detailsPruned=0 ORDER BY updatedAt DESC LIMIT 100')
       .all() as RecordRow[];
   }
   unresolved(profileId: string) {
@@ -306,8 +401,13 @@ export class Store {
           if (
             old.status === 'PREPARED' ||
             (old.status === 'CANCELLED' && entry.status !== 'FAILED')
-          )
+          ) {
+            if (old.detailsPruned)
+              this.db
+                .prepare('UPDATE operations SET action=?,detailsPruned=0 WHERE commandId=?')
+                .run(JSON.stringify(entry.action), old.commandId);
             this.set(old.commandId, 'UNKNOWN', { error: 'JOURNAL_RECONCILIATION_REQUIRED' });
+          }
           continue;
         }
         const status: Status = ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(entry.status)

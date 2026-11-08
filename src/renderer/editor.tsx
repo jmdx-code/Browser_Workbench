@@ -12,7 +12,6 @@ import { DraftSession } from './draft-session.js';
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 
-import { marketplaceCategories } from '../shared/marketplace-categories.js';
 const stepNames = {
   video: '浏览 Reels',
   feed: '浏览首页',
@@ -29,7 +28,16 @@ export function normalizeCombinationResources(value: Combination): Combination {
     steps: value.steps.map((step) =>
       step.type === 'post'
         ? { ...step, resourceMode: 'table' as const, resourceDirectory: '' }
-        : step,
+        : step.type === 'marketplace'
+          ? {
+              id: step.id,
+              type: 'marketplace' as const,
+              durationMinutes: step.durationMinutes,
+              keyword: '',
+              maxLikes: 0 as const,
+              minLikeCount: 0 as const,
+            }
+          : step,
     ),
   };
 }
@@ -38,7 +46,7 @@ function newPostStep(id: string, destination: 'post' | 'story' = 'post'): Step {
     id,
     type: 'post',
     destination,
-    ...(destination === 'story' ? { audience: 'friends' as const } : {}),
+    ...(destination === 'story' ? { audience: 'preserve-current' as const } : {}),
     count: 1,
     resourceDirectory: '',
     resourceMode: 'table',
@@ -446,9 +454,6 @@ export function Editor({
                     <span>分钟</span>
                   </div>
                 </label>
-                <small className="wide">
-                  自动进入好友请求页面（/friends/requests），模仿人工随机间隔确认通过好友申请；达到指定数量或当前无待处理请求时自动完成。
-                </small>
               </div>
             ) : step.type !== 'post' ? (
               <div className="step-fields">
@@ -467,57 +472,7 @@ export function Editor({
                     <span>分钟</span>
                   </div>
                 </label>
-                {step.type === 'marketplace' ? (
-                  <>
-                    <label>
-                      搜索关键词
-                      <input
-                        maxLength={120}
-                        value={step.keyword}
-                        placeholder="留空浏览推荐商品"
-                        onChange={(event) => stepChange(step.id, { keyword: event.target.value })}
-                      />
-                    </label>
-                    <label>
-                      商品分类
-                      <select
-                        value={step.categoryId ?? ''}
-                        onChange={(event) =>
-                          stepChange(step.id, { categoryId: event.target.value || undefined })
-                        }
-                      >
-                        <option value="">全部分类</option>
-                        {marketplaceCategories.map(([id, name]) => (
-                          <option key={id} value={id}>
-                            {name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    {(['minPrice', 'maxPrice'] as const).map((field) => (
-                      <label key={field}>
-                        {field === 'minPrice' ? '最低价格' : '最高价格'}
-                        <input
-                          type="number"
-                          min={0}
-                          max={1_000_000_000}
-                          step="0.01"
-                          placeholder="不限"
-                          value={step[field] ?? ''}
-                          onChange={(event) =>
-                            stepChange(step.id, {
-                              [field]:
-                                event.target.value === '' ? undefined : Number(event.target.value),
-                            })
-                          }
-                        />
-                      </label>
-                    ))}
-                    <small className="wide">
-                      浏览列表和商品详情；价格使用账号商城地区的货币。设置价格需选择分类或填写关键词。关键词、分类及价格筛选需要插件0.3.20，地区沿用账号当前设置。
-                    </small>
-                  </>
-                ) : (
+                {step.type !== 'marketplace' && (
                   <>
                     <label className="check-label browse-like-toggle">
                       <input
@@ -529,7 +484,7 @@ export function Editor({
                           })
                         }
                       />
-                      开启随机点赞（浏览期间按条件自动点赞）
+                      随机点赞
                     </label>
                     {step.maxLikes > 0 && (
                       <>
@@ -622,11 +577,6 @@ export function Editor({
                         </label>
                       </>
                     )}
-                    {step.maxLikes > 0 && (
-                      <small className="wide">
-                        浏览停留期间按点赞条件执行，达到上限后继续浏览至时间结束。
-                      </small>
-                    )}
                   </>
                 )}
               </div>
@@ -667,7 +617,7 @@ export function Editor({
                       {step.destination === 'story' ? '仅自己（快拍不支持）' : '仅自己'}
                     </option>
                     <option value="friends" disabled={step.destination !== 'story'}>
-                      {step.destination === 'story' ? '好友' : '好友（仅快拍）'}
+                      {step.destination === 'story' ? '好友（需当前身份支持）' : '好友（仅快拍）'}
                     </option>
                   </select>
                 </label>
@@ -677,11 +627,8 @@ export function Editor({
                     checked={step.allowRepeat}
                     onChange={(event) => stepChange(step.id, { allowRepeat: event.target.checked })}
                   />
-                  允许重复使用素材（发布成功不从资源表移除）
+                  重复使用素材
                 </label>
-                <p className="field-hint">
-                  共用上方「本组合发帖 / 快拍资源表」；未勾选重复使用时，发布成功后自动从表中清理。
-                </p>
               </div>
             )}
           </article>
@@ -694,7 +641,7 @@ export function Editor({
             checked={value.randomOrder}
             onChange={(event) => change({ ...value, randomOrder: event.target.checked })}
           />
-          每轮随机子任务顺序
+          随机执行顺序
         </label>
         <label>
           循环

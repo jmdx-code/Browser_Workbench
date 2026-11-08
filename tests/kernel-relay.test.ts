@@ -947,3 +947,69 @@ test('a cleanly stopped extension session can reopen on the same connection and 
   assert.equal(chrome.commands.length, 0);
   await channel.freeze();
 });
+
+test('task relay omits inline data resource URLs while preserving HTTP evidence and fixture CDP', async () => {
+  for (const access of ['facebook-task', 'fixture'] as const) {
+    const state = setup(),
+      native = new SimulatedChrome(),
+      replies: KernelJsonObject[] = [];
+    const journal = new KernelJournal(new MemoryKernelStorage());
+    await journal.initialize(state.lease.profileId, randomUUID());
+    const backend = Object.assign(native, {
+      scope: async () => {},
+      owns: (tabId: number) => native.urls.has(tabId),
+      detached: (tabId: number) => {
+        native.attached.delete(tabId);
+      },
+      expectedDetach: () => false,
+    });
+    const channel = new ExtensionKernelChannel(
+      () => ({ profileId: state.lease.profileId, epoch: state.lease.connectionEpoch, valid: true }),
+      (message) => replies.push(JsonObjectSchema.parse(message)),
+      () => backend,
+      journal,
+    );
+    let sequence = 0;
+    const request = async (body: Record<string, unknown>) => {
+      const requestId = randomUUID();
+      channel.receive({
+        type: 'KERNEL_REQUEST',
+        requestId,
+        sequence: ++sequence,
+        connectionEpoch: state.lease.connectionEpoch,
+        leaseId: state.stamp.leaseId,
+        ...body,
+      });
+      for (let i = 0; i < 20 && !replies.some((r) => r.requestId === requestId); i++)
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      const response = replies.find((r) => r.requestId === requestId);
+      assert.ok(response, 'RPC completed');
+      assert.equal(response.error, undefined);
+    };
+    await request({ kind: 'open', access, stamp: state.stamp, files: [] });
+    await request({
+      kind: 'create',
+      url: access === 'fixture' ? fixtureURL : 'https://www.facebook.com/',
+    });
+    await request({ kind: 'attach', tabId: 3 });
+    for (const [method, key] of [
+      ['Network.requestWillBeSent', 'request'],
+      ['Network.responseReceived', 'response'],
+    ] as const) {
+      const before = replies.length;
+      channel.event({ tabId: 3 }, method, {
+        [key]: { url: 'data:application/octet-stream;base64,' + 'A'.repeat(5 * 1024 * 1024) },
+      });
+      assert.equal(replies.length - before, access === 'fixture' ? 1 : 0);
+      const http = {
+        [key]: { url: 'https://www.facebook.com/api/graphql/', status: 200 },
+        requestId: 'native-submit',
+      };
+      channel.event({ tabId: 3 }, method, http);
+      const emitted = replies.at(-1);
+      assert.equal(emitted?.type, 'KERNEL_EVENT');
+      assert.deepEqual(emitted?.params, http);
+    }
+    await channel.freeze();
+  }
+});

@@ -9,6 +9,7 @@ import type { BumperLog, BumperState } from '../shared/group-bumper.js';
 import type { PosterLog, PosterState } from '../shared/group-poster.js';
 import { attentionPlans, taskReasonDescription } from './task-alerts.js';
 import { groupTaskRecords, endedTask } from '../domain/task-run-records.js';
+import { isMarketplaceUnavailableSkip, isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
 import { runSummary, stepResultLabel } from './task-record-summary.js';
 import { api, ApiError } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
@@ -622,7 +623,16 @@ export function TaskRecordsPage({
         </span>
         <span role="cell">
           <span className={'pill pill-' + status?.tone}>
-            {state === 'FAILED' ? '执行异常' : state === 'REVIEW' ? '需处理' : status?.label}
+            {state === 'FAILED'
+              ? '执行异常'
+              : state === 'REVIEW'
+                ? '需处理'
+                : state === 'COMPLETED' &&
+                    group.rows.some((s) =>
+                      isMarketplaceUnavailableSkip(s.type, s.status, s.outcome),
+                    )
+                  ? '已完成（含正常跳过）'
+                  : status?.label}
           </span>
           {state === 'STOPPED' && (
             <small>
@@ -632,14 +642,13 @@ export function TaskRecordsPage({
         </span>
         <span role="cell" className="run-step-pills">
           {group.rows.map((step) => {
-            const tone =
-              step.status === 'COMPLETED'
-                ? 'ok'
-                : step.status === 'FAILED'
-                  ? 'err'
-                  : step.status === 'ACTIVE' && !ended
-                    ? 'run'
-                    : 'idle';
+            const tone = isSuccessfulTaskStep(step.type, step.status, step.outcome)
+              ? 'ok'
+              : step.status === 'FAILED'
+                ? 'err'
+                : step.status === 'ACTIVE' && !ended
+                  ? 'run'
+                  : 'idle';
             return (
               <span
                 key={step.stepId}

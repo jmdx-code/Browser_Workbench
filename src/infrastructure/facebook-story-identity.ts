@@ -3,6 +3,7 @@ import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { projectFacebookDocumentIdentity } from '../shared/facebook-document-identity.js';
+import { projectFacebookStoryPage } from './facebook-story-page-reader.js';
 
 const DocumentFence = z
   .object({
@@ -33,7 +34,11 @@ export async function readCurrentFacebookStoryIdentity(page: Page, guard: () => 
       await page.evaluate(`(() => {
       const fence = () => ({url: location.href, timeOrigin: performance.timeOrigin, ready: document.readyState});
       const before = fence();
-      const current = (${projectFacebookDocumentIdentity.toString()})("story");
+      let current = (${projectFacebookDocumentIdentity.toString()})("story");
+      if (!current.actor) {
+        (${projectFacebookStoryPage.toString()})();
+        current = (${projectFacebookDocumentIdentity.toString()})("story");
+      }
       return {before, current, after: fence()};
     })()`),
     );

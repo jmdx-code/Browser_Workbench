@@ -341,7 +341,8 @@ it('WO61-2: video post finishes on videoEnded/duration, completes at 3min deadli
   await vi.runAllTimersAsync();
   await runB;
   expect(recorded).toEqual([post1]);
-  expect(checkPostCount).toBeLessThanOrEqual(6);
+  // Includes the fresh identity/control read before centering the candidate.
+  expect(checkPostCount).toBeLessThanOrEqual(7);
 });
 
 it('WO61-3: BumperSettings defaults maxConcurrentProfiles to 8 (max 50) and auto-migrates legacy 4 once', async () => {

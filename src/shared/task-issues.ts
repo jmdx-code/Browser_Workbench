@@ -178,6 +178,26 @@ const reasons: Record<string, { summary: string; next: string }> = {
     summary: '本次快拍编辑器已关闭',
     next: '结束本步骤，不另起发布尝试；确认停止后继续独立后续步骤。',
   },
+  STORY_FRIENDS_AUDIENCE_UNAVAILABLE: {
+    summary: '当前身份不支持好友范围快拍，本次未发布',
+    next: '本步骤已结束；如需使用原生现有范围，请选择保持当前后重新运行。',
+  },
+  POST_SELF_AUDIENCE_UNAVAILABLE: {
+    summary: '当前身份不支持仅自己范围',
+    next: '本步骤已结束，未更改为公开发布；请核对分享范围。',
+  },
+  STORY_AUDIENCE_UNSUPPORTED: {
+    summary: '快拍不支持仅自己范围',
+    next: '请选择好友或保持当前范围。',
+  },
+  POST_PREPARATION_TIMEOUT: {
+    summary: '发布准备未能完成',
+    next: '本步骤已结束且未提交；页面可能有保留草稿、尚未加载或缺少所需控件，请查看步骤原因。',
+  },
+  FACEBOOK_CURRENT_STORY_IDENTITY_UNCONFIRMED: {
+    summary: '未能确认当前快拍发布身份',
+    next: '结束本次发布准备，不消费素材；请查看对应步骤记录。',
+  },
   STORY_EFFECT_UNCONFIRMED: {
     summary: '快拍步骤效果未确认',
     next: '查看原任务记录；本次不自动重复输入或提交。',
@@ -239,8 +259,12 @@ const reasons: Record<string, { summary: string; next: string }> = {
     next: '检查商城是否可用，或调整关键词后运行新任务。',
   },
   FACEBOOK_MARKETPLACE_UNAVAILABLE: {
-    summary: '当前账号无法访问商城',
-    next: 'Facebook显示商城不可用页面或提示。请在该浏览器查看原因；这不代表账号被封禁。',
+    summary: '当前身份无法使用商城',
+    next: '已跳过商城，继续后续任务。',
+  },
+  MARKETPLACE_UNAVAILABLE: {
+    summary: '当前身份无法使用商城，已正常跳过',
+    next: '其他步骤照常执行，不计为任务失败。',
   },
   FACEBOOK_BROWSE_LOADING_OR_DIALOG_TIMEOUT: {
     summary: '页面加载或弹窗等待超时',
@@ -293,6 +317,7 @@ const reasons: Record<string, { summary: string; next: string }> = {
   },
 };
 export function taskReasonDescription(reason: string) {
+  if (reason.startsWith('POST_PREPARATION_TIMEOUT:')) return reasons.POST_PREPARATION_TIMEOUT;
   if (reason.startsWith('INITIAL_SESSION_FAILED:')) {
     const inner = reason.slice('INITIAL_SESSION_FAILED:'.length).trim();
     const innerKnown =

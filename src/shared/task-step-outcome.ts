@@ -39,15 +39,48 @@ export const TaskStepSkip = z
   .object({
     version: z.literal(1),
     kind: z.literal('SKIPPED'),
-    reason: z.enum(['DEPENDENCY_FAILED', 'RESOURCE_EXHAUSTED', 'FEATURE_UNAVAILABLE']),
+    reason: z.enum([
+      'DEPENDENCY_FAILED',
+      'RESOURCE_EXHAUSTED',
+      'FEATURE_UNAVAILABLE',
+      'MARKETPLACE_UNAVAILABLE',
+    ]),
     endedAt: z.number().int().nonnegative(),
     dependencyStepId: z.uuid().optional(),
+    endingId: z.uuid().optional(),
+    currentStop: CurrentStopReceipt.optional(),
   })
   .strict()
   .superRefine((value, issue) => {
     if ((value.reason === 'DEPENDENCY_FAILED') !== (value.dependencyStepId !== undefined))
       issue.addIssue({ code: 'custom', message: 'STEP_SKIP_DEPENDENCY_MISMATCH' });
+    if (value.reason === 'MARKETPLACE_UNAVAILABLE') {
+      if (!value.endingId || !value.currentStop || value.currentStop.requestId !== value.endingId)
+        issue.addIssue({ code: 'custom', message: 'MARKETPLACE_SKIP_STOP_REQUIRED' });
+    } else if (value.endingId || value.currentStop)
+      issue.addIssue({ code: 'custom', message: 'STEP_SKIP_UNEXPECTED_STOP' });
   });
 export const TaskStepOutcome = z.union([TaskStepFailure, TaskStepSkip]);
 
 export type StepOutcome = z.infer<typeof TaskStepOutcome>;
+
+export function isMarketplaceUnavailableSkip(
+  type: string,
+  status: string,
+  outcome?: Pick<StepOutcome, 'kind' | 'reason'>,
+): boolean {
+  return (
+    type === 'marketplace' &&
+    status === 'SKIPPED' &&
+    outcome?.kind === 'SKIPPED' &&
+    outcome.reason === 'MARKETPLACE_UNAVAILABLE'
+  );
+}
+
+export function isSuccessfulTaskStep(
+  type: string,
+  status: string,
+  outcome?: Pick<StepOutcome, 'kind' | 'reason'>,
+): boolean {
+  return status === 'COMPLETED' || isMarketplaceUnavailableSkip(type, status, outcome);
+}

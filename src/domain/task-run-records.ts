@@ -1,4 +1,5 @@
 import type { TaskRecord } from '../shared/task-contracts.js';
+import { isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
 
 export const endedTask = (state: string) => ['COMPLETED', 'STOPPED', 'FAILED'].includes(state);
 export type TaskRunGroup = {
@@ -37,12 +38,11 @@ export function groupTaskRecords(records: readonly TaskRecord[]): TaskRunGroup[]
             rows.every((r) => ['COMPLETED', 'FAILED', 'SKIPPED'].includes(r.status)))
             ? Math.max(...finishes)
             : null,
-        state:
-          completed === rows.length
-            ? 'COMPLETED'
-            : rows.some((r) => r.status === 'FAILED')
-              ? 'FAILED'
-              : (first?.planState ?? 'QUEUED'),
+        state: rows.every((r) => isSuccessfulTaskStep(r.type, r.status, r.outcome))
+          ? 'COMPLETED'
+          : rows.some((r) => r.status === 'FAILED')
+            ? 'FAILED'
+            : (first?.planState ?? 'QUEUED'),
       };
     })
     .sort(

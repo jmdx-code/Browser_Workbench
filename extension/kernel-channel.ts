@@ -753,6 +753,25 @@ export class ExtensionKernelChannel {
     // The identity read returns selected actor fields only; raw native requests, headers and
     // response metadata must never escape the read-only inspection via the event relay.
     if (this.access === 'facebook-readonly' && method.startsWith('Network.')) return;
+    // Stories can expose multi-megabyte inline resources as CDP network URLs. They
+    // are local bytes, not HTTP upload/submission evidence; do not serialize them
+    // across the task relay and disconnect the owning session. Fixture CDP is unchanged.
+    if (this.access === 'facebook-task' && value && typeof value === 'object') {
+      const resource =
+        method === 'Network.requestWillBeSent' && 'request' in value
+          ? value.request
+          : method === 'Network.responseReceived' && 'response' in value
+            ? value.response
+            : undefined;
+      if (
+        resource &&
+        typeof resource === 'object' &&
+        'url' in resource &&
+        typeof resource.url === 'string' &&
+        resource.url.startsWith('data:')
+      )
+        return;
+    }
     const params = KernelJsonObject.parse(value ?? {});
     // Chrome may report both Inspector.detached and debugger.onDetach for an intentional
     // native close. Peeking must not consume the callback's expected-detach marker.

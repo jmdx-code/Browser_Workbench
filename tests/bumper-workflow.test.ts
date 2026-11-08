@@ -363,3 +363,263 @@ it('an unclosed owned dialog stops before any following-post input', async () =>
   await vi.runAllTimersAsync();
   await pending;
 });
+
+function nativePostFixture() {
+  header('MEMBER');
+  const article = document.createElement('article');
+  article.setAttribute('role', 'article');
+  article.innerHTML = `<a href="/groups/${gid}/posts/${postId}/">1h</a><button data-ad-rendering-role="like_button">arbitrary</button>`;
+  document.querySelector('main')!.append(article);
+  for (const e of [article, ...article.querySelectorAll('*')]) rect(e);
+  const story = {
+    __id: 'story-' + postId,
+    post_id: postId,
+    actors: [{ id: actor }],
+    feedback: { id: 'fb-' + postId },
+    creation_time: Date.now() / 1000,
+  };
+  const card = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story },
+    return: null as unknown,
+  };
+  Reflect.set(article, '__reactFiber$test', card);
+  fiber(
+    article.querySelector('button')!,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'fb-' + postId } },
+    card,
+  );
+  return { article, card, button: article.querySelector('button')! };
+}
+it('an empty loading projection leaves connected controls intact, but resolved posts drop obsolete controls', () => {
+  const h = nativePostFixture();
+  expect(projectGroupBumper({ groupId: gid }).posts[0]?.likeCSS).not.toBeNull();
+  const loading = document.createElement('span');
+  h.article.append(loading);
+  rect(loading);
+  fiber(loading, 'CometFeedGlimmer.react', {}, h.card);
+  const during = projectGroupBumper({ groupId: gid });
+  expect(during.loading).toBe(true);
+  expect(during.posts).toEqual([]);
+  expect(h.button.isConnected).toBe(true);
+  expect(h.button.getAttribute('data-wb-bumper-like')).toBe(postId);
+  loading.remove();
+  h.button.removeAttribute('data-ad-rendering-role');
+  Reflect.deleteProperty(h.button, '__reactFiber$test');
+  const after = projectGroupBumper({ groupId: gid });
+  expect(after.posts[0]?.postId).toBe(postId);
+  expect(after.posts[0]?.likeCSS).toBeNull();
+  expect(h.button.hasAttribute('data-wb-bumper-like')).toBe(false);
+});
+it('a DOM shell cannot borrow a nested native Story feedback, video, author or timestamp', () => {
+  header('MEMBER');
+  document.head.innerHTML = '<base href="https://www.facebook.com/">';
+  const outer = document.createElement('article');
+  outer.setAttribute('role', 'article');
+  const innerId = '333333333333333',
+    innerActor = '61500000000002';
+  outer.innerHTML = `<a href="https://www.facebook.com/groups/${gid}/user/${actor}/">Outer</a><a href="https://www.facebook.com/groups/${gid}/posts/${postId}/">1h</a><section role="article" id="native"><a href="https://www.facebook.com/groups/${gid}/posts/${innerId}/">2h</a><button data-ad-rendering-role="like_button">whatever</button><video></video></section>`;
+  document.querySelector('main')!.append(outer);
+  for (const e of [outer, ...outer.querySelectorAll('*')]) rect(e);
+  const inner = outer.querySelector('#native')!,
+    card = {
+      type: { displayName: 'CometFeedUnitCard.react' },
+      memoizedProps: {
+        story: {
+          __id: 'inner-story',
+          post_id: innerId,
+          actors: [{ id: innerActor }],
+          feedback: { id: 'inner-feedback' },
+          creation_time: Date.now() / 1000 - 7200,
+        },
+        isPinned: true,
+      },
+      return: null,
+    };
+  Reflect.set(inner, '__reactFiber$test', card);
+  fiber(
+    inner.querySelector('button')!,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'inner-feedback' } },
+    card,
+  );
+  fiber(inner.querySelector('video')!, 'CometVideoPlayer.react', {}, card);
+  const s = projectGroupBumper({ groupId: gid });
+  const a = s.posts.find((p) => p.postId === postId)!,
+    b = s.posts.find((p) => p.postId === innerId)!;
+  expect(s.posts.map((p) => ({ id: p.postId, author: p.authorId }))).toEqual([
+    { id: postId, author: actor },
+    { id: innerId, author: innerActor },
+  ]);
+  expect(a.authorId).toBe(actor);
+  expect(a.feedbackId).toBeNull();
+  expect(a.likeCSS).toBeNull();
+  expect(a.hasVideo).toBe(false);
+  expect(a.pinned).toBe(false);
+  expect(b.authorId).toBe(innerActor);
+  expect(b.likeCSS).not.toBeNull();
+  expect(document.querySelector(b.likeCSS!)?.getAttribute('data-wb-bumper-like')).toBe(innerId);
+  for (const p of s.posts)
+    for (const css of [p.postCSS, p.likeCSS, p.commentCSS, p.videoCSS])
+      if (css) expect(document.querySelector(css)).not.toBeNull();
+});
+it('loading ancestors outside a resolved Card do not discard its controls', () => {
+  const h = nativePostFixture();
+  h.card.return = {
+    type: { displayName: 'CometFeedGlimmer.react' },
+    memoizedProps: {},
+    return: null,
+  };
+  const s = projectGroupBumper({ groupId: gid });
+  expect(s.posts.find((p) => p.postId === postId)?.likeCSS).not.toBeNull();
+});
+it('single-post preparation refreshes before centering, retries a replaced node and verifies after centering', async () => {
+  vi.useFakeTimers();
+  const { prepareBumperPost, BumperPostReadIncomplete } =
+    await import('../src/infrastructure/group-bumper-runner.js');
+  const current = {
+    postId,
+    postCSS: '#current',
+    likeCSS: '#current-like',
+    hasVideo: false,
+  } as BumperPost;
+  const events: string[] = [];
+  let reads = 0,
+    centers = 0;
+  const page = {
+    locator: (css: string) => {
+      events.push('loc:' + css);
+      return {
+        first: () => ({
+          evaluate: async () => {
+            events.push('center');
+            if (centers++ === 0) throw Error('locator.evaluate: Timeout 750ms exceeded.');
+          },
+        }),
+      };
+    },
+  } as unknown as Page;
+  const work = prepareBumperPost({
+    page,
+    paceScale: 0,
+    timeoutMs: 1500,
+    guard: () => {},
+    readCurrent: async () => {
+      events.push('read');
+      if (reads++ === 0) throw new BumperPostReadIncomplete();
+      return current;
+    },
+  });
+  await vi.runAllTimersAsync();
+  expect(await work).toBe(current);
+  expect(events[0]).toBe('read');
+  expect(events.at(-1)).toBe('read');
+  expect(centers).toBe(2);
+  expect(events.filter((e) => e.startsWith('loc:'))).toEqual(['loc:#current', 'loc:#current']);
+});
+it('preparation timeout and stop do not emit business inputs or keep retrying indefinitely', async () => {
+  vi.useFakeTimers();
+  const { prepareBumperPost, BumperPostReadIncomplete } =
+    await import('../src/infrastructure/group-bumper-runner.js');
+  const locator = vi.fn();
+  let stopped = false;
+  const read = vi.fn(async () => {
+    throw new BumperPostReadIncomplete();
+  });
+  const work = expect(
+    prepareBumperPost({
+      page: { locator } as unknown as Page,
+      readCurrent: read,
+      guard: () => {
+        if (stopped) throw Error('stopped');
+      },
+      timeoutMs: 500,
+      paceScale: 0,
+    }),
+  ).rejects.toThrow('准备超时');
+  await vi.runAllTimersAsync();
+  await work;
+  expect(read.mock.calls.length).toBeLessThanOrEqual(4);
+  expect(locator).not.toHaveBeenCalled();
+  const stop = expect(
+    prepareBumperPost({
+      page: { locator } as unknown as Page,
+      readCurrent: read,
+      guard: () => {
+        if (stopped) throw Error('stopped');
+      },
+      timeoutMs: 12000,
+    }),
+  ).rejects.toThrow('stopped');
+  stopped = true;
+  await vi.runAllTimersAsync();
+  await stop;
+});
+it('an unloaded candidate is scrolled once as a card and must be re-read before preparation succeeds', async () => {
+  vi.useFakeTimers();
+  const { prepareBumperPost, BumperPostReadIncomplete } =
+    await import('../src/infrastructure/group-bumper-runner.js');
+  const current = { postId, postCSS: '#fresh-card', likeCSS: '#fresh-like' } as BumperPost;
+  const centered: string[] = [];
+  let hydrated = false;
+  const work = prepareBumperPost({
+    page: {
+      locator: (css: string) => ({
+        first: () => ({
+          evaluate: async () => {
+            centered.push(css);
+            hydrated = true;
+          },
+        }),
+      }),
+    } as unknown as Page,
+    candidateCardCSS: '#candidate-card',
+    readCurrent: async () => {
+      if (!hydrated) throw new BumperPostReadIncomplete();
+      return current;
+    },
+    guard: () => {},
+    paceScale: 0,
+  });
+  await vi.runAllTimersAsync();
+  expect(await work).toBe(current);
+  expect(centered).toEqual(['#candidate-card', '#fresh-card']);
+  expect(centered).not.toContain('#fresh-like');
+});
+it('an inner Story logger is not assigned to a different enclosing native Card', () => {
+  const h = nativePostFixture(),
+    innerId = '444444444444444',
+    innerActor = '61500000000003';
+  const nested = document.createElement('section');
+  nested.innerHTML = `<a href="https://www.facebook.com/groups/${gid}/posts/${innerId}/">inner</a><button data-ad-rendering-role="like_button">any label</button>`;
+  h.article.append(nested);
+  for (const el of [nested, ...nested.querySelectorAll('*')]) rect(el);
+  const logger = {
+    type: { displayName: 'CometFeedStoryClickLoggerContainer.react' },
+    memoizedProps: {
+      story: {
+        __id: 'inner-story',
+        post_id: innerId,
+        actors: [{ id: innerActor }],
+        feedback: { id: 'inner-feedback' },
+      },
+    },
+    return: h.card,
+  };
+  Reflect.set(nested, '__reactFiber$test', logger);
+  fiber(nested.querySelector('a')!, 'CometLink.react', {}, logger);
+  fiber(
+    nested.querySelector('button')!,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'inner-feedback' } },
+    logger,
+  );
+  const s = projectGroupBumper({ groupId: gid });
+  const a = s.posts.find((p) => p.postId === postId)!,
+    b = s.posts.find((p) => p.postId === innerId)!;
+  expect(a.authorId).toBe(actor);
+  expect(b.authorId).toBe(innerActor);
+  expect(document.querySelector(a.likeCSS!)).toBe(h.button);
+  expect(document.querySelector(b.likeCSS!)).toBe(nested.querySelector('button'));
+});

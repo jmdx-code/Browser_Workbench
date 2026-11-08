@@ -8,17 +8,19 @@ import type {
 } from '../domain/facebook-post-execution.js';
 import type { TaskRepository } from '../domain/tasks.js';
 import type { MaterialPostRepository } from '../domain/material-post.js';
-import { validatePostAction } from '../domain/material-post.js';
+import { validatePostAction, postAILabelSetting } from '../domain/material-post.js';
+import { decidePostAILabel, aiLabelEffectObserved } from '../domain/facebook-ai-label.js';
 import {
   decideStoryFriendsPrivacy,
   type StoryPrivacyCheckpoint,
 } from '../domain/facebook-story-privacy.js';
 import { sameTabProof } from '../domain/task-tabs.js';
+import { isEmptyStoryEditor } from '../domain/facebook-story-preparation.js';
 import { storyPrivacyTargets } from '../shared/facebook-story-privacy.js';
 import { sameExecution, sameBinding } from '../shared/task-execution.js';
 import { Action } from '../shared/browser-actions.js';
 import { matchesOriginalStoryMedia } from '../domain/facebook-story-media.js';
-import { matchesDerivedStoryCaption } from '../domain/facebook-story-video.js';
+import { matchesDerivedStoryCaption, matchesStoryContent } from '../domain/facebook-story-video.js';
 import { storyMediaTextFinish, nativeStoryMediaTextLimit } from '../shared/facebook-story.js';
 import type { Reservation } from '../shared/material-index.js';
 import {
@@ -76,8 +78,12 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
     if (execution.step.spec.type !== 'post' || execution.step.spec.destination !== 'story')
       throw Error('STORY_STEP_REQUIRED');
     if (!(await this.available())) return { kind: 'wait', reason: 'STORY_ADAPTERS_REQUIRED' };
-    if (!(await this.friendsAuthorized(execution)) || execution.step.spec.audience !== 'friends')
+    if (!(await this.friendsAuthorized(execution)))
       throw Error('STORY_FRIENDS_AUTHORIZATION_REQUIRED');
+    if (
+      !['friends', 'preserve-current'].includes(execution.step.spec.audience ?? 'preserve-current')
+    )
+      throw Error('STORY_AUDIENCE_UNSUPPORTED');
     const reading = await this.source.read(execution, guard);
     await guard();
     this.assertReading(execution, reading);
@@ -85,7 +91,25 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
     if (active.length > 1) throw Error('STORY_MULTIPLE_ACTIVE_ATTEMPTS');
     const held = active[0];
     if (!held) {
-      if (!reading.homePreparation?.safe && reading.story?.phase !== 'entry')
+      if (
+        reading.story &&
+        !['entry', 'ambiguous'].includes(reading.story.phase) &&
+        !isEmptyStoryEditor(reading.story)
+      )
+        // A just-confirmed Story may still be leaving its editor. Preserve that
+        // normal inter-publication wait; never reset or overwrite its contents.
+        return {
+          kind: 'wait',
+          reason:
+            execution.step.progress.published > 0
+              ? 'STORY_EMPTY_ENTRY_REQUIRED'
+              : 'STORY_FOREIGN_DRAFT',
+        };
+      if (
+        !reading.homePreparation?.safe &&
+        reading.story?.phase !== 'entry' &&
+        !(reading.storyRestartAllowed && isEmptyStoryEditor(reading.story))
+      )
         return {
           kind: 'wait',
           reason: reading.homePreparation?.reason ?? 'STORY_EMPTY_ENTRY_REQUIRED',
@@ -148,6 +172,24 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
       routeEpoch: reading.routeEpoch,
     };
     const story = reading.story;
+    const finish = (): PostExecutionDecision => {
+      if (!story?.submit?.enabled) return { kind: 'wait', reason: 'STORY_SUBMIT_NOT_READY' };
+      const ai = decidePostAILabel(
+        postAILabelSetting(
+          intent,
+          execution.step.spec.type === 'post' ? execution.step.spec.aiLabel : undefined,
+        ),
+        reading.aiLabel,
+        applied,
+      );
+      if (ai.kind === 'wait') return { kind: 'wait', reason: 'POST_AI_LABEL_LOADING' };
+      if (ai.kind === 'action')
+        return operation(ai.purpose, Action.parse({ kind: 'click', ...fields, target: ai.target }));
+      return operation(
+        'SUBMIT',
+        Action.parse({ kind: 'click', ...fields, target: { css: story.submit.css } }),
+      );
+    };
     if (!story) {
       if (applied('PREPARE_STORY') || applied('OPEN_COMPOSER') || applied('UPLOAD_MEDIA'))
         throw Error('STORY_EDITOR_CLOSED');
@@ -164,6 +206,15 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
     }
     if (!story.ready || !story.visible || story.phase === 'ambiguous')
       return { kind: 'wait', reason: 'STORY_EDITOR_NOT_READY' };
+    if (!history.length && reading.storyRestartAllowed && isEmptyStoryEditor(story))
+      return operation(
+        'PREPARE_STORY',
+        Action.parse({
+          kind: 'browseNavigate',
+          tabId: reading.proof.tabId,
+          url: 'https://www.facebook.com/stories/create/',
+        }),
+      );
     if (!media && !applied('OPEN_COMPOSER')) {
       if (story.phase !== 'entry' || !story.textEntry?.enabled)
         return { kind: 'wait', reason: 'STORY_EMPTY_ENTRY_REQUIRED' };
@@ -198,7 +249,11 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
           : applied('OPEN_AUDIENCE')
             ? 'SELECT_FRIENDS'
             : 'OPEN_INITIAL';
-    const privacy = decideStoryFriendsPrivacy(checkpoint, story.privacy);
+    const privacy = decideStoryFriendsPrivacy(
+      checkpoint,
+      story.privacy,
+      execution.step.spec.audience === 'friends' ? 'friends' : 'preserve-current',
+    );
     if (privacy.kind === 'wait') return privacy;
     if (privacy.kind === 'action') {
       if (applied('SET_TEXT')) throw Error('STORY_PRIVACY_CHANGED_AFTER_CONTENT');
@@ -228,12 +283,11 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
       );
     }
     if (uploaded && !applied('OPEN_COMPOSER')) {
-      if (matchesDerivedStoryCaption(story, intent)) {
+      if (matchesDerivedStoryCaption(story, intent) || intent.snapshot.text === '') {
+        if (!matchesStoryContent(story, intent) || story.textEditing)
+          throw Error('STORY_FOREIGN_DRAFT');
         return story.submit?.enabled && !applied('SUBMIT')
-          ? operation(
-              'SUBMIT',
-              Action.parse({ kind: 'click', ...fields, target: { css: story.submit.css } }),
-            )
+          ? finish()
           : { kind: 'wait', reason: 'STORY_SUBMIT_NOT_READY' };
       }
       if (story.text !== '' || story.textEditing) throw Error('STORY_FOREIGN_DRAFT');
@@ -261,7 +315,7 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
           target: { css: story.textCSS },
         }),
       );
-    if (story.text !== intent.snapshot.text) throw Error('STORY_ORIGINAL_TEXT_CHANGED');
+    if (!matchesStoryContent(story, intent)) throw Error('STORY_ORIGINAL_TEXT_CHANGED');
     if (uploaded && story.textEditing) {
       if (applied('ADVANCE_COMPOSER')) throw Error('STORY_TEXT_FINISH_UNCONFIRMED');
       return operation(
@@ -269,11 +323,7 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
         Action.parse({ kind: 'click', ...fields, target: storyMediaTextFinish }),
       );
     }
-    if (story.submit?.enabled && !applied('SUBMIT'))
-      return operation(
-        'SUBMIT',
-        Action.parse({ kind: 'click', ...fields, target: { css: story.submit.css } }),
-      );
+    if (story.submit?.enabled && !applied('SUBMIT')) return finish();
     return { kind: 'wait', reason: 'STORY_SUBMIT_NOT_READY' };
   }
   async verify(
@@ -327,7 +377,7 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
       purpose === 'UPLOAD_MEDIA' &&
       original.intent.snapshot.format === 'video' &&
       story?.nativeVideoCanvas &&
-      !matchesDerivedStoryCaption(story, original.intent)
+      !matchesOriginalStoryMedia(story, original.intent)
     ) {
       if (process.env.WORKBENCH_TRACE_TIMING === '1') {
         const files = original.intent.snapshot.files.filter((file) => file.role === 'video');
@@ -351,9 +401,12 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
       }
       // The native canvas appears before the original upload response. Observe that
       // same transfer within the runner's existing video budget; never upload again.
-      return story.videoTransfer
-        ? { kind: 'unknown', reason: 'STORY_VIDEO_CANVAS_ADAPTER_REQUIRED' }
-        : { kind: 'wait', reason: 'STORY_VIDEO_TRANSFER_PENDING' };
+      return {
+        kind: 'wait',
+        reason: story.videoTransfer
+          ? 'STORY_VIDEO_PREVIEW_PENDING'
+          : 'STORY_VIDEO_TRANSFER_PENDING',
+      };
     }
     const editor =
       story?.ready && story.visible && ['text-editor', 'media-editor'].includes(story.phase);
@@ -362,8 +415,16 @@ export class FacebookStoryStepExecutor implements PostStepExecutor {
       (original.intent.snapshot.format === 'text'
         ? editor && story.text === ''
         : story.ready && story.visible && story.phase === 'entry' && story.text === null);
-    const applied =
-      purpose === 'UPLOAD_MEDIA'
+    const applied = ['OPEN_AI_LABEL', 'SET_AI_LABEL', 'CONFIRM_AI_LABEL'].includes(purpose)
+      ? aiLabelEffectObserved(
+          purpose,
+          reading.aiLabel,
+          postAILabelSetting(
+            original.intent,
+            execution.step.spec.type === 'post' ? execution.step.spec.aiLabel : undefined,
+          ),
+        )
+      : purpose === 'UPLOAD_MEDIA'
         ? !!story && matchesOriginalStoryMedia(story, original.intent)
         : purpose === 'PREPARE_STORY'
           ? story?.ready && story.phase === 'entry'

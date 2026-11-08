@@ -15,6 +15,9 @@ import { storyPrivacyTargets } from '../src/shared/facebook-story-privacy.js';
 import { postFixture, postRequest, deliverPostNotices } from './fixtures/material-post.js';
 import { FacebookPublishingAdapters } from '../src/infrastructure/facebook-publishing-adapters.js';
 import type { KernelManagedFacebookSession } from '../src/infrastructure/kernel-managed-facebook-session.js';
+import { writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
 
 // Real original SQLite/outbox/receipt flow, generated actor/DOM effects, no browser input.
 async function fixture(
@@ -23,8 +26,16 @@ async function fixture(
   alreadyFriends = false,
   loseSave = false,
   nativeChangeConfirmation = false,
+  audience: 'friends' | 'preserve-current' = 'friends',
+  sourceName?: string,
+  aiLabel?: 'on' | 'off',
 ) {
-  const r = await postRequest(store, catalog, { destination: 'story', audience: 'friends' });
+  const r = await postRequest(store, catalog, {
+    destination: 'story',
+    audience,
+    source: sourceName,
+    aiLabel,
+  });
   await store.materials.reserve(r);
   const plan = await store.tasks.get(r.jobId),
     step = (await store.tasks.steps(r.jobId))[0];
@@ -53,11 +64,11 @@ async function fixture(
     phase: 'entry',
     text: null,
     textCSS: '[role="textbox"][contenteditable="true"]',
-    mediaCSS: null,
+    mediaCSS: 'input[type="file"]',
     textEntry: { css: '[role="button"][aria-label="Create a text story"]', enabled: true },
     submit: { css: '[role="button"][aria-label="Share to story"]', enabled: true },
     fontCSS: null,
-    ai: null,
+    ai: aiLabel ? { css: '[data-wb-ai-label-switch="1"]', checked: aiLabel === 'off' } : null,
     privacy: {
       phase: 'CLOSED',
       draftSelection: null,
@@ -73,6 +84,21 @@ async function fixture(
     catalogId: () => catalog.id,
     read: async (_e, guard) => {
       await guard();
+      if (aiLabel && reading.story) {
+        const ready = ['text-editor', 'media-editor'].includes(reading.story.phase);
+        reading.aiLabel = {
+          url: reading.story.url,
+          timeOrigin: reading.story.timeOrigin,
+          ready: true,
+          visible: true,
+          phase: ready ? 'composer' : 'absent',
+          mode: 'inline',
+          value: ready ? reading.story.ai!.checked : null,
+          openCSS: null,
+          switchEnabled: ready,
+          confirmEnabled: false,
+        };
+      }
       return structuredClone(reading);
     },
     verifyBusiness: async (_e, _op, _original, guard) => {
@@ -155,6 +181,21 @@ async function fixture(
     }
     if (purpose === 'SET_TEXT' && operation.action.kind === 'typeText')
       story.text = operation.action.text;
+    if (purpose === 'SET_AI_LABEL') {
+      assert.ok(story.ai);
+      story.ai.checked = !story.ai.checked;
+    }
+    if (purpose === 'UPLOAD_MEDIA') {
+      const intent = (await store.materials.reservation(r.attemptId)).intent;
+      const file = intent.snapshot.files.find((row) => row.role === 'image');
+      assert.ok(file);
+      story.phase = 'media-editor';
+      story.text = '';
+      story.media = { kind: 'image', ready: true, bytes: file.bytes, sha256: file.digest };
+      story.mediaCSS = null;
+      story.addText = null;
+      story.textEditing = false;
+    }
     reading.text = story.text;
     await store.tasks.acknowledgeBound({
       binding: operation.binding,
@@ -180,6 +221,139 @@ async function fixture(
   };
   return { r, source, executor, current, reading, decide, apply };
 }
+
+for (const media of [false, true])
+  test(`an authorized retained empty text editor restarts for ${media ? 'image' : 'text'} and then follows the original preparation operations`, async () => {
+    await postFixture(async (store, _file, original) => {
+      await writeFile(
+        path.join(original.directory, 'retry.png'),
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
+          'base64',
+        ),
+      );
+      const catalog = store.materials.index(
+        await new FilesystemMaterialScanner().scan(original.directory),
+        randomUUID(),
+      );
+      const h = await fixture(
+        store,
+        catalog,
+        false,
+        false,
+        false,
+        'preserve-current',
+        media ? 'retry.png' : undefined,
+      );
+      h.reading.story = {
+        url: 'https://www.facebook.com/stories/create/',
+        timeOrigin: 50,
+        locale: 'my_MM',
+        ready: true,
+        visible: true,
+        phase: 'text-editor',
+        text: '',
+        textCSS: '[role=textbox]',
+        mediaCSS: null,
+        textEntry: null,
+        submit: null,
+        fontCSS: null,
+        ai: null,
+        hasSelectedMedia: false,
+        privacy: {
+          phase: 'MENU',
+          draftSelection: 'PUBLIC',
+          openEnabled: false,
+          friendsEnabled: false,
+          saveEnabled: true,
+          cancelEnabled: true,
+        },
+      };
+      delete h.reading.homePreparation;
+      h.reading.url = h.reading.story.url;
+      h.reading.timeOrigin = 50;
+      h.reading.storyRestartAllowed = true;
+      assert.equal((await h.executor.decide(await h.current(), [], () => {})).kind, 'reserve-next');
+      const expected = media
+        ? ['PREPARE_STORY', 'OPEN_AUDIENCE', 'CLOSE_AUDIENCE', 'UPLOAD_MEDIA']
+        : ['PREPARE_STORY', 'OPEN_COMPOSER', 'OPEN_AUDIENCE', 'CLOSE_AUDIENCE', 'SET_TEXT'];
+      const purposes = [];
+      for (const _ of expected) purposes.push((await h.apply()).purpose);
+      assert.deepEqual(purposes, expected);
+      const next = await h.decide();
+      assert.equal(next.kind === 'action' && next.operation.purpose, 'SUBMIT');
+      assert.equal(store.tasks.steps(h.r.jobId)[0]?.progress.published, 0);
+    }, false);
+  });
+
+test('an unproven empty editor and nonempty draft are preserved without starting an operation', async () => {
+  await postFixture(async (store, _file, catalog) => {
+    const h = await fixture(store, catalog);
+    await h.apply();
+    await h.apply(); // Create a real editor, then inspect an unrelated new admission.
+    h.reading.storyRestartAllowed = false;
+    const blocked = await h.executor.decide(await h.current(), [], () => {});
+    assert.equal(blocked.kind === 'wait' && blocked.reason, 'STORY_EMPTY_ENTRY_REQUIRED');
+    h.reading.story!.text = 'user-owned draft';
+    h.reading.storyRestartAllowed = true;
+    const draft = await h.executor.decide(await h.current(), [], () => {});
+    assert.equal(draft.kind === 'wait' && draft.reason, 'STORY_FOREIGN_DRAFT');
+    const following = await h.current();
+    following.step.progress.published = 1;
+    const leavingPublishedEditor = await h.executor.decide(following, [], () => {});
+    assert.equal(
+      leavingPublishedEditor.kind === 'wait' && leavingPublishedEditor.reason,
+      'STORY_EMPTY_ENTRY_REQUIRED',
+    );
+  }, false);
+});
+
+test('story preserve-current reaches exact content without any range selection or privacy Save', async () => {
+  await postFixture(async (store, _file, catalog) => {
+    const h = await fixture(store, catalog, false, false, false, 'preserve-current');
+    const purposes: string[] = [];
+    for (let i = 0; i < 5; i++) purposes.push((await h.apply()).purpose);
+    assert.deepEqual(purposes, [
+      'PREPARE_STORY',
+      'OPEN_COMPOSER',
+      'OPEN_AUDIENCE',
+      'CLOSE_AUDIENCE',
+      'SET_TEXT',
+    ]);
+    const next = await h.decide();
+    assert.equal(next.kind === 'action' && next.operation.purpose, 'SUBMIT');
+    assert.equal((await store.tasks.steps(h.r.jobId))[0]?.progress.published, 0);
+    assert.equal((await store.materials.reservation(h.r.attemptId)).state, 'RESERVED');
+  }, false);
+});
+
+test('an original image with no caption proceeds without opening an unnecessary text tool', async () => {
+  await postFixture(async (store, _file, original) => {
+    await writeFile(
+      path.join(original.directory, 'image.png'),
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    const catalog = store.materials.index(
+      await new FilesystemMaterialScanner().scan(original.directory),
+      randomUUID(),
+    );
+    const h = await fixture(store, catalog, true, false, false, 'friends', 'image.png');
+    const purposes: string[] = [];
+    for (let i = 0; i < 4; i++) purposes.push((await h.apply()).purpose);
+    assert.deepEqual(purposes, [
+      'PREPARE_STORY',
+      'OPEN_AUDIENCE',
+      'CLOSE_AUDIENCE',
+      'UPLOAD_MEDIA',
+    ]);
+    const decision = await h.decide();
+    assert.equal(decision.kind === 'action' && decision.operation.purpose, 'SUBMIT');
+    assert.equal((await store.tasks.steps(h.r.jobId))[0]?.progress.published, 0);
+  }, false);
+});
 
 test('native canvas waits for the same original transfer and still grants no publication readiness', async () => {
   await postFixture(async (store, _file, catalog) => {
@@ -216,8 +390,8 @@ test('native canvas waits for the same original transfer and still grants no pub
       receivedBytes: 100,
     };
     assert.deepEqual(await h.executor.verify(await h.current(), pending, original, () => {}), {
-      kind: 'unknown',
-      reason: 'STORY_VIDEO_CANVAS_ADAPTER_REQUIRED',
+      kind: 'wait',
+      reason: 'STORY_VIDEO_PREVIEW_PENDING',
     });
     assert.equal((await store.tasks.steps(h.r.jobId))[0]?.progress.published, 0);
     assert.equal((await store.tasks.operations(h.r.jobId)).length, 1);
@@ -397,3 +571,56 @@ test('story executor stays unauthorized by default and rejects a changed native 
     assert.equal((await store.tasks.operations(h.r.jobId)).length, 0);
   }, false);
 });
+for (const setting of ['on', 'off'] as const)
+  for (const image of [false, true]) {
+    test(`${image ? 'image' : 'text'} story AI ${setting} uses original persisted SET after content and before SUBMIT`, async () => {
+      await postFixture(async (store, _file, original) => {
+        if (image)
+          await writeFile(
+            path.join(original.directory, 'image.png'),
+            Buffer.from(
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
+              'base64',
+            ),
+          );
+        const catalog = image
+          ? store.materials.index(
+              await new FilesystemMaterialScanner().scan(original.directory),
+              randomUUID(),
+            )
+          : original;
+        const h = await fixture(
+          store,
+          catalog,
+          true,
+          false,
+          false,
+          'preserve-current',
+          image ? 'image.png' : undefined,
+          setting,
+        );
+        const purposes: string[] = [];
+        for (let i = 0; i < 15; i++) {
+          const d = await h.decide();
+          assert.equal(d.kind, 'action');
+          if (d.kind !== 'action') throw Error('EXPECTED_ACTION');
+          if (d.operation.purpose === 'SUBMIT') break;
+          purposes.push((await h.apply()).purpose);
+        }
+        assert(purposes.includes('SET_AI_LABEL'));
+        assert.equal(purposes.filter((p) => p === 'SET_AI_LABEL').length, 1);
+        assert(!purposes.includes('OPEN_AI_LABEL') && !purposes.includes('CONFIRM_AI_LABEL'));
+        assert(
+          purposes.indexOf(image ? 'UPLOAD_MEDIA' : 'SET_TEXT') < purposes.indexOf('SET_AI_LABEL'),
+        );
+        assert.equal(h.reading.story?.ai?.checked, setting === 'on');
+        assert.equal((await h.decide()).kind, 'action');
+        const next = await h.decide();
+        assert.equal(next.kind === 'action' && next.operation.purpose, 'SUBMIT');
+        const ops = await store.tasks.operations(h.r.jobId);
+        const set = ops.find((o) => store.materialPosts.link(o.id).purpose === 'SET_AI_LABEL');
+        assert.equal(set?.status, 'VERIFIED');
+        assert.equal((await store.tasks.steps(h.r.jobId))[0]?.progress.published, 0);
+      }, false);
+    });
+  }

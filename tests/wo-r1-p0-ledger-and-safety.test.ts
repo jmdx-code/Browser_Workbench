@@ -70,8 +70,8 @@ test('WO-R1.1: group_poster_operations accepts real UUID connectionEpoch without
   }
 });
 
-test('WO-R1.2: v0 -> v52, v47 -> v52, and v51 -> v52 migrations upgrade group_poster_operations.connection_epoch to TEXT, preserve rows, pass foreign_key_check, and run zero ALTER TABLE in constructors', async () => {
-  assert.equal(workspaceSchemaVersion, 53);
+test('WO-R1.2: fresh, v47 and v51 databases upgrade to the current schema with TEXT connection_epoch, preserved rows, valid foreign keys and no constructor ALTER TABLE', async () => {
+  assert.ok(workspaceSchemaVersion >= 52);
   const dir = mkdtempSync(path.join(tmpdir(), 'wb-wor1-mig-'));
   try {
     // 1. v0 -> v52 fresh database

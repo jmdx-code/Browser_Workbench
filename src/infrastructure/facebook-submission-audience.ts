@@ -1,11 +1,29 @@
 import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
+import { projectFacebookComposerAudience } from './facebook-composer-audience.js';
 
 // The exact Chinese privacy label and SELF text were captured in the authorized Reels DOM;
 // the standard editor uses that same privacy control (public variant observed on Maw Htwe).
 // Standard SELF composition remains to be live-validated. This never changes privacy.
-export function projectFacebookSubmissionAudience() {
+export function projectFacebookSubmissionAudience(native?: {
+  phase: string;
+  audience: 'SELF' | null;
+  url: string;
+  timeOrigin: number;
+}) {
+  if (native && native.phase !== 'UNAVAILABLE')
+    return {
+      url: location.href,
+      timeOrigin: performance.timeOrigin,
+      ready: document.readyState,
+      audience:
+        native.url === location.href &&
+        native.timeOrigin === performance.timeOrigin &&
+        native.phase === 'COMPOSER'
+          ? native.audience
+          : null,
+    };
   const visible = (element: Element) => {
     const rect = element.getBoundingClientRect();
     return (
@@ -89,7 +107,12 @@ const reading = z
   .strict();
 export async function readFacebookSubmissionAudience(page: Page, guard: () => Awaitable<void>) {
   await guard();
-  const result = reading.parse(await page.evaluate(projectFacebookSubmissionAudience));
+  const result = reading.parse(
+    await page.evaluate(`(() => {
+    const native = (${projectFacebookComposerAudience.toString()})();
+    return (${projectFacebookSubmissionAudience.toString()})(native);
+  })()`),
+  );
   await guard();
   if (new URL(result.url).origin !== 'https://www.facebook.com')
     throw Error('SUBMISSION_AUDIENCE_ORIGIN');

@@ -73,8 +73,6 @@ export const StepSchema = z.discriminatedUnion('type', [
     })
     .strict()
     .superRefine((step, ctx) => {
-      if (step.destination === 'story' && step.aiLabel && step.aiLabel !== 'preserve-current')
-        ctx.addIssue({ code: 'custom', message: '快拍 AI 声明暂不支持指定值', path: ['aiLabel'] });
       if (step.audience === 'friends' && step.destination !== 'story')
         ctx.addIssue({ code: 'custom', message: '好友范围目前仅用于快拍', path: ['audience'] });
       if (step.resourceMode !== 'table' && !step.resourceDirectory)

@@ -78,7 +78,18 @@ export function createFacebookMaterialInputs(
         );
         return step?.spec.type === 'post' && step.spec.destination === 'story';
       },
-      new FacebookStoryComposerObserver(readStory),
+      new FacebookStoryComposerObserver(
+        readStory,
+        async (post) => {
+          const step = (await store.tasks.steps(post.intent.jobId)).find(
+            (row) => row.id === post.intent.stepId,
+          );
+          return step?.spec.type === 'post'
+            ? (step.spec.audience ?? 'preserve-current')
+            : 'friends';
+        },
+        (post) => store.tasks.canRestartStoryPage(post.intent.jobId, post.intent.proof),
+      ),
     ),
     submission,
   };

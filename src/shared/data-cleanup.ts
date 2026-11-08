@@ -40,6 +40,9 @@ export const CleanupSettings = z
     revision: z.number().int().nonnegative(),
     historyRetentionDays: z.number().int().min(1).max(3650).nullable(),
     historyMaxCount: z.number().int().min(1).max(100000).nullable().optional(),
+    bumperMaxCount: z.number().int().min(1).max(1000000).default(300000),
+    posterMaxCount: z.number().int().min(1).max(1000000).default(100000),
+    detailMaxCount: z.number().int().min(1).max(100000).default(1000),
     automaticLogs: z.boolean(),
     logRetentionDays: z.number().int().min(1).max(90),
   })
@@ -49,6 +52,9 @@ export const SaveCleanupSettings = z
     expectedRevision: z.number().int().nonnegative(),
     historyRetentionDays: CleanupSettings.shape.historyRetentionDays,
     historyMaxCount: CleanupSettings.shape.historyMaxCount,
+    bumperMaxCount: z.number().int().min(1).max(1000000).optional(),
+    posterMaxCount: z.number().int().min(1).max(1000000).optional(),
+    detailMaxCount: z.number().int().min(1).max(100000).optional(),
     automaticLogs: z.boolean().default(false),
   })
   .strict();
@@ -57,3 +63,6 @@ export const ResetWorkspace = z
   .strict();
 export type RecordCleanup = z.infer<typeof RecordCleanupScope>;
 export type CleanupConfiguration = z.infer<typeof CleanupSettings>;
+
+export const DetailBoundary = z.object({ at: z.number().finite(), key: z.string() }).strict();
+export type DetailBoundaryValue = z.infer<typeof DetailBoundary>;

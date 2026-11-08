@@ -52,7 +52,7 @@ async function request(route, value) {
       cookie,
       origin,
       'content-type': 'application/json',
-      'x-workbench-task-contract': '4',
+      'x-workbench-task-contract': '5',
       'x-workbench-workspace-contract': '6',
     },
     body: value === undefined ? undefined : JSON.stringify(value),

@@ -33,6 +33,7 @@ export interface FacebookPostPageReading {
     reason?: 'FACEBOOK_BROWSE_FOREGROUND_REQUIRED' | 'POST_HOME_PREPARATION_BLOCKED';
   };
   story?: StoryPage;
+  storyRestartAllowed?: boolean;
   aiLabel?: AILabelReading;
 }
 

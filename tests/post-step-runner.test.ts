@@ -320,6 +320,26 @@ test('an unconfirmed post effect reaches a bounded timeout without resending or 
   }
 });
 
+test('a foreign draft or unavailable editor cannot leave preparation waiting forever or consume a resource', async () => {
+  await postFixture(async (store, _file, catalog) => {
+    const f = await fixture(store, catalog);
+    f.executor.decide = async () => ({ kind: 'wait', reason: 'FACEBOOK_POST_HOME_REQUIRED' });
+    assert.equal((await f.runner.advance(f.plan.id)).status, 'WAITING');
+    f.h.clock.at += 29_999;
+    assert.equal((await f.runner.advance(f.plan.id)).status, 'WAITING');
+    f.h.clock.at += 1;
+    const result = await f.runner.advance(f.plan.id);
+    assert.match(result.reason, /^POST_PREPARATION_TIMEOUT:/);
+    assert.equal(
+      (await store.tasks.stepEnding(f.plan.id))?.stepId,
+      (await store.tasks.steps(f.plan.id))[0]?.id,
+    );
+    assert.equal((await store.tasks.operations(f.plan.id)).length, 0);
+    assert.equal((await store.materials.forPlan(f.plan.id)).length, 0);
+    assert.equal((await store.tasks.steps(f.plan.id))[0]?.progress.published, 0);
+  });
+});
+
 test('an asynchronous stale reservation cannot be committed after stop; concurrent ticks share one profile work item', async () => {
   await postFixture(async (store, _file, catalog) => {
     const f = await fixture(store, catalog),

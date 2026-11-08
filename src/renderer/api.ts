@@ -108,7 +108,7 @@ async function request(
   const headers: Record<string, string> = {};
   headers['x-workbench-workspace-contract'] = '6';
   headers[TASK_CAPACITY_HEADER] = TASK_CAPACITY_VERSION;
-  if (route === '/tasks' || route.startsWith('/tasks/')) headers['x-workbench-task-contract'] = '4';
+  if (route === '/tasks' || route.startsWith('/tasks/')) headers['x-workbench-task-contract'] = '5';
   if (route === '/tasks/records') headers['x-workbench-records-contract'] = '1';
   if (route.startsWith('/tasks/runtime')) headers['x-workbench-runtime-contract'] = '2';
   if (route === '/tasks/features') headers[FEATURE_CONTRACT_HEADER] = '2';
