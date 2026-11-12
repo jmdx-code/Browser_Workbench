@@ -40,6 +40,7 @@ import {
   publicationOriginalAllowed,
   type PublicationScope,
 } from './publication-acceptance-scope.js';
+import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 
 export type FacebookExecutionAcceptance = Partial<Record<TaskFeatureId | 'friends', () => boolean>>;
 
@@ -58,6 +59,11 @@ export class FacebookPublishingRuntime {
   hasOwner(profileId: string): boolean {
     return this.runtime.registry.hasOwner(profileId);
   }
+  setProfileLifecycle(lifecycle: ProfileLifecyclePort): void {
+    this.profileLifecycle = lifecycle;
+  }
+  private profileLifecycle?: ProfileLifecyclePort;
+  private readonly autoLaunchAttemptedPlans = new Map<string, number>();
   private readonly timingControls = new Map<string, Promise<void>>();
   readonly runtime: AdmittedTaskRuntime;
   readonly adapters: FacebookPublishingAdapters;
@@ -655,8 +661,27 @@ export class FacebookPublishingRuntime {
         })
         .catch(() => {});
     }
-    for (const plan of await this.store.tasks.livePlans())
-      this.updateOfflineSinceForPlan(plan, Date.now());
+    const liveAfterTiming = await this.store.tasks.livePlans();
+    const nowForLaunch = Date.now();
+    if (this.profileLifecycle) {
+      const lifecycle = this.profileLifecycle;
+      for (const plan of liveAfterTiming) {
+        if (plan.state !== 'QUEUED') continue;
+        const timingOpen =
+          !plan.timing ||
+          Boolean(plan.timingReleased) ||
+          taskTimingEligibility(plan.timing, nowForLaunch, false) === 'OPEN';
+        if (!timingOpen) continue;
+        const peer = this.core.peers.get(plan.profileId);
+        if (peer?.online === true && peer.browserWindowCount !== 0) continue;
+        if (lifecycle.isLaunching(plan.profileId)) continue;
+        const lastAttempt = this.autoLaunchAttemptedPlans.get(plan.id);
+        if (lastAttempt !== undefined && nowForLaunch - lastAttempt < 60_000) continue;
+        this.autoLaunchAttemptedPlans.set(plan.id, nowForLaunch);
+        void lifecycle.ensureProfilesOnline([plan.profileId]).catch(() => {});
+      }
+    }
+    for (const plan of liveAfterTiming) this.updateOfflineSinceForPlan(plan, nowForLaunch);
     let pollError: unknown;
     let failed = false;
     let results: CycleResult[] = [];
@@ -674,6 +699,7 @@ export class FacebookPublishingRuntime {
     const peer = this.core.peers.get(plan.profileId);
     if (
       (peer?.online === true && peer.browserWindowCount !== 0) ||
+      this.profileLifecycle?.isLaunching(plan.profileId) === true ||
       (plan.state === 'QUEUED' &&
         plan.timing &&
         !plan.timingReleased &&
@@ -754,6 +780,8 @@ export class FacebookPublishingRuntime {
     }
     for (const id of this.offlineReviewed.keys())
       if (!activePlans.has(id)) this.offlineReviewed.delete(id);
+    for (const id of this.autoLaunchAttemptedPlans.keys())
+      if (!activePlans.has(id)) this.autoLaunchAttemptedPlans.delete(id);
   }
   private async recoverEndings(profileId: string): Promise<void> {
     for (const peer of this.core.peers.values()) {

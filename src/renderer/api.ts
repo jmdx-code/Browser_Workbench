@@ -1,10 +1,12 @@
 import type { TargetListKind, TargetListCommand, TargetFolder } from '../shared/target-list.js';
 import type { BumperState, BumperLog } from '../shared/group-bumper.js';
+import type { BluestacksState } from '../shared/bluestacks.js';
 import type { PosterState, PosterLog } from '../shared/group-poster.js';
 import { MediaComponentStatus } from '../shared/media-component.js';
 import {
   SoftwareUpdateStatus,
   ExtensionReloadResult,
+  OpenAiWorkspaceResult,
   type UpdateConfiguration,
 } from '../shared/software-update.js';
 import { CleanupPreview, CleanupResult, CleanupSettings } from '../shared/data-cleanup.js';
@@ -177,12 +179,13 @@ export const api = {
   posterState: async () => (await request('/group-poster/state')) as PosterState,
   posterAction: async (action: string, input: unknown = {}) =>
     (await request('/group-poster/' + action, input)) as PosterState,
-  posterLogs: async (search = '', before?: number, beforeId?: string) =>
+  posterLogs: async (search = '', before?: number, beforeId?: string, materialId?: string) =>
     (await request(
       '/group-poster/logs?' +
         new URLSearchParams({
           search,
           ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
+          ...(materialId ? { materialId } : {}),
         }),
     )) as PosterLog[],
   savePosterMaterialThumbnail: async (id: string, thumbnailDataUrl: string) =>
@@ -200,6 +203,8 @@ export const api = {
       await request('/extensions/reload', profileIds ? { profileIds } : {}),
     ),
   openExtensionDirectory: () => request('/extensions/open-dir', {}),
+  openAiWorkspaceDirectory: async () =>
+    OpenAiWorkspaceResult.parse(await request('/ai-workspace/open-dir', {})),
   cleanupProfileTabs: async (profileIds: string[], preferActiveTab = false) =>
     CleanupProfileTabsResult.parse(
       await request('/profiles/cleanup-tabs', { profileIds, preferActiveTab }),
@@ -297,7 +302,7 @@ export const api = {
     return NativeReleaseResult.parse(result);
   },
   testTask: async (input: TestRequest) =>
-    TaskTestResult.parse(await request('/tasks/test', input, AbortSignal.timeout(20_000))),
+    TaskTestResult.parse(await request('/tasks/test', input, AbortSignal.timeout(65_000))),
   backupStatus: async (signal: AbortSignal) =>
     WorkspaceBackupStatus.parse(await request('/backups/status', undefined, signal)),
   createBackup: async (directory: string) =>
@@ -337,7 +342,7 @@ export const api = {
       ),
     ),
   startTasks: async (input: Assignment) =>
-    TaskStartResult.parse(await request('/tasks/start', input, AbortSignal.timeout(15_000))),
+    TaskStartResult.parse(await request('/tasks/start', input, AbortSignal.timeout(65_000))),
   commandTasks: async (input: TaskCommand) =>
     TaskCommandResult.parse(await request('/tasks/command', input, AbortSignal.timeout(45_000))),
   archives: async (profileId: string, planId: string, signal: AbortSignal) =>
@@ -647,7 +652,7 @@ export const api = {
     ),
   startGroupInviter: async (input: StartGroupInviterRequest) =>
     GroupInviterState.parse(
-      await request('/group-inviter/start', input, AbortSignal.timeout(15_000)),
+      await request('/group-inviter/start', input, AbortSignal.timeout(65_000)),
     ),
   stopGroupInviter: async () =>
     GroupInviterState.parse(await request('/group-inviter/stop', {}, AbortSignal.timeout(10_000))),
@@ -693,4 +698,12 @@ export const api = {
       filePath: string;
       fileName: string;
     },
+  bluestacksState: async (refresh = false) =>
+    (await request(
+      '/bluestacks/state' + (refresh ? '?refresh=1' : ''),
+      undefined,
+      AbortSignal.timeout(15_000),
+    )) as BluestacksState,
+  bluestacksAction: async (action: string, body: unknown = {}) =>
+    (await request('/bluestacks/' + action, body, AbortSignal.timeout(30_000))) as BluestacksState,
 };

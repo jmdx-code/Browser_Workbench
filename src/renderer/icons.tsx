@@ -175,6 +175,12 @@ export const IconCheckList = (p: P) => (
     <path d="M4 7l1.5 1.5L8 6M4 13l1.5 1.5L8 12M4 19l1.5 1.5L8 18M11 7h9M11 13h9M11 19h9" />
   </Icon>
 );
+export const IconSettings = (p: P) => (
+  <Icon {...p}>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M18 6l-1.4 1.4M7.4 16.6 6 18" />
+  </Icon>
+);
 export const IconBrand = ({ size = 20, ...rest }: P) => (
   <svg
     width={size}

@@ -9,13 +9,15 @@ import { api } from '../api.js';
 
 export const POSTER_COL_WIDTHS_STORAGE_KEY = 'wb_poster_material_col_widths_v1';
 
-export type PosterResizableColKey = 'thumb' | 'caption' | 'media' | 'background' | 'status';
+export type PosterResizableColKey =
+  'thumb' | 'caption' | 'media' | 'background' | 'aiLabel' | 'status';
 
 export const DEFAULT_POSTER_COL_WIDTHS: Record<PosterResizableColKey, number> = {
   thumb: 136,
   caption: 280,
   media: 220,
   background: 112,
+  aiLabel: 100,
   status: 132,
 };
 
@@ -180,7 +182,7 @@ export function useSerialVideoThumbnailGenerator(
                 resolve(null);
                 return;
               }
-              const scale = Math.min(1, 120 / Math.max(w, h));
+              const scale = Math.min(1, 480 / Math.max(w, h));
               const targetW = Math.max(1, Math.round(w * scale));
               const targetH = Math.max(1, Math.round(h * scale));
               const canvas = document.createElement('canvas');
@@ -192,9 +194,9 @@ export function useSerialVideoThumbnailGenerator(
                 return;
               }
               ctx.drawImage(video, 0, 0, targetW, targetH);
-              const out = canvas.toDataURL('image/webp', 0.78);
+              const out = canvas.toDataURL('image/webp', 0.86);
               resolve(
-                out.startsWith('data:image/webp;base64,') && out.length <= 24 * 1024 ? out : null,
+                out.startsWith('data:image/webp;base64,') && out.length <= 96 * 1024 ? out : null,
               );
             } catch {
               resolve(null);
@@ -228,8 +230,12 @@ export function PosterMaterialThumbnailCell({
   row: MaterialDraft;
   onPreview: (row: MaterialDraft) => void;
 }) {
-  if (row.hasThumbnail) {
-    const thumbUrl = `/api/workspace/group-poster/materials/thumbnail?id=${encodeURIComponent(row.id)}&v=${row.updatedAt ?? 0}`;
+  const mediaUrl = `/api/workspace/group-poster/materials/media?id=${encodeURIComponent(row.id)}&v=${row.updatedAt ?? 0}`;
+  const thumbUrl = `/api/workspace/group-poster/materials/thumbnail?id=${encodeURIComponent(row.id)}&v=${row.updatedAt ?? 0}`;
+  const isReadyVideo = row.mediaKind === 'video' && row.cacheStatus === 'ready';
+  const isReadyImage = row.mediaKind === 'image' && row.cacheStatus === 'ready';
+
+  if (isReadyVideo || isReadyImage || row.hasThumbnail) {
     return (
       <button
         type="button"
@@ -251,21 +257,39 @@ export function PosterMaterialThumbnailCell({
           cursor: 'pointer',
         }}
       >
-        <img
-          loading="lazy"
-          decoding="async"
-          src={thumbUrl}
-          alt=""
-          style={{
-            maxWidth: '120px',
-            maxHeight: '120px',
-            width: 'auto',
-            height: 'auto',
-            objectFit: 'contain',
-            borderRadius: '4px',
-            display: 'block',
-          }}
-        />
+        {isReadyVideo ? (
+          <video
+            src={`${mediaUrl}#t=0.1`}
+            preload="metadata"
+            muted
+            playsInline
+            style={{
+              width: '56px',
+              height: '56px',
+              maxWidth: '56px',
+              maxHeight: '56px',
+              objectFit: 'cover',
+              borderRadius: '4px',
+              display: 'block',
+            }}
+          />
+        ) : (
+          <img
+            loading="lazy"
+            decoding="async"
+            src={isReadyImage ? mediaUrl : thumbUrl}
+            alt=""
+            style={{
+              width: '56px',
+              height: '56px',
+              maxWidth: '56px',
+              maxHeight: '56px',
+              objectFit: 'cover',
+              borderRadius: '4px',
+              display: 'block',
+            }}
+          />
+        )}
         {row.mediaKind === 'video' && (
           <span
             className="poster-thumb-video-badge"

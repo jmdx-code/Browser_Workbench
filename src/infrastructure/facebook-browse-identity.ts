@@ -7,6 +7,7 @@ import { FacebookBrowseURL } from '../shared/browser-actions.js';
 import {
   classifyFacebookAbnormalUrl,
   facebookMarketplaceUnavailableURL,
+  facebookPostStoryLandingURL,
 } from '../shared/facebook-browse-route.js';
 import { readFacebookAcrossNavigation } from './facebook-navigation-read.js';
 import {
@@ -18,7 +19,11 @@ import { EXTENSION_VERSION } from '../shared/extension-version.js';
 
 const Fence = z
   .object({
-    url: z.union([FacebookBrowseURL, z.string().refine(facebookMarketplaceUnavailableURL)]),
+    url: z.union([
+      FacebookBrowseURL,
+      z.string().refine(facebookMarketplaceUnavailableURL),
+      z.string().refine(facebookPostStoryLandingURL),
+    ]),
     timeOrigin: z.number().finite().nonnegative(),
     ready: z.enum(['interactive', 'complete']),
   })

@@ -7,12 +7,20 @@ export class SoftwareUpdateService {
   private state: UpdateStatus;
   constructor(
     private readonly port: SoftwareUpdatePort,
-    versions: { software: string; extension: string; directory: string },
+    versions: {
+      software: string;
+      extension: string;
+      directory: string;
+      aiWorkspaceDirectory?: string;
+    },
   ) {
     this.state = {
       currentSoftwareVersion: versions.software,
       currentExtensionVersion: versions.extension,
       extensionDirectory: versions.directory,
+      ...(versions.aiWorkspaceDirectory
+        ? { aiWorkspaceDirectory: versions.aiWorkspaceDirectory }
+        : {}),
       githubRepo: '',
       autoCheck: true,
       checking: false,
@@ -111,5 +119,11 @@ export class SoftwareUpdateService {
   async openDirectory() {
     await this.port.openExtensionDirectory();
     return { opened: true };
+  }
+  async openAiWorkspace() {
+    if (!this.port.openAiWorkspaceDirectory)
+      throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中打开 AI 专属工作夹', 409);
+    const { directory } = await this.port.openAiWorkspaceDirectory();
+    return { opened: true, directory };
   }
 }

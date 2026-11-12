@@ -31,7 +31,10 @@ export class BridgeProfileSource implements BrowserProfileSource {
     private readonly store: BridgeStorePort,
     private readonly tasks: WatchTasks,
     private readonly inspection?: ProfileInspectionService,
-    private readonly labels?: { name(id: string): string | undefined },
+    private readonly labels?: {
+      name(id: string): string | undefined;
+      forget?(ids: readonly string[]): void;
+    },
     private readonly presentation?: (id: string) => ProfilePresentationStatus | null,
   ) {}
   async profiles() {
@@ -100,6 +103,7 @@ export class BridgeProfileSource implements BrowserProfileSource {
   }
   async deleteProfile(id: string) {
     this.inspection?.invalidate(id);
+    this.labels?.forget?.([id]);
     this.tasks.stop(id);
     const peer = this.core.peers.get(id);
     if (peer) {

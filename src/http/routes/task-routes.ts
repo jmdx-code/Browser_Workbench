@@ -5,6 +5,7 @@ import type { TaskService } from '../../application/task-service.js';
 import type { TaskTestService } from '../../application/task-test-service.js';
 import type { WorkspaceService } from '../../application/workspace-service.js';
 import { ProductError } from '../../domain/workspace.js';
+import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
 import { TASK_CAPACITY_HEADER } from '../../shared/task-capacity.js';
 import {
   AssignTasks,
@@ -30,6 +31,7 @@ export interface TaskRouteContext {
   taskTests?: TaskTestService | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
   isProfileOnline?: ((profileId: string) => boolean | Promise<boolean>) | undefined;
+  profileLifecycle?: ProfileLifecyclePort | undefined;
 }
 
 const ACTIVE_PLAN_STATES = [
@@ -113,6 +115,20 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
       if (!previous.length) {
         await tasks.releaseErroredPausedPlans(value.profileIds);
         const checkOnline = !value.timing && typeof ctx.isProfileOnline === 'function';
+        if (checkOnline && ctx.profileLifecycle && ctx.isProfileOnline) {
+          const offlineCandidates: string[] = [];
+          for (const id of value.profileIds) {
+            if (await tasks.hasProfilePlanInStates(id, ACTIVE_PLAN_STATES)) continue;
+            if (await ctx.isProfileOnline(id)) continue;
+            const busyElsewhere = featureExecution
+              ? await featureExecution.isProfileBusy(id, 'active-accounts')
+              : false;
+            if (!busyElsewhere) offlineCandidates.push(id);
+          }
+          if (offlineCandidates.length > 0) {
+            await ctx.profileLifecycle.ensureProfilesOnline(offlineCandidates);
+          }
+        }
         const admission = await admitProfilesForStart({
           requestedProfileIds: value.profileIds,
           currentModuleId: 'active-accounts',

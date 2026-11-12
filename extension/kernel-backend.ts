@@ -502,7 +502,9 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       ['about:blank', ''].includes(target.url)
     )
       throw Error('KERNEL_INITIAL_DOCUMENT_PENDING');
-    if (!kernelAccessURL(target.url, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
+    const urlToCheck =
+      this.access === 'agent-browser' && target.url === '' ? 'about:blank' : target.url;
+    if (!kernelAccessURL(urlToCheck, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
   }
   async revealOwnedPage(proof: TabProof): Promise<{ tabId: number; focused: true }> {
     proof = OwnedTabProof.parse(proof);
@@ -728,8 +730,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'),
     );
     const info = KernelTargetInfo.parse(result.targetInfo);
+    const attachedUrl =
+      this.access === 'agent-browser' && info.url === '' ? 'about:blank' : info.url;
     if (
-      !kernelAccessURL(info.url, this.access) ||
+      !kernelAccessURL(attachedUrl, this.access) ||
       info.type !== 'page' ||
       info.targetId !== this.owned.get(tabId)?.targetId
     )
@@ -784,6 +788,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           await chrome.windows.update(tab.windowId, { focused: true });
         }
         if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      } else if (foreground && this.access === 'agent-browser') {
+        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
       }
       let target = (await chrome.debugger.getTargets()).find((row) => row.tabId === tab.id);
       if (this.access !== 'fixture') {
@@ -795,7 +803,11 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           await new Promise<void>((resolve) => setTimeout(resolve, 100));
           target = (await chrome.debugger.getTargets()).find((row) => row.tabId === tab.id);
         }
-        if (!target || !kernelAccessURL(target.url, this.access))
+        const createdUrl =
+          this.access === 'agent-browser' && target?.url === ''
+            ? 'about:blank'
+            : (target?.url ?? '');
+        if (!target || !kernelAccessURL(createdUrl, this.access))
           throw Error('KERNEL_SCOPE_CHANGED');
       }
       if (!target || target.type !== 'page') throw Error('KERNEL_TARGET_IDENTITY_MISSING');
@@ -925,7 +937,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     // general dialog method still requires an original operation. Never accept confirm,
     // prompt, alert, child-frame or unsolicited dialogs, and never change page content.
     if (
-      this.access !== 'facebook-task' ||
+      (this.access !== 'facebook-task' && this.access !== 'agent-browser') ||
       method !== 'Page.javascriptDialogOpening' ||
       source.sessionId
     )
@@ -970,8 +982,75 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     if (!this.attached.has(target.tabId)) throw Error('KERNEL_NOT_ATTACHED');
     if (this.access === 'facebook-readonly')
       assertKernelSessionCommand(method, params, new Set(), this.access);
-    if (this.access === 'facebook-task' && method !== 'DOM.setFileInputFiles')
+    if (
+      (this.access === 'facebook-task' || this.access === 'agent-browser') &&
+      method !== 'DOM.setFileInputFiles'
+    )
       assertKernelSessionCommand(method, params, new Set(), this.access);
+    if (this.access === 'agent-browser' && method === 'Page.bringToFront') {
+      if (target.sessionId) throw Error('KERNEL_MAIN_TAB_REQUIRED');
+      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      const tab = await chrome.tabs.get(target.tabId);
+      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      if (tab.windowId !== undefined) {
+        const win = await chrome.windows.get(tab.windowId).catch(() => null);
+        if (win?.state === 'minimized') {
+          await chrome.windows
+            .update(tab.windowId, { state: 'normal', focused: true })
+            .catch(() => {});
+        } else {
+          await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        }
+      }
+      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      await chrome.tabs.update(target.tabId, { active: true });
+      return {};
+    }
+    if (this.access === 'agent-browser' && method === 'Page.captureScreenshot') {
+      if (target.sessionId) throw Error('KERNEL_MAIN_TAB_REQUIRED');
+      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      const tab = await chrome.tabs.get(target.tabId);
+      if (!this.allowRead() || !this.owned.has(target.tabId) || !this.attached.has(target.tabId))
+        throw Error('KERNEL_READ_FENCED');
+      let restoreTabId: number | null = null;
+      if (!tab.active && tab.windowId !== undefined) {
+        const activeTabs = await chrome.tabs
+          .query({ windowId: tab.windowId, active: true })
+          .catch(() => []);
+        const prevId = activeTabs[0]?.id;
+        if (typeof prevId === 'number' && prevId !== target.tabId) {
+          restoreTabId = prevId;
+        }
+      }
+      try {
+        if (tab.windowId !== undefined) {
+          const win = await chrome.windows.get(tab.windowId).catch(() => null);
+          if (win?.state === 'minimized') {
+            await chrome.windows
+              .update(tab.windowId, { state: 'normal', focused: false })
+              .catch(() => {});
+          }
+        }
+        if (!tab.active) {
+          await chrome.tabs.update(target.tabId, { active: true });
+        }
+        await chrome.debugger
+          .sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
+          .catch(() => {});
+        await chrome.debugger
+          .sendCommand(target, 'Page.setWebLifecycleState', { state: 'active' })
+          .catch(() => {});
+        if (!this.allowRead() || !this.owned.has(target.tabId) || !this.attached.has(target.tabId))
+          throw Error('KERNEL_READ_FENCED');
+        return KernelJsonObject.parse(
+          (await chrome.debugger.sendCommand(target, method, params)) ?? {},
+        );
+      } finally {
+        if (restoreTabId !== null) {
+          await chrome.tabs.update(restoreTabId, { active: true }).catch(() => {});
+        }
+      }
+    }
     if (
       kernelRequiresOperation(method, this.access) &&
       (!this.journal.writable || !this.allowInput())

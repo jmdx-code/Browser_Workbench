@@ -71,7 +71,7 @@ test(
       for (const authenticate of [true, false]) {
         const failed = await open(authenticate);
         const closed = once(failed.ws, 'close');
-        failed.ws.send(Buffer.alloc(4 * 1024 * 1024 + 1, 65));
+        failed.ws.send(Buffer.alloc(64 * 1024 * 1024 + 1, 65));
         await closed;
         while ((await healthy.next()).type !== 'HEARTBEAT') {
           /* Drain the initial SYNC before testing a live heartbeat. */

@@ -15,6 +15,22 @@ export async function restartEmptyStoryPage(
   const before = await readFacebookStoryPage(page, guard);
   if (!isEmptyStoryEditor(before)) throw Error('STORY_FOREIGN_DRAFT');
   await guard();
+  await page
+    .evaluate(() => {
+      try {
+        window.onbeforeunload = null;
+        if (typeof BeforeUnloadEvent !== 'undefined') {
+          BeforeUnloadEvent.prototype.preventDefault = () => {};
+          Object.defineProperty(BeforeUnloadEvent.prototype, 'returnValue', {
+            configurable: true,
+            get: () => '',
+            set: () => {},
+          });
+        }
+      } catch {}
+    })
+    .catch(() => {});
+  await guard();
   let failure: unknown;
   const pending = new Set<Promise<void>>();
   const onDialog = (dialog: Dialog) => {

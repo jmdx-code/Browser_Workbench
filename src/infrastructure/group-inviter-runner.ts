@@ -15,6 +15,7 @@ import type { InviterGroupRow } from '../shared/group-inviter.js';
 import { ProductError } from '../domain/workspace.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
 import {
+  dismissFeatureInterventionDialogIfPresent,
   groupInvitationEffect,
   readGroupInvitationState,
   inviteDialogSelector,
@@ -552,9 +553,15 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       stepId: scope.stepId,
       actionDigest: invitationDigest(label, accountId, operationId),
     };
+    let interventionDismissedInOp = false;
     const assertPage = async () => {
       scope.guard();
       let state = await readGroupInvitationState(scope.page, scope.guard);
+      if (state.verificationRequired && label !== 'send-group-invites') {
+        const dismissed = await dismissFeatureInterventionDialogIfPresent(scope.page, scope.guard);
+        if (dismissed) interventionDismissedInOp = true;
+        state = await readGroupInvitationState(scope.page, scope.guard);
+      }
       if (state.verificationRequired)
         throw new ProductError(
           'GROUP_INVITER_VERIFICATION_REQUIRED',
@@ -579,6 +586,14 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           );
         await sleep(250);
         state = await readGroupInvitationState(scope.page, scope.guard);
+        if (state.verificationRequired && label !== 'send-group-invites') {
+          const dismissed = await dismissFeatureInterventionDialogIfPresent(
+            scope.page,
+            scope.guard,
+          );
+          if (dismissed) interventionDismissedInOp = true;
+          state = await readGroupInvitationState(scope.page, scope.guard);
+        }
         if (state.verificationRequired)
           throw new ProductError(
             'GROUP_INVITER_VERIFICATION_REQUIRED',
@@ -593,7 +608,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           '当前登录账号已变化，已停止本次邀请；请检查浏览器中的实际账号',
           409,
         );
-      if (label !== 'enter-group') {
+      if (label !== 'enter-group' && !(label === 'join-group' && interventionDismissedInOp)) {
         const route = new URL(state.url);
         if (
           route.origin !== 'https://www.facebook.com' ||
@@ -625,7 +640,16 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       binding,
       async () => {
         try {
-          return await fn(binding.operationId);
+          const val = await fn(binding.operationId);
+          if (
+            val &&
+            typeof val === 'object' &&
+            'unjoinableIntervention' in val &&
+            (val as { unjoinableIntervention?: boolean }).unjoinableIntervention === true
+          ) {
+            interventionDismissedInOp = true;
+          }
+          return val;
         } catch (error) {
           return navigationError(error);
         }
@@ -664,7 +688,11 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     const deadline = Date.now() + (sending ? 20000 : label === 'enter-group' ? 30000 : 15000);
     do {
       scope.guard();
-      const state = await readGroupInvitationState(scope.page, scope.guard);
+      let state = await readGroupInvitationState(scope.page, scope.guard);
+      if (state.verificationRequired && !sending) {
+        await dismissFeatureInterventionDialogIfPresent(scope.page, scope.guard);
+        state = await readGroupInvitationState(scope.page, scope.guard);
+      }
       if (state.verificationRequired)
         throw new ProductError(
           'GROUP_INVITER_VERIFICATION_REQUIRED',
@@ -935,13 +963,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       if (callbacks.isCancelled(profileId)) return;
 
       // Step 3: Check if already in group; if not, click Join group / 加入小组 and close any modal
-      const joinBtnLoc = page
-        .getByRole('button', {
-          name: /^(?:Join group|Join|加入小组|加入小組|加入社團|加入社团|加入群组|加入群組|加入)$/i,
-        })
-        .first();
+      const joinBtnLoc = page.locator('[data-wb-group-join-btn="1"]').first();
       const inviteButton = async () => {
-        const state = await readGroupInvitationState(page, guard);
+        let state = await readGroupInvitationState(page, guard);
+        if (state.verificationRequired) {
+          await dismissFeatureInterventionDialogIfPresent(page, guard);
+          state = await readGroupInvitationState(page, guard);
+        }
         if (state.verificationRequired)
           throw new ProductError(
             'GROUP_INVITER_VERIFICATION_REQUIRED',
@@ -959,7 +987,11 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         guard();
         await clickInvitationControl(button, async () => {
           guard();
-          const current = await readGroupInvitationState(page, guard);
+          let current = await readGroupInvitationState(page, guard);
+          if (current.verificationRequired) {
+            await dismissFeatureInterventionDialogIfPresent(page, guard);
+            current = await readGroupInvitationState(page, guard);
+          }
           if (current.verificationRequired)
             throw new ProductError(
               'GROUP_INVITER_VERIFICATION_REQUIRED',
@@ -993,13 +1025,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             for (const d of dialogs) {
               const closeBtn = Array.from(
                 d.querySelectorAll(
-                  '[role="button"][aria-label="Close"], [role="button"][aria-label="关闭"], [role="button"][aria-label="關閉"]',
+                  '[role="button"][aria-label="Close"], [role="button"][aria-label="关闭"], [role="button"][aria-label="關閉"], [data-testid="feature-intervention-ok-button"]',
                 ),
               ).find(isVis);
               const continueBtn = Array.from(d.querySelectorAll('[role="button"],button')).find(
                 (el) =>
                   isVis(el) &&
-                  /^(?:继续|繼續|Continue|知道了|Got\s*it)$/i.test(
+                  /^(?:继续|繼續|Continue|知道了|Got\s*it|确定|確定|OK)$/i.test(
                     (el.getAttribute('aria-label') || el.textContent || '')
                       .replace(/\s+/g, ' ')
                       .trim(),
@@ -1104,31 +1136,60 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       guard();
       if (!(await inviteButton()) && (await joinBtnLoc.count()) > 0) {
         await callbacks.setProfileStatus(profileId, `加入小组 · ${group.groupName.slice(0, 12)}`);
-        await this.execBoundOp(conn, boundAccountId, 'join-group', async () => {
-          await clickControl(
-            joinBtnLoc,
-            async () => !(await inviteButton()) && (await joinBtnLoc.isVisible()),
-          );
-          const deadline = Date.now() + 4000;
+        const joinRes = await this.execBoundOp(conn, boundAccountId, 'join-group', async () => {
+          let joinInterventionDismissed = false;
+          try {
+            await clickControl(
+              joinBtnLoc,
+              async () => !(await inviteButton()) && (await joinBtnLoc.isVisible()),
+            );
+          } catch (clickErr) {
+            if (
+              clickErr instanceof Error &&
+              clickErr.message === 'GROUP_INVITER_CURRENT_GROUP_CHANGED'
+            ) {
+              return { unjoinableIntervention: true };
+            }
+            throw clickErr;
+          }
+          const joinClickAt = Date.now();
+          const deadline = joinClickAt + 4000;
           do {
             guard();
             const state = await readGroupInvitationState(page, guard);
-            if (state.verificationRequired)
-              throw new ProductError(
-                'GROUP_INVITER_VERIFICATION_REQUIRED',
-                '受限 · 需要手机验证或操作受限',
-                409,
-              );
+            if (state.verificationRequired) {
+              await dismissFeatureInterventionDialogIfPresent(page, guard);
+              joinInterventionDismissed = true;
+              return { unjoinableIntervention: true };
+            }
+            if (!atGroup()) {
+              return { unjoinableIntervention: true };
+            }
             if (
               Boolean(await inviteButton()) ||
-              !(await joinBtnLoc.isVisible()) ||
-              state.dialogCount > 0
+              state.dialogCount > 0 ||
+              (Date.now() - joinClickAt >= 1500 && !(await joinBtnLoc.isVisible()))
             )
               break;
             await sleep(250);
           } while (Date.now() < deadline);
-          return { joinedOrRequested: true };
+          return joinInterventionDismissed
+            ? { unjoinableIntervention: true }
+            : { joinedOrRequested: true };
         });
+
+        if (
+          joinRes &&
+          typeof joinRes === 'object' &&
+          'unjoinableIntervention' in joinRes &&
+          (joinRes as { unjoinableIntervention?: boolean }).unjoinableIntervention
+        ) {
+          throw new ProductError(
+            'GROUP_INVITER_GROUP_UNINVITABLE',
+            `跳过：当前身份暂不支持直接加入该群 · ${group.groupName.slice(0, 10)}`,
+            409,
+          );
+        }
 
         await dismissNonInvitePopupIfNeeded();
       }

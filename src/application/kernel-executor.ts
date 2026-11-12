@@ -90,7 +90,9 @@ export class KernelExecutor {
       try {
         const info = await this.backend.attach(tabId);
         this.check(stamp);
-        if (info.type !== 'page' || !kernelAccessURL(info.url, this.access))
+        const attachedUrl =
+          this.access === 'agent-browser' && info.url === '' ? 'about:blank' : info.url;
+        if (info.type !== 'page' || !kernelAccessURL(attachedUrl, this.access))
           throw Error('KERNEL_URL_REJECTED');
         this.targetIds.set(tabId, info.targetId);
         return info;

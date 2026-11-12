@@ -38,9 +38,23 @@ export async function readFacebookPostPage(
   const projection = validateProjection(request, await page.evaluate(projectPage, request));
   await assertCurrent();
   const name = observeFacebookHomeName(projection);
-  const regionLabel = projection.rows.find((row) => row.key === 'homeComposers')?.nodes[0]
-    ?.attributes['aria-label'];
-  const homeCopy = name ? FACEBOOK_UI_COPY.find((copy) => copy.region === regionLabel) : undefined;
+  const regionNodes = projection.rows.find((row) => row.key === 'homeComposers')?.nodes ?? [];
+  const linkNodes = projection.rows.find((row) => row.key === 'composerProfileLinks')?.nodes ?? [];
+  const promptNodes = projection.rows.find((row) => row.key === 'composerPrompts')?.nodes ?? [];
+  const regionLabel = regionNodes[0]?.attributes['aria-label'];
+  const homeCopy =
+    name ||
+    (projection.url === 'https://www.facebook.com/' &&
+      projection.ready !== 'loading' &&
+      regionNodes.length === 1 &&
+      regionNodes[0]?.visible &&
+      linkNodes.length === 1 &&
+      linkNodes[0]?.visible &&
+      promptNodes.length === 1 &&
+      promptNodes[0]?.visible &&
+      Boolean(promptNodes[0]?.text.trim()))
+      ? FACEBOOK_UI_COPY.find((copy) => copy.region === regionLabel)
+      : undefined;
   const dialogLabel = projection.rows.find((row) => row.key === 'composerDialogs')?.nodes[0]
     ?.attributes['aria-label'];
   const dialogCopy = FACEBOOK_UI_COPY.find((copy) => copy.region === dialogLabel);

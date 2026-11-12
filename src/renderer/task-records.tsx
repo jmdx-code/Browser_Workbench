@@ -13,6 +13,12 @@ import { isMarketplaceUnavailableSkip, isSuccessfulTaskStep } from '../shared/ta
 import { runSummary, stepResultLabel } from './task-record-summary.js';
 import { api, ApiError } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
+import {
+  collectAllPaginatedLogs,
+  formatBumperLogsAsTsv,
+  formatPosterLogsAsTsv,
+  formatUnifiedPostAndBumpLogsAsTsv,
+} from '../shared/log-table-copy.js';
 import { ProfileAvatar } from './profile-avatar.js';
 import { inspectionAvatarURL } from './inspection-presentation.js';
 import { IconClose, IconDownload, IconSearch } from './icons.js';
@@ -84,10 +90,12 @@ export function TaskRecordsPage({
   const [moduleTab, setModuleTab] = useState<ActivityRecordModuleFilter>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectedBumperIds, setSelectedBumperIds] = useState<Set<string>>(new Set());
+  const [selectedPosterIds, setSelectedPosterIds] = useState<Set<string>>(new Set());
   const [inviterLogs, setInviterLogs] = useState<GroupInviteLogRow[]>([]);
   const [bumperLogs, setBumperLogs] = useState<BumperLog[]>([]);
   const [posterLogs, setPosterLogs] = useState<PosterLog[]>([]);
   const [bumperBusy, setBumperBusy] = useState(false);
+  const [copyingRecords, setCopyingRecords] = useState(false);
 
   const deleting = useRef(new Set<string>());
   const afterDelete = (deletedStepIds?: Iterable<string>) => {
@@ -208,6 +216,7 @@ export function TaskRecordsPage({
   useEffect(() => {
     setSelected(new Set());
     setSelectedBumperIds(new Set());
+    setSelectedPosterIds(new Set());
   }, [scopeKey, moduleTab]);
   const scopeRef = useRef('');
   const currentScope = useRef(scopeKey);
@@ -535,6 +544,173 @@ export function TaskRecordsPage({
     }
   }
 
+  const canCopyPostOrBump =
+    moduleTab === 'all' ||
+    moduleTab === 'group-poster' ||
+    moduleTab === 'group-bumper' ||
+    moduleTab === 'page-bumper';
+  const selectedCopyCount =
+    moduleTab === 'group-poster'
+      ? selectedPosterIds.size
+      : moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
+        ? selectedBumperIds.size
+        : moduleTab === 'all'
+          ? selectedPosterIds.size + selectedBumperIds.size
+          : 0;
+
+  async function copyPostAndBumpRecords() {
+    if (copyingRecords || !canCopyPostOrBump) return;
+    setCopyingRecords(true);
+    try {
+      const activeQuery = searchText.trim() || query.trim();
+      if (moduleTab === 'group-poster') {
+        let target: PosterLog[];
+        if (selectedPosterIds.size > 0) {
+          target = posterLogs.filter((l) => selectedPosterIds.has(l.id));
+        } else {
+          const seed = posterLogs.length > 0 ? posterLogs : await api.posterLogs('');
+          const allPoster = await collectAllPaginatedLogs({
+            initialRows: seed,
+            getTimestamp: (r) => r.postedAt,
+            fetchPage: (before, beforeId) => api.posterLogs('', before, beforeId),
+          });
+          const fullFeed = buildUnifiedActivityFeed({
+            profiles,
+            posterState: groupPosterState,
+            posterLogs: allPoster,
+            profileId: filterId,
+            moduleFilter: 'group-poster',
+            statusFilter: filter,
+            query: activeQuery,
+            now,
+          });
+          const byId = new Map(allPoster.map((l) => [l.id, l]));
+          target = fullFeed.items
+            .map((item) => (item.posterLogId ? byId.get(item.posterLogId) : undefined))
+            .filter((row): row is PosterLog => Boolean(row));
+        }
+        if (!target.length) {
+          onNotify?.('当前筛选下没有可复制的发帖记录');
+          return;
+        }
+        await copyTextToClipboard(formatPosterLogsAsTsv(target, profiles));
+        onNotify?.(
+          selectedPosterIds.size > 0
+            ? `已批量复制已选 ${target.length} 条发帖记录，可直接粘贴到表格`
+            : `已批量复制 ${target.length} 条发帖记录，可直接粘贴到表格`,
+        );
+        return;
+      }
+
+      if (moduleTab === 'group-bumper' || moduleTab === 'page-bumper') {
+        let target: BumperLog[];
+        if (selectedBumperIds.size > 0) {
+          target = bumperLogs.filter((l) => selectedBumperIds.has(l.id));
+        } else {
+          const sourceMode = moduleTab === 'page-bumper' ? 'page' : 'group';
+          const seed =
+            bumperLogs.length > 0
+              ? bumperLogs.filter((l) =>
+                  sourceMode === 'page'
+                    ? l.sourceMode === 'page' || l.groupId === '-'
+                    : l.sourceMode !== 'page' && l.groupId !== '-',
+                )
+              : await api.bumperLogs('', undefined, undefined, sourceMode);
+          const firstPage =
+            seed.length >= 200 || bumperLogs.length < 200
+              ? seed
+              : await api.bumperLogs('', undefined, undefined, sourceMode);
+          const allBumper = await collectAllPaginatedLogs({
+            initialRows: firstPage,
+            getTimestamp: (r) => r.bumpedAt,
+            fetchPage: (before, beforeId) => api.bumperLogs('', before, beforeId, sourceMode),
+          });
+          const fullFeed = buildUnifiedActivityFeed({
+            profiles,
+            bumperState: groupBumperState,
+            bumperLogs: allBumper,
+            profileId: filterId,
+            moduleFilter: moduleTab,
+            statusFilter: filter,
+            query: activeQuery,
+            now,
+          });
+          const byId = new Map(allBumper.map((l) => [l.id, l]));
+          target = fullFeed.items
+            .map((item) => (item.bumperLogId ? byId.get(item.bumperLogId) : undefined))
+            .filter((row): row is BumperLog => Boolean(row));
+        }
+        if (!target.length) {
+          onNotify?.('当前筛选下没有可复制的顶贴记录');
+          return;
+        }
+        await copyTextToClipboard(formatBumperLogsAsTsv(target, profiles));
+        onNotify?.(
+          selectedBumperIds.size > 0
+            ? `已批量复制已选 ${target.length} 条顶贴记录，可直接粘贴到表格`
+            : `已批量复制 ${target.length} 条顶贴记录，可直接粘贴到表格`,
+        );
+        return;
+      }
+
+      // moduleTab === 'all'
+      let targetPoster: PosterLog[];
+      let targetBumper: BumperLog[];
+      if (selectedPosterIds.size + selectedBumperIds.size > 0) {
+        targetPoster = posterLogs.filter((l) => selectedPosterIds.has(l.id));
+        targetBumper = bumperLogs.filter((l) => selectedBumperIds.has(l.id));
+      } else {
+        const [allPoster, allBumper] = await Promise.all([
+          collectAllPaginatedLogs({
+            initialRows: posterLogs.length > 0 ? posterLogs : await api.posterLogs(''),
+            getTimestamp: (r) => r.postedAt,
+            fetchPage: (before, beforeId) => api.posterLogs('', before, beforeId),
+          }),
+          collectAllPaginatedLogs({
+            initialRows: bumperLogs.length > 0 ? bumperLogs : await api.bumperLogs(''),
+            getTimestamp: (r) => r.bumpedAt,
+            fetchPage: (before, beforeId) => api.bumperLogs('', before, beforeId),
+          }),
+        ]);
+        const fullFeed = buildUnifiedActivityFeed({
+          profiles,
+          posterState: groupPosterState,
+          posterLogs: allPoster,
+          bumperState: groupBumperState,
+          bumperLogs: allBumper,
+          profileId: filterId,
+          moduleFilter: 'all',
+          statusFilter: filter,
+          query: activeQuery,
+          now,
+        });
+        const posterById = new Map(allPoster.map((l) => [l.id, l]));
+        const bumperById = new Map(allBumper.map((l) => [l.id, l]));
+        targetPoster = fullFeed.items
+          .map((item) => (item.posterLogId ? posterById.get(item.posterLogId) : undefined))
+          .filter((row): row is PosterLog => Boolean(row));
+        targetBumper = fullFeed.items
+          .map((item) => (item.bumperLogId ? bumperById.get(item.bumperLogId) : undefined))
+          .filter((row): row is BumperLog => Boolean(row));
+      }
+      const { tsv, count } = formatUnifiedPostAndBumpLogsAsTsv({
+        posterLogs: targetPoster,
+        bumperLogs: targetBumper,
+        profiles,
+      });
+      if (!count) {
+        onNotify?.('当前筛选下没有可复制的发帖或顶贴记录');
+        return;
+      }
+      await copyTextToClipboard(tsv);
+      onNotify?.(`已批量复制 ${count} 条贴文记录，可直接粘贴到表格`);
+    } catch (err) {
+      onNotify?.(err instanceof Error ? err.message : '批量复制失败');
+    } finally {
+      setCopyingRecords(false);
+    }
+  }
+
   const tabs: [Filter, string][] = [
     ['all', '全部'],
     ['running', '进行中'],
@@ -699,6 +875,8 @@ export function TaskRecordsPage({
     const inspection = byInspection.get(item.profileId);
     const isBumperLog = Boolean(item.bumperLogId);
     const bumperId = item.bumperLogId ?? '';
+    const isPosterLog = Boolean(item.posterLogId);
+    const posterId = item.posterLogId ?? '';
     return (
       <div className={'records-row unified-module-row tone-' + item.tone} role="row" key={item.id}>
         <span role="cell" onClick={(e) => e.stopPropagation()}>
@@ -712,6 +890,20 @@ export function TaskRecordsPage({
                   const next = new Set(prev);
                   if (e.target.checked) next.add(bumperId);
                   else next.delete(bumperId);
+                  return next;
+                })
+              }
+            />
+          ) : isPosterLog ? (
+            <input
+              type="checkbox"
+              aria-label={'选择发帖记录 ' + item.targetLabel}
+              checked={selectedPosterIds.has(posterId)}
+              onChange={(e) =>
+                setSelectedPosterIds((prev) => {
+                  const next = new Set(prev);
+                  if (e.target.checked) next.add(posterId);
+                  else next.delete(posterId);
                   return next;
                 })
               }
@@ -789,6 +981,9 @@ export function TaskRecordsPage({
   const bumperSelectableIds = unifiedFeed.items
     .map((item) => item.bumperLogId)
     .filter((id): id is string => Boolean(id));
+  const posterSelectableIds = unifiedFeed.items
+    .map((item) => item.posterLogId)
+    .filter((id): id is string => Boolean(id));
 
   return (
     <section className="records-page" aria-label="执行记录">
@@ -830,6 +1025,27 @@ export function TaskRecordsPage({
               onChange={(event) => setSearchText(event.target.value)}
             />
           </label>
+          {canCopyPostOrBump && (
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              title="复制贴文时间、账号、小组/专页、内容与链接，可直接粘贴到 Excel / WPS / 飞书 / Google 表格"
+              disabled={
+                copyingRecords || (!bumperLogs.length && !posterLogs.length && !selectedCopyCount)
+              }
+              onClick={() => void copyPostAndBumpRecords()}
+            >
+              {copyingRecords
+                ? '正在复制…'
+                : selectedCopyCount > 0
+                  ? `批量复制已选 (${selectedCopyCount})`
+                  : moduleTab === 'group-poster'
+                    ? '批量复制发帖记录'
+                    : moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
+                      ? '批量复制顶贴记录'
+                      : '批量复制贴文记录'}
+            </button>
+          )}
           <button
             className={'btn btn-icon' + (exporting ? ' is-busy' : '')}
             title={exporting ? '正在导出…' : '导出当前筛选全部执行记录（JSON）'}
@@ -982,7 +1198,7 @@ export function TaskRecordsPage({
         <div className="records-table" role="table">
           <div className="records-row run-record-row records-header" role="row">
             <span role="columnheader">
-              {moduleTab === 'group-bumper' ? (
+              {moduleTab === 'group-bumper' || moduleTab === 'page-bumper' ? (
                 <input
                   type="checkbox"
                   aria-label="全选当前顶贴记录"
@@ -993,6 +1209,20 @@ export function TaskRecordsPage({
                   onChange={(e) =>
                     setSelectedBumperIds(
                       e.target.checked ? new Set(bumperSelectableIds) : new Set(),
+                    )
+                  }
+                />
+              ) : moduleTab === 'group-poster' ? (
+                <input
+                  type="checkbox"
+                  aria-label="全选当前发帖记录"
+                  checked={
+                    posterSelectableIds.length > 0 &&
+                    posterSelectableIds.every((id) => selectedPosterIds.has(id))
+                  }
+                  onChange={(e) =>
+                    setSelectedPosterIds(
+                      e.target.checked ? new Set(posterSelectableIds) : new Set(),
                     )
                   }
                 />

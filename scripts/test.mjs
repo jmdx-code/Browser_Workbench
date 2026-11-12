@@ -3,6 +3,7 @@ requireRuntime();
 await runNode('--test', [
   'dist/tests/*.test.js',
   'dist/tests/bridge/*.test.js',
+  'dist/tests/mcp/*.test.js',
   'scripts/tests/*.test.mjs',
 ]);
 
@@ -19,5 +20,6 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/bumper-interaction-fixes.test.ts',
   'tests/bumper-like-confirmation.test.ts',
   'tests/bumper-workflow.test.ts',
+  'tests/wo-bumper-stability.test.ts',
   'tests/finder-list-ui.test.tsx',
 ]);

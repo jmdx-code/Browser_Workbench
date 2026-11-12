@@ -461,7 +461,7 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
     assert.equal(updated[1]?.background, 'color');
   });
 
-  it('pastes 1-3 columns and 5-column Active Accounts TSV into PosterMaterialMatrix', () => {
+  it('pastes 1-4 columns, 5-column Active Accounts TSV, unquoted leading quotes, and horizontal 1xN Excel rows into PosterMaterialMatrix', () => {
     let idCounter = 0;
     const nextId = () => `draft-${++idCounter}`;
     const startRows = [createEmptyMaterialDraft('draft-0')];
@@ -477,16 +477,44 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
     assert.equal(pasted[0]?.caption, '彩贴短文案');
     assert.equal(pasted[0]?.mediaSource, '');
     assert.equal(pasted[0]?.background, 'color');
+    assert.equal(pasted[0]?.aiLabel, 'default');
     assert.equal(pasted[1]?.caption, '多行带视频文案\n第二行');
     assert.equal(
       pasted[1]?.mediaSource,
       'https://drive.google.com/file/d/1I7SmXoi5aqDctMn1gQnu0qJbLM2PBkl9/view?usp=drive_link',
     );
-    // Media present -> background forced to 'plain'
+    // Media present -> background forced to 'plain', aiLabel mapped from col 5 ('开启' -> 'on')
     assert.equal(pasted[1]?.background, 'plain');
+    assert.equal(pasted[1]?.aiLabel, 'on');
 
-    const formatted = formatPosterCellsForClipboard(pasted, 0, 1, 0, 2);
-    assert.equal(formatted.includes('彩贴短文案\t\t彩贴'), true);
+    const formatted = formatPosterCellsForClipboard(pasted, 0, 1, 0, 3);
+    assert.equal(formatted.includes('彩贴短文案\t\t彩贴\t默认'), true);
+
+    // Unquoted cell starting with a quote character (e.g. Burmese blessing text) must not throw quote error
+    const unquotedLeadingQuote = `"အာမင်" လို့ ရေးခဲ့သူတိုင်း ဘုရားသခင် ကောင်းချီးပေးပါစေ`;
+    const pastedQuote = pastePosterMaterialCells(
+      [createEmptyMaterialDraft('q-0')],
+      0,
+      0,
+      unquotedLeadingQuote,
+      nextId,
+    );
+    assert.equal(pastedQuote.length, 1);
+    assert.equal(pastedQuote[0]?.caption, unquotedLeadingQuote);
+
+    // Horizontal 1x3 Excel row of captions pasted into Column A (col 0) auto-transposes into 3 rows
+    const horizontalCaptions = '第一条横向文案\t第二条横向文案\t第三条横向文案';
+    const pastedHoriz = pastePosterMaterialCells(
+      [createEmptyMaterialDraft('h-0')],
+      0,
+      0,
+      horizontalCaptions,
+      nextId,
+    );
+    assert.equal(pastedHoriz.length, 3);
+    assert.equal(pastedHoriz[0]?.caption, '第一条横向文案');
+    assert.equal(pastedHoriz[1]?.caption, '第二条横向文案');
+    assert.equal(pastedHoriz[2]?.caption, '第三条横向文案');
   });
 
   it('snapshots personal avatar from profile_account_cache at write time and never overwrites page identity avatar', async () => {
@@ -545,5 +573,251 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
     );
     assert.match(personalLog?.accountAvatar ?? '', /record-avatar\?kind=account/);
     assert.match(pageLog?.accountAvatar ?? '', /record-avatar\?kind=page/);
+  });
+
+  it('creates per-post tasks, skips already-posted groups, supports scheduled start with all_online dynamic accounts, and settles partial/failed when restricted or offline', async () => {
+    const { store } = await createTempStore();
+    store.groupPoster.upsertTargets({
+      items: [
+        { id: '10001', name: 'Group Alpha' },
+        { id: '10002', name: 'Group Beta' },
+        { id: '10003', name: 'Group Gamma' },
+      ],
+    });
+    store.groupPoster.saveMaterials({
+      items: [
+        {
+          id: 'mat-card-1',
+          caption: 'Per-post task material 1',
+          mediaSource: '',
+          background: 'color',
+          selected: true,
+        },
+      ],
+    });
+
+    // Mark 10001 as already posted for mat-card-1
+    store.groupPoster.recordPost({
+      id: 'log-alpha-done',
+      profileId: P001,
+      accountId: '61500001',
+      accountName: 'Page A',
+      accountAvatar: null,
+      identityType: 'page',
+      groupId: '10001',
+      groupName: 'Group Alpha',
+      groupAvatar: null,
+      materialId: 'mat-card-1',
+      captionPreview: 'Per-post task material 1',
+      postId: '111',
+      postUrl: 'https://www.facebook.com/groups/10001/posts/111/',
+      postedAt: Date.now() - 5000,
+    });
+
+    let currentOnline: string[] = [];
+    let shouldRestrictAll = false;
+    const mediaPreparer: PosterMediaPreparerPort = {
+      async prepare() {
+        return { localFilePath: '', mediaKind: 'none' };
+      },
+    };
+    const runner: GroupPosterBrowserPort = {
+      ready: (id) => currentOnline.includes(id),
+      onlineProfileIds: () => [...currentOnline],
+      busy: async () => false,
+      stop: async () => {},
+      async runProfileWorker(profileId, _files, _settings, callbacks) {
+        while (await callbacks.canContinueAccount(profileId)) {
+          const task = await callbacks.claimNextTask();
+          if (!task) break;
+          if (shouldRestrictAll) {
+            callbacks.returnTaskOnRestriction(task);
+            throw new PosterAccountRestrictedError('受限 · 账号暂时无法发帖');
+          }
+          await callbacks.onTaskPosted({
+            id: `log-${profileId}-${task.group.id}`,
+            profileId,
+            accountId: '61500002',
+            accountName: 'Page Dynamic',
+            accountAvatar: null,
+            identityType: 'page',
+            groupId: task.group.id,
+            groupName: task.group.name,
+            groupAvatar: null,
+            materialId: task.material.id,
+            captionPreview: task.material.caption,
+            postId: `post-${task.group.id}`,
+            postUrl: `https://www.facebook.com/groups/${task.group.id}/posts/post-${task.group.id}/`,
+            postedAt: Date.now(),
+          });
+        }
+      },
+    };
+
+    const service = new GroupPosterService(store.groupPoster, runner, mediaPreparer);
+
+    // 1) Scheduled task when NO browsers are online at trigger time -> marked 'failed'
+    const scheduledOffline = await service.createTask({
+      materialId: 'mat-card-1',
+      groupIds: ['10001', '10002'],
+      accountMode: 'all_online',
+      profileIds: [],
+      scheduledAt: Date.now() + 500,
+    });
+    const offlineTask = (scheduledOffline.tasks ?? []).find((t) => t.materialId === 'mat-card-1');
+    assert.equal(offlineTask?.status, 'scheduled');
+    assert.equal(offlineTask?.totalGroups, 1); // 10001 was skipped!
+    assert.equal(offlineTask?.skippedCount, 1);
+
+    await service.tickScheduledTasks(Date.now() + 1000);
+    const afterOfflineTrigger = await service.state();
+    const failedTask = (afterOfflineTrigger.tasks ?? []).find((t) => t.id === offlineTask?.id);
+    assert.equal(failedTask?.status, 'failed');
+    assert.equal(failedTask?.statusReason.includes('没有在线'), true);
+
+    // 2) Scheduled task with all_online: created while P002 is offline, then P002 comes online at trigger time
+    const scheduledOnline = await service.createTask({
+      materialId: 'mat-card-1',
+      groupIds: ['10001', '10002'],
+      accountMode: 'all_online',
+      profileIds: [],
+      scheduledAt: Date.now() + 2000,
+    });
+    const onlineTask = (scheduledOnline.tasks ?? []).find((t) => t.status === 'scheduled');
+    assert.ok(onlineTask);
+
+    currentOnline = [P002];
+    await service.tickScheduledTasks(Date.now() + 2500);
+    for (let i = 0; i < 40; i += 1) {
+      if (!service.hasActiveExecution()) break;
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+
+    const afterOnlineRun = await service.state();
+    const completedTask = (afterOnlineRun.tasks ?? []).find((t) => t.id === onlineTask.id);
+    assert.equal(completedTask?.status, 'completed');
+    assert.equal(completedTask?.postedCount, 1);
+    assert.deepEqual(afterOnlineRun.postedGroupIdsByMaterial?.['mat-card-1']?.sort(), [
+      '10001',
+      '10002',
+    ]);
+
+    // 3) Immediate task on 10003 when all accounts hit restriction -> settled as 'failed'
+    shouldRestrictAll = true;
+    await service.createTask({
+      materialId: 'mat-card-1',
+      groupIds: ['10003'],
+      accountMode: 'all_online',
+      profileIds: [],
+      scheduledAt: null,
+    });
+    for (let i = 0; i < 40; i += 1) {
+      if (!service.hasActiveExecution()) break;
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+    const afterRestrictState = await service.state();
+    const latestTask = (afterRestrictState.tasks ?? [])[0];
+    assert.equal(latestTask?.status, 'failed');
+  });
+
+  it('merges overlapping tasks for the same post without duplicate posting', async () => {
+    const { store } = await createTempStore();
+    store.groupPoster.upsertTargets({
+      items: [
+        { id: '20001', name: 'Overlap Group 1' },
+        { id: '20002', name: 'Overlap Group 2' },
+      ],
+    });
+    store.groupPoster.saveMaterials({
+      items: [
+        {
+          id: 'mat-overlap',
+          caption: 'Overlap test post',
+          mediaSource: '',
+          background: 'plain',
+          selected: true,
+        },
+      ],
+    });
+
+    const postedGroups: string[] = [];
+    let releaseFirstPost!: () => void;
+    const firstPostGate = new Promise<void>((resolve) => {
+      releaseFirstPost = resolve;
+    });
+
+    const mediaPreparer: PosterMediaPreparerPort = {
+      async prepare() {
+        return { localFilePath: '', mediaKind: 'none' };
+      },
+    };
+    const runner: GroupPosterBrowserPort = {
+      ready: () => true,
+      onlineProfileIds: () => [P001, P002],
+      busy: async () => false,
+      stop: async () => {},
+      async runProfileWorker(profileId, _files, _settings, callbacks) {
+        while (await callbacks.canContinueAccount(profileId)) {
+          const task = await callbacks.claimNextTask();
+          if (!task) break;
+          await firstPostGate;
+          postedGroups.push(task.group.id);
+          await callbacks.onTaskPosted({
+            id: `log-ov-${task.group.id}-${Date.now()}`,
+            profileId,
+            accountId: '61500099',
+            accountName: 'Overlap Page',
+            accountAvatar: null,
+            identityType: 'page',
+            groupId: task.group.id,
+            groupName: task.group.name,
+            groupAvatar: null,
+            materialId: task.material.id,
+            captionPreview: task.material.caption,
+            postId: `p-${task.group.id}`,
+            postUrl: `https://www.facebook.com/groups/${task.group.id}/posts/p-${task.group.id}/`,
+            postedAt: Date.now(),
+          });
+        }
+      },
+    };
+
+    const service = new GroupPosterService(store.groupPoster, runner, mediaPreparer);
+
+    // Task A starts on [20001, 20002] with P001
+    await service.createTask({
+      materialId: 'mat-overlap',
+      groupIds: ['20001', '20002'],
+      accountMode: 'selected',
+      profileIds: [P001],
+      scheduledAt: null,
+    });
+
+    // While Task A is still in-flight/queued, Task B starts on [20001, 20002] with P002
+    await service.createTask({
+      materialId: 'mat-overlap',
+      groupIds: ['20001', '20002'],
+      accountMode: 'selected',
+      profileIds: [P002],
+      scheduledAt: null,
+    });
+
+    // Check activeGroupsByMaterial while in-flight
+    const midState = await service.state();
+    assert.equal((midState.activeGroupsByMaterial?.['mat-overlap'] ?? []).length, 2);
+
+    releaseFirstPost();
+    for (let i = 0; i < 40; i += 1) {
+      if (!service.hasActiveExecution()) break;
+      await new Promise<void>((r) => setTimeout(r, 20));
+    }
+
+    // Each group must only be posted ONCE!
+    assert.deepEqual([...postedGroups].sort(), ['20001', '20002']);
+    const endState = await service.state();
+    for (const t of endState.tasks ?? []) {
+      assert.equal(t.status, 'completed');
+      assert.equal(t.postedCount, 2);
+    }
   });
 });

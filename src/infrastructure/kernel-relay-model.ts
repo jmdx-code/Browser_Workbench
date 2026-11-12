@@ -110,7 +110,10 @@ export class KernelRelayModel {
       // The publisher's observed controls all belong to the owned main page. Attaching every
       // embedded Facebook widget is unnecessary and can pause/detach initialization on an
       // unrelated cross-origin iframe. Keep SDK root attachment, but disable native children.
-      if (this.access === 'facebook-task' && command.method === 'Target.setAutoAttach') {
+      if (
+        (this.access === 'facebook-task' || this.access === 'agent-browser') &&
+        command.method === 'Target.setAutoAttach'
+      ) {
         if (!tab || params.flatten !== true || typeof params.autoAttach !== 'boolean')
           throw Error('KERNEL_TASK_CHILD_ATTACH_REJECTED');
         this.trace('task:main-page-only');
@@ -142,7 +145,8 @@ export class KernelRelayModel {
       }
       case 'Target.createTarget': {
         // Production sessions own one task page; the SDK cannot create a second task surface.
-        if (this.access === 'facebook-task') throw Error('KERNEL_TASK_TAB_CREATION_REJECTED');
+        if (this.access === 'facebook-task' || this.access === 'agent-browser')
+          throw Error('KERNEL_TASK_TAB_CREATION_REJECTED');
         if (params.browserContextId !== undefined) throw Error('KERNEL_CONTEXT_CREATION_REJECTED');
         const url = typeof params.url === 'string' ? params.url : 'about:blank';
         const tab = await this.executor.create(url);
@@ -246,7 +250,11 @@ export class KernelRelayModel {
       this.trace('event:' + method);
     if (method === 'Page.frameNavigated') {
       const frame = KernelJsonObject.safeParse(params.frame);
-      if (this.access === 'facebook-task' && frame.success && frame.data.parentId) {
+      if (
+        (this.access === 'facebook-task' || this.access === 'agent-browser') &&
+        frame.success &&
+        frame.data.parentId
+      ) {
         this.trace('task:child-frame-excluded');
         return;
       }
@@ -262,7 +270,7 @@ export class KernelRelayModel {
     }
     if (method === 'Target.attachedToTarget') {
       const info = KernelTargetInfo.parse(params.targetInfo);
-      if (this.access === 'facebook-task') {
+      if (this.access === 'facebook-task' || this.access === 'agent-browser') {
         // Unadvertised child targets never get a synthetic SDK session or command authority.
         this.trace('task:child-excluded:' + info.type);
         return;

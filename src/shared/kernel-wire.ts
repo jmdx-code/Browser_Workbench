@@ -22,7 +22,7 @@ export const KernelRequest = z.discriminatedUnion('kind', [
       kind: z.literal('open'),
       stamp: KernelStamp,
       files: z.array(z.string().min(1).max(4096)).max(20),
-      access: z.enum(['fixture', 'facebook-readonly', 'facebook-task']).optional(),
+      access: z.enum(['fixture', 'facebook-readonly', 'facebook-task', 'agent-browser']).optional(),
       summaryOnly: z.boolean().optional(),
     })
     .strict(),

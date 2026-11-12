@@ -69,6 +69,9 @@ export type PosterCacheStatus = z.infer<typeof PosterCacheStatus>;
 export const PosterMaterialBackground = z.enum(['color', 'plain']);
 export type PosterMaterialBackground = z.infer<typeof PosterMaterialBackground>;
 
+export const PosterMaterialAiLabel = z.enum(['default', 'on', 'off']);
+export type PosterMaterialAiLabel = z.infer<typeof PosterMaterialAiLabel>;
+
 export const POSTER_COLOR_BACKGROUND_MAX_CHARS = 120;
 
 export function hasPosterMaterialContent(input: { caption: string; mediaSource: string }): boolean {
@@ -95,6 +98,7 @@ export const PosterMaterialInput = z
     caption: z.string().trim().max(20000, '贴文内容过长').optional().default(''),
     mediaSource: z.string().trim().max(2000).optional().default(''),
     background: PosterMaterialBackground.optional().default('plain'),
+    aiLabel: PosterMaterialAiLabel.optional().default('default'),
     selected: z.boolean().optional().default(true),
   })
   .strict()
@@ -134,6 +138,7 @@ export interface PosterMaterial {
   caption: string;
   mediaSource: string;
   background: PosterMaterialBackground;
+  aiLabel?: PosterMaterialAiLabel | undefined;
   localFilePath: string | null;
   mediaKind: PosterMediaKind;
   cacheStatus: PosterCacheStatus;
@@ -173,6 +178,71 @@ export const StartPosterInput = z
   .strict();
 export type StartPosterInput = z.infer<typeof StartPosterInput>;
 
+export const PosterTaskAccountMode = z.enum(['selected', 'all_online']);
+export type PosterTaskAccountMode = z.infer<typeof PosterTaskAccountMode>;
+
+export const PosterTaskStatus = z.enum([
+  'scheduled',
+  'running',
+  'completed',
+  'partial',
+  'failed',
+  'cancelled',
+]);
+export type PosterTaskStatus = z.infer<typeof PosterTaskStatus>;
+
+export const CreatePosterTaskInput = z
+  .object({
+    materialId: z.string().trim().min(1).max(120),
+    groupIds: z.array(GroupIdString).min(1).max(500),
+    accountMode: PosterTaskAccountMode.optional().default('selected'),
+    profileIds: z.array(Id).max(500).optional().default([]),
+    scheduledAt: z.number().int().positive().nullable().optional().default(null),
+  })
+  .strict()
+  .superRefine((val, ctx) => {
+    if (val.accountMode === 'selected' && val.profileIds.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        message: '请至少选择 1 个发帖账号，或选择上方“全部在线账号”',
+      });
+    }
+  });
+export type CreatePosterTaskInput = z.infer<typeof CreatePosterTaskInput>;
+
+export const PosterTaskIdInput = z
+  .object({
+    id: z.string().trim().min(1).max(120),
+  })
+  .strict();
+export type PosterTaskIdInput = z.infer<typeof PosterTaskIdInput>;
+
+export interface PosterTask {
+  id: string;
+  materialId: string;
+  captionPreview: string;
+  groupIds: string[];
+  accountMode: PosterTaskAccountMode;
+  profileIds: string[];
+  scheduledAt: number | null;
+  status: PosterTaskStatus;
+  totalGroups: number;
+  postedCount: number;
+  skippedCount: number;
+  statusReason: string;
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+export interface PosterActiveGroupItem {
+  groupId: string;
+  groupName: string;
+  state: 'posting' | 'queued';
+  profileId?: string | undefined;
+  statusText?: string | undefined;
+}
+
 export interface PosterProfileStat {
   today: number;
   session: number;
@@ -203,6 +273,9 @@ export interface PosterState {
   profileCounts: Record<string, PosterProfileStat>;
   dailyStats: BumperDailyStat[];
   pendingReviewOperations?: PosterPendingOperation[];
+  postedGroupIdsByMaterial?: Record<string, string[]>;
+  activeGroupsByMaterial?: Record<string, PosterActiveGroupItem[]>;
+  tasks?: PosterTask[];
 }
 
 export const DEFAULT_POSTER_TEST_MATERIAL = {

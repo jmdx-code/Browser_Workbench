@@ -60,6 +60,27 @@ export function WorkbenchTopbar({
           <button
             className="btn btn-sm"
             title={
+              updateStatus?.aiWorkspaceDirectory
+                ? `打开固定的 AI 专属工作夹（同时支持 Antigravity 与 Codex；仅在打开此文件夹的窗口生效）：${updateStatus.aiWorkspaceDirectory}`
+                : '打开固定的 AI 专属工作夹（同时支持 Antigravity 与 Codex；仅在打开此文件夹的窗口生效）'
+            }
+            onClick={() => {
+              void (async () => {
+                try {
+                  const { directory } = await api.openAiWorkspaceDirectory();
+                  await copyTextToClipboard(directory).catch(() => {});
+                  onNotify(`已打开 AI 专属工作夹并复制路径：${directory}`);
+                } catch (err) {
+                  onNotify(err instanceof Error ? err.message : '打开 AI 专属工作夹失败');
+                }
+              })();
+            }}
+          >
+            打开 AI 专属工作夹
+          </button>
+          <button
+            className="btn btn-sm"
+            title={
               updateStatus?.extensionDirectory
                 ? `点击复制固定插件目录：${updateStatus.extensionDirectory}`
                 : '点击复制浏览器扩展（固定插件目录）路径'

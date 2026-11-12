@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { BumperState } from '../../../shared/group-bumper.js';
+import type { BluestacksState } from '../../../shared/bluestacks.js';
 import type { GroupInviterState } from '../../../shared/group-inviter.js';
 import type { PosterState } from '../../../shared/group-poster.js';
 import { api } from '../../api.js';
@@ -33,10 +34,12 @@ export function useFeatureModulesPolling(viewKind: string) {
   const [groupInviter, setGroupInviter] = useState<GroupInviterState | null>(null);
   const [groupInviterLoaded, setGroupInviterLoaded] = useState(false);
   const [groupPoster, setGroupPoster] = useState<PosterState | null>(null);
+  const [bluestacks, setBluestacks] = useState<BluestacksState | null>(null);
   const [windowVisible, setWindowVisible] = useState<boolean>(() =>
     typeof document !== 'undefined' ? !document.hidden : true,
   );
   const prevInviterRunningRef = useRef<boolean>(false);
+  const prevBluestacksRunningRef = useRef<boolean>(false);
 
   useEffect(() => {
     const runningNow = Boolean(groupInviter?.running);
@@ -50,6 +53,18 @@ export function useFeatureModulesPolling(viewKind: string) {
     }
     prevInviterRunningRef.current = runningNow;
   }, [groupInviter]);
+
+  useEffect(() => {
+    const runningNow = Boolean(bluestacks?.running);
+    if (
+      prevBluestacksRunningRef.current &&
+      !runningNow &&
+      bluestacks?.bumperSettings?.enableSound
+    ) {
+      playInviterCompletionChime();
+    }
+    prevBluestacksRunningRef.current = runningNow;
+  }, [bluestacks]);
 
   useEffect(() => {
     if (typeof document === 'undefined') return;
@@ -80,12 +95,20 @@ export function useFeatureModulesPolling(viewKind: string) {
       .catch(() => {});
   }, []);
 
+  const refreshBluestacks = useCallback((force = false) => {
+    void api
+      .bluestacksState(force)
+      .then((next) => setBluestacks(next))
+      .catch(() => {});
+  }, []);
+
   // Initial bootstrap load once on mount
   useEffect(() => {
     refreshBumper();
     void refreshGroupInviter();
     refreshPoster();
-  }, [refreshBumper, refreshGroupInviter, refreshPoster]);
+    refreshBluestacks(false);
+  }, [refreshBumper, refreshGroupInviter, refreshPoster, refreshBluestacks]);
 
   // Bumper polling: 2s when active view or running/refreshing (throttled when hidden); paused when idle & not viewing
   const bumperBusy = Boolean(
@@ -97,16 +120,25 @@ export function useFeatureModulesPolling(viewKind: string) {
   const bumperActive =
     viewKind === 'group-bumper' ||
     viewKind === 'page-bumper' ||
+    viewKind === 'bluestacks-group-bumper' ||
     viewKind === 'records' ||
     bumperBusy;
 
   useEffect(() => {
-    if (viewKind === 'group-bumper' || viewKind === 'page-bumper' || viewKind === 'records') {
+    if (
+      viewKind === 'group-bumper' ||
+      viewKind === 'page-bumper' ||
+      viewKind === 'bluestacks-group-bumper' ||
+      viewKind === 'records'
+    ) {
       refreshBumper();
     }
     if (!bumperActive) return;
     const intervalMs = windowVisible
-      ? viewKind === 'group-bumper' || viewKind === 'page-bumper' || bumperBusy
+      ? viewKind === 'group-bumper' ||
+        viewKind === 'page-bumper' ||
+        viewKind === 'bluestacks-group-bumper' ||
+        bumperBusy
         ? 2000
         : 6000
       : 10000;
@@ -150,6 +182,30 @@ export function useFeatureModulesPolling(viewKind: string) {
     return () => clearInterval(timer);
   }, [viewKind, posterActive, windowVisible, posterBusy, refreshPoster]);
 
+  // BlueStacks polling
+  const bluestacksBusy = Boolean(
+    bluestacks?.running ||
+    (bluestacks?.launchingIds.length ?? 0) > 0 ||
+    (bluestacks?.closingIds.length ?? 0) > 0 ||
+    (bluestacks?.inspectingIds.length ?? 0) > 0,
+  );
+  const bluestacksActive =
+    viewKind === 'bluestacks-group-bumper' || viewKind === 'records' || bluestacksBusy;
+
+  useEffect(() => {
+    if (viewKind === 'bluestacks-group-bumper' || viewKind === 'records') {
+      refreshBluestacks(false);
+    }
+    if (!bluestacksActive) return;
+    const intervalMs = windowVisible
+      ? viewKind === 'bluestacks-group-bumper' || bluestacksBusy
+        ? 1800
+        : 6000
+      : 10000;
+    const timer = setInterval(() => refreshBluestacks(false), intervalMs);
+    return () => clearInterval(timer);
+  }, [viewKind, bluestacksActive, windowVisible, bluestacksBusy, refreshBluestacks]);
+
   return {
     groupBumper,
     setGroupBumper,
@@ -160,5 +216,8 @@ export function useFeatureModulesPolling(viewKind: string) {
     groupPoster,
     setGroupPoster,
     refreshPoster,
+    bluestacks,
+    setBluestacks,
+    refreshBluestacks,
   };
 }

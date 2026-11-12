@@ -5,6 +5,8 @@ import type { FeatureExecutionRegistry } from '../../application/feature-executi
 import type { GroupBumperService } from '../../application/group-bumper-service.js';
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
 import type { GroupPosterService } from '../../application/group-poster-service.js';
+import type { BluestacksService } from '../../application/bluestacks-service.js';
+import { handleBluestacksRoutes } from './bluestacks-routes.js';
 import { handleGroupPosterRoutes } from './group-poster-routes.js';
 import type { NativeReviewService } from '../../application/native-review.js';
 import type { ProfileInspectionService } from '../../application/profile-inspection.js';
@@ -45,6 +47,7 @@ export interface FeatureModuleRouteContext {
   groupInviter?: GroupInviterService | undefined;
   groupBumper?: GroupBumperService | undefined;
   groupPoster?: GroupPosterService | undefined;
+  bluestacks?: BluestacksService | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
 }
 
@@ -64,8 +67,13 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
     groupInviter,
     groupBumper,
     groupPoster,
+    bluestacks,
     featureExecution,
   } = ctx;
+
+  if (await handleBluestacksRoutes({ req, res, route, input, json, cleanup, bluestacks })) {
+    return true;
+  }
 
   if (await handleGroupPosterRoutes({ req, res, route, input, json, cleanup, groupPoster })) {
     return true;

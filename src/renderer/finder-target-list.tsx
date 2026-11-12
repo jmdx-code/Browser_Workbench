@@ -49,6 +49,11 @@ function FinderAvatar({ item }: { item: FinderItem }) {
     <span className="finder-avatar-placeholder">{Array.from(item.name)[0] ?? '?'}</span>
   );
 }
+export interface FinderDisabledItemInfo {
+  badge: string;
+  tone?: 'muted' | 'run' | 'warn' | undefined;
+  title?: string | undefined;
+}
 export function FinderTargetList({
   listKind,
   items,
@@ -60,6 +65,7 @@ export function FinderTargetList({
   title,
   countLabel,
   disabled = false,
+  disabledItems,
   tools,
   moreItems,
 }: {
@@ -73,6 +79,7 @@ export function FinderTargetList({
   title: string;
   countLabel: string;
   disabled?: boolean;
+  disabledItems?: ReadonlyMap<string, FinderDisabledItemInfo> | undefined;
   tools?: ReactNode;
   moreItems?: MenuItem[];
 }) {
@@ -117,7 +124,7 @@ export function FinderTargetList({
   }, [listKind]);
   useEffect(() => {
     if (selected.size === 0) return;
-    const validIds = new Set(items.map((i) => i.id));
+    const validIds = new Set(items.filter((i) => !disabledItems?.has(i.id)).map((i) => i.id));
     let hasStale = false;
     for (const id of selected) {
       if (!validIds.has(id)) {
@@ -130,7 +137,7 @@ export function FinderTargetList({
       selectionRef.current = pruned;
       onSelect(pruned);
     }
-  }, [items, selected, onSelect]);
+  }, [items, selected, onSelect, disabledItems]);
   useEffect(() => {
     const stop = () => {
       paint.current = null;
@@ -157,15 +164,26 @@ export function FinderTargetList({
     { id: '', name: folders.length ? '未分组' : '' },
   ];
   const visible = sections.flatMap((f) =>
-    closed.has(f.id) ? [] : filtered.filter((i) => (i.folderId ?? '') === f.id).map((i) => i.id),
+    closed.has(f.id)
+      ? []
+      : filtered
+          .filter((i) => (i.folderId ?? '') === f.id && !disabledItems?.has(i.id))
+          .map((i) => i.id),
   );
   function select(ids: string[], checked: boolean) {
     const next = new Set(selectionRef.current);
-    ids.forEach((id) => (checked ? next.add(id) : next.delete(id)));
+    ids.forEach((id) => {
+      if (checked) {
+        if (!disabledItems?.has(id)) next.add(id);
+      } else {
+        next.delete(id);
+      }
+    });
     selectionRef.current = next;
     onSelect(next);
   }
   function choose(id: string, shift: boolean) {
+    if (disabledItems?.has(id)) return;
     const next = rangeFinderSelection(
       selectionRef.current,
       visible,
@@ -250,20 +268,16 @@ export function FinderTargetList({
         ]
       : []),
   ];
+  const selectableFilteredIds = filtered.filter((i) => !disabledItems?.has(i.id)).map((i) => i.id);
   return (
     <section className="finder-target-list" aria-label={title}>
       <div className="finder-toolbar">
         <FinderCheck
-          ids={filtered.map((i) => i.id)}
+          ids={selectableFilteredIds}
           selected={selected}
           label={'全选' + title}
-          disabled={unavailable}
-          onChange={(checked) =>
-            select(
-              filtered.map((i) => i.id),
-              checked,
-            )
-          }
+          disabled={unavailable || selectableFilteredIds.length === 0}
+          onChange={(checked) => select(selectableFilteredIds, checked)}
         />
         <strong>{title}</strong>
         <small>
@@ -348,7 +362,8 @@ export function FinderTargetList({
         </div>
         {sections.map((f) => {
           const rows = filtered.filter((i) => (i.folderId ?? '') === f.id),
-            ids = rows.map((i) => i.id);
+            ids = rows.map((i) => i.id),
+            selectableFolderIds = ids.filter((id) => !disabledItems?.has(id));
           return (
             <section key={f.id || 'unfiled'}>
               {(f.id || folders.length > 0) && (
@@ -372,11 +387,11 @@ export function FinderTargetList({
                   }}
                 >
                   <FinderCheck
-                    ids={ids}
+                    ids={selectableFolderIds}
                     selected={selected}
                     label={'选择整组 ' + f.name}
-                    disabled={unavailable}
-                    onChange={(v) => select(ids, v)}
+                    disabled={unavailable || selectableFolderIds.length === 0}
+                    onChange={(v) => select(selectableFolderIds, v)}
                   />
                   <button
                     className="finder-folder-title"
@@ -427,140 +442,167 @@ export function FinderTargetList({
                 </div>
               )}
               {!closed.has(f.id) &&
-                rows.map((item) => (
-                  <div
-                    key={item.id}
-                    data-finder-id={item.id}
-                    draggable={!unavailable}
-                    className={
-                      'finder-row' +
-                      (selected.has(item.id) ? ' is-selected' : '') +
-                      (drop === 'b:' + item.id
-                        ? ' drop-before'
-                        : drop === 'a:' + item.id
-                          ? ' drop-after'
-                          : '')
-                    }
-                    onClick={(e) => {
-                      const selection = window.getSelection()?.toString().trim() ?? '';
-                      if (selection.length > 0) return;
-                      if (!unavailable) choose(item.id, e.shiftKey);
-                    }}
-                    onDragStart={(e) => {
-                      if (
-                        paint.current !== null ||
-                        textSelectRef.current ||
-                        (window.getSelection()?.toString().trim().length ?? 0) > 0
-                      ) {
-                        e.preventDefault();
-                        return;
+                rows.map((item) => {
+                  const disabledInfo = disabledItems?.get(item.id);
+                  const itemUnavailable = unavailable || Boolean(disabledInfo);
+                  return (
+                    <div
+                      key={item.id}
+                      data-finder-id={item.id}
+                      draggable={!unavailable}
+                      title={disabledInfo?.title}
+                      className={
+                        'finder-row' +
+                        (!disabledInfo && selected.has(item.id) ? ' is-selected' : '') +
+                        (disabledInfo ? ' is-disabled-target' : '') +
+                        (drop === 'b:' + item.id
+                          ? ' drop-before'
+                          : drop === 'a:' + item.id
+                            ? ' drop-after'
+                            : '')
                       }
-                      drag.current = selected.has(item.id)
-                        ? ordered.filter((i) => selected.has(i.id)).map((i) => i.id)
-                        : [item.id];
-                      e.dataTransfer.setData(
-                        'text/plain',
-                        JSON.stringify({ listKind, ids: drag.current }),
-                      );
-                      e.dataTransfer.effectAllowed = 'move';
-                      const ghost = document.createElement('div');
-                      ghost.className = 'finder-drag-ghost';
-                      ghost.textContent = '移动 ' + drag.current.length + ' 个条目';
-                      document.body.append(ghost);
-                      e.dataTransfer.setDragImage(ghost, 0, 0);
-                      setTimeout(() => ghost.remove(), 0);
-                    }}
-                    onDragEnd={() => {
-                      drag.current = [];
-                      setDrop('');
-                    }}
-                    onDragOver={(e) => {
-                      if (!unavailable && drag.current.length) {
-                        e.preventDefault();
-                        setDrop(
-                          (e.clientY <
-                          e.currentTarget.getBoundingClientRect().top +
-                            e.currentTarget.offsetHeight / 2
-                            ? 'b:'
-                            : 'a:') + item.id,
+                      onClick={(e) => {
+                        const selection = window.getSelection()?.toString().trim() ?? '';
+                        if (selection.length > 0) return;
+                        if (!itemUnavailable) choose(item.id, e.shiftKey);
+                      }}
+                      onDragStart={(e) => {
+                        if (
+                          paint.current !== null ||
+                          textSelectRef.current ||
+                          (window.getSelection()?.toString().trim().length ?? 0) > 0
+                        ) {
+                          e.preventDefault();
+                          return;
+                        }
+                        drag.current = selected.has(item.id)
+                          ? ordered.filter((i) => selected.has(i.id)).map((i) => i.id)
+                          : [item.id];
+                        e.dataTransfer.setData(
+                          'text/plain',
+                          JSON.stringify({ listKind, ids: drag.current }),
                         );
-                      }
-                    }}
-                    onDragLeave={(e) => {
-                      if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrop('');
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      if (unavailable || drag.current.includes(item.id)) return;
-                      void move(
-                        item.folderId,
-                        drag.current,
-                        item.id,
-                        e.clientY >=
-                          e.currentTarget.getBoundingClientRect().top +
-                            e.currentTarget.getBoundingClientRect().height / 2,
-                      ).catch(() => {});
-                      drag.current = [];
-                      setDrop('');
-                    }}
-                  >
-                    <span
-                      className="finder-check-cell"
-                      onClick={(e) => e.stopPropagation()}
-                      onPointerDown={(e) => {
-                        if (unavailable || e.button !== 0) return;
-                        e.stopPropagation();
-                        pointerHandledRef.current = item.id;
-                        const nextChecked = !selectionRef.current.has(item.id);
-                        paint.current = nextChecked;
-                        if (e.shiftKey) choose(item.id, true);
-                        else {
-                          anchor.current = item.id;
-                          select([item.id], nextChecked);
+                        e.dataTransfer.effectAllowed = 'move';
+                        const ghost = document.createElement('div');
+                        ghost.className = 'finder-drag-ghost';
+                        ghost.textContent = '移动 ' + drag.current.length + ' 个条目';
+                        document.body.append(ghost);
+                        e.dataTransfer.setDragImage(ghost, 0, 0);
+                        setTimeout(() => ghost.remove(), 0);
+                      }}
+                      onDragEnd={() => {
+                        drag.current = [];
+                        setDrop('');
+                      }}
+                      onDragOver={(e) => {
+                        if (!unavailable && drag.current.length) {
+                          e.preventDefault();
+                          setDrop(
+                            (e.clientY <
+                            e.currentTarget.getBoundingClientRect().top +
+                              e.currentTarget.offsetHeight / 2
+                              ? 'b:'
+                              : 'a:') + item.id,
+                          );
                         }
                       }}
-                      onPointerEnter={() => {
-                        if (paint.current !== null && !unavailable)
-                          select([item.id], paint.current);
+                      onDragLeave={(e) => {
+                        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrop('');
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (unavailable || drag.current.includes(item.id)) return;
+                        void move(
+                          item.folderId,
+                          drag.current,
+                          item.id,
+                          e.clientY >=
+                            e.currentTarget.getBoundingClientRect().top +
+                              e.currentTarget.getBoundingClientRect().height / 2,
+                        ).catch(() => {});
+                        drag.current = [];
+                        setDrop('');
                       }}
                     >
-                      <input
-                        type="checkbox"
-                        checked={selected.has(item.id)}
+                      <span
+                        className="finder-check-cell"
+                        onClick={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => {
+                          if (itemUnavailable || e.button !== 0) return;
+                          e.stopPropagation();
+                          pointerHandledRef.current = item.id;
+                          const nextChecked = !selectionRef.current.has(item.id);
+                          paint.current = nextChecked;
+                          if (e.shiftKey) choose(item.id, true);
+                          else {
+                            anchor.current = item.id;
+                            select([item.id], nextChecked);
+                          }
+                        }}
+                        onPointerEnter={() => {
+                          if (paint.current !== null && !itemUnavailable)
+                            select([item.id], paint.current);
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={!disabledInfo && selected.has(item.id)}
+                          disabled={itemUnavailable}
+                          aria-label={'选择 ' + item.name}
+                          readOnly
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (pointerHandledRef.current === item.id) {
+                              pointerHandledRef.current = null;
+                              return;
+                            }
+                            if (!itemUnavailable) choose(item.id, e.shiftKey);
+                          }}
+                        />
+                      </span>
+                      <span className="finder-name">
+                        <FinderAvatar item={item} />
+                        <strong
+                          className="finder-row-name"
+                          onMouseDown={disableRowDragForTextSelect}
+                        >
+                          {item.name}
+                        </strong>
+                      </span>
+                      <code onMouseDown={disableRowDragForTextSelect}>{item.id}</code>
+                      <span className="finder-count-cell">
+                        {disabledInfo ? (
+                          <span
+                            className={
+                              'pill ' +
+                              (disabledInfo.tone === 'run'
+                                ? 'pill-run'
+                                : disabledInfo.tone === 'warn'
+                                  ? 'pill-warn'
+                                  : 'pill-idle')
+                            }
+                            title={disabledInfo.title}
+                          >
+                            {disabledInfo.badge}
+                          </span>
+                        ) : (
+                          <span className="pill pill-ok">{item.count}</span>
+                        )}
+                      </span>
+                      <button
+                        className="finder-delete"
                         disabled={unavailable}
-                        aria-label={'选择 ' + item.name}
-                        readOnly
+                        aria-label={'删除 ' + item.name}
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (pointerHandledRef.current === item.id) {
-                            pointerHandledRef.current = null;
-                            return;
-                          }
-                          if (!unavailable) choose(item.id, e.shiftKey);
+                          void remove([item.id]);
                         }}
-                      />
-                    </span>
-                    <span className="finder-name">
-                      <FinderAvatar item={item} />
-                      <strong className="finder-row-name" onMouseDown={disableRowDragForTextSelect}>
-                        {item.name}
-                      </strong>
-                    </span>
-                    <code onMouseDown={disableRowDragForTextSelect}>{item.id}</code>
-                    <span className="pill pill-ok">{item.count}</span>
-                    <button
-                      className="finder-delete"
-                      disabled={unavailable}
-                      aria-label={'删除 ' + item.name}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void remove([item.id]);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
               {!closed.has(f.id) && !rows.length && (
                 <p
                   className={'finder-empty' + (drop === 'f:' + f.id ? ' is-drop' : '')}
@@ -592,7 +634,7 @@ export function FinderTargetList({
         <SelectByIdsDialog
           title={'按 ID 批量选中 · ' + title}
           kind={listKind}
-          candidates={buildTargetCandidates(ordered)}
+          candidates={buildTargetCandidates(ordered.filter((i) => !disabledItems?.has(i.id)))}
           onClose={() => setSelectByIdsOpen(false)}
           onApply={(matchedIds, applyMode) => {
             const next =

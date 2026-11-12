@@ -75,10 +75,15 @@ import { SqliteMaterialArchiveExecutionRepository } from './material-archive-exe
 import { assertArchiveSourcesAvailable } from './material-archive-source-protection.js';
 import { SqliteFacebookSubmissionObservationRepository } from './facebook-submission-observation-store.js';
 import { SqliteGroupInviterRepository } from './group-inviter-store.js';
+import { SqliteBluestacksRepository } from './bluestacks-store.js';
 import {
   type AccountCacheUpdateInput,
   mergeAccountCacheUpdate,
 } from '../shared/account-state-policy.js';
+import {
+  ProfileLaunchBinding,
+  type ProfileLaunchBinding as ProfileLaunchBindingValue,
+} from '../shared/profile-lifecycle.js';
 import { isLocalAvatar } from '../shared/group-bumper.js';
 import {
   ProductError,
@@ -423,6 +428,7 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly groupInviter: SqliteGroupInviterRepository;
   readonly groupBumper: SqliteGroupBumperRepository;
   readonly groupPoster: SqliteGroupPosterRepository;
+  readonly bluestacks: SqliteBluestacksRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
@@ -449,6 +455,7 @@ export class WorkspaceStore implements WorkspaceRepository {
     this.groupInviter = new SqliteGroupInviterRepository(db);
     this.groupBumper = new SqliteGroupBumperRepository(db);
     this.groupPoster = new SqliteGroupPosterRepository(db);
+    this.bluestacks = new SqliteBluestacksRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -524,6 +531,9 @@ export class WorkspaceStore implements WorkspaceRepository {
       );
       db.exec(
         'CREATE INDEX IF NOT EXISTS record_account_avatar ON profile_account_cache(account_id)',
+      );
+      db.exec(
+        'CREATE TABLE IF NOT EXISTS profile_launch_bindings(profile_id TEXT PRIMARY KEY,browser_kind TEXT NOT NULL,executable_path TEXT NOT NULL,user_data_dir TEXT NOT NULL,profile_directory TEXT NOT NULL,browser_name TEXT NOT NULL,window_name TEXT NOT NULL,verified_at INTEGER NOT NULL DEFAULT 0)',
       );
       const store = new WorkspaceStore(db);
       store.resourceTables.pruneConsumedRows();
@@ -625,10 +635,12 @@ export class WorkspaceStore implements WorkspaceRepository {
       const delMeta = this.stmt('DELETE FROM profile_metadata WHERE profile_id=?');
       const delCache = this.stmt('DELETE FROM profile_account_cache WHERE profile_id=?');
       const delResult = this.stmt('DELETE FROM profile_task_results WHERE profile_id=?');
+      const delBinding = this.stmt('DELETE FROM profile_launch_bindings WHERE profile_id=?');
       for (const id of uniqueIds) {
         delMeta.run(id);
         delCache.run(id);
         delResult.run(id);
+        delBinding.run(id);
       }
       return uniqueIds.length;
     });
@@ -719,6 +731,55 @@ export class WorkspaceStore implements WorkspaceRepository {
         merged.next.avatar,
         merged.next.avatarUpdatedAt,
       );
+    });
+  }
+  profileLaunchBindings(): ProfileLaunchBindingValue[] {
+    const rows = this.stmt('SELECT * FROM profile_launch_bindings').all();
+    const out: ProfileLaunchBindingValue[] = [];
+    for (const row of rows) {
+      const parsed = ProfileLaunchBinding.safeParse({
+        profileId: String(row.profile_id ?? ''),
+        browserKind: String(row.browser_kind ?? ''),
+        executablePath: String(row.executable_path ?? ''),
+        userDataDir: String(row.user_data_dir ?? ''),
+        profileDirectory: String(row.profile_directory ?? ''),
+        browserName: String(row.browser_name ?? ''),
+        windowName: String(row.window_name ?? ''),
+        verifiedAt: Number(row.verified_at ?? 0),
+      });
+      if (parsed.success) out.push(parsed.data);
+    }
+    return out;
+  }
+  upsertProfileLaunchBindings(bindings: readonly ProfileLaunchBindingValue[]): void {
+    if (!bindings.length) return;
+    this.transaction(() => {
+      const stmt = this.stmt(
+        `INSERT INTO profile_launch_bindings(
+           profile_id,browser_kind,executable_path,user_data_dir,profile_directory,browser_name,window_name,verified_at
+         ) VALUES(?,?,?,?,?,?,?,?)
+         ON CONFLICT(profile_id) DO UPDATE SET
+           browser_kind=excluded.browser_kind,
+           executable_path=excluded.executable_path,
+           user_data_dir=excluded.user_data_dir,
+           profile_directory=excluded.profile_directory,
+           browser_name=excluded.browser_name,
+           window_name=excluded.window_name,
+           verified_at=excluded.verified_at`,
+      );
+      for (const item of bindings) {
+        const valid = ProfileLaunchBinding.parse(item);
+        stmt.run(
+          valid.profileId,
+          valid.browserKind,
+          valid.executablePath,
+          valid.userDataDir,
+          valid.profileDirectory,
+          valid.browserName,
+          valid.windowName,
+          valid.verifiedAt,
+        );
+      }
     });
   }
   combinations() {

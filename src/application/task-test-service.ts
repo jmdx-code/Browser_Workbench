@@ -2,6 +2,7 @@ import type { TaskService } from './task-service.js';
 import type { WorkspaceService } from './workspace-service.js';
 import { ProductError } from '../domain/workspace.js';
 import { marketplaceBridgeSupported } from '../shared/task-features.js';
+import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import { CombinationSchema } from '../shared/contracts.js';
 import {
   TaskTestRequest,
@@ -14,11 +15,15 @@ import {
 // Single-task testing creates an ordinary immutable combination and original assignment.
 // Original plans contain the result/stop history. No second execution or test ledger exists.
 export class TaskTestService {
+  private profileLifecycle?: ProfileLifecyclePort;
   constructor(
     private readonly workspace: WorkspaceService,
     private readonly tasks: TaskService,
     private readonly isProfileExternalBusy?: (profileId: string) => boolean | Promise<boolean>,
   ) {}
+  setProfileLifecycle(lifecycle: ProfileLifecyclePort): void {
+    this.profileLifecycle = lifecycle;
+  }
   async start(input: unknown) {
     const request = TaskTestRequest.parse(input);
     request.profileIds = [...new Set(request.profileIds)].sort();
@@ -49,8 +54,22 @@ export class TaskTestService {
     if (!(await this.tasks.capabilities()).types.includes(request.module))
       throw new ProductError('TEST_MODULE_UNAVAILABLE', module.name + '的执行模块尚未加载', 409);
     await this.tasks.releaseErroredPausedPlans(request.profileIds);
-    const snapshot = await this.workspace.snapshot();
+    let snapshot = await this.workspace.snapshot();
     const live = await this.tasks.livePlans();
+    if (this.profileLifecycle) {
+      const offlineCandidates: string[] = [];
+      for (const profileId of request.profileIds) {
+        const profile = snapshot.profiles.find((item) => item.id === profileId);
+        if (profile?.online) continue;
+        const externalBusy = (await this.isProfileExternalBusy?.(profileId)) === true;
+        const hasLive = live.some((plan) => plan.profileId === profileId);
+        if (!externalBusy && !hasLive) offlineCandidates.push(profileId);
+      }
+      if (offlineCandidates.length > 0) {
+        await this.profileLifecycle.ensureProfilesOnline(offlineCandidates);
+        snapshot = await this.workspace.snapshot();
+      }
+    }
     const rejected: { profileId: string; reason: string }[] = [];
     for (const profileId of request.profileIds) {
       const profile = snapshot.profiles.find((item) => item.id === profileId);

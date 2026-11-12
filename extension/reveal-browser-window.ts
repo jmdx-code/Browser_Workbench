@@ -285,3 +285,37 @@ export async function cleanupExtraTabs(
     remainingTabCount: Math.max(1, remaining.length),
   };
 }
+
+export async function closeProfileWindows(): Promise<{
+  closedCount: number;
+  remainingCount: number;
+}> {
+  const allWindows =
+    typeof chrome.windows?.getAll === 'function' ? await chrome.windows.getAll({}) : [];
+  let closedCount = 0;
+  for (const win of allWindows) {
+    if (win.id === undefined) continue;
+    try {
+      await chrome.windows.remove(win.id);
+      closedCount++;
+    } catch {
+      // Ignore already-closed window
+    }
+  }
+  let remainingCount = 0;
+  if (typeof chrome.windows?.getAll === 'function') {
+    const settleDeadline = Date.now() + 900;
+    while (true) {
+      const remaining = await chrome.windows
+        .getAll({ windowTypes: ['normal', 'popup'] })
+        .catch(() => []);
+      remainingCount = remaining.length;
+      if (remainingCount === 0 || Date.now() >= settleDeadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+  }
+  return {
+    closedCount,
+    remainingCount,
+  };
+}

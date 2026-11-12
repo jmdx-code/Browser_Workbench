@@ -25,6 +25,7 @@ import {
   classifyFacebookAbnormalUrl,
   facebookBrowseSurface,
   facebookMarketplaceUnavailableURL,
+  facebookPostStoryLandingURL,
   facebookMarketplaceURL,
   facebookMarketplaceItemURL,
   matchesMarketplaceSearch,
@@ -345,12 +346,18 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
       detail !== null &&
       (this.dwells.get(execution.plan.profileId)?.stepId === execution.step.id ||
         this.viewedItems.get(execution.plan.profileId)?.stepId === execution.step.id);
-    if (facebookMarketplaceUnavailableURL(page.url) && !page.blocked)
+    if (
+      (facebookMarketplaceUnavailableURL(page.url) || facebookPostStoryLandingURL(page.url)) &&
+      !page.blocked
+    ) {
+      this.dwells.delete(execution.plan.profileId);
+      this.waits.delete(execution.plan.profileId);
       return {
         kind: 'action',
         action: { kind: 'browseNavigate', tabId: proof.tabId, url },
         intent: { kind: 'auxiliary', purpose: 'advance', ...scope },
       };
+    }
     if (!facebookBrowseSurface(page.url)) {
       const prevRouteWait = this.waits.get(execution.plan.profileId);
       const routeWaitElapsed =
@@ -373,7 +380,7 @@ export class FacebookBrowseStepExecutor implements BrowseStepExecutor {
         }
       })();
       if (
-        page.ready &&
+        (page.ready || routeWaitElapsed >= 4_000) &&
         safeFacebookOrigin &&
         routeWaitElapsed >= 4_000 &&
         (page.blocked ||

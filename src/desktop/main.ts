@@ -4,6 +4,7 @@ import { applyPendingWorkspaceReset } from '../infrastructure/workspace-reset.js
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   utilityProcess,
@@ -15,8 +16,9 @@ import {
 } from 'electron';
 import { DesktopTaskNotification } from '../shared/workspace-preferences.js';
 import type { UtilityProcess } from 'electron';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -25,6 +27,7 @@ import {
   productDataDirectory,
   productExtensionDirectory,
 } from '../infrastructure/paths.js';
+import { productAiWorkspaceDirectory } from '../infrastructure/ai-workspace.js';
 import { DatabaseSync } from 'node:sqlite';
 import { revealLocalFile } from '../infrastructure/local-file-location.js';
 
@@ -57,6 +60,40 @@ app.setName('Browser Workbench');
 if (process.platform === 'win32') app.setAppUserModelId('浏览器工作台');
 if (process.env.WORKBENCH_SMOKE_USER_DATA)
   app.setPath('userData', process.env.WORKBENCH_SMOKE_USER_DATA);
+
+if (
+  process.platform === 'win32' &&
+  !smokeFile &&
+  !process.env.WORKBENCH_SMOKE_USER_DATA &&
+  process.env.WORKBENCH_ALLOW_MSIX_SANDBOX !== '1' &&
+  process.env.WORKBENCH_MSIX_RELAUNCHED !== '1' &&
+  !process.argv.includes('--wb-msix-relaunched')
+) {
+  try {
+    const candidateDataDir = productDataDirectory();
+    mkdirSync(candidateDataDir, { recursive: true });
+    const resolvedReal = realpathSync.native(candidateDataDir);
+    if (/\\AppData\\Local\\Packages\\[^\\]+\\LocalCache\\Roaming\\/i.test(resolvedReal)) {
+      const escapedExe = process.execPath.replace(/'/g, "''");
+      const psBreakaway =
+        `$exe = '${escapedExe}'; ` +
+        `$dir = Split-Path -Parent $exe; ` +
+        `$res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ('"' + $exe + '" --wb-msix-relaunched'); CurrentDirectory = $dir }; ` +
+        `if ($res.ReturnValue -ne 0) { exit 1 }`;
+      const launched = spawnSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psBreakaway],
+        { stdio: 'ignore', windowsHide: true, timeout: 8000 },
+      );
+      if (launched.status === 0) {
+        app.exit(0);
+      }
+    }
+  } catch {
+    // Proceed normally if realpath inspection or WMI breakaway is unavailable
+  }
+}
+
 if (!app.requestSingleInstanceLock({ version: softwareVersion })) {
   const message = `浏览器工作台 v${softwareVersion} 已在运行，已切换到运行中的窗口。`;
   if (smokeFile) {
@@ -181,6 +218,7 @@ async function boot() {
         ...process.env,
         WORKBENCH_DATA_DIR: dataDir,
         WORKBENCH_RUNTIME_ROOT: path.dirname(root),
+        WORKBENCH_DESKTOP_EXE: process.execPath,
         WORKBENCH_DISPLAYS: JSON.stringify(layoutScreens()),
         ...(avatarToken ? { WORKBENCH_GRAPH_AVATAR_TOKEN: avatarToken } : {}),
       },
@@ -213,12 +251,60 @@ async function boot() {
       message &&
       typeof message === 'object' &&
       'type' in message &&
+      message.type === 'OPEN_AI_WORKSPACE_DIRECTORY'
+    ) {
+      const target =
+        'directory' in message && typeof message.directory === 'string' && message.directory.trim()
+          ? message.directory
+          : productAiWorkspaceDirectory();
+      void mkdir(target, { recursive: true }).finally(() => {
+        void shell.openPath(target);
+      });
+      return;
+    }
+    if (
+      message &&
+      typeof message === 'object' &&
+      'type' in message &&
       message.type === 'REVEAL_DIAGNOSTIC_PACKAGE' &&
       'filePath' in message &&
       typeof message.filePath === 'string' &&
       message.filePath.trim()
     ) {
       shell.showItemInFolder(message.filePath);
+      return;
+    }
+    if (
+      message &&
+      typeof message === 'object' &&
+      'type' in message &&
+      message.type === 'CLIPBOARD_GET' &&
+      'reqId' in message &&
+      typeof message.reqId === 'string'
+    ) {
+      service.postMessage({
+        type: 'CLIPBOARD_RESULT',
+        reqId: message.reqId,
+        text: clipboard.readText(),
+      });
+      return;
+    }
+    if (
+      message &&
+      typeof message === 'object' &&
+      'type' in message &&
+      message.type === 'CLIPBOARD_SET' &&
+      'reqId' in message &&
+      typeof message.reqId === 'string' &&
+      'text' in message &&
+      typeof message.text === 'string'
+    ) {
+      clipboard.writeText(message.text);
+      service.postMessage({
+        type: 'CLIPBOARD_RESULT',
+        reqId: message.reqId,
+        text: message.text,
+      });
       return;
     }
     const notice = DesktopTaskNotification.safeParse(message);

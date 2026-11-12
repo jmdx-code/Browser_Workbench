@@ -1,5 +1,5 @@
 import type { Page } from 'playwright-core';
-import type { Peer } from '../bridge/core.js';
+import type { KernelProfileIdleInspection, Peer } from '../bridge/core.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { extractFacebookGroupId } from '../shared/facebook-target-id.js';
 import {
@@ -59,6 +59,48 @@ export class FacebookGroupSessionHelper {
     return /PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE|KERNEL_PROFILE_NOT_IDLE|KERNEL_PEER_NOT_IDLE/i.test(
       msg,
     );
+  }
+
+  /**
+   * Wait until the profile meets full kernel admission idle criteria,
+   * automatically reconciling RECOVERING / legacy fixture states when possible.
+   */
+  static async waitKernelProfileIdle(options: {
+    inspectIdle: () => Awaitable<KernelProfileIdleInspection>;
+    reconcileRecovering?: () => Awaitable<boolean>;
+    guard: () => Awaitable<void>;
+    timeoutMs?: number;
+    clock?: {
+      now?: () => number;
+      sleep?: (ms: number) => Promise<void>;
+    };
+  }): Promise<KernelProfileIdleInspection> {
+    const timeoutMs = options.timeoutMs ?? 12_000;
+    const now = options.clock?.now ?? Date.now;
+    const waitFn = options.clock?.sleep ?? sleep;
+    const deadline = now() + timeoutMs;
+    let lastReason: KernelProfileIdleInspection['reason'] = 'IDLE';
+    let reconcileAttempted = false;
+    while (now() < deadline) {
+      await options.guard();
+      const status = await options.inspectIdle();
+      if (status.idle) return status;
+      lastReason = status.reason;
+      if (status.reason === 'UNRESOLVED_BRIDGE_COMMANDS') {
+        throw Error('浏览器存在待复核的历史桥接指令（UNRESOLVED_BRIDGE_COMMANDS）');
+      }
+      if (
+        !reconcileAttempted &&
+        options.reconcileRecovering &&
+        (status.reason === 'UNRESOLVED_LEGACY_FIXTURE' ||
+          status.reason === 'RECOVERING_CONTROL_OR_SYNC')
+      ) {
+        reconcileAttempted = true;
+        await options.reconcileRecovering();
+      }
+      await waitFn(100);
+    }
+    throw Error(`等待浏览器空闲超时（${lastReason}）`);
   }
 
   /**

@@ -45,6 +45,7 @@ export const SoftwareUpdateStatus = z.object({
   currentSoftwareVersion: z.string(),
   currentExtensionVersion: z.string(),
   extensionDirectory: z.string(),
+  aiWorkspaceDirectory: z.string().optional(),
   githubRepo: z.string(),
   autoCheck: z.boolean(),
   checking: z.boolean(),
@@ -54,6 +55,12 @@ export const SoftwareUpdateStatus = z.object({
   error: z.string().nullable(),
 });
 export type UpdateStatus = z.infer<typeof SoftwareUpdateStatus>;
+export const OpenAiWorkspaceResult = z
+  .object({
+    opened: z.boolean(),
+    directory: z.string(),
+  })
+  .strict();
 export const ExtensionReloadRequest = z
   .object({ profileIds: z.array(z.uuid()).min(1).max(500).optional() })
   .strict();

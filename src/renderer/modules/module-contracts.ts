@@ -3,7 +3,13 @@ import type { Step } from '../../shared/contracts.js';
 import type { Progress, TaskCommand, TaskStepBudget } from '../../shared/task-contracts.js';
 
 export type FeatureModuleId =
-  'active-accounts' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'group-poster' | 'records';
+  | 'active-accounts'
+  | 'group-inviter'
+  | 'group-bumper'
+  | 'page-bumper'
+  | 'group-poster'
+  | 'bluestacks-group-bumper'
+  | 'records';
 
 export type StepBudget = z.infer<typeof TaskStepBudget>;
 
@@ -27,7 +33,7 @@ export interface ProfileActivityDescriptor {
 
 export interface FeatureNavItem {
   id: FeatureModuleId;
-  group: 'automation' | 'monitor';
+  group: 'automation' | 'bluestacks' | 'monitor';
   title: string;
   icon: FeatureModuleId;
   runningCount?: number | undefined;

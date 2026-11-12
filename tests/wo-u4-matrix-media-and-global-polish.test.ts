@@ -136,32 +136,32 @@ test('WO-U4.2: local media paths immediately become ready without downloading in
   }
 });
 
-test('WO-U4.3: 120px aspect-ratio WebP thumbnail generation, zero-polling-bloat PosterState, and 3-day Drive cache cleanup with path guardrail', async () => {
+test('WO-U4.3: 480px aspect-ratio WebP thumbnail generation, zero-polling-bloat PosterState, and 3-day Drive cache cleanup with path guardrail', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'wb-wou4-media-'));
   try {
-    // 1. Test 16:9 (320x180 -> 120x68) and 9:16 (180x320 -> 68x120) aspect-ratio thumbnails
-    const wide = createCanvas(320, 180);
+    // 1. Test 16:9 (960x540 -> 480x270) and 9:16 (540x960 -> 270x480) aspect-ratio thumbnails
+    const wide = createCanvas(960, 540);
     const wideCtx = wide.getContext('2d');
     wideCtx.fillStyle = '#2563eb';
-    wideCtx.fillRect(0, 0, 320, 180);
+    wideCtx.fillRect(0, 0, 960, 540);
     const wideThumb = await encodeImageBufferToPosterThumbnail(wide.toBuffer('image/png'));
     assert.ok(wideThumb);
     assert.ok(wideThumb.startsWith('data:image/webp;base64,'));
-    assert.ok(wideThumb.length <= 24 * 1024);
+    assert.ok(wideThumb.length <= 96 * 1024);
     const wideDecoded = decodePosterThumbnailDataUrl(wideThumb);
     assert.ok(wideDecoded);
     const wideImg = await loadImage(wideDecoded.bytes);
-    assert.equal(wideImg.width, 120);
-    assert.equal(wideImg.height, 68);
+    assert.equal(wideImg.width, 480);
+    assert.equal(wideImg.height, 270);
 
-    const tall = createCanvas(180, 320);
+    const tall = createCanvas(540, 960);
     const tallThumb = await encodeImageBufferToPosterThumbnail(tall.toBuffer('image/png'));
     assert.ok(tallThumb);
     const tallDecoded = decodePosterThumbnailDataUrl(tallThumb);
     assert.ok(tallDecoded);
     const tallImg = await loadImage(tallDecoded.bytes);
-    assert.equal(tallImg.width, 68);
-    assert.equal(tallImg.height, 120);
+    assert.equal(tallImg.width, 270);
+    assert.equal(tallImg.height, 480);
 
     // 2. Store thumbnail and verify PosterState.materials does not inline thumbnail_data_url
     const dbPath = path.join(dir, 'poster.sqlite');

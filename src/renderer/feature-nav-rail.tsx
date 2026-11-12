@@ -89,6 +89,25 @@ function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
           <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
         </svg>
       );
+    case 'bluestacks-group-bumper':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+          <path d="M12 13v-5M9.5 10.5 12 8l2.5 2.5" />
+        </svg>
+      );
     case 'records':
       return <IconCheckList size={16} />;
   }
@@ -115,6 +134,7 @@ export function FeatureNavRail({
   }, [collapsed]);
 
   const automationItems = items.filter((item) => item.group === 'automation');
+  const bluestacksItems = items.filter((item) => item.group === 'bluestacks');
   const monitorItems = items.filter((item) => item.group === 'monitor');
 
   function toggleGroup(groupKey: string) {
@@ -214,6 +234,30 @@ export function FeatureNavRail({
             <div className="nav-rail-list">{automationItems.map(renderItem)}</div>
           )}
         </div>
+
+        {bluestacksItems.length > 0 && (
+          <>
+            <div className="nav-rail-divider" role="separator" />
+            <div className="nav-rail-group">
+              {!collapsed && (
+                <button
+                  type="button"
+                  className={
+                    'nav-rail-group-title' + (closedGroups.has('bluestacks') ? ' is-closed' : '')
+                  }
+                  aria-expanded={!closedGroups.has('bluestacks')}
+                  onClick={() => toggleGroup('bluestacks')}
+                >
+                  <IconChevronDown size={12} />
+                  <span>蓝蝶自动化</span>
+                </button>
+              )}
+              {(collapsed || !closedGroups.has('bluestacks')) && (
+                <div className="nav-rail-list">{bluestacksItems.map(renderItem)}</div>
+              )}
+            </div>
+          </>
+        )}
 
         <div className="nav-rail-divider" role="separator" />
 

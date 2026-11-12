@@ -2,7 +2,10 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { readFacebookBrowsePage } from './facebook-browse-reader.js';
-import { facebookBrowseSurface } from '../shared/facebook-browse-route.js';
+import {
+  facebookBrowseSurface,
+  facebookPostStoryLandingURL,
+} from '../shared/facebook-browse-route.js';
 
 const DraftState = z
   .object({
@@ -77,26 +80,30 @@ export async function readFacebookHomePreparation(page: Page, guard: () => Await
         timeOrigin: performance.timeOrigin,
         draftPresent,
         emptyComposerOnlyDialog:
-          location.href === 'https://www.facebook.com/' &&
-          dialogs.length === 1 &&
-          composerDialogs.length === 1 &&
-          dialogs[0] === composerDialogs[0] &&
-          !hasComposerMedia &&
-          !draftPresent,
+          (location.href === 'https://www.facebook.com/' &&
+            dialogs.length === 1 &&
+            composerDialogs.length === 1 &&
+            dialogs[0] === composerDialogs[0] &&
+            !hasComposerMedia &&
+            !draftPresent) ||
+          (/^\/marketplace\/item\/\d{1,30}\/?$/i.test(location.pathname) &&
+            composerDialogs.length === 0 &&
+            !draftPresent),
       };
     }),
   );
   await guard();
   if (draft.url !== current.url || draft.timeOrigin !== current.timeOrigin)
     throw Error('POST_HOME_PREPARATION_DOCUMENT_CHANGED');
+  const storyLanding = facebookPostStoryLandingURL(current.url);
   return {
-    page: current,
+    page: storyLanding ? { ...current, ready: true } : current,
     reason: !current.visible
       ? ('FACEBOOK_BROWSE_FOREGROUND_REQUIRED' as const)
       : ('POST_HOME_PREPARATION_BLOCKED' as const),
     safe:
-      facebookBrowseSurface(current.url) !== null &&
-      current.ready &&
+      (facebookBrowseSurface(current.url) !== null || storyLanding) &&
+      (current.ready || storyLanding) &&
       current.visible &&
       (!current.blocked || draft.emptyComposerOnlyDialog) &&
       !draft.draftPresent,

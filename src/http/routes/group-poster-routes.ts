@@ -36,6 +36,7 @@ export async function handleGroupPosterRoutes(ctx: GroupPosterRouteContext): Pro
         url.searchParams.get('search') ?? '',
         before ? z.coerce.number().finite().nonnegative().parse(before) : undefined,
         url.searchParams.get('beforeId') ?? undefined,
+        url.searchParams.get('materialId') ?? undefined,
       ),
     );
     return true;
@@ -126,7 +127,7 @@ export async function handleGroupPosterRoutes(ctx: GroupPosterRouteContext): Pro
             thumbnailDataUrl: z
               .string()
               .trim()
-              .max(32 * 1024)
+              .max(128 * 1024)
               .regex(/^data:image\/(?:webp|jpeg|png);base64,[A-Za-z0-9+/=]+$/i),
           })
           .strict()
@@ -137,6 +138,15 @@ export async function handleGroupPosterRoutes(ctx: GroupPosterRouteContext): Pro
       }
       case 'start':
         json(res, 200, await groupPoster.start(input));
+        return true;
+      case 'tasks/create':
+        json(res, 200, await groupPoster.createTask(input));
+        return true;
+      case 'tasks/cancel':
+        json(res, 200, await groupPoster.cancelTask(input));
+        return true;
+      case 'tasks/delete':
+        json(res, 200, await groupPoster.deleteTask(input));
         return true;
       case 'stop': {
         const parsed = z

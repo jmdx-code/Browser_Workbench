@@ -17,8 +17,10 @@ export class ExtensionUpdates {
     this.bundledVersion = version;
   }
   async automatic(peer: Peer) {
-    const missingReveal = !peer.capabilities?.includes('browser-window-reveal-v1');
-    if (peer.extensionVersion === this.bundledVersion && !missingReveal) {
+    const missingRequiredCap =
+      !peer.capabilities?.includes('browser-window-reveal-v1') ||
+      !peer.capabilities?.includes('browser-window-close-v1');
+    if (peer.extensionVersion === this.bundledVersion && !missingRequiredCap) {
       this.autoReloadAttempted.delete(peer.profileId);
       return;
     }
@@ -34,7 +36,7 @@ export class ExtensionUpdates {
     };
     if (
       !peer.extensionVersion ||
-      (!older(peer.extensionVersion) && !missingReveal) ||
+      (!older(peer.extensionVersion) && !missingRequiredCap) ||
       this.autoReloadAttempted.get(peer.profileId) === this.bundledVersion ||
       this.checking.has(peer.profileId)
     )

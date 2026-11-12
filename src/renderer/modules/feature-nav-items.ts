@@ -8,6 +8,7 @@ export function buildFeatureNavItems({
   bumperRunningCount,
   pageBumperRunningCount = 0,
   groupPosterRunningCount = 0,
+  bluestacksBumperRunningCount = 0,
   attentionCount,
 }: {
   activeAccountRunningCount: number;
@@ -17,6 +18,7 @@ export function buildFeatureNavItems({
   bumperRunningCount: number;
   pageBumperRunningCount?: number;
   groupPosterRunningCount?: number;
+  bluestacksBumperRunningCount?: number;
   attentionCount: number;
 }): FeatureNavItem[] {
   return [
@@ -54,6 +56,13 @@ export function buildFeatureNavItems({
       title: '小组发帖',
       icon: 'group-poster',
       runningCount: groupPosterRunningCount,
+    },
+    {
+      id: 'bluestacks-group-bumper',
+      group: 'bluestacks',
+      title: '蓝蝶小组顶贴',
+      icon: 'bluestacks-group-bumper',
+      runningCount: bluestacksBumperRunningCount,
     },
     {
       id: 'records',

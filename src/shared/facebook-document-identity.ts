@@ -16,6 +16,8 @@ export function projectFacebookDocumentIdentity(
   const empty = () => ({ url: location.href, ready: document.readyState, actor: null });
   const browseRoute =
     /^https:\/\/www\.facebook\.com\/marketplace\/ineligible\/?(?:[?#].*)?$/.test(location.href) ||
+    /^https:\/\/www\.facebook\.com\/stories\/?(?:[?#].*)?$/i.test(location.href) ||
+    /^https:\/\/www\.facebook\.com\/groups\/[^/?#]+(?:\/?(?:[?#].*)?)?$/i.test(location.href) ||
     location.href === 'https://www.facebook.com/reel/?s=tab' ||
     /^https:\/\/www\.facebook\.com\/(?:[?#].*|(?:watch|reels)\/?(?:[?#].*)?|reel\/\d{1,30}\/?(?:[?#].*)?|friends(?:\/requests)?\/?(?:[?#].*)?|marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search|\/item\/\d{1,30})?\/?(?:[?#].*)?)?$/i.test(
       location.href,

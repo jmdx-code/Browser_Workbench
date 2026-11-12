@@ -35,6 +35,23 @@ export type Peer = {
   extensionVersion?: string;
   capabilities?: string[];
 };
+export type KernelProfileIdleInspection = {
+  idle: boolean;
+  reason:
+    | 'IDLE'
+    | 'PEER_OFFLINE'
+    | 'NOT_SYNCED'
+    | 'PHASE_STOPPING'
+    | 'PHASE_STARTING'
+    | 'PHASE_RUNNING'
+    | 'RECOVERING_CONTROL_OR_SYNC'
+    | 'UNRESOLVED_LEGACY_FIXTURE'
+    | 'UNRESOLVED_BRIDGE_COMMANDS'
+    | 'KERNEL_OWNED'
+    | 'QUEUED_INTENTS';
+  unresolvedCount: number;
+  legacyFixtureCount: number;
+};
 export class Core {
   private readonly windowRequests = new Map<
     string,
@@ -152,6 +169,83 @@ export class Core {
     const pending = this.cleanupTabRequests.get(requestId);
     if (pending?.peer === peer && this.peers.get(peer.profileId) === peer && peer.online)
       pending.finish(result);
+  }
+  private readonly closeWindowRequests = new Map<
+    string,
+    {
+      peer: Peer;
+      finish: (result: {
+        ok?: boolean;
+        closedCount?: number;
+        remainingCount?: number;
+        disconnected?: boolean;
+        error?: string;
+      }) => void;
+    }
+  >();
+  closeBrowserWindows(
+    profileId: string,
+    timeoutMs = 8000,
+  ): Promise<{
+    profileId: string;
+    closedCount: number;
+    disconnected: boolean;
+  }> {
+    const peer = this.peers.get(profileId);
+    if (!peer?.online) {
+      return Promise.resolve({ profileId, closedCount: 0, disconnected: true });
+    }
+    if (!peer.capabilities?.includes('browser-window-close-v1')) {
+      return Promise.reject(Error('BROWSER_CLOSE_CAPABILITY_MISSING'));
+    }
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish({ error: 'BROWSER_CLOSE_TIMEOUT' }), timeoutMs);
+      const finish = (result: {
+        ok?: boolean;
+        closedCount?: number;
+        remainingCount?: number;
+        disconnected?: boolean;
+        error?: string;
+      }) => {
+        clearTimeout(timer);
+        this.closeWindowRequests.delete(requestId);
+        if (result.error || result.ok === false || (result.remainingCount ?? 0) > 0) {
+          reject(Error(result.error ?? 'BROWSER_CLOSE_UNCONFIRMED'));
+        } else {
+          resolve({
+            profileId,
+            closedCount: result.closedCount ?? 0,
+            disconnected: Boolean(result.disconnected),
+          });
+        }
+      };
+      this.closeWindowRequests.set(requestId, { peer, finish });
+      try {
+        peer.send({
+          type: 'CLOSE_BROWSER_WINDOWS',
+          requestId,
+          connectionEpoch: peer.epoch,
+        });
+      } catch (error) {
+        finish({ error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+  browserWindowsClosed(
+    peer: Peer,
+    requestId: string,
+    result: {
+      ok?: boolean;
+      closedCount?: number;
+      remainingCount?: number;
+      error?: string;
+    },
+  ) {
+    const pending = this.closeWindowRequests.get(requestId);
+    if (pending?.peer === peer && this.peers.get(peer.profileId) === peer) {
+      pending.finish(result);
+    }
   }
   private readonly inspectWindowRequests = new Map<
     string,
@@ -391,28 +485,118 @@ export class Core {
     peer.phase = 'RECOVERING';
     return { requested: true };
   }
+  private evaluateKernelAdmissionSync(
+    peer: Peer | undefined,
+    unresolved: ReadonlyArray<{ commandId: string; legacyFixture: number }>,
+  ): KernelProfileIdleInspection {
+    if (!peer || !this.current(peer)) {
+      return {
+        idle: false,
+        reason: 'PEER_OFFLINE',
+        unresolvedCount: unresolved.length,
+        legacyFixtureCount: 0,
+      };
+    }
+    const legacyFixtureCount = unresolved.filter((r) => r.legacyFixture === 1).length;
+    if (this.kernelOwners.has(peer.profileId)) {
+      return {
+        idle: false,
+        reason: 'KERNEL_OWNED',
+        unresolvedCount: unresolved.length,
+        legacyFixtureCount,
+      };
+    }
+    if (this.queuedIntents.get(peer.profileId)) {
+      return {
+        idle: false,
+        reason: 'QUEUED_INTENTS',
+        unresolvedCount: unresolved.length,
+        legacyFixtureCount,
+      };
+    }
+    if (unresolved.length > 0) {
+      return {
+        idle: false,
+        reason:
+          legacyFixtureCount === unresolved.length
+            ? 'UNRESOLVED_LEGACY_FIXTURE'
+            : 'UNRESOLVED_BRIDGE_COMMANDS',
+        unresolvedCount: unresolved.length,
+        legacyFixtureCount,
+      };
+    }
+    if (!peer.synced) {
+      return {
+        idle: false,
+        reason: peer.phase === 'RECOVERING' ? 'RECOVERING_CONTROL_OR_SYNC' : 'NOT_SYNCED',
+        unresolvedCount: 0,
+        legacyFixtureCount: 0,
+      };
+    }
+    if (peer.phase !== 'PAUSED') {
+      const reason =
+        peer.phase === 'STOPPING'
+          ? 'PHASE_STOPPING'
+          : peer.phase === 'STARTING'
+            ? 'PHASE_STARTING'
+            : peer.phase === 'RUNNING'
+              ? 'PHASE_RUNNING'
+              : 'RECOVERING_CONTROL_OR_SYNC';
+      return { idle: false, reason, unresolvedCount: 0, legacyFixtureCount: 0 };
+    }
+    return { idle: true, reason: 'IDLE', unresolvedCount: 0, legacyFixtureCount: 0 };
+  }
+  async inspectKernelProfileIdle(profileId: string): Promise<KernelProfileIdleInspection> {
+    const peer = this.peers.get(profileId);
+    const unresolved = await this.store.unresolved(profileId);
+    return this.evaluateKernelAdmissionSync(peer, unresolved);
+  }
+  async reconcileRecoveringPeerIfPossible(profileId: string): Promise<boolean> {
+    const peer = this.peers.get(profileId);
+    if (!peer || !this.current(peer)) return false;
+    const unresolved = await this.store.unresolved(profileId);
+    const inspection = this.evaluateKernelAdmissionSync(peer, unresolved);
+    if (inspection.idle) return true;
+    if (inspection.reason === 'UNRESOLVED_LEGACY_FIXTURE') {
+      for (const row of unresolved) {
+        if (row.legacyFixture === 1) {
+          await this.review(
+            profileId,
+            row.commandId,
+            'ABANDON',
+            'AUTO_ABANDON_LEGACY_FIXTURE',
+          ).catch(() => {});
+        }
+      }
+      const next = await this.inspectKernelProfileIdle(profileId);
+      return next.idle;
+    }
+    if (inspection.reason === 'RECOVERING_CONTROL_OR_SYNC') {
+      if (this.controls.has(profileId) || this.stoppingControllers.has(profileId)) return false;
+      await this.sync(peer);
+      return true;
+    }
+    return false;
+  }
   async claimFixtureKernel(peer: Peer, owner: string): Promise<void> {
     const unresolved = await this.store.unresolved(peer.profileId);
-    if (
-      !this.current(peer) ||
-      peer.phase !== 'PAUSED' ||
-      !peer.synced ||
-      this.kernelOwners.has(peer.profileId) ||
-      this.queuedIntents.get(peer.profileId) ||
-      unresolved.length
-    ) {
+    const admission = this.evaluateKernelAdmissionSync(peer, unresolved);
+    if (!admission.idle) {
       devDiag.record({
         level: 'WARN',
         category: 'KERNEL_RPC',
         event: 'KERNEL_PROFILE_NOT_IDLE',
         profileId: peer.profileId,
+        reason: admission.reason,
         data: {
           current: this.current(peer),
           phase: peer.phase,
           synced: peer.synced,
           owned: this.kernelOwners.has(peer.profileId),
           queued: !!this.queuedIntents.get(peer.profileId),
-          unresolvedCount: unresolved.length,
+          unresolvedCount: admission.unresolvedCount,
+          legacyFixtureCount: admission.legacyFixtureCount,
+          idleReason: admission.reason,
         },
       });
       throw new BridgeError('KERNEL_PROFILE_NOT_IDLE');
@@ -554,6 +738,11 @@ export class Core {
     if (kernelOwner) this.kernelStopRequests.delete(kernelOwner);
     this.kernelOwners.delete(peer.profileId);
     await this.store.cancelPrepared(peer.profileId);
+    for (const [, req] of this.closeWindowRequests) {
+      if (req.peer === peer) {
+        req.finish({ ok: true, closedCount: 1, remainingCount: 0, disconnected: true });
+      }
+    }
     for (const [id, p] of this.pending)
       if (p.peer === peer)
         await this.finish(id, isWrite(p.action) ? 'UNKNOWN' : 'FAILED', {

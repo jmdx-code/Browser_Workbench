@@ -443,3 +443,90 @@ it('pending approval and membership questions skip only that group, then the nex
     vi.useRealTimers();
   }
 });
+
+it('random_browse never clicks joinGroupCSS and bumps public group posts directly', async () => {
+  vi.useFakeTimers();
+  const liked = new Set<string>();
+  const h = harness({
+    onClick: (s) => {
+      if (s === `[data-wb-bumper-like="${post}"]`) liked.add(post);
+    },
+    surface: () => ({
+      groupJoinState: 'can-join',
+      joinGroupCSS: '[data-wb-bumper-join="1"]',
+      posts: [targetPost({ liked: liked.has(post) })],
+    }),
+  });
+  const work = h.adapter.run(
+    'p',
+    [mkTarget(group)],
+    [mkTarget(author, 'TargetPage')],
+    settings({ searchMode: 'random_browse', maxPostsPerGroupPage: 1 }),
+    { cancelled: () => false, status: () => {}, added: () => {} },
+  );
+  await vi.runAllTimersAsync();
+  await work;
+  expect(h.clicks.filter((s) => s.includes('bumper-join'))).toHaveLength(0);
+  expect(h.recorded).toEqual([post]);
+});
+
+it('time_sort dismisses join restriction dialog and automatically falls back to bump public posts', async () => {
+  vi.useFakeTimers();
+  let restrictionPopupOpen = false;
+  const liked = new Set<string>();
+  const statuses: string[] = [];
+  const h = harness({
+    onClick: (s) => {
+      if (s === '[data-wb-bumper-join="1"]') restrictionPopupOpen = true;
+      if (s === '[data-wb-bumper-join-dismiss="1"]') restrictionPopupOpen = false;
+      if (s === `[data-wb-bumper-like="${post}"]`) liked.add(post);
+    },
+    surface: (url) => ({
+      groupJoinState: 'can-join',
+      joinGroupCSS: '[data-wb-bumper-join="1"]',
+      restricted: restrictionPopupOpen,
+      checkpointRestricted: false,
+      joinRestrictionDismissCSS: restrictionPopupOpen ? '[data-wb-bumper-join-dismiss="1"]' : null,
+      posts: url.includes('sorting_setting=CHRONOLOGICAL')
+        ? []
+        : [targetPost({ liked: liked.has(post) })],
+    }),
+  });
+  const work = h.adapter.run(
+    'p',
+    [mkTarget(group)],
+    [mkTarget(author, 'TargetPage')],
+    settings({ searchMode: 'time_sort', maxPostsPerGroupPage: 1 }),
+    { cancelled: () => false, status: (s) => statuses.push(s), added: () => {} },
+  );
+  await vi.runAllTimersAsync();
+  await work;
+  expect(h.clicks).toContain('[data-wb-bumper-join="1"]');
+  expect(h.clicks).toContain('[data-wb-bumper-join-dismiss="1"]');
+  expect(statuses.some((s) => s.includes('已自动切换'))).toBe(true);
+  expect(h.gotos.some((u) => u.includes(`/groups/${group}/user/${author}/`))).toBe(true);
+  expect(h.recorded).toEqual([post]);
+});
+
+it('projectGroupBumper marks joinRestrictionDismissCSS for SentryBlockDialog while flagging Checkpoint as checkpointRestricted', () => {
+  const dlg = document.createElement('div');
+  dlg.setAttribute('role', 'dialog');
+  dlg.innerHTML = '<div id="ok-btn" role="button">确定</div>';
+  box(dlg);
+  box(dlg.querySelector('#ok-btn')!);
+  fiber(dlg, 'SentryBlockDialog.react', {});
+  fiber(dlg.querySelector('#ok-btn')!, 'FDSButton.react', { type: 'primary' });
+  document.body.append(dlg);
+
+  const sentrySurface = projectGroupBumper({ groupId: group });
+  expect(sentrySurface.restricted).toBe(true);
+  expect(sentrySurface.checkpointRestricted).toBe(false);
+  expect(sentrySurface.joinRestrictionDismissCSS).toBe('[data-wb-bumper-join-dismiss="1"]');
+  expect(dlg.querySelector('#ok-btn')?.getAttribute('data-wb-bumper-join-dismiss')).toBe('1');
+
+  fiber(dlg, 'CheckpointDialog.react', {});
+  const cpSurface = projectGroupBumper({ groupId: group });
+  expect(cpSurface.restricted).toBe(true);
+  expect(cpSurface.checkpointRestricted).toBe(true);
+  expect(cpSurface.joinRestrictionDismissCSS).toBeNull();
+});

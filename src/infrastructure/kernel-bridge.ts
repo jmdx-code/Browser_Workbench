@@ -51,6 +51,7 @@ import { facebookDisplayInspectionProjection } from './facebook-read-adapter.js'
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { OwnedTabProof, OwnedTabRecord, type TabRecord } from '../shared/kernel-state.js';
 import {
+  kernelAgentBrowserURL,
   kernelFacebookReadURL,
   kernelRequiresOperation,
   type KernelAccess,
@@ -1327,6 +1328,10 @@ export class KernelBridge implements KernelBridgeHooks {
   async withSummary<T>(peer: Peer, work: (port: KernelSummaryPort) => Promise<T>): Promise<T> {
     if (!peer.capabilities?.includes('kernel-journal-v1') || this.watches.busy(peer.profileId))
       throw Error('KERNEL_SUMMARY_UNAVAILABLE');
+    const rawIdle = this.idlePages.get(peer.profileId);
+    if (rawIdle && (rawIdle.peer !== peer || rawIdle.connection.failureReason)) {
+      this.idlePages.delete(peer.profileId);
+    }
     const idle = this.idlePages.get(peer.profileId);
     if (idle) {
       if (idle.peer !== peer || !peer.online || !peer.synced || peer.phase !== 'PAUSED')
@@ -1589,6 +1594,389 @@ export class KernelBridge implements KernelBridgeHooks {
   async connect(peer: Peer, files: readonly string[] = [], existingTab?: TabProof) {
     return this.connectOwned(peer, files, existingTab);
   }
+  async connectAgentBrowser(
+    peer: Peer,
+    options: {
+      initialUrl: string;
+      files?: readonly string[];
+      foreground?: boolean;
+    },
+  ) {
+    if (!kernelAgentBrowserURL(options.initialUrl)) {
+      throw new ProductError(
+        'AGENT_BROWSER_URL_REJECTED',
+        '仅支持访问合法的 http/https 网页地址（禁止访问本机管理端口或受限协议）',
+        400,
+      );
+    }
+    if (
+      this.core.peers.get(peer.profileId) !== peer ||
+      !peer.online ||
+      !peer.synced ||
+      peer.phase !== 'PAUSED'
+    ) {
+      throw new ProductError(
+        'AGENT_BROWSER_PROFILE_NOT_READY',
+        `浏览器当前未就绪（online=${peer.online}, synced=${peer.synced}, phase=${peer.phase}）`,
+        409,
+      );
+    }
+    if (!peer.capabilities?.includes('agent-browser-kernel-v1')) {
+      throw new ProductError(
+        'AGENT_BROWSER_EXTENSION_RELOAD_REQUIRED',
+        '当前浏览器插件版本尚未加载 AI 浏览器内核能力，请先触发扩展热刷新后再试',
+        409,
+      );
+    }
+    if (this.watches.busy(peer.profileId)) {
+      throw new ProductError('AGENT_BROWSER_PROFILE_BUSY', '当前浏览器正在执行监控任务', 409);
+    }
+    if (this.idlePages.has(peer.profileId)) {
+      await this.releaseIdleForExtension(peer);
+    }
+    const files = options.files ?? [];
+    const owner = randomUUID();
+    await this.core.claimFixtureKernel(peer, owner);
+    const session = new KernelRpcSession(peer, owner, () => {
+      const sequence = (this.sequences.get(peer) ?? 0) + 1;
+      this.sequences.set(peer, sequence);
+      return sequence;
+    });
+    this.sessions.set(peer.profileId, session);
+    this.traces.set(peer.profileId, session.trace);
+    session.access = 'agent-browser';
+    session.boundInputRequired = false;
+    let initialProof: TabProof | null = null;
+    try {
+      await session.request({
+        kind: 'open',
+        stamp: { ...session.stamp },
+        files: [...files],
+        access: 'agent-browser',
+      });
+      const backend = session.backend();
+      const persistent = peer.capabilities?.includes('kernel-journal-v1') ?? false;
+      if (persistent && peer.capabilities?.includes('kernel-journal-collection-v1')) {
+        await this.maintainJournal(peer, session);
+      }
+      const ownershipId = randomUUID();
+      const tab = await backend.create(
+        options.initialUrl,
+        ownershipId,
+        options.foreground ?? false,
+      );
+      let proof: TabProof | null = null;
+      if (persistent) {
+        const inventory = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        proof =
+          inventory.tabs.find((row) => row.ownershipId === ownershipId && row.state === 'READY')
+            ?.proof ?? null;
+        if (!proof || proof.tabId !== tab.tabId) {
+          throw Error('KERNEL_TAB_PERSISTENCE_UNCONFIRMED');
+        }
+        initialProof = proof;
+      }
+      const executor = new KernelExecutor(
+        session.lease,
+        backend,
+        [tab.tabId],
+        new Set(files),
+        'agent-browser',
+      );
+      executor.grant(session.stamp);
+      session.executor = executor;
+      const attachStarted = Date.now();
+      for (;;) {
+        try {
+          await executor.attach(tab.tabId);
+          break;
+        } catch (error) {
+          if (
+            !(
+              error instanceof Error &&
+              /INITIAL_DOCUMENT_PENDING|SCOPE_CHANGED|URL_REJECTED/.test(error.message)
+            ) ||
+            Date.now() - attachStarted > 8_000
+          ) {
+            throw error;
+          }
+          session.lease.check();
+          await new Promise<void>((resolve) => setTimeout(resolve, 200));
+        }
+      }
+      let userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0.0.0';
+      try {
+        const uaReply = await executor.send({ tabId: tab.tabId }, 'Runtime.evaluate', {
+          expression: 'navigator.userAgent',
+          returnByValue: true,
+        });
+        const uaResult = KernelJsonObject.safeParse(uaReply.result);
+        if (uaResult.success && typeof uaResult.data.value === 'string' && uaResult.data.value) {
+          userAgent = uaResult.data.value;
+        }
+      } catch {
+        // Initial navigation may still be swapping execution context; fallback UA is adapter metadata only.
+      }
+      const major = userAgent.match(/(?:Chrome|Chromium)\/(\d+(?:\.\d+){0,3})/)?.[1];
+      const model = new KernelRelayModel(
+        executor,
+        [tab.tabId],
+        {
+          product: major ? 'Chrome/' + major : 'Chrome/Extension-Bridge',
+          userAgent,
+        },
+        (event) => session.record(event),
+        'agent-browser',
+      );
+      session.model = model;
+      const endpoint = await openKernelRelayEndpoint(model);
+      session.endpoint = endpoint;
+      const browser = await connectFixtureKernel(endpoint.endpoint, endpoint.headers);
+      let closingId: string | undefined;
+      let closedPageState: 'CLOSED' | 'LOST' | null = null;
+      const hasVerifiedStopReceipt = (expectedId = closingId ?? session.stopControlId) => {
+        const receipt = session.controlStopReceipt;
+        return (
+          !!receipt &&
+          receipt.state === 'stopped' &&
+          receipt.owner === owner &&
+          receipt.connectionEpoch === session.stamp.connectionEpoch &&
+          receipt.requestId === expectedId &&
+          this.core.peers.get(peer.profileId) === peer &&
+          peer.online &&
+          peer.epoch === session.stamp.connectionEpoch &&
+          peer.lastStoppedRequestId === receipt.requestId
+        );
+      };
+      const awaitingControlStop = () =>
+        this.core.peers.get(peer.profileId) === peer &&
+        peer.online &&
+        peer.epoch === session.stamp.connectionEpoch &&
+        peer.phase === 'STOPPING' &&
+        peer.controlId === session.stopControlId;
+      const removeOwnedAgentPage = async (allowRemove: boolean) => {
+        if (!persistent || !proof) return;
+        const before = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        const original = before.tabs.find((row) => row.ownershipId === ownershipId);
+        if (
+          !original?.proof ||
+          !sameTabProof(original.proof, proof) ||
+          !['READY', 'CLOSED', 'LOST'].includes(original.state)
+        ) {
+          throw Error('AGENT_BROWSER_CLOSE_UNCONFIRMED');
+        }
+        if (original.state === 'CLOSED' || original.state === 'LOST') {
+          closedPageState = original.state;
+          return;
+        }
+        if (!allowRemove) throw Error('AGENT_BROWSER_CLOSE_UNCONFIRMED');
+        await session.request({ kind: 'remove', tabId: tab.tabId });
+        const after = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        const closed = after.tabs.find((row) => row.ownershipId === ownershipId);
+        if (
+          !closed?.proof ||
+          !sameTabProof(closed.proof, proof) ||
+          (closed.state !== 'CLOSED' && closed.state !== 'LOST')
+        ) {
+          throw Error('AGENT_BROWSER_CLOSE_UNCONFIRMED');
+        }
+        closedPageState = closed.state;
+      };
+      const closer = new SessionCloser({
+        closeLocal: async () => {
+          session.closing = true;
+          executor.revokeFiles();
+          if (session.failureReason || hasVerifiedStopReceipt() || awaitingControlStop()) {
+            let local = await endpoint.close();
+            if (local.state !== 'stopped' && awaitingControlStop()) {
+              const until = Date.now() + 14_000;
+              while (!hasVerifiedStopReceipt() && awaitingControlStop() && Date.now() < until)
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (local.state !== 'stopped' && hasVerifiedStopReceipt())
+              local = await endpoint.retryClose();
+            await browser.close().catch(() => {});
+            if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+            if (!hasVerifiedStopReceipt() && !awaitingControlStop())
+              throw Error(session.failureReason ?? 'KERNEL_STOP_UNCONFIRMED');
+            return;
+          }
+          await removeOwnedAgentPage(true);
+          const local = await endpoint.close();
+          await browser.close();
+          if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+        },
+        retryCloseLocal: async () => {
+          if (session.failureReason || hasVerifiedStopReceipt() || awaitingControlStop()) {
+            let local = await endpoint.retryClose();
+            if (local.state !== 'stopped' && awaitingControlStop()) {
+              const until = Date.now() + 14_000;
+              while (!hasVerifiedStopReceipt() && awaitingControlStop() && Date.now() < until)
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (local.state !== 'stopped' && hasVerifiedStopReceipt())
+              local = await endpoint.retryClose();
+            await browser.close().catch(() => {});
+            if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+            if (!hasVerifiedStopReceipt() && !awaitingControlStop())
+              throw Error(session.failureReason ?? 'KERNEL_STOP_UNCONFIRMED');
+            return;
+          }
+          await removeOwnedAgentPage(closedPageState === null);
+          const local = await endpoint.retryClose();
+          await browser.close();
+          if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
+        },
+        assertTransport: () => {
+          if (hasVerifiedStopReceipt() || awaitingControlStop()) return;
+          if (
+            this.sessions.get(peer.profileId) !== session ||
+            this.core.peers.get(peer.profileId) !== peer ||
+            !peer.online ||
+            !peer.synced ||
+            peer.phase !== 'PAUSED'
+          )
+            throw Error('KERNEL_STOP_TRANSPORT_CHANGED');
+        },
+        stopRemote: async (requestId) => {
+          if (awaitingControlStop()) {
+            const until = Date.now() + 14_000;
+            while (
+              !hasVerifiedStopReceipt(requestId) &&
+              awaitingControlStop() &&
+              Date.now() < until
+            )
+              await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          if (hasVerifiedStopReceipt(requestId)) return { requestId, state: 'stopped' };
+          if (session.failureReason) throw Error('KERNEL_STOP_UNCONFIRMED');
+          const remote = await session.request({ kind: 'stop' }, requestId);
+          if (remote.requestId !== requestId || remote.state !== 'stopped')
+            throw Error('KERNEL_STOP_UNCONFIRMED');
+          return { requestId, state: 'stopped' };
+        },
+        release: () => {
+          this.core.releaseFixtureKernel(peer, owner);
+          if (this.sessions.get(peer.profileId) === session) {
+            this.sessions.delete(peer.profileId);
+          }
+          session.fail('KERNEL_CLOSED');
+        },
+      });
+      const close = (requestId: string = closingId ?? session.stopControlId ?? randomUUID()) => {
+        if (closingId && closingId !== requestId)
+          return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
+        if (session.stopControlId && session.stopControlId !== requestId)
+          return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
+        closingId = requestId;
+        session.stopControlId = requestId;
+        if (this.core.hasFixtureKernelOwner(peer, owner))
+          this.core.bindFixtureStopRequest(peer, owner, requestId);
+        return closer.close(requestId);
+      };
+      const page = browser.contexts()[0]?.pages()[0];
+      if (!page) {
+        await close().catch(async () => {
+          await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
+        });
+        throw Error('AGENT_BROWSER_PAGE_MISSING');
+      }
+      const captureScreenshot = async (shotOpts: {
+        quality: number;
+        fullPage: boolean;
+      }): Promise<Buffer> => {
+        let clip: Record<string, number> | undefined;
+        if (shotOpts.fullPage) {
+          const metricsReply = await executor
+            .send({ tabId: tab.tabId }, 'Runtime.evaluate', {
+              expression: `(() => ({
+                width: Math.max(320, Math.min(2560, Math.ceil(document.documentElement?.scrollWidth || window.innerWidth || 1280))),
+                height: Math.max(240, Math.min(8000, Math.ceil(Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0, window.innerHeight || 720))))
+              }))()`,
+              returnByValue: true,
+            })
+            .catch(() => null);
+          const parsedMetrics = metricsReply
+            ? KernelJsonObject.safeParse(metricsReply.result)
+            : null;
+          const val =
+            parsedMetrics?.success &&
+            typeof parsedMetrics.data.value === 'object' &&
+            parsedMetrics.data.value !== null &&
+            !Array.isArray(parsedMetrics.data.value)
+              ? (parsedMetrics.data.value as Record<string, unknown>)
+              : null;
+          if (val && typeof val.width === 'number' && typeof val.height === 'number') {
+            clip = { x: 0, y: 0, width: val.width, height: val.height, scale: 1 };
+          }
+        }
+        const reply = await executor.send({ tabId: tab.tabId }, 'Page.captureScreenshot', {
+          format: 'jpeg',
+          quality: shotOpts.quality,
+          captureBeyondViewport: Boolean(clip),
+          ...(clip ? { clip } : {}),
+        });
+        if (typeof reply.data !== 'string' || !reply.data) {
+          throw Error('AGENT_BROWSER_SCREENSHOT_EMPTY');
+        }
+        return Buffer.from(reply.data, 'base64');
+      };
+      return {
+        browser,
+        page,
+        tabId: tab.tabId,
+        proof,
+        captureScreenshot,
+        get failureReason() {
+          return session.failureReason;
+        },
+        close,
+        retryClose: (requestId: string) => closer.retry(requestId),
+        stopOnCloseFailure: () => this.stopOwnedSessionOnCloseFailure(peer, session, owner, true),
+      };
+    } catch (error) {
+      const originalFailure = session.failureReason;
+      let released = false;
+      if (
+        initialProof &&
+        error instanceof Error &&
+        !error.message.includes('_UNKNOWN') &&
+        !session.hasRequestedMutation
+      ) {
+        try {
+          await session.request({ kind: 'remove', tabId: initialProof.tabId });
+          const closed = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+          if (
+            closed.tabs.some(
+              (row) =>
+                row.state === 'CLOSED' &&
+                row.proof &&
+                initialProof &&
+                sameTabProof(row.proof, initialProof),
+            )
+          ) {
+            const requestId = randomUUID();
+            const stop = await session.request({ kind: 'stop' }, requestId);
+            if (stop.state === 'stopped' && stop.requestId === requestId) {
+              this.core.releaseFixtureKernel(peer, owner);
+              if (this.sessions.get(peer.profileId) === session)
+                this.sessions.delete(peer.profileId);
+              released = true;
+            }
+          }
+        } catch {
+          // Fall through to stopOwnedSessionOnCloseFailure below.
+        }
+      }
+      session.closing = true;
+      session.fail('AGENT_BROWSER_OPEN_FAILED');
+      await session.endpoint?.close().catch(() => {});
+      if (!released) {
+        await this.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
+      }
+      throw originalFailure ? Error(originalFailure) : error;
+    }
+  }
   // Internal only: the authority must be supplied by the real acting-identity observer.
   // Profile display state and /me links are not valid implementations of this callback.
   async connectFacebook(
@@ -1658,24 +2046,31 @@ export class KernelBridge implements KernelBridgeHooks {
     } else if (idle) {
       if (
         idle.peer !== peer ||
+        idle.connection.failureReason ||
         !retainedTab ||
         !idle.connection.proof ||
         !sameTabProof(idle.connection.proof, retainedTab)
-      )
-        throw Error('FACEBOOK_WORKSPACE_REBIND_REQUIRED');
-      const inventory = await idle.connection.inventory();
-      await assertIdentity();
-      const tab = inventory.tabs.find((row) => row.ownershipId === retainedTab.ownershipId);
-      if (
-        inventory.operations.some(kernelOperationPending) ||
-        tab?.state !== 'READY' ||
-        !tab.proof ||
-        !sameTabProof(tab.proof, retainedTab)
-      )
-        throw Error('FACEBOOK_WORKSPACE_NATIVE_RECHECK_REQUIRED');
-      await idle.connection.rebind(accountId, assertIdentity);
-      this.idlePages.delete(peer.profileId);
-      return idle.connection;
+      ) {
+        await idle.connection.close().catch(() => {});
+        this.idlePages.delete(peer.profileId);
+      } else {
+        const inventory = await idle.connection.inventory();
+        await assertIdentity();
+        const tab = inventory.tabs.find((row) => row.ownershipId === retainedTab.ownershipId);
+        if (
+          inventory.operations.some(kernelOperationPending) ||
+          tab?.state !== 'READY' ||
+          !tab.proof ||
+          !sameTabProof(tab.proof, retainedTab)
+        ) {
+          await idle.connection.close().catch(() => {});
+          this.idlePages.delete(peer.profileId);
+        } else {
+          await idle.connection.rebind(accountId, assertIdentity);
+          this.idlePages.delete(peer.profileId);
+          return idle.connection;
+        }
+      }
     }
     await assertIdentity();
     return this.connectOwned(peer, files, retainedTab, {
@@ -1701,34 +2096,155 @@ export class KernelBridge implements KernelBridgeHooks {
       return false;
     }
   }
+  private async discardFacebookDraftIfPresent(
+    page: Page,
+    guard: () => Awaitable<void>,
+  ): Promise<void> {
+    if (typeof page?.evaluate !== 'function') return;
+    await guard();
+    const clickedInitial = await page
+      .evaluate(() => {
+        try {
+          window.onbeforeunload = null;
+          if (typeof BeforeUnloadEvent !== 'undefined') {
+            BeforeUnloadEvent.prototype.preventDefault = () => {};
+            Object.defineProperty(BeforeUnloadEvent.prototype, 'returnValue', {
+              configurable: true,
+              get: () => '',
+              set: () => {},
+            });
+          }
+        } catch {}
+        const visible = (el: Element | null): el is HTMLElement => {
+          if (!(el instanceof HTMLElement)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        if (/^\/stories\/create\/?$/i.test(location.pathname)) {
+          const hasPreview = Boolean(
+            document.querySelector(
+              '[data-wb-story-preview="1"],[role="main"][aria-label="Stories Creation Preview"],textarea,[contenteditable="true"]',
+            ),
+          );
+          if (!hasPreview) return false;
+          const discardRx = /^(?:舍弃|捨棄|放弃|放棄|Discard|Discard\s*story|取消|Cancel)$/i;
+          const btn = Array.from(document.querySelectorAll<HTMLElement>('[role="button"],button'))
+            .filter(visible)
+            .find((el) => {
+              const label = (el.getAttribute('aria-label') || el.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              return discardRx.test(label);
+            });
+          if (btn) {
+            btn.click();
+            return true;
+          }
+        }
+        if (location.pathname === '/') {
+          const dialogs = Array.from(
+            document.querySelectorAll<HTMLElement>('[role="dialog"]'),
+          ).filter(visible);
+          for (const d of dialogs) {
+            const closeBtn = Array.from(
+              d.querySelectorAll<HTMLElement>(
+                '[role="button"][aria-label="关闭"],[role="button"][aria-label="關閉"],[role="button"][aria-label="Close"],button[aria-label="关闭"],button[aria-label="關閉"],button[aria-label="Close"]',
+              ),
+            ).find(visible);
+            if (closeBtn) {
+              closeBtn.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (!clickedInitial) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 350));
+    await guard();
+    const clickedConfirm = await page
+      .evaluate(() => {
+        const visible = (el: Element | null): el is HTMLElement => {
+          if (!(el instanceof HTMLElement)) return false;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          const s = getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0;
+        };
+        const confirmRx =
+          /^(?:舍弃|捨棄|放弃|放棄|不保存|确定|確定|Discard|Discard\s*story|Discard\s*post|Leave|Leave\s*Page)$/i;
+        const dialogs = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            '[role="dialog"],[role="alertdialog"],[aria-modal="true"]',
+          ),
+        ).filter(visible);
+        for (const d of dialogs) {
+          const btn = Array.from(d.querySelectorAll<HTMLElement>('[role="button"],button'))
+            .filter(visible)
+            .find((el) => {
+              const label = (el.getAttribute('aria-label') || el.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              return confirmRx.test(label);
+            });
+          if (btn) {
+            btn.click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (clickedConfirm) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      await guard();
+    }
+  }
   private async navigateRetainedPageHome(
     page: Page,
     guard: () => Awaitable<void>,
   ): Promise<boolean> {
     const url = typeof page.url === 'function' ? page.url() : '';
     if (!this.isRetainedSafeFacebookUrl(url)) return false;
+    await this.discardFacebookDraftIfPresent(page, guard);
     await guard();
-    await page
-      .evaluate(() => {
-        location.assign('https://www.facebook.com/');
-      })
-      .catch(() => {});
-    const started = performance.now();
-    while (performance.now() - started < 15_000) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 120));
-      await guard();
-      const state = await page
-        .evaluate(() => ({ url: location.href, ready: document.readyState }))
-        .catch(() => null);
-      if (
-        state &&
-        FacebookBrowseURL.safeParse(state.url).success &&
-        (state.ready === 'interactive' || state.ready === 'complete')
-      ) {
-        return true;
+    const onDialog = (dialog: { type(): string; accept(): Promise<void> }) => {
+      if (dialog.type() === 'beforeunload') {
+        void dialog.accept().catch(() => {});
       }
+    };
+    if (typeof page.on === 'function') page.on('dialog', onDialog);
+    try {
+      await page
+        .evaluate(() => {
+          try {
+            window.onbeforeunload = null;
+          } catch {}
+          location.assign('https://www.facebook.com/');
+        })
+        .catch(() => {});
+      const started = performance.now();
+      while (performance.now() - started < 15_000) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 120));
+        await guard();
+        const state = await page
+          .evaluate(() => ({ url: location.href, ready: document.readyState }))
+          .catch(() => null);
+        if (
+          state &&
+          FacebookBrowseURL.safeParse(state.url).success &&
+          (state.ready === 'interactive' || state.ready === 'complete')
+        ) {
+          return true;
+        }
+      }
+      return false;
+    } finally {
+      if (typeof page.off === 'function') page.off('dialog', onDialog);
     }
-    return false;
   }
   private async prepareInvitationHome(page: Page, guard: () => Awaitable<void>) {
     if (page.url() === 'https://www.facebook.com/') return false;
@@ -1786,6 +2302,12 @@ export class KernelBridge implements KernelBridgeHooks {
   ): Promise<boolean> {
     const url = typeof page.url === 'function' ? page.url() : '';
     if (!url) return false;
+    if (
+      url === 'https://www.facebook.com/' ||
+      /^https:\/\/www\.facebook\.com\/stories\/create\/?$/.test(url)
+    ) {
+      await this.discardFacebookDraftIfPresent(page, guard);
+    }
     if (storyAdmission && /^https:\/\/www\.facebook\.com\/stories\/create\/?$/.test(url))
       return false;
     if (FacebookBrowseURL.safeParse(url).success) return false;
@@ -1805,8 +2327,11 @@ export class KernelBridge implements KernelBridgeHooks {
       this.core.peers.get(peer.profileId) !== peer ||
       idle.connection.failureReason ||
       !idle.connection.proof
-    )
-      throw Error('FACEBOOK_WORKSPACE_CONNECTION_CHANGED');
+    ) {
+      await idle.connection.close().catch(() => {});
+      this.idlePages.delete(peer.profileId);
+      return null;
+    }
     const proof = idle.connection.proof;
     const inventory = await idle.connection.inventory();
     await guard();
@@ -2110,6 +2635,69 @@ export class KernelBridge implements KernelBridgeHooks {
     );
     return observed.reading;
   }
+  async inspectFacebookAccountSilently(
+    peer: Peer,
+    guard: () => Awaitable<void>,
+    timeoutMs = 20_000,
+  ) {
+    const observed = await this.readFacebookMetadataPage(
+      peer,
+      guard,
+      async (page) => {
+        const settleDeadline = Date.now() + Math.max(4_000, timeoutMs - 4_000);
+        while (Date.now() < settleDeadline) {
+          await guard();
+          const probe = await page
+            .evaluate(projectFacebookDocumentIdentity, 'browse' as const)
+            .catch(() => null);
+          const docReady = await page
+            .evaluate(() => ({
+              ready: document.readyState,
+              href: location.href,
+              hasLoginInputs: Boolean(
+                document.querySelector('input[name="email"]') &&
+                document.querySelector('input[name="pass"]'),
+              ),
+            }))
+            .catch(() => null);
+          if (
+            docReady?.ready === 'complete' &&
+            (probe?.actor !== null ||
+              Boolean(classifyFacebookAbnormalUrl(docReady.href)) ||
+              docReady.hasLoginInputs)
+          ) {
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+        }
+        for (let attempt = 0; ; attempt++) {
+          await guard();
+          try {
+            return await this.readFacebookDisplayDocument(page, guard, true, peer.profileId);
+          } catch (error) {
+            if (
+              attempt < 4 &&
+              error instanceof Error &&
+              error.message === 'FACEBOOK_DISPLAY_DOCUMENT_CHANGED'
+            ) {
+              await new Promise<void>((resolve) => setTimeout(resolve, 400));
+              continue;
+            }
+            throw error;
+          }
+        }
+      },
+      undefined,
+      timeoutMs,
+      {
+        initialUrl: 'https://www.facebook.com/',
+        forceNewTemporaryTab: true,
+        backgroundMetadataRead: true,
+        disableOuterTimeout: false,
+      },
+    );
+    return observed.reading;
+  }
   // Fixed feature entry research only. No execution context, page input, file access or
   // submission can be obtained; stop/close uses the existing owned-page lifecycle.
   async inspectFacebookFeatureSurface(
@@ -2396,8 +2984,10 @@ export class KernelBridge implements KernelBridgeHooks {
         forceNewTemporaryTab: readOptions?.forceNewTemporaryTab === true,
         backgroundMetadataRead: readOptions?.backgroundMetadataRead === true,
       }));
-    let current: T;
-    let stop: Awaited<ReturnType<typeof connection.close>>;
+    let current: T | undefined;
+    let readError: unknown;
+    let hasReadError = false;
+    let stop: Awaited<ReturnType<typeof connection.close>> | undefined;
     try {
       await assertAllowed();
       const contexts = connection.browser.contexts(),
@@ -2434,27 +3024,50 @@ export class KernelBridge implements KernelBridgeHooks {
       }
       await assertAllowed();
       keepPage = retainForTask || existingTab !== undefined;
+    } catch (error) {
+      readError = error;
+      hasReadError = true;
     } finally {
+      const closeRequestId = randomUUID();
       try {
-        stop = await connection.close();
+        stop = await connection.close(closeRequestId);
       } catch (closeError) {
-        await connection.stopOnCloseFailure().catch(() => {});
-        throw closeError;
+        try {
+          await connection.stopOnCloseFailure();
+          stop = await connection.retryClose(closeRequestId);
+        } catch (retryError) {
+          if (hasReadError) {
+            devDiag.record({
+              level: 'WARN',
+              category: 'BRIDGE_WS',
+              event: 'INSPECT_OWNED_PAGE_CLOSE_FAILED_AFTER_READ_ERROR',
+              profileId: peer.profileId,
+              reason:
+                retryError instanceof Error
+                  ? retryError.message
+                  : closeError instanceof Error
+                    ? closeError.message
+                    : 'CLOSE_FAILED',
+            });
+          } else {
+            throw retryError;
+          }
+        }
       }
     }
+    if (hasReadError) throw readError;
     await assertAllowed();
     const proof = connection.proof,
       closedRecord = connection.closedInventory?.tabs.find(
         (row) => proof && row.proof && sameTabProof(proof, row.proof),
       );
-    if (
-      !proof ||
-      closedRecord?.state !== (keepPage ? 'READY' : 'CLOSED') ||
-      stop.state !== 'stopped'
-    )
+    const closedStateAllowed = keepPage
+      ? closedRecord?.state === 'READY'
+      : closedRecord?.state === 'CLOSED' || closedRecord?.state === 'LOST';
+    if (!proof || !closedRecord || !closedStateAllowed || !stop || stop.state !== 'stopped')
       throw Error('FACEBOOK_IDENTITY_READ_RELEASE_UNCONFIRMED');
     return {
-      reading: current,
+      reading: current as T,
       connection: { profileId: peer.profileId, connectionEpoch: peer.epoch },
       proof,
       closedRecord,
@@ -2660,7 +3273,7 @@ export class KernelBridge implements KernelBridgeHooks {
       await facebook?.assertIdentity();
       let closingId: string | undefined;
       let closedInventory: ReturnType<typeof KernelPersistentState.parse> | null = null;
-      let closedPageState: 'READY' | 'CLOSED' | null = null;
+      let closedPageState: 'READY' | 'CLOSED' | 'LOST' | null = null;
       const hasVerifiedStopReceipt = (expectedId = closingId ?? session.stopControlId) => {
         const receipt = session.controlStopReceipt;
         return (
@@ -2681,6 +3294,46 @@ export class KernelBridge implements KernelBridgeHooks {
         peer.epoch === session.stamp.connectionEpoch &&
         peer.phase === 'STOPPING' &&
         peer.controlId === session.stopControlId;
+      const reconcileFacebookClosePage = async (allowRemove: boolean) => {
+        const before = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        const original = before.tabs.find((row) => row.ownershipId === ownershipId);
+        if (
+          !proof ||
+          !original?.proof ||
+          !sameTabProof(original.proof, proof) ||
+          !['READY', 'CLOSED', 'LOST'].includes(original.state)
+        )
+          throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
+        if (
+          this.sessions.get(peer.profileId) !== session ||
+          this.core.peers.get(peer.profileId) !== peer
+        )
+          throw Error('KERNEL_STOP_TRANSPORT_CHANGED');
+        if (original.state === 'CLOSED' || original.state === 'LOST') {
+          closedInventory = before;
+          closedPageState = original.state;
+          return;
+        }
+        const preservePage = facebook?.preservePage?.() === true;
+        if (preservePage) {
+          closedInventory = before;
+          closedPageState = 'READY';
+          return;
+        }
+        if (!allowRemove) throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
+        await session.request({ kind: 'remove', tabId: tab.tabId });
+        const inventory = KernelPersistentState.parse(await session.request({ kind: 'inventory' }));
+        const closed = inventory.tabs.find((row) => row.ownershipId === ownershipId);
+        if (
+          !proof ||
+          !closed?.proof ||
+          !sameTabProof(closed.proof, proof) ||
+          (closed.state !== 'CLOSED' && closed.state !== 'LOST')
+        )
+          throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
+        closedInventory = inventory;
+        closedPageState = closed.state;
+      };
       const closer = new SessionCloser({
         closeLocal: async () => {
           session.closing = true;
@@ -2701,41 +3354,7 @@ export class KernelBridge implements KernelBridgeHooks {
             return;
           }
           if (facebook) {
-            const before = KernelPersistentState.parse(
-              await session.request({ kind: 'inventory' }),
-            );
-            const original = before.tabs.find((row) => row.ownershipId === ownershipId);
-            if (
-              !proof ||
-              !original?.proof ||
-              !sameTabProof(original.proof, proof) ||
-              !['READY', 'CLOSED'].includes(original.state)
-            )
-              throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
-            // Input is synchronously fenced by session.closing. Keep the event channel alive
-            // until exact page removal: a filled draft can raise beforeunload during close.
-            // The native owner handles only that pending owned-page close, never general dialogs.
-            if (
-              this.sessions.get(peer.profileId) !== session ||
-              this.core.peers.get(peer.profileId) !== peer
-            )
-              throw Error('KERNEL_STOP_TRANSPORT_CHANGED');
-            const preservePage = original.state === 'READY' && facebook.preservePage?.() === true;
-            if (original.state !== 'CLOSED' && !preservePage)
-              await session.request({ kind: 'remove', tabId: tab.tabId });
-            const inventory = KernelPersistentState.parse(
-              await session.request({ kind: 'inventory' }),
-            );
-            const closed = inventory.tabs.find((row) => row.ownershipId === ownershipId);
-            if (
-              !proof ||
-              closed?.state !== (preservePage ? 'READY' : 'CLOSED') ||
-              !closed.proof ||
-              !sameTabProof(closed.proof, proof)
-            )
-              throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
-            closedInventory = inventory;
-            closedPageState = preservePage ? 'READY' : 'CLOSED';
+            await reconcileFacebookClosePage(true);
           }
           const local = await endpoint.close();
           await browser.close();
@@ -2743,38 +3362,23 @@ export class KernelBridge implements KernelBridgeHooks {
         },
         retryCloseLocal: async () => {
           if (session.failureReason || hasVerifiedStopReceipt() || awaitingControlStop()) {
-            const local = await endpoint.retryClose();
+            let local = await endpoint.retryClose();
+            if (local.state !== 'stopped' && awaitingControlStop()) {
+              const until = Date.now() + 14000;
+              while (!hasVerifiedStopReceipt() && awaitingControlStop() && Date.now() < until)
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            if (local.state !== 'stopped' && hasVerifiedStopReceipt())
+              local = await endpoint.retryClose();
             await browser.close().catch(() => {});
             if (local.state !== 'stopped') throw Error('KERNEL_LOCAL_STOP_UNCONFIRMED');
             if (!hasVerifiedStopReceipt() && !awaitingControlStop())
               throw Error(session.failureReason ?? 'KERNEL_STOP_UNCONFIRMED');
             return;
           }
-          // Never repeat removal. The first attempt must have observed this exact closed
-          // or retained main before retrying the same local/remote cancellation.
+          // Never repeat removal if first attempt already recorded closedPageState.
           if (facebook) {
-            const closed = closedInventory?.tabs.find((row) => row.ownershipId === ownershipId);
-            if (
-              !proof ||
-              !closedPageState ||
-              closed?.state !== closedPageState ||
-              !closed.proof ||
-              !sameTabProof(closed.proof, proof)
-            )
-              throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
-            const current = KernelPersistentState.parse(
-              await session.request({ kind: 'inventory' }),
-            );
-            const original = current.tabs.find((row) => row.ownershipId === ownershipId);
-            if (
-              !original ||
-              (original.state !== closedPageState && original.state !== 'CLOSED') ||
-              !original.proof ||
-              !sameTabProof(original.proof, proof)
-            )
-              throw Error('FACEBOOK_TASK_CLOSE_UNCONFIRMED');
-            closedInventory = current;
-            if (original.state === 'CLOSED') closedPageState = 'CLOSED';
+            await reconcileFacebookClosePage(closedPageState === null);
           }
           const local = await endpoint.retryClose();
           await browser.close();
@@ -2812,6 +3416,8 @@ export class KernelBridge implements KernelBridgeHooks {
           this.core.releaseFixtureKernel(peer, owner);
           if (this.sessions.get(peer.profileId) === session) {
             this.sessions.delete(peer.profileId);
+          }
+          if (this.idlePages.get(peer.profileId)?.connection === connection) {
             this.idlePages.delete(peer.profileId);
           }
           session.fail('KERNEL_CLOSED');
@@ -3768,6 +4374,9 @@ export class KernelBridge implements KernelBridgeHooks {
     return true;
   }
   disconnected(peer: Peer): void {
+    if (this.idlePages.get(peer.profileId)?.peer === peer) {
+      this.idlePages.delete(peer.profileId);
+    }
     const session = this.sessions.get(peer.profileId);
     if (!session || session.peer !== peer) return;
     this.presentationFocusGate.cancel(peer.profileId);
@@ -3845,6 +4454,7 @@ export class KernelBridge implements KernelBridgeHooks {
     session.closing = true;
     void session.endpoint?.close().catch(() => {});
     if (this.sessions.get(peer.profileId) === session) this.sessions.delete(peer.profileId);
+    if (this.idlePages.get(peer.profileId)?.peer === peer) this.idlePages.delete(peer.profileId);
     this.core.releaseFixtureKernel(peer, session.owner);
   }
   tick(): void {

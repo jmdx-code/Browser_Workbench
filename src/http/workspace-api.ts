@@ -9,6 +9,7 @@ import {
 import type { GroupBumperService } from '../application/group-bumper-service.js';
 import type { GroupInviterService } from '../application/group-inviter-service.js';
 import type { GroupPosterService } from '../application/group-poster-service.js';
+import type { BluestacksService } from '../application/bluestacks-service.js';
 import type { MaterialCacheManagement } from '../application/material-cache-management.js';
 import type { MaterialPreflightService } from '../application/material-preflight.js';
 import type { MaterialUsageService } from '../application/material-usage-service.js';
@@ -35,6 +36,7 @@ import {
   WorkspaceSchema,
 } from '../shared/contracts.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
+import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { WindowLayoutPort } from '../shared/window-layout.js';
 import { handleFeatureModuleRoutes } from './routes/feature-module-routes.js';
 import { handleMaterialResourceRoutes } from './routes/material-resource-routes.js';
@@ -122,20 +124,31 @@ export function workspaceApi(
   featureExecution?: FeatureExecutionRegistry,
   groupPoster?: GroupPosterService,
   isProfileOnline?: (profileId: string) => boolean | Promise<boolean>,
+  bluestacks?: BluestacksService,
+  profileLifecycle?: ProfileLifecyclePort,
 ) {
   const resolvedFeatureExecution = ensureFeatureExecutionRegistry(featureExecution, {
     tasks,
     groupInviter,
     groupBumper,
     groupPoster,
+    bluestacks,
   });
   groupBumper?.setFeatureExecutionRegistry?.(resolvedFeatureExecution);
   groupInviter?.setFeatureExecutionRegistry?.(resolvedFeatureExecution);
+  if (profileLifecycle) {
+    groupBumper?.setProfileLifecycle?.(profileLifecycle);
+    groupInviter?.setProfileLifecycle?.(profileLifecycle);
+    groupPoster?.setProfileLifecycle?.(profileLifecycle);
+  }
   const taskTests = tasks
     ? new TaskTestService(service, tasks, (profileId) =>
         resolvedFeatureExecution.isProfileBusy(profileId, 'active-accounts'),
       )
     : undefined;
+  if (taskTests && profileLifecycle) {
+    taskTests.setProfileLifecycle(profileLifecycle);
+  }
   return async (req: IncomingMessage, res: ServerResponse, route: string, input?: unknown) => {
     if (!route.startsWith('/api/workspace')) return false;
     const reqStartAt = Date.now();
@@ -156,6 +169,7 @@ export function workspaceApi(
           groupInviter,
           groupBumper,
           groupPoster,
+          bluestacks,
           featureExecution: resolvedFeatureExecution,
         })
       ) {
@@ -222,6 +236,7 @@ export function workspaceApi(
           taskTests,
           featureExecution: resolvedFeatureExecution,
           isProfileOnline,
+          profileLifecycle,
         })
       ) {
         return true;

@@ -29,6 +29,10 @@ import {
   productExtensionDirectory,
   syncProductExtensionDirectory,
 } from './infrastructure/paths.js';
+import {
+  productAiWorkspaceDirectory,
+  syncProductAiWorkspaceDirectory,
+} from './infrastructure/ai-workspace.js';
 import { access } from 'node:fs/promises';
 import { DataCleanupService } from './application/data-cleanup.js';
 import { LogCleanup } from './infrastructure/log-cleanup.js';
@@ -86,12 +90,23 @@ import { LocalBrowserLabels } from './infrastructure/local-browser-labels.js';
 import { GraphAvatar } from './infrastructure/graph-avatar.js';
 import { GroupInviterService } from './application/group-inviter-service.js';
 import { GroupInviterBrowserAdapter } from './infrastructure/group-inviter-runner.js';
+import type { BluestacksService } from './application/bluestacks-service.js';
+import type { WindowsOcrClient } from './infrastructure/bluestacks-vision.js';
 import { devDiag } from './shared/dev-diagnostics.js';
 import { DevDiagnosticsFileWriter } from './infrastructure/dev-diagnostics-writer.js';
+import type http from 'node:http';
 import {
   createDiagnosticSnapshotBuilder,
   revealDiagnosticPackage,
 } from './infrastructure/diagnostic-package.js';
+import type { AgentBrowserManager } from './infrastructure/mcp/agent-browser-manager.js';
+import {
+  createBluestacksRuntime,
+  openDesktopAiWorkspaceViaParent,
+  openDesktopExtensionDirViaParent,
+  schedulePosterDriveCacheCleanup,
+  wireLifecycleAndMcpRuntime,
+} from './infrastructure/mcp/mcp-runtime-wiring.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
@@ -118,6 +133,21 @@ const {
   featureEvidence,
   publicationAcceptanceScope,
 } = await loadServerConfig(root);
+if (
+  Boolean(process.env.WORKBENCH_AI_WORKSPACE_DIR?.trim()) ||
+  (!process.env.WORKBENCH_SMOKE_OUT && !process.env.BRIDGE_TEST_DATA_DIR)
+) {
+  await syncProductAiWorkspaceDirectory({ rootDir: root, softwareVersion }).catch(
+    (err: unknown) => {
+      devDiag.record({
+        level: 'WARN',
+        category: 'SYSTEM',
+        event: 'AI_WORKSPACE_SYNC_FAILED',
+        reason: err instanceof Error ? err.message : 'SYNC_FAILED',
+      });
+    },
+  );
+}
 import { WindowLayoutService } from './application/window-layout.js';
 import { LayoutDisplays, defaultWindowLayout } from './shared/window-layout.js';
 let layoutDisplays = LayoutDisplays.parse(JSON.parse(process.env.WORKBENCH_DISPLAYS ?? '[]'));
@@ -191,6 +221,12 @@ let mainKernel: KernelBridge | undefined;
 let publishingRuntime: FacebookPublishingRuntime | undefined;
 let backups: WorkspaceBackupService | undefined;
 let dataCleanup: DataCleanupService | undefined;
+let bluestacksOcrClient: WindowsOcrClient | undefined;
+let bluestacksServiceRef: BluestacksService | undefined;
+let groupBumperServiceRef: GroupBumperService | undefined;
+let agentBrowserManagerRef: AgentBrowserManager | undefined;
+let mcpHttpHandler:
+  ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>) | undefined;
 const materialPreflight = new MaterialPreflightService(
   new FilesystemMaterialScanner(undefined, checkKnownFacebookVideo),
   () => new Date().toISOString(),
@@ -224,6 +260,7 @@ try {
     dataDir,
     port,
     boundServer: binding,
+    mcpHandler: (req, res) => (mcpHttpHandler ? mcpHttpHandler(req, res) : Promise.resolve(false)),
     autoRecoverConnections: process.env.WORKBENCH_DIAGNOSTICS !== '1',
     connectionRecoveryAllowed:
       process.env.WORKBENCH_DIAGNOSTICS === '1'
@@ -469,9 +506,13 @@ try {
               },
               tick: async () => {
                 kernel.tick();
-                void browserLabels
-                  .refresh((await core.store.profileList()).map((row) => String(row.profileId)))
-                  .catch(() => {});
+                void (async () => {
+                  const ids = (await core.store.profileList()).map((row) => String(row.profileId));
+                  const newlyBound = await browserLabels.refresh(ids);
+                  if (newlyBound.length > 0) {
+                    await repository.upsertProfileLaunchBindings(newlyBound);
+                  }
+                })().catch(() => {});
                 void publishingRuntime
                   ?.tick()
                   .catch((error) => console.error('Publishing runtime failed', error));
@@ -631,23 +672,17 @@ try {
         (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
         () => targetMetadataRefresh.stopRefresh('groups'),
       );
+      const bsRuntime = createBluestacksRuntime(repository, featureExecution);
+      bluestacksOcrClient = bsRuntime.ocrClient;
+      const bluestacksService = bsRuntime.service;
+      bluestacksServiceRef = bluestacksService;
       ensureFeatureExecutionRegistry(featureExecution, {
         groupInviter: groupInviterService,
         groupBumper: groupBumperService,
         groupPoster: groupPosterService,
+        bluestacks: bluestacksService,
       });
-      const posterCacheStartupTimer = setTimeout(
-        () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
-        30_000,
-      ).unref();
-      const posterCacheIntervalTimer = setInterval(
-        () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
-        6 * 3600_000,
-      ).unref();
-      process.once('exit', () => {
-        clearTimeout(posterCacheStartupTimer);
-        clearInterval(posterCacheIntervalTimer);
-      });
+      schedulePosterDriveCacheCleanup(groupPosterService);
       const updaterBackend = new SoftwareUpdateBackend({
         root,
         dataDir,
@@ -706,20 +741,14 @@ try {
             if (!extensionUpdates) throw Error('EXTENSION_UPDATE_UNAVAILABLE');
             return extensionUpdates.reload(ids);
           },
-          openExtensionDirectory: () => {
-            if (!process.parentPort)
-              throw new ProductError(
-                'UPDATE_DESKTOP_REQUIRED',
-                '请在桌面工作台中打开插件目录',
-                409,
-              );
-            process.parentPort.postMessage({ type: 'OPEN_EXTENSION_DIRECTORY' });
-          },
+          openExtensionDirectory: () => openDesktopExtensionDirViaParent(),
+          openAiWorkspaceDirectory: () => openDesktopAiWorkspaceViaParent(root, softwareVersion),
         },
         {
           software: softwareVersion,
           extension: bundledExtension.version,
           directory: productExtensionDirectory(),
+          aiWorkspaceDirectory: productAiWorkspaceDirectory(),
         },
       );
       let mutations = 0;
@@ -753,6 +782,62 @@ try {
         },
         persistence.bridge,
       );
+      const captureDiagnostics = createDiagnosticSnapshotBuilder({
+        dataDir,
+        softwareVersion,
+        extensionVersion: bundledExtension.version,
+        workspaceService,
+        taskService,
+        groupInviterService,
+        getGroupBumperService: () => groupBumperService,
+        groupPosterService,
+        tasksRepository: repository.tasks,
+        taskTabsRepository: repository.taskTabs,
+        core,
+        getMainKernel: () => mainKernel,
+        controllerLoopDelay,
+        devDiagFlush: () => devDiagWriter.flush(),
+        devDiagFilePath: devDiagWriter.filePath,
+      });
+      groupBumperServiceRef = groupBumperService;
+      const wired = wireLifecycleAndMcpRuntime({
+        softwareVersion,
+        extensionVersion: bundledExtension.version,
+        dataDir,
+        port,
+        core,
+        store,
+        repository,
+        browserLabels,
+        getMainKernel: () => mainKernel,
+        publishingRuntime,
+        workspaceService,
+        taskService,
+        inspection,
+        featureExecution,
+        groupPosterService,
+        groupBumperService,
+        groupInviterService,
+        bluestacksService,
+        captureDiagnostics,
+        devDiagFilePath: devDiagWriter.filePath,
+        reloadExtensions: (ids) => {
+          if (!extensionUpdates) throw Error('EXTENSION_UPDATE_UNAVAILABLE');
+          return extensionUpdates.reload(ids);
+        },
+        withMutation: async (work) => {
+          dataCleanup?.assertNotResetting();
+          mutations++;
+          try {
+            return await work();
+          } finally {
+            mutations--;
+          }
+        },
+      });
+      const { profileLifecycle } = wired;
+      agentBrowserManagerRef = wired.agentBrowserManager;
+      mcpHttpHandler = wired.mcpHttpHandler;
       const handler = workspaceApi(
         workspaceService,
         taskService,
@@ -806,23 +891,7 @@ try {
           cacheDirectory: uploadCacheRoot,
         }),
         groupInviterService,
-        createDiagnosticSnapshotBuilder({
-          dataDir,
-          softwareVersion,
-          extensionVersion: bundledExtension.version,
-          workspaceService,
-          taskService,
-          groupInviterService,
-          getGroupBumperService: () => groupBumperService,
-          groupPosterService,
-          tasksRepository: repository.tasks,
-          taskTabsRepository: repository.taskTabs,
-          core,
-          getMainKernel: () => mainKernel,
-          controllerLoopDelay,
-          devDiagFlush: () => devDiagWriter.flush(),
-          devDiagFilePath: devDiagWriter.filePath,
-        }),
+        captureDiagnostics,
         dataCleanup,
         windowLayout,
         mediaComponent,
@@ -832,6 +901,8 @@ try {
         featureExecution,
         groupPosterService,
         (id) => Boolean(core.peers.get(id)?.online),
+        bluestacksService,
+        profileLifecycle,
       );
       return async (...args) => {
         const [req] = args;
@@ -912,6 +983,10 @@ async function shutdown() {
   controllerLoopDelay.disable();
   if (notificationTimer) clearInterval(notificationTimer);
   clearInterval(cleanupTimer);
+  groupBumperServiceRef?.shutdown();
+  await agentBrowserManagerRef?.closeAll().catch(() => {});
+  await bluestacksServiceRef?.stopBumper().catch(() => {});
+  bluestacksOcrClient?.close();
   devDiag.record({
     level: 'INFO',
     category: 'SYSTEM',

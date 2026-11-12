@@ -133,7 +133,7 @@ export function Sidebar({
   onStopGroupInviterProfiles?: (profileIds: string[]) => void;
 }) {
   const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState('online');
+  const [filter, setFilter] = useState('all');
   const [closed, setClosed] = useState<Set<string>>(new Set());
   const [groupName, setGroupName] = useState('');
   const [creating, setCreating] = useState(false);

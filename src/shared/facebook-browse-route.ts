@@ -48,6 +48,20 @@ export function facebookMarketplaceUnavailableURL(value: string): boolean {
     return false;
   }
 }
+export function facebookPostStoryLandingURL(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      value.length <= 2048 &&
+      url.origin === 'https://www.facebook.com' &&
+      !url.username &&
+      !url.password &&
+      /^\/stories\/?$/i.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
 export function facebookBrowseSurface(value: string): FacebookBrowseType | null {
   try {
     const url = new URL(value);

@@ -32,6 +32,7 @@ import { ReconnectBackoff } from '../src/shared/reconnect-backoff.js';
 import { Id } from '../src/shared/contracts.js';
 import {
   cleanupExtraTabs,
+  closeProfileWindows,
   getLastUserFocusedAt,
   inspectBrowserWindow,
   isProgrammaticWindowMoveActive,
@@ -67,7 +68,8 @@ let generation = 0,
   connecting = false;
 let freezeSerial = 0,
   kernelStopUnconfirmed = false,
-  reloadingExtension = false;
+  reloadingExtension = false,
+  closingBrowserWindows = false;
 const defaultFreezeTimeoutMs = 8_000,
   welcomeFreezeTimeoutMs = 5_000,
   disconnectFreezeTimeoutMs = 5_000,
@@ -124,9 +126,54 @@ async function init() {
         owned.set(row.tabId, { ...row, documentEpoch: row.documentEpoch + 1 });
     } catch {}
 }
+export interface OutgoingMessageDiagnostic {
+  observed: boolean;
+  utf8Bytes: number;
+  type: string;
+  method?: string;
+  entriesCount?: number;
+}
+export function inspectOutgoingExtensionMessage(
+  msg: unknown,
+  serialized?: string,
+): OutgoingMessageDiagnostic {
+  const raw = typeof serialized === 'string' ? serialized : JSON.stringify(msg);
+  if (raw.length <= 350_000) {
+    return { observed: false, utf8Bytes: raw.length, type: 'UNKNOWN' };
+  }
+  const utf8Bytes = new TextEncoder().encode(raw).byteLength;
+  const record =
+    typeof msg === 'object' && msg !== null ? (msg as Record<string, unknown>) : undefined;
+  const ev =
+    typeof record?.event === 'object' && record.event !== null
+      ? (record.event as Record<string, unknown>)
+      : undefined;
+  const type = typeof record?.type === 'string' ? record.type : 'UNKNOWN';
+  const method =
+    typeof record?.method === 'string'
+      ? record.method
+      : typeof ev?.method === 'string'
+        ? ev.method
+        : undefined;
+  const entriesCount = Array.isArray(record?.entries) ? record.entries.length : undefined;
+  if (utf8Bytes > 1_048_576) {
+    console.warn('[BrowserWorkbench][BridgeOutgoingLargeMessage]', {
+      type,
+      method,
+      entriesCount,
+      utf8Bytes,
+    });
+    return { observed: true, utf8Bytes, type, method, entriesCount };
+  }
+  return { observed: false, utf8Bytes, type, method, entriesCount };
+}
 let ready = typeof chrome !== 'undefined' && chrome?.storage?.local ? init() : Promise.resolve();
 const send = (msg: unknown) => {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+  if (socket?.readyState === WebSocket.OPEN) {
+    const raw = JSON.stringify(msg);
+    inspectOutgoingExtensionMessage(msg, raw);
+    socket.send(raw);
+  }
 };
 async function saveOwned() {
   await chrome.storage.session.set({ owned: [...owned.values()] });
@@ -246,10 +293,15 @@ async function execute(
   if (action.kind === 'readFacebookDisplay') {
     const tabs = await chrome.tabs.query({ url: 'https://www.facebook.com/*' });
     guard(command, g);
-    const tab = tabs
-      .filter((t) => t.url === 'https://www.facebook.com/')
-      .sort((a, b) => Number(b.active) - Number(a.active))[0];
+    const tab =
+      tabs
+        .filter((t) => t.url === 'https://www.facebook.com/')
+        .sort((a, b) => Number(b.active) - Number(a.active))[0] ??
+      tabs
+        .filter((t) => typeof t.url === 'string' && t.url.startsWith('https://www.facebook.com/'))
+        .sort((a, b) => Number(b.active) - Number(a.active))[0];
     if (tab?.id === undefined) return { status: 'VERIFIED', evidence: { available: false } };
+    const scope = tab.url === 'https://www.facebook.com/' ? 'home' : 'browse';
     const pages = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: 'MAIN',
@@ -261,7 +313,7 @@ async function execute(
       target: { tabId: tab.id },
       world: 'MAIN',
       func: projectFacebookDocumentIdentity,
-      args: ['home'],
+      args: [scope],
     });
     guard(command, g);
     const page = pages.find((r) => r.frameId === 0),
@@ -710,6 +762,78 @@ async function connect() {
       });
       return;
     }
+    if (
+      incoming &&
+      typeof incoming === 'object' &&
+      'type' in incoming &&
+      incoming.type === 'CLOSE_BROWSER_WINDOWS'
+    ) {
+      const request = incoming as Record<string, unknown>;
+      if (
+        connectionStage !== 'ready' ||
+        ws.readyState !== WebSocket.OPEN ||
+        request.connectionEpoch !== epoch ||
+        !Id.safeParse(request.requestId).success
+      ) {
+        ws.close(1008, 'PROTOCOL_REJECTED');
+        return;
+      }
+      if (closingBrowserWindows) return;
+      closingBrowserWindows = true;
+      void (async () => {
+        try {
+          await freeze('BROWSER_CLOSE_REQUESTED', { timeoutMs: reloadFreezeTimeoutMs }).catch(
+            () => {},
+          );
+          const { closedCount, remainingCount } = await closeProfileWindows();
+          if (serial !== connectionSerial || ws.readyState !== WebSocket.OPEN) return;
+          if (remainingCount > 0) {
+            send({
+              type: 'BROWSER_WINDOWS_CLOSED',
+              requestId: request.requestId,
+              connectionEpoch: epoch,
+              ok: false,
+              error: 'BROWSER_CLOSE_BLOCKED',
+              closedCount,
+              remainingCount,
+            });
+            return;
+          }
+          send({
+            type: 'BROWSER_WINDOWS_CLOSED',
+            requestId: request.requestId,
+            connectionEpoch: epoch,
+            ok: true,
+            closedCount,
+            remainingCount: 0,
+          });
+          send({
+            type: 'PONG',
+            connectionEpoch: epoch,
+            windowCount: 0,
+            profileWindowFocused: false,
+          });
+          ws.close(1000, 'BROWSER_WINDOW_CLOSED');
+        } catch (err) {
+          if (serial === connectionSerial && ws.readyState === WebSocket.OPEN) {
+            send({
+              type: 'BROWSER_WINDOWS_CLOSED',
+              requestId: request.requestId,
+              connectionEpoch: epoch,
+              ok: false,
+              error: err instanceof Error ? err.message : 'BROWSER_CLOSE_FAILED',
+              closedCount: 0,
+              remainingCount: 1,
+            });
+          }
+        } finally {
+          closingBrowserWindows = false;
+        }
+      })().catch(() => {
+        closingBrowserWindows = false;
+      });
+      return;
+    }
     inbox = inbox
       .then(async () => {
         try {
@@ -922,73 +1046,75 @@ async function connect() {
     ws.close();
   };
 }
-chrome.debugger.onEvent.addListener((source, method, p: any) => {
-  if (source.tabId !== undefined)
-    kernel.event({ tabId: source.tabId, sessionId: source.sessionId }, method, p);
-  const o = source.tabId ? owned.get(source.tabId) : undefined;
-  if (!o) return;
-  if (method === 'Page.frameNavigated' && !source.sessionId && !p.frame.parentId) {
-    o.documentEpoch++;
-    o.routeEpoch++;
+if (typeof chrome !== 'undefined' && chrome?.debugger?.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, p: any) => {
+    if (source.tabId !== undefined)
+      kernel.event({ tabId: source.tabId, sessionId: source.sessionId }, method, p);
+    const o = source.tabId ? owned.get(source.tabId) : undefined;
+    if (!o) return;
+    if (method === 'Page.frameNavigated' && !source.sessionId && !p.frame.parentId) {
+      o.documentEpoch++;
+      o.routeEpoch++;
+      void saveOwned();
+    }
+    if (method === 'Page.navigatedWithinDocument' && !source.sessionId) {
+      o.routeEpoch++;
+      void saveOwned();
+    }
+    if (method === 'Target.attachedToTarget' && p.targetInfo.type === 'iframe') {
+      frames.set(p.targetInfo.targetId, { tabId: o.tabId, sessionId: p.sessionId });
+      void chrome.debugger
+        .sendCommand({ tabId: o.tabId, sessionId: p.sessionId }, 'Target.setAutoAttach', {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+          filter: [{ type: 'iframe', exclude: false }],
+        })
+        .catch(() => {});
+    }
+    if (method === 'Target.detachedFromTarget')
+      for (const [id, f] of frames) if (f.sessionId === p.sessionId) frames.delete(id);
+  });
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source.tabId !== undefined) kernel.detached(source.tabId);
+    if (source.tabId === undefined || !attached.has(source.tabId)) return;
+    if (!stopping) {
+      void freeze('DEBUGGER_DETACHED').catch(() => {});
+      send({ type: 'LOCAL_STOP' });
+    }
+  });
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    kernel.removed(tabId);
+    owned.delete(tabId);
+    attached.delete(tabId);
     void saveOwned();
-  }
-  if (method === 'Page.navigatedWithinDocument' && !source.sessionId) {
-    o.routeEpoch++;
-    void saveOwned();
-  }
-  if (method === 'Target.attachedToTarget' && p.targetInfo.type === 'iframe') {
-    frames.set(p.targetInfo.targetId, { tabId: o.tabId, sessionId: p.sessionId });
-    void chrome.debugger
-      .sendCommand({ tabId: o.tabId, sessionId: p.sessionId }, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true,
-        filter: [{ type: 'iframe', exclude: false }],
+  });
+  chrome.windows.onCreated.addListener(() => {
+    manualPauseReconnect = false;
+    reconnectBackoff.reset();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    void connect().catch(() => {});
+  });
+  chrome.windows.onRemoved.addListener(() => {
+    void chrome.windows
+      .getAll({ windowTypes: ['normal', 'popup'] })
+      .then((windows) => {
+        if (windows.length === 0 && socket?.readyState === WebSocket.OPEN) {
+          send({
+            type: 'PONG',
+            connectionEpoch: epoch,
+            windowCount: 0,
+            profileWindowFocused: false,
+          });
+          socket.close(1000, 'BROWSER_WINDOW_CLOSED');
+        }
       })
       .catch(() => {});
-  }
-  if (method === 'Target.detachedFromTarget')
-    for (const [id, f] of frames) if (f.sessionId === p.sessionId) frames.delete(id);
-});
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined) kernel.detached(source.tabId);
-  if (source.tabId === undefined || !attached.has(source.tabId)) return;
-  if (!stopping) {
-    void freeze('DEBUGGER_DETACHED').catch(() => {});
-    send({ type: 'LOCAL_STOP' });
-  }
-});
-chrome.tabs.onRemoved.addListener((tabId) => {
-  kernel.removed(tabId);
-  owned.delete(tabId);
-  attached.delete(tabId);
-  void saveOwned();
-});
-chrome.windows.onCreated.addListener(() => {
-  manualPauseReconnect = false;
-  reconnectBackoff.reset();
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = undefined;
-  }
-  void connect().catch(() => {});
-});
-chrome.windows.onRemoved.addListener(() => {
-  void chrome.windows
-    .getAll({ windowTypes: ['normal', 'popup'] })
-    .then((windows) => {
-      if (windows.length === 0 && socket?.readyState === WebSocket.OPEN) {
-        send({
-          type: 'PONG',
-          connectionEpoch: epoch,
-          windowCount: 0,
-          profileWindowFocused: false,
-        });
-        socket.close(1000, 'BROWSER_WINDOW_CLOSED');
-      }
-    })
-    .catch(() => {});
-});
+  });
+}
 function tryWakeReconnect() {
   if (
     manualPauseReconnect ||
@@ -1003,7 +1129,10 @@ function tryWakeReconnect() {
   }
   void connect().catch(() => {});
 }
-if (typeof chrome.windows?.onFocusChanged?.addListener === 'function') {
+if (
+  typeof chrome !== 'undefined' &&
+  typeof chrome.windows?.onFocusChanged?.addListener === 'function'
+) {
   chrome.windows.onFocusChanged.addListener((windowId) => {
     if (
       typeof windowId !== 'number' ||
@@ -1024,7 +1153,10 @@ if (typeof chrome.windows?.onFocusChanged?.addListener === 'function') {
       .catch(() => {});
   });
 }
-if (typeof chrome.windows?.onBoundsChanged?.addListener === 'function') {
+if (
+  typeof chrome !== 'undefined' &&
+  typeof chrome.windows?.onBoundsChanged?.addListener === 'function'
+) {
   chrome.windows.onBoundsChanged.addListener((win) => {
     if (!isProgrammaticWindowMoveActive() && win?.focused && (!win.type || win.type === 'normal')) {
       recordUserWindowFocus(Date.now());
@@ -1032,7 +1164,7 @@ if (typeof chrome.windows?.onBoundsChanged?.addListener === 'function') {
     }
   });
 }
-if (typeof chrome.tabs?.onActivated?.addListener === 'function') {
+if (typeof chrome !== 'undefined' && typeof chrome.tabs?.onActivated?.addListener === 'function') {
   chrome.tabs.onActivated.addListener((activeInfo) => {
     if (isProgrammaticWindowMoveActive()) return;
     tryWakeReconnect();
@@ -1047,50 +1179,52 @@ if (typeof chrome.tabs?.onActivated?.addListener === 'function') {
       .catch(() => {});
   });
 }
-chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-  if (sender.id !== chrome.runtime.id || sender.tab) return false;
-  void (async () => {
-    await ready;
-    if (msg.type === 'CONNECT') {
-      manualPauseReconnect = false;
-      reconnectBackoff.reset();
-      await connect();
-      reply({ accepted: true });
-    } else if (msg.type === 'STOP') {
-      await freeze('USER_STOP');
-      send({ type: 'LOCAL_STOP' });
-      reply({ stopped: true });
-    } else if (msg.type === 'STATUS')
-      reply({
-        profileId,
-        connected: socket?.readyState === WebSocket.OPEN,
-        connectionStage,
-        connectionFailure,
-        paired: Boolean(secret),
-        paused,
-        leaseRemainingMs: Math.max(0, leaseUntil - Date.now()),
-        ownedTabs: [...owned.keys()],
-      });
-  })().catch((e) => reply({ error: e.message }));
-  return true;
-});
-chrome.alarms.onAlarm.addListener(() => {
-  if (manualPauseReconnect || connecting || socket?.readyState === WebSocket.OPEN) return;
-  reconnectBackoff.reset();
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = undefined;
-  }
-  void connect().catch(() => {});
-});
-chrome.runtime.onStartup.addListener(() => {
-  manualPauseReconnect = false;
-  reconnectBackoff.reset();
-  void connect().catch(() => {});
-});
-void chrome.alarms.create('reconnect', { periodInMinutes: 0.5 });
-setInterval(() => {
-  kernel.expire();
-  if (!paused && Date.now() > leaseUntil) void freeze('LEASE_EXPIRED').catch(() => {});
-}, 500);
-void ready.then(() => connect());
+if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+    if (sender.id !== chrome.runtime.id || sender.tab) return false;
+    void (async () => {
+      await ready;
+      if (msg.type === 'CONNECT') {
+        manualPauseReconnect = false;
+        reconnectBackoff.reset();
+        await connect();
+        reply({ accepted: true });
+      } else if (msg.type === 'STOP') {
+        await freeze('USER_STOP');
+        send({ type: 'LOCAL_STOP' });
+        reply({ stopped: true });
+      } else if (msg.type === 'STATUS')
+        reply({
+          profileId,
+          connected: socket?.readyState === WebSocket.OPEN,
+          connectionStage,
+          connectionFailure,
+          paired: Boolean(secret),
+          paused,
+          leaseRemainingMs: Math.max(0, leaseUntil - Date.now()),
+          ownedTabs: [...owned.keys()],
+        });
+    })().catch((e) => reply({ error: e.message }));
+    return true;
+  });
+  chrome.alarms.onAlarm.addListener(() => {
+    if (manualPauseReconnect || connecting || socket?.readyState === WebSocket.OPEN) return;
+    reconnectBackoff.reset();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    void connect().catch(() => {});
+  });
+  chrome.runtime.onStartup.addListener(() => {
+    manualPauseReconnect = false;
+    reconnectBackoff.reset();
+    void connect().catch(() => {});
+  });
+  void chrome.alarms.create('reconnect', { periodInMinutes: 0.5 });
+  setInterval(() => {
+    kernel.expire();
+    if (!paused && Date.now() > leaseUntil) void freeze('LEASE_EXPIRED').catch(() => {});
+  }, 500);
+  void ready.then(() => connect());
+}

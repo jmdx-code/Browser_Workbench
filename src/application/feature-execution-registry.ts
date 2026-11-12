@@ -112,6 +112,11 @@ export interface FeatureExecutionFallbackServices {
     hasActiveExecution(): boolean;
     stopProfiles(profileIds: readonly string[]): Promise<unknown>;
   };
+  bluestacks?: {
+    isProfileRunning(profileId: string): boolean;
+    hasActiveExecution(): boolean;
+    stopBumper(profileIds?: readonly string[]): Promise<unknown>;
+  };
 }
 
 const ACTIVE_PLAN_STATES = [
@@ -128,7 +133,7 @@ export function ensureFeatureExecutionRegistry(
   services: FeatureExecutionFallbackServices,
 ): FeatureExecutionRegistry {
   const registry = existing ?? new FeatureExecutionRegistry();
-  const { tasks, groupInviter, groupBumper, groupPoster } = services;
+  const { tasks, groupInviter, groupBumper, groupPoster, bluestacks } = services;
 
   if (tasks && !registry.hasParticipant('active-accounts')) {
     registry.register({
@@ -195,6 +200,18 @@ export function ensureFeatureExecutionRegistry(
       hasActiveExecution: () => groupPoster.hasActiveExecution(),
       stopProfiles: async (profileIds) => {
         await groupPoster.stopProfiles(profileIds);
+      },
+    });
+  }
+
+  if (bluestacks && !registry.hasParticipant('bluestacks-group-bumper')) {
+    registry.register({
+      id: 'bluestacks-group-bumper',
+      label: '蓝蝶小组顶贴',
+      isProfileRunning: (profileId) => bluestacks.isProfileRunning(profileId),
+      hasActiveExecution: () => bluestacks.hasActiveExecution(),
+      stopProfiles: async (profileIds) => {
+        await bluestacks.stopBumper(profileIds);
       },
     });
   }

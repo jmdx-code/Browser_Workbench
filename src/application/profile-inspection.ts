@@ -5,6 +5,7 @@ import { observeFacebookHomeAvatar } from '../domain/facebook-avatar-analysis.js
 import { observeFacebookHomeName } from '../domain/facebook-name-analysis.js';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { FacebookBrowseURL } from '../shared/browser-actions.js';
+import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import { NameObservation } from '../shared/account-display.js';
 import {
   InspectionReason,
@@ -316,7 +317,7 @@ export class ProfileInspectionService {
       const native = FacebookNativeActor.safeParse(reading.actor);
       const nativeName =
         observed.account.state === 'unknown' &&
-        FacebookBrowseURL.safeParse(page.url).success &&
+        (FacebookBrowseURL.safeParse(page.url).success || kernelFacebookReadURL(page.url)) &&
         native.success &&
         this.now() >= native.data.checkedAt &&
         this.now() - native.data.checkedAt < 30_000

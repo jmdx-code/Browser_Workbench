@@ -3,6 +3,7 @@ import {
   BumperGroupTargetsInput,
   BumperPageTargetsInput,
   BumperSettings,
+  CreateBumperTaskInput,
   StartBumper,
   StartPageBumper,
   isTargetIncomplete,
@@ -15,7 +16,9 @@ import {
   type BumperDailyStat,
   type BumperPendingOperation,
   type BumperRefreshResult,
+  type BumperScheduledTask,
 } from '../shared/group-bumper.js';
+import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { ProfileTaskResultValue } from '../shared/task-contracts.js';
 import { z } from 'zod';
 import { ProductError } from '../domain/workspace.js';
@@ -80,6 +83,19 @@ export interface BumperRepository {
   todayCounts(sourceMode?: BumperScope): Record<string, number>;
   weeklyDailyCounts?(now?: number, sourceMode?: BumperScope): BumperDailyStat[];
   pendingReviewOperations?(limit?: number): BumperPendingOperation[];
+  scheduledTasks?(limit?: number): BumperScheduledTask[];
+  createScheduledTask?(input: unknown): BumperScheduledTask;
+  updateScheduledTask?(
+    id: string,
+    patch: {
+      status?: BumperScheduledTask['status'] | undefined;
+      statusReason?: string | undefined;
+      runId?: string | null | undefined;
+      startedAt?: number | null | undefined;
+      finishedAt?: number | null | undefined;
+    },
+  ): BumperScheduledTask | null;
+  deleteScheduledTask?(id: string): boolean;
   saveProfileResult?(result: ProfileTaskResultValue): void;
   applyResolvedTargetMetadata?(
     kind: 'groups' | 'pages',
@@ -143,6 +159,10 @@ export class GroupBumperService {
   private statusText = '请选择账号、小组和目标主页';
   private pageStatusText = '请选择账号和目标专页';
   private featureExecution?: FeatureExecutionRegistry;
+  private profileLifecycle?: ProfileLifecyclePort;
+  private fallbackScheduledTasks = new Map<string, BumperScheduledTask>();
+  private scheduleTimer: ReturnType<typeof setInterval> | null = null;
+  private scheduleTicking = false;
   constructor(
     private readonly repo: CompatibleRepository<BumperRepository>,
     private readonly runner: BumperRunner,
@@ -158,6 +178,111 @@ export class GroupBumperService {
   ) {}
   setFeatureExecutionRegistry(registry: FeatureExecutionRegistry): void {
     this.featureExecution = registry;
+  }
+  setProfileLifecycle(lifecycle: ProfileLifecyclePort): void {
+    this.profileLifecycle = lifecycle;
+  }
+  startScheduler(intervalMs = 2000): void {
+    if (this.scheduleTimer) return;
+    const timer = setInterval(() => {
+      void this.tickScheduledTasks();
+    }, intervalMs);
+    timer.unref?.();
+    this.scheduleTimer = timer;
+  }
+  shutdown(): void {
+    if (this.scheduleTimer) {
+      clearInterval(this.scheduleTimer);
+      this.scheduleTimer = null;
+    }
+    this.refreshAbort?.abort();
+  }
+  private async readScheduledTasks(limit = 100): Promise<BumperScheduledTask[]> {
+    if (this.repo.scheduledTasks) {
+      return await this.repo.scheduledTasks(limit);
+    }
+    return [...this.fallbackScheduledTasks.values()]
+      .sort((a, b) => a.scheduledAt - b.scheduledAt || b.createdAt - a.createdAt)
+      .slice(0, limit);
+  }
+  private async writeScheduledTaskPatch(
+    id: string,
+    patch: {
+      status?: BumperScheduledTask['status'] | undefined;
+      statusReason?: string | undefined;
+      runId?: string | null | undefined;
+      startedAt?: number | null | undefined;
+      finishedAt?: number | null | undefined;
+    },
+  ): Promise<BumperScheduledTask | null> {
+    if (this.repo.updateScheduledTask) {
+      return await this.repo.updateScheduledTask(id, patch);
+    }
+    const existing = this.fallbackScheduledTasks.get(id);
+    if (!existing) return null;
+    const updated: BumperScheduledTask = {
+      ...existing,
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.statusReason !== undefined ? { statusReason: patch.statusReason } : {}),
+      ...(patch.runId !== undefined ? { runId: patch.runId } : {}),
+      ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt } : {}),
+      ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt } : {}),
+    };
+    this.fallbackScheduledTasks.set(id, updated);
+    return updated;
+  }
+  async tickScheduledTasks(now = Date.now()): Promise<void> {
+    if (this.scheduleTicking) return;
+    this.scheduleTicking = true;
+    try {
+      const tasks = await this.readScheduledTasks(200);
+      const due = tasks
+        .filter((t) => t.status === 'scheduled' && t.scheduledAt <= now)
+        .sort((a, b) => a.scheduledAt - b.scheduledAt);
+      for (const task of due) {
+        const claimed = await this.writeScheduledTaskPatch(task.id, {
+          status: 'running',
+          startedAt: Date.now(),
+          statusReason: '已到达定时时间，正在启动浏览器并分配顶贴任务…',
+        });
+        if (!claimed) continue;
+        try {
+          const meta = await this.startRunWithMeta(
+            task.mode === 'page-bumper'
+              ? { profileIds: task.profileIds, pageIds: task.pageIds }
+              : { profileIds: task.profileIds, groupIds: task.groupIds, pageIds: task.pageIds },
+            'live',
+            task.mode,
+          );
+          await this.writeScheduledTaskPatch(task.id, {
+            status: 'running',
+            runId: meta.runId,
+            statusReason: `运行中（已分配 ${meta.admittedCount} 个账号）`,
+          });
+          void Promise.allSettled(meta.workerPromises).then(async () => {
+            const latest = (await this.readScheduledTasks(200)).find((r) => r.id === task.id);
+            if (!latest || latest.status !== 'running') return;
+            const anyCancelled = meta.admittedIds.every((pid) => this.cancelled.has(pid));
+            await this.writeScheduledTaskPatch(task.id, {
+              status: anyCancelled ? 'cancelled' : 'completed',
+              statusReason: anyCancelled
+                ? '用户手动停止'
+                : `已完成（共执行 ${meta.admittedCount} 个账号）`,
+              finishedAt: Date.now(),
+            });
+          });
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await this.writeScheduledTaskPatch(task.id, {
+            status: 'failed',
+            statusReason: reason,
+            finishedAt: Date.now(),
+          });
+        }
+      }
+    } finally {
+      this.scheduleTicking = false;
+    }
   }
   private profilesForMode(mode: BumperMode): Map<string, BumperProfileStat> {
     return mode === 'page-bumper' ? this.pageProfiles : this.profiles;
@@ -235,6 +360,7 @@ export class GroupBumperService {
     const dailyStats = (await this.repo.weeklyDailyCounts?.(undefined, 'group')) ?? [];
     const pageDailyStats = (await this.repo.weeklyDailyCounts?.(undefined, 'page')) ?? [];
     const pendingReviewOperations = (await this.repo.pendingReviewOperations?.()) ?? [];
+    const scheduledTasks = await this.readScheduledTasks(100);
     const profiles: Record<string, BumperProfileStat> = Object.fromEntries(
       Object.entries(groupCounts).map(([id, today]) => [
         id,
@@ -276,6 +402,7 @@ export class GroupBumperService {
       groupAvatarRefreshing: this.refreshingKind === 'groups',
       pageAvatarRefreshing: this.refreshingKind === 'pages',
       pendingReviewOperations,
+      scheduledTasks,
     };
   }
   async manage(action: string, input: unknown) {
@@ -453,6 +580,135 @@ export class GroupBumperService {
       case 'logs/delete':
         await this.repo.deleteLogs(input);
         break;
+      case 'tasks/create': {
+        const parsed = CreateBumperTaskInput.parse(input);
+        if (parsed.scheduledAt <= Date.now() + 2000) {
+          throw new ProductError('BUMPER_SCHEDULE_IN_PAST', '定时启动时间必须晚于当前时间', 400);
+        }
+        const allPages = await this.repo.targets('pages');
+        const pages = parsed.pageIds.flatMap((id) => allPages.filter((p) => p.id === id));
+        if (!pages.length) {
+          throw new ProductError('BUMPER_TARGETS_EMPTY', '请至少选择一个有效的目标主页/专页', 400);
+        }
+        let validGroupIds: string[] = [];
+        if (parsed.mode === 'group-bumper') {
+          const allGroups = await this.repo.targets('groups');
+          const groups = parsed.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
+          if (!groups.length) {
+            throw new ProductError('BUMPER_TARGETS_EMPTY', '请至少选择一个有效的小组', 400);
+          }
+          validGroupIds = groups.map((g) => g.id);
+        }
+        const checkSettings =
+          parsed.mode === 'page-bumper'
+            ? this.repo.pageSettings
+              ? await this.repo.pageSettings()
+              : (this.fallbackPageSettings ?? (await this.repo.settings()))
+            : await this.repo.settings();
+        if (checkSettings.likeProbability === 0 && checkSettings.commentProbability === 0) {
+          throw new ProductError('BUMPER_PROBABILITY_ZERO', '点赞概率和留言概率不能同时为 0%', 400);
+        }
+        if (checkSettings.commentProbability > 0 && checkSettings.likeProbability === 0) {
+          const commentScope: BumperScope = parsed.mode === 'page-bumper' ? 'page' : 'group';
+          const commentItems = this.repo.comments
+            ? await this.repo.comments(commentScope)
+            : (await this.summary()).comments;
+          if (commentItems.length === 0) {
+            throw new ProductError(
+              'BUMPER_COMMENTS_EMPTY',
+              '当前仅开启了留言（点赞概率 0%），但留言列表为空，请先添加留言话术',
+              400,
+            );
+          }
+        }
+        const cleanInput = {
+          mode: parsed.mode,
+          profileIds: [...new Set(parsed.profileIds)],
+          groupIds: validGroupIds,
+          pageIds: pages.map((p) => p.id),
+          scheduledAt: parsed.scheduledAt,
+        };
+        let created: BumperScheduledTask;
+        if (this.repo.createScheduledTask) {
+          created = await this.repo.createScheduledTask(cleanInput);
+        } else {
+          created = {
+            id: globalThis.crypto.randomUUID(),
+            ...cleanInput,
+            status: 'scheduled',
+            statusReason: '',
+            runId: null,
+            createdAt: Date.now(),
+            startedAt: null,
+            finishedAt: null,
+          };
+          this.fallbackScheduledTasks.set(created.id, created);
+        }
+        this.startScheduler();
+        const notice = `已创建定时顶贴任务（${new Date(created.scheduledAt).toLocaleString()} 自动启动）`;
+        if (created.mode === 'page-bumper') this.pageStatusText = notice;
+        else this.statusText = notice;
+        break;
+      }
+      case 'tasks/cancel': {
+        const { id } = z.object({ id: z.uuid() }).strict().parse(input);
+        const existing = (await this.readScheduledTasks(200)).find((t) => t.id === id);
+        if (!existing) {
+          throw new ProductError('BUMPER_TASK_NOT_FOUND', '定时任务不存在', 404);
+        }
+        if (existing.status === 'scheduled') {
+          await this.writeScheduledTaskPatch(id, {
+            status: 'cancelled',
+            statusReason: '用户手动取消',
+            finishedAt: Date.now(),
+          });
+          const rest = (await this.readScheduledTasks(200)).filter(
+            (t) => t.mode === existing.mode && t.status === 'scheduled',
+          );
+          if (rest.length === 0 && !this.hasActiveExecutionInMode(existing.mode)) {
+            if (existing.mode === 'page-bumper') this.pageStatusText = '请选择账号和目标专页';
+            else this.statusText = '请选择账号、小组和目标主页';
+          }
+        } else if (existing.status === 'running') {
+          await this.writeScheduledTaskPatch(id, {
+            status: 'cancelled',
+            statusReason: '用户手动停止',
+            finishedAt: Date.now(),
+          });
+          const runningIds = existing.profileIds.filter((pid) =>
+            existing.runId
+              ? this.profileRunIds.get(pid) === existing.runId
+              : this.isProfileRunningInMode(pid, existing.mode),
+          );
+          if (runningIds.length > 0) {
+            await this.stop(runningIds, existing.mode);
+          }
+        }
+        break;
+      }
+      case 'tasks/delete': {
+        const { id } = z.object({ id: z.uuid() }).strict().parse(input);
+        const existing = (await this.readScheduledTasks(200)).find((t) => t.id === id);
+        if (!existing) {
+          throw new ProductError('BUMPER_TASK_NOT_FOUND', '定时任务不存在', 404);
+        }
+        if (existing.status === 'running') {
+          throw new ProductError('BUMPER_TASK_RUNNING', '请先取消正在运行的定时任务再删除', 409);
+        }
+        if (this.repo.deleteScheduledTask) {
+          await this.repo.deleteScheduledTask(id);
+        } else {
+          this.fallbackScheduledTasks.delete(id);
+        }
+        const rest = (await this.readScheduledTasks(200)).filter(
+          (t) => t.mode === existing.mode && t.status === 'scheduled',
+        );
+        if (rest.length === 0 && !this.hasActiveExecutionInMode(existing.mode)) {
+          if (existing.mode === 'page-bumper') this.pageStatusText = '请选择账号和目标专页';
+          else this.statusText = '请选择账号、小组和目标主页';
+        }
+        break;
+      }
       default:
         throw new ProductError('BUMPER_ACTION_UNKNOWN', '未知的小组顶贴操作', 404);
     }
@@ -481,7 +737,21 @@ export class GroupBumperService {
     input: unknown,
     executionMode: 'live' | 'scan_only',
     mode: BumperMode = 'group-bumper',
-  ) {
+  ): Promise<BumperState> {
+    await this.startRunWithMeta(input, executionMode, mode);
+    return this.state();
+  }
+
+  private async startRunWithMeta(
+    input: unknown,
+    executionMode: 'live' | 'scan_only',
+    mode: BumperMode = 'group-bumper',
+  ): Promise<{
+    runId: string;
+    admittedIds: string[];
+    admittedCount: number;
+    workerPromises: Promise<void>[];
+  }> {
     this.assertAllowed();
     if (this.refreshing || this.runner.hasMetadataReads?.() === true)
       throw new ProductError('BUMPER_READING', '正在读取资料，请稍候', 409);
@@ -494,19 +764,107 @@ export class GroupBumperService {
     const otherLabel = otherMode === 'page-bumper' ? '专页顶贴' : '小组顶贴';
     const targetProfiles = this.profilesForMode(mode);
     const otherProfiles = this.profilesForMode(otherMode);
+    const setStatus = (text: string) => {
+      if (mode === 'page-bumper') this.pageStatusText = text;
+      else this.statusText = text;
+    };
+
+    const allGroups = await this.repo.targets('groups');
+    const groups =
+      mode === 'page-bumper'
+        ? [PAGE_BUMPER_SYNTHETIC_GROUP]
+        : req.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
+    const allPages = await this.repo.targets('pages');
+    const pages = req.pageIds.flatMap((id) => allPages.filter((p) => p.id === id));
+    if (!groups.length || !pages.length)
+      throw new ProductError(
+        'BUMPER_TARGETS_EMPTY',
+        mode === 'page-bumper' ? '请选择已保存的目标专页' : '请选择已保存的小组和目标主页',
+        400,
+      );
+    const settings =
+      mode === 'page-bumper'
+        ? this.repo.pageSettings
+          ? await this.repo.pageSettings()
+          : (this.fallbackPageSettings ?? (await this.repo.settings()))
+        : await this.repo.settings();
+    if (
+      executionMode === 'live' &&
+      settings.likeProbability === 0 &&
+      settings.commentProbability === 0
+    )
+      throw new ProductError('BUMPER_PROBABILITY_ZERO', '点赞概率和留言概率不能同时为 0%', 400);
+    if (
+      executionMode === 'live' &&
+      settings.commentProbability > 0 &&
+      settings.likeProbability === 0
+    ) {
+      const commentScope: BumperScope = mode === 'page-bumper' ? 'page' : 'group';
+      const commentItems = this.repo.comments
+        ? await this.repo.comments(commentScope)
+        : (await this.summary()).comments;
+      if (commentItems.length === 0)
+        throw new ProductError(
+          'BUMPER_COMMENTS_EMPTY',
+          '当前仅开启了留言（点赞概率 0%），但留言列表为空，请先添加留言话术',
+          400,
+        );
+    }
 
     const newlyAdmitting = requested.filter(
       (id) => !this.isProfileRunningInMode(id, mode) && !this.admitting.has(id),
     );
     for (const id of newlyAdmitting) {
+      this.cancelled.delete(id);
       this.admitting.add(id);
       this.admittingModes.set(id, mode);
     }
 
     let admittedIds: string[] = [];
+    const launchFailureReasons = new Map<string, string>();
     try {
+      if (this.profileLifecycle && newlyAdmitting.length > 0) {
+        const offlineCandidates: string[] = [];
+        for (const id of newlyAdmitting) {
+          if (this.runner.ready(id)) continue;
+          const busyElsewhere =
+            this.isProfileRunningInMode(id, otherMode) ||
+            (this.featureExecution ? await this.featureExecution.isProfileBusy(id, mode) : false) ||
+            (await this.runner.busy(id));
+          if (!busyElsewhere) offlineCandidates.push(id);
+        }
+        if (offlineCandidates.length > 0) {
+          setStatus(`正在自动启动 ${offlineCandidates.length} 个离线浏览器并同步插件…`);
+          for (const id of offlineCandidates) {
+            targetProfiles.set(id, {
+              today: 0,
+              session: 0,
+              status: '正在启动浏览器…',
+              running: true,
+            });
+          }
+          const launchRes = await this.profileLifecycle.ensureProfilesOnline(offlineCandidates);
+          for (const f of launchRes.failed) {
+            launchFailureReasons.set(f.profileId, `跳过：${f.reason}`);
+          }
+        }
+      }
+
+      const activeRequested = requested.filter(
+        (id) => !newlyAdmitting.includes(id) || !this.cancelled.has(id),
+      );
+      if (activeRequested.length === 0) {
+        for (const id of newlyAdmitting) {
+          if (this.cancelled.has(id)) {
+            targetProfiles.set(id, { today: 0, session: 0, status: '已停止', running: false });
+          }
+        }
+        setStatus('已停止');
+        return { runId: '', admittedIds: [], admittedCount: 0, workerPromises: [] };
+      }
+
       const admission = await admitProfilesForStart({
-        requestedProfileIds: requested,
+        requestedProfileIds: activeRequested,
         currentModuleId: mode,
         isAlreadyRunningInCurrentModule: (id) =>
           this.isProfileRunningInMode(id, mode) ||
@@ -544,51 +902,9 @@ export class GroupBumperService {
         targetProfiles.set(skipped.profileId, {
           today: 0,
           session: 0,
-          status: skipped.reason,
+          status: launchFailureReasons.get(skipped.profileId) ?? skipped.reason,
           running: false,
         });
-      }
-
-      const allGroups = await this.repo.targets('groups');
-      const groups =
-        mode === 'page-bumper'
-          ? [PAGE_BUMPER_SYNTHETIC_GROUP]
-          : req.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
-      const allPages = await this.repo.targets('pages');
-      const pages = req.pageIds.flatMap((id) => allPages.filter((p) => p.id === id));
-      if (!groups.length || !pages.length)
-        throw new ProductError(
-          'BUMPER_TARGETS_EMPTY',
-          mode === 'page-bumper' ? '请选择已保存的目标专页' : '请选择已保存的小组和目标主页',
-          400,
-        );
-      const settings =
-        mode === 'page-bumper'
-          ? this.repo.pageSettings
-            ? await this.repo.pageSettings()
-            : (this.fallbackPageSettings ?? (await this.repo.settings()))
-          : await this.repo.settings();
-      if (
-        executionMode === 'live' &&
-        settings.likeProbability === 0 &&
-        settings.commentProbability === 0
-      )
-        throw new ProductError('BUMPER_PROBABILITY_ZERO', '点赞概率和留言概率不能同时为 0%', 400);
-      if (
-        executionMode === 'live' &&
-        settings.commentProbability > 0 &&
-        settings.likeProbability === 0
-      ) {
-        const commentScope: BumperScope = mode === 'page-bumper' ? 'page' : 'group';
-        const commentItems = this.repo.comments
-          ? await this.repo.comments(commentScope)
-          : (await this.summary()).comments;
-        if (commentItems.length === 0)
-          throw new ProductError(
-            'BUMPER_COMMENTS_EMPTY',
-            '当前仅开启了留言（点赞概率 0%），但留言列表为空，请先添加留言话术',
-            400,
-          );
       }
 
       if (admission.admittedProfileIds.length === 0) {
@@ -601,17 +917,16 @@ export class GroupBumperService {
         }
         const firstReason =
           admission.skippedBusy[0]?.reason ??
-          admission.skippedOffline[0]?.reason ??
+          (admission.skippedOffline[0]
+            ? (launchFailureReasons.get(admission.skippedOffline[0].profileId) ??
+              admission.skippedOffline[0].reason)
+            : undefined) ??
           '所选浏览器正在运行顶贴任务';
         throw new ProductError('BUMPER_NO_ELIGIBLE_PROFILES', firstReason, 409);
       }
 
       admittedIds = admission.admittedProfileIds;
       const runId = globalThis.crypto.randomUUID();
-      const setStatus = (text: string) => {
-        if (mode === 'page-bumper') this.pageStatusText = text;
-        else this.statusText = text;
-      };
       for (const id of admittedIds) {
         this.cancelled.delete(id);
         targetProfiles.delete(id);
@@ -628,6 +943,7 @@ export class GroupBumperService {
       const pageQueues = buildStaggeredBumperQueues(eligibleIds, pages);
       let stagger = 0;
       let launched = 0;
+      const workerPromises: Promise<void>[] = [];
       for (const id of eligibleIds) {
         this.assertAllowed();
         if (this.cancelled.has(id)) continue;
@@ -648,6 +964,7 @@ export class GroupBumperService {
           mode,
         );
         this.workers.set(id, work);
+        workerPromises.push(work);
         void work.finally(() => {
           if (this.workers.get(id) === work) this.workers.delete(id);
           if (!this.hasActiveExecutionInMode(mode)) setStatus('本轮已结束');
@@ -661,6 +978,12 @@ export class GroupBumperService {
             ? `运行中 · ${runningCount} 个账号（本次追加无可运行的空闲账号）`
             : '没有可运行的空闲账号',
       );
+      return {
+        runId,
+        admittedIds: eligibleIds,
+        admittedCount: launched,
+        workerPromises,
+      };
     } finally {
       for (const id of newlyAdmitting) {
         this.admitting.delete(id);
@@ -668,7 +991,6 @@ export class GroupBumperService {
       }
       for (const id of admittedIds) this.starting.delete(id);
     }
-    return this.state();
   }
   private async acquireSlot(
     id: string,

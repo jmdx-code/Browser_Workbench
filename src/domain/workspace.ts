@@ -45,6 +45,12 @@ export interface WorkspaceRepository {
     profileId: string,
     update: import('../shared/account-state-policy.js').AccountCacheUpdateInput,
   ): Awaitable<void>;
+  profileLaunchBindings?(): Awaitable<
+    import('../shared/profile-lifecycle.js').ProfileLaunchBinding[]
+  >;
+  upsertProfileLaunchBindings?(
+    bindings: readonly import('../shared/profile-lifecycle.js').ProfileLaunchBinding[],
+  ): Awaitable<void>;
   combinations(): Awaitable<SavedCombination[]>;
   createCombination(value: Combination): Awaitable<SavedCombination>;
   createDraft(value: Combination): Awaitable<SavedCombination>;

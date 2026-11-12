@@ -47,7 +47,7 @@ export interface GroupInvitationState {
 export function projectGroupInvitationState(selector = inviteDialogSelector): GroupInvitationState {
   document
     .querySelectorAll(
-      '[data-wb-recipient-id],[data-wb-group-send-btn],[data-wb-group-close-btn],[data-wb-group-invite-menuitem]',
+      '[data-wb-recipient-id],[data-wb-group-send-btn],[data-wb-group-close-btn],[data-wb-group-invite-menuitem],[data-wb-intervention-dismiss-btn]',
     )
     .forEach((el) => {
       for (const attribute of [
@@ -55,6 +55,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
         'data-wb-group-send-btn',
         'data-wb-group-close-btn',
         'data-wb-group-invite-menuitem',
+        'data-wb-intervention-dismiss-btn',
       ])
         el.removeAttribute(attribute);
     });
@@ -299,40 +300,89 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       .find((b) =>
         b.frames.some((f) => f.name.includes('FDSButton.react') && f.props.type === 'secondary'),
       );
-  const verificationRequired = dialogs
-    .filter(visible)
-    .some(
-      (d) =>
-        chain(d).some(
-          (f) =>
-            f.name.includes('GroupsCometFeatureInterventionDialog') ||
-            f.props.testid === 'feature-intervention-ok-button' ||
-            (record(f.props.footer) &&
-              record(f.props.footer.props) &&
-              record(f.props.footer.props.primary) &&
-              f.props.footer.props.primary.testid === 'feature-intervention-ok-button'),
-        ) ||
+  const interventionDialogs = dialogs.filter(
+    (d) =>
+      visible(d) &&
+      (chain(d).some(
+        (f) =>
+          /GroupsCometFeatureInterventionDialog|SentryBlockDialog|CometErrorDialog/.test(f.name) ||
+          f.props.testid === 'feature-intervention-ok-button' ||
+          (record(f.props.footer) &&
+            record(f.props.footer.props) &&
+            record(f.props.footer.props.primary) &&
+            f.props.footer.props.primary.testid === 'feature-intervention-ok-button'),
+      ) ||
         Array.from(d.querySelectorAll('button,[role="button"],h1,h2,[role="heading"]')).some((el) =>
           chain(el, 32).some(
             (f) =>
+              /GroupsCometFeatureInterventionDialog|SentryBlockDialog|CometErrorDialog/.test(
+                f.name,
+              ) ||
               f.props.testid === 'feature-intervention-ok-button' ||
               (record(f.props.footer) &&
                 record(f.props.footer.props) &&
                 record(f.props.footer.props.primary) &&
                 f.props.footer.props.primary.testid === 'feature-intervention-ok-button'),
           ),
-        ),
+        )),
+  );
+  const verificationRequired = interventionDialogs.length > 0;
+  for (const d of interventionDialogs) {
+    const btns = Array.from(d.querySelectorAll('[role="button"],button')).filter(
+      (el) => visible(el) && !el.matches?.('a[href]') && !el.closest?.('a[href]'),
     );
+    const dismissBtn =
+      btns.find((el) => chain(el, 24).some((f) => f.name.includes('FDSCircleButton'))) ??
+      btns.find((el) =>
+        chain(el, 24).some(
+          (f) =>
+            f.props.testid === 'feature-intervention-ok-button' ||
+            (f.name.includes('FDSButton.react') && f.props.type === 'primary'),
+        ),
+      ) ??
+      btns.at(-1);
+    dismissBtn?.setAttribute?.('data-wb-intervention-dismiss-btn', '1');
+  }
   const pageButtons = Array.from(document.querySelectorAll('[role="button"],button'));
-  document
-    .querySelectorAll('[data-wb-group-invite-btn]')
-    .forEach((el) => el.removeAttribute('data-wb-group-invite-btn'));
-  const invite = pageButtons.findIndex(
+  document.querySelectorAll('[data-wb-group-invite-btn],[data-wb-group-join-btn]').forEach((el) => {
+    el.removeAttribute('data-wb-group-invite-btn');
+    el.removeAttribute('data-wb-group-join-btn');
+  });
+  const inviteCandidates = pageButtons.filter(
     (el) =>
       visible(el) &&
+      !el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav') &&
       chain(el, 24).some((f) => f.name.includes('GroupsCometHeaderInviteMemberAddButton')),
   );
-  if (invite >= 0) pageButtons[invite]?.setAttribute('data-wb-group-invite-btn', '1');
+  const inviteBtn =
+    inviteCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? inviteCandidates[0];
+  const invite = inviteBtn ? pageButtons.indexOf(inviteBtn) : -1;
+  if (inviteBtn) inviteBtn.setAttribute('data-wb-group-invite-btn', '1');
+  const joinCandidates = pageButtons.filter((el) => {
+    if (
+      !visible(el) ||
+      el.getAttribute('aria-disabled') === 'true' ||
+      el.hasAttribute?.('disabled') ||
+      el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav')
+    )
+      return false;
+    return chain(el, 48).some((f) => {
+      if (!f.name.includes('GroupsCometJoinForumButton')) return false;
+      if (!groupId) return true;
+      const marker = typeof f.props.testid === 'string' ? f.props.testid : '';
+      const matchedId = /^group-can-join-(\d+)$/.exec(marker)?.[1];
+      const actionObj = record(f.props.action) ? f.props.action : null;
+      const actionRef = typeof actionObj?.__id === 'string' ? actionObj.__id : '';
+      const actionGroup = /^client:(\d+):join_action\(/.exec(actionRef)?.[1];
+      if (matchedId || actionGroup) {
+        return matchedId === groupId || actionGroup === groupId;
+      }
+      return true;
+    });
+  });
+  const joinBtn =
+    joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
+  if (joinBtn) joinBtn.setAttribute('data-wb-group-join-btn', '1');
   const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
   const menuItems = menus.map((el, index) => ({
     index,
@@ -420,6 +470,44 @@ export async function readGroupInvitationState(
   );
 }
 
+export async function dismissFeatureInterventionDialogIfPresent(
+  page: Page,
+  guard: () => Awaitable<void> = () => {},
+): Promise<boolean> {
+  if (typeof page?.evaluate !== 'function') return false;
+  let state = await readGroupInvitationState(page, guard);
+  if (!state.verificationRequired) return false;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await guard();
+    const clicked = await page
+      .evaluate(() => {
+        const btn = document.querySelector<HTMLElement>('[data-wb-intervention-dismiss-btn="1"]');
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        document.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key: 'Escape',
+            code: 'Escape',
+            keyCode: 27,
+            bubbles: true,
+          }),
+        );
+        return false;
+      })
+      .catch(() => false);
+    if (!clicked) {
+      await page.keyboard?.press?.('Escape')?.catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 350));
+    await guard();
+    state = await readGroupInvitationState(page, guard);
+    if (!state.verificationRequired) return true;
+  }
+  return !state.verificationRequired;
+}
+
 const InvitationProof = z
   .object({
     friendIds: z.array(z.string()).min(1),
@@ -445,6 +533,14 @@ export function groupInvitationEffect(
     return false;
   const url = new URL(state.url);
   if (url.origin !== 'https://www.facebook.com') return false;
+  if (
+    label === 'join-group' &&
+    Boolean(value) &&
+    typeof value === 'object' &&
+    (value as { unjoinableIntervention?: boolean }).unjoinableIntervention === true
+  ) {
+    return true;
+  }
   const atGroup = url.pathname.split('/')[1] === 'groups' && url.pathname.split('/')[2] === groupId;
   if (!atGroup) return false;
   if (label === 'enter-group') return true;
@@ -454,7 +550,8 @@ export function groupInvitationEffect(
       state.dialogCount > 0 ||
       (Boolean(value) &&
         typeof value === 'object' &&
-        (value as { joinedOrRequested?: boolean }).joinedOrRequested === true)
+        ((value as { joinedOrRequested?: boolean }).joinedOrRequested === true ||
+          (value as { unjoinableIntervention?: boolean }).unjoinableIntervention === true))
     );
   if (label === 'close-join-popup') return state.dialogCount === 0;
   if (label === 'open-invite-modal') return state.dialog || state.menu;

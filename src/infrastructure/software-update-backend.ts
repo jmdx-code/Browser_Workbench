@@ -20,6 +20,8 @@ import {
   safeRuntimeEntry,
 } from './runtime-installation.js';
 import { syncProductExtensionDirectory, productExtensionDirectory } from './paths.js';
+import { syncProductAiWorkspaceDirectory } from './ai-workspace.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
 
 export async function extractRuntimeArchive(archive: string, destination: string) {
   const zip = await new Promise<ZipFile>((resolve, reject) =>
@@ -97,6 +99,7 @@ export class SoftwareUpdateBackend {
       extensionVersion: string;
       runtimeDir?: string;
       extensionDir?: string;
+      aiWorkspaceDir?: string;
       apiBase?: string;
       fetch?: typeof fetch;
     },
@@ -258,6 +261,25 @@ export class SoftwareUpdateBackend {
       await rename(extracted, runtime);
       installed = true;
       await syncProductExtensionDirectory(path.join(runtime, 'extension-build'), ext);
+      if (this.options.aiWorkspaceDir) {
+        await syncProductAiWorkspaceDirectory({
+          rootDir: runtime,
+          softwareVersion: release.softwareVersion,
+          targetDir: this.options.aiWorkspaceDir,
+        });
+      } else {
+        await syncProductAiWorkspaceDirectory({
+          rootDir: runtime,
+          softwareVersion: release.softwareVersion,
+        }).catch((err: unknown) => {
+          devDiag.record({
+            level: 'WARN',
+            category: 'SYSTEM',
+            event: 'AI_WORKSPACE_SYNC_FAILED',
+            reason: err instanceof Error ? err.message : 'SYNC_FAILED',
+          });
+        });
+      }
     } catch (error) {
       if (installed) await rm(runtime, { recursive: true, force: true });
       if (moved) await rename(previous, runtime);

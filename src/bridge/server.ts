@@ -46,6 +46,7 @@ export interface BridgeServerOptions {
     tasks: WatchTasks;
   }) => KernelBridgeHooks;
   boundServer?: { server: http.Server; bootstrapHandler: http.RequestListener };
+  mcpHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
   appRoutes?: (context: {
     core: Core;
     store: BridgeStorePort;
@@ -56,6 +57,49 @@ export interface BridgeServerOptions {
     pathname: string,
     input?: unknown,
   ) => Promise<boolean>;
+}
+export function observeBridgeIncomingMessage(
+  raw: unknown,
+  parsed: unknown,
+  profileId?: string,
+): { utf8Bytes: number; observed: boolean } {
+  const utf8Bytes = Buffer.isBuffer(raw)
+    ? raw.byteLength
+    : raw instanceof ArrayBuffer
+      ? raw.byteLength
+      : Array.isArray(raw)
+        ? raw.reduce((acc, buf) => acc + (Buffer.isBuffer(buf) ? buf.byteLength : 0), 0)
+        : Buffer.byteLength(String(raw ?? ''), 'utf8');
+  if (utf8Bytes > 2 * 1024 * 1024 && typeof parsed === 'object' && parsed !== null) {
+    const record = parsed as Record<string, unknown>;
+    const ev =
+      typeof record.event === 'object' && record.event !== null
+        ? (record.event as Record<string, unknown>)
+        : undefined;
+    devDiag.record({
+      level: 'WARN',
+      category: 'BRIDGE_WS',
+      event: 'BRIDGE_LARGE_MESSAGE_OBSERVED',
+      profileId,
+      reason: 'LARGE_INCOMING_MESSAGE',
+      data: {
+        bytes: utf8Bytes,
+        type: typeof record.type === 'string' ? record.type : 'UNKNOWN',
+        method:
+          typeof record.method === 'string'
+            ? record.method
+            : typeof ev?.method === 'string'
+              ? ev.method
+              : undefined,
+        commandId: typeof record.commandId === 'string' ? record.commandId : undefined,
+        requestId: typeof record.requestId === 'string' ? record.requestId : undefined,
+        entriesCount: Array.isArray(record.entries) ? record.entries.length : undefined,
+        topKeys: Object.keys(record).slice(0, 12),
+      },
+    });
+    return { utf8Bytes, observed: true };
+  }
+  return { utf8Bytes, observed: false };
 }
 export async function startBridgeServer(options: BridgeServerOptions) {
   const root = options.root;
@@ -178,6 +222,8 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       if (![HOST, 'localhost:' + port].includes(req.headers.host ?? ''))
         return json(res, 403, { error: 'HOST_REJECTED' });
       const u = new URL(req.url ?? '/', ORIGIN);
+      if (u.pathname === '/mcp' && options.mcpHandler && (await options.mcpHandler(req, res)))
+        return;
       res.setHeader(
         'Content-Security-Policy',
         "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob: https://*.fbcdn.net https://*.fbsbx.com; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
@@ -397,7 +443,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       json(res, 400, { error: e instanceof Error ? e.message : 'ERROR' });
     }
   });
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin ?? '';
     if (
@@ -472,6 +518,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
     ws.on('message', async (raw) => {
       try {
         const m = JSON.parse(raw.toString());
+        observeBridgeIncomingMessage(raw, m, peer?.profileId ?? claimedProfileId);
         if (peer && m && typeof m === 'object' && typeof m.type === 'string') lastPong = Date.now();
         if (!peer) {
           if (authenticationPending) throw Error('AUTH_IN_PROGRESS');
@@ -755,6 +802,18 @@ export async function startBridgeServer(options: BridgeServerOptions) {
             profileId: peer.profileId,
             data: { requestId, epoch: peer.epoch },
           });
+        } else if (m.type === 'BROWSER_WINDOWS_CLOSED') {
+          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
+          const reply = z
+            .object({
+              requestId: z.string().uuid(),
+              ok: z.boolean(),
+              closedCount: z.number().int().nonnegative().optional(),
+              remainingCount: z.number().int().nonnegative().optional(),
+              error: z.string().max(240).optional(),
+            })
+            .parse(m);
+          core.browserWindowsClosed(peer, reply.requestId, reply);
         } else if (m.type === 'PONG') {
           if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
           if (m.windowCount !== undefined)

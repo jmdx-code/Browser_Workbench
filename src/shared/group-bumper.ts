@@ -197,6 +197,40 @@ export const StartPageBumper = z
     pageIds: z.array(GroupIdString).min(1).max(500),
   })
   .strict();
+
+export const BumperTaskStatus = z.enum([
+  'scheduled',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+]);
+export type BumperTaskStatus = z.infer<typeof BumperTaskStatus>;
+
+export const BumperScheduledTask = z.strictObject({
+  id: Id,
+  mode: z.enum(['group-bumper', 'page-bumper']),
+  profileIds: z.array(Id).min(1).max(500),
+  groupIds: z.array(GroupIdString).max(500),
+  pageIds: z.array(GroupIdString).min(1).max(500),
+  scheduledAt: z.number().int().positive(),
+  status: BumperTaskStatus,
+  statusReason: z.string().max(400).default(''),
+  runId: z.string().max(120).nullable().default(null),
+  createdAt: z.number().int().nonnegative(),
+  startedAt: z.number().int().nonnegative().nullable().default(null),
+  finishedAt: z.number().int().nonnegative().nullable().default(null),
+});
+export type BumperScheduledTask = z.infer<typeof BumperScheduledTask>;
+
+export const CreateBumperTaskInput = z.strictObject({
+  mode: z.enum(['group-bumper', 'page-bumper']).default('group-bumper'),
+  profileIds: z.array(Id).min(1).max(500),
+  groupIds: z.array(GroupIdString).max(500).default([]),
+  pageIds: z.array(GroupIdString).min(1).max(500),
+  scheduledAt: z.number().int().positive(),
+});
+export type CreateBumperTaskInput = z.infer<typeof CreateBumperTaskInput>;
 export interface BumperProfileStat {
   today: number;
   session: number;
@@ -241,6 +275,7 @@ export interface BumperState {
   groupAvatarRefreshing?: boolean;
   pageAvatarRefreshing?: boolean;
   pendingReviewOperations?: BumperPendingOperation[];
+  scheduledTasks?: BumperScheduledTask[];
 }
 
 export function extractBumperPageId(raw: string): string {

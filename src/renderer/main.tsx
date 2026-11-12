@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { bluestacksDisplayTitle } from '../shared/bluestacks.js';
 import type { Profile, SavedCombination } from '../shared/contracts.js';
 import type { DesktopBridge } from '../shared/desktop.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
@@ -12,6 +13,7 @@ import { FeatureNavRail } from './feature-nav-rail.js';
 import { GroupBumperPage } from './group-bumper-page.js';
 import { GroupInviterPage } from './group-inviter-page.js';
 import { GroupPosterPage } from './group-poster-page.js';
+import { BluestacksSidebar } from './modules/bluestacks-sidebar.js';
 import { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
 import { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
 import type { ResourceEditorHandle } from './resource-table-editor.js';
@@ -40,7 +42,8 @@ type View =
   | { kind: 'group-inviter' }
   | { kind: 'group-bumper' }
   | { kind: 'page-bumper' }
-  | { kind: 'group-poster' };
+  | { kind: 'group-poster' }
+  | { kind: 'bluestacks-group-bumper' };
 type DetailTarget = { profileId: string; planId: string; round?: number };
 function App() {
   const { workspace, error, refresh } = useWorkspace();
@@ -48,6 +51,7 @@ function App() {
   const tasks = useTasks();
   const cardColors = useCardColors();
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectedBluestacks, setSelectedBluestacks] = useState<Set<string>>(new Set());
   const [view, setView] = useState<View>({ kind: 'home' });
   const [recordFilter, setRecordFilter] = useState<string | null>(null);
   const [detail, setDetail] = useState<DetailTarget | null>(null);
@@ -73,6 +77,8 @@ function App() {
     setGroupInviter,
     groupPoster,
     setGroupPoster,
+    bluestacks,
+    setBluestacks,
   } = mods;
   const resourceGeneration = useRef(0);
   async function applyUpdate() {
@@ -163,8 +169,38 @@ function App() {
       groupInviter?.running ||
       groupBumper?.running ||
       groupBumper?.pageBumperRunning ||
-      groupPoster?.running,
+      groupPoster?.running ||
+      bluestacks?.running,
     );
+  const mergedProfiles = useMemo<Profile[]>(() => {
+    const base = workspace?.profiles ?? [];
+    const bsList = bluestacks?.instances ?? [];
+    if (!bsList.length) return base;
+    const seen = new Set(base.map((p) => p.id));
+    const extras: Profile[] = bsList
+      .filter((inst) => !seen.has(inst.id))
+      .map((inst, idx) => ({
+        id: inst.id,
+        alias: `[蓝蝶] ${bluestacksDisplayTitle(inst)}`,
+        browserName: `[蓝蝶] ${bluestacksDisplayTitle(inst)}`,
+        groupId: null,
+        order: 10000 + idx,
+        online: inst.online,
+        phase: inst.online ? 'READY' : 'OFFLINE',
+        synced: inst.online,
+        unresolved: 0,
+        extensionVersion: null,
+        capabilities: [],
+        presentation: null,
+        account: {
+          state: inst.accountState === 'missing-app' ? 'unknown' : inst.accountState,
+          id: inst.accountId || null,
+          name: inst.accountName || null,
+          avatar: inst.avatarUrl,
+        },
+      }));
+    return [...base, ...extras];
+  }, [workspace?.profiles, bluestacks?.instances]);
   const projection = buildWorkbenchProjection({
     viewKind: view.kind,
     profiles: workspace?.profiles,
@@ -173,6 +209,7 @@ function App() {
     groupBumper,
     groupInviter,
     groupPoster,
+    bluestacks,
     attentionCount,
     message,
   });
@@ -213,53 +250,63 @@ function App() {
               void navigate({ kind: mod === 'active-accounts' ? 'home' : mod })
             }
           />
-          <Sidebar
-            tasks={tasks.runtime}
-            onTaskCommand={commandPlans}
-            workspace={workspace}
-            selected={selected}
-            onSelect={setSelected}
-            nameAction={view.kind === 'records' ? 'filter' : 'select'}
-            filteredId={view.kind === 'records' ? recordFilter : null}
-            onInspect={(id) => setRecordFilter((current) => (current === id ? null : id))}
-            mutate={mutate}
-            inspections={inspections.rows}
-            inspectionAvailable={inspections.available}
-            inspectionError={inspections.error}
-            busy={busy}
-            onCheck={checkProfiles}
-            onShow={(id) =>
-              void mutate(() => api.showBrowser(id).then(() => '已显示对应浏览器页面'))
-            }
-            activities={projection.projectedActivities}
-            selectionControls={projection.projectedControls}
-            bumperCounts={
-              view.kind === 'group-bumper'
-                ? groupBumper?.profileCounts
-                : view.kind === 'page-bumper'
-                  ? (groupBumper?.pageBumperProfileCounts ?? {})
-                  : undefined
-            }
-            bumperRunningIds={projection.bumperRunningIds}
-            groupInviterCounts={
-              view.kind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null
-            }
-            groupInviterRunningIds={projection.inviterRunningIds}
-            onStopModules={(ids) =>
-              void mutate(async () => {
-                const bIds = ids.filter((id) => projection.bumperRunningIds.includes(id));
-                if (bIds.length)
-                  setGroupBumper(await api.bumperAction('stop', { profileIds: bIds }));
-                const pIds = ids.filter((id) => projection.posterRunningIds.includes(id));
-                if (pIds.length)
-                  setGroupPoster(await api.posterAction('stop', { profileIds: pIds }));
-                const inviteIds = ids.filter((id) => projection.inviterRunningIds.includes(id));
-                if (inviteIds.length)
-                  setGroupInviter(await api.stopGroupInviterProfiles({ profileIds: inviteIds }));
-                return `已发送停止 ${ids.length} 个浏览器的小组任务指令`;
-              })
-            }
-          />
+          {view.kind === 'bluestacks-group-bumper' ? (
+            <BluestacksSidebar
+              state={bluestacks}
+              onChange={setBluestacks}
+              selected={selectedBluestacks}
+              onSelect={setSelectedBluestacks}
+              onError={setMessage}
+            />
+          ) : (
+            <Sidebar
+              tasks={tasks.runtime}
+              onTaskCommand={commandPlans}
+              workspace={workspace}
+              selected={selected}
+              onSelect={setSelected}
+              nameAction={view.kind === 'records' ? 'filter' : 'select'}
+              filteredId={view.kind === 'records' ? recordFilter : null}
+              onInspect={(id) => setRecordFilter((current) => (current === id ? null : id))}
+              mutate={mutate}
+              inspections={inspections.rows}
+              inspectionAvailable={inspections.available}
+              inspectionError={inspections.error}
+              busy={busy}
+              onCheck={checkProfiles}
+              onShow={(id) =>
+                void mutate(() => api.showBrowser(id).then(() => '已显示对应浏览器页面'))
+              }
+              activities={projection.projectedActivities}
+              selectionControls={projection.projectedControls}
+              bumperCounts={
+                view.kind === 'group-bumper'
+                  ? groupBumper?.profileCounts
+                  : view.kind === 'page-bumper'
+                    ? (groupBumper?.pageBumperProfileCounts ?? {})
+                    : undefined
+              }
+              bumperRunningIds={projection.bumperRunningIds}
+              groupInviterCounts={
+                view.kind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null
+              }
+              groupInviterRunningIds={projection.inviterRunningIds}
+              onStopModules={(ids) =>
+                void mutate(async () => {
+                  const bIds = ids.filter((id) => projection.bumperRunningIds.includes(id));
+                  if (bIds.length)
+                    setGroupBumper(await api.bumperAction('stop', { profileIds: bIds }));
+                  const pIds = ids.filter((id) => projection.posterRunningIds.includes(id));
+                  if (pIds.length)
+                    setGroupPoster(await api.posterAction('stop', { profileIds: pIds }));
+                  const inviteIds = ids.filter((id) => projection.inviterRunningIds.includes(id));
+                  if (inviteIds.length)
+                    setGroupInviter(await api.stopGroupInviterProfiles({ profileIds: inviteIds }));
+                  return `已发送停止 ${ids.length} 个浏览器的小组任务指令`;
+                })
+              }
+            />
+          )}
           <SidebarResizer />
           <main className={'workspace view-' + view.kind}>
             {error && (
@@ -296,7 +343,7 @@ function App() {
             {view.kind === 'records' && (
               <TaskRecordsPage
                 runtime={tasks.runtime}
-                profiles={workspace.profiles}
+                profiles={mergedProfiles}
                 inspections={inspections.rows}
                 loaded={!!tasks.runtime}
                 filterId={recordFilter}
@@ -309,13 +356,17 @@ function App() {
                 onNotify={setMessage}
               />
             )}
-            {(view.kind === 'group-bumper' || view.kind === 'page-bumper') && (
+            {(view.kind === 'group-bumper' ||
+              view.kind === 'page-bumper' ||
+              view.kind === 'bluestacks-group-bumper') && (
               <GroupBumperPage
                 key={view.kind}
                 mode={view.kind}
                 state={groupBumper}
-                selected={selected}
-                profiles={workspace.profiles}
+                selected={view.kind === 'bluestacks-group-bumper' ? selectedBluestacks : selected}
+                profiles={mergedProfiles}
+                bluestacksState={bluestacks}
+                onBluestacksState={setBluestacks}
                 onState={(next) => {
                   setGroupBumper(next);
                   void mods.refreshGroupInviter();
@@ -329,6 +380,7 @@ function App() {
                 state={groupPoster}
                 selected={selected}
                 profiles={workspace.profiles}
+                profileGroups={workspace.groups}
                 onState={(next) => {
                   setGroupPoster(next);
                   void mods.refreshGroupInviter();

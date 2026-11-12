@@ -354,7 +354,8 @@ export async function handleSystemMaintenanceRoutes(
     case '/api/workspace/update/config':
     case '/api/workspace/update/apply':
     case '/api/workspace/extensions/reload':
-    case '/api/workspace/extensions/open-dir': {
+    case '/api/workspace/extensions/open-dir':
+    case '/api/workspace/ai-workspace/open-dir': {
       cleanup?.assertNotResetting();
       if (!softwareUpdate)
         throw new ProductError('UPDATER_UNAVAILABLE', '当前服务未启用更新器', 409);
@@ -368,7 +369,9 @@ export async function handleSystemMaintenanceRoutes(
               ? await softwareUpdate.apply()
               : route.endsWith('/reload')
                 ? await softwareUpdate.reload(ExtensionReloadRequest.parse(input ?? {}).profileIds)
-                : await softwareUpdate.openDirectory();
+                : route.endsWith('/ai-workspace/open-dir')
+                  ? await softwareUpdate.openAiWorkspace()
+                  : await softwareUpdate.openDirectory();
       json(res, 200, result);
       return true;
     }

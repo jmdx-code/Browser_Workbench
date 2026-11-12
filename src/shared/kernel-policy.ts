@@ -1,9 +1,10 @@
 import { KernelJsonObject, type KernelJsonObject as Params } from './kernel-protocol.js';
-export type KernelAccess = 'fixture' | 'facebook-readonly' | 'facebook-task';
+export type KernelAccess = 'fixture' | 'facebook-readonly' | 'facebook-task' | 'agent-browser';
 
 // The SDK is private to trusted controller code. Runtime commands are not a read-only API.
 // All explicit UI mutations need an original, currently active operation in the native journal.
 export function kernelRequiresOperation(method: string, access: KernelAccess): boolean {
+  if (access === 'agent-browser') return false;
   return (
     /^(Input\.|DOM\.setFileInputFiles$)/.test(method) ||
     (access === 'facebook-task' &&
@@ -25,7 +26,20 @@ export function kernelFacebookReadURL(value: string): boolean {
     return false;
   }
 }
+export function kernelAgentBrowserURL(value: string): boolean {
+  if (value === 'about:blank') return true;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+    if (url.username || url.password) return false;
+    if (['http://127.0.0.1:18767', 'http://localhost:18767'].includes(url.origin)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 export function kernelAccessURL(value: string, access: KernelAccess): boolean {
+  if (access === 'agent-browser') return kernelAgentBrowserURL(value);
   return access === 'fixture' ? kernelFixtureURL(value) : kernelFacebookReadURL(value);
 }
 
@@ -104,7 +118,11 @@ export function assertKernelSessionCommand(
     !['Page.enable', 'Page.getFrameTree', 'Target.getTargetInfo'].includes(method)
   )
     throw Error('KERNEL_READONLY_METHOD_REJECTED_' + method);
-  if (!sessionMethods.has(method)) throw Error('KERNEL_METHOD_REJECTED_' + method);
+  if (
+    !sessionMethods.has(method) &&
+    !(access === 'agent-browser' && method === 'Page.captureScreenshot')
+  )
+    throw Error('KERNEL_METHOD_REJECTED_' + method);
   const params = KernelJsonObject.parse(value);
   if (method === 'Target.setAutoAttach') {
     if (typeof params.autoAttach !== 'boolean' || params.flatten !== true)

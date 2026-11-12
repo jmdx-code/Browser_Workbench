@@ -90,6 +90,7 @@ export interface BumperSurface {
   ready: boolean;
   visible: boolean;
   restricted: boolean;
+  checkpointRestricted?: boolean;
   restrictionReason?: string;
   loading: boolean;
   groupEntryCSS: string | null;
@@ -100,6 +101,7 @@ export interface BumperSurface {
   postDialogs?: { postId: string; feedbackId: string | null; css: string }[];
   joinGroupCSS?: string | null;
   welcomeDismissCSS?: string | null;
+  joinRestrictionDismissCSS?: string | null;
   posts: BumperPost[];
 }
 
@@ -393,12 +395,13 @@ export function projectGroupBumper(input: {
   let groupEntryCSS: string | null = null;
   document
     .querySelectorAll(
-      '[data-wb-bumper-group],[data-wb-bumper-welcome-dismiss],[data-wb-bumper-join]',
+      '[data-wb-bumper-group],[data-wb-bumper-welcome-dismiss],[data-wb-bumper-join],[data-wb-bumper-join-dismiss]',
     )
     .forEach((e) => {
       e.removeAttribute('data-wb-bumper-group');
       e.removeAttribute('data-wb-bumper-welcome-dismiss');
       e.removeAttribute('data-wb-bumper-join');
+      e.removeAttribute('data-wb-bumper-join-dismiss');
     });
   let joinGroupCSS: string | null = null;
   let groupJoinState: BumperSurface['groupJoinState'] = 'unknown';
@@ -1420,33 +1423,66 @@ export function projectGroupBumper(input: {
       if (restrictionReason) break;
     }
   }
-  const restricted =
-    !!restrictionReason ||
-    Array.from(
-      document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]'),
-    )
-      .filter(visible)
-      .some(
-        (d) =>
-          !!d.querySelector('[data-testid="feature-intervention-ok-button"]') ||
-          [d, ...Array.from(d.querySelectorAll('[role="button"],button'))].some((e) =>
-            chain(e).some(
-              (f) =>
-                /GroupsCometFeatureInterventionDialog|Checkpoint|CometErrorDialog|SentryBlockDialog/.test(
-                  f.name,
-                ) ||
-                JSON.stringify(f.props.testid ?? '').includes('feature-intervention-ok-button'),
-            ),
-          ),
+  const visibleDialogs = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '[role="dialog"],[role="alertdialog"],[aria-modal="true"]',
+    ),
+  ).filter(visible);
+  let checkpointRestricted = /^\/checkpoint(?:\/|\.php|$)/i.test(location.pathname);
+  let joinRestrictionDismissCSS: string | null = null;
+  const restrictedDialogs = visibleDialogs.filter((d) => {
+    const nodes = [d, ...Array.from(d.querySelectorAll('[role="button"],button'))];
+    let matched = !!d.querySelector('[data-testid="feature-intervention-ok-button"]');
+    for (const e of nodes) {
+      for (const f of chain(e)) {
+        if (/Checkpoint/.test(f.name)) {
+          checkpointRestricted = true;
+          matched = true;
+        } else if (
+          /GroupsCometFeatureInterventionDialog|CometErrorDialog|SentryBlockDialog/.test(f.name) ||
+          JSON.stringify(f.props.testid ?? '').includes('feature-intervention-ok-button')
+        ) {
+          matched = true;
+        }
+      }
+    }
+    return matched;
+  });
+  const restricted = !!restrictionReason || restrictedDialogs.length > 0;
+  if (!checkpointRestricted && !restrictionReason && restrictedDialogs.length > 0) {
+    const d = restrictedDialogs[0];
+    if (d) {
+      const btns = Array.from(d.querySelectorAll<HTMLElement>('[role="button"],button')).filter(
+        (el) =>
+          visible(el) &&
+          !el.matches('a[href]') &&
+          !el.closest('a[href]') &&
+          el.getAttribute('aria-disabled') !== 'true' &&
+          !el.hasAttribute('disabled'),
       );
+      const dismissBtn =
+        btns.find((el) => chain(el, 28).some((f) => /FDSCircleButton/.test(f.name))) ??
+        btns.find(
+          (el) =>
+            el.getAttribute('data-testid') === 'feature-intervention-ok-button' ||
+            chain(el, 28).some(
+              (f) =>
+                JSON.stringify(f.props.testid ?? '').includes('feature-intervention-ok-button') ||
+                (/FDSButton/.test(f.name) &&
+                  (f.props.type === 'primary' || f.props.type === 'secondary')),
+            ),
+        ) ??
+        btns.at(-1);
+      if (dismissBtn) {
+        dismissBtn.setAttribute('data-wb-bumper-join-dismiss', '1');
+        joinRestrictionDismissCSS = '[data-wb-bumper-join-dismiss="1"]';
+      }
+    }
+  }
   let welcomeDismissCSS: string | null = null;
   let blockingDialog = false;
   if (!restricted) {
-    for (const d of Array.from(
-      document.querySelectorAll<HTMLElement>(
-        '[role="dialog"],[role="alertdialog"],[aria-modal="true"]',
-      ),
-    ).filter(visible)) {
+    for (const d of visibleDialogs) {
       const rect = d.getBoundingClientRect(),
         vw = window.innerWidth || 1024,
         vh = window.innerHeight || 768;
@@ -1485,10 +1521,11 @@ export function projectGroupBumper(input: {
       if (questions || (fields && sameGroup && groupJoinState !== 'member'))
         groupJoinState = 'questions';
       blockingDialog = true;
-      if (fields || groupJoinState === 'questions') continue;
       const buttons = Array.from(d.querySelectorAll<HTMLElement>('[role="button"],button')).filter(
         (el) =>
           visible(el) &&
+          !el.matches('a[href]') &&
+          !el.closest('a[href]') &&
           el.getAttribute('aria-disabled') !== 'true' &&
           !el.hasAttribute('disabled'),
       );
@@ -1500,8 +1537,19 @@ export function projectGroupBumper(input: {
           (Math.abs(r.left - rect.left) <= 80 || Math.abs(rect.right - r.right) <= 80);
         return header && chain(el, 30).some((f) => /FDSCircleButton/.test(f.name));
       });
+      if (fields || groupJoinState === 'questions') {
+        const closeBtn = close[0];
+        if (!joinRestrictionDismissCSS && close.length === 1 && closeBtn) {
+          closeBtn.setAttribute('data-wb-bumper-join-dismiss', '1');
+          joinRestrictionDismissCSS = '[data-wb-bumper-join-dismiss="1"]';
+        }
+        continue;
+      }
       const primary = buttons.filter((el) =>
         chain(el, 25).some((f) => /FDSButton/.test(f.name) && f.props.type === 'primary'),
+      );
+      const secondary = buttons.filter((el) =>
+        chain(el, 25).some((f) => /FDSButton/.test(f.name) && f.props.type === 'secondary'),
       );
       const target =
         close.length === 1
@@ -1513,6 +1561,14 @@ export function projectGroupBumper(input: {
         target.setAttribute('data-wb-bumper-welcome-dismiss', '1');
         welcomeDismissCSS = '[data-wb-bumper-welcome-dismiss="1"]';
         break;
+      }
+      if (!joinRestrictionDismissCSS) {
+        const fallbackDismiss =
+          close[0] ?? (primary.length === 1 ? primary[0] : undefined) ?? secondary[0];
+        if (fallbackDismiss) {
+          fallbackDismiss.setAttribute('data-wb-bumper-join-dismiss', '1');
+          joinRestrictionDismissCSS = '[data-wb-bumper-join-dismiss="1"]';
+        }
       }
     }
   }
@@ -1589,6 +1645,7 @@ export function projectGroupBumper(input: {
       (posts.length > 0 || !!document.querySelector('main,[role="main"]')),
     visible: document.visibilityState === 'visible',
     restricted,
+    checkpointRestricted,
     ...(restrictionReason ? { restrictionReason } : {}),
     loading,
     groupEntryCSS,
@@ -1602,6 +1659,7 @@ export function projectGroupBumper(input: {
     })),
     joinGroupCSS,
     welcomeDismissCSS,
+    joinRestrictionDismissCSS,
     posts,
   };
 }

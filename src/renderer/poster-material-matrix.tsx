@@ -8,6 +8,7 @@ import {
   toMaterialDraft,
   type MaterialDraft,
 } from '../domain/poster-material-table.js';
+import { hasPosterMaterialContent } from '../shared/group-poster.js';
 import { mediaReference } from '../domain/resource-table.js';
 import { copyTextToClipboard } from './clipboard.js';
 import {
@@ -72,6 +73,7 @@ export function PosterMaterialMatrix({
   const [undo, setUndo] = useState<MaterialDraft[][]>([]);
   const [redo, setRedo] = useState<MaterialDraft[][]>([]);
   const [range, setRange] = useState({ r1: 0, c1: 0, r2: 0, c2: 0 });
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<{ r: number; c: number; value: string } | null>(null);
   const editingRef = useRef<typeof editing>(null);
   const [query, setQuery] = useState('');
@@ -102,11 +104,15 @@ export function PosterMaterialMatrix({
       Math.max(0, effectiveRows.length - 1),
     ),
     minCol: Math.min(range.c1, range.c2),
-    maxCol: Math.min(2, Math.max(range.c1, range.c2)),
+    maxCol: Math.min(3, Math.max(range.c1, range.c2)),
   };
   const selectedRangeIds = new Set(
     effectiveRows.slice(bounds.minRow, bounds.maxRow + 1).map((r) => r.id),
   );
+  const activeCheckedIds = new Set(
+    effectiveRows.filter((r) => checkedIds.has(r.id)).map((r) => r.id),
+  );
+  const targetBatchIds = activeCheckedIds.size > 0 ? activeCheckedIds : selectedRangeIds;
 
   const handleVideoThumbSaved = useCallback(
     (id: string) => {
@@ -254,11 +260,11 @@ export function PosterMaterialMatrix({
     let targetRow = baseRow + dr;
     let targetCol = baseCol + dc;
     if (dc !== 0) {
-      if (targetCol > 2) {
+      if (targetCol > 3) {
         targetCol = 0;
         targetRow += 1;
       } else if (targetCol < 0) {
-        targetCol = 2;
+        targetCol = 3;
         targetRow = Math.max(0, targetRow - 1);
       }
     }
@@ -267,7 +273,7 @@ export function PosterMaterialMatrix({
       applyEdit(nextRows);
     }
     const clampedRow = Math.max(0, Math.min(nextRows.length - 1, targetRow));
-    const clampedCol = Math.max(0, Math.min(2, targetCol));
+    const clampedCol = Math.max(0, Math.min(3, targetCol));
     setRange({ r1: clampedRow, c1: clampedCol, r2: clampedRow, c2: clampedCol });
     requestAnimationFrame(() => {
       grid.current?.focus();
@@ -290,6 +296,29 @@ export function PosterMaterialMatrix({
         bounds.maxCol,
       ),
     );
+  }
+
+  function pasteAppendAtEnd(text: string) {
+    if (!text) return;
+    attempt(() => {
+      const current = preparedRows();
+      let startIdx = current.length;
+      while (
+        startIdx > 0 &&
+        !hasPosterMaterialContent(current[startIdx - 1] ?? { caption: '', mediaSource: '' })
+      ) {
+        startIdx--;
+      }
+      const next = pastePosterMaterialCells(current, startIdx, 0, text, createId, startIdx, 0);
+      setRange({ r1: startIdx, c1: 0, r2: Math.max(startIdx, next.length - 1), c2: 0 });
+      requestAnimationFrame(() => {
+        grid.current?.focus();
+        grid.current
+          ?.querySelector(`[data-r="${startIdx}"][data-c="0"]`)
+          ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      });
+      return next;
+    });
   }
 
   function paste(event: React.ClipboardEvent) {
@@ -348,6 +377,8 @@ export function PosterMaterialMatrix({
             target.hasThumbnail = false;
           } else if (c === 2) {
             target.background = 'plain';
+          } else if (c === 3) {
+            target.aiLabel = 'default';
           }
         }
         if (target.mediaSource.trim().length > 0) {
@@ -358,11 +389,16 @@ export function PosterMaterialMatrix({
     });
   }
 
-  function deleteRangeRows() {
+  function deleteTargetRows(idsToRemove = targetBatchIds) {
     const current = commitPendingEdit();
-    const removedIds = current.filter((r) => selectedRangeIds.has(r.id)).map((r) => r.id);
-    const remaining = current.filter((r) => !selectedRangeIds.has(r.id));
+    const removedIds = current.filter((r) => idsToRemove.has(r.id)).map((r) => r.id);
+    const remaining = current.filter((r) => !idsToRemove.has(r.id));
     applyEdit(remaining.length > 0 ? remaining : [createEmptyMaterialDraft(createId())]);
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of removedIds) next.delete(id);
+      return next;
+    });
     const nextRow = Math.max(0, Math.min(bounds.minRow, remaining.length - 1));
     setRange({ r1: nextRow, c1: 0, r2: nextRow, c2: 0 });
     if (removedIds.length > 0) {
@@ -383,30 +419,36 @@ export function PosterMaterialMatrix({
     setRange({ r1: clamped, c1: 0, r2: clamped, c2: 0 });
   }
 
-  function appendRowAtEnd() {
+  function appendRowsAtEnd(count = 1) {
     if (busy || effectiveRows.length >= 500) return;
     const current = commitPendingEdit();
-    const next = [...current, createEmptyMaterialDraft(createId())];
+    const allowed = Math.max(1, Math.min(count, 500 - current.length));
+    const added = Array.from({ length: allowed }, () => createEmptyMaterialDraft(createId()));
+    const firstNewIdx = current.length;
+    const next = [...current, ...added];
     applyEdit(next);
-    const lastIdx = next.length - 1;
-    setRange({ r1: lastIdx, c1: 0, r2: lastIdx, c2: 0 });
+    setRange({ r1: firstNewIdx, c1: 0, r2: firstNewIdx, c2: 0 });
     requestAnimationFrame(() => {
       grid.current?.focus();
       grid.current
-        ?.querySelector(`[data-r="${lastIdx}"][data-c="0"]`)
+        ?.querySelector(`[data-r="${firstNewIdx}"][data-c="0"]`)
         ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     });
   }
 
   function toggleRangeSelection(checked?: boolean) {
-    attempt(() => {
-      const current = preparedRows();
-      const targetChecked =
-        checked ?? !current.filter((r) => selectedRangeIds.has(r.id)).every((r) => r.selected);
-      return current.map((r) =>
-        selectedRangeIds.has(r.id) ? { ...r, selected: targetChecked } : r,
-      );
+    const current = preparedRows();
+    const rangeIds = [...selectedRangeIds];
+    const targetChecked = checked ?? !rangeIds.every((id) => checkedIds.has(id));
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of rangeIds) {
+        if (targetChecked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
     });
+    void current;
   }
 
   function beginRange(r: number, c: number, shift: boolean, kind: 'cells' | 'rows' = 'cells') {
@@ -421,7 +463,7 @@ export function PosterMaterialMatrix({
       r1: from.r,
       c1: kind === 'rows' ? 0 : from.c,
       r2: r,
-      c2: kind === 'rows' ? 2 : c,
+      c2: kind === 'rows' ? 3 : c,
     });
   }
 
@@ -434,7 +476,7 @@ export function PosterMaterialMatrix({
         r1: anchor.current.r,
         c1: drag.current === 'rows' ? 0 : anchor.current.c,
         r2: r,
-        c2: drag.current === 'rows' ? 2 : c,
+        c2: drag.current === 'rows' ? 3 : c,
       });
     }
   }
@@ -467,6 +509,8 @@ export function PosterMaterialMatrix({
                 }
               } else if (c === 2) {
                 target.background = first.background;
+              } else if (c === 3) {
+                target.aiLabel = first.aiLabel;
               }
             }
             if (target.mediaSource.trim().length > 0) {
@@ -545,7 +589,7 @@ export function PosterMaterialMatrix({
         0,
         Math.min(effectiveRows.length - 1, (event.shiftKey ? range.r2 : range.r1) + dr),
       );
-      const c = Math.max(0, Math.min(2, (event.shiftKey ? range.c2 : range.c1) + dc));
+      const c = Math.max(0, Math.min(3, (event.shiftKey ? range.c2 : range.c1) + dc));
       setRange(event.shiftKey ? { ...range, r2: r, c2: c } : { r1: r, c1: c, r2: r, c2: c });
       grid.current
         ?.querySelector(`[data-r="${r}"][data-c="${c}"]`)
@@ -562,12 +606,14 @@ export function PosterMaterialMatrix({
     if (!list?.length) return;
     attempt(() => {
       const desktop = window.workbenchDesktop;
-      if (!desktop) {
-        throw Error('完整本机文件路径仅桌面端可用；或在 B 列粘贴本机绝对路径 / Google Drive 链接');
-      }
       const sources = Array.from(list).map((file) => {
-        const source = desktop.materialFilePath(file);
-        if (!source) throw Error('文件没有真实本机路径，本批次尚未添加');
+        const source =
+          desktop?.materialFilePath(file) || ((file as File & { path?: string }).path ?? '').trim();
+        if (!source) {
+          throw Error(
+            '完整本机文件路径仅桌面端可用；或在 B 列粘贴本机绝对路径 / Google Drive 链接',
+          );
+        }
         return mediaReference(source).source;
       });
       const current = preparedRows();
@@ -637,6 +683,60 @@ export function PosterMaterialMatrix({
       style={{ position: 'relative' }}
     >
       <div className="resource-toolbar resource-main-toolbar poster-matrix-toolbar poster-compact-toolbar">
+        <div className="resource-toolbar-actions">
+          <button
+            type="button"
+            disabled={busy || effectiveRows.length >= 500}
+            onClick={() => appendRowsAtEnd(1)}
+            title="在表格末尾新增 1 行空行"
+          >
+            ＋ 新增一行
+          </button>
+          <button
+            type="button"
+            disabled={busy || effectiveRows.length >= 500}
+            onClick={() => appendRowsAtEnd(10)}
+            title="在表格末尾批量新增 10 行空行，方便批量粘贴或填写"
+          >
+            ＋ 批量新增 10 行
+          </button>
+          <button
+            type="button"
+            disabled={busy || effectiveRows.length >= 500}
+            onClick={() => {
+              void navigator.clipboard
+                ?.readText()
+                .then((text) => {
+                  if (!text.trim()) {
+                    reportError('剪贴板为空，请先复制文案或 Excel 表格内容');
+                    return;
+                  }
+                  pasteAppendAtEnd(text);
+                })
+                .catch(() => reportError('请点击目标单元格后按 Ctrl/Cmd+V 粘贴'));
+            }}
+            title="读取剪贴板中的多行文案或 Excel 内容，自动追加到表格末尾新行"
+          >
+            📋 粘贴追加新行
+          </button>
+          <button type="button" disabled={busy} onClick={() => filesInput.current?.click()}>
+            ＋ 添加本机图片/视频
+          </button>
+          <button type="button" disabled={busy || !undo.length} onClick={undoEdit}>
+            撤销 (Ctrl+Z)
+          </button>
+          <input
+            ref={filesInput}
+            type="file"
+            accept=".mp4,.mov,.png,.jpg,.jpeg,.webp"
+            multiple
+            hidden
+            onChange={(event) => {
+              addFiles(event.target.files);
+              event.target.value = '';
+            }}
+          />
+        </div>
         <div className="resource-toolbar-actions resource-search">
           <input
             aria-label="搜索发帖素材"
@@ -651,41 +751,54 @@ export function PosterMaterialMatrix({
             onChange={(e) => {
               const [column, value] = e.target.value.split(':');
               if (!column || !value) return;
-              attempt(() =>
-                pastePosterMaterialCells(
-                  preparedRows(),
-                  bounds.minRow,
-                  Number(column),
-                  value,
-                  createId,
-                  bounds.maxRow,
-                  Number(column),
-                ),
-              );
+              const colNum = Number(column);
+              attempt(() => {
+                const current = structuredClone(preparedRows());
+                for (const row of current) {
+                  if (!targetBatchIds.has(row.id)) continue;
+                  if (colNum === 2) {
+                    row.background = row.mediaSource.trim()
+                      ? 'plain'
+                      : value === 'color'
+                        ? 'color'
+                        : 'plain';
+                  } else if (colNum === 3) {
+                    row.aiLabel = value === 'on' ? 'on' : value === 'off' ? 'off' : 'default';
+                  }
+                }
+                return current;
+              });
             }}
           >
-            <option value="">批量设背景（彩贴/白底）</option>
-            <optgroup label="C列·文字背景">
-              <option value="2:color">彩贴</option>
-              <option value="2:plain">普通文字</option>
+            <option value="">
+              批量设置（
+              {activeCheckedIds.size > 0
+                ? `已勾选 ${activeCheckedIds.size} 行`
+                : `选区 ${selectedRangeIds.size} 行`}
+              ）…
+            </option>
+            <optgroup label="C列 · 文字背景">
+              <option value="2:color">设为：彩贴</option>
+              <option value="2:plain">设为：普通文字</option>
+            </optgroup>
+            <optgroup label="D列 · AI 声明标签">
+              <option value="3:default">AI 声明：默认</option>
+              <option value="3:on">AI 声明：开启</option>
+              <option value="3:off">AI 声明：关闭</option>
             </optgroup>
           </select>
-        </div>
-        <div className="resource-toolbar-actions">
-          <button type="button" disabled={busy} onClick={() => filesInput.current?.click()}>
-            ＋ 添加本机图片/视频
+          <button
+            type="button"
+            className="btn-danger"
+            disabled={busy || targetBatchIds.size === 0}
+            onClick={() => deleteTargetRows(targetBatchIds)}
+            title="删除勾选的行或当前框选的行"
+          >
+            删除
+            {activeCheckedIds.size > 0
+              ? `已勾选 (${activeCheckedIds.size})`
+              : `所选行 (${selectedRangeIds.size})`}
           </button>
-          <input
-            ref={filesInput}
-            type="file"
-            accept=".mp4,.mov,.png,.jpg,.jpeg,.webp"
-            multiple
-            hidden
-            onChange={(event) => {
-              addFiles(event.target.files);
-              event.target.value = '';
-            }}
-          />
           {onToggleFullscreen && (
             <button type="button" onClick={onToggleFullscreen}>
               {isFullscreen ? '退出全屏' : '全屏编辑'}
@@ -724,7 +837,7 @@ export function PosterMaterialMatrix({
           className="resource-grid resource-matrix poster-material-matrix"
           role="grid"
           aria-rowcount={effectiveRows.length + 1}
-          aria-colcount={7}
+          aria-colcount={8}
           style={{ tableLayout: 'fixed' }}
         >
           <colgroup>
@@ -734,6 +847,7 @@ export function PosterMaterialMatrix({
             <col style={{ width: colWidths.caption }} />
             <col style={{ width: colWidths.media }} />
             <col style={{ width: colWidths.background }} />
+            <col style={{ width: colWidths.aiLabel }} />
             <col style={{ width: colWidths.status }} />
           </colgroup>
           <thead>
@@ -742,10 +856,17 @@ export function PosterMaterialMatrix({
                 <input
                   type="checkbox"
                   aria-label="全选发帖素材"
-                  checked={effectiveRows.length > 0 && effectiveRows.every((d) => d.selected)}
+                  checked={entries.length > 0 && entries.every(({ row }) => checkedIds.has(row.id))}
                   onChange={(e) => {
                     const checked = e.target.checked;
-                    attempt(() => preparedRows().map((d) => ({ ...d, selected: checked })));
+                    setCheckedIds((prev) => {
+                      const next = new Set(prev);
+                      for (const { row } of entries) {
+                        if (checked) next.add(row.id);
+                        else next.delete(row.id);
+                      }
+                      return next;
+                    });
                   }}
                 />
               </th>
@@ -758,7 +879,7 @@ export function PosterMaterialMatrix({
                       r1: 0,
                       c1: 0,
                       r2: Math.max(0, effectiveRows.length - 1),
-                      c2: 2,
+                      c2: 3,
                     })
                   }
                 >
@@ -774,6 +895,7 @@ export function PosterMaterialMatrix({
                   ['A · 发帖文案', 'caption', 0],
                   ['B · 本机媒体 / 网盘链接', 'media', 1],
                   ['C · 文字背景', 'background', 2],
+                  ['D · AI 声明', 'aiLabel', 3],
                 ] as const
               ).map(([title, colKey, c]) => (
                 <th key={title} style={{ position: 'relative' }}>
@@ -802,14 +924,15 @@ export function PosterMaterialMatrix({
           <tbody>
             {entries.map(({ row, index: r }) => {
               const badge = posterRowBadge(row);
+              const isRowChecked = checkedIds.has(row.id);
               return (
                 <tr
                   key={row.id}
-                  className={row.selected ? 'is-selected-row' : ''}
+                  className={isRowChecked ? 'is-selected-row' : ''}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     if (r < bounds.minRow || r > bounds.maxRow) {
-                      setRange({ r1: r, c1: 0, r2: r, c2: 2 });
+                      setRange({ r1: r, c1: 0, r2: r, c2: 3 });
                     }
                     setContextMenu({ x: e.clientX, y: e.clientY });
                   }}
@@ -818,14 +941,15 @@ export function PosterMaterialMatrix({
                     <input
                       type="checkbox"
                       aria-label={`勾选素材#${r + 1}`}
-                      checked={row.selected}
+                      checked={isRowChecked}
                       onChange={(e) => {
                         const checked = e.target.checked;
-                        attempt(() =>
-                          preparedRows().map((d, idx) =>
-                            idx === r ? { ...d, selected: checked } : d,
-                          ),
-                        );
+                        setCheckedIds((prev) => {
+                          const next = new Set(prev);
+                          if (checked) next.add(row.id);
+                          else next.delete(row.id);
+                          return next;
+                        });
                       }}
                     />
                   </td>
@@ -836,14 +960,14 @@ export function PosterMaterialMatrix({
                       e.preventDefault();
                       beginRange(r, 0, e.shiftKey, 'rows');
                     }}
-                    onPointerEnter={() => extendRange(r, 2)}
+                    onPointerEnter={() => extendRange(r, 3)}
                   >
                     {r + 1}
                   </th>
                   <td className="poster-thumb-cell" style={{ textAlign: 'center' }}>
                     <PosterMaterialThumbnailCell row={row} onPreview={setPreviewRow} />
                   </td>
-                  {[0, 1, 2].map((c) => {
+                  {[0, 1, 2, 3].map((c) => {
                     const inRange =
                       r >= bounds.minRow &&
                       r <= bounds.maxRow &&
@@ -890,6 +1014,30 @@ export function PosterMaterialMatrix({
                                 editingRef.current = next;
                                 setEditing(next);
                               }}
+                              onPaste={(e) => {
+                                const text = e.clipboardData.getData('text/plain');
+                                const html = e.clipboardData.getData('text/html');
+                                if (
+                                  text.includes('\t') ||
+                                  html.includes('<table') ||
+                                  (c === 1 && text.includes('\n'))
+                                ) {
+                                  e.preventDefault();
+                                  editingRef.current = null;
+                                  setEditing(null);
+                                  attempt(() =>
+                                    pastePosterMaterialCells(
+                                      effectiveRows,
+                                      r,
+                                      c,
+                                      text,
+                                      createId,
+                                      r,
+                                      c,
+                                    ),
+                                  );
+                                }
+                              }}
                               onBlur={() => commitPendingEdit()}
                               onKeyDown={(e) => {
                                 e.stopPropagation();
@@ -909,7 +1057,7 @@ export function PosterMaterialMatrix({
                           ) : (
                             <select
                               autoFocus
-                              aria-label={`素材#${r + 1}文字背景`}
+                              aria-label={c === 2 ? `素材#${r + 1}文字背景` : `素材#${r + 1}AI声明`}
                               value={editing.value}
                               onChange={(e) => {
                                 editingRef.current = { ...editing, value: e.target.value };
@@ -931,11 +1079,13 @@ export function PosterMaterialMatrix({
                                 }
                               }}
                             >
-                              {['彩贴', '普通文字'].map((v) => (
-                                <option key={v} value={v}>
-                                  {v}
-                                </option>
-                              ))}
+                              {(c === 2 ? ['彩贴', '普通文字'] : ['默认', '开启', '关闭']).map(
+                                (v) => (
+                                  <option key={v} value={v}>
+                                    {v}
+                                  </option>
+                                ),
+                              )}
                             </select>
                           )
                         ) : (
@@ -946,11 +1096,11 @@ export function PosterMaterialMatrix({
                             >
                               {posterCellValue(row, c) || '\u00a0'}
                             </span>
-                            {c === 2 && !hasMedia && (
+                            {(c === 3 || (c === 2 && !hasMedia)) && (
                               <button
                                 type="button"
                                 className="cell-arrow"
-                                aria-label={`编辑C${r + 1}`}
+                                aria-label={`编辑${String.fromCharCode(65 + c)}${r + 1}`}
                                 onPointerDown={(e) => e.stopPropagation()}
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -1002,7 +1152,7 @@ export function PosterMaterialMatrix({
         aria-label="新增一行"
         title="在表格末尾新增一行"
         disabled={busy || effectiveRows.length >= 500}
-        onClick={appendRowAtEnd}
+        onClick={() => appendRowsAtEnd(1)}
       >
         ＋
       </button>
@@ -1021,7 +1171,7 @@ export function PosterMaterialMatrix({
             .catch(() => reportError('请直接按 Ctrl/Cmd+V 粘贴'));
         }}
         onClearRange={clearRange}
-        onDeleteRows={deleteRangeRows}
+        onDeleteRows={() => deleteTargetRows(selectedRangeIds)}
       />
 
       <PosterMediaPreviewModal row={previewRow} onClose={() => setPreviewRow(null)} />

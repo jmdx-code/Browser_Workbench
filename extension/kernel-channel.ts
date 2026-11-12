@@ -756,7 +756,11 @@ export class ExtensionKernelChannel {
     // Stories can expose multi-megabyte inline resources as CDP network URLs. They
     // are local bytes, not HTTP upload/submission evidence; do not serialize them
     // across the task relay and disconnect the owning session. Fixture CDP is unchanged.
-    if (this.access === 'facebook-task' && value && typeof value === 'object') {
+    if (
+      (this.access === 'facebook-task' || this.access === 'agent-browser') &&
+      value &&
+      typeof value === 'object'
+    ) {
       const resource =
         method === 'Network.requestWillBeSent' && 'request' in value
           ? value.request
@@ -771,6 +775,55 @@ export class ExtensionKernelChannel {
         resource.url.startsWith('data:')
       )
         return;
+      if (
+        method === 'Network.requestWillBeSent' &&
+        'request' in value &&
+        value.request &&
+        typeof value.request === 'object'
+      ) {
+        const req = value.request as Record<string, unknown>;
+        const postData = typeof req.postData === 'string' ? req.postData : undefined;
+        const postDataEntries = Array.isArray(req.postDataEntries)
+          ? req.postDataEntries
+          : undefined;
+        const PAYLOAD_BUDGET_BYTES = 524_288;
+        const postDataUtf8Bytes =
+          postData !== undefined
+            ? postData.length > 170_000
+              ? new TextEncoder().encode(postData).byteLength
+              : postData.length
+            : 0;
+        let entriesUtf8Bytes = 0;
+        if (postDataEntries !== undefined) {
+          let approxChars = 0;
+          for (const entry of postDataEntries) {
+            if (entry && typeof entry === 'object' && 'bytes' in entry) {
+              const b = (entry as Record<string, unknown>).bytes;
+              if (typeof b === 'string') approxChars += b.length;
+            }
+          }
+          entriesUtf8Bytes =
+            approxChars > 170_000
+              ? new TextEncoder().encode(JSON.stringify(postDataEntries)).byteLength
+              : approxChars;
+        }
+        const hasLargePostData = postDataUtf8Bytes > PAYLOAD_BUDGET_BYTES;
+        const hasLargePostDataEntries = entriesUtf8Bytes > PAYLOAD_BUDGET_BYTES;
+        if (hasLargePostData || hasLargePostDataEntries) {
+          const nextReq: Record<string, unknown> = { ...req };
+          if (hasLargePostDataEntries) {
+            delete nextReq.postDataEntries;
+            nextReq.__wbPostDataEntriesTruncated = true;
+            nextReq.originalPostDataEntriesBytes = entriesUtf8Bytes;
+          }
+          if (hasLargePostData && postData !== undefined) {
+            nextReq.postData = postData.slice(0, 16_384);
+            nextReq.__wbPostDataTruncated = true;
+            nextReq.originalPostDataBytes = postDataUtf8Bytes;
+          }
+          value = { ...(value as Record<string, unknown>), request: nextReq };
+        }
+      }
     }
     const params = KernelJsonObject.parse(value ?? {});
     // Chrome may report both Inspector.detached and debugger.onDetach for an intentional
@@ -785,7 +838,12 @@ export class ExtensionKernelChannel {
       const frame = KernelJsonObject.safeParse(params.frame);
       // Task SDK owns the main page only. Embedded widgets can navigate to blank or
       // third-party documents without changing that page's ownership or input scope.
-      if (this.access === 'facebook-task' && frame.success && frame.data.parentId) return;
+      if (
+        (this.access === 'facebook-task' || this.access === 'agent-browser') &&
+        frame.success &&
+        frame.data.parentId
+      )
+        return;
       if (
         frame.success &&
         (this.access !== 'facebook-readonly' || !frame.data.parentId) &&

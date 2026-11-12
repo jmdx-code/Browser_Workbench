@@ -9,6 +9,7 @@ import { SettlementNotifier } from '../application/settlement-notifier.js';
 import { isInertSettledBrowseOperation } from '../domain/kernel-readiness.js';
 import { facebookDisplayInspectionProjection } from './facebook-read-adapter.js';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
+import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
 import { marketplaceBridgeSupported } from '../shared/task-features.js';
 import { randomUUID } from 'node:crypto';
@@ -350,7 +351,7 @@ export class KernelProfileInspection implements ProfileInspectionPort {
     const page = validateProjection(facebookDisplayInspectionProjection, data.page);
     const identity = z
       .object({
-        url: z.literal('https://www.facebook.com/'),
+        url: z.string().refine(kernelFacebookReadURL),
         ready: z.enum(['interactive', 'complete']),
         actor: FacebookNativeActor.nullable(),
       })

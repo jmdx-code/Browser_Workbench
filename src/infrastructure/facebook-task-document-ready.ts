@@ -7,6 +7,7 @@ import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import {
   classifyFacebookAbnormalUrl,
   facebookMarketplaceUnavailableURL,
+  facebookPostStoryLandingURL,
 } from '../shared/facebook-browse-route.js';
 
 export const FACEBOOK_TASK_DOCUMENT_READ =
@@ -96,7 +97,8 @@ export async function awaitFacebookTaskDocument(
               !classifyFacebookAbnormalUrl(document.url) &&
               !/^https:\/\/www\.facebook\.com\/messages(?:\/|$|\?)/i.test(document.url)) ||
               FacebookBrowseURL.safeParse(document.url).success ||
-              facebookMarketplaceUnavailableURL(document.url))))
+              facebookMarketplaceUnavailableURL(document.url) ||
+              facebookPostStoryLandingURL(document.url))))
           ? 'home'
           : document.url === 'about:blank' && !homeSeen
             ? 'initial-blank'

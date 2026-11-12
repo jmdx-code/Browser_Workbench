@@ -34,11 +34,15 @@ import {
   type PosterCacheStatus,
   type PosterLog,
   type PosterMaterial,
+  type PosterMaterialAiLabel,
   type PosterMaterialBackground,
   type PosterMediaKind,
   type PosterOperationRecord,
   type PosterOperationResolution,
   type PosterPendingOperation,
+  type PosterTask,
+  type PosterTaskAccountMode,
+  type PosterTaskStatus,
 } from '../shared/group-poster.js';
 
 function formatLocalYmd(date: Date): string {
@@ -66,6 +70,11 @@ function ensurePosterMaterialColumns(db: DatabaseSync): void {
   if (!cols.has('thumbnail_data_url')) {
     db.exec('ALTER TABLE group_poster_materials ADD COLUMN thumbnail_data_url TEXT DEFAULT NULL');
   }
+  if (!cols.has('ai_label')) {
+    db.exec(
+      "ALTER TABLE group_poster_materials ADD COLUMN ai_label TEXT NOT NULL DEFAULT 'default'",
+    );
+  }
 }
 
 export const groupPosterMigration = `
@@ -74,6 +83,7 @@ CREATE TABLE IF NOT EXISTS group_poster_materials(
   caption TEXT NOT NULL,
   media_source TEXT NOT NULL DEFAULT '',
   background TEXT NOT NULL DEFAULT 'plain',
+  ai_label TEXT NOT NULL DEFAULT 'default',
   local_file_path TEXT,
   media_kind TEXT NOT NULL DEFAULT 'none',
   cache_status TEXT NOT NULL DEFAULT 'ready',
@@ -108,6 +118,25 @@ CREATE INDEX IF NOT EXISTS idx_group_poster_logs_profile_time ON group_poster_lo
 CREATE INDEX IF NOT EXISTS idx_group_poster_logs_posted_at ON group_poster_logs(posted_at DESC);
 CREATE TABLE IF NOT EXISTS group_poster_settings(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
 INSERT OR IGNORE INTO group_poster_settings(id, body) VALUES(1, '{}');
+CREATE TABLE IF NOT EXISTS group_poster_tasks(
+  id TEXT PRIMARY KEY,
+  material_id TEXT NOT NULL,
+  caption_preview TEXT NOT NULL DEFAULT '',
+  group_ids_json TEXT NOT NULL DEFAULT '[]',
+  account_mode TEXT NOT NULL DEFAULT 'selected' CHECK(account_mode IN ('selected', 'all_online')),
+  profile_ids_json TEXT NOT NULL DEFAULT '[]',
+  scheduled_at INTEGER DEFAULT NULL,
+  status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled')),
+  total_groups INTEGER NOT NULL DEFAULT 0,
+  posted_count INTEGER NOT NULL DEFAULT 0,
+  skipped_count INTEGER NOT NULL DEFAULT 0,
+  status_reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  started_at INTEGER DEFAULT NULL,
+  finished_at INTEGER DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_group_poster_tasks_created_at
+  ON group_poster_tasks(created_at DESC);
 `;
 
 export const groupPosterOperationsMigration = `
@@ -266,6 +295,7 @@ export class SqliteGroupPosterRepository {
     ensureTargetLibrarySchema(this.db);
     this.db.exec(groupPosterMigration);
     this.db.exec(groupPosterOperationsMigration);
+    ensurePosterMaterialColumns(this.db);
     ensurePosterUsage(db);
     ensureRecordAvatars(db);
     this.db.exec(`
@@ -281,6 +311,18 @@ export class SqliteGroupPosterRepository {
         skipped_steps INTEGER NOT NULL DEFAULT 0
       );
     `);
+    this.db
+      .prepare(
+        `UPDATE group_poster_tasks
+            SET status = CASE WHEN posted_count > 0 THEN 'partial' ELSE 'cancelled' END,
+                status_reason = CASE
+                  WHEN posted_count > 0 THEN '部分成功 · 软件重启前已发 ' || posted_count || '/' || total_groups || ' 组'
+                  ELSE '已停止 · 软件重启中断'
+                END,
+                finished_at = COALESCE(finished_at, ?)
+          WHERE status = 'running'`,
+      )
+      .run(Date.now());
     this.targetLibrary = new SqliteTargetLibraryRepository(this.db);
   }
 
@@ -655,7 +697,7 @@ export class SqliteGroupPosterRepository {
   materials(): PosterMaterial[] {
     return this.db
       .prepare(
-        `SELECT id, caption, media_source, background, local_file_path, media_kind,
+        `SELECT id, caption, media_source, background, ai_label, local_file_path, media_kind,
                 cache_status, cache_error, selected, used_count, sort_order,
                 created_at, updated_at, last_used_at,
                 CASE WHEN thumbnail_data_url IS NOT NULL AND length(thumbnail_data_url) > 0 THEN 1 ELSE 0 END AS has_thumbnail
@@ -673,6 +715,9 @@ export class SqliteGroupPosterRepository {
             : String(r.background) === 'color'
               ? 'color'
               : 'plain',
+        aiLabel: (['default', 'on', 'off'].includes(String(r.ai_label))
+          ? String(r.ai_label)
+          : 'default') as PosterMaterialAiLabel,
         localFilePath: r.local_file_path == null ? null : String(r.local_file_path),
         mediaKind: (['none', 'image', 'video'].includes(String(r.media_kind))
           ? String(r.media_kind)
@@ -723,12 +768,13 @@ export class SqliteGroupPosterRepository {
       }
       const upsert = this.db.prepare(
         `INSERT INTO group_poster_materials(
-           id,caption,media_source,background,local_file_path,media_kind,cache_status,cache_error,selected,used_count,sort_order,created_at,updated_at,last_used_at,thumbnail_data_url
-         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+           id,caption,media_source,background,ai_label,local_file_path,media_kind,cache_status,cache_error,selected,used_count,sort_order,created_at,updated_at,last_used_at,thumbnail_data_url
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
          ON CONFLICT(id) DO UPDATE SET
            caption=excluded.caption,
            media_source=excluded.media_source,
            background=excluded.background,
+           ai_label=excluded.ai_label,
            local_file_path=excluded.local_file_path,
            media_kind=excluded.media_kind,
            cache_status=excluded.cache_status,
@@ -759,6 +805,10 @@ export class SqliteGroupPosterRepository {
             : hasExplicitBg
               ? 'plain'
               : (prev?.background ?? 'plain');
+        const hasExplicitAiLabel = Boolean(raw && typeof raw === 'object' && 'aiLabel' in raw);
+        const effectiveAiLabel: PosterMaterialAiLabel = hasExplicitAiLabel
+          ? (item.aiLabel ?? 'default')
+          : (prev?.aiLabel ?? 'default');
         const sourceChanged = !prev || prev.mediaSource !== mediaSource;
         const isLocalSource = ref?.kind === 'local';
         const localFilePath = !mediaSource
@@ -801,6 +851,7 @@ export class SqliteGroupPosterRepository {
           item.caption.trim(),
           mediaSource,
           effectiveBackground,
+          effectiveAiLabel,
           localFilePath,
           mediaKind,
           cacheStatus,
@@ -819,6 +870,11 @@ export class SqliteGroupPosterRepository {
 
   deleteMaterials(input: unknown): number {
     const { ids } = PosterMaterialIdsInput.parse(input);
+    this.db
+      .prepare(
+        "DELETE FROM group_poster_tasks WHERE material_id IN (SELECT value FROM json_each(?)) AND status = 'scheduled'",
+      )
+      .run(JSON.stringify(ids));
     return Number(
       this.db
         .prepare('DELETE FROM group_poster_materials WHERE id IN (SELECT value FROM json_each(?))')
@@ -898,7 +954,7 @@ export class SqliteGroupPosterRepository {
 
   saveMaterialThumbnail(id: string, thumbnailDataUrl: string): boolean {
     const trimmed = thumbnailDataUrl.trim();
-    if (!trimmed.startsWith('data:image/') || trimmed.length > 48 * 1024) return false;
+    if (!trimmed.startsWith('data:image/') || trimmed.length > 140 * 1024) return false;
     const res = this.db
       .prepare(
         'UPDATE group_poster_materials SET thumbnail_data_url = ?, updated_at = ? WHERE id = ?',
@@ -984,6 +1040,127 @@ export class SqliteGroupPosterRepository {
     );
   }
 
+  postedGroupIdsByMaterial(): Record<string, string[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT material_id, group_id FROM group_poster_usage
+          WHERE material_id IS NOT NULL AND group_id IS NOT NULL
+         UNION
+         SELECT material_id, group_id FROM group_poster_operations
+          WHERE material_id IS NOT NULL AND group_id IS NOT NULL
+            AND status IN ('VERIFIED', 'PENDING_REVIEW')`,
+      )
+      .all() as Array<{ material_id?: string | null; group_id?: string | null }>;
+    const map: Record<string, string[]> = {};
+    for (const r of rows) {
+      const mid = String(r.material_id ?? '').trim();
+      const gid = String(r.group_id ?? '').trim();
+      if (!mid || !gid) continue;
+      const list = map[mid] ?? [];
+      list.push(gid);
+      map[mid] = list;
+    }
+    return map;
+  }
+
+  private mapTaskRow(r: Record<string, unknown>): PosterTask {
+    let groupIds: string[] = [];
+    let profileIds: string[] = [];
+    try {
+      const parsed = JSON.parse(String(r.group_ids_json ?? '[]'));
+      if (Array.isArray(parsed)) groupIds = parsed.map((x) => String(x));
+    } catch {
+      groupIds = [];
+    }
+    try {
+      const parsed = JSON.parse(String(r.profile_ids_json ?? '[]'));
+      if (Array.isArray(parsed)) profileIds = parsed.map((x) => String(x));
+    } catch {
+      profileIds = [];
+    }
+    const rawMode = String(r.account_mode ?? 'selected');
+    const accountMode: PosterTaskAccountMode = rawMode === 'all_online' ? 'all_online' : 'selected';
+    const rawStatus = String(r.status ?? 'scheduled');
+    const status: PosterTaskStatus = (
+      ['scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled'].includes(rawStatus)
+        ? rawStatus
+        : 'scheduled'
+    ) as PosterTaskStatus;
+    return {
+      id: String(r.id),
+      materialId: String(r.material_id),
+      captionPreview: String(r.caption_preview ?? ''),
+      groupIds,
+      accountMode,
+      profileIds,
+      scheduledAt: r.scheduled_at == null ? null : Number(r.scheduled_at),
+      status,
+      totalGroups: Number(r.total_groups ?? 0),
+      postedCount: Number(r.posted_count ?? 0),
+      skippedCount: Number(r.skipped_count ?? 0),
+      statusReason: String(r.status_reason ?? ''),
+      createdAt: Number(r.created_at ?? 0),
+      startedAt: r.started_at == null ? null : Number(r.started_at),
+      finishedAt: r.finished_at == null ? null : Number(r.finished_at),
+    };
+  }
+
+  listTasks(limit = 100): PosterTask[] {
+    const rows = this.db
+      .prepare('SELECT * FROM group_poster_tasks ORDER BY created_at DESC, id DESC LIMIT ?')
+      .all(Math.max(1, Math.min(500, limit))) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapTaskRow(r));
+  }
+
+  saveTask(task: PosterTask): PosterTask {
+    this.db
+      .prepare(
+        `INSERT INTO group_poster_tasks(
+           id, material_id, caption_preview, group_ids_json, account_mode, profile_ids_json,
+           scheduled_at, status, total_groups, posted_count, skipped_count, status_reason,
+           created_at, started_at, finished_at
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           material_id=excluded.material_id,
+           caption_preview=excluded.caption_preview,
+           group_ids_json=excluded.group_ids_json,
+           account_mode=excluded.account_mode,
+           profile_ids_json=excluded.profile_ids_json,
+           scheduled_at=excluded.scheduled_at,
+           status=excluded.status,
+           total_groups=excluded.total_groups,
+           posted_count=excluded.posted_count,
+           skipped_count=excluded.skipped_count,
+           status_reason=excluded.status_reason,
+           created_at=excluded.created_at,
+           started_at=excluded.started_at,
+           finished_at=excluded.finished_at`,
+      )
+      .run(
+        task.id,
+        task.materialId,
+        task.captionPreview,
+        JSON.stringify(task.groupIds),
+        task.accountMode,
+        JSON.stringify(task.profileIds),
+        task.scheduledAt ?? null,
+        task.status,
+        task.totalGroups,
+        task.postedCount,
+        task.skippedCount,
+        task.statusReason,
+        task.createdAt,
+        task.startedAt ?? null,
+        task.finishedAt ?? null,
+      );
+    return task;
+  }
+
+  deleteTask(id: string): boolean {
+    const res = this.db.prepare('DELETE FROM group_poster_tasks WHERE id = ?').run(id);
+    return Number(res.changes ?? 0) > 0;
+  }
+
   recordPost(input: PosterLog): boolean {
     return transaction(this.db, () => {
       const existing = this.db
@@ -1051,11 +1228,19 @@ export class SqliteGroupPosterRepository {
     });
   }
 
-  logs(search = '', limit = 200, before?: number, beforeId = '\uffff'): PosterLog[] {
+  logs(
+    search = '',
+    limit = 200,
+    before?: number,
+    beforeId = '\uffff',
+    materialId?: string,
+  ): PosterLog[] {
+    const trimmedMaterialId = materialId?.trim() ?? '';
     return this.db
       .prepare(
         `SELECT * FROM group_poster_logs
           WHERE (posted_at<? OR (posted_at=? AND id<?))
+            AND (?='' OR material_id=?)
             AND (?='' OR instr(lower(group_name||' '||group_id||' '||account_name||' '||account_id||' '||caption_preview||' '||post_url),lower(?))>0)
           ORDER BY posted_at DESC,id DESC LIMIT ?`,
       )
@@ -1063,6 +1248,8 @@ export class SqliteGroupPosterRepository {
         before ?? Date.now() + 1000,
         before ?? Date.now() + 1000,
         beforeId,
+        trimmedMaterialId,
+        trimmedMaterialId,
         search,
         search,
         Math.max(1, Math.min(1000, limit)),
@@ -1137,6 +1324,15 @@ export class SqliteGroupPosterRepository {
                 SET posted_count = (
                   SELECT COUNT(*) FROM group_poster_usage
                    WHERE group_poster_usage.group_id = shared_facebook_groups.group_id
+                )`,
+          )
+          .run();
+        this.db
+          .prepare(
+            `UPDATE group_poster_materials
+                SET used_count = (
+                  SELECT COUNT(*) FROM group_poster_usage
+                   WHERE group_poster_usage.material_id = group_poster_materials.id
                 )`,
           )
           .run();

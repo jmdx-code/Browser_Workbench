@@ -27,6 +27,7 @@
     "tests/wo62-page-bumper-and-recovery.test.ts",
     "tests/bumper-interaction-fixes.test.ts",
     "tests/bumper-like-confirmation.test.ts",
-    "tests/bumper-workflow.test.ts"
+    "tests/bumper-workflow.test.ts",
+    "tests/wo-bumper-stability.test.ts"
   ]
 }

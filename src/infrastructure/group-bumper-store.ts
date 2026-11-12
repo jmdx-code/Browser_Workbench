@@ -20,12 +20,15 @@ import {
   BumperTargetsInput,
   BumperIdsInput,
   BumperCommentsInput,
+  BumperScheduledTask,
+  CreateBumperTaskInput,
   type BumperTarget,
   type BumperComment,
   type BumperLog,
   type BumperDailyStat,
   type BumperPendingOperation,
   type BumperScope,
+  type BumperScheduledTask as BumperScheduledTaskValue,
 } from '../shared/group-bumper.js';
 
 export { mergedAvatar };
@@ -223,7 +226,30 @@ export class SqliteGroupBumperRepository {
         failed_steps INTEGER NOT NULL DEFAULT 0,
         skipped_steps INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS group_bumper_scheduled_tasks(
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL DEFAULT 'group-bumper' CHECK(mode IN ('group-bumper','page-bumper')),
+        profile_ids TEXT NOT NULL DEFAULT '[]',
+        group_ids TEXT NOT NULL DEFAULT '[]',
+        page_ids TEXT NOT NULL DEFAULT '[]',
+        scheduled_at INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('scheduled','running','completed','failed','cancelled')),
+        status_reason TEXT NOT NULL DEFAULT '',
+        run_id TEXT,
+        created_at INTEGER NOT NULL,
+        started_at INTEGER,
+        finished_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_group_bumper_scheduled_tasks_status_due
+        ON group_bumper_scheduled_tasks(status, scheduled_at ASC);
     `);
+    db.prepare(
+      `UPDATE group_bumper_scheduled_tasks
+          SET status='failed',
+              status_reason='软件重启中断',
+              finished_at=COALESCE(finished_at, ?)
+        WHERE status='running'`,
+    ).run(Date.now());
     db.exec(groupBumperOperationsMigration);
     ensureBumperEffects(db);
     try {
@@ -886,7 +912,11 @@ export class SqliteGroupBumperRepository {
         pageName: String(r.page_name),
         postId: String(r.post_id),
         actionKind: String(r.action_kind).includes('comment') ? 'comment' : 'like',
-        reason: String(r.reason ?? ''),
+        reason:
+          String(r.reason ?? '')
+            .replace(/\u001b\[[0-9;]*m/g, '')
+            .split(/\r?\nCall log:/)[0]
+            ?.trim() ?? '',
         updatedAt: Number(r.updated_at ?? 0),
       }));
   }
@@ -917,6 +947,15 @@ export class SqliteGroupBumperRepository {
           )
           .run(all ? 1 : 0, mode, mode, JSON.stringify(ids)).changes,
       );
+      if (all) {
+        this.db
+          .prepare(
+            `DELETE FROM group_bumper_operations
+              WHERE (status='PENDING_REVIEW' OR resolution_outcome='ENDED_UNKNOWN')
+                AND (?='all' OR (CASE WHEN group_id='-' THEN 'page' ELSE 'group' END)=?)`,
+          )
+          .run(mode, mode);
+      }
       if (changes > 0 || usageChanges > 0) {
         this.db
           .prepare(
@@ -939,5 +978,112 @@ export class SqliteGroupBumperRepository {
       }
       return changes;
     });
+  }
+  private mapScheduledTaskRow(row: Record<string, unknown>): BumperScheduledTaskValue {
+    const parseArray = (raw: unknown): string[] => {
+      if (typeof raw !== 'string') return [];
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        return Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch {
+        return [];
+      }
+    };
+    return BumperScheduledTask.parse({
+      id: String(row.id),
+      mode: row.mode === 'page-bumper' ? 'page-bumper' : 'group-bumper',
+      profileIds: parseArray(row.profile_ids),
+      groupIds: parseArray(row.group_ids),
+      pageIds: parseArray(row.page_ids),
+      scheduledAt: Number(row.scheduled_at),
+      status: String(row.status),
+      statusReason: String(row.status_reason ?? ''),
+      runId: row.run_id === null || row.run_id === undefined ? null : String(row.run_id),
+      createdAt: Number(row.created_at),
+      startedAt:
+        row.started_at === null || row.started_at === undefined ? null : Number(row.started_at),
+      finishedAt:
+        row.finished_at === null || row.finished_at === undefined ? null : Number(row.finished_at),
+    });
+  }
+  scheduledTasks(limit = 100): BumperScheduledTaskValue[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM group_bumper_scheduled_tasks
+          ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'scheduled' THEN 1 ELSE 2 END,
+                   scheduled_at ASC,
+                   created_at DESC
+          LIMIT ?`,
+      )
+      .all(Math.max(1, Math.min(500, limit)))
+      .map((row) => this.mapScheduledTaskRow(row as Record<string, unknown>));
+  }
+  createScheduledTask(input: unknown): BumperScheduledTaskValue {
+    const parsed = CreateBumperTaskInput.parse(input);
+    const id = randomUUID();
+    const now = Date.now();
+    const profileIds = [...new Set(parsed.profileIds)];
+    const groupIds = parsed.mode === 'page-bumper' ? [] : [...new Set(parsed.groupIds)];
+    const pageIds = [...new Set(parsed.pageIds)];
+    this.db
+      .prepare(
+        `INSERT INTO group_bumper_scheduled_tasks(
+           id, mode, profile_ids, group_ids, page_ids, scheduled_at, status, status_reason, run_id, created_at, started_at, finished_at
+         ) VALUES(?,?,?,?,?,?,'scheduled','',NULL,?,NULL,NULL)`,
+      )
+      .run(
+        id,
+        parsed.mode,
+        JSON.stringify(profileIds),
+        JSON.stringify(groupIds),
+        JSON.stringify(pageIds),
+        parsed.scheduledAt,
+        now,
+      );
+    const row = this.db
+      .prepare('SELECT * FROM group_bumper_scheduled_tasks WHERE id=?')
+      .get(id) as Record<string, unknown>;
+    return this.mapScheduledTaskRow(row);
+  }
+  updateScheduledTask(
+    id: string,
+    patch: {
+      status?: BumperScheduledTaskValue['status'] | undefined;
+      statusReason?: string | undefined;
+      runId?: string | null | undefined;
+      startedAt?: number | null | undefined;
+      finishedAt?: number | null | undefined;
+    },
+  ): BumperScheduledTaskValue | null {
+    const validId = z.uuid().parse(id);
+    const existing = this.db
+      .prepare('SELECT * FROM group_bumper_scheduled_tasks WHERE id=?')
+      .get(validId) as Record<string, unknown> | undefined;
+    if (!existing) return null;
+    const current = this.mapScheduledTaskRow(existing);
+    const nextStatus = patch.status ?? current.status;
+    const nextReason =
+      patch.statusReason !== undefined ? patch.statusReason.slice(0, 400) : current.statusReason;
+    const nextRunId = patch.runId !== undefined ? patch.runId : current.runId;
+    const nextStartedAt = patch.startedAt !== undefined ? patch.startedAt : current.startedAt;
+    const nextFinishedAt = patch.finishedAt !== undefined ? patch.finishedAt : current.finishedAt;
+    this.db
+      .prepare(
+        `UPDATE group_bumper_scheduled_tasks
+            SET status=?, status_reason=?, run_id=?, started_at=?, finished_at=?
+          WHERE id=?`,
+      )
+      .run(nextStatus, nextReason, nextRunId, nextStartedAt, nextFinishedAt, validId);
+    const updated = this.db
+      .prepare('SELECT * FROM group_bumper_scheduled_tasks WHERE id=?')
+      .get(validId) as Record<string, unknown>;
+    return this.mapScheduledTaskRow(updated);
+  }
+  deleteScheduledTask(id: string): boolean {
+    const validId = z.uuid().parse(id);
+    const changes = Number(
+      this.db.prepare('DELETE FROM group_bumper_scheduled_tasks WHERE id=?').run(validId).changes,
+    );
+    return changes > 0;
   }
 }

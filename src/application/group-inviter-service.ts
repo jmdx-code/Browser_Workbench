@@ -15,6 +15,7 @@ import {
   type BumperTarget,
 } from '../shared/group-bumper.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
+import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { ProfileTaskResultValue } from '../shared/task-contracts.js';
 import { admitProfilesForStart } from './profile-start-admission.js';
 import type { FeatureExecutionRegistry } from './feature-execution-registry.js';
@@ -199,6 +200,12 @@ export class GroupInviterService {
     ) => Promise<BumperRefreshResult | void>,
     private readonly stopAvatarRefresh?: () => void,
   ) {}
+
+  private profileLifecycle?: ProfileLifecyclePort;
+
+  setProfileLifecycle(lifecycle: ProfileLifecyclePort): void {
+    this.profileLifecycle = lifecycle;
+  }
 
   hasActiveExecution(): boolean {
     return (
@@ -396,6 +403,20 @@ export class GroupInviterService {
     }
     let admittedBatch: Set<string> | null = null;
     try {
+      if (this.profileLifecycle && this.runner && candidateProfiles.length > 0) {
+        const offlineCandidates: string[] = [];
+        for (const id of candidateProfiles) {
+          if (this.runner.isProfileReady(id)) continue;
+          const busyElsewhere =
+            (this.featureExecution
+              ? await this.featureExecution.isProfileBusy(id, 'group-inviter')
+              : false) || Boolean(await this.runner.isProfileBusy?.(id));
+          if (!busyElsewhere) offlineCandidates.push(id);
+        }
+        if (offlineCandidates.length > 0) {
+          await this.profileLifecycle.ensureProfilesOnline(offlineCandidates);
+        }
+      }
       const admission = await admitProfilesForStart({
         requestedProfileIds: candidateProfiles,
         currentModuleId: 'group-inviter',
@@ -851,14 +872,24 @@ export class GroupInviterService {
                 },
               });
             } catch (err) {
-              if (err instanceof ProductError && err.code === 'GROUP_INVITER_GROUP_UNINVITABLE') {
-                run.profileStatus.set(profileId, err.message);
+              const isSkippableGroupError =
+                (err instanceof ProductError &&
+                  (err.code === 'GROUP_INVITER_GROUP_UNINVITABLE' ||
+                    err.code === 'GROUP_INVITER_GROUP_NOT_READY' ||
+                    err.code === 'GROUP_INVITER_GROUP_CHANGED')) ||
+                (err instanceof Error && err.message === 'GROUP_INVITER_CURRENT_GROUP_CHANGED');
+              if (isSkippableGroupError) {
+                const skipMsg =
+                  err instanceof ProductError
+                    ? err.message
+                    : `跳过：小组页面已跳转或无法直接加入 · ${group.groupName.slice(0, 10)}`;
+                run.profileStatus.set(profileId, skipMsg);
                 devDiag.record({
                   level: 'INFO',
                   category: 'GROUP_INVITER',
                   event: 'GROUP_INVITER_GROUP_SKIPPED',
                   profileId,
-                  reason: err.code,
+                  reason: err instanceof ProductError ? err.code : 'GROUP_INVITER_GROUP_CHANGED',
                   data: { runId: run.id, groupId: group.groupId },
                 });
                 if (pending.length > 0) {

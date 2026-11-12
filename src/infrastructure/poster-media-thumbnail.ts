@@ -5,8 +5,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MediaRuntimeComponent } from './media-runtime-component.js';
 
-export const MAX_POSTER_THUMBNAIL_DIM = 120;
-export const MAX_POSTER_THUMBNAIL_DATA_URL_BYTES = 24 * 1024;
+export const MAX_POSTER_THUMBNAIL_DIM = 480;
+export const MAX_POSTER_THUMBNAIL_DATA_URL_BYTES = 96 * 1024;
 
 export async function encodeImageBufferToPosterThumbnail(
   bytes: Buffer | Uint8Array,
@@ -93,7 +93,7 @@ export function decodePosterThumbnailDataUrl(
   if (!match?.[1] || !match[2]) return null;
   try {
     const bytes = Buffer.from(match[2], 'base64');
-    if (bytes.byteLength < 8 || bytes.byteLength > 48 * 1024) return null;
+    if (bytes.byteLength < 8 || bytes.byteLength > 128 * 1024) return null;
     return { bytes, contentType: match[1].toLowerCase() };
   } catch {
     return null;

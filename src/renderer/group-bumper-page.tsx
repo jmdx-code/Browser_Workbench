@@ -5,8 +5,10 @@ import type { TargetFolder } from '../shared/target-list.js';
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
+import { collectAllPaginatedLogs, formatBumperLogsAsTsv } from '../shared/log-table-copy.js';
 import { GroupDraftGrid } from './group-inviter-page.js';
 import { extractGroupId, type DraftGroupEntry } from './group-inviter-grid.js';
+import type { BluestacksState } from '../shared/bluestacks.js';
 import {
   extractBumperPageId,
   type BumperReactionType,
@@ -15,6 +17,7 @@ import {
   type BumperTarget,
   type BumperLog,
 } from '../shared/group-bumper.js';
+import { BumperScheduleModal, BumperScheduledTasksBar } from './modules/bumper-schedule-modal.js';
 
 const REACTION_OPTIONS: ReadonlyArray<{ type: BumperReactionType; label: string }> = [
   { type: 'like', label: '👍 赞' },
@@ -84,10 +87,13 @@ type BumperPageProps = {
     name?: string | null;
     browserName?: string | null;
     alias?: string | null;
+    online?: boolean | undefined;
   }>;
   onState: (s: BumperState) => void;
   onMessage: (s: string) => void;
-  mode?: 'group-bumper' | 'page-bumper';
+  mode?: 'group-bumper' | 'page-bumper' | 'bluestacks-group-bumper';
+  bluestacksState?: BluestacksState | null | undefined;
+  onBluestacksState?: ((s: BluestacksState) => void) | undefined;
 };
 /** 专页顶贴：复用顶贴页面与执行器，直接进入专页主页按时间线顶贴。 */
 export function PageBumperPage(props: Omit<BumperPageProps, 'mode'>) {
@@ -100,36 +106,63 @@ export function GroupBumperPage({
   onState,
   onMessage,
   mode = 'group-bumper',
+  bluestacksState,
+  onBluestacksState,
 }: BumperPageProps) {
   const pageMode = mode === 'page-bumper';
-  const isRunning = pageMode ? !!state?.pageBumperRunning : !!state?.running;
-  const statusText = pageMode ? state?.pageBumperStatusText : state?.statusText;
-  const effectiveStateSettings = pageMode
-    ? (state?.pageSettings ?? state?.settings ?? null)
-    : (state?.settings ?? null);
+  const bluestacksMode = mode === 'bluestacks-group-bumper';
+  const isRunning = bluestacksMode
+    ? Boolean(bluestacksState?.running)
+    : pageMode
+      ? !!state?.pageBumperRunning
+      : !!state?.running;
+  const statusText = bluestacksMode
+    ? bluestacksState?.statusText
+    : pageMode
+      ? state?.pageBumperStatusText
+      : state?.statusText;
+  const effectiveStateSettings = bluestacksMode
+    ? (bluestacksState?.bumperSettings ?? state?.settings ?? null)
+    : pageMode
+      ? (state?.pageSettings ?? state?.settings ?? null)
+      : (state?.settings ?? null);
   const settingsActionName = pageMode ? 'page-settings' : 'settings';
   const commentsActionName = pageMode ? 'page-comments' : 'comments';
   const effectiveComments = pageMode
     ? (state?.pageComments ?? state?.comments ?? [])
     : (state?.comments ?? []);
-  const effectiveTotal = pageMode ? (state?.pageTotal ?? state?.total ?? 0) : (state?.total ?? 0);
-  const effectiveDailyStats = pageMode
-    ? (state?.pageDailyStats ?? state?.dailyStats ?? [])
-    : (state?.dailyStats ?? []);
-  const runningIds = new Set(
-    [
-      ...Object.entries(state?.profileCounts ?? {}),
-      ...Object.entries(state?.pageBumperProfileCounts ?? {}),
-    ]
-      .filter(([, stat]) => stat.running)
-      .map(([id]) => id),
-  );
+  const effectiveTotal = bluestacksMode
+    ? (bluestacksState?.total ?? state?.total ?? 0)
+    : pageMode
+      ? (state?.pageTotal ?? state?.total ?? 0)
+      : (state?.total ?? 0);
+  const effectiveDailyStats = bluestacksMode
+    ? (bluestacksState?.dailyStats ?? state?.dailyStats ?? [])
+    : pageMode
+      ? (state?.pageDailyStats ?? state?.dailyStats ?? [])
+      : (state?.dailyStats ?? []);
+  const runningIds = bluestacksMode
+    ? new Set(
+        Object.entries(bluestacksState?.profileCounts ?? {})
+          .filter(([, stat]) => stat.running)
+          .map(([id]) => id),
+      )
+    : new Set(
+        [
+          ...Object.entries(state?.profileCounts ?? {}),
+          ...Object.entries(state?.pageBumperProfileCounts ?? {}),
+        ]
+          .filter(([, stat]) => stat.running)
+          .map(([id]) => id),
+      );
   const idleSelected = [...selected].filter((id) => !runningIds.has(id));
   const [chosenGroups, setGroups] = useState<Set<string>>(new Set()),
-    [chosenPages, setPages] = useState<Set<string>>(new Set());
+    [chosenPages, setPages] = useState<Set<string>>(new Set()),
+    [scheduleOpen, setScheduleOpen] = useState(false);
   useEffect(() => {
     setGroups(new Set());
     setPages(new Set());
+    setScheduleOpen(false);
   }, [mode]);
   const [folders, setFolders] = useState<{ groups: TargetFolder[]; pages: TargetFolder[] }>({
     groups: [],
@@ -170,13 +203,50 @@ export function GroupBumperPage({
   const [logs, setLogs] = useState<BumperLog[]>([]),
     [logSearch, setLogSearch] = useState(''),
     [logScopeFilter, setLogScopeFilter] = useState<'current' | 'all'>('current'),
-    [logSelected, setLogSelected] = useState<Set<string>>(new Set());
+    [logSelected, setLogSelected] = useState<Set<string>>(new Set()),
+    [copyingLogs, setCopyingLogs] = useState(false);
+  const loadedLogKeyRef = useRef('');
   async function action(name: string, input: unknown = {}) {
     setBusy(true);
     setError('');
     try {
       const next = await api.bumperAction(name, input);
       onState(next);
+      return next;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '操作失败';
+      setError(message);
+      onMessage(message);
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function saveSettings(next: BumperSettings) {
+    if (bluestacksMode) {
+      setBusy(true);
+      setError('');
+      try {
+        const updated = await api.bluestacksAction('settings', next);
+        onBluestacksState?.(updated);
+        return updated;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : '操作失败';
+        setError(message);
+        onMessage(message);
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    }
+    return action(settingsActionName, next);
+  }
+  async function runBluestacksAction(name: string, input: unknown = {}) {
+    setBusy(true);
+    setError('');
+    try {
+      const next = await api.bluestacksAction(name, input);
+      onBluestacksState?.(next);
       return next;
     } catch (e) {
       const message = e instanceof Error ? e.message : '操作失败';
@@ -202,10 +272,51 @@ export function GroupBumperPage({
     try {
       const sourceMode = scope === 'current' ? (pageMode ? 'page' : 'group') : undefined;
       const values = await api.bumperLogs(search, before, beforeId, sourceMode);
+      loadedLogKeyRef.current = `${scope}|${search}`;
       setLogs((old) => (before ? [...old, ...values] : values));
       if (!before) setLogSelected(new Set());
     } catch (e) {
       onMessage(e instanceof Error ? e.message : '记录读取失败');
+    }
+  }
+  async function copyBumperLogs() {
+    if (copyingLogs) return;
+    setCopyingLogs(true);
+    try {
+      const sourceMode = logScopeFilter === 'current' ? (pageMode ? 'page' : 'group') : undefined;
+      let targetRows: BumperLog[];
+      if (logSelected.size > 0) {
+        targetRows = logs.filter((l) => logSelected.has(l.id));
+      } else {
+        const expectedKey = `${logScopeFilter}|${logSearch}`;
+        const seedRows =
+          logs.length > 0 && loadedLogKeyRef.current === expectedKey
+            ? logs
+            : await api.bumperLogs(logSearch, undefined, undefined, sourceMode);
+        if (loadedLogKeyRef.current !== expectedKey) {
+          loadedLogKeyRef.current = expectedKey;
+          setLogs(seedRows);
+        }
+        targetRows = await collectAllPaginatedLogs({
+          initialRows: seedRows,
+          getTimestamp: (r) => r.bumpedAt,
+          fetchPage: (before, beforeId) => api.bumperLogs(logSearch, before, beforeId, sourceMode),
+        });
+      }
+      if (!targetRows.length) {
+        onMessage('当前没有可复制的顶贴记录');
+        return;
+      }
+      await copyTextToClipboard(formatBumperLogsAsTsv(targetRows, profiles ?? []));
+      onMessage(
+        logSelected.size > 0
+          ? `已批量复制已选 ${targetRows.length} 条顶贴记录，可直接粘贴到表格`
+          : `已批量复制全部 ${targetRows.length} 条顶贴记录，可直接粘贴到表格`,
+      );
+    } catch (e) {
+      onMessage(e instanceof Error ? e.message : '复制顶贴记录失败');
+    } finally {
+      setCopyingLogs(false);
     }
   }
   async function open(kind: NonNullable<typeof modal>) {
@@ -283,6 +394,14 @@ export function GroupBumperPage({
             latestSettingsRef.current = next;
             dirtySettingsRef.current = false;
             setSettings(next);
+            if (bluestacksMode) {
+              return api
+                .bluestacksAction('settings', next)
+                .then((s) => {
+                  onBluestacksState?.(s);
+                })
+                .catch(() => {});
+            }
             return api
               .bumperAction(settingsActionName, next)
               .then((s) => {
@@ -313,31 +432,33 @@ export function GroupBumperPage({
               latestSettingsRef.current = next;
               dirtySettingsRef.current = false;
               setSettings(next);
-              void action(settingsActionName, next);
+              void saveSettings(next);
             }}
           />
           <span>开启声音</span>
         </label>
-        <label className="bumper-policy-field bumper-sound-toggle">
-          <input
-            type="checkbox"
-            aria-label="长按选表情"
-            checked={Boolean(settings.useLongPressReaction)}
-            onChange={(e) => {
-              const base = latestSettingsRef.current ?? settings;
-              const next = normalizeBumperSettings(
-                { ...base, useLongPressReaction: e.target.checked },
-                effectiveStateSettings ?? base,
-              );
-              latestSettingsRef.current = next;
-              dirtySettingsRef.current = false;
-              setSettings(next);
-              void action(settingsActionName, next);
-            }}
-          />
-          <span>长按选表情</span>
-        </label>
-        {settings.useLongPressReaction && (
+        {!bluestacksMode && (
+          <label className="bumper-policy-field bumper-sound-toggle">
+            <input
+              type="checkbox"
+              aria-label="长按选表情"
+              checked={Boolean(settings.useLongPressReaction)}
+              onChange={(e) => {
+                const base = latestSettingsRef.current ?? settings;
+                const next = normalizeBumperSettings(
+                  { ...base, useLongPressReaction: e.target.checked },
+                  effectiveStateSettings ?? base,
+                );
+                latestSettingsRef.current = next;
+                dirtySettingsRef.current = false;
+                setSettings(next);
+                void saveSettings(next);
+              }}
+            />
+            <span>长按选表情</span>
+          </label>
+        )}
+        {!bluestacksMode && settings.useLongPressReaction && (
           <div className="bumper-reaction-badges" role="group" aria-label="表情类型选择">
             {REACTION_OPTIONS.map((opt) => {
               const checked = activeReactions.includes(opt.type);
@@ -362,7 +483,7 @@ export function GroupBumperPage({
                     latestSettingsRef.current = next;
                     dirtySettingsRef.current = false;
                     setSettings(next);
-                    void action(settingsActionName, next);
+                    void saveSettings(next);
                   }}
                 >
                   {opt.label}
@@ -420,33 +541,54 @@ export function GroupBumperPage({
   const showStatusBadge = Boolean(
     isRunning ||
     (statusText &&
-      !['请选择账号、小组和目标主页', '请选择账号和目标专页', '本轮已结束', '正在读取…'].includes(
-        statusText,
-      )),
+      ![
+        '请选择账号、小组和目标主页',
+        '请选择模拟器窗口、小组和目标主页',
+        '请选择账号和目标专页',
+        '本轮已结束',
+        '正在读取…',
+      ].includes(statusText)),
   );
   const startDisabled =
     busy || !idleSelected.length || (!pageMode && !selectedGroups.length) || !selectedPages.length;
+  const scheduleDisabled =
+    busy || selected.size === 0 || (!pageMode && !selectedGroups.length) || !selectedPages.length;
+  const offlineSelectedCount = profiles
+    ? [...selected].filter((id) => profiles.find((p) => p.id === id)?.online === false).length
+    : 0;
+  const flushSettingsIfDirty = async () => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const currentCandidate = latestSettingsRef.current ?? settings;
+    if (currentCandidate) {
+      const normalized = normalizeBumperSettings(
+        currentCandidate,
+        effectiveStateSettings ?? currentCandidate,
+      );
+      if (
+        dirtySettingsRef.current ||
+        JSON.stringify(normalized) !== JSON.stringify(effectiveStateSettings)
+      ) {
+        dirtySettingsRef.current = false;
+        latestSettingsRef.current = normalized;
+        setSettings(normalized);
+        await saveSettings(normalized);
+      }
+    }
+  };
   const startRun = () => {
     void (async () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
-      const currentCandidate = latestSettingsRef.current ?? settings;
-      if (currentCandidate) {
-        const normalized = normalizeBumperSettings(
-          currentCandidate,
-          effectiveStateSettings ?? currentCandidate,
-        );
-        if (
-          dirtySettingsRef.current ||
-          JSON.stringify(normalized) !== JSON.stringify(effectiveStateSettings)
-        ) {
-          dirtySettingsRef.current = false;
-          latestSettingsRef.current = normalized;
-          setSettings(normalized);
-          await action(settingsActionName, normalized);
-        }
+      await flushSettingsIfDirty();
+      if (bluestacksMode) {
+        const next = await runBluestacksAction('bumper/start', {
+          profileIds: idleSelected,
+          groupIds: selectedGroups,
+          pageIds: selectedPages,
+        });
+        if (next) void api.bumperState().then(onState, () => {});
+        return;
       }
       await action(
         pageMode ? 'start-page' : 'start',
@@ -490,7 +632,7 @@ export function GroupBumperPage({
                       latestSettingsRef.current = next;
                       dirtySettingsRef.current = false;
                       setSettings(next);
-                      void action(settingsActionName, next);
+                      void saveSettings(next);
                     }}
                   >
                     <option value="time_sort">1. 时间排序查找</option>
@@ -543,7 +685,10 @@ export function GroupBumperPage({
                       {pageMode
                         ? renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')
                         : renderSettingInput('maxPostsPerGroupPage', '每组每主页最多扫帖')}
-                      {renderSettingInput('maxConcurrentProfiles', '最大并发浏览器数')}
+                      {renderSettingInput(
+                        'maxConcurrentProfiles',
+                        bluestacksMode ? '最大并发模拟器数' : '最大并发浏览器数',
+                      )}
                     </div>
                   </div>
                 )}
@@ -553,26 +698,98 @@ export function GroupBumperPage({
               <>
                 {idleSelected.length > 0 && (
                   <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
-                    ▶ 追加运行已选闲置号 ({idleSelected.length}号)
+                    {bluestacksMode
+                      ? `▶ 追加运行已选闲置窗口 (${idleSelected.length}窗)`
+                      : `▶ 追加运行已选闲置号 (${idleSelected.length}号)`}
+                  </button>
+                )}
+                {!bluestacksMode && (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={scheduleDisabled}
+                    onClick={() => setScheduleOpen(true)}
+                  >
+                    ⏰ 定时任务
                   </button>
                 )}
                 <button
                   className="btn btn-danger"
-                  onClick={() => void action(pageMode ? 'stop-page' : 'stop')}
+                  onClick={() =>
+                    void (bluestacksMode
+                      ? runBluestacksAction('bumper/stop', {})
+                      : action(pageMode ? 'stop-page' : 'stop'))
+                  }
                 >
                   ■ 停止全部运行
                 </button>
               </>
             ) : (
-              <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
-                {pageMode
-                  ? `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedPages.length}专页)`
-                  : `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`}
-              </button>
+              <>
+                <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
+                  {pageMode
+                    ? `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedPages.length}专页)`
+                    : bluestacksMode
+                      ? `▶ 开始运行 (已选${idleSelected.length}窗 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`
+                      : `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`}
+                </button>
+                {!bluestacksMode && (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={scheduleDisabled}
+                    onClick={() => setScheduleOpen(true)}
+                  >
+                    ⏰ 定时任务
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>
       </div>
+      {!bluestacksMode && (
+        <BumperScheduledTasksBar
+          mode={pageMode ? 'page-bumper' : 'group-bumper'}
+          tasks={state?.scheduledTasks ?? []}
+          busy={busy}
+          onCancelTask={async (taskId) => {
+            const next = await action('tasks/cancel', { id: taskId });
+            if (next) onMessage('已取消定时顶贴任务');
+          }}
+          onDeleteTask={async (taskId) => {
+            await action('tasks/delete', { id: taskId });
+          }}
+        />
+      )}
+      {!bluestacksMode && scheduleOpen && (
+        <BumperScheduleModal
+          mode={pageMode ? 'page-bumper' : 'group-bumper'}
+          profileIds={[...selected]}
+          offlineSelectedCount={offlineSelectedCount}
+          groupIds={pageMode ? [] : selectedGroups}
+          pageIds={selectedPages}
+          busy={busy}
+          onClose={() => setScheduleOpen(false)}
+          onSubmit={async (scheduledAt) => {
+            await flushSettingsIfDirty();
+            const next = await action('tasks/create', {
+              mode: pageMode ? 'page-bumper' : 'group-bumper',
+              profileIds: [...selected],
+              groupIds: pageMode ? [] : selectedGroups,
+              pageIds: selectedPages,
+              scheduledAt,
+            });
+            if (next) {
+              onMessage(
+                `已创建${pageMode ? '专页顶贴' : '小组顶贴'}定时任务（将于 ${new Date(scheduledAt).toLocaleString()} 自动启动）`,
+              );
+              return true;
+            }
+            return false;
+          }}
+        />
+      )}
       <div className={'bumper-columns' + (pageMode ? ' is-single' : '')}>
         {!pageMode && targets('groups', state?.groups ?? [])}
         {targets('pages', state?.pages ?? [])}
@@ -709,8 +926,22 @@ export function GroupBumperPage({
                           .filter(Boolean),
                         consumeCommentOnUse: consume,
                         baseComments: commentBaseRef.current,
-                      }).then((next) => {
-                        if (next) setModal(null);
+                      }).then(async (next) => {
+                        if (!next) return;
+                        if (
+                          bluestacksMode &&
+                          settings &&
+                          consume !== settings.consumeCommentOnUse
+                        ) {
+                          const synced = normalizeBumperSettings(
+                            { ...settings, consumeCommentOnUse: consume },
+                            effectiveStateSettings ?? settings,
+                          );
+                          latestSettingsRef.current = synced;
+                          setSettings(synced);
+                          await saveSettings(synced);
+                        }
+                        setModal(null);
                       })
                     }
                   >
@@ -747,16 +978,50 @@ export function GroupBumperPage({
                     搜索
                   </button>
                   <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={
+                      copyingLogs ||
+                      (!logs.length &&
+                        (logScopeFilter === 'all'
+                          ? (state?.total ?? 0) + (state?.pageTotal ?? 0) === 0
+                          : !effectiveTotal))
+                    }
+                    onClick={() => void copyBumperLogs()}
+                  >
+                    {copyingLogs
+                      ? '正在复制…'
+                      : logSelected.size > 0
+                        ? `批量复制已选 (${logSelected.size})`
+                        : `批量复制全部 (${
+                            logSearch.trim()
+                              ? logs.length
+                              : logScopeFilter === 'all'
+                                ? (state?.total ?? 0) + (state?.pageTotal ?? 0)
+                                : effectiveTotal || logs.length
+                          })`}
+                  </button>
+                  <button
                     className="btn"
                     disabled={
                       !logSelected.size ||
                       busy ||
                       (logScopeFilter === 'all'
-                        ? Boolean(state?.running || state?.pageBumperRunning)
+                        ? Boolean(
+                            state?.running || state?.pageBumperRunning || bluestacksState?.running,
+                          )
                         : isRunning)
                     }
                     onClick={() =>
-                      void action('logs/delete', { ids: [...logSelected] }).then(() => loadLogs())
+                      void action('logs/delete', { ids: [...logSelected] }).then(async () => {
+                        if (bluestacksMode) {
+                          await api.bluestacksState(false).then(
+                            (s) => onBluestacksState?.(s),
+                            () => {},
+                          );
+                        }
+                        await loadLogs();
+                      })
                     }
                   >
                     删除已选 ({logSelected.size})
@@ -769,16 +1034,24 @@ export function GroupBumperPage({
                         : !effectiveTotal) ||
                       busy ||
                       (logScopeFilter === 'all'
-                        ? Boolean(state?.running || state?.pageBumperRunning)
+                        ? Boolean(
+                            state?.running || state?.pageBumperRunning || bluestacksState?.running,
+                          )
                         : isRunning)
                     }
                     onClick={() => {
                       const sourceMode =
                         logScopeFilter === 'current' ? (pageMode ? 'page' : 'group') : undefined;
                       if (confirm('清空全部顶贴记录？清空后对应的历史防重和次数统计也会清除。'))
-                        void action('logs/delete', { all: true, sourceMode }).then(() =>
-                          loadLogs(),
-                        );
+                        void action('logs/delete', { all: true, sourceMode }).then(async () => {
+                          if (bluestacksMode) {
+                            await api.bluestacksState(false).then(
+                              (s) => onBluestacksState?.(s),
+                              () => {},
+                            );
+                          }
+                          await loadLogs();
+                        });
                     }}
                   >
                     清空历史记录

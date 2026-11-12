@@ -9,7 +9,7 @@ import { BUMPER_REACTION_IDS, projectBumperReactionTarget } from './bumper-react
 import { readBumperReactionFromServer } from './bumper-reaction-read.js';
 import { randomUUID, createHash } from 'node:crypto';
 import type { Page, Response, Request, Locator } from 'playwright-core';
-import type { Core } from '../bridge/core.js';
+import type { Core, Peer } from '../bridge/core.js';
 import type { KernelBridge } from './kernel-bridge.js';
 import type { BumperRunner } from '../application/group-bumper-service.js';
 import type { CompatibleRepository } from '../domain/persistence.js';
@@ -45,7 +45,10 @@ import {
   type AccountAbnormalState,
   type GlobalAccountAbnormalReporter,
 } from '../application/account-abnormal-reporter.js';
-import { readGroupInvitationState } from './group-inviter-effects.js';
+import {
+  dismissFeatureInterventionDialogIfPresent,
+  readGroupInvitationState,
+} from './group-inviter-effects.js';
 import { prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
@@ -945,6 +948,18 @@ export function isBumperFatal(error: unknown): boolean {
       ))
   );
 }
+export function isBumperRecoverableDisconnectError(error: unknown): boolean {
+  if (error instanceof BumperSetupUnconfirmed) return true;
+  if (error instanceof BumperFatalError) {
+    return /^浏览器连接已变化$/.test(error.message);
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  if (/受限|验证|封禁|已停止|登录账号已变化|结果保存失败|连续 3 次互动结果未确认/.test(msg))
+    return false;
+  return /KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|CONTROL_STOPPED|RPC_SEND_UNKNOWN|FENCED|CONTEXT|LEASE|BOUND_EXECUTION|OPERATION_CONTEXT|RPC_RESULT_UNKNOWN)|SESSION_CHANGED|CONNECTION_CHANGED|Target.*closed|Browser.*closed|FRAME_DETACHED|浏览器连接已变化|账号控制已失效|Execution context was destroyed/i.test(
+    msg,
+  );
+}
 export async function centerBumperControl(locator: Locator, paceScale = 1, timeout = 4000) {
   await locator.evaluate(
     (el) => el.scrollIntoView({ block: 'center', inline: 'center' }),
@@ -1044,7 +1059,9 @@ export async function revealBumperControlIfNeeded(
     (el) => {
       if (!(el instanceof HTMLElement)) return false;
       const vh = window.innerHeight || document.documentElement.clientHeight || 800;
-      const banner = document.querySelector('[role="banner"]');
+      const banner = document.querySelector(
+        '[role="banner"], [role="navigation"][aria-label="Facebook"]',
+      );
       const bannerBottom = banner ? Math.max(0, banner.getBoundingClientRect().bottom) : 56;
       const topSafe = Math.min(Math.max(68, Math.ceil(bannerBottom + 12)), Math.floor(vh * 0.35));
       const bottomSafe = vh - 20;
@@ -1197,14 +1214,24 @@ export async function executeBumperOperation<T>(input: {
     value = result.value.value;
     if (!(await input.verify(value))) throw Error(input.label + '结果待核对，未重发');
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
+    const rawReason = error instanceof Error ? error.message : String(error);
+    const reason =
+      rawReason
+        .replace(/\u001b\[[0-9;]*m/g, '')
+        .split(/\r?\nCall log:/)[0]
+        ?.trim() || rawReason;
     if (mutations() === before) {
       const resolution = input.settlement
         ? await input.settlement.save(makeResolution('NOT_APPLIED', reason))
         : makeResolution('NOT_APPLIED', reason);
       if (resolution.outcome !== 'ENDED_UNKNOWN') {
-        await conn.reconcile(input.binding, { ...resolution, outcome: resolution.outcome });
-        await input.settlement?.settled();
+        try {
+          await conn.reconcile(input.binding, { ...resolution, outcome: resolution.outcome });
+          await input.settlement?.settled();
+        } catch {
+          // If the connection is already disconnected, keep the saved NOT_APPLIED resolution
+          // in SQLite so recoverBumperOperations can notify and settle it upon reconnect.
+        }
       }
     } else if (input.settlement?.auxiliary) {
       await input.settlement.save(makeResolution('ENDED_UNKNOWN', reason));
@@ -1280,6 +1307,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     private readonly isBusy: (id: string) => Promise<boolean>,
     private readonly paceScale = 1,
     private onAccountAbnormal?: GlobalAccountAbnormalReporter,
+    private readonly clock?: {
+      now?: () => number;
+      sleep?: (ms: number) => Promise<void>;
+    },
   ) {}
   setAccountAbnormalReporter(reporter: GlobalAccountAbnormalReporter) {
     this.onAccountAbnormal = reporter;
@@ -1826,46 +1857,63 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     const updatedIds = new Set<string>();
     const browserQueue: BumperTarget[] = [];
 
-    for (const item of items) {
-      if (batchSignal?.aborted) break;
-      try {
-        const meta = await resolveBumperTargetMetadata(kind, item.id, batchSignal);
-        if (batchSignal?.aborted) break;
-        if (!meta.avatarUrl) {
-          if (isLocalAvatar(item.avatarUrl)) {
-            meta.avatarUrl = item.avatarUrl;
-          } else if (typeof item.avatarUrl === 'string' && item.avatarUrl.startsWith('https://')) {
-            meta.avatarUrl = await fetchAndLocalizeAvatar(item.avatarUrl, batchSignal);
+    const browserQueueSlots: Array<BumperTarget | null> = new Array(items.length).fill(null);
+    let nextHttpIdx = 0;
+    const httpWorkerCount = Math.min(5, Math.max(1, items.length));
+    await Promise.all(
+      Array.from({ length: httpWorkerCount }, async () => {
+        for (;;) {
+          if (batchSignal?.aborted) break;
+          const idx = nextHttpIdx++;
+          if (idx >= items.length) break;
+          const item = items[idx];
+          if (!item) continue;
+          try {
+            const meta = await resolveBumperTargetMetadata(kind, item.id, batchSignal);
+            if (batchSignal?.aborted) break;
+            if (!meta.avatarUrl) {
+              if (isLocalAvatar(item.avatarUrl)) {
+                meta.avatarUrl = item.avatarUrl;
+              } else if (
+                typeof item.avatarUrl === 'string' &&
+                item.avatarUrl.startsWith('https://')
+              ) {
+                meta.avatarUrl = await fetchAndLocalizeAvatar(item.avatarUrl, batchSignal);
+              }
+            }
+            if (batchSignal?.aborted) break;
+            const hasNewMeta = Boolean(
+              meta.name || meta.avatarUrl || (meta.canonicalId && meta.canonicalId !== item.id),
+            );
+            if (hasNewMeta) {
+              if (await this.repo.applyResolvedTargetMetadata(kind, item.id, meta)) {
+                updatedIds.add(item.id);
+                options?.onUpdated?.();
+              }
+            }
+            const effectiveTarget = {
+              id: meta.canonicalId ?? item.id,
+              name: meta.name ?? item.name,
+              avatarUrl: meta.avatarUrl ?? (isLocalAvatar(item.avatarUrl) ? item.avatarUrl : null),
+            };
+            if (!isTargetIncomplete(effectiveTarget)) {
+              updatedIds.add(item.id);
+            } else {
+              browserQueueSlots[idx] = {
+                ...item,
+                id: effectiveTarget.id,
+                name: effectiveTarget.name,
+                avatarUrl: effectiveTarget.avatarUrl ?? item.avatarUrl,
+              };
+            }
+          } catch {
+            browserQueueSlots[idx] = item;
           }
         }
-        if (batchSignal?.aborted) break;
-        const hasNewMeta = Boolean(
-          meta.name || meta.avatarUrl || (meta.canonicalId && meta.canonicalId !== item.id),
-        );
-        if (hasNewMeta) {
-          if (await this.repo.applyResolvedTargetMetadata(kind, item.id, meta)) {
-            updatedIds.add(item.id);
-            options?.onUpdated?.();
-          }
-        }
-        const effectiveTarget = {
-          id: meta.canonicalId ?? item.id,
-          name: meta.name ?? item.name,
-          avatarUrl: meta.avatarUrl ?? (isLocalAvatar(item.avatarUrl) ? item.avatarUrl : null),
-        };
-        if (kind !== 'pages' && !isTargetIncomplete(effectiveTarget)) {
-          updatedIds.add(item.id);
-        } else {
-          browserQueue.push({
-            ...item,
-            id: effectiveTarget.id,
-            name: effectiveTarget.name,
-            avatarUrl: effectiveTarget.avatarUrl ?? item.avatarUrl,
-          });
-        }
-      } catch {
-        browserQueue.push(item);
-      }
+      }),
+    );
+    for (const queued of browserQueueSlots) {
+      if (queued) browserQueue.push(queued);
     }
 
     if (browserQueue.length > 0 && !batchSignal?.aborted) {
@@ -1913,13 +1961,21 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     const kernel = this.kernel(),
       peer = this.core()?.peers.get(id);
     try {
-      if (
-        kernel &&
-        peer?.online &&
-        peer.synced &&
-        peer.phase === 'PAUSED' &&
-        peer.epoch !== stop.peerEpoch
-      ) {
+      if (!peer || !peer.online || !peer.synced) {
+        await connection.closeLocalAfterDisconnect().catch(() => {});
+        stop.failed = true;
+        throw Error('BUMPER_STOP_AWAITING_RECONNECT');
+      } else if (kernel && peer.epoch !== stop.peerEpoch) {
+        if (peer.phase !== 'PAUSED') {
+          await this.core()
+            ?.reconcileRecoveringPeerIfPossible?.(id)
+            .catch(() => false);
+        }
+        if (peer.phase !== 'PAUSED') {
+          await connection.closeLocalAfterDisconnect().catch(() => {});
+          stop.failed = true;
+          throw Error('BUMPER_STOP_AWAITING_RECONNECT');
+        }
         await connection.closeLocalAfterDisconnect();
         await recoverBumperOperations(kernel, peer, this.repo, () => {
           if (this.core()?.peers.get(id) !== peer || !peer.online || !peer.synced)
@@ -1946,15 +2002,23 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             throw Error('BUMPER_STOP_UNCONFIRMED');
           await connection.confirmReconnectedStop(receipt);
         });
-      } else if (stop.failed) await connection.retryClose(stop.id);
-      else await connection.close(stop.id);
+      } else if (stop.failed) {
+        await connection.retryClose(stop.id);
+      } else {
+        try {
+          await connection.close(stop.id);
+        } catch {
+          stop.failed = true;
+          await connection.stopOnCloseFailure();
+          await connection.retryClose(stop.id);
+        }
+      }
     } catch (error) {
       stop.failed = true;
       throw error;
     }
-    if (this.connections.get(id) !== connection || this.closing.get(id) !== stop) return;
-    this.connections.delete(id);
-    this.closing.delete(id);
+    if (this.connections.get(id) === connection) this.connections.delete(id);
+    if (this.closing.get(id) === stop) this.closing.delete(id);
   }
   async run(
     profileId: string,
@@ -1965,11 +2029,15 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
   ) {
     const kernel = this.kernel(),
       core = this.core(),
-      peer = core?.peers.get(profileId);
-    if (!kernel || !peer) throw Error('浏览器未连接');
+      initialPeer = core?.peers.get(profileId);
+    if (!kernel || !initialPeer) throw Error('浏览器未连接');
+    let peer: Peer = initialPeer;
     if (this.closing.has(profileId)) await this.stop(profileId);
     if (this.connections.has(profileId)) throw Error('BUMPER_PREVIOUS_RUN_ACTIVE');
-    const epoch = peer.epoch;
+    let epoch = peer.epoch;
+    let initialBrowserSessionEpoch: string | null = null;
+    const nowFn = this.clock?.now ?? Date.now;
+    const sleepFn = this.clock?.sleep ?? wait;
     const runId = callbacks.runId ?? randomUUID();
     const scanOnly = callbacks.executionMode === 'scan_only';
     const updateAvatar = async (kind: 'groups' | 'pages', id: string, rawUrl: string) => {
@@ -2008,6 +2076,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     const guard = () => {
       if (callbacks.cancelled()) throw new BumperFatalError('已停止');
       if (
+        !peer ||
         !peer.online ||
         !peer.synced ||
         peer.epoch !== epoch ||
@@ -2015,7 +2084,74 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       )
         throw new BumperFatalError('浏览器连接已变化');
     };
+    const inspectIdleForProfile = async () => {
+      if (core && typeof core.inspectKernelProfileIdle === 'function') {
+        return core.inspectKernelProfileIdle(profileId);
+      }
+      const currentPeer = core?.peers.get(profileId);
+      if (!currentPeer || !currentPeer.online) {
+        return {
+          idle: false,
+          reason: 'PEER_OFFLINE' as const,
+          unresolvedCount: 0,
+          legacyFixtureCount: 0,
+        };
+      }
+      if (!currentPeer.synced) {
+        return {
+          idle: false,
+          reason:
+            currentPeer.phase === 'RECOVERING'
+              ? ('RECOVERING_CONTROL_OR_SYNC' as const)
+              : ('NOT_SYNCED' as const),
+          unresolvedCount: 0,
+          legacyFixtureCount: 0,
+        };
+      }
+      if (currentPeer.phase !== undefined && currentPeer.phase !== 'PAUSED') {
+        return {
+          idle: false,
+          reason:
+            currentPeer.phase === 'STOPPING'
+              ? ('PHASE_STOPPING' as const)
+              : ('RECOVERING_CONTROL_OR_SYNC' as const),
+          unresolvedCount: 0,
+          legacyFixtureCount: 0,
+        };
+      }
+      return { idle: true, reason: 'IDLE' as const, unresolvedCount: 0, legacyFixtureCount: 0 };
+    };
+    const reconcileRecoveringForProfile = async () => {
+      if (core && typeof core.reconcileRecoveringPeerIfPossible === 'function') {
+        return core.reconcileRecoveringPeerIfPossible(profileId);
+      }
+      return false;
+    };
+    type BumperIdentity =
+      | NonNullable<Awaited<ReturnType<typeof kernel.inspectIdleFacebookPage>>>
+      | Awaited<ReturnType<typeof kernel.inspectFacebookIdentity>>;
     const prepareAndConnect = async () => {
+      const activePeer = core?.peers.get(profileId);
+      if (!activePeer || !activePeer.online || !activePeer.synced) {
+        throw Error('BROWSER_OFFLINE');
+      }
+      peer = activePeer;
+      epoch = activePeer.epoch;
+      await FacebookGroupSessionHelper.waitKernelProfileIdle({
+        inspectIdle: inspectIdleForProfile,
+        reconcileRecovering: reconcileRecoveringForProfile,
+        guard: () => {
+          if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+        },
+        timeoutMs: 12_000,
+        clock: { now: nowFn, sleep: sleepFn },
+      });
+      const refreshedPeer = core?.peers.get(profileId);
+      if (!refreshedPeer || !refreshedPeer.online || !refreshedPeer.synced) {
+        throw Error('BROWSER_OFFLINE');
+      }
+      peer = refreshedPeer;
+      epoch = refreshedPeer.epoch;
       const prepared = await prepareFacebookWorkspace(
         kernel,
         peer,
@@ -2024,27 +2160,39 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         undefined,
         true,
       );
+      const sessionEpochFromInventory = (prepared.inventory as { browserSessionEpoch?: string })
+        .browserSessionEpoch;
+      if (typeof sessionEpochFromInventory === 'string' && sessionEpochFromInventory.length > 0) {
+        if (initialBrowserSessionEpoch === null) {
+          initialBrowserSessionEpoch = sessionEpochFromInventory;
+        } else if (sessionEpochFromInventory !== initialBrowserSessionEpoch) {
+          throw new BumperFatalError('浏览器已重启，当前任务已停止');
+        }
+      }
       if (prepared.inventory.operations.some(kernelOperationPending)) {
         await recoverBumperOperations(kernel, peer, this.repo, guard);
       }
-      type BumperIdentity =
-        | NonNullable<Awaited<ReturnType<typeof kernel.inspectIdleFacebookPage>>>
-        | Awaited<ReturnType<typeof kernel.inspectFacebookIdentity>>;
       const waitPeerPaused = async () => {
-        await FacebookGroupSessionHelper.waitPeerPaused(peer, guard, 10_000);
+        await FacebookGroupSessionHelper.waitKernelProfileIdle({
+          inspectIdle: inspectIdleForProfile,
+          reconcileRecovering: reconcileRecoveringForProfile,
+          guard,
+          timeoutMs: 12_000,
+          clock: { now: nowFn, sleep: sleepFn },
+        });
       };
-      let identity: BumperIdentity | null = await kernel
+      let identityResult: BumperIdentity | null = await kernel
         .inspectIdleFacebookPage(peer, guard, false, false)
         .catch(() => null);
-      if (!identity) {
+      if (!identityResult) {
         await waitPeerPaused();
-        identity = await kernel
+        identityResult = await kernel
           .inspectFacebookIdentity(peer, guard, true, prepared.proof, true, false, false)
           .catch(() => null);
       }
-      if (!identity) {
+      if (!identityResult) {
         await waitPeerPaused();
-        identity =
+        identityResult =
           (await kernel.inspectIdleFacebookPage(peer, guard, false, true)) ??
           (await kernel.inspectFacebookIdentity(
             peer,
@@ -2057,38 +2205,115 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           ));
       }
       guard();
-      if (!identity) throw Error('未能确认 Facebook 登录身份');
-      return identity;
+      if (!identityResult) throw Error('未能确认 Facebook 登录身份');
+      const proofSessionEpoch = identityResult.proof?.browserSessionEpoch;
+      if (typeof proofSessionEpoch === 'string' && proofSessionEpoch.length > 0) {
+        if (initialBrowserSessionEpoch === null) {
+          initialBrowserSessionEpoch = proofSessionEpoch;
+        } else if (proofSessionEpoch !== initialBrowserSessionEpoch) {
+          throw new BumperFatalError('浏览器已重启，当前任务已停止');
+        }
+      }
+      return identityResult;
     };
     const prepareConnection = async () => {
+      const currentPeer = core?.peers.get(profileId);
+      if (currentPeer && currentPeer.online && currentPeer.synced) {
+        peer = currentPeer;
+        epoch = currentPeer.epoch;
+      }
+      await FacebookGroupSessionHelper.waitKernelProfileIdle({
+        inspectIdle: inspectIdleForProfile,
+        reconcileRecovering: reconcileRecoveringForProfile,
+        guard: () => {
+          if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+        },
+        timeoutMs: 12_000,
+        clock: { now: nowFn, sleep: sleepFn },
+      });
+      const syncedPeer = core?.peers.get(profileId);
+      if (!syncedPeer || !syncedPeer.online || !syncedPeer.synced) {
+        throw Error('BROWSER_OFFLINE');
+      }
+      peer = syncedPeer;
+      epoch = syncedPeer.epoch;
       await recoverBumperOperations(kernel, peer, this.repo, guard);
-      const identity = await prepareAndConnect();
+      const resolvedIdentity = await prepareAndConnect();
+      await FacebookGroupSessionHelper.waitKernelProfileIdle({
+        inspectIdle: inspectIdleForProfile,
+        reconcileRecovering: reconcileRecoveringForProfile,
+        guard,
+        timeoutMs: 12_000,
+        clock: { now: nowFn, sleep: sleepFn },
+      });
       guard();
       const connection = await kernel.connectFacebook(
         peer,
-        identity.actor.accountId,
+        resolvedIdentity.actor.accountId,
         guard,
-        identity.proof,
+        resolvedIdentity.proof,
       );
-      return { identity, connection };
+      return { identity: resolvedIdentity, connection };
     };
-    let preparedConnection: Awaited<ReturnType<typeof prepareConnection>>;
-    try {
-      try {
-        preparedConnection = await prepareConnection();
-      } catch (firstError) {
-        guard();
-        if (
-          isBumperFatal(firstError) ||
-          !FacebookGroupSessionHelper.isTransientPrepareError(firstError) ||
-          (await this.isBusy(profileId))
-        )
-          throw firstError;
-        await kernel.taskWindow?.(profileId).catch(() => {});
-        await wait(Math.max(10, Math.round(1000 * this.paceScale)));
-        guard();
-        preparedConnection = await prepareConnection();
+    const waitPeerOnlineAndIdle = async (timeoutMs = 15_000) => {
+      const deadline = nowFn() + timeoutMs;
+      while (nowFn() < deadline) {
+        if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+        const candidate = core?.peers.get(profileId);
+        if (candidate?.browserWindowCount === 0) {
+          throw new BumperFatalError('浏览器窗口已关闭，当前任务已停止');
+        }
+        if (candidate && candidate.online && candidate.synced) {
+          peer = candidate;
+          epoch = candidate.epoch;
+          const remaining = Math.max(500, deadline - nowFn());
+          await FacebookGroupSessionHelper.waitKernelProfileIdle({
+            inspectIdle: inspectIdleForProfile,
+            reconcileRecovering: reconcileRecoveringForProfile,
+            guard: () => {
+              if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+            },
+            timeoutMs: remaining,
+            clock: { now: nowFn, sleep: sleepFn },
+          });
+          const readyPeer = core?.peers.get(profileId);
+          if (readyPeer && readyPeer.online && readyPeer.synced) {
+            peer = readyPeer;
+            epoch = readyPeer.epoch;
+            return;
+          }
+        }
+        await sleepFn(100);
       }
+      throw new BumperFatalError('等待浏览器重连超时，已停止顶贴');
+    };
+    let preparedConnection: Awaited<ReturnType<typeof prepareConnection>> | undefined;
+    try {
+      let lastStartupErr: unknown;
+      for (let startupAttempt = 0; startupAttempt < 3; startupAttempt++) {
+        try {
+          if (startupAttempt > 0) {
+            await waitPeerOnlineAndIdle(12_000);
+          }
+          preparedConnection = await prepareConnection();
+          break;
+        } catch (startupErr) {
+          lastStartupErr = startupErr;
+          if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+          if (startupErr instanceof BumperFatalError && startupErr.message !== '浏览器连接已变化') {
+            throw startupErr;
+          }
+          const isTransient =
+            FacebookGroupSessionHelper.isTransientPrepareError(startupErr) ||
+            isBumperRecoverableDisconnectError(startupErr);
+          if (startupAttempt >= 2 || !isTransient || (await this.isBusy(profileId))) {
+            throw startupErr;
+          }
+          await kernel.taskWindow?.(profileId).catch(() => {});
+          await sleepFn(Math.max(10, Math.round(500 * this.paceScale)));
+        }
+      }
+      if (!preparedConnection) throw lastStartupErr ?? Error('未能建立顶贴控制连接');
     } catch (error) {
       devDiag.record({
         level: 'WARN',
@@ -2099,29 +2324,76 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       });
       throw error;
     }
-    const identity = preparedConnection.identity;
+    let identity = preparedConnection.identity;
     let conn = preparedConnection.connection;
     const accountId = identity.actor.accountId;
-    this.connections.set(profileId, conn);
-    this.closing.set(profileId, {
-      id: conn.stopRequestId,
-      failed: false,
-      accountId,
-      peerEpoch: epoch,
-      leaseId: (await conn.context(accountId))?.leaseId ?? '',
-      ownershipId: conn.proof?.ownershipId,
-      connection: conn,
-    });
-    const initialPage = conn.browser.contexts()[0]?.pages()[0];
-    if (!initialPage) {
-      await this.stop(profileId);
-      throw Error('任务页面不存在');
+    if (identity.proof?.browserSessionEpoch && initialBrowserSessionEpoch === null) {
+      initialBrowserSessionEpoch = identity.proof.browserSessionEpoch;
+    } else if (conn.proof?.browserSessionEpoch && initialBrowserSessionEpoch === null) {
+      initialBrowserSessionEpoch = conn.proof.browserSessionEpoch;
     }
-    let page: Page = initialPage;
-    const jobId = randomUUID(),
-      stepId = randomUUID();
+    let page!: Page;
     let identityDocument = '';
     let identityAt = 0;
+    const registerActiveConnection = async (nextConn: Connection, nextIdentity: BumperIdentity) => {
+      const proofEpoch =
+        nextIdentity.proof?.browserSessionEpoch ?? nextConn.proof?.browserSessionEpoch;
+      if (
+        proofEpoch &&
+        initialBrowserSessionEpoch !== null &&
+        proofEpoch !== initialBrowserSessionEpoch
+      ) {
+        this.connections.set(profileId, nextConn);
+        this.closing.set(profileId, {
+          id: nextConn.stopRequestId,
+          failed: false,
+          accountId,
+          peerEpoch: epoch,
+          leaseId: (await nextConn.context(accountId))?.leaseId ?? '',
+          ownershipId: nextConn.proof?.ownershipId,
+          connection: nextConn,
+        });
+        await this.stop(profileId).catch(() => {});
+        throw new BumperFatalError('浏览器已重启，当前任务已停止');
+      }
+      if (nextIdentity.actor.accountId !== accountId) {
+        this.connections.set(profileId, nextConn);
+        this.closing.set(profileId, {
+          id: nextConn.stopRequestId,
+          failed: false,
+          accountId,
+          peerEpoch: epoch,
+          leaseId: (await nextConn.context(accountId))?.leaseId ?? '',
+          ownershipId: nextConn.proof?.ownershipId,
+          connection: nextConn,
+        });
+        await this.stop(profileId).catch(() => {});
+        throw new BumperFatalError('登录账号已变化，已停止顶贴');
+      }
+      conn = nextConn;
+      identity = nextIdentity;
+      this.connections.set(profileId, conn);
+      this.closing.set(profileId, {
+        id: conn.stopRequestId,
+        failed: false,
+        accountId,
+        peerEpoch: epoch,
+        leaseId: (await conn.context(accountId))?.leaseId ?? '',
+        ownershipId: conn.proof?.ownershipId,
+        connection: conn,
+      });
+      const replacementPage = conn.browser.contexts()[0]?.pages()[0];
+      if (!replacementPage) {
+        await this.stop(profileId);
+        throw new BumperFatalError('任务页面不存在');
+      }
+      page = replacementPage;
+      identityDocument = '';
+      identityAt = 0;
+    };
+    await registerActiveConnection(conn, identity);
+    const jobId = randomUUID(),
+      stepId = randomUUID();
     let avatarObservedOnce = false;
     const assertIdentity = async (force = false) => {
       guard();
@@ -2133,6 +2405,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       while (!state.ready || !state.visible || state.accountId === null) {
         if (state.accountId !== null && state.accountId !== accountId)
           throw new BumperFatalError('登录账号已变化，已停止顶贴');
+        if (state.verificationRequired) {
+          await dismissFeatureInterventionDialogIfPresent(page, guard);
+          state = await readGroupInvitationState(page, guard);
+        }
         if (state.verificationRequired) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
         if (!state.visible && !revealed && identity.proof) {
           revealed = true;
@@ -2144,6 +2420,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           );
         guard();
         await wait(250);
+        state = await readGroupInvitationState(page, guard);
+      }
+      if (state.verificationRequired) {
+        await dismissFeatureInterventionDialogIfPresent(page, guard);
         state = await readGroupInvitationState(page, guard);
       }
       if (state.verificationRequired) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
@@ -2167,6 +2447,54 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       commentId?: string;
       commentText?: string;
     } = { groupId: '', groupName: '' };
+    type ActionProgressState = 'NOT_SENT' | 'UNKNOWN' | 'VERIFIED';
+    interface ResumablePostState {
+      postId: string;
+      wantLike: boolean;
+      chosen: Awaited<ReturnType<SqliteGroupBumperRepository['pickComment']>>;
+      record: BumperLog;
+      credited: boolean;
+      browseDone: boolean;
+      likeProgress: ActionProgressState;
+      commentProgress: ActionProgressState;
+    }
+    let consecutiveNoProgressRecoveries = 0;
+    let recoveryPromise: Promise<void> | null = null;
+    const recoverBumperSession = async (reason: string): Promise<void> => {
+      if (recoveryPromise) return recoveryPromise;
+      const runRecovery = async () => {
+        if (consecutiveNoProgressRecoveries >= 2) {
+          throw new BumperFatalError(`连续 2 次中断恢复无实质进展，已停止顶贴（${reason}）`);
+        }
+        consecutiveNoProgressRecoveries++;
+        callbacks.status('连接中断，正在恢复 · ' + reason);
+        await waitPeerOnlineAndIdle(15_000);
+        await this.stop(profileId);
+        await waitPeerOnlineAndIdle(12_000);
+        const reconnected = await prepareConnection();
+        await registerActiveConnection(reconnected.connection, reconnected.identity);
+      };
+      recoveryPromise = runRecovery().finally(() => {
+        recoveryPromise = null;
+      });
+      return recoveryPromise;
+    };
+    const resolveActionProgressOnOpExit = async (
+      operationId: string,
+      dispatched: boolean,
+    ): Promise<ActionProgressState> => {
+      const savedOp = await Promise.resolve(this.repo.getOperation(operationId)).catch(() => null);
+      if (savedOp?.resolution?.outcome === 'VERIFIED') return 'VERIFIED';
+      if (savedOp?.resolution?.outcome === 'NOT_APPLIED') return 'NOT_SENT';
+      if (
+        savedOp?.reason ||
+        savedOp?.resolution?.outcome === 'ENDED_UNKNOWN' ||
+        savedOp?.resolution?.outcome === 'ABANDONED'
+      ) {
+        return 'UNKNOWN';
+      }
+      return dispatched ? 'UNKNOWN' : 'NOT_SENT';
+    };
     const op = async <T>(
       label: string,
       work: () => Promise<T>,
@@ -2236,29 +2564,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         if (!(error instanceof BumperSetupUnconfirmed)) throw error;
         // Dispose this uncertain setup only after a real stop, then resume with a fresh lease.
         callbacks.status('恢复准备步骤 · ' + label);
-        await this.stop(profileId);
-        guard();
-        await recoverBumperOperations(kernel, peer, this.repo, guard);
-        try {
-          const ready = await prepareFacebookWorkspace(kernel, peer, identity.proof, guard);
-          conn = await kernel.connectFacebook(peer, accountId, guard, ready.proof);
-        } catch (error) {
-          throw new BumperFatalError(String(error));
-        }
-        this.connections.set(profileId, conn);
-        this.closing.set(profileId, {
-          id: conn.stopRequestId,
-          failed: false,
-          accountId,
-          peerEpoch: epoch,
-          leaseId: (await conn.context(accountId))?.leaseId ?? '',
-          ownershipId: conn.proof?.ownershipId,
-          connection: conn,
-        });
-        const replacementPage = conn.browser.contexts()[0]?.pages()[0];
-        if (!replacementPage) throw new BumperFatalError('任务页面不存在');
-        page = replacementPage;
-        identityAt = 0;
+        await recoverBumperSession(label);
         throw Error(error.message);
       }
     };
@@ -2302,6 +2608,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           return (
             /^\/groups\/(?!search(?:\/|$))[^/]+/.test(u.pathname) &&
             (!requested.searchParams.has('sorting_setting') ||
+              u.searchParams.get('sorting_setting') === null ||
               u.searchParams.get('sorting_setting') ===
                 requested.searchParams.get('sorting_setting'))
           );
@@ -2379,6 +2686,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     let skippedByQuotaPosts = 0;
     let sessionBumped = 0;
     let quotaReached = false;
+    let commentRestrictedInSession = false;
     try {
       // Resolve numeric Page aliases before preparing any business binding.
       pages = pages.map((p) => ({ ...p }));
@@ -2391,7 +2699,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           target.id = canonicalId;
         }
       }
-      for (const group of groups) {
+      for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+        const group = groups[groupIndex];
+        if (!group) continue;
         operationContext = { groupId: group.id, groupName: group.name };
         try {
           guard();
@@ -2414,14 +2724,27 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             break;
           }
           let effectiveGroupId = group.id;
+          let effectiveSearchMode: BumperSettings['searchMode'] = settings.searchMode;
+          let joinRestrictedFallback = false;
+          let unjoinableFallbackReason = '';
           const rejectBlockedGroup = (surface: Awaited<ReturnType<typeof readGroupBumper>>) => {
             if (surface.restricted)
               throw new BumperFatalError(
                 '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
               );
-            if (surface.groupJoinState === 'pending')
+            if (
+              surface.groupJoinState === 'pending' &&
+              (effectiveSearchMode === 'time_sort' || surface.posts.length === 0) &&
+              !joinRestrictedFallback
+            )
               throw new BumperGroupSkipped('入组申请待审核');
-            if (surface.groupJoinState === 'questions')
+            if (
+              surface.groupJoinState === 'questions' &&
+              (effectiveSearchMode === 'time_sort' ||
+                surface.posts.length === 0 ||
+                surface.blockingDialog) &&
+              !joinRestrictedFallback
+            )
               throw new BumperGroupSkipped('小组需要回答入组问题');
           };
           const dismissWelcomeDialogIfNeeded = async (
@@ -2472,13 +2795,117 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             if (current.blockingDialog) throw new BumperGroupSkipped('页面有未处理的阻断弹窗');
             return closed;
           };
+          const dismissPostJoinObstructionIfNeeded = async (
+            s: Awaited<ReturnType<typeof readGroupBumper>>,
+          ) => {
+            let current = s;
+            for (
+              let count = 0;
+              (current.blockingDialog ||
+                current.joinRestrictionDismissCSS ||
+                current.welcomeDismissCSS) &&
+              count < 3;
+              count++
+            ) {
+              const token = randomUUID();
+              await op(
+                '关闭入组欢迎弹窗',
+                async () => {
+                  const next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                  if (next.checkpointRestricted || next.restrictionReason) {
+                    throw new BumperFatalError(
+                      '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
+                    );
+                  }
+                  const dismissSelector =
+                    next.joinRestrictionDismissCSS ?? next.welcomeDismissCSS ?? null;
+                  if (dismissSelector) {
+                    const button = page.locator(dismissSelector).first();
+                    await button.evaluate((el, id) => {
+                      (
+                        el.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"]') ?? el
+                      ).setAttribute('data-wb-bumper-closing', id);
+                    }, token);
+                    await button.click({ timeout: 4000 });
+                    return 'button' as const;
+                  }
+                  if (next.blockingDialog || next.restricted) {
+                    await page.keyboard.press('Escape');
+                    return 'escape' as const;
+                  }
+                  return null;
+                },
+                async (mode) => {
+                  if (!mode) return true;
+                  const until = Date.now() + 2500;
+                  do {
+                    guard();
+                    const next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                    if (next.checkpointRestricted || next.restrictionReason) {
+                      throw new BumperFatalError(
+                        '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
+                      );
+                    }
+                    if (
+                      mode === 'button' &&
+                      !next.restricted &&
+                      (await page.evaluate(bumperDialogClosed, token))
+                    ) {
+                      return true;
+                    }
+                    if (!next.restricted && !next.blockingDialog) return true;
+                    await wait(150);
+                  } while (Date.now() < until);
+                  return true;
+                },
+              );
+              current = await readGroupBumper(page, { groupId: effectiveGroupId });
+            }
+            return current;
+          };
+          const activateJoinRestrictedFallback = (reason: string) => {
+            joinRestrictedFallback = true;
+            unjoinableFallbackReason = reason;
+            if (effectiveSearchMode === 'time_sort') {
+              const fallbackMode: BumperSettings['searchMode'] =
+                pages.length > 0 && pages.length <= 3 ? 'page_group_feed' : 'random_browse';
+              effectiveSearchMode = fallbackMode;
+              const modeLabel =
+                fallbackMode === 'page_group_feed' ? '直接打开专页小组贴' : '随机浏览';
+              callbacks.status(`${reason}，已自动切换${modeLabel} · ${group.name}`);
+              devDiag.record({
+                level: 'INFO',
+                category: 'GROUP_BUMPER',
+                event: 'BUMPER_JOIN_RESTRICTED_FALLBACK',
+                profileId,
+                reason,
+                data: {
+                  groupId: effectiveGroupId,
+                  fromMode: settings.searchMode,
+                  toMode: fallbackMode,
+                  pagesCount: pages.length,
+                },
+              });
+            }
+          };
           const joinGroupIfNeeded = async (s?: Awaited<ReturnType<typeof readGroupBumper>>) => {
-            if (scanOnly || isPageBumperMode) return false;
+            if (
+              scanOnly ||
+              isPageBumperMode ||
+              effectiveSearchMode === 'random_browse' ||
+              joinRestrictedFallback
+            ) {
+              return false;
+            }
             const current = s ?? (await readGroupBumper(page, { groupId: effectiveGroupId }));
             rejectBlockedGroup(current);
+            if (effectiveSearchMode === 'page_group_feed' && current.posts.length > 0) {
+              return false;
+            }
             if (current.groupJoinState === 'member' || !current.joinGroupCSS) return false;
             callbacks.status('正在加入小组 · ' + group.name);
             let next = current;
+            let unjoinableIntervention = false;
             await op(
               '加入小组',
               async () => {
@@ -2497,21 +2924,101 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 do {
                   guard();
                   next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                  if (
+                    next.checkpointRestricted ||
+                    /^\/(?:login|checkpoint)(?:\/|\.php|$)/i.test(new URL(next.url).pathname)
+                  ) {
+                    throw new BumperFatalError(
+                      '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
+                    );
+                  }
+                  if (next.restricted && !next.restrictionReason) {
+                    const dismissed = await dismissFeatureInterventionDialogIfPresent(page, guard);
+                    if (!dismissed && next.joinRestrictionDismissCSS) {
+                      await page
+                        .evaluate((sel) => {
+                          document.querySelector<HTMLElement>(sel)?.click();
+                        }, next.joinRestrictionDismissCSS)
+                        .catch(() => {});
+                      await wait(350);
+                    }
+                    next = await readGroupBumper(page, { groupId: effectiveGroupId });
+                    if (!next.restricted) {
+                      unjoinableIntervention = true;
+                      return true;
+                    }
+                    if (next.joinRestrictionDismissCSS && !next.checkpointRestricted) {
+                      unjoinableIntervention = true;
+                      return true;
+                    }
+                  }
                   if (next.restricted)
                     throw new BumperFatalError(
                       '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
                     );
                   if (['member', 'pending', 'questions'].includes(next.groupJoinState ?? ''))
                     return true;
+                  if (
+                    next.blockingDialog &&
+                    (next.joinRestrictionDismissCSS || next.welcomeDismissCSS)
+                  ) {
+                    return true;
+                  }
                   // Old test/adaptor versions have no membership field; retain their explicit observed transition.
                   if (next.groupJoinState === undefined && !next.joinGroupCSS) return true;
                   await wait(250);
                 } while (Date.now() < end);
+                if (
+                  !next.restricted &&
+                  next.groupIds.includes(effectiveGroupId.toLowerCase()) &&
+                  next.joinGroupCSS
+                ) {
+                  unjoinableIntervention = true;
+                  return true;
+                }
                 return false;
               },
             );
+            if (
+              unjoinableIntervention ||
+              next.groupJoinState === 'pending' ||
+              next.groupJoinState === 'questions' ||
+              (next.groupJoinState !== 'member' &&
+                (next.blockingDialog ||
+                  Boolean(next.joinRestrictionDismissCSS) ||
+                  Boolean(next.joinGroupCSS)))
+            ) {
+              const reason =
+                next.groupJoinState === 'pending'
+                  ? '入组申请待审核'
+                  : next.groupJoinState === 'questions'
+                    ? '小组需要回答入组问题'
+                    : '入组操作受限';
+              if (
+                next.restricted ||
+                next.blockingDialog ||
+                next.joinRestrictionDismissCSS ||
+                next.welcomeDismissCSS
+              ) {
+                next = await dismissPostJoinObstructionIfNeeded(next);
+              }
+              if (next.restricted) {
+                throw new BumperFatalError(
+                  '受限 · ' + (next.restrictionReason ?? '需要手机验证或操作受限'),
+                );
+              }
+              if (next.blockingDialog) {
+                throw new BumperGroupSkipped('页面有未处理的阻断弹窗');
+              }
+              activateJoinRestrictedFallback(reason);
+              return false;
+            }
             rejectBlockedGroup(next);
             await dismissWelcomeDialogIfNeeded(next);
+            if (next.joinGroupCSS && !next.posts.length) {
+              activateJoinRestrictedFallback('当前身份暂不支持直接加入该小组');
+              return false;
+            }
             return true;
           };
           const waitForFeed = async (pageId?: string) => {
@@ -2583,7 +3090,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           let initialFeed!: Awaited<ReturnType<typeof readGroupBumper>>;
           if (!isPageBumperMode) {
             const fallbackGroupUrl =
-              settings.searchMode === 'time_sort'
+              effectiveSearchMode === 'time_sort'
                 ? `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/?sorting_setting=CHRONOLOGICAL`
                 : `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/`;
             let navigatedChronological = false;
@@ -2637,15 +3144,15 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 } catch (err) {
                   if (isBumperFatal(err)) throw err;
                   await navigate(fallbackGroupUrl);
-                  navigatedChronological = settings.searchMode === 'time_sort';
+                  navigatedChronological = effectiveSearchMode === 'time_sort';
                 }
               } else {
                 await navigate(fallbackGroupUrl);
-                navigatedChronological = settings.searchMode === 'time_sort';
+                navigatedChronological = effectiveSearchMode === 'time_sort';
               }
             } else {
               await navigate(fallbackGroupUrl);
-              navigatedChronological = settings.searchMode === 'time_sort';
+              navigatedChronological = effectiveSearchMode === 'time_sort';
             }
             const applyGroupRedirectResolution = () => {
               if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
@@ -2672,7 +3179,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             applyGroupRedirectResolution();
             if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
               await navigate(fallbackGroupUrl);
-              navigatedChronological = settings.searchMode === 'time_sort';
+              navigatedChronological = effectiveSearchMode === 'time_sort';
               surface = await readGroupBumper(page, { groupId: group.id });
               applyGroupRedirectResolution();
             }
@@ -2705,7 +3212,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             await dismissWelcomeDialogIfNeeded(surface);
             const joinedEarly = await joinGroupIfNeeded(surface);
             if (
-              settings.searchMode === 'time_sort' &&
+              effectiveSearchMode === 'time_sort' &&
               (!navigatedChronological ||
                 joinedEarly ||
                 !surface.url.includes('sorting_setting=CHRONOLOGICAL'))
@@ -2713,10 +3220,18 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               await navigate(
                 `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
               );
+            } else if (
+              joinRestrictedFallback &&
+              effectiveSearchMode !== 'time_sort' &&
+              page.url().includes('sorting_setting=CHRONOLOGICAL')
+            ) {
+              await navigate(
+                `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/`,
+              );
             }
             initialFeed = await waitForFeed();
             if (await joinGroupIfNeeded(initialFeed)) {
-              if (settings.searchMode === 'time_sort') {
+              if (effectiveSearchMode === 'time_sort') {
                 await navigate(
                   `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`,
                 );
@@ -2728,7 +3243,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             if (
               !initialFeed.posts.length &&
               !initialFeed.restricted &&
-              settings.searchMode === 'time_sort' &&
               page.url().includes('sorting_setting=CHRONOLOGICAL')
             ) {
               // 未加入/入组待审核的公开小组常不开放时间排序流，但默认流可读：回退一次默认小组页
@@ -2744,17 +3258,29 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               });
               group.name = initialFeed.groupTitle;
             }
-            if (!initialFeed.posts.length)
+            if (!initialFeed.posts.length) {
+              if (joinRestrictedFallback) {
+                throw new BumperGroupSkipped(
+                  unjoinableFallbackReason === '入组申请待审核' ||
+                    unjoinableFallbackReason === '小组需要回答入组问题'
+                    ? unjoinableFallbackReason
+                    : '当前身份暂不支持直接加入该小组',
+                );
+              }
               throw Error(initialFeed.loading ? '小组内容加载超时' : '小组暂无可访问帖子');
+            }
             callbacks.status('正在扫描 · ' + group.name);
             groupsEntered++;
           }
-          const feeds = isPageBumperMode
-            ? pages
-            : settings.searchMode === 'page_group_feed'
-              ? pages
+          const feeds: (BumperTarget | null)[] = isPageBumperMode
+            ? [...pages]
+            : effectiveSearchMode === 'page_group_feed'
+              ? [...pages]
               : [null];
-          for (const feed of feeds) {
+          let anyUserFeedPosts = false;
+          let fallbackRandomAppended = false;
+          for (let feedIndex = 0; feedIndex < feeds.length; feedIndex++) {
+            const feed = feeds[feedIndex] ?? null;
             let resolvedPageId = feed?.id;
             let pageOwnerAuthorId: string | null = null;
             let enteredViaDirectOrId = false;
@@ -2965,6 +3491,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/user/${encodeURIComponent(resolvedPageId ?? feed.id)}/`,
               );
               const userFeed = await waitForFeed(resolvedPageId);
+              if (userFeed.posts.length > 0) anyUserFeedPosts = true;
               if (userFeed.pageAvatarUrl)
                 await updateAvatar('pages', feed.id, userFeed.pageAvatarUrl);
               if (
@@ -3003,16 +3530,27 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/user/${encodeURIComponent(resolvedPageId)}/`,
                   );
                   const aliasFeed = await waitForFeed(resolvedPageId);
+                  if (aliasFeed.posts.length > 0) anyUserFeedPosts = true;
                   if (aliasFeed.pageAvatarUrl)
                     await updateAvatar('pages', feed.id, aliasFeed.pageAvatarUrl);
                 }
               }
+            } else if (!isPageBumperMode && !feed && fallbackRandomAppended) {
+              if (!/^\/groups\/[^/]+\/?$/i.test(new URL(page.url()).pathname)) {
+                await navigate(
+                  `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/`,
+                );
+                initialFeed = await waitForFeed();
+              }
             }
             await paceWait(2500 + Math.floor(Math.random() * 2501));
+            consecutiveNoProgressRecoveries = 0;
             const seen = new Set<string>(),
               counts = new Map<string, number>();
             let empty = 0,
               oldPosts = 0;
+            let hasRecoveredInFeed = false;
+            let resumablePost = null as ResumablePostState | null;
             const maxScanForTarget = isPageBumperMode
               ? (settings.maxPostsPerPage ?? 3)
               : settings.maxPostsPerGroupPage;
@@ -3023,334 +3561,448 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               empty < 5;
               scroll++
             ) {
-              guard();
-              await assertIdentity();
-              if (scroll === 0 && isPageBumperMode && !scanOnly) {
-                const refreshedSurface = await readGroupBumper(page, {
-                  groupId: effectiveGroupId,
-                  ...(feed ? { pageId: resolvedPageId } : {}),
-                }).catch(() => null);
-                surface =
-                  refreshedSurface && refreshedSurface.posts.length > 0
-                    ? refreshedSurface
-                    : initialFeed;
-              } else {
-                surface =
-                  scroll === 0 && !feed && !scanOnly
-                    ? initialFeed
-                    : await readGroupBumper(page, {
-                        groupId: effectiveGroupId,
-                        ...(feed ? { pageId: resolvedPageId } : {}),
-                        audit: scanOnly && scroll === 0,
-                      });
-              }
-              if (scanOnly && scroll === 0)
-                devDiag.record({
-                  category: 'GROUP_BUMPER',
-                  event: 'BUMPER_SCAN_SAMPLE',
-                  profileId,
-                  data: {
-                    runId,
-                    groupId: group.id,
-                    pageId: feed?.id ?? null,
-                    resolvedPageId: resolvedPageId ?? null,
-                    posts: surface.posts.slice(0, 15).map((p) => ({
-                      postId: p.postId,
-                      authorId: p.authorId,
-                      authorAliases: p.authorAliases,
-                      ageHours: p.ageHours,
-                      sourceEvidence: p.sourceEvidence,
-                    })),
-                  },
-                });
-              if (feed && surface.pageAvatarUrl)
-                await updateAvatar('pages', feed.id, surface.pageAvatarUrl);
-              if (surface.restricted)
-                throw new BumperFatalError(
-                  '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
-                );
-              if (
-                isPageBumperMode &&
-                /^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname)
-              )
-                throw Error('当前页面不是专页主页，未执行顶贴');
-              if (!isPageBumperMode && !surface.groupIds.includes(effectiveGroupId.toLowerCase()))
-                throw Error('当前小组已变化');
-              let fresh = 0;
-              for (const post of surface.posts) {
-                if (seen.has(post.postId)) continue;
-                if (!isPageBumperMode && !post.authorId && !post.authorName.trim()) continue;
-                const isSelfAccountPost =
-                  post.authorId &&
-                  post.authorId === accountId &&
-                  accountId !== feed?.id &&
-                  accountId !== resolvedPageId;
-                const target =
-                  isPageBumperMode && feed
-                    ? isSelfAccountPost || isForeignPagePost(post, feed, pageOwnerAuthorId)
-                      ? undefined
-                      : feed
-                    : (feed ? [feed] : pages).find((p) =>
-                        bumperAuthorMatch(
-                          post,
-                          feed && resolvedPageId ? { ...p, id: resolvedPageId } : p,
-                        ),
-                      );
-                const isPostHydrated = Boolean(
-                  post.likeCSS ||
-                  post.commentButtonCSS ||
-                  post.commentCSS ||
-                  post.authorAliases.length > 0,
-                );
-                if (!target) {
-                  // 未水合的屏下卡片暂不计入已见，等滚动水合后再判定作者
-                  if (!isPostHydrated) continue;
-                  seen.add(post.postId);
-                  fresh++;
-                  if (
-                    settings.searchMode === 'time_sort' &&
-                    !post.pinned &&
-                    post.ageHours !== null &&
-                    post.ageHours > settings.maxPostAgeHours
-                  )
-                    oldPosts++;
-                  else if (!post.pinned) oldPosts = 0;
-                  continue;
+              try {
+                guard();
+                await assertIdentity();
+                if (scroll === 0 && isPageBumperMode && !scanOnly && !hasRecoveredInFeed) {
+                  const refreshedSurface = await readGroupBumper(page, {
+                    groupId: effectiveGroupId,
+                    ...(feed ? { pageId: resolvedPageId } : {}),
+                  }).catch(() => null);
+                  surface =
+                    refreshedSurface && refreshedSurface.posts.length > 0
+                      ? refreshedSurface
+                      : initialFeed;
+                } else {
+                  surface =
+                    scroll === 0 && !feed && !scanOnly && !hasRecoveredInFeed
+                      ? initialFeed
+                      : await readGroupBumper(page, {
+                          groupId: effectiveGroupId,
+                          ...(feed ? { pageId: resolvedPageId } : {}),
+                          audit: scanOnly && scroll === 0,
+                        });
                 }
-                if (
-                  isPageBumperMode &&
-                  scroll === 0 &&
-                  surface.posts.indexOf(post) > 0 &&
-                  !post.likeCSS &&
-                  !post.commentButtonCSS &&
-                  !post.commentCSS &&
-                  !post.videoCSS
-                ) {
-                  continue;
-                }
-                if (
-                  !isPageBumperMode &&
-                  settings.searchMode !== 'random_browse' &&
-                  post.ageHours === null
-                )
-                  continue;
-                seen.add(post.postId);
-                fresh++;
-                if (
-                  settings.searchMode === 'time_sort' &&
-                  !post.pinned &&
-                  post.ageHours !== null &&
-                  post.ageHours > settings.maxPostAgeHours
-                )
-                  oldPosts++;
-                else if (!post.pinned) oldPosts = 0;
-                matchedAuthorPosts++;
-                if (scanOnly)
+                if (scanOnly && scroll === 0)
                   devDiag.record({
                     category: 'GROUP_BUMPER',
-                    event: 'BUMPER_SCAN_MATCH',
+                    event: 'BUMPER_SCAN_SAMPLE',
                     profileId,
                     data: {
                       runId,
                       groupId: group.id,
-                      pageId: target.id,
-                      resolvedPageId: resolvedPageId ?? target.id,
-                      postId: post.postId,
-                      authorId: post.authorId,
-                      ageHours: post.ageHours,
-                      liked: post.liked,
-                      hasLikeControl: post.likeCSS !== null,
-                      sourceEvidence: post.sourceEvidence,
+                      pageId: feed?.id ?? null,
+                      resolvedPageId: resolvedPageId ?? null,
+                      posts: surface.posts.slice(0, 15).map((p) => ({
+                        postId: p.postId,
+                        authorId: p.authorId,
+                        authorAliases: p.authorAliases,
+                        ageHours: p.ageHours,
+                        sourceEvidence: p.sourceEvidence,
+                      })),
                     },
                   });
-                if (post.authorAvatarUrl)
-                  await updateAvatar('pages', target.id, post.authorAvatarUrl);
-                if (post.authorName.trim() && (!target.name.trim() || target.name === target.id)) {
-                  await updateMetadata('pages', target.id, {
-                    name: post.authorName.trim(),
-                    avatarUrl: post.authorAvatarUrl,
-                  });
-                  target.name = post.authorName.trim();
-                }
-                const scanned = counts.get(target.id) ?? 0;
-                if (scanned >= maxScanForTarget) continue;
-                counts.set(target.id, scanned + 1);
-                if (
-                  !isPageBumperMode &&
-                  settings.searchMode !== 'random_browse' &&
-                  (post.ageHours === null || post.ageHours > settings.maxPostAgeHours)
-                ) {
-                  filteredByAgePosts++;
-                  continue;
-                }
-                guard();
-                let chosen: Awaited<ReturnType<SqliteGroupBumperRepository['pickComment']>> = null;
-                let postClaimed = false;
-                let quotaReserved = false;
-                const issueCountBeforePost = issueCount;
-                try {
-                  if (
-                    !scanOnly &&
-                    !this.inFlightCoordinator.tryAcquirePost(accountId, post.postId)
-                  ) {
-                    skippedByQuotaPosts++;
-                    continue;
-                  }
-                  postClaimed = !scanOnly;
-                  const q = await this.repo.eligibility(
-                    accountId,
-                    profileId,
-                    post.postId,
-                    Date.now(),
-                    sourceMode,
+                if (feed && surface.pageAvatarUrl)
+                  await updateAvatar('pages', feed.id, surface.pageAvatarUrl);
+                if (surface.restricted)
+                  throw new BumperFatalError(
+                    '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
                   );
-                  guard();
-                  if (q.today >= settings.dailyMaxLikesPerAccount) {
-                    quotaReached = true;
-                    callbacks.status(
-                      `今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`,
-                      q.today,
-                    );
-                    return;
-                  }
-                  if (!q.allowed) {
-                    skippedByQuotaPosts++;
-                    continue;
-                  }
-                  const wantLike = !post.liked && Math.random() * 100 < settings.likeProbability;
-                  chosen =
-                    Math.random() * 100 < settings.commentProbability
-                      ? await claimBumperComment(
-                          this.commentClaims,
-                          (excludeIds) =>
-                            this.repo.pickComment(
-                              post.postId,
-                              Math.random(),
-                              excludeIds,
-                              sourceMode,
-                            ),
-                          guard,
-                        )
-                      : null;
-                  if (!scanOnly && !wantLike && !chosen) continue;
-                  if (
-                    !scanOnly &&
-                    !this.inFlightCoordinator.tryReserveDailyQuota(
-                      accountId,
-                      sourceMode,
-                      q.today,
-                      settings.dailyMaxLikesPerAccount,
+                if (
+                  isPageBumperMode &&
+                  /^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname)
+                )
+                  throw Error('当前页面不是专页主页，未执行顶贴');
+                if (!isPageBumperMode && !surface.groupIds.includes(effectiveGroupId.toLowerCase()))
+                  throw Error('当前小组已变化');
+                let fresh = 0;
+                for (const post of surface.posts) {
+                  const currentResumable = resumablePost;
+                  const isResumingCurrentPost = currentResumable?.postId === post.postId;
+                  if (!isResumingCurrentPost && seen.has(post.postId)) continue;
+                  if (!isPageBumperMode && !post.authorId && !post.authorName.trim()) continue;
+                  const isSelfAccountPost =
+                    post.authorId &&
+                    post.authorId === accountId &&
+                    accountId !== feed?.id &&
+                    accountId !== resolvedPageId;
+                  const target =
+                    isPageBumperMode && feed
+                      ? isSelfAccountPost || isForeignPagePost(post, feed, pageOwnerAuthorId)
+                        ? undefined
+                        : feed
+                      : (feed ? [feed] : pages).find((p) =>
+                          bumperAuthorMatch(
+                            post,
+                            feed && resolvedPageId ? { ...p, id: resolvedPageId } : p,
+                          ),
+                        );
+                  const isPostHydrated = Boolean(
+                    post.likeCSS ||
+                    post.commentButtonCSS ||
+                    post.commentCSS ||
+                    post.authorAliases.length > 0,
+                  );
+                  if (!target) {
+                    // 未水合的屏下卡片暂不计入已见，等滚动水合后再判定作者
+                    if (!isPostHydrated) continue;
+                    seen.add(post.postId);
+                    fresh++;
+                    if (
+                      effectiveSearchMode === 'time_sort' &&
+                      !post.pinned &&
+                      post.ageHours !== null &&
+                      post.ageHours > settings.maxPostAgeHours
                     )
-                  ) {
-                    quotaReached = true;
-                    callbacks.status(
-                      `今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`,
-                      q.today,
-                    );
-                    return;
-                  }
-                  quotaReserved = !scanOnly;
-                  const record: BumperLog = {
-                    id: randomUUID(),
-                    profileId,
-                    accountId,
-                    groupId: group.id,
-                    groupName: group.name,
-                    pageId: target.id,
-                    pageName: target.name,
-                    postId: post.postId,
-                    postUrl: post.postUrl,
-                    liked: false,
-                    commentText: null,
-                    bumpedAt: Date.now(),
-                    sourceMode,
-                  };
-                  let credited = false;
-                  operationContext = {
-                    groupId: group.id,
-                    groupName: group.name,
-                    pageId: target.id,
-                    pageName: target.name,
-                    postId: post.postId,
-                    postUrl: post.postUrl,
-                    logId: record.id,
-                    commentId: chosen?.id,
-                    commentText: chosen?.text,
-                  };
-                  const persist = async (
-                    _value: unknown,
-                    binding: Binding,
-                    resolution: BumperResolutionValue,
-                  ) => {
-                    const saved = await this.repo.confirmSubmission(
-                      binding.operationId,
-                      record,
-                      chosen?.id,
-                      resolution,
-                    );
-                    if (!credited) {
-                      credited = true;
-                      if (quotaReserved) {
-                        quotaReserved = false;
-                        this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
-                      }
-                      sessionBumped++;
-                      callbacks.added(
-                        (
-                          await this.repo.eligibility(
-                            accountId,
-                            profileId,
-                            post.postId,
-                            Date.now(),
-                            sourceMode,
-                          )
-                        ).today,
-                      );
-                    }
-                    return saved;
-                  };
-                  let expectedFeedbackId: string | null = null;
-                  const checkPost = async (): Promise<BumperPost> => {
-                    for (let attempt = 0; ; attempt++) {
-                      await assertIdentity();
-                      const s = await readGroupBumper(page, {
-                        groupId: effectiveGroupId,
-                        ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
-                        targetPostId: post.postId,
-                      });
-                      if (s.restricted)
-                        throw new BumperFatalError(
-                          '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
-                        );
-                      if (!s.visible || !s.ready)
-                        throw new BumperPostReadIncomplete('目标帖子页面尚未可见就绪');
-                      const p = s.posts.find((p) => p.postId === post.postId);
-                      if (!isPageBumperMode && !s.groupIds.includes(effectiveGroupId.toLowerCase()))
-                        throw Error('目标帖子或作者已变化');
-                      try {
-                        return requireBumperPost(
-                          p,
-                          feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
-                          expectedFeedbackId,
-                        );
-                      } catch (error) {
-                        if (!(error instanceof BumperPostReadIncomplete) || attempt > 0)
-                          throw error;
-                        await wait(200);
-                      }
-                    }
-                  };
-                  await dismissWelcomeDialogIfNeeded();
-                  if (scanOnly) {
-                    callbacks.status('只读扫描 · ' + post.postId);
+                      oldPosts++;
+                    else if (!post.pinned) oldPosts = 0;
                     continue;
                   }
-                  // Pre-like/comment mandatory human-like browsing dwell inside bound op
-                  await op(
-                    post.hasVideo ? '观看目标视频' : '浏览目标帖子',
-                    async () => {
-                      const maxWatchMs = Math.round(180_000 * this.paceScale);
-                      // A scan supplies a candidate ID, never a durable DOM locator.
+                  if (
+                    isPageBumperMode &&
+                    scroll === 0 &&
+                    surface.posts.indexOf(post) > 0 &&
+                    !post.likeCSS &&
+                    !post.commentButtonCSS &&
+                    !post.commentCSS &&
+                    !post.videoCSS
+                  ) {
+                    continue;
+                  }
+                  if (
+                    !isPageBumperMode &&
+                    effectiveSearchMode !== 'random_browse' &&
+                    post.ageHours === null
+                  )
+                    continue;
+                  if (!isResumingCurrentPost) {
+                    seen.add(post.postId);
+                    fresh++;
+                    if (
+                      effectiveSearchMode === 'time_sort' &&
+                      !post.pinned &&
+                      post.ageHours !== null &&
+                      post.ageHours > settings.maxPostAgeHours
+                    )
+                      oldPosts++;
+                    else if (!post.pinned) oldPosts = 0;
+                    matchedAuthorPosts++;
+                    if (scanOnly)
+                      devDiag.record({
+                        category: 'GROUP_BUMPER',
+                        event: 'BUMPER_SCAN_MATCH',
+                        profileId,
+                        data: {
+                          runId,
+                          groupId: group.id,
+                          pageId: target.id,
+                          resolvedPageId: resolvedPageId ?? target.id,
+                          postId: post.postId,
+                          authorId: post.authorId,
+                          ageHours: post.ageHours,
+                          liked: post.liked,
+                          hasLikeControl: post.likeCSS !== null,
+                          sourceEvidence: post.sourceEvidence,
+                        },
+                      });
+                    if (post.authorAvatarUrl)
+                      await updateAvatar('pages', target.id, post.authorAvatarUrl);
+                    if (
+                      post.authorName.trim() &&
+                      (!target.name.trim() || target.name === target.id)
+                    ) {
+                      await updateMetadata('pages', target.id, {
+                        name: post.authorName.trim(),
+                        avatarUrl: post.authorAvatarUrl,
+                      });
+                      target.name = post.authorName.trim();
+                    }
+                    const scanned = counts.get(target.id) ?? 0;
+                    if (scanned >= maxScanForTarget) continue;
+                    counts.set(target.id, scanned + 1);
+                    if (
+                      !isPageBumperMode &&
+                      effectiveSearchMode !== 'random_browse' &&
+                      (post.ageHours === null || post.ageHours > settings.maxPostAgeHours)
+                    ) {
+                      filteredByAgePosts++;
+                      continue;
+                    }
+                  }
+                  guard();
+                  let chosen: Awaited<ReturnType<SqliteGroupBumperRepository['pickComment']>> =
+                    null;
+                  let postClaimed = false;
+                  let quotaReserved = false;
+                  const issueCountBeforePost = issueCount;
+                  try {
+                    if (
+                      !scanOnly &&
+                      !this.inFlightCoordinator.tryAcquirePost(accountId, post.postId)
+                    ) {
+                      skippedByQuotaPosts++;
+                      continue;
+                    }
+                    postClaimed = !scanOnly;
+                    const q = await this.repo.eligibility(
+                      accountId,
+                      profileId,
+                      post.postId,
+                      Date.now(),
+                      sourceMode,
+                    );
+                    guard();
+                    const resumingAlreadyCredited =
+                      isResumingCurrentPost &&
+                      currentResumable !== null &&
+                      (currentResumable.credited || currentResumable.likeProgress === 'VERIFIED');
+                    if (!resumingAlreadyCredited && q.today >= settings.dailyMaxLikesPerAccount) {
+                      quotaReached = true;
+                      callbacks.status(
+                        `今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`,
+                        q.today,
+                      );
+                      return;
+                    }
+                    if (!resumingAlreadyCredited && !q.allowed) {
+                      skippedByQuotaPosts++;
+                      continue;
+                    }
+                    const wantLike =
+                      isResumingCurrentPost && currentResumable
+                        ? currentResumable.wantLike
+                        : !post.liked && Math.random() * 100 < settings.likeProbability;
+                    if (isResumingCurrentPost && currentResumable) {
+                      chosen = currentResumable.chosen;
+                      if (chosen) this.commentClaims.add(chosen.id);
+                    } else {
+                      chosen =
+                        !joinRestrictedFallback &&
+                        !commentRestrictedInSession &&
+                        Math.random() * 100 < settings.commentProbability
+                          ? await claimBumperComment(
+                              this.commentClaims,
+                              (excludeIds) =>
+                                this.repo.pickComment(
+                                  post.postId,
+                                  Math.random(),
+                                  excludeIds,
+                                  sourceMode,
+                                ),
+                              guard,
+                            )
+                          : null;
+                    }
+                    if (!scanOnly && !wantLike && !chosen) {
+                      if (isResumingCurrentPost) resumablePost = null;
+                      continue;
+                    }
+                    if (
+                      !scanOnly &&
+                      !resumingAlreadyCredited &&
+                      !this.inFlightCoordinator.tryReserveDailyQuota(
+                        accountId,
+                        sourceMode,
+                        q.today,
+                        settings.dailyMaxLikesPerAccount,
+                      )
+                    ) {
+                      quotaReached = true;
+                      callbacks.status(
+                        `今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`,
+                        q.today,
+                      );
+                      return;
+                    }
+                    quotaReserved = !scanOnly && !resumingAlreadyCredited;
+                    const record: BumperLog =
+                      isResumingCurrentPost && currentResumable
+                        ? currentResumable.record
+                        : {
+                            id: randomUUID(),
+                            profileId,
+                            accountId,
+                            groupId: group.id,
+                            groupName: group.name,
+                            pageId: target.id,
+                            pageName: target.name,
+                            postId: post.postId,
+                            postUrl: post.postUrl,
+                            liked: false,
+                            commentText: null,
+                            bumpedAt: Date.now(),
+                            sourceMode,
+                          };
+                    let credited =
+                      isResumingCurrentPost && currentResumable ? currentResumable.credited : false;
+                    const activePostState: ResumablePostState =
+                      isResumingCurrentPost && currentResumable
+                        ? currentResumable
+                        : {
+                            postId: post.postId,
+                            wantLike,
+                            chosen,
+                            record,
+                            credited,
+                            browseDone: false,
+                            likeProgress: wantLike ? 'NOT_SENT' : 'VERIFIED',
+                            commentProgress: chosen ? 'NOT_SENT' : 'VERIFIED',
+                          };
+                    resumablePost = activePostState;
+                    operationContext = {
+                      groupId: group.id,
+                      groupName: group.name,
+                      pageId: target.id,
+                      pageName: target.name,
+                      postId: post.postId,
+                      postUrl: post.postUrl,
+                      logId: record.id,
+                      commentId: chosen?.id,
+                      commentText: chosen?.text,
+                    };
+                    const persist = async (
+                      _value: unknown,
+                      binding: Binding,
+                      resolution: BumperResolutionValue,
+                    ) => {
+                      const saved = await this.repo.confirmSubmission(
+                        binding.operationId,
+                        record,
+                        chosen?.id,
+                        resolution,
+                      );
+                      consecutiveNoProgressRecoveries = 0;
+                      if (!credited) {
+                        credited = true;
+                        activePostState.credited = true;
+                        if (quotaReserved) {
+                          quotaReserved = false;
+                          this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
+                        }
+                        sessionBumped++;
+                        callbacks.added(
+                          (
+                            await this.repo.eligibility(
+                              accountId,
+                              profileId,
+                              post.postId,
+                              Date.now(),
+                              sourceMode,
+                            )
+                          ).today,
+                        );
+                      }
+                      return saved;
+                    };
+                    let expectedFeedbackId: string | null = null;
+                    const checkPost = async (): Promise<BumperPost> => {
+                      for (let attempt = 0; ; attempt++) {
+                        await assertIdentity();
+                        const s = await readGroupBumper(page, {
+                          groupId: effectiveGroupId,
+                          ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
+                          targetPostId: post.postId,
+                        });
+                        if (s.restricted)
+                          throw new BumperFatalError(
+                            '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
+                          );
+                        if (!s.visible || !s.ready)
+                          throw new BumperPostReadIncomplete('目标帖子页面尚未可见就绪');
+                        const p = s.posts.find((p) => p.postId === post.postId);
+                        if (
+                          !isPageBumperMode &&
+                          !s.groupIds.includes(effectiveGroupId.toLowerCase())
+                        )
+                          throw Error('目标帖子或作者已变化');
+                        try {
+                          return requireBumperPost(
+                            p,
+                            feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
+                            expectedFeedbackId,
+                          );
+                        } catch (error) {
+                          if (!(error instanceof BumperPostReadIncomplete) || attempt > 0)
+                            throw error;
+                          await wait(200);
+                        }
+                      }
+                    };
+                    await dismissWelcomeDialogIfNeeded();
+                    if (scanOnly) {
+                      callbacks.status('只读扫描 · ' + post.postId);
+                      resumablePost = null;
+                      continue;
+                    }
+                    // Pre-like/comment mandatory human-like browsing dwell inside bound op
+                    if (!activePostState.browseDone) {
+                      await op(
+                        post.hasVideo ? '观看目标视频' : '浏览目标帖子',
+                        async () => {
+                          const maxWatchMs = Math.round(180_000 * this.paceScale);
+                          // A scan supplies a candidate ID, never a durable DOM locator.
+                          const refreshedPost = await prepareBumperPost({
+                            page,
+                            readCurrent: checkPost,
+                            guard,
+                            candidateCardCSS: post.postCSS,
+                            paceScale: this.paceScale,
+                          });
+                          expectedFeedbackId = refreshedPost.feedbackId;
+                          if (refreshedPost.hasVideo) {
+                            callbacks.status(
+                              `正在观看视频 · ${group.name} · ${target.name}`,
+                              q.today,
+                            );
+                            await watchBumperVideo({
+                              page,
+                              initial: refreshedPost,
+                              readCurrent: checkPost,
+                              guard,
+                              sleep: (ms) => paceWait(ms / (this.paceScale || 1)),
+                              sound: Boolean(settings.enableSound),
+                              budgetMs: maxWatchMs,
+                              tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
+                              stallMs: Math.max(120, Math.round(12000 * this.paceScale)),
+                            });
+                          } else {
+                            callbacks.status(
+                              `正在浏览目标帖子 · ${group.name} · ${target.name}`,
+                              q.today,
+                            );
+                            const totalDwell = Math.round(
+                              (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
+                            );
+                            await paceWait(totalDwell / (this.paceScale || 1));
+                            guard();
+                            const latest = await checkPost();
+                            const latestAnchor =
+                              latest.likeCSS ??
+                              latest.commentButtonCSS ??
+                              latest.commentCSS ??
+                              latest.videoCSS ??
+                              latest.postCSS;
+                            if (latestAnchor) {
+                              await revealBumperControlIfNeeded(
+                                page.locator(latestAnchor).first(),
+                                this.paceScale,
+                              ).catch(() => {});
+                            }
+                          }
+                          return true;
+                        },
+                        async () => true,
+                      ).catch((error) => {
+                        if (!callbacks.cancelled())
+                          reportIssue({
+                            kind: 'failed',
+                            reason: error instanceof Error ? error.message : String(error),
+                          });
+                        throw error;
+                      });
+                      activePostState.browseDone = true;
+                      consecutiveNoProgressRecoveries = 0;
+                    } else {
                       const refreshedPost = await prepareBumperPost({
                         page,
                         readCurrent: checkPost,
@@ -3359,363 +4011,172 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                         paceScale: this.paceScale,
                       });
                       expectedFeedbackId = refreshedPost.feedbackId;
-                      if (refreshedPost.hasVideo) {
-                        callbacks.status(`正在观看视频 · ${group.name} · ${target.name}`, q.today);
-                        await watchBumperVideo({
-                          page,
-                          initial: refreshedPost,
-                          readCurrent: checkPost,
-                          guard,
-                          sleep: (ms) => paceWait(ms / (this.paceScale || 1)),
-                          sound: Boolean(settings.enableSound),
-                          budgetMs: maxWatchMs,
-                          tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
-                          stallMs: Math.max(120, Math.round(12000 * this.paceScale)),
-                        });
-                      } else {
-                        callbacks.status(
-                          `正在浏览目标帖子 · ${group.name} · ${target.name}`,
-                          q.today,
-                        );
-                        const totalDwell = Math.round(
-                          (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
-                        );
-                        await paceWait(totalDwell / (this.paceScale || 1));
-                        guard();
-                        const latest = await checkPost();
-                        const latestAnchor =
-                          latest.likeCSS ??
-                          latest.commentButtonCSS ??
-                          latest.commentCSS ??
-                          latest.videoCSS ??
-                          latest.postCSS;
-                        if (latestAnchor) {
-                          await revealBumperControlIfNeeded(
-                            page.locator(latestAnchor).first(),
-                            this.paceScale,
-                          ).catch(() => {});
-                        }
+                    }
+                    callbacks.status(`正在顶贴 · ${group.name} · ${target.name}`, q.today);
+                    let hydratedPost = await checkPost();
+                    if (
+                      wantLike &&
+                      activePostState.likeProgress === 'NOT_SENT' &&
+                      !hydratedPost.liked &&
+                      !hydratedPost.likeCSS
+                    ) {
+                      const bottomAnchor =
+                        hydratedPost.commentButtonCSS ??
+                        hydratedPost.commentCSS ??
+                        hydratedPost.postCSS ??
+                        post.postCSS;
+                      if (bottomAnchor) {
+                        await page
+                          .locator(bottomAnchor)
+                          .first()
+                          .evaluate((el) => el.scrollIntoView({ block: 'end', inline: 'nearest' }))
+                          .catch(() => {});
+                        await paceWait(500);
+                        hydratedPost = await checkPost().catch(() => hydratedPost);
                       }
-                      return true;
-                    },
-                    async () => true,
-                  ).catch((error) => {
-                    if (!callbacks.cancelled())
-                      reportIssue({
-                        kind: 'failed',
-                        reason: error instanceof Error ? error.message : String(error),
-                      });
-                    throw error;
-                  });
-                  callbacks.status(`正在顶贴 · ${group.name} · ${target.name}`, q.today);
-                  let hydratedPost = await checkPost();
-                  if (wantLike && !hydratedPost.liked && !hydratedPost.likeCSS) {
-                    const bottomAnchor =
-                      hydratedPost.commentButtonCSS ??
-                      hydratedPost.commentCSS ??
-                      hydratedPost.postCSS ??
-                      post.postCSS;
-                    if (bottomAnchor) {
-                      await page
-                        .locator(bottomAnchor)
-                        .first()
-                        .evaluate((el) => el.scrollIntoView({ block: 'end', inline: 'nearest' }))
-                        .catch(() => {});
-                      await paceWait(500);
-                      hydratedPost = await checkPost().catch(() => hydratedPost);
                     }
-                  }
-                  const readReactionPost = async () => {
-                    const current = await checkPost();
-                    if (current.reactionState !== 'unknown') return current;
-                    const fresh = await readBumperReactionFromServer(page, {
-                      actorId: accountId,
-                      postId: post.postId,
-                      feedbackId: current.feedbackId ?? '',
-                    });
-                    guard();
-                    if (fresh.state === 'unknown') throw Error('点赞状态暂未读清，未点击当前帖');
-                    return {
-                      ...current,
-                      reactionState: fresh.state,
-                      liked: fresh.state === 'active',
-                    };
-                  };
-                  if (wantLike && hydratedPost.reactionState === 'unknown')
-                    hydratedPost = await readReactionPost();
-                  const doLike = wantLike && !hydratedPost.liked && !!hydratedPost.likeCSS;
-                  if (doLike) {
-                    const reactionPool = settings.reactionTypes?.length
-                      ? settings.reactionTypes
-                      : (['care'] as const);
-                    const selectedReaction = settings.useLongPressReaction
-                      ? (reactionPool[Math.floor(Math.random() * reactionPool.length)] ?? 'care')
-                      : 'like';
-                    const expectedReactionId = BUMPER_REACTION_IDS[selectedReaction];
-                    const likePressBefore = conn.submissionCalls?.mousePress;
-                    const native = observeBumperGraphql(page, {
-                      actorId: accountId,
-                      feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
-                      kind: 'like',
-                      profileId,
-                      postId: post.postId,
-                      expectedReactionId,
-                    });
-                    try {
-                      await op(
-                        '点赞',
-                        async () => {
-                          const current = await readReactionPost();
-                          if (current.liked) return false;
-                          if (current.reactionState === 'unknown')
-                            throw Error('点赞状态暂未读清，未点击当前帖');
-                          if (!current.likeCSS) throw Error('点赞入口未找到');
-                          const performLikeOrReaction = async (likeSelector: string) => {
-                            let activeLikeSelector = likeSelector;
-                            const scrolled = await revealBumperControlIfNeeded(
-                              page.locator(activeLikeSelector).first(),
-                              this.paceScale,
-                            );
-                            if (scrolled) {
-                              if (this.paceScale > 0) {
-                                await wait(Math.max(1, Math.round(180 * this.paceScale)));
-                              }
-                              const afterScroll = await checkPost().catch(() => null);
-                              if (afterScroll?.liked) return;
-                              if (afterScroll?.likeCSS) {
-                                activeLikeSelector = afterScroll.likeCSS;
-                              }
-                            }
-                            if (selectedReaction !== 'like') {
-                              const hover = async () => {
-                                guard();
-                                await page
-                                  .locator(activeLikeSelector)
-                                  .first()
-                                  .hover({ timeout: 3000 });
-                              };
-                              await hover();
-                              const deadline =
-                                Date.now() + Math.max(80, Math.round(1800 * (this.paceScale || 1)));
-                              let target: string | null = null,
-                                rehovered = false;
-                              do {
-                                guard();
-                                target = await page.evaluate(projectBumperReactionTarget, {
-                                  postId: post.postId,
-                                  feedbackId: current.feedbackId ?? '',
-                                  reactionId: expectedReactionId,
-                                });
-                                if (target) break;
-                                if (this.paceScale === 0) break;
-                                if (!rehovered && Date.now() > deadline - 800) {
-                                  rehovered = true;
-                                  await hover();
-                                }
-                                await wait(180);
-                              } while (Date.now() < deadline);
-                              if (!target) throw Error('所选反应按钮未就绪，未改用其他反应');
-                              const beforeReactionPress = await readReactionPost();
-                              if (beforeReactionPress.liked) return;
-                              if (beforeReactionPress.reactionState === 'unknown')
-                                throw Error('点赞状态暂未读清，未点击当前帖');
-                              await page.locator(target).first().click({ timeout: 4000 });
-                              return;
-                            }
-                            const beforePress = await readReactionPost();
-                            if (beforePress.liked) return;
-                            if (beforePress.reactionState === 'unknown')
-                              throw Error('点赞状态暂未读清，未点击当前帖');
-                            await page.locator(activeLikeSelector).first().click({ timeout: 4000 });
-                          };
-                          try {
-                            await performLikeOrReaction(current.likeCSS);
-                          } catch (error) {
-                            if (conn.submissionCalls?.mousePress !== likePressBefore) throw error;
-                            // Retry a stale selector only when no press was dispatched.
-                            guard();
-                            const retried = await checkPost();
-                            if (retried.liked) return false;
-                            if (!retried.likeCSS) throw Error('点赞入口未找到');
-                            await performLikeOrReaction(retried.likeCSS);
-                          }
-                          return (
-                            likePressBefore === undefined ||
-                            conn.submissionCalls.mousePress > likePressBefore
-                          );
-                        },
-                        async (clicked) => {
-                          if (!clicked) return true;
-                          const end = Date.now() + 8000;
-                          while (Date.now() < end) {
-                            guard();
-                            if (native.restricted())
-                              throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
-                            if (native.failed()) throw Error(native.failureReason());
-                            if (native.confirmed()) {
-                              record.liked = true;
-                              consecutiveUnconfirmed = 0;
-                              return true;
-                            }
-                            await wait(250);
-                          }
-                          await native.waitForEvidence(2000, guard);
-                          if (native.restricted())
-                            throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
-                          if (native.failed()) throw Error(native.failureReason());
-                          if (native.confirmed()) {
-                            record.liked = true;
-                            consecutiveUnconfirmed = 0;
-                            return true;
-                          }
-                          const fresh = await readBumperReactionFromServer(page, {
-                            actorId: accountId,
-                            postId: post.postId,
-                            feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
-                          });
-                          guard();
-                          if (native.restricted())
-                            throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
-                          if (native.failed()) throw Error(native.failureReason());
-                          if (
-                            native.confirmed() ||
-                            (fresh.state === 'active' && fresh.reactionId === expectedReactionId)
-                          ) {
-                            record.liked = true;
-                            consecutiveUnconfirmed = 0;
-                            devDiag.record({
-                              category: 'GROUP_BUMPER',
-                              event: 'BUMPER_LIKE_READBACK',
-                              profileId,
-                              data: {
-                                postId: post.postId,
-                                feedbackId: fresh.feedbackId,
-                                reactionId: fresh.reactionId,
-                                state: fresh.state,
-                              },
-                            });
-                            return true;
-                          }
-                          consecutiveUnconfirmed++;
-                          return false;
-                        },
-                        async (value, binding, resolution) => {
-                          if (record.liked) return persist(value, binding, resolution);
-                        },
-                        (binding) => native.bindOperation(binding.operationId),
-                      );
-                    } finally {
-                      await native.close();
-                    }
-                    await dismissWelcomeDialogIfNeeded();
-                  }
-                  if (doLike && chosen) {
-                    await paceWait(3500 + Math.floor(Math.random() * 4001));
-                  }
-                  if (chosen) {
-                    try {
+                    const readReactionPost = async () => {
                       const current = await checkPost();
-                      if (!current.commentCSS && current.commentButtonCSS) {
-                        await op(
-                          '展开评论',
-                          async () => {
-                            const clickCommentBtn = async (css: string) => {
-                              const button = page.locator(css).first();
-                              await revealBumperControlIfNeeded(button, this.paceScale);
-                              await button.click({ timeout: 4000 });
-                            };
-                            try {
-                              await clickCommentBtn(
-                                current.commentButtonCSS ?? '[data-wb-missing-control]',
-                              );
-                            } catch {
-                              guard();
-                              const retried = await checkPost();
-                              if (retried.commentCSS) return true;
-                              if (!retried.commentButtonCSS) throw Error('评论入口未找到');
-                              await clickCommentBtn(retried.commentButtonCSS);
-                            }
-                            const waitEnd =
-                              Date.now() + Math.max(200, Math.round(5000 * (this.paceScale || 1)));
-                            let retriedClick = false;
-                            while (Date.now() < waitEnd) {
-                              guard();
-                              const polled = await checkPost().catch(() => null);
-                              if (polled?.commentCSS) return true;
-                              if (
-                                !retriedClick &&
-                                Date.now() + Math.round(2500 * (this.paceScale || 1)) >= waitEnd &&
-                                polled?.commentButtonCSS
-                              ) {
-                                retriedClick = true;
-                                await clickCommentBtn(polled.commentButtonCSS).catch(() => {});
-                              }
-                              await paceWait(250);
-                            }
-                            return true;
-                          },
-                          async () => true,
-                        );
-                      }
-                      const editor = (await checkPost()).commentCSS;
-                      if (!editor) throw Error('评论输入框未找到');
-                      await op(
-                        '填写评论',
-                        async () => {
-                          try {
-                            await typeBumperComment(
-                              page,
-                              page.locator(editor).first(),
-                              chosen?.text ?? '',
-                              this.paceScale,
-                              guard,
-                            );
-                          } catch (err) {
-                            guard();
-                            const retriedEditor = (await checkPost()).commentCSS;
-                            if (!retriedEditor) throw err;
-                            await typeBumperComment(
-                              page,
-                              page.locator(retriedEditor).first(),
-                              chosen?.text ?? '',
-                              this.paceScale,
-                              guard,
-                            );
-                          }
-                          return true;
-                        },
-                        async () => true,
-                      );
+                      if (current.reactionState !== 'unknown') return current;
+                      const fresh = await readBumperReactionFromServer(page, {
+                        actorId: accountId,
+                        postId: post.postId,
+                        feedbackId: current.feedbackId ?? '',
+                      });
+                      guard();
+                      if (fresh.state === 'unknown') throw Error('点赞状态暂未读清，未点击当前帖');
+                      return {
+                        ...current,
+                        reactionState: fresh.state,
+                        liked: fresh.state === 'active',
+                      };
+                    };
+                    if (
+                      wantLike &&
+                      activePostState.likeProgress === 'NOT_SENT' &&
+                      hydratedPost.reactionState === 'unknown'
+                    )
+                      hydratedPost = await readReactionPost();
+                    const doLike =
+                      wantLike &&
+                      activePostState.likeProgress === 'NOT_SENT' &&
+                      !hydratedPost.liked &&
+                      !!hydratedPost.likeCSS;
+                    if (doLike) {
+                      const reactionPool = settings.reactionTypes?.length
+                        ? settings.reactionTypes
+                        : (['care'] as const);
+                      const selectedReaction = settings.useLongPressReaction
+                        ? (reactionPool[Math.floor(Math.random() * reactionPool.length)] ?? 'care')
+                        : 'like';
+                      const expectedReactionId = BUMPER_REACTION_IDS[selectedReaction];
+                      const likePressBefore = conn.submissionCalls?.mousePress;
                       const native = observeBumperGraphql(page, {
                         actorId: accountId,
                         feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
-                        kind: 'comment',
-                        comment: chosen.text,
+                        kind: 'like',
                         profileId,
                         postId: post.postId,
+                        expectedReactionId,
                       });
+                      let likeOpId = '';
                       try {
                         await op(
-                          '发送评论',
+                          '点赞',
                           async () => {
-                            const activeEditor =
-                              (await checkPost().catch(() => null))?.commentCSS ?? editor;
-                            await page
-                              .locator(activeEditor)
-                              .first()
-                              .press('Enter', { timeout: 4000 });
-                            // Dispatch once. A slow native response is not permission to resubmit.
-                            return true;
+                            const current = await readReactionPost();
+                            if (current.liked) return false;
+                            if (current.reactionState === 'unknown')
+                              throw Error('点赞状态暂未读清，未点击当前帖');
+                            if (!current.likeCSS) throw Error('点赞入口未找到');
+                            const performLikeOrReaction = async (likeSelector: string) => {
+                              let activeLikeSelector = likeSelector;
+                              const scrolled = await revealBumperControlIfNeeded(
+                                page.locator(activeLikeSelector).first(),
+                                this.paceScale,
+                              );
+                              if (scrolled) {
+                                if (this.paceScale > 0) {
+                                  await wait(Math.max(1, Math.round(180 * this.paceScale)));
+                                }
+                                const afterScroll = await checkPost().catch(() => null);
+                                if (afterScroll?.liked) return;
+                                if (afterScroll?.likeCSS) {
+                                  activeLikeSelector = afterScroll.likeCSS;
+                                }
+                              }
+                              if (selectedReaction !== 'like') {
+                                const hover = async () => {
+                                  guard();
+                                  await page
+                                    .locator(activeLikeSelector)
+                                    .first()
+                                    .hover({ timeout: 3000 });
+                                };
+                                await hover();
+                                const deadline =
+                                  Date.now() +
+                                  Math.max(80, Math.round(1800 * (this.paceScale || 1)));
+                                let target: string | null = null,
+                                  rehovered = false;
+                                do {
+                                  guard();
+                                  target = await page.evaluate(projectBumperReactionTarget, {
+                                    postId: post.postId,
+                                    feedbackId: current.feedbackId ?? '',
+                                    reactionId: expectedReactionId,
+                                  });
+                                  if (target) break;
+                                  if (this.paceScale === 0) break;
+                                  if (!rehovered && Date.now() > deadline - 800) {
+                                    rehovered = true;
+                                    await hover();
+                                  }
+                                  await wait(180);
+                                } while (Date.now() < deadline);
+                                if (!target) throw Error('所选反应按钮未就绪，未改用其他反应');
+                                const beforeReactionPress = await readReactionPost();
+                                if (beforeReactionPress.liked) return;
+                                if (beforeReactionPress.reactionState === 'unknown')
+                                  throw Error('点赞状态暂未读清，未点击当前帖');
+                                await page.locator(target).first().click({ timeout: 4000 });
+                                return;
+                              }
+                              const beforePress = await readReactionPost();
+                              if (beforePress.liked) return;
+                              if (beforePress.reactionState === 'unknown')
+                                throw Error('点赞状态暂未读清，未点击当前帖');
+                              await page
+                                .locator(activeLikeSelector)
+                                .first()
+                                .click({ timeout: 4000 });
+                            };
+                            try {
+                              await performLikeOrReaction(current.likeCSS);
+                            } catch (error) {
+                              if (conn.submissionCalls?.mousePress !== likePressBefore) throw error;
+                              // Retry a stale selector only when no press was dispatched.
+                              guard();
+                              const retried = await checkPost();
+                              if (retried.liked) return false;
+                              if (!retried.likeCSS) throw Error('点赞入口未找到');
+                              await performLikeOrReaction(retried.likeCSS);
+                            }
+                            return (
+                              likePressBefore === undefined ||
+                              conn.submissionCalls.mousePress > likePressBefore
+                            );
                           },
-                          async () => {
-                            const end = Date.now() + 10000;
+                          async (clicked) => {
+                            if (!clicked) return true;
+                            const end = Date.now() + 8000;
                             while (Date.now() < end) {
                               guard();
                               if (native.restricted())
                                 throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
                               if (native.failed()) throw Error(native.failureReason());
                               if (native.confirmed()) {
-                                record.commentText = chosen?.text ?? null;
+                                record.liked = true;
                                 consecutiveUnconfirmed = 0;
                                 return true;
                               }
@@ -3726,130 +4187,492 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                               throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
                             if (native.failed()) throw Error(native.failureReason());
                             if (native.confirmed()) {
-                              record.commentText = chosen?.text ?? null;
+                              record.liked = true;
                               consecutiveUnconfirmed = 0;
+                              return true;
+                            }
+                            const fresh = await readBumperReactionFromServer(page, {
+                              actorId: accountId,
+                              postId: post.postId,
+                              feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
+                            });
+                            guard();
+                            if (native.restricted())
+                              throw new BumperFatalError('受限 · 账号点赞或评论被 Facebook 限制');
+                            if (native.failed()) throw Error(native.failureReason());
+                            if (
+                              native.confirmed() ||
+                              (fresh.state === 'active' && fresh.reactionId === expectedReactionId)
+                            ) {
+                              record.liked = true;
+                              consecutiveUnconfirmed = 0;
+                              devDiag.record({
+                                category: 'GROUP_BUMPER',
+                                event: 'BUMPER_LIKE_READBACK',
+                                profileId,
+                                data: {
+                                  postId: post.postId,
+                                  feedbackId: fresh.feedbackId,
+                                  reactionId: fresh.reactionId,
+                                  state: fresh.state,
+                                },
+                              });
                               return true;
                             }
                             consecutiveUnconfirmed++;
                             return false;
                           },
-                          persist,
-                          (binding) => native.bindOperation(binding.operationId),
+                          async (value, binding, resolution) => {
+                            if (record.liked) return persist(value, binding, resolution);
+                          },
+                          (binding) => {
+                            likeOpId = binding.operationId;
+                            native.bindOperation(binding.operationId);
+                          },
                         );
+                        activePostState.likeProgress = 'VERIFIED';
+                      } catch (likeErr) {
+                        const dispatched =
+                          likePressBefore !== undefined &&
+                          (conn.submissionCalls?.mousePress ?? 0) > likePressBefore;
+                        if (likeOpId) {
+                          activePostState.likeProgress = await resolveActionProgressOnOpExit(
+                            likeOpId,
+                            dispatched,
+                          );
+                        } else if (dispatched) {
+                          activePostState.likeProgress = 'UNKNOWN';
+                        }
+                        throw likeErr;
                       } finally {
                         await native.close();
                       }
-                    } finally {
                       await dismissWelcomeDialogIfNeeded();
                     }
-                  }
-                  if (record.liked || record.commentText) {
-                    await paceWait(4000 + Math.floor(Math.random() * 5001));
-                  }
-                } catch (error) {
-                  guard();
-                  if (isBumperFatal(error)) throw error;
-                  if (issueCount === issueCountBeforePost)
-                    reportIssue({
-                      kind: 'failed',
-                      reason: error instanceof Error ? error.message : String(error),
-                    });
-                  if (consecutiveUnconfirmed >= 3) {
-                    throw new BumperFatalError(
-                      '连续 3 次互动结果未确认，本轮已结束，原操作保留待核对',
-                    );
-                  }
-                  devDiag.record({
-                    level: 'WARN',
-                    category: 'GROUP_BUMPER',
-                    event: 'BUMPER_POST_SKIPPED',
-                    profileId,
-                    reason: error instanceof Error ? error.message : String(error),
-                    data: { groupId: group.id, postId: post.postId },
-                  });
-                } finally {
-                  // Release local claims even when closing the native dialog fails.
-                  try {
-                    if (!callbacks.cancelled() && peer.online && peer.epoch === epoch) {
-                      await closeBumperPostDialog({
-                        page,
-                        postId: post.postId,
-                        guard,
-                        read: () =>
-                          readGroupBumper(page, {
-                            groupId: effectiveGroupId,
-                            targetPostId: post.postId,
-                          }),
-                        run: (work, verify) => op('关闭帖子弹窗', work, verify),
+                    if (doLike && chosen && activePostState.commentProgress === 'NOT_SENT') {
+                      await paceWait(3500 + Math.floor(Math.random() * 4001));
+                    }
+                    if (chosen && activePostState.commentProgress === 'NOT_SENT') {
+                      try {
+                        const current = await checkPost();
+                        if (!current.commentCSS && current.commentButtonCSS) {
+                          await op(
+                            '展开评论',
+                            async () => {
+                              const clickCommentBtn = async (css: string) => {
+                                const button = page.locator(css).first();
+                                await revealBumperControlIfNeeded(button, this.paceScale);
+                                await button.click({ timeout: 4000 });
+                              };
+                              try {
+                                await clickCommentBtn(
+                                  current.commentButtonCSS ?? '[data-wb-missing-control]',
+                                );
+                              } catch {
+                                guard();
+                                const retried = await checkPost();
+                                if (retried.commentCSS) return true;
+                                if (!retried.commentButtonCSS) throw Error('评论入口未找到');
+                                await clickCommentBtn(retried.commentButtonCSS);
+                              }
+                              const waitEnd =
+                                Date.now() +
+                                Math.max(200, Math.round(5000 * (this.paceScale || 1)));
+                              let retriedClick = false;
+                              while (Date.now() < waitEnd) {
+                                guard();
+                                const polled = await checkPost().catch(() => null);
+                                if (polled?.commentCSS) return true;
+                                if (
+                                  !retriedClick &&
+                                  Date.now() + Math.round(2500 * (this.paceScale || 1)) >=
+                                    waitEnd &&
+                                  polled?.commentButtonCSS
+                                ) {
+                                  retriedClick = true;
+                                  await clickCommentBtn(polled.commentButtonCSS).catch(() => {});
+                                }
+                                await paceWait(250);
+                              }
+                              return true;
+                            },
+                            async () => true,
+                          );
+                        }
+                        const editor = (await checkPost()).commentCSS;
+                        if (!editor) throw Error('评论输入框未找到');
+                        await op(
+                          '填写评论',
+                          async () => {
+                            try {
+                              await typeBumperComment(
+                                page,
+                                page.locator(editor).first(),
+                                chosen?.text ?? '',
+                                this.paceScale,
+                                guard,
+                              );
+                            } catch (err) {
+                              guard();
+                              const retriedEditor = (await checkPost()).commentCSS;
+                              if (!retriedEditor) throw err;
+                              await typeBumperComment(
+                                page,
+                                page.locator(retriedEditor).first(),
+                                chosen?.text ?? '',
+                                this.paceScale,
+                                guard,
+                              );
+                            }
+                            return true;
+                          },
+                          async () => true,
+                        );
+                        const commentEnterBefore = conn.submissionCalls?.enter;
+                        const native = observeBumperGraphql(page, {
+                          actorId: accountId,
+                          feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
+                          kind: 'comment',
+                          comment: chosen.text,
+                          profileId,
+                          postId: post.postId,
+                        });
+                        let commentOpId = '';
+                        let commentRejectedByRestriction = false;
+                        try {
+                          await op(
+                            '发送评论',
+                            async () => {
+                              const activeEditor =
+                                (await checkPost().catch(() => null))?.commentCSS ?? editor;
+                              await page
+                                .locator(activeEditor)
+                                .first()
+                                .press('Enter', { timeout: 4000 });
+                              // Dispatch once. A slow native response is not permission to resubmit.
+                              return true;
+                            },
+                            async () => {
+                              const checkCommentRestriction = async (checkDom: boolean) => {
+                                if (native.confirmed()) return false;
+                                if (native.restricted()) {
+                                  if (settings.likeProbability === 0) {
+                                    throw new BumperFatalError(
+                                      '受限 · 账号点赞或评论被 Facebook 限制',
+                                    );
+                                  }
+                                  await dismissFeatureInterventionDialogIfPresent(page, guard);
+                                  commentRejectedByRestriction = true;
+                                  commentRestrictedInSession = true;
+                                  return true;
+                                }
+                                if (!checkDom) return false;
+                                const s = await readGroupBumper(page, {
+                                  groupId: effectiveGroupId,
+                                });
+                                if (s.checkpointRestricted || s.restrictionReason) {
+                                  throw new BumperFatalError(
+                                    '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
+                                  );
+                                }
+                                if (
+                                  settings.likeProbability > 0 &&
+                                  (s.restricted ||
+                                    (s.blockingDialog && Boolean(s.joinRestrictionDismissCSS)))
+                                ) {
+                                  const dismissed = await dismissFeatureInterventionDialogIfPresent(
+                                    page,
+                                    guard,
+                                  );
+                                  if (!dismissed && s.joinRestrictionDismissCSS) {
+                                    await page
+                                      .evaluate((sel) => {
+                                        document.querySelector<HTMLElement>(sel)?.click();
+                                      }, s.joinRestrictionDismissCSS)
+                                      .catch(() => {});
+                                    await wait(350);
+                                  }
+                                  commentRejectedByRestriction = true;
+                                  commentRestrictedInSession = true;
+                                  return true;
+                                }
+                                return false;
+                              };
+                              const end = Date.now() + 10000;
+                              let pollTick = 0;
+                              while (Date.now() < end) {
+                                guard();
+                                if (native.confirmed()) {
+                                  record.commentText = chosen?.text ?? null;
+                                  consecutiveUnconfirmed = 0;
+                                  return true;
+                                }
+                                if (await checkCommentRestriction(pollTick % 2 === 1)) return true;
+                                if (native.failed()) throw Error(native.failureReason());
+                                await wait(250);
+                                pollTick++;
+                              }
+                              await native.waitForEvidence(2000, guard);
+                              if (native.confirmed()) {
+                                record.commentText = chosen?.text ?? null;
+                                consecutiveUnconfirmed = 0;
+                                return true;
+                              }
+                              if (await checkCommentRestriction(true)) return true;
+                              if (native.failed()) throw Error(native.failureReason());
+                              consecutiveUnconfirmed++;
+                              return false;
+                            },
+                            async (value, binding, resolution) => {
+                              if (commentRejectedByRestriction && !record.commentText) {
+                                return {
+                                  id: randomUUID(),
+                                  outcome: 'NOT_APPLIED',
+                                  evidenceDigest: digest({
+                                    binding,
+                                    label: '发送评论',
+                                    rejectedByRestriction: true,
+                                  }),
+                                };
+                              }
+                              return persist(value, binding, resolution);
+                            },
+                            (binding) => {
+                              commentOpId = binding.operationId;
+                              native.bindOperation(binding.operationId);
+                            },
+                          );
+                          if (commentRejectedByRestriction) {
+                            activePostState.chosen = null;
+                            devDiag.record({
+                              level: 'INFO',
+                              category: 'GROUP_BUMPER',
+                              event: 'BUMPER_COMMENT_RESTRICTED_FALLBACK_LIKE_ONLY',
+                              profileId,
+                              data: { groupId: effectiveGroupId, postId: post.postId },
+                            });
+                          }
+                          activePostState.commentProgress = 'VERIFIED';
+                        } catch (commentErr) {
+                          const dispatched =
+                            commentEnterBefore !== undefined &&
+                            (conn.submissionCalls?.enter ?? 0) > commentEnterBefore;
+                          if (commentOpId) {
+                            activePostState.commentProgress = await resolveActionProgressOnOpExit(
+                              commentOpId,
+                              dispatched,
+                            );
+                          } else if (dispatched) {
+                            activePostState.commentProgress = 'UNKNOWN';
+                          }
+                          throw commentErr;
+                        } finally {
+                          await native.close();
+                        }
+                      } finally {
+                        const postCommentSurface = await readGroupBumper(page, {
+                          groupId: effectiveGroupId,
+                        }).catch(() => null);
+                        if (
+                          postCommentSurface &&
+                          settings.likeProbability > 0 &&
+                          !postCommentSurface.checkpointRestricted &&
+                          !postCommentSurface.restrictionReason &&
+                          (postCommentSurface.restricted ||
+                            Boolean(postCommentSurface.joinRestrictionDismissCSS))
+                        ) {
+                          commentRestrictedInSession = true;
+                          await dismissPostJoinObstructionIfNeeded(postCommentSurface);
+                          devDiag.record({
+                            level: 'INFO',
+                            category: 'GROUP_BUMPER',
+                            event: 'BUMPER_COMMENT_RESTRICTED_FALLBACK_LIKE_ONLY',
+                            profileId,
+                            data: { groupId: effectiveGroupId, postId: post.postId },
+                          });
+                        }
+                        await dismissWelcomeDialogIfNeeded();
+                      }
+                    }
+                    resumablePost = null;
+                    if (record.liked || record.commentText) {
+                      await paceWait(4000 + Math.floor(Math.random() * 5001));
+                    }
+                  } catch (error) {
+                    if (isBumperRecoverableDisconnectError(error)) {
+                      throw error;
+                    }
+                    resumablePost = null;
+                    guard();
+                    if (isBumperFatal(error)) throw error;
+                    if (issueCount === issueCountBeforePost)
+                      reportIssue({
+                        kind: 'failed',
+                        reason: error instanceof Error ? error.message : String(error),
                       });
-                      await dismissWelcomeDialogIfNeeded();
+                    if (consecutiveUnconfirmed >= 3) {
+                      throw new BumperFatalError(
+                        '连续 3 次互动结果未确认，本轮已结束，原操作保留待核对',
+                      );
                     }
+                    devDiag.record({
+                      level: 'WARN',
+                      category: 'GROUP_BUMPER',
+                      event: 'BUMPER_POST_SKIPPED',
+                      profileId,
+                      reason: error instanceof Error ? error.message : String(error),
+                      data: { groupId: group.id, postId: post.postId },
+                    });
                   } finally {
-                    if (quotaReserved) {
-                      this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
+                    // Release local claims even when closing the native dialog fails.
+                    try {
+                      if (!callbacks.cancelled() && peer.online && peer.epoch === epoch) {
+                        await closeBumperPostDialog({
+                          page,
+                          postId: post.postId,
+                          guard,
+                          read: () =>
+                            readGroupBumper(page, {
+                              groupId: effectiveGroupId,
+                              targetPostId: post.postId,
+                            }),
+                          run: (work, verify) => op('关闭帖子弹窗', work, verify),
+                        });
+                        await dismissWelcomeDialogIfNeeded();
+                      }
+                    } finally {
+                      if (quotaReserved) {
+                        this.inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
+                      }
+                      if (postClaimed) {
+                        this.inFlightCoordinator.releasePost(accountId, post.postId);
+                      }
+                      if (chosen) this.commentClaims.delete(chosen.id);
                     }
-                    if (postClaimed) {
-                      this.inFlightCoordinator.releasePost(accountId, post.postId);
-                    }
-                    if (chosen) this.commentClaims.delete(chosen.id);
                   }
                 }
-              }
-              if (!isPageBumperMode && oldPosts >= 3) break;
-              if ((feed ? [feed] : pages).every((p) => (counts.get(p.id) ?? 0) >= maxScanForTarget))
-                break;
-              empty = fresh ? 0 : empty + 1;
-              await op(
-                '浏览小组帖子',
-                async () => {
-                  const vp = page.viewportSize?.() ?? { width: 1024, height: 768 };
-                  await page.mouse?.move?.(
-                    Math.max(440, Math.round(vp.width * 0.58)),
-                    Math.round(vp.height * 0.55),
-                    { steps: 2 },
-                  );
-                  const beforeY = await page.evaluate(() => window.scrollY).catch(() => 0);
-                  const segments = this.paceScale > 0 ? 2 + Math.floor(Math.random() * 2) : 1;
-                  for (let s = 0; s < segments; s++) {
-                    await page.mouse.wheel(0, 280 + Math.floor(Math.random() * 181));
-                    if (s + 1 < segments) {
-                      const segPause = Math.round(
-                        (250 + Math.floor(Math.random() * 351)) * this.paceScale,
-                      );
-                      if (segPause > 0) await wait(segPause);
-                    }
-                  }
-                  if (this.paceScale > 0 && Math.random() < 0.25) {
-                    const microPause = Math.round(
-                      (300 + Math.floor(Math.random() * 301)) * this.paceScale,
+                if (!isPageBumperMode && oldPosts >= 3) break;
+                if (
+                  (feed ? [feed] : pages).every((p) => (counts.get(p.id) ?? 0) >= maxScanForTarget)
+                )
+                  break;
+                empty = fresh ? 0 : empty + 1;
+                await op(
+                  '浏览小组帖子',
+                  async () => {
+                    const vp = page.viewportSize?.() ?? { width: 1024, height: 768 };
+                    await page.mouse?.move?.(
+                      Math.max(440, Math.round(vp.width * 0.58)),
+                      Math.round(vp.height * 0.55),
+                      { steps: 2 },
                     );
-                    if (microPause > 0) await wait(microPause);
-                    if (Math.random() < 0.5) {
-                      await page.mouse.wheel(0, -(60 + Math.floor(Math.random() * 71)));
-                    } else {
-                      await page.mouse?.move?.(
-                        300 + Math.floor(Math.random() * 300),
-                        240 + Math.floor(Math.random() * 240),
-                        { steps: 3 },
-                      );
+                    const beforeY = await page.evaluate(() => window.scrollY).catch(() => 0);
+                    const segments = this.paceScale > 0 ? 2 + Math.floor(Math.random() * 2) : 1;
+                    for (let s = 0; s < segments; s++) {
+                      await page.mouse.wheel(0, 280 + Math.floor(Math.random() * 181));
+                      if (s + 1 < segments) {
+                        const segPause = Math.round(
+                          (250 + Math.floor(Math.random() * 351)) * this.paceScale,
+                        );
+                        if (segPause > 0) await wait(segPause);
+                      }
                     }
+                    if (this.paceScale > 0 && Math.random() < 0.25) {
+                      const microPause = Math.round(
+                        (300 + Math.floor(Math.random() * 301)) * this.paceScale,
+                      );
+                      if (microPause > 0) await wait(microPause);
+                      if (Math.random() < 0.5) {
+                        await page.mouse.wheel(0, -(60 + Math.floor(Math.random() * 71)));
+                      } else {
+                        await page.mouse?.move?.(
+                          300 + Math.floor(Math.random() * 300),
+                          240 + Math.floor(Math.random() * 240),
+                          { steps: 3 },
+                        );
+                      }
+                    }
+                    const afterY = await page.evaluate(() => window.scrollY).catch(() => 0);
+                    if (
+                      typeof beforeY === 'number' &&
+                      typeof afterY === 'number' &&
+                      afterY - beforeY < 220
+                    ) {
+                      await page.evaluate((dy) => window.scrollBy(0, dy), 650).catch(() => {});
+                    }
+                    return true;
+                  },
+                  async () => true,
+                );
+                await paceWait(1800 + Math.floor(Math.random() * 2201));
+              } catch (scrollError) {
+                if (callbacks.cancelled() || !isBumperRecoverableDisconnectError(scrollError)) {
+                  throw scrollError;
+                }
+                const reason =
+                  scrollError instanceof Error ? scrollError.message : String(scrollError);
+                await recoverBumperSession(reason);
+                hasRecoveredInFeed = true;
+                if (resumablePost) {
+                  const likeDone =
+                    !resumablePost.wantLike || resumablePost.likeProgress !== 'NOT_SENT';
+                  const commentDone =
+                    !resumablePost.chosen || resumablePost.commentProgress !== 'NOT_SENT';
+                  if (likeDone && commentDone) {
+                    resumablePost = null;
                   }
-                  const afterY = await page.evaluate(() => window.scrollY).catch(() => 0);
-                  if (
-                    typeof beforeY === 'number' &&
-                    typeof afterY === 'number' &&
-                    afterY - beforeY < 220
-                  ) {
-                    await page.evaluate((dy) => window.scrollBy(0, dy), 650).catch(() => {});
-                  }
-                  return true;
-                },
-                async () => true,
-              );
-              await paceWait(1800 + Math.floor(Math.random() * 2201));
+                }
+                const expectedFeedUrl = isPageBumperMode
+                  ? buildBumperTargetUrl('pages', resolvedPageId ?? feed?.id ?? '')
+                  : feed
+                    ? `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/user/${encodeURIComponent(resolvedPageId ?? feed.id)}/`
+                    : effectiveSearchMode === 'time_sort'
+                      ? `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/?sorting_setting=CHRONOLOGICAL`
+                      : `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/`;
+                const currentCheck = await readGroupBumper(page, {
+                  groupId: effectiveGroupId,
+                  ...(feed ? { pageId: resolvedPageId } : {}),
+                }).catch(() => null);
+                const stillOnTargetSurface = isPageBumperMode
+                  ? Boolean(
+                      currentCheck &&
+                      currentCheck.posts.length > 0 &&
+                      !/^\/(?:search|groups)(?:\/|$)/i.test(new URL(page.url()).pathname),
+                    )
+                  : Boolean(
+                      currentCheck &&
+                      currentCheck.groupIds.includes(effectiveGroupId.toLowerCase()),
+                    );
+                if (!stillOnTargetSurface) {
+                  await navigate(expectedFeedUrl);
+                  await waitForFeed(resolvedPageId);
+                }
+                scroll = Math.max(-1, scroll - 1);
+                continue;
+              }
+            }
+            if (
+              !isPageBumperMode &&
+              joinRestrictedFallback &&
+              effectiveSearchMode === 'page_group_feed' &&
+              !fallbackRandomAppended &&
+              feedIndex === feeds.length - 1 &&
+              !anyUserFeedPosts &&
+              initialFeed.posts.length > 0
+            ) {
+              fallbackRandomAppended = true;
+              effectiveSearchMode = 'random_browse';
+              callbacks.status(`专页小组贴未开放，已自动切换随机浏览 · ${group.name}`);
+              feeds.push(null);
             }
           }
         } catch (error) {
+          if (!callbacks.cancelled() && isBumperRecoverableDisconnectError(error)) {
+            const reason = error instanceof Error ? error.message : String(error);
+            await recoverBumperSession(reason);
+            groupIndex--;
+            continue;
+          }
           guard();
           if (isBumperFatal(error)) throw error;
           skippedGroups++;
@@ -3909,7 +4732,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       }
       throw runErr;
     } finally {
-      if (this.connections.get(profileId) === conn) await this.stop(profileId);
+      if (this.connections.get(profileId) === conn) {
+        await this.stop(profileId).catch(() => {});
+      }
       // The worker has now classified its last operation. Do not race that classification from stop().
       if (
         !this.hasControl(profileId) &&
@@ -3921,7 +4746,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         await recoverBumperOperations(kernel, peer, this.repo, () => {
           if (core?.peers.get(profileId) !== peer || !peer.online || !peer.synced)
             throw Error('BUMPER_RECOVERY_CHANGED');
-        });
+        }).catch(() => {});
     }
   }
 }

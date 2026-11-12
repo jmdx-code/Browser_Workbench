@@ -1323,16 +1323,18 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
     ),
   );
 
-  // 1. 4-char title "小组列表" and 0 default selected groups (never auto-selects 2/2)
+  // 1. Main page renders full-width post card grid without outer 7-day pills
+  expect(host.querySelector('.bumper-sticky-header .poster-daily-pills')).toBeNull();
+  expect(host.querySelectorAll('.poster-rect-card').length).toBe(1);
+
+  // 2. Open "发帖 / 定时" modal -> embeds FinderTargetList ("小组列表") and PosterProfileSelector ("发帖账号")
+  const dispatchBtn = host.querySelector<HTMLButtonElement>('.poster-card-post-btn');
+  expect(dispatchBtn).toBeTruthy();
+  await click(dispatchBtn);
   const toolbarTitle = host.querySelector('.finder-toolbar > strong')?.textContent;
   expect(toolbarTitle).toBe('小组列表');
-  expect(host.textContent).toContain('已选 0/2');
-  expect(host.textContent).toContain('▶ 开始发帖 (已选0号 × 0组 × 1素材)');
 
-  // 2. Outer 7-day pills removed from main page header
-  expect(host.querySelector('.bumper-sticky-header .poster-daily-pills')).toBeNull();
-
-  // 3. Outer "按 ID 选中" button works with shared_groups Facebook URLs
+  // 3. Outer "按 ID 选中" button inside dispatch modal works with shared_groups Facebook URLs
   const selectIdsBtn = [...host.querySelectorAll('.finder-toolbar button')].find((b) =>
     b.textContent?.includes('按 ID 选中'),
   );
@@ -1364,20 +1366,25 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
   await click(refreshAvatarBtn ?? null);
   expect(api.posterAction).toHaveBeenCalledWith('groups/refresh', { ids: ['3017439278594998'] });
 
-  // 5. PosterMaterialMatrix streamlined buttons, column resizers, floating + button, no bottom hint, and binary thumbnail img
+  // Close dispatch modal and open table editor ("表格批量新增 / Excel粘贴")
+  await click(host.querySelector('.poster-dispatch-right-head button[aria-label="关闭弹窗"]'));
+  const tableBtn = [...host.querySelectorAll('.poster-cards-toolbar button')].find((b) =>
+    b.textContent?.includes('Excel粘贴'),
+  );
+  await click(tableBtn ?? null);
+
+  // 5. PosterMaterialMatrix streamlined buttons, 6 column resizers (including AI label), floating + button, and video preview
   expect(host.textContent).not.toContain('填入测试素材');
   expect(host.textContent).not.toContain('复制整表');
-  expect(host.textContent).not.toContain('显示 1 / 1 行 · 支持从 Excel');
-  expect(host.querySelectorAll('.poster-col-resizer').length).toBe(5);
+  expect(host.querySelectorAll('.poster-col-resizer').length).toBe(6);
   expect(host.querySelector('.poster-floating-add-row-btn')?.textContent?.trim()).toMatch(
     /^[+＋]$/,
   );
-  const thumbImg = host.querySelector<HTMLImageElement>(
-    'img[src*="/api/workspace/group-poster/materials/thumbnail"]',
+  const videoThumb = host.querySelector<HTMLVideoElement>(
+    'video[src*="/api/workspace/group-poster/materials/media"]',
   );
-  expect(thumbImg).toBeTruthy();
-  expect(thumbImg?.getAttribute('src')).toContain('id=mat-thumb-1&v=777888');
-  expect(thumbImg?.getAttribute('loading')).toBe('lazy');
+  expect(videoThumb).toBeTruthy();
+  expect(videoThumb?.getAttribute('src')).toContain('id=mat-thumb-1&v=777888#t=0.1');
 });
 
 it('marketplace unavailable skip renders a green completed run and follows completed/failed tabs', async () => {
@@ -1445,4 +1452,292 @@ it('marketplace unavailable skip renders a green completed run and follows compl
   );
   await click(failed ?? null);
   expect(host.querySelectorAll('.run-record-row')).toHaveLength(0);
+});
+
+it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, DetailModal, GroupBumperPage, and TaskRecordsPage', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', {
+    value: { writeText },
+    configurable: true,
+  });
+  vi.mocked(api.targetFolders).mockResolvedValue([]);
+
+  const samplePosterLog = {
+    id: 'pl-1',
+    profileId: id,
+    accountId: '615501',
+    accountName: '测试专页',
+    accountAvatar: null,
+    identityType: 'page' as const,
+    groupId: '88001',
+    groupName: '缅甸交流群',
+    groupAvatar: null,
+    materialId: 'mat-1',
+    captionPreview: '第一行文案\n第二行文案',
+    postId: '99001122',
+    postUrl: 'https://www.facebook.com/groups/88001/posts/99001122/',
+    postedAt: new Date(2026, 10, 12, 10, 0, 0).getTime(),
+  };
+  const sampleBumperLog = {
+    id: 'bl-1',
+    profileId: id,
+    accountId: '100088',
+    groupId: '88001',
+    groupName: '缅甸交流群',
+    pageId: '615501',
+    pageName: '测试专页',
+    postId: '99001122',
+    postUrl: 'https://www.facebook.com/groups/88001/posts/99001122/',
+    liked: true,
+    commentText: '顶贴支持\n赞',
+    bumpedAt: new Date(2026, 10, 12, 11, 0, 0).getTime(),
+    sourceMode: 'group' as const,
+  };
+  const profile = {
+    id,
+    browserName: '用户8',
+    alias: '浏览器8',
+    order: 0,
+    groupId: null,
+    online: true,
+    phase: 'PAUSED' as const,
+    synced: true,
+    unresolved: 0,
+    extensionVersion: '0.3.82',
+    capabilities: [],
+    account: { state: 'logged_in' as const, id: '100088', name: 'Zhang', avatar: null },
+  };
+
+  vi.mocked(api.posterLogs).mockResolvedValue([samplePosterLog]);
+  vi.mocked(api.bumperLogs).mockResolvedValue([sampleBumperLog]);
+
+  // 1. GroupPosterPage 发帖记录弹窗 + 单条贴文详情弹窗
+  const posterMessages: string[] = [];
+  await act(async () =>
+    root.render(
+      <GroupPosterPage
+        state={{
+          groups: [],
+          materials: [
+            {
+              id: 'mat-1',
+              caption: '第一行文案\n第二行文案',
+              mediaSource: '',
+              localFilePath: null,
+              mediaKind: 'none',
+              background: 'plain',
+              aiLabel: 'default',
+              cacheStatus: 'none',
+              cacheError: null,
+              thumbnailDataUrl: null,
+              selected: true,
+              usedCount: 1,
+              sortOrder: 0,
+              createdAt: 1700000000000,
+              updatedAt: 1700000000000,
+            },
+          ],
+          settings: PosterSettings.parse({}),
+          running: false,
+          statusText: '',
+          total: 1,
+          dailyStats: [],
+          profileCounts: {},
+          pendingReviewOperations: [],
+          tasks: [],
+          postedGroupIdsByMaterial: { 'mat-1': ['88001'] },
+          activeGroupsByMaterial: {},
+        }}
+        selected={new Set()}
+        profiles={[profile]}
+        onState={() => {}}
+        onMessage={(m) => posterMessages.push(m)}
+      />,
+    ),
+  );
+
+  // Open 发帖记录 modal and click 批量复制全部
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('发帖记录')) ?? null,
+  );
+  const copyAllPosterBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('批量复制全部'),
+  );
+  expect(copyAllPosterBtn).toBeTruthy();
+  await click(copyAllPosterBtn ?? null);
+  expect(writeText).toHaveBeenCalledTimes(1);
+  expect(writeText.mock.calls[0]?.[0]).toContain('发帖时间\t浏览器\t发帖身份');
+  expect(writeText.mock.calls[0]?.[0]).toContain('第一行文案 第二行文案');
+  expect(writeText.mock.calls[0]?.[0]).toContain(
+    'https://www.facebook.com/groups/88001/posts/99001122/',
+  );
+
+  // Close modal and open 详情 modal on the material card
+  await click(host.querySelector('[aria-label="关闭弹窗"]'));
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('详情')) ?? null,
+  );
+  const detailCopyBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('批量复制全部'),
+  );
+  expect(detailCopyBtn).toBeTruthy();
+  await click(detailCopyBtn ?? null);
+  expect(writeText).toHaveBeenCalledTimes(2);
+
+  // 2. GroupBumperPage 顶贴记录弹窗
+  await act(async () =>
+    root.render(
+      <GroupBumperPage
+        state={{
+          groups: [],
+          pages: [],
+          comments: [],
+          pageComments: [],
+          settings: BumperSettings.parse({}),
+          pageSettings: BumperSettings.parse({}),
+          running: false,
+          pageBumperRunning: false,
+          statusText: '',
+          pageBumperStatusText: '',
+          total: 1,
+          pageTotal: 0,
+          dailyStats: [],
+          pageDailyStats: [],
+          profileCounts: {},
+          pageBumperProfileCounts: {},
+          pendingReviewOperations: [],
+          scheduledTasks: [],
+        }}
+        selected={new Set()}
+        profiles={[profile]}
+        onState={() => {}}
+        onMessage={() => {}}
+      />,
+    ),
+  );
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('顶贴记录')) ?? null,
+  );
+  const copyAllBumperBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('批量复制全部'),
+  );
+  expect(copyAllBumperBtn).toBeTruthy();
+  await click(copyAllBumperBtn ?? null);
+  expect(writeText).toHaveBeenCalledTimes(3);
+  expect(writeText.mock.calls[2]?.[0]).toContain('顶贴时间\t模块类型\t浏览器/窗口');
+  expect(writeText.mock.calls[2]?.[0]).toContain('顶贴支持 赞');
+
+  // 3. TaskRecordsPage 执行记录页面批量复制
+  vi.mocked(api.taskRecords).mockResolvedValue({
+    records: [],
+    total: 0,
+    counts: { all: 0, running: 0, completed: 0, failed: 0, review: 0 },
+    nextCursor: null,
+    viewVersion: 'v1',
+  });
+  vi.mocked(api.groupInviterLogs).mockResolvedValue([]);
+  vi.mocked(api.cleanupSettings).mockRejectedValue(Error('skip'));
+  await act(async () =>
+    root.render(
+      <TaskRecordsPage
+        runtime={null}
+        profiles={[profile]}
+        inspections={[]}
+        loaded={true}
+        filterId={null}
+        onClearFilter={() => {}}
+        onOpen={() => {}}
+      />,
+    ),
+  );
+  const copyUnifiedBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('批量复制贴文记录'),
+  );
+  expect(copyUnifiedBtn).toBeTruthy();
+  await click(copyUnifiedBtn ?? null);
+  expect(writeText).toHaveBeenCalledTimes(4);
+  expect(writeText.mock.calls[3]?.[0]).toContain('执行时间\t模块类型\t浏览器/窗口');
+});
+
+it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时任务 defaults accountMode to selected for offline auto-launch', async () => {
+  const profile = {
+    id,
+    browserName: '用户8',
+    alias: '用户8',
+    order: 0,
+    groupId: null,
+    online: true,
+    phase: 'PAUSED' as const,
+    synced: true,
+    unresolved: 0,
+    extensionVersion: '0.3.82',
+    capabilities: [],
+    account: { state: 'logged_in' as const, id: '61593615564708', name: '用户8', avatar: null },
+  };
+  await act(async () =>
+    root.render(
+      <GroupPosterPage
+        state={{
+          groups: [
+            {
+              id: '3017439278594998',
+              name: '测试小组1',
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalBumpedCount: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+          materials: [
+            {
+              id: 'mat-card-sched',
+              caption: '测试贴文',
+              mediaSource: '',
+              localFilePath: null,
+              mediaKind: 'none',
+              background: 'plain',
+              aiLabel: 'default',
+              cacheStatus: 'none',
+              cacheError: null,
+              thumbnailDataUrl: null,
+              selected: true,
+              usedCount: 2,
+              sortOrder: 0,
+              createdAt: 1700000000000,
+              updatedAt: 1700000000000,
+            },
+          ],
+          settings: PosterSettings.parse({}),
+          running: false,
+          statusText: '',
+          total: 2,
+          dailyStats: [],
+          profileCounts: {},
+          pendingReviewOperations: [],
+          tasks: [],
+          postedGroupIdsByMaterial: {},
+          activeGroupsByMaterial: {},
+        }}
+        selected={new Set()}
+        profiles={[profile]}
+        onState={() => {}}
+        onMessage={() => {}}
+      />,
+    ),
+  );
+
+  const actionBtns = [...host.querySelectorAll('.poster-rect-card-actions > button')].map((b) =>
+    b.textContent?.trim(),
+  );
+  expect(actionBtns).toEqual(['▶ 发帖', '⏰ 定时任务', '详情 (2)', '编辑', '删除']);
+
+  const schedBtn = host.querySelector<HTMLButtonElement>('.poster-card-schedule-btn');
+  await click(schedBtn);
+
+  const selectedModeBtn = [...host.querySelectorAll('.poster-mode-btn')].find((b) =>
+    b.textContent?.includes('指定勾选账号 (1)'),
+  );
+  expect(selectedModeBtn?.classList.contains('is-active')).toBe(true);
 });

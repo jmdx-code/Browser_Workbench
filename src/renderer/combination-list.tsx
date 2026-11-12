@@ -285,7 +285,7 @@ export function CombinationList({
           (id) => !busyProfileSet.has(id) && !profiles.find((p) => p.id === id)?.online,
         ).length
       : 0;
-  const eligibleImmediateCount = Math.max(0, selectedCount - busySelected - offlineSelected);
+  const eligibleImmediateCount = Math.max(0, selectedCount - busySelected);
   const eligibleScheduleCount = Math.max(0, selectedCount - busySelected);
   return (
     <section className="combos" aria-label="任务组合">
@@ -405,12 +405,8 @@ export function CombinationList({
             managing || busy || !onStart || !capability?.enabled || eligibleImmediateCount === 0;
           const scheduleDisabled =
             busy || !onSchedule || !capability?.enabled || eligibleScheduleCount === 0;
-          const skipSummary = [
-            busySelected ? `${busySelected} 个任务运行中` : '',
-            offlineSelected ? `${offlineSelected} 个未连接` : '',
-          ]
-            .filter(Boolean)
-            .join('、');
+          const offlineHint =
+            offlineSelected > 0 ? `（含 ${offlineSelected} 个离线资料将自动启动）` : '';
           const startTitle =
             capability?.reason ||
             (!capability
@@ -418,14 +414,10 @@ export function CombinationList({
               : selectedCount === 0
                 ? '请先在左侧勾选浏览器'
                 : eligibleImmediateCount === 0
-                  ? busySelected > 0 && offlineSelected === 0
-                    ? `${busySelected} 份资料已有任务，可继续或先停止原任务`
-                    : busySelected === 0 && offlineSelected > 0
-                      ? `所选 ${offlineSelected} 个浏览器未连接，请先打开对应资料`
-                      : `所选浏览器不可启动（${skipSummary}）`
-                  : skipSummary
-                    ? `给 ${eligibleImmediateCount} 个可用浏览器启动（自动跳过 ${skipSummary}）`
-                    : `给左侧选中的 ${eligibleImmediateCount} 个浏览器启动`);
+                  ? `${busySelected} 份资料已有任务，可继续或先停止原任务`
+                  : busySelected > 0
+                    ? `给 ${eligibleImmediateCount} 个浏览器启动${offlineHint}（自动跳过 ${busySelected} 个已有任务）`
+                    : `给左侧选中的 ${eligibleImmediateCount} 个浏览器启动${offlineHint}`);
           const scheduleTitle =
             capability?.reason ||
             (!capability
@@ -435,8 +427,8 @@ export function CombinationList({
                 : eligibleScheduleCount === 0
                   ? `${busySelected} 份资料已有任务，可继续或先停止原任务`
                   : busySelected > 0
-                    ? `给 ${eligibleScheduleCount} 个浏览器定时启动（自动跳过 ${busySelected} 个已有任务）`
-                    : `给左侧选中的 ${eligibleScheduleCount} 个浏览器定时启动`);
+                    ? `给 ${eligibleScheduleCount} 个浏览器定时启动${offlineHint}（自动跳过 ${busySelected} 个已有任务）`
+                    : `给左侧选中的 ${eligibleScheduleCount} 个浏览器定时启动${offlineHint}`);
           const color = colorOf?.(row.id) ?? 'graphite';
           const extra = saved.steps.length - 5;
           return (

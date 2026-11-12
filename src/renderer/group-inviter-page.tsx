@@ -4,7 +4,7 @@ import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
 import { useEffect, useRef, useState } from 'react';
 import type { GroupInviterState } from '../shared/group-inviter.js';
-import { IconClose, IconPlay, IconPlus, IconStop } from './icons.js';
+import { IconClose, IconPlay, IconStop } from './icons.js';
 import {
   ControlledNumberInput,
   type ControlledNumberInputHandle,
@@ -596,169 +596,155 @@ export function GroupInviterPage({
   }
 
   return (
-    <section className="records-page group-inviter-page" aria-label="小组邀请人">
-      <div className="section-head">
-        <div>
-          <h2>
-            小组邀请人
-            <span className="count-chip" title="小组库总数">
-              {groups.length} 个小组
-            </span>
-            <span className="count-chip" title="所有小组累计被邀请总人数">
-              累计邀请 {totalInvitedAcrossGroups} 人
-            </span>
-          </h2>
-        </div>
-        <div className="section-tools group-inviter-toolbar">
-          <label
-            className="group-inviter-limit-field"
-            title="每个账号进入每个小组单次最多邀请的好友人数（默认 30）"
-          >
-            <span>每组邀请</span>
-            <ControlledNumberInput
-              ref={invitesInputRef}
-              ariaLabel="每组邀请"
-              min={1}
-              max={200}
-              defaultValue={30}
-              disabled={busy || isRunning}
-              value={invitesInput}
-              onChange={setInvitesInput}
-              onCommit={(normalized) => {
-                setInvitesInput(normalized);
-                if (state && normalized !== state.invitesPerGroup) {
-                  return onSaveInvitesPerGroup(normalized);
+    <section className="records-page bumper-page group-inviter-page" aria-label="小组邀请人">
+      <div className="bumper-sticky-header">
+        <div className="bumper-heading">
+          <div className="bumper-primary-controls">
+            <div className="bumper-search-highlight bumper-policy">
+              <label
+                className="bumper-policy-field"
+                title="每个账号进入每个小组单次最多邀请的好友人数（默认 30）"
+              >
+                <span>每组邀请</span>
+                <ControlledNumberInput
+                  ref={invitesInputRef}
+                  ariaLabel="每组邀请"
+                  min={1}
+                  max={200}
+                  defaultValue={30}
+                  disabled={busy || isRunning}
+                  value={invitesInput}
+                  onChange={setInvitesInput}
+                  onCommit={(normalized) => {
+                    setInvitesInput(normalized);
+                    if (state && normalized !== state.invitesPerGroup) {
+                      return onSaveInvitesPerGroup(normalized);
+                    }
+                  }}
+                />
+                <span>人</span>
+              </label>
+              <label
+                className="bumper-policy-field"
+                title="同时运行的最大浏览器并发数（默认 4，范围 1-50）"
+              >
+                <span>最大并发</span>
+                <ControlledNumberInput
+                  ref={concurrencyInputRef}
+                  ariaLabel="最大并发"
+                  min={1}
+                  max={50}
+                  defaultValue={4}
+                  disabled={busy}
+                  value={concurrencyInput}
+                  onChange={setConcurrencyInput}
+                  onCommit={(normalized) => {
+                    setConcurrencyInput(normalized);
+                    if (state && normalized !== state.maxConcurrentProfiles) {
+                      return api
+                        .saveGroupInviterSettings({ maxConcurrentProfiles: normalized })
+                        .then(() => onRefresh())
+                        .catch(() => {});
+                    }
+                  }}
+                />
+              </label>
+              <label className="bumper-policy-field" title="所有账号邀请完成后播放提示音">
+                <input
+                  type="checkbox"
+                  aria-label="完成后播放提示音"
+                  disabled={busy}
+                  checked={state?.playSoundOnComplete !== false}
+                  onChange={(e) => {
+                    void api
+                      .saveGroupInviterSettings({ playSoundOnComplete: e.target.checked })
+                      .then(() => onRefresh())
+                      .catch(() => {});
+                  }}
+                />
+                <span>完成后播放提示音</span>
+              </label>
+              <span className="bumper-policy-field muted">
+                共 {groups.length} 个小组 · 累计邀请 {totalInvitedAcrossGroups} 人
+              </span>
+            </div>
+          </div>
+
+          <div className="bumper-actions">
+            {(state?.avatarRefreshStatusText || state?.statusText) && (
+              <span
+                className={
+                  'bumper-status' + (isRunning || state?.groupAvatarRefreshing ? ' is-running' : '')
                 }
-              }}
-            />
-            <span>人</span>
-          </label>
-          <label
-            className="group-inviter-limit-field"
-            title="同时运行的最大浏览器并发数（默认 4，范围 1-50）"
-          >
-            <span>最大并发</span>
-            <ControlledNumberInput
-              ref={concurrencyInputRef}
-              ariaLabel="最大并发"
-              min={1}
-              max={50}
-              defaultValue={4}
-              disabled={busy}
-              value={concurrencyInput}
-              onChange={setConcurrencyInput}
-              onCommit={(normalized) => {
-                setConcurrencyInput(normalized);
-                if (state && normalized !== state.maxConcurrentProfiles) {
-                  return api
-                    .saveGroupInviterSettings({ maxConcurrentProfiles: normalized })
-                    .then(() => onRefresh())
-                    .catch(() => {});
+                role="status"
+              >
+                {state?.groupAvatarRefreshing && state.avatarRefreshStatusText
+                  ? state.avatarRefreshStatusText
+                  : state?.statusText}
+              </span>
+            )}
+            {isRunning && idleSelected.length > 0 && (
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={busy || idleSelected.length === 0 || selectedGroups.size === 0}
+                onClick={() => {
+                  void (async () => {
+                    const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
+                    await concurrencyInputRef.current?.flush();
+                    await onStart(
+                      orderedFinderItems(groups, folders)
+                        .filter((g) => selectedGroups.has(g.groupId))
+                        .map((g) => g.groupId),
+                      normalizeInvitesCount(flushedInvites),
+                    );
+                  })();
+                }}
+              >
+                ▶ 追加运行已选闲置号 ({idleSelected.length})
+              </button>
+            )}
+            {isRunning ? (
+              <button
+                className="btn btn-danger"
+                type="button"
+                disabled={busy}
+                onClick={() => void onStop()}
+              >
+                <IconStop size={13} /> 停止运行
+              </button>
+            ) : (
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={busy || selectedProfileIds.size === 0 || selectedGroups.size === 0}
+                title={
+                  selectedProfileIds.size === 0
+                    ? '请先在左侧列表勾选账号'
+                    : selectedGroups.size === 0
+                      ? '请先在下方列表勾选小组'
+                      : `使用已选的 ${selectedProfileIds.size} 个账号向 ${selectedGroups.size} 个小组随机错峰邀请好友`
                 }
-              }}
-            />
-          </label>
-          <label className="group-inviter-limit-field" title="所有账号邀请完成后播放提示音">
-            <input
-              type="checkbox"
-              aria-label="完成后播放提示音"
-              disabled={busy}
-              checked={state?.playSoundOnComplete !== false}
-              onChange={(e) => {
-                void api
-                  .saveGroupInviterSettings({ playSoundOnComplete: e.target.checked })
-                  .then(() => onRefresh())
-                  .catch(() => {});
-              }}
-            />
-            <span>完成后播放提示音</span>
-          </label>
-          <button className="btn" type="button" disabled={busy} onClick={openAddModal}>
-            <IconPlus size={14} /> 添加小组
-          </button>
-          {isRunning && idleSelected.length > 0 && (
-            <button
-              className="btn btn-primary"
-              type="button"
-              disabled={busy || idleSelected.length === 0 || selectedGroups.size === 0}
-              onClick={() => {
-                void (async () => {
-                  const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
-                  await concurrencyInputRef.current?.flush();
-                  await onStart(
-                    orderedFinderItems(groups, folders)
-                      .filter((g) => selectedGroups.has(g.groupId))
-                      .map((g) => g.groupId),
-                    normalizeInvitesCount(flushedInvites),
-                  );
-                })();
-              }}
-            >
-              ▶ 追加运行已选闲置号 ({idleSelected.length})
-            </button>
-          )}
-          {isRunning ? (
-            <button
-              className="btn btn-danger"
-              type="button"
-              disabled={busy}
-              onClick={() => void onStop()}
-            >
-              <IconStop size={13} /> 停止运行
-            </button>
-          ) : (
-            <button
-              className="btn btn-primary"
-              type="button"
-              disabled={busy || selectedProfileIds.size === 0 || selectedGroups.size === 0}
-              title={
-                selectedProfileIds.size === 0
-                  ? '请先在左侧列表勾选账号'
-                  : selectedGroups.size === 0
-                    ? '请先在右侧表格勾选小组'
-                    : `使用已选的 ${selectedProfileIds.size} 个账号向 ${selectedGroups.size} 个小组随机错峰邀请好友`
-              }
-              onClick={() => {
-                void (async () => {
-                  const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
-                  await concurrencyInputRef.current?.flush();
-                  await onStart(
-                    orderedFinderItems(groups, folders)
-                      .filter((g) => selectedGroups.has(g.groupId))
-                      .map((g) => g.groupId),
-                    normalizeInvitesCount(flushedInvites),
-                  );
-                })();
-              }}
-            >
-              <IconPlay size={12} /> 开始运行
-              {selectedProfileIds.size > 0 && selectedGroups.size > 0
-                ? ` (${selectedProfileIds.size}号 × ${selectedGroups.size}组)`
-                : ''}
-            </button>
-          )}
+                onClick={() => {
+                  void (async () => {
+                    const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
+                    await concurrencyInputRef.current?.flush();
+                    await onStart(
+                      orderedFinderItems(groups, folders)
+                        .filter((g) => selectedGroups.has(g.groupId))
+                        .map((g) => g.groupId),
+                      normalizeInvitesCount(flushedInvites),
+                    );
+                  })();
+                }}
+              >
+                <IconPlay size={12} /> 开始运行 ({selectedProfileIds.size}号 × {selectedGroups.size}
+                组)
+              </button>
+            )}
+          </div>
         </div>
       </div>
-
-      {(state?.avatarRefreshStatusText || state?.statusText) && (
-        <div
-          className={
-            'group-inviter-banner' +
-            (isRunning || state?.groupAvatarRefreshing ? ' is-running' : '')
-          }
-          role="status"
-        >
-          <span className="banner-dot" />
-          <span>
-            {state?.groupAvatarRefreshing && state.avatarRefreshStatusText
-              ? state.avatarRefreshStatusText
-              : state?.statusText}
-          </span>
-          <span className="banner-hint">
-            已选账号 {selectedProfileIds.size} 个 · 已选小组 {selectedGroups.size} 个
-          </span>
-        </div>
-      )}
 
       {!loaded ? (
         <p className="muted records-empty">正在读取小组库…</p>

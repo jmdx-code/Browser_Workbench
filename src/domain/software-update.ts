@@ -17,4 +17,5 @@ export interface SoftwareUpdatePort {
   restart(): void;
   reloadExtensions(ids?: string[]): Promise<ReloadResult>;
   openExtensionDirectory(): Awaitable<void>;
+  openAiWorkspaceDirectory?(): Awaitable<{ directory: string }>;
 }

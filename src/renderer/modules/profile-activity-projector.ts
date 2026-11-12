@@ -320,11 +320,19 @@ export function buildWorkbenchProjection({
   groupBumper,
   groupInviter,
   groupPoster,
+  bluestacks,
   attentionCount,
   message,
 }: {
   viewKind:
-    'home' | 'edit' | 'records' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'group-poster';
+    | 'home'
+    | 'edit'
+    | 'records'
+    | 'group-inviter'
+    | 'group-bumper'
+    | 'page-bumper'
+    | 'group-poster'
+    | 'bluestacks-group-bumper';
   profiles: readonly Profile[] | undefined;
   selected: ReadonlySet<string>;
   tasks: z.infer<typeof TaskRuntimeOverview> | null | undefined;
@@ -341,6 +349,8 @@ export function buildWorkbenchProjection({
     { running: boolean; profileCounts: Record<string, GroupInviterProfileStat> } | null | undefined;
   groupPoster?:
     { running: boolean; profileCounts: Record<string, PosterProfileStat> } | null | undefined;
+  bluestacks?:
+    { running: boolean; profileCounts: Record<string, BumperProfileStat> } | null | undefined;
   attentionCount: number;
   message: string;
 }) {
@@ -351,6 +361,9 @@ export function buildWorkbenchProjection({
   const pageBumperRunningIds = Object.entries(groupBumper?.pageBumperProfileCounts ?? {})
     .filter(([, stat]) => stat.running)
     .map(([id]) => id);
+  const bluestacksRunningCount = Object.values(bluestacks?.profileCounts ?? {}).filter(
+    (stat) => stat.running,
+  ).length;
   const bumperRunningIds = [...new Set([...groupBumperRunningIds, ...pageBumperRunningIds])];
   const inviterRunningIds = extractInviterRunningIds(groupInviter);
   const posterRunningIds = extractPosterRunningIds(groupPoster);
@@ -377,7 +390,9 @@ export function buildWorkbenchProjection({
               ? '专页顶贴'
               : viewKind === 'group-poster'
                 ? '小组发帖'
-                : '执行记录';
+                : viewKind === 'bluestacks-group-bumper'
+                  ? '蓝蝶小组顶贴'
+                  : '执行记录';
   const navItems = buildFeatureNavItems({
     activeAccountRunningCount,
     groupInviterRunning: Boolean(groupInviter?.running),
@@ -388,6 +403,7 @@ export function buildWorkbenchProjection({
       ? Math.max(1, pageBumperRunningIds.length)
       : 0,
     groupPosterRunningCount: posterRunningIds.length,
+    bluestacksBumperRunningCount: bluestacks?.running ? Math.max(1, bluestacksRunningCount) : 0,
     attentionCount,
   });
   const projectionInput: ProfileActivityProjectionInput = {

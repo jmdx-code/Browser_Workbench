@@ -106,21 +106,20 @@ export function ActiveAccountsPage({
                 (id) => !busyIds.has(id) && !workspace.profiles.find((p) => p.id === id)?.online,
               ),
             );
-            const eligibleIds = [...selected]
-              .filter((id) => !busyIds.has(id) && !offlineIds.has(id))
-              .sort();
-            if (!eligibleIds.length) throw Error('所选浏览器当前不可启动，请检查连接或任务状态');
+            const eligibleIds = [...selected].filter((id) => !busyIds.has(id)).sort();
+            if (!eligibleIds.length)
+              throw Error('所选浏览器当前已有任务运行中，请先停止或另选资料');
             const result = await tasks.start({
               combinationId: row.id,
               version: row.version,
               profileIds: eligibleIds,
               ...(usesTable ? { expectedResourceRevision: revision } : {}),
             });
-            const skipParts = [
-              busyIds.size ? `${busyIds.size} 个任务运行中` : '',
-              offlineIds.size ? `${offlineIds.size} 个未连接` : '',
+            const noteParts = [
+              offlineIds.size ? `已自动唤醒 ${offlineIds.size} 个离线浏览器` : '',
+              busyIds.size ? `已自动跳过 ${busyIds.size} 个运行中资料` : '',
             ].filter(Boolean);
-            return `已分配 ${result.plans.length} 份任务${skipParts.length ? `（已自动跳过 ${skipParts.join('、')}）` : ''}；将按并发设置执行`;
+            return `已分配 ${result.plans.length} 份任务${noteParts.length ? `（${noteParts.join('；')}）` : ''}；将按并发设置执行`;
           })
         }
         rows={workspace.combinations.filter(
