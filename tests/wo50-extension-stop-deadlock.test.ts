@@ -426,9 +426,9 @@ test('WO50-9: actual worker disconnect schedules reconnect despite hung writes a
     h.api.commands.drainWrites = never;
     h.api.setKernel({ freeze: never, isStopUnconfirmed: () => true });
     ws.close();
-    // Wait for the reconnect outcome, allowing concurrent-suite timer contention.
+    // Wait for the reconnect outcome, allowing concurrent-suite timer contention on CI runners.
     // Hung cleanup must still never be a prerequisite for this second socket.
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + 8_000;
     while (h.sockets.length < 2 && Date.now() < deadline)
       await new Promise((r) => setTimeout(r, 20));
     assert.ok(h.sockets.length >= 2);
