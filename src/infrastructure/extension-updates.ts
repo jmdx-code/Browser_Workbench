@@ -19,7 +19,8 @@ export class ExtensionUpdates {
   async automatic(peer: Peer) {
     const missingRequiredCap =
       !peer.capabilities?.includes('browser-window-reveal-v1') ||
-      !peer.capabilities?.includes('browser-window-close-v1');
+      !peer.capabilities?.includes('browser-window-close-v1') ||
+      !peer.capabilities?.includes('kernel-passive-page-reveal-v1');
     if (peer.extensionVersion === this.bundledVersion && !missingRequiredCap) {
       this.autoReloadAttempted.delete(peer.profileId);
       return;

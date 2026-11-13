@@ -91,7 +91,7 @@ type BumperPageProps = {
   }>;
   onState: (s: BumperState) => void;
   onMessage: (s: string) => void;
-  mode?: 'group-bumper' | 'page-bumper' | 'bluestacks-group-bumper';
+  mode?: 'group-bumper' | 'page-bumper' | 'bluestacks-group-bumper' | 'bluestacks-page-bumper';
   bluestacksState?: BluestacksState | null | undefined;
   onBluestacksState?: ((s: BluestacksState) => void) | undefined;
 };
@@ -109,20 +109,24 @@ export function GroupBumperPage({
   bluestacksState,
   onBluestacksState,
 }: BumperPageProps) {
-  const pageMode = mode === 'page-bumper';
-  const bluestacksMode = mode === 'bluestacks-group-bumper';
+  const pageMode = mode === 'page-bumper' || mode === 'bluestacks-page-bumper';
+  const bluestacksMode = mode === 'bluestacks-group-bumper' || mode === 'bluestacks-page-bumper';
   const isRunning = bluestacksMode
-    ? Boolean(bluestacksState?.running)
+    ? Boolean(pageMode ? bluestacksState?.pageBumperRunning : bluestacksState?.running)
     : pageMode
       ? !!state?.pageBumperRunning
       : !!state?.running;
   const statusText = bluestacksMode
-    ? bluestacksState?.statusText
+    ? pageMode
+      ? bluestacksState?.pageBumperStatusText
+      : bluestacksState?.statusText
     : pageMode
       ? state?.pageBumperStatusText
       : state?.statusText;
   const effectiveStateSettings = bluestacksMode
-    ? (bluestacksState?.bumperSettings ?? state?.settings ?? null)
+    ? pageMode
+      ? (bluestacksState?.pageBumperSettings ?? state?.pageSettings ?? state?.settings ?? null)
+      : (bluestacksState?.bumperSettings ?? state?.settings ?? null)
     : pageMode
       ? (state?.pageSettings ?? state?.settings ?? null)
       : (state?.settings ?? null);
@@ -132,18 +136,25 @@ export function GroupBumperPage({
     ? (state?.pageComments ?? state?.comments ?? [])
     : (state?.comments ?? []);
   const effectiveTotal = bluestacksMode
-    ? (bluestacksState?.total ?? state?.total ?? 0)
+    ? pageMode
+      ? (bluestacksState?.pageTotal ?? state?.pageTotal ?? 0)
+      : (bluestacksState?.total ?? state?.total ?? 0)
     : pageMode
       ? (state?.pageTotal ?? state?.total ?? 0)
       : (state?.total ?? 0);
   const effectiveDailyStats = bluestacksMode
-    ? (bluestacksState?.dailyStats ?? state?.dailyStats ?? [])
+    ? pageMode
+      ? (bluestacksState?.pageDailyStats ?? state?.pageDailyStats ?? [])
+      : (bluestacksState?.dailyStats ?? state?.dailyStats ?? [])
     : pageMode
       ? (state?.pageDailyStats ?? state?.dailyStats ?? [])
       : (state?.dailyStats ?? []);
   const runningIds = bluestacksMode
     ? new Set(
-        Object.entries(bluestacksState?.profileCounts ?? {})
+        [
+          ...Object.entries(bluestacksState?.profileCounts ?? {}),
+          ...Object.entries(bluestacksState?.pageBumperProfileCounts ?? {}),
+        ]
           .filter(([, stat]) => stat.running)
           .map(([id]) => id),
       )
@@ -227,7 +238,7 @@ export function GroupBumperPage({
       setBusy(true);
       setError('');
       try {
-        const updated = await api.bluestacksAction('settings', next);
+        const updated = await api.bluestacksAction(settingsActionName, next);
         onBluestacksState?.(updated);
         return updated;
       } catch (e) {
@@ -396,7 +407,7 @@ export function GroupBumperPage({
             setSettings(next);
             if (bluestacksMode) {
               return api
-                .bluestacksAction('settings', next)
+                .bluestacksAction(settingsActionName, next)
                 .then((s) => {
                   onBluestacksState?.(s);
                 })
@@ -544,7 +555,9 @@ export function GroupBumperPage({
       ![
         '请选择账号、小组和目标主页',
         '请选择模拟器窗口、小组和目标主页',
+        '请选择蓝蝶窗口、目标小组和目标主页',
         '请选择账号和目标专页',
+        '请选择蓝蝶窗口和目标专页',
         '本轮已结束',
         '正在读取…',
       ].includes(statusText)),
@@ -582,11 +595,12 @@ export function GroupBumperPage({
     void (async () => {
       await flushSettingsIfDirty();
       if (bluestacksMode) {
-        const next = await runBluestacksAction('bumper/start', {
-          profileIds: idleSelected,
-          groupIds: selectedGroups,
-          pageIds: selectedPages,
-        });
+        const next = await runBluestacksAction(
+          pageMode ? 'bumper/start-page' : 'bumper/start',
+          pageMode
+            ? { profileIds: idleSelected, pageIds: selectedPages }
+            : { profileIds: idleSelected, groupIds: selectedGroups, pageIds: selectedPages },
+        );
         if (next) void api.bumperState().then(onState, () => {});
         return;
       }
@@ -607,7 +621,10 @@ export function GroupBumperPage({
             {settings && pageMode && (
               <div className="bumper-search-highlight bumper-policy">
                 {renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')}
-                {renderSettingInput('maxConcurrentProfiles', '最大并发浏览器数')}
+                {renderSettingInput(
+                  'maxConcurrentProfiles',
+                  bluestacksMode ? '最大并发模拟器数' : '最大并发浏览器数',
+                )}
                 {renderSoundToggle()}
               </div>
             )}
@@ -717,7 +734,7 @@ export function GroupBumperPage({
                   className="btn btn-danger"
                   onClick={() =>
                     void (bluestacksMode
-                      ? runBluestacksAction('bumper/stop', {})
+                      ? runBluestacksAction(pageMode ? 'bumper/stop-page' : 'bumper/stop', {})
                       : action(pageMode ? 'stop-page' : 'stop'))
                   }
                 >
@@ -728,7 +745,9 @@ export function GroupBumperPage({
               <>
                 <button className="btn btn-primary" disabled={startDisabled} onClick={startRun}>
                   {pageMode
-                    ? `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedPages.length}专页)`
+                    ? bluestacksMode
+                      ? `▶ 开始运行 (已选${idleSelected.length}窗 × ${selectedPages.length}专页)`
+                      : `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedPages.length}专页)`
                     : bluestacksMode
                       ? `▶ 开始运行 (已选${idleSelected.length}窗 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`
                       : `▶ 开始运行 (已选${idleSelected.length}号 × ${selectedGroups.length}组 × ${selectedPages.length}主页)`}
@@ -1008,7 +1027,10 @@ export function GroupBumperPage({
                       busy ||
                       (logScopeFilter === 'all'
                         ? Boolean(
-                            state?.running || state?.pageBumperRunning || bluestacksState?.running,
+                            state?.running ||
+                            state?.pageBumperRunning ||
+                            bluestacksState?.running ||
+                            bluestacksState?.pageBumperRunning,
                           )
                         : isRunning)
                     }
@@ -1035,7 +1057,10 @@ export function GroupBumperPage({
                       busy ||
                       (logScopeFilter === 'all'
                         ? Boolean(
-                            state?.running || state?.pageBumperRunning || bluestacksState?.running,
+                            state?.running ||
+                            state?.pageBumperRunning ||
+                            bluestacksState?.running ||
+                            bluestacksState?.pageBumperRunning,
                           )
                         : isRunning)
                     }

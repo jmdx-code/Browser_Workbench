@@ -203,6 +203,7 @@ export async function collectInvitationConfirmations(input: {
   now?: () => number;
   wait?: () => Promise<void>;
   budgetMs?: number;
+  allowHidden?: boolean;
 }) {
   const confirmed = input.confirmed ?? new Set<string>(),
     selected = new Set(input.selectedIds),
@@ -224,7 +225,7 @@ export async function collectInvitationConfirmations(input: {
     origin ??= state.timeOrigin;
     if (
       !state.ready ||
-      !state.visible ||
+      (!state.visible && !input.allowHidden) ||
       state.accountId !== input.accountId ||
       state.timeOrigin !== origin ||
       url.pathname.split('/')[2] !== input.groupId ||
@@ -452,6 +453,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     {
       guard: () => void;
       activate?: () => Promise<unknown>;
+      backgroundAllowed?: boolean;
       page: Page;
       groupId: string;
       jobId: string;
@@ -554,6 +556,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       actionDigest: invitationDigest(label, accountId, operationId),
     };
     let interventionDismissedInOp = false;
+    const backgroundAllowed = scope.backgroundAllowed === true || conn.taskRendering === true;
     const assertPage = async () => {
       scope.guard();
       let state = await readGroupInvitationState(scope.page, scope.guard);
@@ -570,7 +573,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         );
       const deadline = Date.now() + 15000;
       let activated = false;
-      while (!state.ready || !state.visible) {
+      while (!state.ready || (!state.visible && !(backgroundAllowed && activated))) {
         scope.guard();
         if (!state.visible && !activated) {
           activated = true;
@@ -706,7 +709,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         if (
           (resultTimeOrigin !== undefined && state.timeOrigin !== resultTimeOrigin) ||
           !state.ready ||
-          !state.visible ||
+          (!state.visible && !backgroundAllowed) ||
           state.accountId !== accountId ||
           route.origin !== 'https://www.facebook.com' ||
           route.pathname.split('/')[1] !== 'groups' ||
@@ -736,7 +739,16 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           // ignore malformed URL during transition
         }
       }
-      if (groupInvitationEffect(label, evidence, scope.groupId, accountId, res.value)) {
+      if (
+        groupInvitationEffect(
+          label,
+          evidence,
+          scope.groupId,
+          accountId,
+          res.value,
+          backgroundAllowed,
+        )
+      ) {
         observed = evidence;
         break;
       }
@@ -875,10 +887,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         guard,
         activate: async () => {
           guard();
-          const result = await kernel.revealOwnedFacebookPage(peer, proof);
+          const result = await kernel.revealOwnedFacebookPage(peer, proof, false);
           guard();
           return result;
         },
+        backgroundAllowed:
+          peer.capabilities?.includes('kernel-background-presentation-v1') === true ||
+          conn.taskRendering === true,
         page,
         groupId: effectiveGroupId,
         jobId: randomUUID(),
@@ -1561,6 +1576,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
                   confirmed,
                   guard,
                   budgetMs: 6000,
+                  allowHidden: scopeRef.backgroundAllowed === true,
                 });
               let fallbackReopens = 0,
                 reloads = 0;

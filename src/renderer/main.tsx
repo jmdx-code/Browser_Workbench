@@ -43,7 +43,8 @@ type View =
   | { kind: 'group-bumper' }
   | { kind: 'page-bumper' }
   | { kind: 'group-poster' }
-  | { kind: 'bluestacks-group-bumper' };
+  | { kind: 'bluestacks-group-bumper' }
+  | { kind: 'bluestacks-page-bumper' };
 type DetailTarget = { profileId: string; planId: string; round?: number };
 function App() {
   const { workspace, error, refresh } = useWorkspace();
@@ -170,7 +171,8 @@ function App() {
       groupBumper?.running ||
       groupBumper?.pageBumperRunning ||
       groupPoster?.running ||
-      bluestacks?.running,
+      bluestacks?.running ||
+      bluestacks?.pageBumperRunning,
     );
   const mergedProfiles = useMemo<Profile[]>(() => {
     const base = workspace?.profiles ?? [];
@@ -250,8 +252,9 @@ function App() {
               void navigate({ kind: mod === 'active-accounts' ? 'home' : mod })
             }
           />
-          {view.kind === 'bluestacks-group-bumper' ? (
+          {view.kind === 'bluestacks-group-bumper' || view.kind === 'bluestacks-page-bumper' ? (
             <BluestacksSidebar
+              mode={view.kind}
               state={bluestacks}
               onChange={setBluestacks}
               selected={selectedBluestacks}
@@ -358,12 +361,17 @@ function App() {
             )}
             {(view.kind === 'group-bumper' ||
               view.kind === 'page-bumper' ||
-              view.kind === 'bluestacks-group-bumper') && (
+              view.kind === 'bluestacks-group-bumper' ||
+              view.kind === 'bluestacks-page-bumper') && (
               <GroupBumperPage
                 key={view.kind}
                 mode={view.kind}
                 state={groupBumper}
-                selected={view.kind === 'bluestacks-group-bumper' ? selectedBluestacks : selected}
+                selected={
+                  view.kind === 'bluestacks-group-bumper' || view.kind === 'bluestacks-page-bumper'
+                    ? selectedBluestacks
+                    : selected
+                }
                 profiles={mergedProfiles}
                 bluestacksState={bluestacks}
                 onBluestacksState={setBluestacks}

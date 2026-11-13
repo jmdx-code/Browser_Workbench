@@ -221,68 +221,82 @@ export function withClipboardLock<T>(fn: () => Promise<T>): Promise<T> {
 interface ParentPortLike {
   postMessage(message: unknown): void;
   on(event: 'message', listener: (event: { data?: unknown }) => void): void;
-  off?(event: 'message', listener: (event: { data?: unknown }) => void): void;
-  removeListener?(event: 'message', listener: (event: { data?: unknown }) => void): void;
+  start?(): void;
 }
 
-function getElectronParentPort(): ParentPortLike | null {
+const pendingIpcClipboard = new Map<
+  string,
+  { resolve: (value: string | null) => void; timer: ReturnType<typeof setTimeout> }
+>();
+let ipcClipboardBoundPort: ParentPortLike | null = null;
+
+function ensureIpcClipboardPort(): ParentPortLike | null {
   const procRecord = process as unknown as { parentPort?: ParentPortLike };
-  return procRecord.parentPort ?? null;
-}
-
-let ipcClipboardAvailable = true;
-
-async function ipcClipboardRequest(
-  payload:
-    | { type: 'CLIPBOARD_GET'; reqId: string }
-    | { type: 'CLIPBOARD_SET'; reqId: string; text: string },
-): Promise<string | null> {
-  const port = getElectronParentPort();
-  if (!port || !ipcClipboardAvailable) return null;
-  return new Promise<string | null>((resolveReq) => {
-    const detach = (fn: (event: { data?: unknown }) => void) => {
-      if (typeof port.off === 'function') port.off('message', fn);
-      else if (typeof port.removeListener === 'function') port.removeListener('message', fn);
-    };
-    const listener = (event: { data?: unknown }) => {
-      const msg = event?.data ?? event;
+  const port = procRecord.parentPort ?? null;
+  if (!port) return null;
+  if (ipcClipboardBoundPort !== port) {
+    ipcClipboardBoundPort = port;
+    port.on('message', (event: { data?: unknown }) => {
+      const msg = event && typeof event === 'object' && 'data' in event ? event.data : event;
       if (
         msg &&
         typeof msg === 'object' &&
         'type' in msg &&
         msg.type === 'CLIPBOARD_RESULT' &&
         'reqId' in msg &&
-        msg.reqId === payload.reqId
+        typeof msg.reqId === 'string'
       ) {
-        clearTimeout(timer);
-        detach(listener);
+        const pending = pendingIpcClipboard.get(msg.reqId);
+        if (!pending) return;
+        pendingIpcClipboard.delete(msg.reqId);
+        clearTimeout(pending.timer);
+        const ok = !('ok' in msg) || msg.ok !== false;
         const text = 'text' in msg && typeof msg.text === 'string' ? msg.text : '';
-        resolveReq(text);
+        pending.resolve(ok ? text : null);
       }
-    };
+    });
+    if (typeof port.start === 'function') {
+      port.start();
+    }
+  }
+  return port;
+}
+
+async function ipcClipboardRequest(
+  payload:
+    | { type: 'CLIPBOARD_GET'; reqId: string }
+    | { type: 'CLIPBOARD_SET'; reqId: string; text: string },
+): Promise<string | null> {
+  const port = ensureIpcClipboardPort();
+  if (!port) return null;
+  return new Promise<string | null>((resolveReq) => {
     const timer = setTimeout(() => {
-      ipcClipboardAvailable = false;
-      detach(listener);
+      pendingIpcClipboard.delete(payload.reqId);
       resolveReq(null);
-    }, 250);
-    port.on('message', listener);
-    port.postMessage(payload);
+    }, 1500);
+    pendingIpcClipboard.set(payload.reqId, { resolve: resolveReq, timer });
+    try {
+      port.postMessage(payload);
+    } catch {
+      clearTimeout(timer);
+      pendingIpcClipboard.delete(payload.reqId);
+      resolveReq(null);
+    }
   });
 }
 
 async function getHostClipboard(): Promise<string> {
   const ipcRes = await ipcClipboardRequest({ type: 'CLIPBOARD_GET', reqId: randomUUID() });
   if (ipcRes !== null) return ipcRes.trim();
-  const out = await runProcess(
-    'powershell.exe',
-    [
-      '-NoProfile',
-      '-Sta',
-      '-Command',
-      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard -Raw',
-    ],
-    { timeoutMs: 5000 },
-  );
+  const script =
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ' +
+    'for ($i = 0; $i -lt 10; $i++) { ' +
+    'try { Get-Clipboard -Raw -ErrorAction Stop; exit 0 } ' +
+    'catch { if ($i -eq 9) { throw }; Start-Sleep -Milliseconds 60 } ' +
+    '}';
+  const out = await runProcess('powershell.exe', ['-NoProfile', '-Sta', '-Command', script], {
+    timeoutMs: 8000,
+  });
   return out.toString('utf8').trim();
 }
 
@@ -293,16 +307,17 @@ async function setHostClipboard(text: string): Promise<void> {
     text,
   });
   if (ipcRes !== null) return;
-  await runProcess(
-    'powershell.exe',
-    [
-      '-NoProfile',
-      '-Sta',
-      '-Command',
-      '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())',
-    ],
-    { input: Buffer.from(text, 'utf8'), timeoutMs: 5000 },
-  );
+  const script =
+    '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; ' +
+    '$val = [Console]::In.ReadToEnd(); ' +
+    'for ($i = 0; $i -lt 10; $i++) { ' +
+    'try { Set-Clipboard -Value $val -ErrorAction Stop; exit 0 } ' +
+    'catch { if ($i -eq 9) { throw }; Start-Sleep -Milliseconds 60 } ' +
+    '}';
+  await runProcess('powershell.exe', ['-NoProfile', '-Sta', '-Command', script], {
+    input: Buffer.from(text, 'utf8'),
+    timeoutMs: 8000,
+  });
 }
 
 const COMMON_INSTALL_DIRS = [
@@ -1000,6 +1015,87 @@ if ($pids.Count -gt 0) {
     await this.adb(serial, ['shell', 'input', 'keyevent', String(code)], 5000, signal);
   }
 
+  private parseStreamMusicState(
+    dumpsysAudio: string,
+  ): { muted: boolean; speakerVol: number } | null {
+    const idx = dumpsysAudio.indexOf('- STREAM_MUSIC:');
+    if (idx < 0) return null;
+    const block = dumpsysAudio.slice(idx, idx + 420);
+    const mutedMatch = /\bMuted:\s*(true|false)\b/i.exec(block);
+    const speakerMatch = /\bspeaker\):\s*(\d+)\b/i.exec(block);
+    const defaultMatch = /\bdefault\):\s*(\d+)\b/i.exec(block);
+    if (!mutedMatch) return null;
+    const muted = mutedMatch[1]?.toLowerCase() === 'true';
+    const speakerVol = Number(speakerMatch?.[1] ?? defaultMatch?.[1] ?? (muted ? 0 : 10));
+    return { muted, speakerVol: Number.isFinite(speakerVol) ? speakerVol : 0 };
+  }
+
+  async setMediaSoundEnabled(
+    serial: string,
+    enabled: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      if (enabled) {
+        const audioBuf = await this.adb(serial, ['shell', 'dumpsys', 'audio'], 4000, signal).catch(
+          () => null,
+        );
+        const state = audioBuf ? this.parseStreamMusicState(audioBuf.toString('utf8')) : null;
+        if (state && !state.muted && state.speakerVol >= 3) {
+          return;
+        }
+        await this.adb(
+          serial,
+          [
+            'shell',
+            'media volume --stream 3 --set 11 >/dev/null 2>&1 || cmd media_session volume --stream 3 --set 11 >/dev/null 2>&1 || true',
+          ],
+          4000,
+          signal,
+        );
+        const verifyBuf = await this.adb(serial, ['shell', 'dumpsys', 'audio'], 4000, signal).catch(
+          () => null,
+        );
+        const afterState = verifyBuf
+          ? this.parseStreamMusicState(verifyBuf.toString('utf8'))
+          : null;
+        if (afterState?.muted) {
+          await this.keyevent(serial, 24, signal);
+        }
+      } else {
+        await this.adb(
+          serial,
+          [
+            'shell',
+            'media volume --stream 3 --set 0 >/dev/null 2>&1 || cmd media_session volume --stream 3 --set 0 >/dev/null 2>&1 || true',
+          ],
+          4000,
+          signal,
+        );
+      }
+    } catch (err) {
+      if (signal?.aborted || (err instanceof Error && err.message === 'TASK_STOPPED')) {
+        throw new Error('TASK_STOPPED');
+      }
+    }
+  }
+
+  async setInstanceSoundEnabled(
+    instanceId: string,
+    enabled: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const existing = await this.repo.getInstance(instanceId);
+    if (!existing) return;
+    if (
+      !this.onlineInstanceKeys.has(existing.instanceKey) &&
+      !(await isTcpPortOpen(existing.adbPort))
+    ) {
+      return;
+    }
+    await this.setMediaSoundEnabled(existing.serial, enabled, signal);
+  }
+
   async openDeepLink(
     serial: string,
     url: string,
@@ -1070,9 +1166,13 @@ if ($pids.Count -gt 0) {
   ): Promise<string | null> {
     return withClipboardLock(async () => {
       const previousClipboard = await getHostClipboard().catch(() => null);
+      let sheetMayBeOpen = false;
       try {
         const marker = `__AGY_EMPTY_${Date.now()}__`;
-        await setHostClipboard(marker);
+        const markerApplied = await setHostClipboard(marker)
+          .then(() => true)
+          .catch(() => false);
+        sheetMayBeOpen = true;
         await this.tap900(serial, moreBounds.cx, moreBounds.cy, screenW, screenH, signal);
         await abortableWait(1350, signal);
 
@@ -1081,19 +1181,23 @@ if ($pids.Count -gt 0) {
           this.dumpXml(serial, screenW, screenH, signal),
         ]);
         if (!(await isBottomSheetOpen(sheetPng))) {
+          sheetMayBeOpen = false;
           return null;
         }
 
         let copyTapY = 1370;
-        const sheetRows = flattenLiteNodes(sheetXml).filter(
-          (n) =>
-            n.clickable &&
-            n.bounds.x1 >= 12 &&
-            n.bounds.x2 >= 820 &&
-            n.bounds.y1 >= 740 &&
-            n.bounds.h >= 50 &&
-            n.bounds.h <= 115,
-        );
+        const sheetRows = flattenLiteNodes(sheetXml)
+          .filter(
+            (n) =>
+              n.clickable &&
+              n.bounds.x1 >= 0 &&
+              n.bounds.x1 <= 80 &&
+              n.bounds.x2 >= 820 &&
+              n.bounds.y1 >= 740 &&
+              n.bounds.h >= 50 &&
+              n.bounds.h <= 115,
+          )
+          .sort((a, b) => b.bounds.y1 - a.bounds.y1);
         for (const row of sheetRows) {
           const rowText = await this.ocr.recognizeBounds(sheetPng, row.bounds);
           const compact = rowText.replace(/\s+/g, '');
@@ -1111,13 +1215,27 @@ if ($pids.Count -gt 0) {
           await this.keyevent(serial, 4, signal).catch(() => null);
           await abortableWait(600, signal);
         }
+        sheetMayBeOpen = false;
 
-        const clip = await getHostClipboard();
-        if (!clip || clip === marker || !/^https?:\/\//i.test(clip)) {
+        const clip = await getHostClipboard().catch(() => '');
+        if (!clip || !/^https?:\/\//i.test(clip)) {
+          return null;
+        }
+        if (markerApplied && clip === marker) {
+          return null;
+        }
+        if (!markerApplied && previousClipboard !== null && clip === previousClipboard) {
           return null;
         }
         return clip;
       } finally {
+        if (sheetMayBeOpen && !signal?.aborted) {
+          const remainPng = await this.screencap(serial).catch(() => null);
+          if (remainPng && (await isBottomSheetOpen(remainPng))) {
+            await this.keyevent(serial, 4).catch(() => null);
+            await abortableWait(500).catch(() => null);
+          }
+        }
         if (previousClipboard !== null) {
           await setHostClipboard(previousClipboard).catch(() => null);
         }

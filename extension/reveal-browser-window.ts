@@ -100,7 +100,7 @@ export async function inspectBrowserWindow(): Promise<{
   let { win, tab, registeredTabId } = await resolveTargetWindow();
   if (win.state === 'locked-fullscreen') throw Error('WINDOW_LAYOUT_NORMAL_WINDOW_REQUIRED');
   if (win.state && win.state !== 'normal') {
-    await chrome.windows.update(win.id, { state: 'normal' });
+    await chrome.windows.update(win.id, { state: 'normal', focused: false });
     const updated = await chrome.windows.get(win.id);
     win = { ...updated, id: updated.id ?? win.id };
     if (tab?.id !== undefined) {

@@ -1,7 +1,7 @@
 {
   "name": "browser-workbench",
   "productName": "Browser Workbench",
-  "version": "0.1.221",
+  "version": "0.1.226",
   "private": true,
   "type": "module",
   "main": "dist/src/desktop/bootstrap.js",

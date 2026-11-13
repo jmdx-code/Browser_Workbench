@@ -74,6 +74,9 @@ export interface BumperPost {
   videoDuration?: number | null;
   videoCSS?: string | null;
   videoPlayCSS?: string | null;
+  videoAudioCSS?: string | null;
+  videoMuted?: boolean;
+  videoSpeakerMuted?: boolean;
   videoPaused?: boolean;
   videoReadyState?: number;
   videoCurrentSrc?: string;
@@ -594,6 +597,7 @@ export function projectGroupBumper(input: {
     'data-wb-bumper-open-comment': 'commentButtonCSS',
     'data-wb-bumper-video': 'videoCSS',
     'data-wb-bumper-video-play': 'videoPlayCSS',
+    'data-wb-bumper-video-audio': 'videoAudioCSS',
   } as const;
   type Marker = keyof typeof markerFields;
   const marks = new Map<Element, Map<Marker, { id: string | null; rank: number }>>();
@@ -1251,6 +1255,8 @@ export function projectGroupBumper(input: {
       videoDuration: number | null = null,
       videoCSS: string | null = null;
     let videoPlayCSS: string | null = null;
+    let videoAudioCSS: string | null = null;
+    let videoSpeakerMuted: boolean | undefined = undefined;
     const playControl = controls
       .filter(belongsToStory)
       .find(
@@ -1269,6 +1275,71 @@ export function projectGroupBumper(input: {
     }
     if (videoEl || hasVideoContainer) {
       hasVideo = true;
+      const unmuteLabelRx =
+        /^(?:Unmute(?:\s+(?:video|audio))?|Turn on sound|Tap to unmute|Click to unmute|取消静音|取消靜音|开启声音|開啟聲音|打开声音|打開聲音|点击开启声音|點擊開啟聲音|Bật âm thanh|เปิดเสียง|အသံဖွင့်(?:ပါ)?|Nyalakan suara)$/i;
+      const muteLabelRx =
+        /^(?:Mute(?:\s+(?:video|audio))?|Turn off sound|Tap to mute|Click to mute|静音|靜音|关闭声音|關閉聲音|Tắt âm thanh|ปิดเสียง|အသံပိတ်(?:ပါ)?|Matikan suara)$/i;
+      const audioControlBoxReady = (el: Element | null): el is HTMLElement => {
+        if (!(el instanceof HTMLElement)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      const matchesAudioControl = (
+        el: Element,
+        allowZeroOpacityOverlay: boolean,
+      ): el is HTMLElement => {
+        if (
+          !el.matches('[role="button"],button') ||
+          commentRow(el) ||
+          el.matches('a[href]') ||
+          el.closest('a[href]') ||
+          !(visible(el) || (allowZeroOpacityOverlay && audioControlBoxReady(el)))
+        )
+          return false;
+        const label = (el.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
+        if (label && (unmuteLabelRx.test(label) || muteLabelRx.test(label))) return true;
+        return chain(el).some(
+          (f) =>
+            /VideoPlayerAudio|VideoPlayerMute|AudioButton|VolumeButton|VolumeControl|MuteButton|SoundToggle|ReelsAudio/i.test(
+              f.name,
+            ) ||
+            (/VideoPlayer|Audio|Volume|Mute|Sound/i.test(f.name) &&
+              (typeof f.props.isMuted === 'boolean' ||
+                typeof f.props.muted === 'boolean' ||
+                typeof f.props.onToggleMute === 'function' ||
+                typeof f.props.onMuteChange === 'function')),
+        );
+      };
+      const storyControls = controls.filter(belongsToStory);
+      const audioControl =
+        storyControls.find((el) => matchesAudioControl(el, false)) ??
+        (videoEl && visible(videoEl)
+          ? storyControls.find((el) => matchesAudioControl(el, true))
+          : undefined);
+      if (audioControl) {
+        mark(audioControl, 'data-wb-bumper-video-audio', postId, markerRank);
+        videoAudioCSS = '[data-wb-bumper-video-audio="' + postId + '"]';
+        const audioLabel = (audioControl.getAttribute('aria-label') ?? '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (audioLabel && unmuteLabelRx.test(audioLabel)) {
+          videoSpeakerMuted = true;
+        } else if (audioLabel && muteLabelRx.test(audioLabel)) {
+          videoSpeakerMuted = false;
+        } else {
+          const muteFrame = chain(audioControl).find(
+            (f) => typeof f.props.isMuted === 'boolean' || typeof f.props.muted === 'boolean',
+          );
+          if (muteFrame) {
+            videoSpeakerMuted =
+              typeof muteFrame.props.isMuted === 'boolean'
+                ? muteFrame.props.isMuted
+                : Boolean(muteFrame.props.muted);
+          }
+        }
+      }
       if (videoEl) {
         mark(videoEl, 'data-wb-bumper-video', postId, markerRank);
         videoCSS = '[data-wb-bumper-video="' + postId + '"]';
@@ -1358,6 +1429,9 @@ export function projectGroupBumper(input: {
       videoDuration,
       videoCSS,
       videoPlayCSS,
+      videoAudioCSS,
+      videoMuted: videoEl ? videoEl.muted || videoEl.volume === 0 : true,
+      ...(videoSpeakerMuted !== undefined ? { videoSpeakerMuted } : {}),
       comments,
     });
   }

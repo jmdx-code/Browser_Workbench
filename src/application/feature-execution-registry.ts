@@ -113,9 +113,9 @@ export interface FeatureExecutionFallbackServices {
     stopProfiles(profileIds: readonly string[]): Promise<unknown>;
   };
   bluestacks?: {
-    isProfileRunning(profileId: string): boolean;
-    hasActiveExecution(): boolean;
-    stopBumper(profileIds?: readonly string[]): Promise<unknown>;
+    isProfileRunning(profileId: string, mode?: 'group' | 'page'): boolean;
+    hasActiveExecution(mode?: 'group' | 'page'): boolean;
+    stopBumper(profileIds?: readonly string[], mode?: 'group' | 'page'): Promise<unknown>;
   };
 }
 
@@ -204,16 +204,23 @@ export function ensureFeatureExecutionRegistry(
     });
   }
 
-  if (bluestacks && !registry.hasParticipant('bluestacks-group-bumper')) {
-    registry.register({
-      id: 'bluestacks-group-bumper',
-      label: '蓝蝶小组顶贴',
-      isProfileRunning: (profileId) => bluestacks.isProfileRunning(profileId),
-      hasActiveExecution: () => bluestacks.hasActiveExecution(),
-      stopProfiles: async (profileIds) => {
-        await bluestacks.stopBumper(profileIds);
-      },
-    });
+  if (bluestacks) {
+    for (const [id, label, mode] of [
+      ['bluestacks-group-bumper', '蓝蝶小组顶贴', 'group'],
+      ['bluestacks-page-bumper', '蓝蝶专页顶贴', 'page'],
+    ] as const) {
+      if (!registry.hasParticipant(id)) {
+        registry.register({
+          id,
+          label,
+          isProfileRunning: (profileId) => bluestacks.isProfileRunning(profileId, mode),
+          hasActiveExecution: () => bluestacks.hasActiveExecution(mode),
+          stopProfiles: async (profileIds) => {
+            await bluestacks.stopBumper(profileIds, mode);
+          },
+        });
+      }
+    }
   }
 
   return registry;

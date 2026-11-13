@@ -1,4 +1,5 @@
 import {
+  buildEnrichedProfiles,
   errorResult,
   okResult,
   resolveProfileId,
@@ -382,15 +383,24 @@ export function createAgentBrowserTools(deps: WorkbenchMcpDependencies): McpTool
   const wbBrowserLifecycle: McpToolDefinition = {
     name: 'wb_browser_lifecycle',
     description:
-      '安全控制「已安装工作台插件并配对注册」的浏览器资料生命周期（启动 open / 安全关窗 close / 卡死自愈重开 restart / 查询启动能力 status）。严格仅管理已在工作台注册的浏览器，绝不扫描或暴露未装插件的本机浏览器资料；启动参数与正常打开完全一致（--profile-directory、--user-data-dir、--window-name，无任何自动化/调试标记）；关窗仅关闭指定资料窗口而不杀共享进程、不误关其他窗口。当某个浏览器页面卡死无响应时，调用 action="restart" 可安全停止该号任务并自动关窗重开自愈（保留 PENDING_REVIEW 待核对账本不重发）。',
+      '安全控制「已安装工作台插件并配对注册」的浏览器资料生命周期与窗口整理（启动 open / 安全关窗 close / 卡死自愈重开 restart / 查询启动能力 status / 清理多余标签 cleanup_tabs / 前置显示窗口 show_window / 整理窗口布局 arrange_windows / 还原窗口布局 restore_windows）。严格仅管理已在工作台注册的浏览器，绝不扫描或暴露未装插件的本机浏览器资料；启动参数与正常打开完全一致（--profile-directory、--user-data-dir、--window-name，无任何自动化/调试标记）；关窗仅关闭指定资料窗口而不杀共享进程、不误关其他窗口。',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['open', 'close', 'restart', 'status'],
+          enum: [
+            'open',
+            'close',
+            'restart',
+            'status',
+            'cleanup_tabs',
+            'show_window',
+            'arrange_windows',
+            'restore_windows',
+          ],
           description:
-            '生命周期动作：open（启动离线浏览器并等待插件就绪）、close（停止该号任务并安全关闭其窗口）、restart（卡死自愈：关闭后以正常参数重新打开并等待回连）、status（查询在线与可启动状态）',
+            '生命周期与窗口动作：open（启动离线浏览器并等待插件就绪）、close（停止该号任务并安全关闭其窗口）、restart（卡死自愈：关闭后重新打开并等待回连）、status（查询在线与可启动状态）、cleanup_tabs（清理闲置浏览器的多余非主标签页）、show_window（前置显示指定在线浏览器窗口）、arrange_windows（按工作台布局规则整理窗口位置）、restore_windows（还原受管窗口布局）',
         },
         profileId: {
           type: 'string',
@@ -399,7 +409,12 @@ export function createAgentBrowserTools(deps: WorkbenchMcpDependencies): McpTool
         profileIds: {
           type: 'array',
           items: { type: 'string' },
-          description: '多个目标浏览器标识列表（仅限已安装插件并注册的浏览器）',
+          description:
+            '多个目标浏览器标识列表（cleanup_tabs / arrange_windows / restore_windows 省略时默认作用于全部在线已注册浏览器）',
+        },
+        preferActiveTab: {
+          type: 'boolean',
+          description: 'cleanup_tabs 时是否优先保留当前活动标签页（默认 false）',
         },
         timeoutMs: {
           type: 'number',
@@ -412,12 +427,22 @@ export function createAgentBrowserTools(deps: WorkbenchMcpDependencies): McpTool
       additionalProperties: false,
     },
     handler: async (args) => {
-      if (!deps.profileLifecycle) {
-        return errorResult('LIFECYCLE_UNAVAILABLE', '当前环境未启用浏览器生命周期管理器');
-      }
       const action = String(args.action ?? '').trim();
-      if (!['open', 'close', 'restart', 'status'].includes(action)) {
-        return errorResult('INVALID_ACTION', 'action 必须为 open、close、restart 或 status');
+      const validActions = new Set([
+        'open',
+        'close',
+        'restart',
+        'status',
+        'cleanup_tabs',
+        'show_window',
+        'arrange_windows',
+        'restore_windows',
+      ]);
+      if (!validActions.has(action)) {
+        return errorResult(
+          'INVALID_ACTION',
+          'action 必须为 open、close、restart、status、cleanup_tabs、show_window、arrange_windows 或 restore_windows',
+        );
       }
       const rawSingle = typeof args.profileId === 'string' ? args.profileId.trim() : '';
       const rawList = [
@@ -426,6 +451,77 @@ export function createAgentBrowserTools(deps: WorkbenchMcpDependencies): McpTool
           : []),
         ...(rawSingle ? [rawSingle] : []),
       ];
+
+      if (action === 'cleanup_tabs') {
+        if (!deps.browserWindow?.cleanupTabs) {
+          return errorResult('BROWSER_WINDOW_UNAVAILABLE', '当前环境未启用浏览器标签整理服务');
+        }
+        const profileIds =
+          rawList.length > 0
+            ? await resolveProfileIds(deps, rawList)
+            : (await buildEnrichedProfiles(deps)).filter((p) => p.online).map((p) => p.id);
+        if (profileIds.length === 0) {
+          return okResult({
+            ok: true,
+            action,
+            cleanedProfiles: 0,
+            closedTabs: 0,
+            skippedBusy: 0,
+            skippedOffline: 0,
+          });
+        }
+        const res = await deps.browserWindow.cleanupTabs(profileIds, args.preferActiveTab === true);
+        return okResult({
+          ok: true,
+          action,
+          ...res,
+        });
+      }
+
+      if (action === 'show_window') {
+        if (!deps.browserWindow) {
+          return errorResult('BROWSER_WINDOW_UNAVAILABLE', '当前环境未启用浏览器窗口显示服务');
+        }
+        if (rawList.length === 0) {
+          return errorResult(
+            'PROFILE_IDS_REQUIRED',
+            'show_window 需要通过 profileId 指定目标浏览器',
+          );
+        }
+        const profileIds = await resolveProfileIds(deps, rawList);
+        const enriched = await buildEnrichedProfiles(deps);
+        const aliasMap = new Map(enriched.map((p) => [p.id, p.displayName]));
+        const items = [];
+        for (const id of profileIds) {
+          items.push(await deps.browserWindow.show(id, aliasMap.get(id) ?? id));
+        }
+        return okResult({
+          ok: true,
+          action,
+          count: items.length,
+          items,
+        });
+      }
+
+      if (action === 'arrange_windows' || action === 'restore_windows') {
+        if (!deps.windowLayout) {
+          return errorResult('WINDOW_LAYOUT_UNAVAILABLE', '当前环境未启用窗口布局服务');
+        }
+        const profileIds = rawList.length > 0 ? await resolveProfileIds(deps, rawList) : undefined;
+        const result = await deps.windowLayout.command({
+          action: action === 'arrange_windows' ? 'apply' : 'restore',
+          ...(profileIds && profileIds.length > 0 ? { profileIds } : {}),
+        });
+        return okResult({
+          ok: true,
+          action,
+          layout: result,
+        });
+      }
+
+      if (!deps.profileLifecycle) {
+        return errorResult('LIFECYCLE_UNAVAILABLE', '当前环境未启用浏览器生命周期管理器');
+      }
       if (rawList.length === 0) {
         return errorResult(
           'PROFILE_IDS_REQUIRED',

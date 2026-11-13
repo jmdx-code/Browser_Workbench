@@ -282,11 +282,19 @@ async function boot() {
       'reqId' in message &&
       typeof message.reqId === 'string'
     ) {
-      service.postMessage({
-        type: 'CLIPBOARD_RESULT',
-        reqId: message.reqId,
-        text: clipboard.readText(),
-      });
+      const reqId = message.reqId;
+      void (async () => {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            const text = clipboard.readText();
+            service.postMessage({ type: 'CLIPBOARD_RESULT', reqId, ok: true, text });
+            return;
+          } catch {
+            if (attempt < 4) await new Promise((r) => setTimeout(r, 35));
+          }
+        }
+        service.postMessage({ type: 'CLIPBOARD_RESULT', reqId, ok: false, text: '' });
+      })();
       return;
     }
     if (
@@ -299,12 +307,20 @@ async function boot() {
       'text' in message &&
       typeof message.text === 'string'
     ) {
-      clipboard.writeText(message.text);
-      service.postMessage({
-        type: 'CLIPBOARD_RESULT',
-        reqId: message.reqId,
-        text: message.text,
-      });
+      const reqId = message.reqId;
+      const targetText = message.text;
+      void (async () => {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          try {
+            clipboard.writeText(targetText);
+            service.postMessage({ type: 'CLIPBOARD_RESULT', reqId, ok: true, text: targetText });
+            return;
+          } catch {
+            if (attempt < 4) await new Promise((r) => setTimeout(r, 35));
+          }
+        }
+        service.postMessage({ type: 'CLIPBOARD_RESULT', reqId, ok: false, text: '' });
+      })();
       return;
     }
     const notice = DesktopTaskNotification.safeParse(message);

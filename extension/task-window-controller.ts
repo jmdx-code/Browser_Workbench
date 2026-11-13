@@ -104,7 +104,7 @@ export class TaskWindowController {
     check();
     if (win.state === 'locked-fullscreen') throw Error('WINDOW_LAYOUT_NORMAL_WINDOW_REQUIRED');
     if (win.state !== 'normal') {
-      await chrome.windows.update(tab.windowId, { state: 'normal' });
+      await chrome.windows.update(tab.windowId, { state: 'normal', focused: false });
       check();
       win = await chrome.windows.get(tab.windowId);
       check();
@@ -172,7 +172,10 @@ export class TaskWindowController {
         checkTab();
         if (win.state === 'locked-fullscreen') throw Error('WINDOW_LAYOUT_NORMAL_WINDOW_REQUIRED');
         if (win.state && win.state !== 'normal') {
-          await chrome.windows.update(windowId, { state: 'normal' });
+          await chrome.windows.update(windowId, {
+            state: 'normal',
+            ...(shouldFocus ? {} : { focused: false }),
+          });
           checkTab();
           win = await chrome.windows.get(windowId);
           checkTab();

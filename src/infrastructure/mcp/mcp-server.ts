@@ -6,6 +6,7 @@ import {
   type McpToolDefinition,
   type WorkbenchMcpDependencies,
 } from './mcp-context.js';
+import { createActiveAccountsTools } from './tools-active-accounts.js';
 import { createAgentBrowserTools } from './tools-browser.js';
 import { createMonitorAndDiagnosticTools } from './tools-monitor-diagnostics.js';
 import { createPosterAndModuleTools } from './tools-poster-modules.js';
@@ -60,6 +61,7 @@ async function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promis
 export function buildWorkbenchMcpTools(deps: WorkbenchMcpDependencies): McpToolDefinition[] {
   return [
     ...createWorkspaceAndTargetTools(deps),
+    ...createActiveAccountsTools(deps),
     ...createPosterAndModuleTools(deps),
     ...createMonitorAndDiagnosticTools(deps),
     ...createAgentBrowserTools(deps),
@@ -155,7 +157,7 @@ export function createWorkbenchMcpHttpHandler(
             version: deps.softwareVersion,
           },
           instructions:
-            'Browser Workbench MCP 服务：优先调用现成模块工具（小组发帖/定时发帖、小组顶贴、专页顶贴、小组邀请人、蓝蝶多开、本地 Excel/CSV 读取），仅在自定义外部网页自动化时使用 wb_browser_*。所有任务结果请依据真实回执（postUrl / pendingReviewOperations / devDiag）判断，遇到 CAPTCHA 或双重验证严禁自动点击，交由人工完成。',
+            'Browser Workbench MCP 服务：优先调用现成模块工具（活跃账号任务组合与全局执行记录、小组发帖/定时发帖、小组顶贴、专页顶贴、小组邀请人、蓝蝶小组顶贴与蓝蝶专页顶贴、本地 Excel/CSV 读取），仅在自定义外部网页自动化时使用 wb_browser_*。所有任务结果请依据真实回执（postUrl / pendingReviewOperations / devDiag）判断，遇到 CAPTCHA 或双重验证严禁自动点击，交由人工完成。',
         },
       };
     }

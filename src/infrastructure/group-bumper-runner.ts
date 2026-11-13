@@ -65,19 +65,38 @@ export class BumperPostReadIncomplete extends Error {
     super(message);
   }
 }
+export interface RequireBumperPostOptions {
+  pageBumper?: boolean;
+  accountId?: string;
+  pageOwnerAuthorId?: string | null;
+}
 export function requireBumperPost(
   post: BumperPost | undefined,
   target: BumperTarget,
   expectedFeedback: string | null,
+  options?: RequireBumperPostOptions,
 ): BumperPost {
-  if (
-    !post ||
-    (!post.authorId && !post.authorAliases?.length) ||
-    (expectedFeedback && !post.feedbackId)
-  )
+  const hasAuthorIdentity = options?.pageBumper
+    ? Boolean(
+        post?.authorId ||
+        post?.authorAliases?.length ||
+        post?.authorName?.trim() ||
+        post?.feedbackId,
+      )
+    : Boolean(post?.authorId || post?.authorAliases?.length);
+  if (!post || !hasAuthorIdentity || (expectedFeedback && !post.feedbackId))
     throw new BumperPostReadIncomplete();
+  const authorMatched = options?.pageBumper
+    ? !(
+        options.accountId &&
+        post.authorId &&
+        post.authorId === options.accountId &&
+        options.accountId !== target.id &&
+        options.accountId !== options.pageOwnerAuthorId
+      ) && !isForeignPagePost(post, target, options.pageOwnerAuthorId ?? null)
+    : bumperAuthorMatch(post, target);
   if (
-    !bumperAuthorMatch(post, target) ||
+    !authorMatched ||
     (expectedFeedback && !sameBumperFeedbackId(post.feedbackId, expectedFeedback))
   )
     throw Error('目标帖子或作者已变化');
@@ -2255,6 +2274,23 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       );
       return { identity: resolvedIdentity, connection };
     };
+    const waitPeerOnlineAndSynced = async (timeoutMs = 15_000) => {
+      const deadline = nowFn() + timeoutMs;
+      while (nowFn() < deadline) {
+        if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+        const candidate = core?.peers.get(profileId);
+        if (candidate?.browserWindowCount === 0) {
+          throw new BumperFatalError('浏览器窗口已关闭，当前任务已停止');
+        }
+        if (candidate && candidate.online && candidate.synced) {
+          peer = candidate;
+          epoch = candidate.epoch;
+          return;
+        }
+        await sleepFn(100);
+      }
+      throw new BumperFatalError('等待浏览器重连超时，已停止顶贴');
+    };
     const waitPeerOnlineAndIdle = async (timeoutMs = 15_000) => {
       const deadline = nowFn() + timeoutMs;
       while (nowFn() < deadline) {
@@ -2395,14 +2431,22 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     const jobId = randomUUID(),
       stepId = randomUUID();
     let avatarObservedOnce = false;
+    const isBackgroundAllowed = () =>
+      peer.capabilities?.includes('kernel-background-presentation-v1') === true ||
+      conn.taskRendering === true;
     const assertIdentity = async (force = false) => {
       guard();
       const doc = await page.evaluate(() => `${location.href}|${performance.timeOrigin}`);
       if (!force && doc === identityDocument && Date.now() - identityAt < 1000) return;
       let state = await readGroupInvitationState(page, guard);
       const deadline = Date.now() + 15000;
+      const backgroundAllowed = isBackgroundAllowed();
       let revealed = false;
-      while (!state.ready || !state.visible || state.accountId === null) {
+      while (
+        !state.ready ||
+        state.accountId === null ||
+        (!state.visible && !(backgroundAllowed && revealed))
+      ) {
         if (state.accountId !== null && state.accountId !== accountId)
           throw new BumperFatalError('登录账号已变化，已停止顶贴');
         if (state.verificationRequired) {
@@ -2412,7 +2456,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         if (state.verificationRequired) throw new BumperFatalError('受限 · 需要手机验证或操作受限');
         if (!state.visible && !revealed && identity.proof) {
           revealed = true;
-          await kernel.revealOwnedFacebookPage(peer, identity.proof);
+          await kernel.revealOwnedFacebookPage(peer, identity.proof, false);
         }
         if (Date.now() >= deadline)
           throw Error(
@@ -2468,7 +2512,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         }
         consecutiveNoProgressRecoveries++;
         callbacks.status('连接中断，正在恢复 · ' + reason);
-        await waitPeerOnlineAndIdle(15_000);
+        await waitPeerOnlineAndSynced(15_000);
         await this.stop(profileId);
         await waitPeerOnlineAndIdle(12_000);
         const reconnected = await prepareConnection();
@@ -3409,19 +3453,6 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   pageFeed = await waitForFeed(feed.id);
                 }
               }
-              if (enteredViaDirectOrId) {
-                pageOwnerAuthorId =
-                  pageFeed.posts.find((p) => p.authorId === feed.id)?.authorId ??
-                  pageFeed.posts.find(
-                    (p) =>
-                      /^\d+$/.test(p.authorId ?? '') &&
-                      p.authorId !== accountId &&
-                      (bumperAuthorMatch(p, feed) ||
-                        (!isPlaceholderTargetName(feed.name, feed.id) &&
-                          p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
-                  )?.authorId ??
-                  (/^\d+$/.test(feed.id) ? feed.id : null);
-              }
               const pageAvatar = pageFeed.pageAvatarUrl ?? pageFeed.avatarUrl;
               const canonicalPageId = canonicalBumperPageIdFromURL(page.url());
               if (canonicalPageId) {
@@ -3449,6 +3480,18 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   feed.name = pageFeed.groupTitle;
                 }
               }
+              const inferPageOwnerAuthorId = (postsOnPage: readonly BumperPost[]) =>
+                postsOnPage.find((p) => p.authorId === feed.id)?.authorId ??
+                postsOnPage.find(
+                  (p) =>
+                    /^\d+$/.test(p.authorId ?? '') &&
+                    p.authorId !== accountId &&
+                    (bumperAuthorMatch(p, feed) ||
+                      (!isPlaceholderTargetName(feed.name, feed.id) &&
+                        p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
+                )?.authorId ??
+                (/^\d+$/.test(feed.id) ? feed.id : null);
+              pageOwnerAuthorId = inferPageOwnerAuthorId(pageFeed.posts);
               if (!pageFeed.posts.length) {
                 skippedGroups++;
                 lastGroupError = pageFeed.loading ? '专页内容加载超时' : '专页暂无可访问帖子';
@@ -3604,6 +3647,23 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                   });
                 if (feed && surface.pageAvatarUrl)
                   await updateAvatar('pages', feed.id, surface.pageAvatarUrl);
+                if (
+                  isPageBumperMode &&
+                  feed &&
+                  (!pageOwnerAuthorId ||
+                    (pageOwnerAuthorId === feed.id &&
+                      !surface.posts.some((p) => p.authorId === feed.id)))
+                ) {
+                  const matchedOwner = surface.posts.find(
+                    (p) =>
+                      /^\d+$/.test(p.authorId ?? '') &&
+                      p.authorId !== accountId &&
+                      (bumperAuthorMatch(p, feed) ||
+                        (!isPlaceholderTargetName(feed.name, feed.id) &&
+                          p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
+                  )?.authorId;
+                  if (matchedOwner) pageOwnerAuthorId = matchedOwner;
+                }
                 if (surface.restricted)
                   throw new BumperFatalError(
                     '受限 · ' + (surface.restrictionReason ?? '需要手机验证或操作受限'),
@@ -3907,7 +3967,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                           throw new BumperFatalError(
                             '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
                           );
-                        if (!s.visible || !s.ready)
+                        if ((!s.visible && !isBackgroundAllowed()) || !s.ready)
                           throw new BumperPostReadIncomplete('目标帖子页面尚未可见就绪');
                         const p = s.posts.find((p) => p.postId === post.postId);
                         if (
@@ -3920,6 +3980,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                             p,
                             feed && resolvedPageId ? { ...target, id: resolvedPageId } : target,
                             expectedFeedbackId,
+                            isPageBumperMode && feed
+                              ? { pageBumper: true, accountId, pageOwnerAuthorId }
+                              : undefined,
                           );
                         } catch (error) {
                           if (!(error instanceof BumperPostReadIncomplete) || attempt > 0)

@@ -669,9 +669,23 @@ export class KernelBridge implements KernelBridgeHooks {
   async revealOwnedFacebookPage(
     peer: Peer,
     proof: TabProof,
-  ): Promise<{ profileId: string; tabId: number; focused: true }> {
+    focus?: true,
+  ): Promise<{ profileId: string; tabId: number; focused: true }>;
+  async revealOwnedFacebookPage(
+    peer: Peer,
+    proof: TabProof,
+    focus: boolean,
+  ): Promise<{ profileId: string; tabId: number; focused: boolean }>;
+  async revealOwnedFacebookPage(
+    peer: Peer,
+    proof: TabProof,
+    focus = true,
+  ): Promise<{ profileId: string; tabId: number; focused: boolean }> {
     if (!peer.capabilities?.includes('kernel-owned-page-reveal-v1'))
       throw Error('WORKSPACE_REVEAL_EXTENSION_UPDATE_REQUIRED');
+    if (!focus && !peer.capabilities?.includes('kernel-passive-page-reveal-v1')) {
+      return { profileId: peer.profileId, tabId: proof.tabId, focused: false };
+    }
     const session = this.sessions.get(peer.profileId);
     if (!session) {
       const guard = () => {
@@ -684,7 +698,7 @@ export class KernelBridge implements KernelBridgeHooks {
           throw Error('WORKSPACE_REVEAL_SESSION_RECHECK_REQUIRED');
       };
       guard();
-      return this.revealIdleFacebookPage(peer, proof, guard);
+      return this.revealIdleFacebookPage(peer, proof, guard, focus);
     }
     if (session.peer !== peer || session.closing || session.failureReason)
       throw Error('WORKSPACE_REVEAL_SESSION_RECHECK_REQUIRED');
@@ -697,14 +711,28 @@ export class KernelBridge implements KernelBridgeHooks {
       )
     )
       throw Error('WORKSPACE_REVEAL_PROOF_REJECTED');
-    const result = await session.request({ kind: 'revealOwnedPage', proof });
-    if (result.tabId !== proof.tabId || result.focused !== true)
+    const result = await session.request({
+      kind: 'revealOwnedPage',
+      proof,
+      ...(focus ? {} : { focus: false }),
+    });
+    if (
+      result.tabId !== proof.tabId ||
+      (focus ? result.focused !== true : typeof result.focused !== 'boolean')
+    )
       throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
-    peer.profileWindowFocused = true;
-    peer.focusedWindowAt = Date.now();
-    return { profileId: peer.profileId, tabId: proof.tabId, focused: true as const };
+    if (result.focused === true) {
+      peer.profileWindowFocused = true;
+      peer.focusedWindowAt = Date.now();
+    }
+    return { profileId: peer.profileId, tabId: proof.tabId, focused: Boolean(result.focused) };
   }
-  private async revealIdleFacebookPage(peer: Peer, proof: TabProof, guard: () => Awaitable<void>) {
+  private async revealIdleFacebookPage(
+    peer: Peer,
+    proof: TabProof,
+    guard: () => Awaitable<void>,
+    focus = true,
+  ) {
     if (
       !peer.capabilities?.includes('facebook-task-kernel-v1') ||
       this.watches.busy(peer.profileId)
@@ -749,14 +777,23 @@ export class KernelBridge implements KernelBridgeHooks {
         throw Error('WORKSPACE_REVEAL_PROOF_REJECTED');
       await session.request({ kind: 'adopt', proof });
       await current();
-      const result = await session.request({ kind: 'revealOwnedPage', proof });
+      const result = await session.request({
+        kind: 'revealOwnedPage',
+        proof,
+        ...(focus ? {} : { focus: false }),
+      });
       await current();
-      if (result.tabId !== proof.tabId || result.focused !== true)
+      if (
+        result.tabId !== proof.tabId ||
+        (focus ? result.focused !== true : typeof result.focused !== 'boolean')
+      )
         throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
       displayed = true;
-      peer.profileWindowFocused = true;
-      peer.focusedWindowAt = Date.now();
-      return { profileId: peer.profileId, tabId: proof.tabId, focused: true as const };
+      if (result.focused === true) {
+        peer.profileWindowFocused = true;
+        peer.focusedWindowAt = Date.now();
+      }
+      return { profileId: peer.profileId, tabId: proof.tabId, focused: Boolean(result.focused) };
     } finally {
       session.closing = true;
       try {
@@ -2351,7 +2388,7 @@ export class KernelBridge implements KernelBridgeHooks {
       !this.usesExposedWindowLayout() &&
       peer.capabilities?.includes('kernel-owned-page-reveal-v1')
     ) {
-      await this.revealOwnedFacebookPage(peer, proof).catch(() => {});
+      await this.revealOwnedFacebookPage(peer, proof, false).catch(() => {});
       await guard();
     }
     let current;
@@ -2999,7 +3036,7 @@ export class KernelBridge implements KernelBridgeHooks {
         !this.usesExposedWindowLayout() &&
         peer.capabilities?.includes('kernel-owned-page-reveal-v1')
       ) {
-        await this.revealOwnedFacebookPage(peer, connection.proof).catch(() => {});
+        await this.revealOwnedFacebookPage(peer, connection.proof, false).catch(() => {});
         await assertAllowed();
       }
       if (readOptions?.disableOuterTimeout === true) {

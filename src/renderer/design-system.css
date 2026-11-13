@@ -3109,7 +3109,10 @@ code {
 }
 .bumper-advanced-panel .bumper-policy-field {
   display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  white-space: nowrap;
   width: 100%;
 }
 .bumper-advanced-panel .bumper-policy-field input {

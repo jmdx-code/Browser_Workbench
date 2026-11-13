@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 
 export type MenuItem =
   | {
@@ -10,6 +10,53 @@ export type MenuItem =
       danger?: boolean;
     }
   | { separator: true; label?: string };
+
+function resolveClippingBounds(triggerEl: HTMLElement): { minX: number; maxX: number } {
+  const viewportW =
+    typeof window !== 'undefined' && window.innerWidth > 0 ? window.innerWidth : 1280;
+  const container = triggerEl.closest(
+    '.workspace, .sidebar, .modal, .dialog-card, .confirm-dialog',
+  );
+  const containerRect = container?.getBoundingClientRect();
+  const rawMin = containerRect && containerRect.width > 0 ? Math.max(0, containerRect.left) : 0;
+  const rawMax =
+    containerRect && containerRect.width > 0 ? Math.min(viewportW, containerRect.right) : viewportW;
+  const minX = rawMin + 8;
+  const maxX = Math.max(minX + 120, rawMax - 8);
+  return { minX, maxX };
+}
+
+export function computePopoverPlacement(
+  triggerEl: HTMLElement,
+  panelWidth: number,
+  preferred: 'start' | 'end',
+): { effectiveAlign: 'start' | 'end'; offsetPx: number } {
+  const rect = triggerEl.getBoundingClientRect();
+  if (rect.width === 0 && rect.left === 0 && rect.right === 0) {
+    return { effectiveAlign: preferred, offsetPx: 0 };
+  }
+  const { minX, maxX } = resolveClippingBounds(triggerEl);
+
+  if (preferred === 'end') {
+    if (rect.right - panelWidth >= minX && rect.right <= maxX) {
+      return { effectiveAlign: 'end', offsetPx: 0 };
+    }
+    if (rect.left >= minX && rect.left + panelWidth <= maxX) {
+      return { effectiveAlign: 'start', offsetPx: 0 };
+    }
+  } else {
+    if (rect.left >= minX && rect.left + panelWidth <= maxX) {
+      return { effectiveAlign: 'start', offsetPx: 0 };
+    }
+    if (rect.right - panelWidth >= minX && rect.right <= maxX) {
+      return { effectiveAlign: 'end', offsetPx: 0 };
+    }
+  }
+
+  let shift = Math.min(0, maxX - (rect.left + panelWidth));
+  shift = Math.max(minX - rect.left, shift);
+  return { effectiveAlign: 'start', offsetPx: Math.round(shift) };
+}
 
 // Lightweight dropdown: closes on outside click, Escape or selection.
 export function PopoverMenu({
@@ -31,10 +78,32 @@ export function PopoverMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [effectiveAlign, setEffectiveAlign] = useState<'start' | 'end'>(align);
+  const [offsetPx, setOffsetPx] = useState(0);
   const root = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     setEffectiveAlign(align);
+    setOffsetPx(0);
   }, [align]);
+
+  useLayoutEffect(() => {
+    if (!open || !root.current || !panelRef.current) return;
+    const updatePlacement = () => {
+      if (!root.current || !panelRef.current) return;
+      const measuredWidth =
+        panelRef.current.offsetWidth ||
+        Math.round(panelRef.current.getBoundingClientRect().width) ||
+        252;
+      const next = computePopoverPlacement(root.current, measuredWidth, align);
+      setEffectiveAlign(next.effectiveAlign);
+      setOffsetPx(next.offsetPx);
+    };
+    updatePlacement();
+    window.addEventListener('resize', updatePlacement);
+    return () => window.removeEventListener('resize', updatePlacement);
+  }, [open, align]);
+
   useEffect(() => {
     if (!open) return;
     const down = (event: PointerEvent) => {
@@ -50,6 +119,7 @@ export function PopoverMenu({
       document.removeEventListener('keydown', key);
     };
   }, [open]);
+
   const close = () => setOpen(false);
   return (
     <div className={'popover ' + className} ref={root}>
@@ -64,18 +134,9 @@ export function PopoverMenu({
         onClick={(event) => {
           event.stopPropagation();
           if (!open && root.current) {
-            const rect = root.current.getBoundingClientRect();
-            if (align === 'end' && rect.right < 200) {
-              setEffectiveAlign('start');
-            } else if (
-              align === 'start' &&
-              typeof window !== 'undefined' &&
-              rect.left + 200 > window.innerWidth
-            ) {
-              setEffectiveAlign('end');
-            } else {
-              setEffectiveAlign(align);
-            }
+            const initial = computePopoverPlacement(root.current, 256, align);
+            setEffectiveAlign(initial.effectiveAlign);
+            setOffsetPx(initial.offsetPx);
           }
           setOpen(!open);
         }}
@@ -84,7 +145,9 @@ export function PopoverMenu({
       </button>
       {open && (
         <div
+          ref={panelRef}
           className={'popover-panel align-' + effectiveAlign}
+          style={offsetPx !== 0 ? { left: `${offsetPx}px`, right: 'auto' } : undefined}
           role="menu"
           onClick={(event) => event.stopPropagation()}
         >

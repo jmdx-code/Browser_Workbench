@@ -18,7 +18,9 @@ import type { WorkspaceService } from '../../application/workspace-service.js';
 import type { TaskService } from '../../application/task-service.js';
 import type { ProfileInspectionService } from '../../application/profile-inspection.js';
 import type { KernelBridge } from '../kernel-bridge.js';
+import type { BrowserWindowPort } from '../../shared/browser-window.js';
 import type { ReloadResult } from '../../shared/software-update.js';
+import type { WindowLayoutPort } from '../../shared/window-layout.js';
 import { AgentBrowserManager } from './agent-browser-manager.js';
 import { createWorkbenchMcpHttpHandler } from './mcp-server.js';
 import type { WorkbenchMcpDependencies } from './mcp-context.js';
@@ -42,6 +44,8 @@ export interface McpRuntimeWiringInput {
   groupBumperService: GroupBumperService;
   groupInviterService: GroupInviterService;
   bluestacksService: BluestacksService;
+  browserWindow?: BrowserWindowPort | undefined;
+  windowLayout?: WindowLayoutPort | undefined;
   captureDiagnostics: WorkbenchMcpDependencies['captureDiagnostics'];
   devDiagFilePath: string;
   reloadExtensions: (ids?: string[]) => Promise<ReloadResult>;
@@ -165,6 +169,8 @@ export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
       bluestacksService: input.bluestacksService,
       agentBrowser: agentBrowserManager,
       profileLifecycle,
+      browserWindow: input.browserWindow,
+      windowLayout: input.windowLayout,
       captureDiagnostics: input.captureDiagnostics,
       devDiagFilePath: input.devDiagFilePath,
       reloadExtensions: input.reloadExtensions,

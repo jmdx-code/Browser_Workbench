@@ -528,8 +528,14 @@ export function groupInvitationEffect(
   groupId: string,
   accountId: string,
   value: unknown,
+  allowHidden = false,
 ) {
-  if (!state.ready || !state.visible || state.verificationRequired || state.accountId !== accountId)
+  if (
+    !state.ready ||
+    (!state.visible && !allowHidden) ||
+    state.verificationRequired ||
+    state.accountId !== accountId
+  )
     return false;
   const url = new URL(state.url);
   if (url.origin !== 'https://www.facebook.com') return false;

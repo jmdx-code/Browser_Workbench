@@ -23,6 +23,7 @@ import {
   type BumperComment,
   type BumperDailyStat,
   type BumperLog,
+  type BumperScope,
   type BumperTarget,
 } from '../shared/group-bumper.js';
 import { saveRecordAvatar } from './record-avatar-store.js';
@@ -65,10 +66,16 @@ export interface BluestacksSavedSettings {
   installDir: string | null;
   confPath: string | null;
   bumperSettings: BumperSettings;
+  pageBumperSettings: BumperSettings;
 }
 
 const DEFAULT_BLUESTACKS_BUMPER_SETTINGS: BumperSettings = BumperSettings.parse({
   searchMode: 'page_group_feed',
+  maxConcurrentProfiles: 4,
+});
+
+const DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS: BumperSettings = BumperSettings.parse({
+  maxPostsPerPage: 3,
   maxConcurrentProfiles: 4,
 });
 
@@ -136,18 +143,30 @@ export class SqliteBluestacksRepository {
         id INTEGER PRIMARY KEY CHECK(id=1),
         install_dir TEXT,
         conf_path TEXT,
-        bumper_settings TEXT NOT NULL DEFAULT '{}'
+        bumper_settings TEXT NOT NULL DEFAULT '{}',
+        page_bumper_settings TEXT NOT NULL DEFAULT '{}'
       );
       INSERT OR IGNORE INTO bluestacks_settings(id, install_dir, conf_path, bumper_settings)
         VALUES(1, NULL, NULL, '{}');
     `);
+    const settingCols = db
+      .prepare('PRAGMA table_info(bluestacks_settings)')
+      .all()
+      .map((r) => String(r.name));
+    if (!settingCols.includes('page_bumper_settings')) {
+      db.exec(
+        "ALTER TABLE bluestacks_settings ADD COLUMN page_bumper_settings TEXT NOT NULL DEFAULT '{}';",
+      );
+    }
     ensureBumperEffects(db);
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
   }
 
   savedSettings(): BluestacksSavedSettings {
     const row = this.db
-      .prepare('SELECT install_dir, conf_path, bumper_settings FROM bluestacks_settings WHERE id=1')
+      .prepare(
+        'SELECT install_dir, conf_path, bumper_settings, page_bumper_settings FROM bluestacks_settings WHERE id=1',
+      )
       .get();
     let bumperSettings = DEFAULT_BLUESTACKS_BUMPER_SETTINGS;
     try {
@@ -159,6 +178,20 @@ export class SqliteBluestacksRepository {
     } catch {
       bumperSettings = DEFAULT_BLUESTACKS_BUMPER_SETTINGS;
     }
+    let pageBumperSettings = DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS;
+    try {
+      const rawPage = JSON.parse(String(row?.page_bumper_settings ?? '{}')) as Record<
+        string,
+        unknown
+      >;
+      pageBumperSettings = BumperSettings.parse({
+        maxPostsPerPage: 3,
+        maxConcurrentProfiles: 4,
+        ...rawPage,
+      });
+    } catch {
+      pageBumperSettings = DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS;
+    }
     return {
       installDir:
         typeof row?.install_dir === 'string' && row.install_dir.trim()
@@ -167,6 +200,7 @@ export class SqliteBluestacksRepository {
       confPath:
         typeof row?.conf_path === 'string' && row.conf_path.trim() ? row.conf_path.trim() : null,
       bumperSettings,
+      pageBumperSettings,
     };
   }
 
@@ -187,6 +221,14 @@ export class SqliteBluestacksRepository {
     const parsed = BumperSettings.parse(input);
     this.db
       .prepare('UPDATE bluestacks_settings SET bumper_settings=? WHERE id=1')
+      .run(JSON.stringify(parsed));
+    return parsed;
+  }
+
+  savePageBumperSettings(input: unknown): BumperSettings {
+    const parsed = BumperSettings.parse(input);
+    this.db
+      .prepare('UPDATE bluestacks_settings SET page_bumper_settings=? WHERE id=1')
       .run(JSON.stringify(parsed));
     return parsed;
   }
@@ -521,17 +563,24 @@ export class SqliteBluestacksRepository {
     );
   }
 
-  eligibility(accountId: string, instanceId: string, postId: string, now = Date.now()) {
-    const settings = this.savedSettings().bumperSettings;
+  eligibility(
+    accountId: string,
+    instanceId: string,
+    postId: string,
+    now = Date.now(),
+    sourceMode: BumperScope = 'group',
+  ) {
+    const saved = this.savedSettings();
+    const settings = sourceMode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
     const date = new Date(now);
     date.setHours(0, 0, 0, 0);
     const today = Number(
       this.db
         .prepare(
           `SELECT COUNT(*) n FROM group_bumper_effects
-            WHERE (account_id=? OR profile_id=?) AND applied_at>=? AND source_mode='group'`,
+            WHERE (account_id=? OR profile_id=?) AND applied_at>=? AND source_mode=?`,
         )
-        .get(accountId, instanceId, date.getTime())?.n ?? 0,
+        .get(accountId, instanceId, date.getTime(), sourceMode)?.n ?? 0,
     );
     const postCount = postId
       ? Number(
@@ -582,13 +631,15 @@ export class SqliteBluestacksRepository {
       .strict()
       .parse(input);
     if (!row.liked && !row.commentText) return false;
-    const settings = this.savedSettings().bumperSettings;
+    const mode: BumperScope = row.sourceMode ?? 'group';
+    const saved = this.savedSettings();
+    const settings = mode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
 
     return transaction(this.db, () => {
       const previous = this.db.prepare('SELECT * FROM group_bumper_logs WHERE id=?').get(row.id);
       if (
         !previous &&
-        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt).duplicate
+        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt, mode).duplicate
       ) {
         return false;
       }
@@ -597,7 +648,7 @@ export class SqliteBluestacksRepository {
         .prepare(
           `INSERT INTO group_bumper_logs(
              id,profile_id,account_id,group_id,group_name,page_id,page_name,post_id,post_url,liked,comment_text,bumped_at,source_mode
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'group')
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              liked=MAX(liked,excluded.liked),
              comment_text=COALESCE(comment_text,excluded.comment_text)`,
@@ -615,6 +666,7 @@ export class SqliteBluestacksRepository {
           row.liked ? 1 : 0,
           row.commentText,
           row.bumpedAt,
+          mode,
         );
       if (row.commentText) {
         this.db.prepare('UPDATE group_bumper_effects SET comment_digest=? WHERE log_id=?').run(
@@ -655,16 +707,16 @@ export class SqliteBluestacksRepository {
       : this.targetLibrary.listPages();
   }
 
-  comments(): BumperComment[] {
+  comments(scope: BumperScope = 'group'): BumperComment[] {
     return this.db
-      .prepare("SELECT * FROM group_bumper_comments WHERE scope='group' ORDER BY created_at, id")
-      .all()
+      .prepare('SELECT * FROM group_bumper_comments WHERE scope=? ORDER BY created_at, id')
+      .all(scope)
       .map((r) => ({
         id: String(r.id),
         text: String(r.comment_text),
         usedCount: Number(r.used_count),
         createdAt: Number(r.created_at),
-        scope: 'group' as const,
+        scope,
       }));
   }
 
@@ -672,6 +724,7 @@ export class SqliteBluestacksRepository {
     postId: string,
     random = Math.random(),
     excludeIds: ReadonlyArray<string> = [],
+    scope: BumperScope = 'group',
   ): BumperComment | null {
     const excluded = new Set(excludeIds);
     const digests = new Set(
@@ -690,16 +743,20 @@ export class SqliteBluestacksRepository {
         .all(postId)
         .map((r) => String(r.comment_text)),
     );
-    const all = this.comments().filter((r) => !excluded.has(r.id));
+    const all = this.comments(scope).filter((r) => !excluded.has(r.id));
     const unused = all.filter(
       (r) => !used.has(r.text) && !digests.has(createHash('sha256').update(r.text).digest('hex')),
     );
-    const consumeOnUse = this.savedSettings().bumperSettings.consumeCommentOnUse;
+    const saved = this.savedSettings();
+    const consumeOnUse =
+      scope === 'page'
+        ? saved.pageBumperSettings.consumeCommentOnUse
+        : saved.bumperSettings.consumeCommentOnUse;
     const pool = unused.length > 0 ? unused : consumeOnUse ? [] : all;
     return pool[Math.min(pool.length - 1, Math.max(0, Math.floor(random * pool.length)))] ?? null;
   }
 
-  todayCounts(now = Date.now()): Record<string, number> {
+  todayCounts(now = Date.now(), sourceMode: BumperScope = 'group'): Record<string, number> {
     const today = new Date(now);
     today.setHours(0, 0, 0, 0);
     return Object.fromEntries(
@@ -708,29 +765,29 @@ export class SqliteBluestacksRepository {
           `SELECT profile_id, COUNT(*) n
              FROM group_bumper_effects
             WHERE applied_at>=?
-              AND source_mode='group'
+              AND source_mode=?
               AND profile_id IN (SELECT id FROM bluestacks_instances)
             GROUP BY profile_id`,
         )
-        .all(today.getTime())
+        .all(today.getTime(), sourceMode)
         .map((r) => [String(r.profile_id), Number(r.n)]),
     );
   }
 
-  total(): number {
+  total(sourceMode: BumperScope = 'group'): number {
     return Number(
       this.db
         .prepare(
           `SELECT COUNT(*) n
              FROM group_bumper_logs
-            WHERE source_mode='group'
+            WHERE source_mode=?
               AND profile_id IN (SELECT id FROM bluestacks_instances)`,
         )
-        .get()?.n ?? 0,
+        .get(sourceMode)?.n ?? 0,
     );
   }
 
-  weeklyDailyCounts(now = Date.now()): BumperDailyStat[] {
+  weeklyDailyCounts(now = Date.now(), sourceMode: BumperScope = 'group'): BumperDailyStat[] {
     const base = new Date(now);
     base.setHours(0, 0, 0, 0);
     const tomorrow = new Date(base);
@@ -755,10 +812,10 @@ export class SqliteBluestacksRepository {
         `SELECT applied_at AS bumped_at
            FROM group_bumper_effects
           WHERE applied_at >= ? AND applied_at < ?
-            AND source_mode='group'
+            AND source_mode=?
             AND profile_id IN (SELECT id FROM bluestacks_instances)`,
       )
-      .all(startMs, endMs);
+      .all(startMs, endMs, sourceMode);
     for (const r of rows) {
       const ymd = formatLocalYmd(new Date(Number(r.bumped_at)));
       if (buckets.has(ymd)) {

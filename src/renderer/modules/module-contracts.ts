@@ -9,6 +9,7 @@ export type FeatureModuleId =
   | 'page-bumper'
   | 'group-poster'
   | 'bluestacks-group-bumper'
+  | 'bluestacks-page-bumper'
   | 'records';
 
 export type StepBudget = z.infer<typeof TaskStepBudget>;

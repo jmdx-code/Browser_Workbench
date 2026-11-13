@@ -108,6 +108,25 @@ function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
           <path d="M12 13v-5M9.5 10.5 12 8l2.5 2.5" />
         </svg>
       );
+    case 'bluestacks-page-bumper':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+          <path d="M9.5 13.5V7l5 2.2-5 2.2" />
+        </svg>
+      );
     case 'records':
       return <IconCheckList size={16} />;
   }

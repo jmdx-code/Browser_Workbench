@@ -623,3 +623,112 @@ it('an inner Story logger is not assigned to a different enclosing native Card',
   expect(document.querySelector(a.likeCSS!)).toBe(h.button);
   expect(document.querySelector(b.likeCSS!)).toBe(nested.querySelector('button'));
 });
+
+it('projects video speaker button and speaker muted state across labels and Fiber props', () => {
+  header('MEMBER');
+  const a = document.createElement('article');
+  a.setAttribute('role', 'article');
+  a.innerHTML = `<a href="/groups/${gid}/posts/${postId}/">p</a><a href="/groups/${gid}/user/${actor}/">Page</a><video src="https://video.xx.fbcdn.net/v.mp4"></video><div role="button" id="speaker" aria-label="Unmute"></div><button data-ad-rendering-role="like_button">Like</button>`;
+  document.querySelector('main')!.append(a);
+  for (const e of [a, ...a.querySelectorAll('*')]) rect(e);
+  const videoEl = a.querySelector('video')!;
+  videoEl.muted = true;
+  const story = {
+    __id: btoa('actor:VK:' + postId),
+    post_id: postId,
+    actors: [{ id: actor }],
+    feedback: { id: 'feedback-' + postId },
+  };
+  const card = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story },
+    return: null,
+  };
+  Reflect.set(a, '__reactFiber$test', card);
+  const speaker = a.querySelector('#speaker')!;
+  fiber(speaker, 'VideoPlayerAudioButton.react', { isMuted: true }, card);
+
+  let s = projectGroupBumper({ groupId: gid });
+  expect(s.posts[0]?.videoAudioCSS).toBe(`[data-wb-bumper-video-audio="${postId}"]`);
+  expect(s.posts[0]?.videoSpeakerMuted).toBe(true);
+  expect(s.posts[0]?.videoMuted).toBe(true);
+
+  speaker.setAttribute('aria-label', 'Mute');
+  videoEl.muted = false;
+  fiber(speaker, 'VideoPlayerAudioButton.react', { isMuted: false }, card);
+  s = projectGroupBumper({ groupId: gid });
+  expect(s.posts[0]?.videoSpeakerMuted).toBe(false);
+  expect(s.posts[0]?.videoMuted).toBe(false);
+});
+
+it('watchBumperVideo clicks speaker button when sound=true so speaker icon turns on and video continues playing', async () => {
+  vi.useFakeTimers();
+  const video = document.createElement('video');
+  document.body.append(video);
+  rect(video);
+  video.muted = true;
+  video.volume = 0.2;
+  video.scrollIntoView = vi.fn();
+  video.play = vi.fn(async () => {});
+  let speakerMuted = true;
+  let speakerClicks = 0;
+  const audioSelector = `[data-wb-bumper-video-audio="${postId}"]`;
+  const page = {
+    locator: (sel: string) => ({
+      first() {
+        return this;
+      },
+      evaluate: async (fn: Function, arg?: unknown) => fn(video, arg),
+      hover: async () => {},
+      click: async () => {
+        if (sel === audioSelector) {
+          speakerClicks++;
+          speakerMuted = !speakerMuted;
+          video.muted = speakerMuted;
+        }
+      },
+    }),
+  } as unknown as Page;
+  let reads = 0;
+  let unmutedObservedDuringWatch = false;
+  const initial = {
+    postId,
+    feedbackId: 'fb',
+    videoCSS: 'video',
+    videoAudioCSS: audioSelector,
+    videoMuted: true,
+    videoSpeakerMuted: true,
+    videoCurrentTime: 0,
+    videoFrames: 0,
+    videoPaused: false,
+  } as BumperPost;
+  const p = watchBumperVideo({
+    page,
+    initial,
+    guard: () => {},
+    readCurrent: async () => {
+      reads++;
+      if (!video.muted && !speakerMuted) unmutedObservedDuringWatch = true;
+      return {
+        ...initial,
+        videoMuted: video.muted,
+        videoSpeakerMuted: speakerMuted,
+        videoCurrentTime: reads,
+        videoFrames: reads * 30,
+      };
+    },
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    sound: true,
+    budgetMs: 2500,
+    tickMs: 800,
+    stallMs: 3000,
+  });
+  await vi.runAllTimersAsync();
+  expect(await p).toBe('budget');
+  expect(speakerClicks).toBe(1);
+  expect(unmutedObservedDuringWatch).toBe(true);
+  expect(video.volume).toBeGreaterThanOrEqual(0.8);
+  // Keep speaker icon and <video>.muted unmuted on normal completion so volumechange does not flip speaker back off
+  expect(video.muted).toBe(false);
+  expect(speakerMuted).toBe(false);
+});

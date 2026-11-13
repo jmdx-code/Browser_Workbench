@@ -199,7 +199,10 @@ test('minimized and maximized task windows are restored and viewport is read aga
       const result = await f.controller.inspect(f.current.proof, f.guard);
       assert.equal(result.state, 'normal');
     }
-    assert.deepEqual(f.writes, [{ state: 'normal' }, { state: 'normal' }]);
+    assert.deepEqual(f.writes, [
+      { state: 'normal', focused: false },
+      { state: 'normal', focused: false },
+    ]);
   }));
 
 test('STOP before dispatch prevents window mutation', async () =>

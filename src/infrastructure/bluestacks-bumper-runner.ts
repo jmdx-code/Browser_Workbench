@@ -5,19 +5,25 @@ import {
   hasUnsupportedOcrScript,
   nameSimilarity,
   relativePostAge,
+  type BluestacksBumperMode,
   type BluestacksInstance,
 } from '../shared/bluestacks.js';
-import type {
-  BumperComment,
-  BumperLog,
-  BumperSettings,
-  BumperTarget,
+import {
+  isLocalAvatar,
+  isPlaceholderTargetName,
+  type BumperComment,
+  type BumperLog,
+  type BumperScope,
+  type BumperSettings,
+  type BumperTarget,
 } from '../shared/group-bumper.js';
 import { abortableWait, type BluestacksDeviceManager } from './bluestacks-device-manager.js';
 import {
   compareAvatarToRegion,
   cropToDataUrl,
+  detectVideoSpeakerState,
   extractActionBars,
+  extractInlineVideoControls,
   extractPostCards,
   findGroupSortButtonNode,
   findJoinGroupButtonNode,
@@ -26,12 +32,15 @@ import {
   findTextInputNode,
   flattenLiteNodes,
   getRegionSignature,
+  hasPageHeroHeader,
+  hasPageTopBar,
   isBottomSheetOpen,
   isDarkScreenOrReelMode,
   isLikeButtonBlue,
   makeCanonicalRect,
   resolveSharePostUrl,
   signatureSimilarity,
+  type LiteInlineVideoControls,
   type LitePostActionBar,
   type LitePostCard,
   type LiteXmlNode,
@@ -40,11 +49,16 @@ import {
 } from './bluestacks-vision.js';
 
 export interface BluestacksBumperRunnerRepo {
+  savedSettings?(): {
+    bumperSettings: BumperSettings;
+    pageBumperSettings?: BumperSettings;
+  };
   eligibility(
     accountId: string,
     instanceId: string,
     postId: string,
     now?: number,
+    sourceMode?: BumperScope,
   ): {
     today: number;
     postCount: number;
@@ -55,6 +69,7 @@ export interface BluestacksBumperRunnerRepo {
     postId: string,
     random?: number,
     excludeIds?: ReadonlyArray<string>,
+    scope?: BumperScope,
   ): BumperComment | null;
   recordBump(input: BumperLog, commentId?: string): boolean;
   saveInspectionResult(input: {
@@ -101,6 +116,70 @@ export class BluestacksGroupBumperRunner {
     public readonly devices: BluestacksDeviceManager,
     private readonly ocr: OcrRecognizer,
   ) {}
+
+  private async resolveLiveEnableSound(
+    fallback: BumperSettings,
+    sourceMode: BumperScope,
+  ): Promise<boolean> {
+    if (typeof this.repo.savedSettings !== 'function') {
+      return Boolean(fallback.enableSound);
+    }
+    try {
+      const saved = await this.repo.savedSettings();
+      const effective =
+        sourceMode === 'page'
+          ? (saved.pageBumperSettings?.enableSound ?? fallback.enableSound)
+          : (saved.bumperSettings.enableSound ?? fallback.enableSound);
+      return Boolean(effective);
+    } catch {
+      return Boolean(fallback.enableSound);
+    }
+  }
+
+  private async applyDeviceStreamSound(
+    serial: string,
+    wantSound: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (typeof this.devices.setMediaSoundEnabled === 'function') {
+      await this.devices.setMediaSoundEnabled(serial, wantSound, signal);
+    }
+  }
+
+  private async syncVideoSpeakerIfVisible(
+    serial: string,
+    sw: number,
+    sh: number,
+    xml: LiteXmlNode | null,
+    png: Buffer,
+    minY: number,
+    maxY: number,
+    headerOnScreen: boolean,
+    wantSound: boolean,
+    signal: AbortSignal,
+  ): Promise<{ png: Buffer; controls: LiteInlineVideoControls }> {
+    const controls = extractInlineVideoControls(xml, minY, maxY, headerOnScreen);
+    if (!controls.soundBounds) {
+      return { png, controls };
+    }
+    let currentPng = png;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const state = await detectVideoSpeakerState(currentPng, controls.soundBounds);
+      const needsTap = (wantSound && state === 'muted') || (!wantSound && state === 'unmuted');
+      if (!needsTap) break;
+      await this.devices.tap900(
+        serial,
+        controls.soundBounds.cx,
+        controls.soundBounds.cy,
+        sw,
+        sh,
+        signal,
+      );
+      await abortableWait(attempt === 0 ? 600 : 450, signal);
+      currentPng = await this.devices.screencap(serial, signal);
+    }
+    return { png: currentPng, controls };
+  }
 
   private async recoverToFeedIfNeeded(
     inst: BluestacksInstance,
@@ -344,6 +423,123 @@ export class BluestacksGroupBumperRunner {
     return page;
   }
 
+  private async enterAndVerifyPage(
+    inst: BluestacksInstance,
+    page: BumperTarget,
+    signal: AbortSignal,
+    status: (text: string) => void,
+  ): Promise<BumperTarget> {
+    const { serial, fbWidth: sw, fbHeight: sh } = inst;
+    const targetUrl = `https://www.facebook.com/${encodeURIComponent(page.id)}`;
+    status(`正在进入目标专页 · ${page.name}`);
+    await this.devices.openDeepLink(serial, targetUrl, sw, sh, signal);
+    await abortableWait(2400, signal);
+
+    let pageXml = await this.devices.dumpXml(serial, sw, sh, signal);
+    if (this.devices.isLoginOrLoggedOutXml(pageXml)) {
+      await this.repo.saveInspectionResult({
+        id: inst.id,
+        fbLiteInstalled: true,
+        accountState: 'logged-out',
+        fbWidth: sw,
+        fbHeight: sh,
+      });
+      throw new AccountCircuitBreakError('FB Lite 账号已退出登录或需验证');
+    }
+
+    const closeCarouselBtn = findRelatedGroupsCloseButtonNode(pageXml);
+    if (closeCarouselBtn) {
+      await this.devices.tap900(
+        serial,
+        closeCarouselBtn.bounds.cx,
+        closeCarouselBtn.bounds.cy,
+        sw,
+        sh,
+        signal,
+      );
+      await abortableWait(900, signal);
+      pageXml = await this.devices.dumpXml(serial, sw, sh, signal);
+    }
+
+    // When FB Lite re-opens the currently active Page, Android delivers the intent without resetting scroll.
+    // Pull back up to the Page hero header first so Post #1 at the top of the timeline is never skipped.
+    for (
+      let pullStep = 0;
+      pullStep < 3 && hasPageTopBar(pageXml) && !hasPageHeroHeader(pageXml);
+      pullStep++
+    ) {
+      await this.devices.swipe900(serial, 450, 300, 450, 1400, 320, sw, sh, signal);
+      await abortableWait(1050, signal);
+      pageXml = await this.devices.dumpXml(serial, sw, sh, signal);
+    }
+
+    if (extractPostCards(pageXml).length === 0) {
+      await this.devices.swipe900(serial, 115, 1280, 115, 360, 650, sw, sh, signal);
+      await abortableWait(1350, signal);
+    }
+    return page;
+  }
+
+  private async matchPageTimelinePost(
+    png: Buffer,
+    card: LitePostCard,
+    page: BumperTarget,
+    actingAccountName: string,
+  ): Promise<{ target: BumperTarget; authorName: string } | null> {
+    const cleanPageName = page.name.replace(/\s*\|.*$/, '').trim() || page.name.trim();
+    const ocrName = await this.ocr.recognizeBounds(png, card.header.authorNameBounds);
+    const ocrAuthorOnly = ocrName.replace(/关注|關注|follow/gi, '').trim();
+    const ocrReadable = extractOcrReadableText(ocrAuthorOnly);
+
+    const nameSim = Math.max(
+      nameSimilarity(ocrAuthorOnly, cleanPageName),
+      nameSimilarity(ocrAuthorOnly, page.name),
+      nameSimilarity(ocrAuthorOnly, page.id),
+    );
+    const avatarSim = isLocalAvatar(page.avatarUrl)
+      ? await compareAvatarToRegion(png, card.header.avatarBounds, page.avatarUrl)
+      : 0;
+
+    // Reject self-posts authored by the acting personal account when distinct from the Page
+    const cleanActing = actingAccountName.trim();
+    if (
+      cleanActing.length >= 2 &&
+      ocrReadable.length >= 3 &&
+      nameSimilarity(ocrAuthorOnly, cleanActing) >= 0.78 &&
+      nameSim < 0.45 &&
+      avatarSim < 0.85
+    ) {
+      return null;
+    }
+
+    // Reject visitor posts whose avatar or Latin/CJK author name strongly disagrees with the Page
+    const candReadable = extractOcrReadableText(cleanPageName);
+    const candPureOcrScript =
+      !isPlaceholderTargetName(page.name, page.id) &&
+      candReadable.length >= 3 &&
+      !hasUnsupportedOcrScript(cleanPageName);
+
+    if (candPureOcrScript && ocrReadable.length >= 5 && nameSim < 0.2 && avatarSim < 0.85) {
+      return null;
+    }
+    if (
+      !isPlaceholderTargetName(page.name, page.id) &&
+      candReadable.length === 0 &&
+      ocrReadable.length >= 5 &&
+      avatarSim < 0.85
+    ) {
+      return null;
+    }
+    if (avatarSim > 0 && avatarSim < 0.65 && nameSim < 0.45) {
+      return null;
+    }
+
+    return {
+      target: page,
+      authorName: ocrAuthorOnly || cleanPageName || page.name,
+    };
+  }
+
   private async matchPostTarget(
     png: Buffer,
     card: LitePostCard,
@@ -409,21 +605,60 @@ export class BluestacksGroupBumperRunner {
       status(text: string, today?: number): void;
       added(today: number): void;
     },
+    mode: BluestacksBumperMode = 'group',
   ): Promise<void> {
     const guard = () => {
       if (signal.aborted) throw new Error('TASK_STOPPED');
     };
+
+    const isPageMode = mode === 'page' || (groups.length === 1 && groups[0]?.id === '-');
+    const sourceMode: BumperScope = isPageMode ? 'page' : 'group';
+    const maxPostsPerTarget = isPageMode
+      ? (settings.maxPostsPerPage ?? 3)
+      : settings.maxPostsPerGroupPage;
 
     callbacks.status('正在校验模拟器连接与 FB Lite 账号登录状态…');
     const inst = await this.devices.ensureReadyAndLoggedIn(instanceId, signal);
     const { serial, fbWidth: sw, fbHeight: sh, accountId } = inst;
     guard();
 
-    const mutablePages = pages.map((p) => ({ ...p }));
+    let lastAppliedStreamSound: boolean | null = null;
+    const syncStreamSound = async (): Promise<boolean> => {
+      const wantSound = await this.resolveLiveEnableSound(settings, sourceMode);
+      if (wantSound !== lastAppliedStreamSound) {
+        await this.applyDeviceStreamSound(serial, wantSound, signal);
+        lastAppliedStreamSound = wantSound;
+      }
+      return wantSound;
+    };
+    await syncStreamSound();
+    guard();
 
-    for (const rawGroup of groups) {
+    const mutablePages = pages.map((p) => ({ ...p }));
+    const outerGroups: readonly BumperTarget[] = isPageMode
+      ? [
+          {
+            id: '-',
+            name: '专页主页',
+            avatarUrl: null,
+            folderId: null,
+            sortOrder: 0,
+            totalBumpedCount: 0,
+            createdAt: 0,
+            updatedAt: 0,
+          },
+        ]
+      : groups;
+
+    for (const rawGroup of outerGroups) {
       guard();
-      const initialQuota = await this.repo.eligibility(accountId, instanceId, '');
+      const initialQuota = await this.repo.eligibility(
+        accountId,
+        instanceId,
+        '',
+        Date.now(),
+        sourceMode,
+      );
       if (initialQuota.today >= settings.dailyMaxLikesPerAccount) {
         callbacks.status(
           `今日已达上限 (${initialQuota.today}/${settings.dailyMaxLikesPerAccount})`,
@@ -432,29 +667,58 @@ export class BluestacksGroupBumperRunner {
         return;
       }
 
-      let group: BumperTarget;
-      try {
-        group = await this.enterAndVerifyGroup(inst, rawGroup, settings.searchMode, signal, (txt) =>
-          callbacks.status(txt, initialQuota.today),
-        );
-        if (settings.searchMode === 'time_sort') {
-          callbacks.status(`正在切换最新帖子排序 · ${group.name}`, initialQuota.today);
-          await this.switchGroupSortToNewest(inst, signal);
+      let group: BumperTarget = rawGroup;
+      if (!isPageMode) {
+        try {
+          group = await this.enterAndVerifyGroup(
+            inst,
+            rawGroup,
+            settings.searchMode,
+            signal,
+            (txt) => callbacks.status(txt, initialQuota.today),
+          );
+          if (settings.searchMode === 'time_sort') {
+            callbacks.status(`正在切换最新帖子排序 · ${group.name}`, initialQuota.today);
+            await this.switchGroupSortToNewest(inst, signal);
+          }
+        } catch (err) {
+          if (isFatalDeviceOrStopError(err, signal)) throw err;
+          callbacks.status(`小组访问超时或不可用，跳过 · ${rawGroup.name}`, initialQuota.today);
+          continue;
         }
-      } catch (err) {
-        if (isFatalDeviceOrStopError(err, signal)) throw err;
-        callbacks.status(`小组访问超时或不可用，跳过 · ${rawGroup.name}`, initialQuota.today);
-        continue;
       }
 
-      const feeds: Array<BumperTarget | null> =
-        settings.searchMode === 'page_group_feed' ? mutablePages : [null];
+      const feeds: Array<BumperTarget | null> = isPageMode
+        ? mutablePages
+        : settings.searchMode === 'page_group_feed'
+          ? mutablePages
+          : [null];
 
       for (const feed of feeds) {
         guard();
+        if (isPageMode) {
+          const pageQuota = await this.repo.eligibility(
+            accountId,
+            instanceId,
+            '',
+            Date.now(),
+            sourceMode,
+          );
+          if (pageQuota.today >= settings.dailyMaxLikesPerAccount) {
+            callbacks.status(
+              `今日已达上限 (${pageQuota.today}/${settings.dailyMaxLikesPerAccount})`,
+              pageQuota.today,
+            );
+            return;
+          }
+        }
         let activeFeed = feed;
         try {
-          if (activeFeed) {
+          if (isPageMode && activeFeed) {
+            activeFeed = await this.enterAndVerifyPage(inst, activeFeed, signal, (txt) =>
+              callbacks.status(txt),
+            );
+          } else if (activeFeed) {
             activeFeed = await this.openPageGroupFeed(inst, group, activeFeed, signal, (txt) =>
               callbacks.status(txt),
             );
@@ -467,24 +731,33 @@ export class BluestacksGroupBumperRunner {
           }
         } catch (err) {
           if (isFatalDeviceOrStopError(err, signal)) throw err;
+          if (isPageMode && feed) {
+            callbacks.status(`专页访问超时或不可用，跳过 · ${feed.name}`);
+          }
           continue;
         }
 
-        const expectedFeedUrl = activeFeed
-          ? `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(activeFeed.id)}/`
-          : this.buildGroupUrl(group.id, settings.searchMode);
+        const expectedFeedUrl =
+          isPageMode && activeFeed
+            ? `https://www.facebook.com/${encodeURIComponent(activeFeed.id)}`
+            : activeFeed
+              ? `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(activeFeed.id)}/`
+              : this.buildGroupUrl(group.id, settings.searchMode);
 
         const seenFingerprints = new Set<string>();
         const seenCardSigs: Float32Array[] = [];
         const scannedPerTarget = new Map<string, number>();
         let emptyScrolls = 0;
         let consecutiveExpired = 0;
-        const maxEmptyScrolls = activeFeed ? 2 : 5;
-        const maxScrolls = activeFeed
-          ? Math.max(6, settings.maxPostsPerGroupPage * 2)
-          : settings.searchMode === 'random_browse'
-            ? Math.max(12, settings.maxPostsPerGroupPage * 2)
-            : Math.min(36, Math.max(22, settings.maxPostsPerGroupPage * 3));
+        let prevScrollDidAlign = false;
+        const maxEmptyScrolls = isPageMode ? 4 : activeFeed ? 2 : 5;
+        const maxScrolls = isPageMode
+          ? Math.min(36, Math.max(12, maxPostsPerTarget * 6))
+          : activeFeed
+            ? Math.max(6, maxPostsPerTarget * 2)
+            : settings.searchMode === 'random_browse'
+              ? Math.max(12, maxPostsPerTarget * 2)
+              : Math.min(36, Math.max(22, maxPostsPerTarget * 3));
 
         for (
           let scrollIdx = 0;
@@ -493,7 +766,9 @@ export class BluestacksGroupBumperRunner {
         ) {
           guard();
           callbacks.status(
-            `正在扫描帖子 (${scrollIdx + 1}/${maxScrolls}) · ${group.name}${activeFeed ? ' · ' + activeFeed.name : ''}`,
+            isPageMode && activeFeed
+              ? `正在扫描帖子 (${scrollIdx + 1}/${maxScrolls}) · ${activeFeed.name}`
+              : `正在扫描帖子 (${scrollIdx + 1}/${maxScrolls}) · ${group.name}${activeFeed ? ' · ' + activeFeed.name : ''}`,
           );
 
           let xml: LiteXmlNode | null = null;
@@ -514,19 +789,27 @@ export class BluestacksGroupBumperRunner {
 
           const cards = extractPostCards(xml);
           let newCardsInScroll = 0;
+          let scrolledDuringCards = false;
+          await syncStreamSound();
 
-          for (const card of cards) {
+          for (let cardIdx = 0; cardIdx < cards.length; cardIdx++) {
+            const card = cards[cardIdx];
+            if (!card) continue;
+            if (scrolledDuringCards) break;
             guard();
 
-            const bodyProbeY1 = Math.min(1460, card.header.bounds.y2 + 4);
-            const bodyProbeY2 = Math.min(1520, bodyProbeY1 + 88);
-            const cardSig = await getRegionSignature(
-              png,
-              makeCanonicalRect(20, bodyProbeY1, 880, Math.max(bodyProbeY1 + 16, bodyProbeY2)),
-            );
+            const bodyProbeY1 = Math.max(108, Math.min(1440, card.header.bounds.y2 - 24));
+            const bodyProbeY2 = Math.min(1520, card.header.bounds.y2 + 164);
+            const cardSig =
+              bodyProbeY2 - bodyProbeY1 >= 48
+                ? await getRegionSignature(
+                    png,
+                    makeCanonicalRect(18, bodyProbeY1, 882, bodyProbeY2),
+                  )
+                : null;
             if (
               cardSig &&
-              seenCardSigs.some((prev) => signatureSimilarity(cardSig, prev) >= 0.96)
+              seenCardSigs.some((prev) => signatureSimilarity(cardSig, prev) >= 0.988)
             ) {
               continue;
             }
@@ -535,7 +818,7 @@ export class BluestacksGroupBumperRunner {
             }
             newCardsInScroll++;
 
-            if (settings.searchMode !== 'random_browse') {
+            if (!isPageMode && settings.searchMode !== 'random_browse') {
               let timeText = await this.ocr.recognizeBounds(png, card.header.timestampBounds);
               let ageHours = relativePostAge(timeText);
               if (ageHours === null) {
@@ -563,56 +846,111 @@ export class BluestacksGroupBumperRunner {
               consecutiveExpired = 0;
             }
 
-            const match = await this.matchPostTarget(
-              png,
-              card,
-              activeFeed ? [activeFeed] : mutablePages,
-              Boolean(activeFeed),
-            );
+            const match =
+              isPageMode && activeFeed
+                ? await this.matchPageTimelinePost(png, card, activeFeed, inst.accountName)
+                : await this.matchPostTarget(
+                    png,
+                    card,
+                    activeFeed ? [activeFeed] : mutablePages,
+                    Boolean(activeFeed),
+                  );
             if (!match) continue;
             const { target } = match;
 
-            if ((scannedPerTarget.get(target.id) ?? 0) >= settings.maxPostsPerGroupPage) {
+            if ((scannedPerTarget.get(target.id) ?? 0) >= maxPostsPerTarget) {
               continue;
             }
 
-            if (!target.avatarUrl) {
-              const cropped = await cropToDataUrl(png, card.header.avatarBounds, 96);
-              if (cropped) {
+            const needAvatar = !isLocalAvatar(target.avatarUrl);
+            const needName =
+              isPageMode &&
+              isPlaceholderTargetName(target.name, target.id) &&
+              match.authorName.trim().length > 0 &&
+              !isPlaceholderTargetName(match.authorName, target.id);
+            if (needAvatar || needName) {
+              const cropped = needAvatar
+                ? await cropToDataUrl(png, card.header.avatarBounds, 96)
+                : null;
+              if (cropped || needName) {
                 await Promise.resolve(
                   this.targetAvatarUpdater.applyResolvedTargetMetadata('pages', target.id, {
-                    avatarUrl: cropped,
+                    ...(cropped ? { avatarUrl: cropped } : {}),
+                    ...(needName ? { name: match.authorName.trim() } : {}),
                   }),
                 ).catch(() => null);
-                target.avatarUrl = cropped;
+                if (cropped) target.avatarUrl = cropped;
+                if (needName) target.name = match.authorName.trim();
               }
             }
+
+            const earlyWantSound = await syncStreamSound();
+            const nextVisibleCard = cards[cardIdx + 1];
+            const earlyMaxY = card.actionBar
+              ? card.actionBar.y1 + 16
+              : nextVisibleCard
+                ? nextVisibleCard.header.bounds.y1
+                : 1600;
+            const earlyVideoSync = await this.syncVideoSpeakerIfVisible(
+              serial,
+              sw,
+              sh,
+              xml,
+              png,
+              card.header.bounds.y2,
+              earlyMaxY,
+              true,
+              earlyWantSound,
+              signal,
+            );
+            png = earlyVideoSync.png;
 
             let postId = '';
             let postUrl = '';
             const moreBounds = card.header.moreMenuBounds;
             if (moreBounds) {
               callbacks.status(`正在提取帖子链接 · ${target.name}`);
-              const rawClipUrl = await this.devices.copyLinkFromMoreMenu(
-                serial,
-                moreBounds,
-                sw,
-                sh,
-                signal,
-              );
-              if (rawClipUrl) {
-                const resolved = await resolveSharePostUrl(rawClipUrl, group.id);
-                postId = resolved.postId;
-                postUrl = resolved.postUrl;
+              try {
+                const rawClipUrl = await this.devices.copyLinkFromMoreMenu(
+                  serial,
+                  moreBounds,
+                  sw,
+                  sh,
+                  signal,
+                );
+                if (rawClipUrl) {
+                  const resolved = await resolveSharePostUrl(
+                    rawClipUrl,
+                    isPageMode ? target.id : group.id,
+                    sourceMode,
+                  );
+                  postId = resolved.postId;
+                  postUrl = resolved.postUrl;
+                }
+              } catch (linkErr) {
+                const msg = linkErr instanceof Error ? linkErr.message : String(linkErr);
+                if (
+                  signal?.aborted ||
+                  /TASK_STOPPED|device\s+offline|device\s+'.*'\s+not\s+found|cannot\s+connect\s+to\s+daemon/i.test(
+                    msg,
+                  )
+                ) {
+                  throw linkErr;
+                }
               }
             }
 
             let workingActionBar: LitePostActionBar | null = card.actionBar;
+            let workingXml: LiteXmlNode | null = xml;
             let workingPng = png;
+            let workingHeaderBottomY = card.header.bounds.y2;
+            let workingHeaderOnScreen = true;
             if (!workingActionBar) {
-              for (let alignStep = 0; alignStep < 3 && !workingActionBar; alignStep++) {
-                const startY = alignStep === 0 ? Math.max(820, card.header.bounds.y1 + 260) : 1220;
-                await this.devices.swipe900(serial, 115, startY, 115, 280, 750, sw, sh, signal);
+              let currentHeaderY = card.header.bounds.y1;
+              let prevStepBars = extractActionBars(xml);
+              for (let alignStep = 0; alignStep < 5 && !workingActionBar; alignStep++) {
+                await this.devices.swipe900(serial, 115, 1120, 115, 420, 900, sw, sh, signal);
+                scrolledDuringCards = true;
                 await abortableWait(1350, signal);
                 const { xml: nextXml, png: nextPng } = await this.recoverToFeedIfNeeded(
                   inst,
@@ -622,26 +960,52 @@ export class BluestacksGroupBumperRunner {
                 );
                 const nextCards = extractPostCards(nextXml);
                 const nextBars = extractActionBars(nextXml);
+                const hadBarAboveBefore = prevStepBars.some((b) => b.y1 < currentHeaderY);
 
-                const firstBar = nextBars[0];
-                if (firstBar) {
-                  const firstNextHeaderY = nextCards[0]?.header.bounds.y1 ?? 1600;
-                  if (firstBar.y1 >= 150 && firstBar.y1 < firstNextHeaderY) {
-                    workingActionBar = firstBar;
+                const candidateShifted = nextCards.find(
+                  (nc) =>
+                    nc.header.bounds.y1 <= currentHeaderY - 180 &&
+                    nc.header.bounds.y1 >= currentHeaderY - 920,
+                );
+                const topUnparentedBar = nextBars[0];
+                const hasUnparentedBarAboveCandidate = Boolean(
+                  candidateShifted &&
+                  topUnparentedBar &&
+                  topUnparentedBar.y1 >= 115 &&
+                  topUnparentedBar.y1 < candidateShifted.header.bounds.y1,
+                );
+
+                if (
+                  candidateShifted &&
+                  (hadBarAboveBefore || currentHeaderY >= 960 || !hasUnparentedBarAboveCandidate)
+                ) {
+                  currentHeaderY = candidateShifted.header.bounds.y1;
+                  prevStepBars = nextBars;
+                  workingHeaderBottomY = candidateShifted.header.bounds.y2;
+                  workingHeaderOnScreen = true;
+                  if (candidateShifted.actionBar) {
+                    workingActionBar = candidateShifted.actionBar;
+                    workingXml = nextXml;
                     workingPng = nextPng;
                   }
+                  continue;
                 }
 
-                const topNextCard = nextCards[0];
-                if (!workingActionBar && topNextCard?.actionBar) {
-                  const m = await this.matchPostTarget(
-                    nextPng,
-                    topNextCard,
-                    [target],
-                    Boolean(activeFeed),
-                  );
-                  if (m) {
-                    workingActionBar = topNextCard.actionBar;
+                if (currentHeaderY >= 960) {
+                  currentHeaderY -= 680;
+                  prevStepBars = nextBars;
+                  continue;
+                }
+
+                currentHeaderY = -100;
+                prevStepBars = nextBars;
+                workingHeaderBottomY = 106;
+                workingHeaderOnScreen = false;
+                if (topUnparentedBar) {
+                  const firstNextHeaderY = nextCards[0]?.header.bounds.y1 ?? 1600;
+                  if (topUnparentedBar.y1 >= 115 && topUnparentedBar.y1 < firstNextHeaderY) {
+                    workingActionBar = topUnparentedBar;
+                    workingXml = nextXml;
                     workingPng = nextPng;
                   }
                 }
@@ -655,14 +1019,19 @@ export class BluestacksGroupBumperRunner {
               postId = BigInt(
                 '0x' + createHash('sha256').update(fallbackKey).digest('hex').slice(0, 14),
               ).toString(10);
-              postUrl = `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(target.id)}/`;
+              postUrl = isPageMode
+                ? `https://www.facebook.com/${encodeURIComponent(target.id)}`
+                : `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(target.id)}/`;
             }
 
             if (seenFingerprints.has(postId)) continue;
             seenFingerprints.add(postId);
 
             const scannedCount = scannedPerTarget.get(target.id) ?? 0;
-            if (scannedCount >= settings.maxPostsPerGroupPage) continue;
+            if (scannedCount >= maxPostsPerTarget) continue;
+            if (isPageMode) {
+              scannedPerTarget.set(target.id, scannedCount + 1);
+            }
 
             while (this.postClaims.has(postId)) {
               await abortableWait(100, signal);
@@ -671,7 +1040,13 @@ export class BluestacksGroupBumperRunner {
 
             let reservedCommentId: string | null = null;
             try {
-              const q = await this.repo.eligibility(accountId, instanceId, postId);
+              const q = await this.repo.eligibility(
+                accountId,
+                instanceId,
+                postId,
+                Date.now(),
+                sourceMode,
+              );
               if (q.today >= settings.dailyMaxLikesPerAccount) {
                 callbacks.status(
                   `今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`,
@@ -685,7 +1060,12 @@ export class BluestacksGroupBumperRunner {
               const doLike = !alreadyLiked && Math.random() * 100 < settings.likeProbability;
               const chosenComment =
                 Math.random() * 100 < settings.commentProbability
-                  ? await this.repo.pickComment(postId, Math.random(), [...this.commentClaims])
+                  ? await this.repo.pickComment(
+                      postId,
+                      Math.random(),
+                      [...this.commentClaims],
+                      sourceMode,
+                    )
                   : null;
               if (chosenComment) {
                 reservedCommentId = chosenComment.id;
@@ -698,8 +1078,8 @@ export class BluestacksGroupBumperRunner {
                 id: randomUUID(),
                 profileId: instanceId,
                 accountId,
-                groupId: group.id,
-                groupName: group.name,
+                groupId: isPageMode ? '-' : group.id,
+                groupName: isPageMode ? '专页主页' : group.name,
                 pageId: target.id,
                 pageName: target.name,
                 postId,
@@ -707,7 +1087,7 @@ export class BluestacksGroupBumperRunner {
                 liked: false,
                 commentText: null,
                 bumpedAt: Date.now(),
-                sourceMode: 'group',
+                sourceMode,
               };
 
               let credited = false;
@@ -715,14 +1095,43 @@ export class BluestacksGroupBumperRunner {
                 await this.repo.recordBump(record, chosenComment?.id);
                 if (!credited) {
                   credited = true;
-                  scannedPerTarget.set(target.id, (scannedPerTarget.get(target.id) ?? 0) + 1);
-                  const updatedQuota = await this.repo.eligibility(accountId, instanceId, postId);
+                  if (!isPageMode) {
+                    scannedPerTarget.set(target.id, (scannedPerTarget.get(target.id) ?? 0) + 1);
+                  }
+                  const updatedQuota = await this.repo.eligibility(
+                    accountId,
+                    instanceId,
+                    postId,
+                    Date.now(),
+                    sourceMode,
+                  );
                   callbacks.added(updatedQuota.today);
                 }
               };
 
+              const actionTargetLabel = isPageMode ? target.name : `${group.name} · ${target.name}`;
+
+              const liveWantSound = await syncStreamSound();
+              const syncedVideo = await this.syncVideoSpeakerIfVisible(
+                serial,
+                sw,
+                sh,
+                workingXml,
+                workingPng,
+                workingHeaderBottomY,
+                workingActionBar.y1 + 16,
+                workingHeaderOnScreen,
+                liveWantSound,
+                signal,
+              );
+              workingPng = syncedVideo.png;
+              if (syncedVideo.controls.videoBounds && !syncedVideo.controls.ended) {
+                callbacks.status(`正在观看视频 · ${actionTargetLabel}`, q.today);
+                await abortableWait(liveWantSound ? 2800 : 1100, signal);
+              }
+
               if (doLike) {
-                callbacks.status(`正在点赞 · ${group.name} · ${target.name}`, q.today);
+                callbacks.status(`正在点赞 · ${actionTargetLabel}`, q.today);
                 await this.devices.tap900(
                   serial,
                   workingActionBar.likeBounds.cx,
@@ -745,7 +1154,7 @@ export class BluestacksGroupBumperRunner {
 
               if (chosenComment) {
                 guard();
-                callbacks.status(`正在留言 · ${group.name} · ${target.name}`, q.today);
+                callbacks.status(`正在留言 · ${actionTargetLabel}`, q.today);
                 await this.devices.tap900(
                   serial,
                   workingActionBar.commentBounds.cx,
@@ -818,6 +1227,7 @@ export class BluestacksGroupBumperRunner {
           }
 
           if (
+            !isPageMode &&
             (settings.searchMode === 'time_sort' || Boolean(activeFeed)) &&
             consecutiveExpired >= 2
           ) {
@@ -825,25 +1235,40 @@ export class BluestacksGroupBumperRunner {
           }
           if (
             (activeFeed ? [activeFeed] : mutablePages).every(
-              (p) => (scannedPerTarget.get(p.id) ?? 0) >= settings.maxPostsPerGroupPage,
+              (p) => (scannedPerTarget.get(p.id) ?? 0) >= maxPostsPerTarget,
             )
           ) {
             break;
           }
 
+          // If alignStep already scrolled the feed to expose the current post's action bar,
+          // re-scan the newly exposed viewport immediately instead of flinging past the next post's header!
+          if (scrolledDuringCards) {
+            emptyScrolls = 0;
+            prevScrollDidAlign = true;
+            continue;
+          }
+
           const seeMoreNode = findSeeMoreButtonNode(xml);
           if (seeMoreNode) {
-            callbacks.status(`正在展开更多帖子 · ${group.name}`);
+            callbacks.status(
+              `正在展开更多帖子 · ${isPageMode && activeFeed ? activeFeed.name : group.name}`,
+            );
             await this.devices.tap900(serial, 450, seeMoreNode.bounds.cy, sw, sh, signal);
             await abortableWait(1900, signal);
             emptyScrolls = 0;
+            prevScrollDidAlign = false;
           } else if (newCardsInScroll === 0) {
-            emptyScrolls++;
-            if (activeFeed && seenCardSigs.length > 0) {
-              break;
+            if (!prevScrollDidAlign) {
+              emptyScrolls++;
+              if (!isPageMode && activeFeed && seenCardSigs.length > 0) {
+                break;
+              }
             }
+            prevScrollDidAlign = false;
           } else {
             emptyScrolls = 0;
+            prevScrollDidAlign = false;
           }
 
           if (emptyScrolls >= maxEmptyScrolls) {

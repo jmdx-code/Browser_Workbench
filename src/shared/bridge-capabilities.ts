@@ -43,6 +43,7 @@ export const bridgeCapabilities = [
   'kernel-task-rendering-v1',
   'agent-browser-kernel-v1',
   'browser-window-close-v1',
+  'kernel-passive-page-reveal-v1',
 ] as const;
 
 // Old controllers reject unknown HELLO capability names. Advertise this optional
@@ -61,6 +62,7 @@ export function bridgeHelloCapabilities(supported: unknown) {
         'browser-window-reveal-v1',
         'agent-browser-kernel-v1',
         'browser-window-close-v1',
+        'kernel-passive-page-reveal-v1',
       ].includes(value) ||
         (Array.isArray(supported) && supported.includes(value))) &&
       (value !== 'task-presentation-recovery-v1' || recovery) &&

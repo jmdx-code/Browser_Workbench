@@ -3,9 +3,11 @@ import { ProductError } from '../domain/workspace.js';
 import {
   BluestacksInstanceIdsInput,
   StartBluestacksBumperInput,
+  StartBluestacksPageBumperInput,
   StopBluestacksBumperInput,
   bluestacksDisplayTitle,
   isBluestacksPortraitResolution,
+  type BluestacksBumperMode,
   type BluestacksFolder,
   type BluestacksInstance,
   type BluestacksRuntimeConfig,
@@ -14,6 +16,7 @@ import {
 import type {
   BumperDailyStat,
   BumperProfileStat,
+  BumperScope,
   BumperSettings,
   BumperTarget,
 } from '../shared/group-bumper.js';
@@ -25,13 +28,16 @@ export interface BluestacksServiceRepository {
     installDir: string | null;
     confPath: string | null;
     bumperSettings: BumperSettings;
+    pageBumperSettings?: BumperSettings;
   };
   savePaths(input: unknown): {
     installDir: string | null;
     confPath: string | null;
     bumperSettings: BumperSettings;
+    pageBumperSettings?: BumperSettings;
   };
   saveBumperSettings(input: unknown): BumperSettings;
+  savePageBumperSettings?(input: unknown): BumperSettings;
   folders(): BluestacksFolder[];
   createFolder(input: unknown): BluestacksFolder;
   renameFolder(input: unknown): BluestacksFolder;
@@ -44,9 +50,9 @@ export interface BluestacksServiceRepository {
   reorderInstances(input: unknown): void;
   deleteInstances(input: unknown): number;
   targets(kind: 'groups' | 'pages'): BumperTarget[];
-  todayCounts(now?: number): Record<string, number>;
-  total(): number;
-  weeklyDailyCounts(now?: number): BumperDailyStat[];
+  todayCounts(now?: number, sourceMode?: BumperScope): Record<string, number>;
+  total(sourceMode?: BumperScope): number;
+  weeklyDailyCounts(now?: number, sourceMode?: BumperScope): BumperDailyStat[];
 }
 
 export interface BluestacksDeviceController {
@@ -58,6 +64,11 @@ export interface BluestacksDeviceController {
   launchInstance(instanceId: string, signal?: AbortSignal): Promise<BluestacksInstance>;
   closeInstance(instanceId: string): Promise<void>;
   inspectAccount(instanceId: string, signal?: AbortSignal): Promise<BluestacksInstance>;
+  setInstanceSoundEnabled?(
+    instanceId: string,
+    enabled: boolean,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 export interface BluestacksBumperRunnerPort {
@@ -71,11 +82,13 @@ export interface BluestacksBumperRunnerPort {
       status(text: string, today?: number): void;
       added(today: number): void;
     },
+    mode?: BluestacksBumperMode,
   ): Promise<void>;
 }
 
 interface QueuedBluestacksTask {
   instanceId: string;
+  mode: BluestacksBumperMode;
   groups: BumperTarget[];
   pages: BumperTarget[];
   settings: BumperSettings;
@@ -84,13 +97,27 @@ interface QueuedBluestacksTask {
 
 const DISCOVERY_CACHE_TTL_MS = 2500;
 
-function delayMs(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function delayMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export class BluestacksService {
   private readonly profileStats = new Map<string, BumperProfileStat>();
+  private readonly pageProfileStats = new Map<string, BumperProfileStat>();
   private readonly activeWorkers = new Map<string, Promise<void>>();
+  private readonly activeWorkerModes = new Map<string, BluestacksBumperMode>();
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly queuedTasks: QueuedBluestacksTask[] = [];
   private readonly launchingIds = new Set<string>();
@@ -99,6 +126,7 @@ export class BluestacksService {
   private pumpingPool = false;
   private activeConcurrencyCap = 4;
   private statusText = '请选择蓝蝶窗口、目标小组和目标主页';
+  private pageStatusText = '请选择蓝蝶窗口和目标专页';
 
   private discoveryCache: {
     at: number;
@@ -119,22 +147,43 @@ export class BluestacksService {
     registry?.register({
       id: 'bluestacks-group-bumper',
       label: '蓝蝶小组顶贴',
-      isProfileRunning: (id) => this.isProfileRunning(id),
-      hasActiveExecution: () => this.hasActiveExecution(),
+      isProfileRunning: (id) => this.isProfileRunning(id, 'group'),
+      hasActiveExecution: () => this.hasActiveExecution('group'),
       stopProfiles: async (ids) => {
-        await this.stopBumper(ids);
+        await this.stopBumper(ids, 'group');
+      },
+    });
+    registry?.register({
+      id: 'bluestacks-page-bumper',
+      label: '蓝蝶专页顶贴',
+      isProfileRunning: (id) => this.isProfileRunning(id, 'page'),
+      hasActiveExecution: () => this.hasActiveExecution('page'),
+      stopProfiles: async (ids) => {
+        await this.stopBumper(ids, 'page');
       },
     });
   }
 
-  isProfileRunning(instanceId: string): boolean {
+  isProfileRunning(instanceId: string, mode?: BluestacksBumperMode): boolean {
+    if (mode) {
+      return (
+        (this.activeWorkers.has(instanceId) && this.activeWorkerModes.get(instanceId) === mode) ||
+        this.queuedTasks.some((t) => t.instanceId === instanceId && t.mode === mode)
+      );
+    }
     return (
       this.activeWorkers.has(instanceId) ||
       this.queuedTasks.some((t) => t.instanceId === instanceId)
     );
   }
 
-  hasActiveExecution(): boolean {
+  hasActiveExecution(mode?: BluestacksBumperMode): boolean {
+    if (mode) {
+      for (const m of this.activeWorkerModes.values()) {
+        if (m === mode) return true;
+      }
+      return this.queuedTasks.some((t) => t.mode === mode);
+    }
     return this.activeWorkers.size > 0 || this.queuedTasks.length > 0;
   }
 
@@ -201,52 +250,82 @@ export class BluestacksService {
   }
 
   async state(forceDiscover = false): Promise<BluestacksState> {
-    const [{ instances, config }, folders, saved, counts, total, dailyStats] = await Promise.all([
+    const [
+      { instances, config },
+      folders,
+      saved,
+      counts,
+      pageCounts,
+      total,
+      pageTotal,
+      dailyStats,
+      pageDailyStats,
+    ] = await Promise.all([
       this.getDiscoverySnapshot(forceDiscover),
       this.repo.folders(),
       this.repo.savedSettings(),
-      this.repo.todayCounts(),
-      this.repo.total(),
-      this.repo.weeklyDailyCounts(),
+      this.repo.todayCounts(undefined, 'group'),
+      this.repo.todayCounts(undefined, 'page'),
+      this.repo.total('group'),
+      this.repo.total('page'),
+      this.repo.weeklyDailyCounts(undefined, 'group'),
+      this.repo.weeklyDailyCounts(undefined, 'page'),
     ]);
 
-    const profileCounts: Record<string, BumperProfileStat> = {};
-    for (const inst of instances) {
-      const today = counts[inst.id] ?? 0;
-      const runtimeStat = this.profileStats.get(inst.id);
-      const isRunning = this.isProfileRunning(inst.id);
-      const staleOfflineSkip =
-        !isRunning && inst.online && runtimeStat?.status === '跳过：模拟器未启动';
-      if (runtimeStat && !staleOfflineSkip) {
-        profileCounts[inst.id] = {
-          ...runtimeStat,
-          running: isRunning,
-          today,
-        };
-      } else {
-        if (staleOfflineSkip) this.profileStats.delete(inst.id);
-        profileCounts[inst.id] = {
-          running: isRunning,
-          status: this.buildDefaultInstanceStatus(inst),
-          session: 0,
-          today,
-        };
+    const buildCountsMap = (
+      mode: BluestacksBumperMode,
+      statsMap: Map<string, BumperProfileStat>,
+      todayByInst: Record<string, number>,
+    ): Record<string, BumperProfileStat> => {
+      const result: Record<string, BumperProfileStat> = {};
+      for (const inst of instances) {
+        const today = todayByInst[inst.id] ?? 0;
+        const runtimeStat = statsMap.get(inst.id);
+        const isRunning = this.isProfileRunning(inst.id, mode);
+        const staleOfflineSkip =
+          !isRunning && inst.online && runtimeStat?.status === '跳过：模拟器未启动';
+        if (runtimeStat && !staleOfflineSkip) {
+          result[inst.id] = {
+            ...runtimeStat,
+            running: isRunning,
+            today,
+          };
+        } else {
+          if (staleOfflineSkip) statsMap.delete(inst.id);
+          result[inst.id] = {
+            running: isRunning,
+            status: this.buildDefaultInstanceStatus(inst),
+            session: 0,
+            today,
+          };
+        }
       }
-    }
+      return result;
+    };
+
+    const profileCounts = buildCountsMap('group', this.profileStats, counts);
+    const pageBumperProfileCounts = buildCountsMap('page', this.pageProfileStats, pageCounts);
+    const pageBumperSettings = saved.pageBumperSettings ?? saved.bumperSettings;
 
     return {
       instances,
       folders,
       config,
       bumperSettings: saved.bumperSettings,
-      running: this.hasActiveExecution(),
+      pageBumperSettings,
+      running: this.hasActiveExecution('group'),
+      pageBumperRunning: this.hasActiveExecution('page'),
       launchingIds: [...this.launchingIds],
       closingIds: [...this.closingIds],
       inspectingIds: [...this.inspectingIds],
       statusText: this.statusText,
+      pageBumperStatusText: this.pageStatusText,
       profileCounts,
+      pageBumperProfileCounts,
       total,
+      pageTotal,
       dailyStats,
+      pageDailyStats,
     };
   }
 
@@ -258,7 +337,35 @@ export class BluestacksService {
 
   async saveBumperSettings(input: unknown): Promise<BluestacksState> {
     const saved = await this.repo.saveBumperSettings(input);
-    this.activeConcurrencyCap = Math.max(1, saved.maxConcurrentProfiles);
+    if (!this.hasActiveExecution('page') || this.hasActiveExecution('group')) {
+      this.activeConcurrencyCap = Math.max(1, saved.maxConcurrentProfiles);
+    }
+    for (const q of this.queuedTasks) {
+      if (q.mode === 'group') q.settings = saved;
+    }
+    for (const [id, m] of this.activeWorkerModes.entries()) {
+      if (m === 'group') {
+        void this.devices.setInstanceSoundEnabled?.(id, Boolean(saved.enableSound)).catch(() => {});
+      }
+    }
+    return this.state(false);
+  }
+
+  async savePageBumperSettings(input: unknown): Promise<BluestacksState> {
+    const saved = this.repo.savePageBumperSettings
+      ? await this.repo.savePageBumperSettings(input)
+      : await this.repo.saveBumperSettings(input);
+    if (!this.hasActiveExecution('group') || this.hasActiveExecution('page')) {
+      this.activeConcurrencyCap = Math.max(1, saved.maxConcurrentProfiles);
+    }
+    for (const q of this.queuedTasks) {
+      if (q.mode === 'page') q.settings = saved;
+    }
+    for (const [id, m] of this.activeWorkerModes.entries()) {
+      if (m === 'page') {
+        void this.devices.setInstanceSoundEnabled?.(id, Boolean(saved.enableSound)).catch(() => {});
+      }
+    }
     return this.state(false);
   }
 
@@ -363,6 +470,7 @@ export class BluestacksService {
           await this.devices.closeInstance(id);
           await this.repo.saveLastStatus(id, '已关闭');
           this.profileStats.delete(id);
+          this.pageProfileStats.delete(id);
         } finally {
           this.closingIds.delete(id);
         }
@@ -421,21 +529,11 @@ export class BluestacksService {
     return this.state(false);
   }
 
-  async startBumper(input: unknown): Promise<BluestacksState> {
-    const { profileIds, groupIds, pageIds } = StartBluestacksBumperInput.parse(input);
-    const [{ instances }, allGroups, allPages, saved] = await Promise.all([
-      this.getDiscoverySnapshot(true),
-      this.repo.targets('groups'),
-      this.repo.targets('pages'),
-      this.repo.savedSettings(),
-    ]);
-
-    const selectedGroups = allGroups.filter((g) => groupIds.includes(g.id));
-    const selectedPages = allPages.filter((p) => pageIds.includes(p.id));
-    if (selectedGroups.length === 0 || selectedPages.length === 0) {
-      throw new ProductError('BUMPER_TARGETS_EMPTY', '请至少选择一个有效小组和一个目标主页', 400);
-    }
-
+  private filterReadyInstancesForRun(
+    profileIds: readonly string[],
+    instances: readonly BluestacksInstance[],
+    statsMap: Map<string, BumperProfileStat>,
+  ): string[] {
     const instMap = new Map(instances.map((i) => [i.id, i]));
     const idleIds = [...new Set(profileIds)].filter((id) => !this.isProfileRunning(id));
     if (idleIds.length === 0) {
@@ -450,7 +548,7 @@ export class BluestacksService {
       const label = bluestacksDisplayTitle(inst);
       if (this.closingIds.has(id)) {
         skippedReasons.push(`${label} 正在关闭`);
-        this.profileStats.set(id, {
+        statsMap.set(id, {
           running: false,
           status: '跳过：窗口正在关闭',
           session: 0,
@@ -460,7 +558,7 @@ export class BluestacksService {
       }
       if (!inst.online && !this.launchingIds.has(id)) {
         skippedReasons.push(`${label} 未启动`);
-        this.profileStats.set(id, {
+        statsMap.set(id, {
           running: false,
           status: '跳过：模拟器未启动',
           session: 0,
@@ -470,7 +568,7 @@ export class BluestacksService {
       }
       if (!isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight)) {
         skippedReasons.push(`${label} 为横屏 (${inst.fbWidth}×${inst.fbHeight})`);
-        this.profileStats.set(id, {
+        statsMap.set(id, {
           running: false,
           status: `跳过：横屏 ${inst.fbWidth}×${inst.fbHeight}（需改竖屏）`,
           session: 0,
@@ -490,17 +588,47 @@ export class BluestacksService {
         400,
       );
     }
+    return onlineReady;
+  }
 
+  private countModeRunners(mode: BluestacksBumperMode): number {
+    let n = 0;
+    for (const m of this.activeWorkerModes.values()) {
+      if (m === mode) n++;
+    }
+    for (const q of this.queuedTasks) {
+      if (q.mode === mode) n++;
+    }
+    return n;
+  }
+
+  async startBumper(input: unknown): Promise<BluestacksState> {
+    const { profileIds, groupIds, pageIds } = StartBluestacksBumperInput.parse(input);
+    const [{ instances }, allGroups, allPages, saved, counts] = await Promise.all([
+      this.getDiscoverySnapshot(true),
+      this.repo.targets('groups'),
+      this.repo.targets('pages'),
+      this.repo.savedSettings(),
+      this.repo.todayCounts(undefined, 'group'),
+    ]);
+
+    const selectedGroups = allGroups.filter((g) => groupIds.includes(g.id));
+    const selectedPages = allPages.filter((p) => pageIds.includes(p.id));
+    if (selectedGroups.length === 0 || selectedPages.length === 0) {
+      throw new ProductError('BUMPER_TARGETS_EMPTY', '请至少选择一个有效小组和一个目标主页', 400);
+    }
+
+    const onlineReady = this.filterReadyInstancesForRun(profileIds, instances, this.profileStats);
     const settings = saved.bumperSettings;
     this.activeConcurrencyCap = Math.max(1, settings.maxConcurrentProfiles);
     const staggeredGroupQueues = buildStaggeredBumperQueues(onlineReady, selectedGroups);
-    const counts = await this.repo.todayCounts();
 
     for (const id of onlineReady) {
       const controller = new AbortController();
       this.abortControllers.set(id, controller);
       this.queuedTasks.push({
         instanceId: id,
+        mode: 'group',
         groups: staggeredGroupQueues.get(id) ?? [...selectedGroups],
         pages: [...selectedPages],
         settings,
@@ -514,7 +642,54 @@ export class BluestacksService {
       });
     }
 
-    this.statusText = `正在运行 ${this.activeWorkers.size + this.queuedTasks.length} 个蓝蝶模拟器（最大并发 ${this.activeConcurrencyCap}）`;
+    this.statusText = `正在运行 ${this.countModeRunners('group')} 个蓝蝶模拟器（最大并发 ${this.activeConcurrencyCap}）`;
+    this.pumpWorkerPool();
+    return this.state(false);
+  }
+
+  async startPageBumper(input: unknown): Promise<BluestacksState> {
+    const { profileIds, pageIds } = StartBluestacksPageBumperInput.parse(input);
+    const [{ instances }, allPages, saved, counts] = await Promise.all([
+      this.getDiscoverySnapshot(true),
+      this.repo.targets('pages'),
+      this.repo.savedSettings(),
+      this.repo.todayCounts(undefined, 'page'),
+    ]);
+
+    const selectedPages = allPages.filter((p) => pageIds.includes(p.id));
+    if (selectedPages.length === 0) {
+      throw new ProductError('BUMPER_TARGETS_EMPTY', '请至少选择一个有效的目标专页', 400);
+    }
+
+    const onlineReady = this.filterReadyInstancesForRun(
+      profileIds,
+      instances,
+      this.pageProfileStats,
+    );
+    const settings = saved.pageBumperSettings ?? saved.bumperSettings;
+    this.activeConcurrencyCap = Math.max(1, settings.maxConcurrentProfiles);
+    const staggeredPageQueues = buildStaggeredBumperQueues(onlineReady, selectedPages);
+
+    for (const id of onlineReady) {
+      const controller = new AbortController();
+      this.abortControllers.set(id, controller);
+      this.queuedTasks.push({
+        instanceId: id,
+        mode: 'page',
+        groups: [],
+        pages: staggeredPageQueues.get(id) ?? [...selectedPages],
+        settings,
+        controller,
+      });
+      this.pageProfileStats.set(id, {
+        running: true,
+        status: '排队等待并发槽位…',
+        session: 0,
+        today: counts[id] ?? 0,
+      });
+    }
+
+    this.pageStatusText = `正在运行 ${this.countModeRunners('page')} 个蓝蝶模拟器（最大并发 ${this.activeConcurrencyCap}）`;
     this.pumpWorkerPool();
     return this.state(false);
   }
@@ -531,14 +706,26 @@ export class BluestacksService {
           continue;
         }
         const slotIndex = this.activeWorkers.size;
+        this.activeWorkerModes.set(nextTask.instanceId, nextTask.mode);
         const workerPromise = this.executeInstanceTask(nextTask, slotIndex * 650).finally(() => {
           this.activeWorkers.delete(nextTask.instanceId);
+          this.activeWorkerModes.delete(nextTask.instanceId);
           this.abortControllers.delete(nextTask.instanceId);
-          if (this.hasActiveExecution()) {
-            this.statusText = `正在运行 ${this.activeWorkers.size + this.queuedTasks.length} 个蓝蝶模拟器`;
-            this.pumpWorkerPool();
+          if (nextTask.mode === 'page') {
+            if (this.hasActiveExecution('page')) {
+              this.pageStatusText = `正在运行 ${this.countModeRunners('page')} 个蓝蝶模拟器`;
+            } else {
+              this.pageStatusText = '蓝蝶专页顶贴运行结束';
+            }
           } else {
-            this.statusText = '蓝蝶小组顶贴运行结束';
+            if (this.hasActiveExecution('group')) {
+              this.statusText = `正在运行 ${this.countModeRunners('group')} 个蓝蝶模拟器`;
+            } else {
+              this.statusText = '蓝蝶小组顶贴运行结束';
+            }
+          }
+          if (this.hasActiveExecution()) {
+            this.pumpWorkerPool();
           }
         });
         this.activeWorkers.set(nextTask.instanceId, workerPromise);
@@ -552,58 +739,74 @@ export class BluestacksService {
     task: QueuedBluestacksTask,
     initialDelayMs: number,
   ): Promise<void> {
-    const { instanceId, groups, pages, settings, controller } = task;
+    const { instanceId, mode, groups, pages, settings, controller } = task;
+    const isPage = mode === 'page';
+    const modeLabel = isPage ? '蓝蝶专页顶贴' : '蓝蝶小组顶贴';
+    const statsMap = isPage ? this.pageProfileStats : this.profileStats;
+
     const setStat = (patch: Partial<BumperProfileStat>) => {
-      const prev = this.profileStats.get(instanceId) ?? {
+      const prev = statsMap.get(instanceId) ?? {
         running: true,
         status: '准备中…',
         session: 0,
         today: 0,
       };
-      this.profileStats.set(instanceId, { ...prev, ...patch });
+      statsMap.set(instanceId, { ...prev, ...patch });
     };
 
     try {
       if (initialDelayMs > 0 && !controller.signal.aborted) {
-        await delayMs(initialDelayMs);
+        await delayMs(initialDelayMs, controller.signal);
       }
       while (
         (this.inspectingIds.has(instanceId) || this.launchingIds.has(instanceId)) &&
         !controller.signal.aborted
       ) {
         setStat({ running: true, status: '等待窗口就绪/账号识别完成…' });
-        await delayMs(300);
+        await delayMs(300, controller.signal);
       }
       if (controller.signal.aborted) {
         setStat({ running: false, status: '已停止' });
-        await this.repo.saveLastStatus(instanceId, '上次已停止 · 蓝蝶小组顶贴');
+        await this.repo.saveLastStatus(instanceId, `上次已停止 · ${modeLabel}`);
         return;
       }
 
       setStat({ running: true, status: '正在启动任务…' });
-      await this.runner.run(instanceId, groups, pages, settings, controller.signal, {
-        status: (text, today) => {
-          setStat({
-            running: true,
-            status: text,
-            ...(today !== undefined ? { today } : {}),
-          });
-          this.statusText = text;
+      await this.runner.run(
+        instanceId,
+        groups,
+        pages,
+        settings,
+        controller.signal,
+        {
+          status: (text, today) => {
+            setStat({
+              running: true,
+              status: text,
+              ...(today !== undefined ? { today } : {}),
+            });
+            if (isPage) this.pageStatusText = text;
+            else this.statusText = text;
+          },
+          added: (today) => {
+            const cur = statsMap.get(instanceId);
+            setStat({
+              session: (cur?.session ?? 0) + 1,
+              today,
+            });
+          },
         },
-        added: (today) => {
-          const cur = this.profileStats.get(instanceId);
-          setStat({
-            session: (cur?.session ?? 0) + 1,
-            today,
-          });
-        },
-      });
+        mode,
+      );
 
-      const finalStat = this.profileStats.get(instanceId);
+      const finalStat = statsMap.get(instanceId);
       const addedCount = finalStat?.session ?? 0;
       const doneMsg = `已完成（本次顶贴 ${addedCount} 条）`;
       setStat({ running: false, status: doneMsg });
-      await this.repo.saveLastStatus(instanceId, `上次成功 · 顶贴 ${addedCount} 条`);
+      await this.repo.saveLastStatus(
+        instanceId,
+        `上次成功 · ${isPage ? '专页顶贴' : '顶贴'} ${addedCount} 条`,
+      );
     } catch (err) {
       const rawMsg = err instanceof Error ? err.message : '运行异常';
       const isStopped = controller.signal.aborted || rawMsg === 'TASK_STOPPED';
@@ -611,44 +814,55 @@ export class BluestacksService {
       setStat({ running: false, status: displayMsg });
       await this.repo.saveLastStatus(
         instanceId,
-        isStopped ? '上次已停止 · 蓝蝶小组顶贴' : `上次异常 · ${rawMsg.slice(0, 80)}`,
+        isStopped ? `上次已停止 · ${modeLabel}` : `上次异常 · ${rawMsg.slice(0, 80)}`,
       );
     }
   }
 
-  async stopBumper(ids?: readonly string[]): Promise<BluestacksState> {
+  async stopBumper(ids?: readonly string[], mode?: BluestacksBumperMode): Promise<BluestacksState> {
     const targetIds = ids && ids.length > 0 ? new Set(ids) : null;
     const matchedIds = targetIds
       ? [...targetIds]
-      : [...new Set([...this.activeWorkers.keys(), ...this.queuedTasks.map((q) => q.instanceId)])];
+      : [
+          ...new Set([
+            ...[...this.activeWorkers.keys()].filter(
+              (id) => !mode || this.activeWorkerModes.get(id) === mode,
+            ),
+            ...this.queuedTasks.filter((q) => !mode || q.mode === mode).map((q) => q.instanceId),
+          ]),
+        ];
 
-    // Remove queued tasks immediately and abort active controllers
     for (let i = this.queuedTasks.length - 1; i >= 0; i--) {
       const q = this.queuedTasks[i];
-      if (q && (!targetIds || targetIds.has(q.instanceId))) {
+      if (q && (!targetIds || targetIds.has(q.instanceId)) && (!mode || q.mode === mode)) {
         q.controller.abort(new Error('TASK_STOPPED'));
         this.abortControllers.delete(q.instanceId);
         this.queuedTasks.splice(i, 1);
-        const cur = this.profileStats.get(q.instanceId);
-        this.profileStats.set(q.instanceId, {
+        const statsMap = q.mode === 'page' ? this.pageProfileStats : this.profileStats;
+        const modeLabel = q.mode === 'page' ? '蓝蝶专页顶贴' : '蓝蝶小组顶贴';
+        const cur = statsMap.get(q.instanceId);
+        statsMap.set(q.instanceId, {
           running: false,
           status: '已停止',
           session: cur?.session ?? 0,
           today: cur?.today ?? 0,
         });
-        await this.repo.saveLastStatus(q.instanceId, '上次已停止 · 蓝蝶小组顶贴');
+        await this.repo.saveLastStatus(q.instanceId, `上次已停止 · ${modeLabel}`);
       }
     }
 
     const activePromisesToWait: Promise<void>[] = [];
     for (const id of matchedIds) {
+      const activeMode = this.activeWorkerModes.get(id);
+      if (mode && activeMode && activeMode !== mode) continue;
       const ctrl = this.abortControllers.get(id);
       if (ctrl) ctrl.abort(new Error('TASK_STOPPED'));
       const worker = this.activeWorkers.get(id);
       if (worker) {
-        const cur = this.profileStats.get(id);
+        const statsMap = activeMode === 'page' ? this.pageProfileStats : this.profileStats;
+        const cur = statsMap.get(id);
         if (cur) {
-          this.profileStats.set(id, { ...cur, status: '正在停止…' });
+          statsMap.set(id, { ...cur, status: '正在停止…' });
         }
         activePromisesToWait.push(worker);
       }
@@ -658,8 +872,11 @@ export class BluestacksService {
       await Promise.allSettled(activePromisesToWait);
     }
 
-    if (!this.hasActiveExecution()) {
+    if ((!mode || mode === 'group') && !this.hasActiveExecution('group')) {
       this.statusText = '已停止蓝蝶小组顶贴任务';
+    }
+    if ((!mode || mode === 'page') && !this.hasActiveExecution('page')) {
+      this.pageStatusText = '已停止蓝蝶专页顶贴任务';
     }
     return this.state(false);
   }

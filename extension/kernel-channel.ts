@@ -535,7 +535,7 @@ export class ExtensionKernelChannel {
           )
         )
           throw Error('WORKSPACE_REVEAL_PROOF_REJECTED');
-        const result = await backend.revealOwnedPage(request.proof);
+        const result = await backend.revealOwnedPage(request.proof, request.focus);
         executor.lease.check();
         return result;
       }

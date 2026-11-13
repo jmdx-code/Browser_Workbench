@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { FinderTargetList } from '../src/renderer/finder-target-list.js';
+import { computePopoverPlacement, PopoverMenu } from '../src/renderer/popover-menu.js';
 import { GroupInviterPage } from '../src/renderer/group-inviter-page.js';
 import { GroupBumperPage } from '../src/renderer/group-bumper-page.js';
 import { GroupPosterPage } from '../src/renderer/group-poster-page.js';
@@ -13,7 +14,10 @@ import { Sidebar } from '../src/renderer/sidebar.js';
 import { FeatureNavRail } from '../src/renderer/feature-nav-rail.js';
 import { CombinationList } from '../src/renderer/combination-list.js';
 import { TaskRecordsPage } from '../src/renderer/task-records.js';
-import { projectSelectionControls } from '../src/renderer/modules/profile-activity-projector.js';
+import {
+  buildFeatureNavItems,
+  projectSelectionControls,
+} from '../src/renderer/modules/profile-activity-projector.js';
 import {
   nudgeFinderIds,
   insertFinderIds,
@@ -44,7 +48,10 @@ vi.mock('../src/renderer/api.js', () => ({
     reorderGroups: vi.fn(),
     cleanupProfileTabs: vi.fn(),
     bumperAction: vi.fn(),
+    bumperState: vi.fn(),
     bumperLogs: vi.fn(),
+    bluestacksAction: vi.fn(),
+    bluestacksState: vi.fn(),
     posterAction: vi.fn(),
     posterState: vi.fn(),
     posterLogs: vi.fn(),
@@ -1740,4 +1747,229 @@ it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时�
     b.textContent?.includes('指定勾选账号 (1)'),
   );
   expect(selectedModeBtn?.classList.contains('is-active')).toBe(true);
+});
+
+it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dispatches page-settings + bumper/start-page', async () => {
+  const navItems = buildFeatureNavItems({
+    activeAccountRunningCount: 0,
+    groupInviterRunning: false,
+    inviterRunningCount: 0,
+    groupBumperRunning: false,
+    bumperRunningCount: 0,
+    pageBumperRunningCount: 0,
+    groupPosterRunningCount: 0,
+    bluestacksBumperRunningCount: 1,
+    bluestacksPageBumperRunningCount: 2,
+    attentionCount: 0,
+  });
+  const bsItems = navItems.filter((item) => item.group === 'bluestacks');
+  expect(bsItems.map((i) => ({ id: i.id, title: i.title, runningCount: i.runningCount }))).toEqual([
+    { id: 'bluestacks-group-bumper', title: '蓝蝶小组顶贴', runningCount: 1 },
+    { id: 'bluestacks-page-bumper', title: '蓝蝶专页顶贴', runningCount: 2 },
+  ]);
+
+  const clickedNav: string[] = [];
+  await act(async () =>
+    root.render(
+      <FeatureNavRail
+        activeModule="bluestacks-page-bumper"
+        items={navItems}
+        onSelectModule={(mod) => clickedNav.push(mod)}
+      />,
+    ),
+  );
+  const pageNavBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('蓝蝶专页顶贴'),
+  );
+  expect(pageNavBtn).toBeTruthy();
+  await click(pageNavBtn ?? null);
+  expect(clickedNav).toEqual(['bluestacks-page-bumper']);
+
+  const instId = '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc';
+  const mockBsState = {
+    config: {
+      installDir: null,
+      confPath: null,
+      detectedInstallDir: 'C:\\Program Files\\BlueStacks_nxt',
+      detectedConfPath: 'D:\\BlueStacks_nxt\\bluestacks.conf',
+      adbReady: true,
+      playerReady: true,
+    },
+    folders: [],
+    instances: [],
+    bumperSettings: BumperSettings.parse({ maxPostsPerPage: 3, maxConcurrentProfiles: 4 }),
+    pageBumperSettings: BumperSettings.parse({ maxPostsPerPage: 5, maxConcurrentProfiles: 2 }),
+    running: false,
+    statusText: '请选择蓝蝶窗口、目标小组和目标主页',
+    profileCounts: {},
+    total: 10,
+    dailyStats: [],
+    pageBumperRunning: false,
+    pageBumperStatusText: '请选择蓝蝶窗口和目标专页',
+    pageBumperProfileCounts: {},
+    pageTotal: 4,
+    pageDailyStats: [{ date: '2026-11-13', count: 4 }],
+    launchingIds: [],
+    closingIds: [],
+    inspectingIds: [],
+  };
+  vi.mocked(api.targetFolders).mockResolvedValue([]);
+  vi.mocked(api.bluestacksAction).mockResolvedValue(mockBsState as never);
+  vi.mocked(api.bumperState).mockResolvedValue({
+    groups: [],
+    pages: [],
+    settings: BumperSettings.parse({}),
+    comments: [],
+    total: 0,
+    running: false,
+    statusText: '',
+    profileCounts: {},
+  });
+
+  await act(async () =>
+    root.render(
+      <GroupBumperPage
+        mode="bluestacks-page-bumper"
+        state={{
+          groups: [
+            {
+              id: '111222333',
+              name: '不应该显示的小组',
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalBumpedCount: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+          pages: [
+            {
+              id: '61588452821652',
+              name: 'Grace Myanmar Page',
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalBumpedCount: 4,
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+          settings: BumperSettings.parse({}),
+          pageSettings: BumperSettings.parse({}),
+          comments: [],
+          pageComments: [{ id, text: '阿门', usedCount: 0, createdAt: 1 }],
+          total: 10,
+          pageTotal: 4,
+          running: false,
+          pageBumperRunning: false,
+          statusText: '',
+          pageBumperStatusText: '',
+          profileCounts: {},
+          pageBumperProfileCounts: {},
+        }}
+        selected={new Set([instId])}
+        bluestacksState={mockBsState}
+        onBluestacksState={() => {}}
+        onState={() => {}}
+        onMessage={() => {}}
+      />,
+    ),
+  );
+
+  // Single column: Page list rendered, Group list hidden
+  expect(host.textContent).toContain('专页列表');
+  expect(host.textContent).not.toContain('小组列表');
+  expect(host.textContent).toContain('最大并发模拟器数');
+  expect(host.textContent).toContain('顶贴记录 (4 条)');
+
+  // Select the Page row checkbox and click Start
+  const pageCheckbox = host.querySelector<HTMLInputElement>('.finder-row input[type="checkbox"]');
+  expect(pageCheckbox).toBeTruthy();
+  await click(pageCheckbox);
+
+  const startBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('▶ 开始运行 (已选1窗 × 1专页)'),
+  );
+  expect(startBtn).toBeTruthy();
+  expect((startBtn as HTMLButtonElement | undefined)?.disabled).toBe(false);
+
+  // Modify maxPostsPerPage and verify page-settings action
+  const scanInput = host.querySelector<HTMLInputElement>('input[aria-label="maxPostsPerPage"]');
+  expect(scanInput?.value).toBe('5');
+  await act(async () => {
+    if (scanInput) {
+      scanInput.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(
+        scanInput,
+        '6',
+      );
+      scanInput.dispatchEvent(new Event('input', { bubbles: true }));
+      scanInput.dispatchEvent(new Event('change', { bubbles: true }));
+      scanInput.blur();
+    }
+  });
+  expect(api.bluestacksAction).toHaveBeenCalledWith(
+    'page-settings',
+    expect.objectContaining({ maxPostsPerPage: 6 }),
+  );
+
+  await click(startBtn ?? null);
+  expect(api.bluestacksAction).toHaveBeenCalledWith('bumper/start-page', {
+    profileIds: [instId],
+    pageIds: ['61588452821652'],
+  });
+});
+
+it('PopoverMenu flips to align-start when trigger is near the left edge of .workspace so 高级参数 is never clipped', async () => {
+  await act(async () =>
+    root.render(
+      <main className="workspace">
+        <PopoverMenu className="bumper-advanced-popover" label="高级参数" trigger={<>⚙ 高级参数</>}>
+          {() => <div className="bumper-advanced-panel">参数面板</div>}
+        </PopoverMenu>
+      </main>,
+    ),
+  );
+
+  const workspaceEl = host.querySelector<HTMLElement>('main.workspace');
+  const popoverEl = host.querySelector<HTMLElement>('.popover.bumper-advanced-popover');
+  expect(workspaceEl).toBeTruthy();
+  expect(popoverEl).toBeTruthy();
+
+  if (workspaceEl && popoverEl) {
+    // Simulate sidebar + nav rail occupying 0..416px and .workspace occupying 416..1280px,
+    // with wrapped ⚙ 高级参数 sitting at x = 505..590px (590 - 252 = 338 < 424 would clip left under align-end!)
+    vi.spyOn(workspaceEl, 'getBoundingClientRect').mockReturnValue({
+      x: 416,
+      y: 60,
+      left: 416,
+      top: 60,
+      right: 1280,
+      bottom: 900,
+      width: 864,
+      height: 840,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(popoverEl, 'getBoundingClientRect').mockReturnValue({
+      x: 505,
+      y: 160,
+      left: 505,
+      top: 160,
+      right: 590,
+      bottom: 188,
+      width: 85,
+      height: 28,
+      toJSON: () => ({}),
+    });
+
+    const placement = computePopoverPlacement(popoverEl, 252, 'end');
+    expect(placement).toEqual({ effectiveAlign: 'start', offsetPx: 0 });
+  }
+
+  await click(host.querySelector('button[aria-label="高级参数"]'));
+  const panel = host.querySelector<HTMLElement>('.popover-panel');
+  expect(panel).toBeTruthy();
+  expect(panel?.classList.contains('align-start')).toBe(true);
+  expect(panel?.classList.contains('align-end')).toBe(false);
 });

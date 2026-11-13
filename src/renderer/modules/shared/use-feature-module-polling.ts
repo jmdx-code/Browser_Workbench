@@ -40,6 +40,7 @@ export function useFeatureModulesPolling(viewKind: string) {
   );
   const prevInviterRunningRef = useRef<boolean>(false);
   const prevBluestacksRunningRef = useRef<boolean>(false);
+  const prevBluestacksPageRunningRef = useRef<boolean>(false);
 
   useEffect(() => {
     const runningNow = Boolean(groupInviter?.running);
@@ -64,6 +65,18 @@ export function useFeatureModulesPolling(viewKind: string) {
       playInviterCompletionChime();
     }
     prevBluestacksRunningRef.current = runningNow;
+  }, [bluestacks]);
+
+  useEffect(() => {
+    const runningNow = Boolean(bluestacks?.pageBumperRunning);
+    if (
+      prevBluestacksPageRunningRef.current &&
+      !runningNow &&
+      bluestacks?.pageBumperSettings?.enableSound
+    ) {
+      playInviterCompletionChime();
+    }
+    prevBluestacksPageRunningRef.current = runningNow;
   }, [bluestacks]);
 
   useEffect(() => {
@@ -121,6 +134,7 @@ export function useFeatureModulesPolling(viewKind: string) {
     viewKind === 'group-bumper' ||
     viewKind === 'page-bumper' ||
     viewKind === 'bluestacks-group-bumper' ||
+    viewKind === 'bluestacks-page-bumper' ||
     viewKind === 'records' ||
     bumperBusy;
 
@@ -129,6 +143,7 @@ export function useFeatureModulesPolling(viewKind: string) {
       viewKind === 'group-bumper' ||
       viewKind === 'page-bumper' ||
       viewKind === 'bluestacks-group-bumper' ||
+      viewKind === 'bluestacks-page-bumper' ||
       viewKind === 'records'
     ) {
       refreshBumper();
@@ -138,6 +153,7 @@ export function useFeatureModulesPolling(viewKind: string) {
       ? viewKind === 'group-bumper' ||
         viewKind === 'page-bumper' ||
         viewKind === 'bluestacks-group-bumper' ||
+        viewKind === 'bluestacks-page-bumper' ||
         bumperBusy
         ? 2000
         : 6000
@@ -185,20 +201,30 @@ export function useFeatureModulesPolling(viewKind: string) {
   // BlueStacks polling
   const bluestacksBusy = Boolean(
     bluestacks?.running ||
+    bluestacks?.pageBumperRunning ||
     (bluestacks?.launchingIds.length ?? 0) > 0 ||
     (bluestacks?.closingIds.length ?? 0) > 0 ||
     (bluestacks?.inspectingIds.length ?? 0) > 0,
   );
   const bluestacksActive =
-    viewKind === 'bluestacks-group-bumper' || viewKind === 'records' || bluestacksBusy;
+    viewKind === 'bluestacks-group-bumper' ||
+    viewKind === 'bluestacks-page-bumper' ||
+    viewKind === 'records' ||
+    bluestacksBusy;
 
   useEffect(() => {
-    if (viewKind === 'bluestacks-group-bumper' || viewKind === 'records') {
+    if (
+      viewKind === 'bluestacks-group-bumper' ||
+      viewKind === 'bluestacks-page-bumper' ||
+      viewKind === 'records'
+    ) {
       refreshBluestacks(false);
     }
     if (!bluestacksActive) return;
     const intervalMs = windowVisible
-      ? viewKind === 'bluestacks-group-bumper' || bluestacksBusy
+      ? viewKind === 'bluestacks-group-bumper' ||
+        viewKind === 'bluestacks-page-bumper' ||
+        bluestacksBusy
         ? 1800
         : 6000
       : 10000;

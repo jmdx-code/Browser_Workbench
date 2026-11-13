@@ -115,7 +115,7 @@ async function fixture(
           value = inventory;
           break;
         case 'revealOwnedPage':
-          value = { tabId: request.proof.tabId, focused: true };
+          value = { tabId: request.proof.tabId, focused: request.focus !== false };
           break;
         case 'attach':
           value = {
@@ -749,6 +749,47 @@ test('unconfirmed native close discards login observation and retains original R
     assert.equal(result.account.state, 'unknown');
     assert.equal(f.inventory.tabs[0]?.state, 'READY');
     assert.ok(f.inventory.tabs[0]?.proof);
+  } finally {
+    await f.close();
+  }
+});
+
+test('passive revealOwnedFacebookPage(..., false) skips focus RPC on legacy peers and forwards focus=false on passive-capable peers', async () => {
+  const f = await fixture();
+  try {
+    f.peer.capabilities?.push('kernel-owned-page-reveal-v1', 'facebook-task-kernel-v1');
+    const proof = {
+      profileId: f.id,
+      browserSessionEpoch: f.inventory.browserSessionEpoch,
+      ownershipId: randomUUID(),
+      tabId: 7,
+      targetId: 'registered-main',
+    };
+    f.inventory.workspaceMain = proof;
+    f.inventory.tabs.push({
+      ownershipId: proof.ownershipId,
+      proof,
+      state: 'READY',
+      url: 'https://www.facebook.com/',
+      reason: '',
+    });
+
+    // Legacy peer without kernel-passive-page-reveal-v1 skips revealOwnedPage so Virtual Desktop never jumps
+    assert.deepEqual(await f.kernel.revealOwnedFacebookPage(f.peer, proof, false), {
+      profileId: f.id,
+      tabId: 7,
+      focused: false,
+    });
+    assert.deepEqual(f.requests, []);
+
+    // Peer with kernel-passive-page-reveal-v1 performs passive reveal without OS focus
+    f.peer.capabilities?.push('kernel-passive-page-reveal-v1');
+    assert.deepEqual(await f.kernel.revealOwnedFacebookPage(f.peer, proof, false), {
+      profileId: f.id,
+      tabId: 7,
+      focused: false,
+    });
+    assert.deepEqual(f.requests, ['open', 'inventory', 'adopt', 'revealOwnedPage', 'stop']);
   } finally {
     await f.close();
   }

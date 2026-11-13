@@ -58,7 +58,14 @@ export const KernelRequest = z.discriminatedUnion('kind', [
     .strict(),
   z.object({ ...header, kind: z.literal('adopt'), proof: OwnedTabProof }).strict(),
   z.object({ ...header, kind: z.literal('armTaskPresentation'), proof: OwnedTabProof }).strict(),
-  z.object({ ...header, kind: z.literal('revealOwnedPage'), proof: OwnedTabProof }).strict(),
+  z
+    .object({
+      ...header,
+      kind: z.literal('revealOwnedPage'),
+      proof: OwnedTabProof,
+      focus: z.boolean().optional(),
+    })
+    .strict(),
   z.object({ ...header, kind: z.literal('inspectTaskWindow'), proof: OwnedTabProof }).strict(),
   z
     .object({

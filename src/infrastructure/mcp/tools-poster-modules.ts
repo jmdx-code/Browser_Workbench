@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { bluestacksDisplayTitle, isBluestacksPortraitResolution } from '../../shared/bluestacks.js';
 import { extractFacebookGroupId, extractFacebookPageId } from '../../shared/facebook-target-id.js';
-import type { BumperScheduledTask } from '../../shared/group-bumper.js';
+import {
+  isLocalAvatar,
+  isTargetIncomplete,
+  type BumperScheduledTask,
+} from '../../shared/group-bumper.js';
 import type { PosterTask } from '../../shared/group-poster.js';
 import {
   buildEnrichedProfiles,
@@ -9,6 +13,8 @@ import {
   formatLocalDateTime,
   okResult,
   parseFlexibleScheduleTime,
+  resolveBluestacksInstanceIdentifierFromList,
+  resolveBluestacksInstanceIds,
   resolveProfileIdentifierFromList,
   resolveProfileIds,
   type McpToolDefinition,
@@ -649,6 +655,15 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           maximum: 200,
           description: 'logs 返回条数上限（默认 50）',
         },
+        autoAddMissingTargets: {
+          type: 'boolean',
+          description:
+            'start / scan_only / schedule 时若目标小组或专页尚未在共享目标库中，是否自动补入（默认 true）',
+        },
+        includeComments: {
+          type: 'boolean',
+          description: 'state 查询时是否返回完整留言话术文本列表（默认 false 仅返回数量）',
+        },
       },
       required: ['mode', 'action'],
       additionalProperties: false,
@@ -662,12 +677,39 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         args.mode === 'page-bumper' ? 'page-bumper' : 'group-bumper';
       const action = String(args.action ?? 'state');
 
+      const ensureBumperTargetsExist = async (
+        groupIds: readonly string[],
+        pageIds: readonly string[],
+      ) => {
+        if (args.autoAddMissingTargets === false) return;
+        if (groupIds.length === 0 && pageIds.length === 0) return;
+        const current = await bumper.state();
+        const knownGroups = new Set(current.groups.map((g) => g.id));
+        const knownPages = new Set(current.pages.map((p) => p.id));
+        const missingGroups = groupIds.filter((id) => !knownGroups.has(id)).map((id) => ({ id }));
+        const missingPages = pageIds.filter((id) => !knownPages.has(id)).map((id) => ({ id }));
+        if (missingGroups.length > 0) {
+          await bumper.manage('groups/add', { items: missingGroups });
+        }
+        if (missingPages.length > 0) {
+          await bumper.manage('pages/add', { items: missingPages });
+        }
+      };
+
       if (action === 'logs') {
         const search = typeof args.search === 'string' ? args.search : '';
         const limit = Math.max(1, Math.min(200, Math.floor(Number(args.limit ?? 50))));
         const sourceMode = mode === 'page-bumper' ? 'page' : 'group';
         const logs = await bumper.logs(search, undefined, undefined, limit, sourceMode);
-        return okResult({ ok: true, mode, count: logs.length, logs });
+        return okResult({
+          ok: true,
+          mode,
+          count: logs.length,
+          logs: logs.map((l) => ({
+            ...l,
+            bumpedAtLocal: formatLocalDateTime(l.bumpedAt),
+          })),
+        });
       }
 
       if (action === 'save_settings') {
@@ -730,22 +772,12 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         if (parsedSchedule.mode !== 'scheduled' || !parsedSchedule.scheduledAt) {
           return errorResult(
             'SCHEDULE_TIME_REQUIRED',
-            'schedule 需要提供未来的 scheduledAt 时间（如 "20:30"、"+30m" 或 ISO 时间）',
+            'schedule 需要提供未来的 scheduledAt 时间（如 "20:30"、"明天 09:00" 或 ISO 时间）',
           );
         }
 
+        await ensureBumperTargetsExist(mode === 'page-bumper' ? [] : groupIds, pageIds);
         const current = await bumper.state();
-        const knownGroups = new Set(current.groups.map((g) => g.id));
-        const knownPages = new Set(current.pages.map((p) => p.id));
-        const missingGroups = groupIds.filter((id) => !knownGroups.has(id)).map((id) => ({ id }));
-        const missingPages = pageIds.filter((id) => !knownPages.has(id)).map((id) => ({ id }));
-        if (missingGroups.length > 0) {
-          await bumper.manage('groups/add', { items: missingGroups });
-        }
-        if (missingPages.length > 0) {
-          await bumper.manage('pages/add', { items: missingPages });
-        }
-
         const beforeIds = new Set((current.scheduledTasks ?? []).map((t) => t.id));
         const st = await bumper.manage('tasks/create', {
           mode,
@@ -795,6 +827,8 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
           : [];
 
+        await ensureBumperTargetsExist(mode === 'page-bumper' ? [] : groupIds, pageIds);
+
         const st =
           mode === 'page-bumper'
             ? await bumper.startPageBumper({ profileIds, pageIds })
@@ -831,13 +865,15 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
       }
 
       const st = await bumper.state();
+      const modeComments = (mode === 'page-bumper' ? st.pageComments : st.comments) ?? [];
       return okResult({
         ok: true,
         mode,
         running: mode === 'page-bumper' ? st.pageBumperRunning : st.running,
         statusText: mode === 'page-bumper' ? st.pageBumperStatusText : st.statusText,
         settings: mode === 'page-bumper' ? st.pageSettings : st.settings,
-        commentsCount: ((mode === 'page-bumper' ? st.pageComments : st.comments) ?? []).length,
+        commentsCount: modeComments.length,
+        ...(args.includeComments === true ? { comments: modeComments.map((c) => c.text) } : {}),
         groupsCount: st.groups.length,
         pagesCount: st.pages.length,
         total: mode === 'page-bumper' ? st.pageTotal : st.total,
@@ -853,40 +889,80 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
   const wbInviterControl: McpToolDefinition = {
     name: 'wb_inviter_control',
     description:
-      '控制与监控「小组邀请人（group-inviter）」模块：查询运行状态（state）、查看邀请成功记录（logs）、修改每组邀请人数与并发数（save_settings）、启动邀请任务（start）以及停止全部或指定浏览器（stop）。',
+      '控制与监控「小组邀请人（group-inviter）」模块：查询运行状态（state）、管理邀请人目标小组库（list_groups / add_groups / delete_groups / refresh_groups / stop_refresh_groups）、查看邀请成功记录（logs）、修改每组邀请人数与并发数（save_settings）、启动邀请任务（start，支持 Facebook 小组 URL 自动提取 ID 与自动补入目标库、支持离线浏览器自动唤醒）以及停止全部或指定浏览器（stop）。',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['state', 'logs', 'save_settings', 'start', 'stop'],
+          enum: [
+            'state',
+            'list_groups',
+            'add_groups',
+            'delete_groups',
+            'refresh_groups',
+            'stop_refresh_groups',
+            'logs',
+            'save_settings',
+            'start',
+            'stop',
+          ],
           description: '操作类型',
         },
         profileIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'start 或 stop 时指定的浏览器 profileId 列表（stop 省略则停止全部）',
+          description:
+            'start 或 stop 时指定的浏览器标识列表（UUID、浏览器名如 "用户8" 或专页名；stop 省略则停止全部）',
         },
         groupIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'start 时指定的目标小组 ID 列表',
+          description:
+            'start / add_groups / delete_groups / refresh_groups 时指定的目标小组 ID 或 Facebook 小组链接列表',
+        },
+        items: {
+          type: 'array',
+          description: 'add_groups 时可选传入带名称的小组对象数组（或字符串数组）',
+          items: {
+            type: ['object', 'string'],
+            properties: {
+              id: { type: 'string', description: '小组 ID 或链接' },
+              groupId: { type: 'string', description: '小组 ID 或链接（同 id）' },
+              name: { type: 'string', description: '可选小组名称' },
+              groupName: { type: 'string', description: '可选小组名称（同 name）' },
+              folderId: { type: ['string', 'null'] },
+            },
+            additionalProperties: false,
+          },
+        },
+        autoAddMissingGroups: {
+          type: 'boolean',
+          description: 'start 时若目标小组尚未在邀请人小组库中，是否自动添加（默认 true）',
+        },
+        includeGroups: {
+          type: 'boolean',
+          description: 'state 查询时是否同时返回完整小组列表（默认 false）',
         },
         invitesPerGroup: {
           type: 'number',
           minimum: 1,
-          maximum: 500,
-          description: 'save_settings 或 start 时每组邀请好友人数',
+          maximum: 200,
+          description: 'save_settings 或 start 时每组邀请好友人数（1-200）',
         },
         maxConcurrentProfiles: {
           type: 'number',
           minimum: 1,
           maximum: 50,
-          description: 'save_settings 时最大并发浏览器数',
+          description: 'save_settings 或 start 时最大并发浏览器数（1-50）',
+        },
+        playSoundOnComplete: {
+          type: 'boolean',
+          description: 'save_settings 或 start 时任务结束是否播放提示音',
         },
         search: {
           type: 'string',
-          description: 'logs 检索关键词',
+          description: 'logs 或 list_groups 检索关键词',
         },
         limit: {
           type: 'number',
@@ -900,12 +976,150 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
     },
     handler: async (args) => {
       const action = String(args.action ?? 'state');
+      const summarizeInviterGroup = (g: {
+        groupId: string;
+        groupName: string;
+        avatarUrl: string | null;
+        folderId?: string | null;
+        totalInvitedCount: number;
+        updatedAt: number;
+      }) => ({
+        id: g.groupId,
+        groupId: g.groupId,
+        name: g.groupName,
+        groupName: g.groupName,
+        folderId: g.folderId ?? null,
+        totalInvitedCount: g.totalInvitedCount,
+        hasLocalAvatar: isLocalAvatar(g.avatarUrl),
+        incomplete: isTargetIncomplete({
+          id: g.groupId,
+          name: g.groupName,
+          avatarUrl: g.avatarUrl,
+        }),
+        updatedAt: g.updatedAt,
+      });
+
+      if (action === 'list_groups') {
+        const st = await deps.groupInviterService.state();
+        const q = typeof args.search === 'string' ? args.search.trim().toLowerCase() : '';
+        const filtered = q
+          ? st.groups.filter(
+              (g) => g.groupId.toLowerCase().includes(q) || g.groupName.toLowerCase().includes(q),
+            )
+          : st.groups;
+        return okResult({
+          ok: true,
+          totalCount: st.groups.length,
+          matchedCount: filtered.length,
+          groups: filtered.map(summarizeInviterGroup),
+        });
+      }
+
+      if (action === 'add_groups') {
+        const normalizedItems: Array<{
+          groupId: string;
+          groupName?: string;
+          folderId?: string | null;
+        }> = [];
+        if (Array.isArray(args.items)) {
+          for (const raw of args.items) {
+            if (typeof raw === 'string') {
+              const gid = extractFacebookGroupId(raw.trim());
+              if (gid) normalizedItems.push({ groupId: gid });
+            } else if (typeof raw === 'object' && raw !== null) {
+              const obj = raw as Record<string, unknown>;
+              const rawId = String(obj.groupId ?? obj.id ?? '').trim();
+              const gid = extractFacebookGroupId(rawId);
+              if (!gid) continue;
+              const name = String(obj.groupName ?? obj.name ?? '').trim();
+              const folderId =
+                obj.folderId === null
+                  ? null
+                  : typeof obj.folderId === 'string' && obj.folderId.trim()
+                    ? obj.folderId.trim()
+                    : undefined;
+              normalizedItems.push({
+                groupId: gid,
+                ...(name ? { groupName: name } : {}),
+                ...(folderId !== undefined ? { folderId } : {}),
+              });
+            }
+          }
+        }
+        if (Array.isArray(args.groupIds)) {
+          for (const raw of args.groupIds) {
+            const gid = extractFacebookGroupId(String(raw).trim());
+            if (gid && !normalizedItems.some((item) => item.groupId === gid)) {
+              normalizedItems.push({ groupId: gid });
+            }
+          }
+        }
+        if (normalizedItems.length === 0) {
+          return errorResult(
+            'GROUP_ITEMS_REQUIRED',
+            'add_groups 需要通过 items 或 groupIds 提供小组',
+          );
+        }
+        const st = await deps.groupInviterService.addGroups({ items: normalizedItems });
+        return okResult({
+          ok: true,
+          addedOrUpdatedCount: normalizedItems.length,
+          groupsCount: st.groups.length,
+          groups: st.groups.map(summarizeInviterGroup),
+        });
+      }
+
+      if (action === 'delete_groups') {
+        const groupIds = Array.isArray(args.groupIds)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
+          : [];
+        if (groupIds.length === 0) {
+          return errorResult('GROUP_IDS_REQUIRED', 'delete_groups 需要提供 groupIds');
+        }
+        const st = await deps.groupInviterService.deleteGroups({ groupIds });
+        return okResult({
+          ok: true,
+          deletedRequestedCount: groupIds.length,
+          groupsCount: st.groups.length,
+        });
+      }
+
+      if (action === 'refresh_groups') {
+        const groupIds = Array.isArray(args.groupIds)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
+          : [];
+        const st = await deps.groupInviterService.refreshGroups(
+          groupIds.length > 0 ? groupIds : undefined,
+        );
+        return okResult({
+          ok: true,
+          groupAvatarRefreshing: Boolean(st.groupAvatarRefreshing),
+          avatarRefreshStatusText: st.avatarRefreshStatusText ?? '',
+          groupsCount: st.groups.length,
+        });
+      }
+
+      if (action === 'stop_refresh_groups') {
+        const st = await deps.groupInviterService.stopRefreshGroups();
+        return okResult({
+          ok: true,
+          groupAvatarRefreshing: Boolean(st.groupAvatarRefreshing),
+          avatarRefreshStatusText: st.avatarRefreshStatusText ?? '',
+        });
+      }
 
       if (action === 'logs') {
         const search = typeof args.search === 'string' ? args.search : '';
         const limit = Math.max(1, Math.min(300, Math.floor(Number(args.limit ?? 50))));
         const rows = await deps.groupInviterService.logs(search, undefined, limit);
-        return okResult({ ok: true, count: rows.length, logs: rows });
+        return okResult({
+          ok: true,
+          count: rows.length,
+          logs: rows.map((r) => ({
+            ...r,
+            invitedAtLocal: formatLocalDateTime(r.invitedAt),
+          })),
+        });
       }
 
       if (action === 'save_settings') {
@@ -917,12 +1131,16 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
             typeof args.maxConcurrentProfiles === 'number'
               ? args.maxConcurrentProfiles
               : cur.maxConcurrentProfiles,
-          playSoundOnComplete: cur.playSoundOnComplete,
+          playSoundOnComplete:
+            typeof args.playSoundOnComplete === 'boolean'
+              ? args.playSoundOnComplete
+              : cur.playSoundOnComplete,
         });
         return okResult({
           ok: true,
           invitesPerGroup: st.invitesPerGroup,
           maxConcurrentProfiles: st.maxConcurrentProfiles,
+          playSoundOnComplete: st.playSoundOnComplete,
         });
       }
 
@@ -932,13 +1150,27 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           : [];
         const profileIds = await resolveProfileIds(deps, rawPids);
         const groupIds = Array.isArray(args.groupIds)
-          ? args.groupIds.map((x) => String(x).trim()).filter(Boolean)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
           : [];
+        if (args.autoAddMissingGroups !== false && groupIds.length > 0) {
+          const cur = await deps.groupInviterService.state();
+          const known = new Set(cur.groups.map((g) => g.groupId));
+          const missing = groupIds.filter((id) => !known.has(id)).map((groupId) => ({ groupId }));
+          if (missing.length > 0) {
+            await deps.groupInviterService.addGroups({ items: missing });
+          }
+        }
         const st = await deps.groupInviterService.start({
           profileIds,
           groupIds,
           ...(typeof args.invitesPerGroup === 'number'
             ? { invitesPerGroup: args.invitesPerGroup }
+            : {}),
+          ...(typeof args.maxConcurrentProfiles === 'number'
+            ? { maxConcurrentProfiles: args.maxConcurrentProfiles }
+            : {}),
+          ...(typeof args.playSoundOnComplete === 'boolean'
+            ? { playSoundOnComplete: args.playSoundOnComplete }
             : {}),
         });
         return okResult({
@@ -975,7 +1207,10 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         statusText: st.statusText,
         invitesPerGroup: st.invitesPerGroup,
         maxConcurrentProfiles: st.maxConcurrentProfiles,
+        playSoundOnComplete: st.playSoundOnComplete,
+        groupAvatarRefreshing: Boolean(st.groupAvatarRefreshing),
         groupsCount: st.groups.length,
+        ...(args.includeGroups === true ? { groups: st.groups.map(summarizeInviterGroup) } : {}),
         profileCounts: st.profileCounts,
       });
     },
@@ -984,29 +1219,107 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
   const wbBluestacksControl: McpToolDefinition = {
     name: 'wb_bluestacks_control',
     description:
-      '控制与监控「蓝蝶模拟器多开（BlueStacks FB Lite）」模块：查询/强制刷新全部模拟器实例与在线竖屏状态（state / refresh）、启动模拟器窗口（launch）、关闭模拟器窗口（close）、识别 FB Lite 登录账号（inspect）、启动或停止蓝蝶小组顶贴（start_bumper / stop_bumper）。',
+      '控制与监控「蓝蝶模拟器多开（BlueStacks FB Lite — 蓝蝶小组顶贴与蓝蝶专页顶贴）」全功能模块：查询/强制刷新全部模拟器实例与在线竖屏状态（state / refresh）、启动/关闭窗口（launch / close）、识别 FB Lite 账号（inspect）、重命名实例备注（rename_instance）、配置蓝蝶安装目录与配置文件路径（save_paths）、修改蓝蝶小组顶贴或蓝蝶专页顶贴参数（save_settings / save_page_settings，含 enableSound 开启声音、最大扫描贴文数、并发数、点赞/留言概率等，运行中即时生效）、保存留言话术池（save_comments）、查询蓝蝶顶贴回执记录（logs）、启动或停止蓝蝶小组顶贴（start_bumper / stop_bumper）、启动或停止蓝蝶专页顶贴（start_page_bumper / stop_page_bumper）。instanceIds 支持直接传窗口名（如 "p023"）、备注名、FB 账号名（如 "Mawi Lee"）、ADB 端口（如 "5565"）或 UUID。',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['state', 'refresh', 'launch', 'close', 'inspect', 'start_bumper', 'stop_bumper'],
+          enum: [
+            'state',
+            'refresh',
+            'launch',
+            'close',
+            'inspect',
+            'rename_instance',
+            'save_paths',
+            'save_settings',
+            'save_page_settings',
+            'save_comments',
+            'logs',
+            'start_bumper',
+            'stop_bumper',
+            'start_page_bumper',
+            'stop_page_bumper',
+          ],
           description: '操作类型',
+        },
+        mode: {
+          type: 'string',
+          enum: ['group', 'page'],
+          description:
+            'save_settings / save_comments / logs 时指定作用于蓝蝶小组顶贴（group）还是蓝蝶专页顶贴（page，默认 group；action="save_page_settings" 等价于 mode="page" + action="save_settings"）',
         },
         instanceIds: {
           type: 'array',
           items: { type: 'string' },
-          description: '目标蓝蝶实例 ID 列表（如 Nougat64、Nougat64_1 等）',
+          description:
+            '目标蓝蝶实例标识列表（支持窗口名如 "p023"、备注名、instanceKey 如 "Pie64_1"、FB 账号名如 "Mawi Lee"、ADB 端口如 "5565" 或实例 UUID）',
+        },
+        instanceId: {
+          type: 'string',
+          description:
+            '单个目标蓝蝶实例标识（rename_instance 必填，其他动作等价于 instanceIds: [instanceId]）',
+        },
+        alias: {
+          type: ['string', 'null'],
+          description: 'rename_instance 时设置的备注名称（传 null 或空字符串恢复默认窗口名）',
+        },
+        installDir: {
+          type: ['string', 'null'],
+          description: 'save_paths 时设置蓝蝶安装目录（传 null 恢复自动探测）',
+        },
+        confPath: {
+          type: ['string', 'null'],
+          description: 'save_paths 时设置 bluestacks.conf 路径（传 null 恢复自动探测）',
         },
         groupIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'start_bumper 时选择的目标小组 ID 列表',
+          description: 'start_bumper 时选择的目标小组 ID 或 Facebook 小组链接列表',
         },
         pageIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'start_bumper 时选择的目标主页/专页 ID 列表',
+          description:
+            'start_bumper / start_page_bumper 时选择的目标主页/专页 ID 或 Facebook 链接列表',
+        },
+        autoAddMissingTargets: {
+          type: 'boolean',
+          description:
+            'start_bumper / start_page_bumper 时若目标小组或专页不在共享目标库中，是否自动补入（默认 true）',
+        },
+        settings: {
+          type: 'object',
+          description:
+            'save_settings / save_page_settings 时的参数补丁（未传字段自动保留当前设置；支持 enableSound 开启声音、maxPostsPerPage、maxPostsPerGroupPage、maxConcurrentProfiles、dailyMaxLikesPerAccount、maxLikesPerPost、likeProbability、commentProbability、consumeCommentOnUse、searchMode、maxPostAgeHours、useLongPressReaction、reactionTypes）',
+        },
+        comments: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'save_comments 时的留言话术文本列表（按 mode 写入小组顶贴或专页顶贴留言池）',
+        },
+        consumeCommentOnUse: {
+          type: 'boolean',
+          description: 'save_comments 时是否每使用一条话术即消耗移除',
+        },
+        includeComments: {
+          type: 'boolean',
+          description: 'state / refresh 时是否同时返回留言话术文本数组（默认 false 仅返回数量）',
+        },
+        search: {
+          type: 'string',
+          description: 'logs 查询时的搜索关键词',
+        },
+        limit: {
+          type: 'number',
+          minimum: 1,
+          maximum: 200,
+          description: 'logs 返回条数上限（默认 50）',
+        },
+        bluestacksOnly: {
+          type: 'boolean',
+          description: 'logs 查询时是否仅返回蓝蝶模拟器实例产生的顶贴记录（默认 true）',
         },
       },
       required: ['action'],
@@ -1014,71 +1327,285 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
     },
     handler: async (args) => {
       const action = String(args.action ?? 'state');
-      const instanceIds = Array.isArray(args.instanceIds)
-        ? args.instanceIds.map((x) => String(x).trim()).filter(Boolean)
-        : [];
+      const scopeMode: 'group' | 'page' =
+        action === 'save_page_settings' ||
+        action === 'start_page_bumper' ||
+        action === 'stop_page_bumper' ||
+        args.mode === 'page'
+          ? 'page'
+          : 'group';
 
-      const formatBsState = (st: Awaited<ReturnType<typeof deps.bluestacksService.state>>) => ({
-        ok: true,
-        running: st.running,
-        statusText: st.statusText,
-        launchingIds: st.launchingIds,
-        closingIds: st.closingIds,
-        inspectingIds: st.inspectingIds,
-        totalBumpedAllTime: st.total,
-        bumperSettings: st.bumperSettings,
-        instances: st.instances.map((inst) => ({
-          id: inst.id,
-          displayTitle: bluestacksDisplayTitle(inst),
-          displayName: inst.displayName,
-          alias: inst.alias,
-          adbPort: inst.adbPort,
-          online: inst.online,
-          resolution: `${inst.fbWidth}x${inst.fbHeight}`,
-          portraitReady: isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight),
-          fbLiteInstalled: inst.fbLiteInstalled,
-          accountState: inst.accountState,
-          accountName: inst.accountName,
-          stat: st.profileCounts[inst.id] ?? null,
-        })),
-      });
+      const singleInstRaw = typeof args.instanceId === 'string' ? args.instanceId.trim() : '';
+      const rawInstanceQueries = [
+        ...(Array.isArray(args.instanceIds)
+          ? args.instanceIds.map((x) => String(x).trim()).filter(Boolean)
+          : []),
+        ...(singleInstRaw ? [singleInstRaw] : []),
+      ];
+
+      const formatBsState = async (
+        st: Awaited<ReturnType<typeof deps.bluestacksService.state>>,
+      ) => {
+        const bumper = deps.getGroupBumperService();
+        const bumperSt = bumper ? await bumper.state() : null;
+        const groupComments = bumperSt?.comments ?? [];
+        const pageComments = bumperSt?.pageComments ?? [];
+        return {
+          ok: true,
+          running: st.running,
+          statusText: st.statusText,
+          pageBumperRunning: st.pageBumperRunning,
+          pageBumperStatusText: st.pageBumperStatusText,
+          launchingIds: st.launchingIds,
+          closingIds: st.closingIds,
+          inspectingIds: st.inspectingIds,
+          totalBumpedAllTime: st.total,
+          totalPageBumpedAllTime: st.pageTotal,
+          config: st.config,
+          bumperSettings: st.bumperSettings,
+          pageBumperSettings: st.pageBumperSettings,
+          commentsCount: groupComments.length,
+          pageCommentsCount: pageComments.length,
+          ...(args.includeComments === true
+            ? {
+                comments: groupComments.map((c) => c.text),
+                pageComments: pageComments.map((c) => c.text),
+              }
+            : {}),
+          instances: st.instances.map((inst) => ({
+            id: inst.id,
+            instanceKey: inst.instanceKey,
+            displayTitle: bluestacksDisplayTitle(inst),
+            displayName: inst.displayName,
+            alias: inst.alias,
+            adbPort: inst.adbPort,
+            serial: inst.serial,
+            online: inst.online,
+            resolution: `${inst.fbWidth}x${inst.fbHeight}`,
+            portraitReady: isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight),
+            fbLiteInstalled: inst.fbLiteInstalled,
+            accountState: inst.accountState,
+            accountId: inst.accountId,
+            accountName: inst.accountName,
+            stat: st.profileCounts[inst.id] ?? null,
+            pageStat: st.pageBumperProfileCounts[inst.id] ?? null,
+          })),
+        };
+      };
+
+      const resolveTargetInstanceIds = async (forceRefresh = false): Promise<string[]> => {
+        if (rawInstanceQueries.length === 0) return [];
+        const current = await deps.bluestacksService.state(forceRefresh);
+        return resolveBluestacksInstanceIds(current.instances, rawInstanceQueries);
+      };
+
+      const ensureSharedTargetsForBluestacks = async (
+        groupIds: readonly string[],
+        pageIds: readonly string[],
+      ) => {
+        if (args.autoAddMissingTargets === false) return;
+        const bumper = deps.getGroupBumperService();
+        if (!bumper || (groupIds.length === 0 && pageIds.length === 0)) return;
+        const current = await bumper.state();
+        const knownGroups = new Set(current.groups.map((g) => g.id));
+        const knownPages = new Set(current.pages.map((p) => p.id));
+        const missingGroups = groupIds.filter((id) => !knownGroups.has(id)).map((id) => ({ id }));
+        const missingPages = pageIds.filter((id) => !knownPages.has(id)).map((id) => ({ id }));
+        if (missingGroups.length > 0) {
+          await bumper.manage('groups/add', { items: missingGroups });
+        }
+        if (missingPages.length > 0) {
+          await bumper.manage('pages/add', { items: missingPages });
+        }
+      };
 
       if (action === 'refresh') {
-        return okResult(formatBsState(await deps.bluestacksService.state(true)));
+        return okResult(await formatBsState(await deps.bluestacksService.state(true)));
       }
-      if (action === 'launch') {
-        if (instanceIds.length === 0) {
-          return errorResult('INSTANCE_IDS_REQUIRED', 'launch 需要提供 instanceIds');
+
+      if (action === 'save_paths') {
+        const payload: Record<string, unknown> = {};
+        if ('installDir' in args) {
+          payload.installDir =
+            typeof args.installDir === 'string' && args.installDir.trim()
+              ? args.installDir.trim()
+              : null;
         }
+        if ('confPath' in args) {
+          payload.confPath =
+            typeof args.confPath === 'string' && args.confPath.trim() ? args.confPath.trim() : null;
+        }
+        return okResult(await formatBsState(await deps.bluestacksService.updatePaths(payload)));
+      }
+
+      if (action === 'rename_instance') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_ID_REQUIRED',
+            'rename_instance 需要通过 instanceId 或 instanceIds 指定目标窗口',
+          );
+        }
+        const current = await deps.bluestacksService.state(false);
+        const targetId = resolveBluestacksInstanceIdentifierFromList(
+          current.instances,
+          rawInstanceQueries[0] ?? '',
+        );
+        const aliasVal =
+          typeof args.alias === 'string' && args.alias.trim() ? args.alias.trim() : null;
+        const updated = await deps.bluestacksService.renameInstance({
+          id: targetId,
+          alias: aliasVal,
+        });
+        return okResult(await formatBsState(updated));
+      }
+
+      if (action === 'save_settings' || action === 'save_page_settings') {
+        const current = await deps.bluestacksService.state(false);
+        const base = scopeMode === 'page' ? current.pageBumperSettings : current.bumperSettings;
+        const patch =
+          typeof args.settings === 'object' && args.settings !== null
+            ? (args.settings as Record<string, unknown>)
+            : {};
+        const merged = { ...base, ...patch };
+        const updated =
+          scopeMode === 'page'
+            ? await deps.bluestacksService.savePageBumperSettings(merged)
+            : await deps.bluestacksService.saveBumperSettings(merged);
+        return okResult({
+          ...(await formatBsState(updated)),
+          updatedScope: scopeMode,
+          appliedSettings:
+            scopeMode === 'page' ? updated.pageBumperSettings : updated.bumperSettings,
+        });
+      }
+
+      if (action === 'save_comments') {
+        const bumper = deps.getGroupBumperService();
+        if (!bumper) {
+          return errorResult('BUMPER_UNAVAILABLE', '留言池服务当前不可用');
+        }
+        const texts = Array.isArray(args.comments)
+          ? args.comments.map((x) => String(x).trim()).filter(Boolean)
+          : [];
+        const currentBs = await deps.bluestacksService.state(false);
+        const baseBsSettings =
+          scopeMode === 'page' ? currentBs.pageBumperSettings : currentBs.bumperSettings;
+        const consume =
+          typeof args.consumeCommentOnUse === 'boolean'
+            ? args.consumeCommentOnUse
+            : baseBsSettings.consumeCommentOnUse;
+        const bumperSt = await bumper.manage(scopeMode === 'page' ? 'page-comments' : 'comments', {
+          texts,
+          consumeCommentOnUse: consume,
+          scope: scopeMode,
+        });
+        if (consume !== baseBsSettings.consumeCommentOnUse) {
+          const mergedBs = { ...baseBsSettings, consumeCommentOnUse: consume };
+          if (scopeMode === 'page') {
+            await deps.bluestacksService.savePageBumperSettings(mergedBs);
+          } else {
+            await deps.bluestacksService.saveBumperSettings(mergedBs);
+          }
+        }
+        const savedComments =
+          (scopeMode === 'page' ? bumperSt.pageComments : bumperSt.comments) ?? [];
+        return okResult({
+          ok: true,
+          mode: scopeMode,
+          consumeCommentOnUse: consume,
+          commentsCount: savedComments.length,
+        });
+      }
+
+      if (action === 'logs') {
+        const bumper = deps.getGroupBumperService();
+        if (!bumper) {
+          return errorResult('BUMPER_UNAVAILABLE', '顶贴日志服务当前不可用');
+        }
+        const search = typeof args.search === 'string' ? args.search : '';
+        const limit = Math.max(1, Math.min(200, Math.floor(Number(args.limit ?? 50))));
+        const bsOnly = args.bluestacksOnly !== false;
+        const currentBs = await deps.bluestacksService.state(false);
+        const instById = new Map(currentBs.instances.map((i) => [i.id, i]));
+        const filterInstIds =
+          rawInstanceQueries.length > 0
+            ? new Set(resolveBluestacksInstanceIds(currentBs.instances, rawInstanceQueries))
+            : null;
+        const rawLogs = await bumper.logs(
+          search,
+          undefined,
+          undefined,
+          Math.max(limit * 3, 120),
+          scopeMode,
+        );
+        const filtered = rawLogs
+          .filter((row) => {
+            if (bsOnly && !instById.has(row.profileId)) return false;
+            if (filterInstIds && !filterInstIds.has(row.profileId)) return false;
+            return true;
+          })
+          .slice(0, limit)
+          .map((row) => {
+            const inst = instById.get(row.profileId);
+            return {
+              ...row,
+              instanceDisplayTitle: inst ? bluestacksDisplayTitle(inst) : null,
+              bumpedAtLocal: formatLocalDateTime(row.bumpedAt),
+            };
+          });
+        return okResult({
+          ok: true,
+          mode: scopeMode,
+          bluestacksOnly: bsOnly,
+          count: filtered.length,
+          logs: filtered,
+        });
+      }
+
+      if (action === 'launch') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult('INSTANCE_IDS_REQUIRED', 'launch 需要提供 instanceIds 或 instanceId');
+        }
+        const instanceIds = await resolveTargetInstanceIds(false);
         return okResult(
-          formatBsState(await deps.bluestacksService.launchInstances({ instanceIds })),
+          await formatBsState(await deps.bluestacksService.launchInstances({ instanceIds })),
         );
       }
       if (action === 'close') {
-        if (instanceIds.length === 0) {
-          return errorResult('INSTANCE_IDS_REQUIRED', 'close 需要提供 instanceIds');
+        if (rawInstanceQueries.length === 0) {
+          return errorResult('INSTANCE_IDS_REQUIRED', 'close 需要提供 instanceIds 或 instanceId');
         }
+        const instanceIds = await resolveTargetInstanceIds(false);
         return okResult(
-          formatBsState(await deps.bluestacksService.closeInstances({ instanceIds })),
+          await formatBsState(await deps.bluestacksService.closeInstances({ instanceIds })),
         );
       }
       if (action === 'inspect') {
-        if (instanceIds.length === 0) {
-          return errorResult('INSTANCE_IDS_REQUIRED', 'inspect 需要提供 instanceIds');
+        if (rawInstanceQueries.length === 0) {
+          return errorResult('INSTANCE_IDS_REQUIRED', 'inspect 需要提供 instanceIds 或 instanceId');
         }
+        const instanceIds = await resolveTargetInstanceIds(false);
         return okResult(
-          formatBsState(await deps.bluestacksService.inspectInstances({ instanceIds })),
+          await formatBsState(await deps.bluestacksService.inspectInstances({ instanceIds })),
         );
       }
       if (action === 'start_bumper') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'start_bumper 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(true);
         const groupIds = Array.isArray(args.groupIds)
-          ? args.groupIds.map((x) => String(x).trim()).filter(Boolean)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
           : [];
         const pageIds = Array.isArray(args.pageIds)
-          ? args.pageIds.map((x) => String(x).trim()).filter(Boolean)
+          ? args.pageIds.map((x) => extractFacebookPageId(String(x).trim())).filter(Boolean)
           : [];
+        await ensureSharedTargetsForBluestacks(groupIds, pageIds);
         return okResult(
-          formatBsState(
+          await formatBsState(
             await deps.bluestacksService.startBumper({
               profileIds: instanceIds,
               groupIds,
@@ -1088,13 +1615,46 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         );
       }
       if (action === 'stop_bumper') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : [];
         const st = await deps.bluestacksService.stopBumper(
           instanceIds.length > 0 ? instanceIds : undefined,
+          instanceIds.length > 0 ? undefined : 'group',
         );
-        return okResult(formatBsState(st));
+        return okResult(await formatBsState(st));
+      }
+      if (action === 'start_page_bumper') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'start_page_bumper 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(true);
+        const pageIds = Array.isArray(args.pageIds)
+          ? args.pageIds.map((x) => extractFacebookPageId(String(x).trim())).filter(Boolean)
+          : [];
+        await ensureSharedTargetsForBluestacks([], pageIds);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.startPageBumper({
+              profileIds: instanceIds,
+              pageIds,
+            }),
+          ),
+        );
+      }
+      if (action === 'stop_page_bumper') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : [];
+        const st = await deps.bluestacksService.stopBumper(
+          instanceIds.length > 0 ? instanceIds : undefined,
+          'page',
+        );
+        return okResult(await formatBsState(st));
       }
 
-      return okResult(formatBsState(await deps.bluestacksService.state(false)));
+      return okResult(await formatBsState(await deps.bluestacksService.state(false)));
     },
   };
 

@@ -62,22 +62,29 @@ export function createMonitorAndDiagnosticTools(
         module: {
           type: 'string',
           enum: [
+            'active-accounts',
             'group-poster',
             'group-bumper',
             'page-bumper',
             'group-inviter',
             'bluestacks-bumper',
+            'bluestacks-page-bumper',
           ],
           description: '要监控的业务模块',
         },
         taskIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'group-poster 模块可选传入要精确跟踪的任务 ID 数组',
+          description: '可选传入要精确跟踪的任务 ID 或计划 planId 数组',
         },
         taskId: {
           type: 'string',
-          description: 'group-poster 模块可选传入单个要跟踪的任务 ID（等价于 taskIds: [taskId]）',
+          description: '可选传入单个要跟踪的任务 ID 或计划 planId（等价于 taskIds: [taskId]）',
+        },
+        profileIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'active-accounts 模块可选按指定浏览器标识列表过滤跟踪计划',
         },
         waitSeconds: {
           type: 'number',
@@ -96,6 +103,8 @@ export function createMonitorAndDiagnosticTools(
     handler: async (args) => {
       const rawModule = String(args.module ?? 'group-poster').trim();
       const moduleAliasMap: Record<string, string> = {
+        tasks: 'active-accounts',
+        'active-accounts': 'active-accounts',
         poster: 'group-poster',
         'group-poster': 'group-poster',
         bumper: 'group-bumper',
@@ -105,12 +114,14 @@ export function createMonitorAndDiagnosticTools(
         'group-inviter': 'group-inviter',
         bluestacks: 'bluestacks-bumper',
         'bluestacks-bumper': 'bluestacks-bumper',
+        'bluestacks-group-bumper': 'bluestacks-bumper',
+        'bluestacks-page-bumper': 'bluestacks-page-bumper',
       };
       const moduleName = moduleAliasMap[rawModule];
       if (!moduleName) {
         return errorResult(
           'INVALID_MODULE',
-          `不支持的监控模块 "${rawModule}"，可选值：group-poster、group-bumper、page-bumper、group-inviter、bluestacks-bumper`,
+          `不支持的监控模块 "${rawModule}"，可选值：active-accounts、group-poster、group-bumper、page-bumper、group-inviter、bluestacks-bumper、bluestacks-page-bumper`,
         );
       }
       const waitMs = Math.max(1, Math.min(90, Number(args.waitSeconds ?? 25))) * 1000;
@@ -146,6 +157,121 @@ export function createMonitorAndDiagnosticTools(
             reason: e.reason ?? null,
             data: e.data ?? null,
           }));
+
+      if (moduleName === 'active-accounts') {
+        const taskService = deps.taskService;
+        if (!taskService) {
+          return errorResult('TASKS_UNAVAILABLE', '活跃账号任务执行服务未启用');
+        }
+        const rawFilterPids = Array.isArray(args.profileIds)
+          ? args.profileIds.map((x) => String(x).trim()).filter(Boolean)
+          : [];
+        const filterProfileSet =
+          rawFilterPids.length > 0 ? new Set(await resolveProfileIds(deps, rawFilterPids)) : null;
+        const filterPlanSet = taskIds.length > 0 ? new Set(taskIds) : null;
+
+        const initOverview = await taskService.overview();
+        const initialReviewIds = new Set(
+          initOverview.plans.filter((p) => p.state === 'REVIEW').map((p) => p.id),
+        );
+
+        let aaWake:
+          | 'completed'
+          | 'paused'
+          | 'scheduled_in_future'
+          | 'pending_review_detected'
+          | 'timeout_still_running' = 'timeout_still_running';
+
+        while (true) {
+          const ov = await taskService.overview();
+          const tracked = ov.plans.filter((p) => {
+            if (filterPlanSet && !filterPlanSet.has(p.id)) return false;
+            if (filterProfileSet && !filterProfileSet.has(p.profileId)) return false;
+            if (!filterPlanSet && !filterProfileSet) {
+              return !['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state);
+            }
+            return true;
+          });
+
+          if (tracked.length === 0) {
+            aaWake = 'completed';
+            break;
+          }
+          if (tracked.every((p) => ['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))) {
+            aaWake = 'completed';
+            break;
+          }
+          if (
+            tracked.every((p) => ['PAUSED', 'STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))
+          ) {
+            aaWake = 'paused';
+            break;
+          }
+          if (
+            tracked.every(
+              (p) =>
+                p.state === 'QUEUED' &&
+                p.timing?.mode === 'at' &&
+                p.timing.startAt > Date.now() + Math.max(2000, deadline - Date.now()),
+            )
+          ) {
+            aaWake = 'scheduled_in_future';
+            break;
+          }
+          if (
+            wakeOnAnomaly &&
+            ov.plans.some((p) => p.state === 'REVIEW' && !initialReviewIds.has(p.id))
+          ) {
+            aaWake = 'pending_review_detected';
+            break;
+          }
+          if (Date.now() >= deadline) break;
+          await new Promise<void>((r) => setTimeout(r, 1000));
+        }
+
+        const finalOv = await taskService.overview();
+        const monitoredPlans = finalOv.plans
+          .filter((p) => {
+            if (filterPlanSet && !filterPlanSet.has(p.id)) return false;
+            if (filterProfileSet && !filterProfileSet.has(p.profileId)) return false;
+            return true;
+          })
+          .slice(0, 30)
+          .map((p) => ({
+            id: p.id,
+            profileId: p.profileId,
+            combinationId: p.combinationId,
+            combinationName: p.snapshot.name,
+            state: p.state,
+            reason: p.reason,
+            round: p.round,
+            position: p.position,
+            updatedAtLocal: formatLocalDateTime(p.updatedAt),
+          }));
+        const stillRunning = monitoredPlans.some((p) =>
+          ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'].includes(p.state),
+        );
+
+        return okResult({
+          ok: true,
+          module: moduleName,
+          settled: !stillRunning,
+          wakeReason: aaWake,
+          elapsedMs: Date.now() - startedAt,
+          running: stillRunning,
+          monitoredPlansCount: monitoredPlans.length,
+          monitoredPlans,
+          reviewPlans: finalOv.plans
+            .filter((p) => p.state === 'REVIEW')
+            .map((p) => ({
+              id: p.id,
+              profileId: p.profileId,
+              combinationName: p.snapshot.name,
+              reason: p.reason,
+            })),
+          newDiagnostics: collectNewDiagnostics(),
+        });
+      }
 
       if (moduleName === 'group-poster') {
         const initialState = await deps.groupPosterService.state();
@@ -393,27 +519,42 @@ export function createMonitorAndDiagnosticTools(
         });
       }
 
-      // bluestacks-bumper
+      // bluestacks-bumper | bluestacks-page-bumper
+      const isBsPage = moduleName === 'bluestacks-page-bumper';
       let bsWake: 'completed' | 'timeout_still_running' = 'timeout_still_running';
       while (true) {
         const st = await deps.bluestacksService.state(false);
-        if (!st.running) {
+        const running = isBsPage ? st.pageBumperRunning : st.running;
+        if (!running) {
           bsWake = 'completed';
           break;
         }
         if (Date.now() >= deadline) break;
         await new Promise<void>((r) => setTimeout(r, 1000));
       }
-      const finalBs = await deps.bluestacksService.state(false);
+      const bumperSvc = deps.getGroupBumperService();
+      const [finalBs, bsLogs] = await Promise.all([
+        deps.bluestacksService.state(false),
+        bumperSvc
+          ? bumperSvc.logs('', undefined, undefined, 80, isBsPage ? 'page' : 'group')
+          : Promise.resolve([]),
+      ]);
+      const bsInstIds = new Set(finalBs.instances.map((i) => i.id));
+      const newBsBumps = bsLogs.filter(
+        (l) => bsInstIds.has(l.profileId) && l.bumpedAt >= startedAt - 2000,
+      );
+      const finalRunning = isBsPage ? finalBs.pageBumperRunning : finalBs.running;
       return okResult({
         ok: true,
         module: moduleName,
-        settled: !finalBs.running,
+        settled: !finalRunning,
         wakeReason: bsWake,
         elapsedMs: Date.now() - startedAt,
-        running: finalBs.running,
-        statusText: finalBs.statusText,
-        profileCounts: finalBs.profileCounts,
+        running: finalRunning,
+        statusText: isBsPage ? finalBs.pageBumperStatusText : finalBs.statusText,
+        profileCounts: isBsPage ? finalBs.pageBumperProfileCounts : finalBs.profileCounts,
+        newVerifiedBumpsCount: newBsBumps.length,
+        newVerifiedBumps: newBsBumps,
         newDiagnostics: collectNewDiagnostics(),
       });
     },
@@ -559,9 +700,11 @@ export function createMonitorAndDiagnosticTools(
       }
 
       // action === 'inspect'
-      const [posterState, bumperState] = await Promise.all([
+      const [posterState, bumperState, bluestacksState, taskOverview] = await Promise.all([
         deps.groupPosterService.state(),
         deps.getGroupBumperService()?.state(),
+        deps.bluestacksService.state(false),
+        deps.taskService ? deps.taskService.overview() : Promise.resolve(null),
       ]);
       const profiles = allKnownProfiles;
 
@@ -612,8 +755,26 @@ export function createMonitorAndDiagnosticTools(
         logFilePath: deps.devDiagFilePath,
         outdatedExtensions,
         bridgeUnresolvedByProfile,
+        activeAccountsReviewPlans: taskOverview
+          ? taskOverview.plans
+              .filter((p) => p.state === 'REVIEW')
+              .map((p) => ({
+                id: p.id,
+                profileId: p.profileId,
+                combinationName: p.snapshot.name,
+                reason: p.reason,
+                updatedAtLocal: formatLocalDateTime(p.updatedAt),
+              }))
+          : [],
         posterPendingReview: posterState.pendingReviewOperations ?? [],
         bumperPendingReview: bumperState?.pendingReviewOperations ?? [],
+        bluestacks: {
+          adbReady: Boolean(bluestacksState.config?.adbReady),
+          playerReady: Boolean(bluestacksState.config?.playerReady),
+          running: bluestacksState.running,
+          pageBumperRunning: bluestacksState.pageBumperRunning,
+          onlineInstances: bluestacksState.instances.filter((i) => i.online).length,
+        },
         profilesWithIssues: profiles.filter(
           (p) =>
             p.online &&

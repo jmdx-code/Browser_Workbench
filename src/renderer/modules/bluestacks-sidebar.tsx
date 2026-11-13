@@ -24,12 +24,14 @@ export function BluestacksSidebar({
   selected,
   onSelect,
   onError,
+  mode = 'bluestacks-group-bumper',
 }: {
   state: BluestacksState | null;
   onChange: (next: BluestacksState) => void;
   selected: ReadonlySet<string>;
   onSelect: (ids: Set<string>) => void;
   onError: (msg: string) => void;
+  mode?: 'bluestacks-group-bumper' | 'bluestacks-page-bumper';
 }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'online' | 'selected'>('all');
@@ -119,8 +121,16 @@ export function BluestacksSidebar({
     }
   }
 
+  function getEffectiveStat(id: string) {
+    const groupStat = state?.profileCounts[id];
+    const pageStat = state?.pageBumperProfileCounts?.[id];
+    if (pageStat?.running) return pageStat;
+    if (groupStat?.running) return groupStat;
+    return mode === 'bluestacks-page-bumper' ? (pageStat ?? groupStat) : (groupStat ?? pageStat);
+  }
+
   const selectedIds = [...selected];
-  const anySelectedRunning = selectedIds.some((id) => Boolean(state?.profileCounts[id]?.running));
+  const anySelectedRunning = selectedIds.some((id) => Boolean(getEffectiveStat(id)?.running));
   const anySelectedOnline = selectedIds.some((id) => instances.find((x) => x.id === id)?.online);
 
   return (
@@ -245,7 +255,7 @@ export function BluestacksSidebar({
           const groupVisIds = visibleInGroup.map((i) => i.id);
           const gState = selectionState(selected, groupVisIds);
           const isClosed = closed.has(group.id);
-          const runningCount = allInGroup.filter((i) => state?.profileCounts[i.id]?.running).length;
+          const runningCount = allInGroup.filter((i) => getEffectiveStat(i.id)?.running).length;
 
           return (
             <section className="group color-blue" key={group.id}>
@@ -320,7 +330,7 @@ export function BluestacksSidebar({
                   <BluestacksInstanceRow
                     key={inst.id}
                     inst={inst}
-                    stat={state?.profileCounts[inst.id]}
+                    stat={getEffectiveStat(inst.id)}
                     selected={selected.has(inst.id)}
                     busy={busy}
                     isLaunching={launchingSet.has(inst.id)}

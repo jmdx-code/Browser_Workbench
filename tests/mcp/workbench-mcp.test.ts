@@ -21,11 +21,16 @@ import {
   formatExcelSerialValue,
   parseFlexibleScheduleTime,
   readSpreadsheetOrTableFile,
+  resolveBluestacksInstanceIdentifierFromList,
   resolveProfileIdentifierFromList,
   type EnrichedProfileSummary,
   type WorkbenchMcpDependencies,
 } from '../../src/infrastructure/mcp/mcp-context.js';
-import { createWorkbenchMcpHttpHandler } from '../../src/infrastructure/mcp/mcp-server.js';
+import {
+  buildWorkbenchMcpTools,
+  createWorkbenchMcpHttpHandler,
+} from '../../src/infrastructure/mcp/mcp-server.js';
+import type { BluestacksInstance } from '../../src/shared/bluestacks.js';
 import { FeatureExecutionRegistry } from '../../src/application/feature-execution-registry.js';
 import { AgentBrowserManager } from '../../src/infrastructure/mcp/agent-browser-manager.js';
 
@@ -320,7 +325,7 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
     });
     assert.equal(notifRes.status, 202);
 
-    // 4. tools/list exposes all 20 operational tools
+    // 4. tools/list exposes all 21 operational tools (including wb_active_accounts_control)
     const listRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -329,8 +334,9 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
     const listJson = (await listRes.json()) as {
       result: { tools: Array<{ name: string }> };
     };
-    assert.equal(listJson.result.tools.length, 20);
+    assert.equal(listJson.result.tools.length, 21);
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_get_overview'));
+    assert.ok(listJson.result.tools.some((t) => t.name === 'wb_active_accounts_control'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_poster_dispatch'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_browser_open'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_browser_lifecycle'));
@@ -662,4 +668,621 @@ test('syncProductAiWorkspaceDirectory provisions Antigravity plugin + OpenAI Cod
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+});
+
+test('resolveBluestacksInstanceIdentifierFromList resolves UUID, displayName, accountName, adbPort, online tiebreak, and rejects ambiguity', () => {
+  const instances: BluestacksInstance[] = [
+    {
+      id: '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc',
+      instanceKey: 'Pie64_1',
+      displayName: 'p023',
+      alias: null,
+      folderId: null,
+      sortOrder: 0,
+      adbPort: 5565,
+      serial: '127.0.0.1:5565',
+      fbWidth: 720,
+      fbHeight: 1280,
+      online: true,
+      fbLiteInstalled: true,
+      accountState: 'logged-in',
+      accountId: '100088001',
+      accountName: 'Mawi Lee',
+      avatarUrl: null,
+      lastStatus: '在线就绪',
+      updatedAt: 1,
+    },
+    {
+      id: '11111111-2222-4333-8444-555555555555',
+      instanceKey: 'Pie64_2',
+      displayName: 'BlueStacks 2',
+      alias: '备用模拟器',
+      folderId: null,
+      sortOrder: 1,
+      adbPort: 5575,
+      serial: '127.0.0.1:5575',
+      fbWidth: 720,
+      fbHeight: 1280,
+      online: false,
+      fbLiteInstalled: true,
+      accountState: 'logged-in',
+      accountId: '100088001',
+      accountName: 'Mawi Lee',
+      avatarUrl: null,
+      lastStatus: '未启动',
+      updatedAt: 1,
+    },
+  ];
+
+  assert.equal(
+    resolveBluestacksInstanceIdentifierFromList(instances, 'p023'),
+    '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc',
+  );
+  assert.equal(
+    resolveBluestacksInstanceIdentifierFromList(instances, '5565'),
+    '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc',
+  );
+  assert.equal(
+    resolveBluestacksInstanceIdentifierFromList(instances, ':5565'),
+    '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc',
+  );
+  assert.equal(
+    resolveBluestacksInstanceIdentifierFromList(instances, '备用模拟器'),
+    '11111111-2222-4333-8444-555555555555',
+  );
+  // Single online tiebreak on shared accountName
+  assert.equal(
+    resolveBluestacksInstanceIdentifierFromList(instances, 'Mawi Lee'),
+    '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc',
+  );
+  // Ambiguity rejected when both matching instances are online
+  const bothOnline = instances.map((i) => ({ ...i, online: true }));
+  assert.throws(
+    () => resolveBluestacksInstanceIdentifierFromList(bothOnline, 'Mawi Lee'),
+    /AMBIGUOUS_BLUESTACKS_IDENTIFIER|同时匹配到多个蓝蝶窗口/,
+  );
+});
+
+test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add, wb_active_accounts_control, wb_inviter_control, wb_bumper_control, and wb_browser_lifecycle', async () => {
+  const registry = new FeatureExecutionRegistry();
+  const profileId = '9e4d39b2-8f6a-4313-ba6a-d9efdc0a16b3';
+  const comboId = '22222222-3333-4444-8555-666666666666';
+  const stepId = '33333333-4444-4555-8666-777777777777';
+  const bsInstanceId = '6f625a7b-4dc1-4c40-bb6f-4ca3b7cf28bc';
+
+  const peersMap = new Map<
+    string,
+    {
+      online: boolean;
+      phase: string;
+      synced: boolean;
+      extensionVersion: string;
+      capabilities: string[];
+    }
+  >();
+  peersMap.set(profileId, {
+    online: false,
+    phase: 'PAUSED',
+    synced: true,
+    extensionVersion: '0.3.80',
+    capabilities: ['agent-browser-kernel-v1'],
+  });
+  const fakeCore = { peers: peersMap } as unknown as WorkbenchMcpDependencies['core'];
+  const agentBrowser = new AgentBrowserManager(
+    () => fakeCore,
+    () => undefined,
+    registry,
+  );
+
+  const addedSharedPages: string[] = [];
+  const addedSharedGroups: string[] = [];
+  let pageCommentsSaved: string[] = [];
+  let bsPageSettings = {
+    searchMode: 'time_sort' as const,
+    maxPostAgeHours: 24,
+    maxPostsPerGroupPage: 5,
+    maxPostsPerPage: 3,
+    maxConcurrentProfiles: 4,
+    dailyMaxLikesPerAccount: 20,
+    maxLikesPerPost: 50,
+    likeProbability: 100,
+    commentProbability: 30,
+    consumeCommentOnUse: false,
+    enableSound: false,
+  };
+  let lastBsStartedPageBumper: { profileIds: string[]; pageIds: string[] } | null = null;
+  let inviterGroupsList: Array<{
+    groupId: string;
+    groupName: string;
+    avatarUrl: string | null;
+    folderId: string | null;
+    sortOrder: number;
+    totalInvitedCount: number;
+    createdAt: number;
+    updatedAt: number;
+  }> = [];
+  let lastInviterStart: { profileIds: string[]; groupIds: string[] } | null = null;
+  let launchedOfflineProfiles: string[] = [];
+  let activePlans: Array<{
+    id: string;
+    batchId: string;
+    profileId: string;
+    combinationId: string;
+    version: number;
+    accountId: string | null;
+    snapshot: {
+      name: string;
+      note: string;
+      steps: Array<{
+        id: string;
+        type: 'video';
+        durationMinutes: number;
+        maxLikes: number;
+        minLikeCount: number;
+      }>;
+      randomOrder: boolean;
+      loop: { mode: 'finite'; rounds: number };
+    };
+    state: 'RUNNING' | 'PAUSED' | 'STOPPED' | 'QUEUED';
+    reason: string;
+    controlMode: null;
+    controlRequestId: null;
+    controlConfirmed: boolean;
+    round: number;
+    position: number;
+    createdAt: number;
+    updatedAt: number;
+  }> = [];
+  let cleanedTabProfileIds: string[] = [];
+
+  const mockBumperService = {
+    state: async () => ({
+      groups: addedSharedGroups.map((id) => ({ id, name: id })),
+      pages: addedSharedPages.map((id) => ({ id, name: id })),
+      comments: [],
+      pageComments: pageCommentsSaved.map((text, idx) => ({
+        id: `c-${idx}`,
+        text,
+        usedCount: 0,
+        createdAt: 1,
+      })),
+      settings: bsPageSettings,
+      pageSettings: bsPageSettings,
+      running: false,
+      pageBumperRunning: false,
+      statusText: '就绪',
+      pageBumperStatusText: '就绪',
+      profileCounts: {},
+      pageBumperProfileCounts: {},
+      total: 0,
+      pageTotal: 1,
+      dailyStats: [],
+      pageDailyStats: [],
+      scheduledTasks: [],
+      pendingReviewOperations: [],
+    }),
+    manage: async (route: string, input: Record<string, unknown>) => {
+      if (route === 'pages/add' && Array.isArray(input.items)) {
+        for (const item of input.items as Array<{ id: string }>) {
+          if (!addedSharedPages.includes(item.id)) addedSharedPages.push(item.id);
+        }
+      }
+      if (route === 'groups/add' && Array.isArray(input.items)) {
+        for (const item of input.items as Array<{ id: string }>) {
+          if (!addedSharedGroups.includes(item.id)) addedSharedGroups.push(item.id);
+        }
+      }
+      if (route === 'page-comments' && Array.isArray(input.texts)) {
+        pageCommentsSaved = (input.texts as string[]).slice();
+      }
+      return mockBumperService.state();
+    },
+    startPageBumper: async () => mockBumperService.state(),
+    logs: async () => [
+      {
+        id: 'log-bs-1',
+        profileId: bsInstanceId,
+        accountId: '100088001',
+        groupId: '61560099726339',
+        pageId: '61560099726339',
+        postId: 'pfbid01',
+        postUrl: 'https://www.facebook.com/61560099726339/posts/1',
+        liked: true,
+        commentText: 'Amen',
+        bumpedAt: 1763000000000,
+        sourceMode: 'page',
+      },
+      {
+        id: 'log-chrome-1',
+        profileId,
+        accountId: '61593615564708',
+        groupId: '61560099726339',
+        pageId: '61560099726339',
+        postId: 'pfbid02',
+        postUrl: 'https://www.facebook.com/61560099726339/posts/2',
+        liked: true,
+        commentText: null,
+        bumpedAt: 1763000001000,
+        sourceMode: 'page',
+      },
+    ],
+  };
+
+  const buildBsState = async () => ({
+    instances: [
+      {
+        id: bsInstanceId,
+        instanceKey: 'Pie64_1',
+        displayName: 'p023',
+        alias: null,
+        folderId: null,
+        sortOrder: 0,
+        adbPort: 5565,
+        serial: '127.0.0.1:5565',
+        fbWidth: 720,
+        fbHeight: 1280,
+        online: true,
+        fbLiteInstalled: true,
+        accountState: 'logged-in' as const,
+        accountId: '100088001',
+        accountName: 'Mawi Lee',
+        avatarUrl: null,
+        lastStatus: '在线就绪',
+        updatedAt: 1,
+      },
+    ],
+    folders: [],
+    config: {
+      installDir: null,
+      confPath: null,
+      detectedInstallDir: 'C:\\Program Files\\BlueStacks_nxt',
+      detectedConfPath: 'C:\\ProgramData\\BlueStacks_nxt\\bluestacks.conf',
+      adbReady: true,
+      playerReady: true,
+    },
+    bumperSettings: bsPageSettings,
+    pageBumperSettings: bsPageSettings,
+    running: false,
+    pageBumperRunning: lastBsStartedPageBumper !== null,
+    launchingIds: [],
+    closingIds: [],
+    inspectingIds: [],
+    statusText: '就绪',
+    pageBumperStatusText: lastBsStartedPageBumper ? '正在运行' : '就绪',
+    profileCounts: {},
+    pageBumperProfileCounts: {},
+    total: 0,
+    pageTotal: 1,
+    dailyStats: [],
+    pageDailyStats: [],
+  });
+
+  const deps: WorkbenchMcpDependencies = {
+    softwareVersion: '0.1.226',
+    extensionVersion: '0.3.80',
+    dataDir: os.tmpdir(),
+    core: fakeCore,
+    store: {
+      unresolved: async () => [],
+    } as unknown as WorkbenchMcpDependencies['store'],
+    getMainKernel: () => undefined,
+    workspaceService: {
+      requireProfiles: async () => undefined,
+      snapshot: async () => ({
+        schemaVersion: 1,
+        groups: [],
+        profiles: [
+          {
+            id: profileId,
+            alias: 'Chrome 9e4d39b2',
+            browserName: '用户8',
+            groupId: null,
+            order: 0,
+            online: Boolean(peersMap.get(profileId)?.online),
+            phase: 'PAUSED',
+            synced: true,
+            unresolved: 0,
+            extensionVersion: '0.3.80',
+            capabilities: ['agent-browser-kernel-v1'],
+            account: {
+              state: 'logged-in',
+              id: '61593615564708',
+              name: 'Grace Page',
+              avatar: null,
+            },
+          },
+        ],
+        combinations: [
+          {
+            id: comboId,
+            version: 2,
+            revision: 2,
+            saved: {
+              name: '浏览 Reels',
+              note: '日常活跃',
+              steps: [
+                {
+                  id: stepId,
+                  type: 'video',
+                  durationMinutes: 10,
+                  maxLikes: 3,
+                  minLikeCount: 0,
+                },
+              ],
+              randomOrder: false,
+              loop: { mode: 'finite', rounds: 1 },
+            },
+            draft: null,
+            updatedAt: 1763000000000,
+          },
+        ],
+        records: [],
+        support: { comboExecution: false, accountIdentity: false, reason: '' },
+      }),
+    } as unknown as WorkbenchMcpDependencies['workspaceService'],
+    taskService: {
+      overview: async () => ({
+        dispatchEnabled: true,
+        settings: { maxConcurrentProfiles: 6 },
+        plans: activePlans,
+      }),
+      capabilities: async () => ({
+        types: ['video', 'feed', 'marketplace', 'friends', 'post'],
+        combinations: [{ id: comboId, version: 2, enabled: true, reason: '' }],
+      }),
+      releaseErroredPausedPlans: async () => 0,
+      hasProfilePlanInStates: async (pid: string, states: readonly string[]) =>
+        activePlans.some((p) => p.profileId === pid && states.includes(p.state)),
+      start: async (input: { profileIds: string[] }) => {
+        const created = {
+          id: '44444444-5555-4666-8777-888888888888',
+          batchId: '55555555-6666-4777-8888-999999999999',
+          profileId: input.profileIds[0] ?? profileId,
+          combinationId: comboId,
+          version: 2,
+          accountId: '61593615564708',
+          snapshot: {
+            name: '浏览 Reels',
+            note: '日常活跃',
+            steps: [
+              {
+                id: stepId,
+                type: 'video' as const,
+                durationMinutes: 10,
+                maxLikes: 3,
+                minLikeCount: 0,
+              },
+            ],
+            randomOrder: false,
+            loop: { mode: 'finite' as const, rounds: 1 },
+          },
+          state: 'RUNNING' as const,
+          reason: '正在浏览视频',
+          controlMode: null,
+          controlRequestId: null,
+          controlConfirmed: true,
+          round: 1,
+          position: 0,
+          createdAt: 1763000000000,
+          updatedAt: 1763000002000,
+        };
+        activePlans = [created];
+        return { plans: activePlans };
+      },
+      command: async (req: {
+        command: 'pause' | 'resume' | 'stop';
+        plans: Array<{ planId: string; profileId: string }>;
+      }) => {
+        const nextState =
+          req.command === 'pause' ? 'PAUSED' : req.command === 'resume' ? 'RUNNING' : 'STOPPED';
+        activePlans = activePlans.map((p) => ({ ...p, state: nextState }));
+        return {
+          results: req.plans.map((p) => ({
+            profileId: p.profileId,
+            planId: p.planId,
+            accepted: true,
+            state: nextState,
+            controlConfirmed: true,
+            reason: '',
+          })),
+        };
+      },
+      setSettings: async (s: { maxConcurrentProfiles: number }) => s,
+      records: async () => ({
+        records: [],
+        nextCursor: null,
+        total: 0,
+        counts: { all: 0, running: 0, completed: 0, failed: 0, review: 0 },
+      }),
+    } as unknown as WorkbenchMcpDependencies['taskService'],
+    featureExecution: registry,
+    groupPosterService: {
+      state: async () => ({
+        groups: [],
+        materials: [],
+        settings: { maxConcurrentProfiles: 4, maxPostsPerAccount: 10, materialsPerGroup: 1 },
+        total: 0,
+        running: false,
+        statusText: '就绪',
+        profileCounts: {},
+        dailyStats: [],
+        tasks: [],
+        pendingReviewOperations: [],
+      }),
+      logs: async () => [],
+    } as unknown as WorkbenchMcpDependencies['groupPosterService'],
+    getGroupBumperService: () =>
+      mockBumperService as unknown as ReturnType<WorkbenchMcpDependencies['getGroupBumperService']>,
+    groupInviterService: {
+      state: async () => ({
+        groups: inviterGroupsList,
+        invitesPerGroup: 20,
+        maxConcurrentProfiles: 4,
+        playSoundOnComplete: true,
+        running: lastInviterStart !== null,
+        groupAvatarRefreshing: false,
+        runId: lastInviterStart ? 'run-1' : null,
+        startedAt: null,
+        finishedAt: null,
+        statusText: '就绪',
+        profileCounts: {},
+      }),
+      addGroups: async (input: { items: Array<{ groupId: string; groupName?: string }> }) => {
+        for (const item of input.items) {
+          if (!inviterGroupsList.some((g) => g.groupId === item.groupId)) {
+            inviterGroupsList.push({
+              groupId: item.groupId,
+              groupName: item.groupName || item.groupId,
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalInvitedCount: 0,
+              createdAt: 1,
+              updatedAt: 1,
+            });
+          }
+        }
+        return deps.groupInviterService.state();
+      },
+      start: async (input: { profileIds: string[]; groupIds: string[] }) => {
+        lastInviterStart = input;
+        return deps.groupInviterService.state();
+      },
+      logs: async () => [],
+    } as unknown as WorkbenchMcpDependencies['groupInviterService'],
+    bluestacksService: {
+      state: buildBsState,
+      saveBumperSettings: async (s: typeof bsPageSettings) => {
+        bsPageSettings = { ...bsPageSettings, ...s };
+        return buildBsState();
+      },
+      savePageBumperSettings: async (s: typeof bsPageSettings) => {
+        bsPageSettings = { ...bsPageSettings, ...s };
+        return buildBsState();
+      },
+      startPageBumper: async (input: { profileIds: string[]; pageIds: string[] }) => {
+        lastBsStartedPageBumper = input;
+        return buildBsState();
+      },
+    } as unknown as WorkbenchMcpDependencies['bluestacksService'],
+    agentBrowser,
+    profileLifecycle: {
+      ensureProfilesOnline: async (ids: readonly string[]) => {
+        launchedOfflineProfiles = [...ids];
+        for (const id of ids) {
+          const cur = peersMap.get(id);
+          if (cur) cur.online = true;
+        }
+        return { ready: [...ids], launched: [...ids], alreadyOnline: [], failed: [] };
+      },
+    } as unknown as WorkbenchMcpDependencies['profileLifecycle'],
+    browserWindow: {
+      cleanupTabs: async (ids: string[]) => {
+        cleanedTabProfileIds = ids;
+        return { cleanedProfiles: ids.length, closedTabs: 2, skippedBusy: 0, skippedOffline: 0 };
+      },
+      show: async (id: string) => ({ profileId: id, tabId: 1, focused: true as const }),
+    } as unknown as WorkbenchMcpDependencies['browserWindow'],
+    devDiagFilePath: path.join(os.tmpdir(), 'nonexistent-diag.jsonl'),
+  };
+
+  const toolMap = new Map(buildWorkbenchMcpTools(deps).map((t) => [t.name, t]));
+  const callTool = async (name: string, args: Record<string, unknown>) => {
+    const tool = toolMap.get(name);
+    assert.ok(tool, `Missing tool ${name}`);
+    const res = await tool.handler(args);
+    assert.equal(
+      Boolean(res.isError),
+      false,
+      `Tool ${name} errored: ${JSON.stringify(res.structuredContent)}`,
+    );
+    return res.structuredContent as Record<string, unknown>;
+  };
+
+  // 1. BlueStacks save_page_settings toggles enableSound + save_comments syncs consumeCommentOnUse
+  const bsSettingsRes = await callTool('wb_bluestacks_control', {
+    action: 'save_page_settings',
+    settings: { enableSound: true, maxPostsPerPage: 5 },
+  });
+  assert.equal((bsSettingsRes.appliedSettings as { enableSound: boolean }).enableSound, true);
+  assert.equal((bsSettingsRes.appliedSettings as { maxPostsPerPage: number }).maxPostsPerPage, 5);
+
+  const bsCommentsRes = await callTool('wb_bluestacks_control', {
+    action: 'save_comments',
+    mode: 'page',
+    comments: ['Amen', 'God bless'],
+    consumeCommentOnUse: true,
+  });
+  assert.equal(bsCommentsRes.commentsCount, 2);
+  assert.equal(bsPageSettings.consumeCommentOnUse, true);
+
+  // 2. BlueStacks start_page_bumper resolves friendly "p023" + extracts Page ID from URL + auto-adds target
+  await callTool('wb_bluestacks_control', {
+    action: 'start_page_bumper',
+    instanceIds: ['p023'],
+    pageIds: ['https://www.facebook.com/profile.php?id=61560099726339'],
+  });
+  assert.deepEqual(lastBsStartedPageBumper, {
+    profileIds: [bsInstanceId],
+    pageIds: ['61560099726339'],
+  });
+  assert.ok(addedSharedPages.includes('61560099726339'));
+
+  // 3. BlueStacks logs filters out Chrome profile logs by default
+  const bsLogsRes = await callTool('wb_bluestacks_control', {
+    action: 'logs',
+    mode: 'page',
+  });
+  assert.equal(bsLogsRes.count, 1);
+  assert.equal(
+    (bsLogsRes.logs as Array<{ instanceDisplayTitle: string }>)[0]?.instanceDisplayTitle,
+    'p023',
+  );
+
+  // 4. Active Accounts: start by combination name + auto-launch offline browser -> pause -> stop -> overview
+  const aaState = await callTool('wb_active_accounts_control', { action: 'state' });
+  assert.equal(aaState.combinationsCount, 1);
+
+  const aaStart = await callTool('wb_active_accounts_control', {
+    action: 'start',
+    combinationId: '浏览 Reels',
+    profileIds: ['用户8'],
+  });
+  assert.deepEqual(launchedOfflineProfiles, [profileId]);
+  assert.equal(aaStart.plansCount, 1);
+
+  const overviewAfterStart = await callTool('wb_get_overview', {});
+  assert.equal(
+    (overviewAfterStart.activeAccounts as { runningPlansCount: number }).runningPlansCount,
+    1,
+  );
+
+  const aaPause = await callTool('wb_active_accounts_control', { action: 'pause' });
+  assert.equal(aaPause.acceptedCount, 1);
+
+  const aaStop = await callTool('wb_active_accounts_control', { action: 'stop' });
+  assert.equal(aaStop.acceptedCount, 1);
+
+  const waitAa = await callTool('wb_wait_for_task', {
+    module: 'active-accounts',
+    waitSeconds: 2,
+  });
+  assert.equal(waitAa.settled, true);
+
+  // 5. Group Inviter start extracts Facebook Group URL + auto-adds missing group
+  await callTool('wb_inviter_control', {
+    action: 'start',
+    profileIds: ['用户8'],
+    groupIds: ['https://www.facebook.com/groups/9876543210/'],
+  });
+  assert.deepEqual(lastInviterStart, {
+    profileIds: [profileId],
+    groupIds: ['9876543210'],
+  });
+  assert.equal(inviterGroupsList[0]?.groupId, '9876543210');
+
+  // 6. Browser Lifecycle cleanup_tabs targets online registered profiles
+  const cleanupRes = await callTool('wb_browser_lifecycle', { action: 'cleanup_tabs' });
+  assert.equal(cleanupRes.cleanedProfiles, 1);
+  assert.deepEqual(cleanedTabProfileIds, [profileId]);
 });

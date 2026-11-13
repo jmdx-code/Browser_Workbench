@@ -40,6 +40,9 @@ export async function handleBluestacksRoutes(ctx: BluestacksRouteContext): Promi
     case 'settings':
       json(res, 200, await bluestacks.saveBumperSettings(input));
       return true;
+    case 'page-settings':
+      json(res, 200, await bluestacks.savePageBumperSettings(input));
+      return true;
     case 'folders/create':
       json(res, 200, await bluestacks.createFolder(input));
       return true;
@@ -73,8 +76,16 @@ export async function handleBluestacksRoutes(ctx: BluestacksRouteContext): Promi
     case 'bumper/start':
       json(res, 200, await bluestacks.startBumper(input));
       return true;
-    case 'bumper/stop':
-      json(res, 200, await bluestacks.stopBumper(bluestacks.parseStopInput(input)));
+    case 'bumper/start-page':
+      json(res, 200, await bluestacks.startPageBumper(input));
+      return true;
+    case 'bumper/stop': {
+      const stopIds = bluestacks.parseStopInput(input);
+      json(res, 200, await bluestacks.stopBumper(stopIds, stopIds ? undefined : 'group'));
+      return true;
+    }
+    case 'bumper/stop-page':
+      json(res, 200, await bluestacks.stopBumper(bluestacks.parseStopInput(input), 'page'));
       return true;
     default:
       return false;

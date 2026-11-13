@@ -368,7 +368,11 @@ test('old idle extensions reload once per target, busy accounts are skipped, man
     peer.phase = 'PAUSED';
     peer.synced = true;
     peer.extensionVersion = '0.3.54';
-    peer.capabilities = ['browser-window-reveal-v1', 'browser-window-close-v1'];
+    peer.capabilities = [
+      'browser-window-reveal-v1',
+      'browser-window-close-v1',
+      'kernel-passive-page-reveal-v1',
+    ];
     await manager.automatic(peer);
     assert.equal(manager.autoReloadAttempted.has(id), false);
     const owner = randomUUID();

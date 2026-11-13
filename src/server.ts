@@ -800,6 +800,26 @@ try {
         devDiagFilePath: devDiagWriter.filePath,
       });
       groupBumperServiceRef = groupBumperService;
+      const browserWindow = new BridgeBrowserWindow(
+        core,
+        repository.tasks,
+        async (profileId) => {
+          const peer = core.peers.get(profileId);
+          if (!peer || !mainKernel) return null;
+          return mainKernel.revealRegisteredFacebookPage(peer);
+        },
+        async (profileId, preferActiveTab = true) => {
+          const peer = core.peers.get(profileId);
+          if (!peer || !mainKernel)
+            throw new ProductError(
+              'WORKSPACE_CLEANUP_UNAVAILABLE',
+              '浏览器未连接或内核未就绪',
+              409,
+            );
+          return mainKernel.consolidateFacebookWorkspace(peer, preferActiveTab);
+        },
+        (profileId) => featureExecution.isProfileBusy(profileId),
+      );
       const wired = wireLifecycleAndMcpRuntime({
         softwareVersion,
         extensionVersion: bundledExtension.version,
@@ -819,6 +839,8 @@ try {
         groupBumperService,
         groupInviterService,
         bluestacksService,
+        browserWindow,
+        windowLayout,
         captureDiagnostics,
         devDiagFilePath: devDiagWriter.filePath,
         reloadExtensions: (ids) => {
@@ -859,26 +881,7 @@ try {
         process.parentPort
           ? { restart: () => process.parentPort?.postMessage({ type: 'REQUEST_RESTART' }) }
           : undefined,
-        new BridgeBrowserWindow(
-          core,
-          repository.tasks,
-          async (profileId) => {
-            const peer = core.peers.get(profileId);
-            if (!peer || !mainKernel) return null;
-            return mainKernel.revealRegisteredFacebookPage(peer);
-          },
-          async (profileId, preferActiveTab = true) => {
-            const peer = core.peers.get(profileId);
-            if (!peer || !mainKernel)
-              throw new ProductError(
-                'WORKSPACE_CLEANUP_UNAVAILABLE',
-                '浏览器未连接或内核未就绪',
-                409,
-              );
-            return mainKernel.consolidateFacebookWorkspace(peer, preferActiveTab);
-          },
-          (profileId) => featureExecution.isProfileBusy(profileId),
-        ),
+        browserWindow,
         new MaterialCacheManagement(
           repository.cacheCleanup,
           new MaterialCacheCleanup(

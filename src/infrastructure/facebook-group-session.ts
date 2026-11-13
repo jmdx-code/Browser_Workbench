@@ -56,7 +56,7 @@ export class FacebookGroupSessionHelper {
    */
   static isTransientPrepareError(error: unknown): boolean {
     const msg = error instanceof Error ? error.message : String(error);
-    return /PREPARE_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE|KERNEL_PROFILE_NOT_IDLE|KERNEL_PEER_NOT_IDLE/i.test(
+    return /PREPARE_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|KERNEL_SCOPE_CHANGED|KERNEL_INITIAL_DOCUMENT_PENDING|BROWSER_OFFLINE|KERNEL_PROFILE_NOT_IDLE|KERNEL_PEER_NOT_IDLE/i.test(
       msg,
     );
   }

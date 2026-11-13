@@ -21,6 +21,44 @@ import type {
   SelectionControlSummary,
 } from './module-contracts.js';
 
+const MODULE_LABELS: Record<string, string> = {
+  'group-poster': '小组发帖',
+  'group-bumper': '小组顶贴',
+  'page-bumper': '专页顶贴',
+  'group-inviter': '小组邀请人',
+};
+
+const BREADCRUMB_LABELS: Record<string, string> = {
+  home: '活跃账号',
+  edit: '活跃账号 · 编辑组合',
+  'group-inviter': '小组邀请人',
+  'group-bumper': '小组顶贴',
+  'page-bumper': '专页顶贴',
+  'group-poster': '小组发帖',
+  'bluestacks-group-bumper': '蓝蝶小组顶贴',
+  'bluestacks-page-bumper': '蓝蝶专页顶贴',
+};
+
+function runningStatIds(counts?: Record<string, { running: boolean }>): string[] {
+  return Object.entries(counts ?? {})
+    .filter(([, stat]) => stat.running)
+    .map(([id]) => id);
+}
+
+function backgroundRunningDescriptor(
+  moduleId: FeatureModuleId,
+  moduleLabel: string,
+): ProfileActivityDescriptor {
+  return {
+    moduleId,
+    moduleLabel,
+    running: true,
+    tone: 'run',
+    text: `${moduleLabel} · 运行中`,
+    tooltipLines: [`${moduleLabel}正在后台运行`],
+  };
+}
+
 const taskNames = {
   feed: '浏览首页',
   video: '浏览 Reels',
@@ -67,17 +105,9 @@ export function projectProfileActivity(
 
   // Priority 1: Actively running task in ANY module always takes precedence
   if (posterRunning) {
-    if (input.groupPosterCounts?.[profileId]) {
-      return projectGroupPosterProfileActivity(profileId, input.groupPosterCounts, true);
-    }
-    return {
-      moduleId: 'group-poster',
-      moduleLabel: '小组发帖',
-      running: true,
-      tone: 'run',
-      text: '小组发帖 · 运行中',
-      tooltipLines: ['小组发帖正在后台运行'],
-    };
+    return input.groupPosterCounts?.[profileId]
+      ? projectGroupPosterProfileActivity(profileId, input.groupPosterCounts, true)
+      : backgroundRunningDescriptor('group-poster', '小组发帖');
   }
 
   if (bumperRunning) {
@@ -85,33 +115,20 @@ export function projectProfileActivity(
       input.pageBumperRunningIds?.includes(profileId) === true ||
       (input.bumperModuleId === 'page-bumper' && input.bumperCounts?.[profileId]?.running === true);
     const bumperModule: 'group-bumper' | 'page-bumper' = isPage ? 'page-bumper' : 'group-bumper';
-    const bumperLabel = isPage ? '专页顶贴' : '小组顶贴';
     const stat =
       (input.bumperModuleId ?? 'group-bumper') === bumperModule
         ? input.bumperCounts?.[profileId]
         : undefined;
-    if (stat) return formatBumperStat(bumperModule, stat, true);
-    return {
-      moduleId: bumperModule,
-      moduleLabel: bumperLabel,
-      running: true,
-      tone: 'run',
-      text: `${bumperLabel} · 运行中`,
-      tooltipLines: [`${bumperLabel}正在后台运行`],
-    };
+    return stat
+      ? formatBumperStat(bumperModule, stat, true)
+      : backgroundRunningDescriptor(bumperModule, isPage ? '专页顶贴' : '小组顶贴');
   }
 
   if (inviterRunning) {
     const stat = input.groupInviterCounts?.[profileId];
-    if (stat) return formatInviterStat(stat, true);
-    return {
-      moduleId: 'group-inviter',
-      moduleLabel: '小组邀请人',
-      running: true,
-      tone: 'run',
-      text: '小组邀请人 · 运行中',
-      tooltipLines: ['小组邀请人正在后台运行'],
-    };
+    return stat
+      ? formatInviterStat(stat, true)
+      : backgroundRunningDescriptor('group-inviter', '小组邀请人');
   }
 
   if (plan) {
@@ -207,22 +224,10 @@ export function projectProfileActivity(
   // Priority 3: Last finished result projection when idle (mapped directly by 5-source enum)
   if (lastResult && lastStatus) {
     const sourceModule: FeatureModuleId =
-      lastResult.source === 'group-poster' ||
-      lastResult.source === 'page-bumper' ||
-      lastResult.source === 'group-bumper' ||
-      lastResult.source === 'group-inviter'
-        ? lastResult.source
+      lastResult.source in MODULE_LABELS
+        ? (lastResult.source as FeatureModuleId)
         : 'active-accounts';
-    const moduleLabel =
-      sourceModule === 'group-poster'
-        ? '小组发帖'
-        : sourceModule === 'group-bumper'
-          ? '小组顶贴'
-          : sourceModule === 'page-bumper'
-            ? '专页顶贴'
-            : sourceModule === 'group-inviter'
-              ? '小组邀请人'
-              : '活跃账号';
+    const moduleLabel = MODULE_LABELS[sourceModule] ?? '活跃账号';
     return {
       moduleId: sourceModule,
       moduleLabel,
@@ -312,18 +317,7 @@ export function projectSelectionControls(
 export { extractInviterRunningIds } from './group-poster-activity.js';
 export { buildFeatureNavItems } from './feature-nav-items.js';
 
-export function buildWorkbenchProjection({
-  viewKind,
-  profiles,
-  selected,
-  tasks,
-  groupBumper,
-  groupInviter,
-  groupPoster,
-  bluestacks,
-  attentionCount,
-  message,
-}: {
+export interface WorkbenchProjectionParams {
   viewKind:
     | 'home'
     | 'edit'
@@ -332,7 +326,8 @@ export function buildWorkbenchProjection({
     | 'group-bumper'
     | 'page-bumper'
     | 'group-poster'
-    | 'bluestacks-group-bumper';
+    | 'bluestacks-group-bumper'
+    | 'bluestacks-page-bumper';
   profiles: readonly Profile[] | undefined;
   selected: ReadonlySet<string>;
   tasks: z.infer<typeof TaskRuntimeOverview> | null | undefined;
@@ -350,20 +345,35 @@ export function buildWorkbenchProjection({
   groupPoster?:
     { running: boolean; profileCounts: Record<string, PosterProfileStat> } | null | undefined;
   bluestacks?:
-    { running: boolean; profileCounts: Record<string, BumperProfileStat> } | null | undefined;
+    | {
+        running: boolean;
+        profileCounts: Record<string, BumperProfileStat>;
+        pageBumperRunning?: boolean | undefined;
+        pageBumperProfileCounts?: Record<string, BumperProfileStat> | undefined;
+      }
+    | null
+    | undefined;
   attentionCount: number;
   message: string;
-}) {
+}
+
+export function buildWorkbenchProjection({
+  viewKind,
+  profiles,
+  selected,
+  tasks,
+  groupBumper,
+  groupInviter,
+  groupPoster,
+  bluestacks,
+  attentionCount,
+  message,
+}: WorkbenchProjectionParams) {
   const plans = tasks?.plans ?? [];
-  const groupBumperRunningIds = Object.entries(groupBumper?.profileCounts ?? {})
-    .filter(([, stat]) => stat.running)
-    .map(([id]) => id);
-  const pageBumperRunningIds = Object.entries(groupBumper?.pageBumperProfileCounts ?? {})
-    .filter(([, stat]) => stat.running)
-    .map(([id]) => id);
-  const bluestacksRunningCount = Object.values(bluestacks?.profileCounts ?? {}).filter(
-    (stat) => stat.running,
-  ).length;
+  const groupBumperRunningIds = runningStatIds(groupBumper?.profileCounts);
+  const pageBumperRunningIds = runningStatIds(groupBumper?.pageBumperProfileCounts);
+  const bluestacksRunningCount = runningStatIds(bluestacks?.profileCounts).length;
+  const bluestacksPageRunningCount = runningStatIds(bluestacks?.pageBumperProfileCounts).length;
   const bumperRunningIds = [...new Set([...groupBumperRunningIds, ...pageBumperRunningIds])];
   const inviterRunningIds = extractInviterRunningIds(groupInviter);
   const posterRunningIds = extractPosterRunningIds(groupPoster);
@@ -377,22 +387,7 @@ export function buildWorkbenchProjection({
   ).size;
   const activeModule: FeatureModuleId =
     viewKind === 'home' || viewKind === 'edit' ? 'active-accounts' : viewKind;
-  const breadcrumbText =
-    viewKind === 'home'
-      ? '活跃账号'
-      : viewKind === 'edit'
-        ? '活跃账号 · 编辑组合'
-        : viewKind === 'group-inviter'
-          ? '小组邀请人'
-          : viewKind === 'group-bumper'
-            ? '小组顶贴'
-            : viewKind === 'page-bumper'
-              ? '专页顶贴'
-              : viewKind === 'group-poster'
-                ? '小组发帖'
-                : viewKind === 'bluestacks-group-bumper'
-                  ? '蓝蝶小组顶贴'
-                  : '执行记录';
+  const breadcrumbText = BREADCRUMB_LABELS[viewKind] ?? '执行记录';
   const navItems = buildFeatureNavItems({
     activeAccountRunningCount,
     groupInviterRunning: Boolean(groupInviter?.running),
@@ -404,6 +399,9 @@ export function buildWorkbenchProjection({
       : 0,
     groupPosterRunningCount: posterRunningIds.length,
     bluestacksBumperRunningCount: bluestacks?.running ? Math.max(1, bluestacksRunningCount) : 0,
+    bluestacksPageBumperRunningCount: bluestacks?.pageBumperRunning
+      ? Math.max(1, bluestacksPageRunningCount)
+      : 0,
     attentionCount,
   });
   const projectionInput: ProfileActivityProjectionInput = {

@@ -104,10 +104,20 @@ export const ReorderBluestacksInstancesInput = z
   })
   .strict();
 
+export const BluestacksBumperMode = z.enum(['group', 'page']);
+export type BluestacksBumperMode = z.infer<typeof BluestacksBumperMode>;
+
 export const StartBluestacksBumperInput = z
   .object({
     profileIds: z.array(Id).min(1).max(200),
     groupIds: z.array(GroupIdString).min(1).max(500),
+    pageIds: z.array(GroupIdString).min(1).max(500),
+  })
+  .strict();
+
+export const StartBluestacksPageBumperInput = z
+  .object({
+    profileIds: z.array(Id).min(1).max(200),
     pageIds: z.array(GroupIdString).min(1).max(500),
   })
   .strict();
@@ -123,14 +133,20 @@ export interface BluestacksState {
   folders: BluestacksFolder[];
   config: BluestacksRuntimeConfig;
   bumperSettings: BumperSettings;
+  pageBumperSettings: BumperSettings;
   running: boolean;
+  pageBumperRunning: boolean;
   launchingIds: string[];
   closingIds: string[];
   inspectingIds: string[];
   statusText: string;
+  pageBumperStatusText: string;
   profileCounts: Record<string, BumperProfileStat>;
+  pageBumperProfileCounts: Record<string, BumperProfileStat>;
   total: number;
+  pageTotal: number;
   dailyStats: BumperDailyStat[];
+  pageDailyStats: BumperDailyStat[];
 }
 
 export function isBluestacksPortraitResolution(fbWidth: number, fbHeight: number): boolean {

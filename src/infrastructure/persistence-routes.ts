@@ -337,6 +337,7 @@ export const persistenceRoutes = new Set([
   'workspace.bluestacks.savedSettings',
   'workspace.bluestacks.savePaths',
   'workspace.bluestacks.saveBumperSettings',
+  'workspace.bluestacks.savePageBumperSettings',
   'workspace.bluestacks.folders',
   'workspace.bluestacks.createFolder',
   'workspace.bluestacks.renameFolder',

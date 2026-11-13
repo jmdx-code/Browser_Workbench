@@ -37,7 +37,7 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
   const wbGetOverview: McpToolDefinition = {
     name: 'wb_get_overview',
     description:
-      '获取 Browser Workbench 全景真实运行状态：在线/就绪/忙碌/异常浏览器列表、当前运行模块、小组发帖（含定时/运行中任务计数与待核对记录）、小组顶贴/专页顶贴、小组邀请人、蓝蝶多开状态、AI 浏览器会话以及最近 WARN/ERROR 诊断事件。开始任何操作前建议先调用一次。',
+      '获取 Browser Workbench 全景真实运行状态：在线/就绪/忙碌/异常浏览器列表、当前运行模块、活跃账号（任务组合与计划计数）、小组发帖（含定时/运行中任务计数与待核对记录）、小组顶贴/专页顶贴、小组邀请人、蓝蝶多开状态（含蓝蝶小组顶贴与蓝蝶专页顶贴）、AI 浏览器会话以及最近 WARN/ERROR 诊断事件。开始任何操作前建议先调用一次。',
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: 'object',
@@ -46,14 +46,23 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
     },
     handler: async () => {
       const now = Date.now();
-      const [profiles, activeModules, posterState, inviterState, bluestacksState] =
-        await Promise.all([
-          buildEnrichedProfiles(deps),
-          deps.featureExecution.activeModuleLabels(),
-          deps.groupPosterService.state(),
-          deps.groupInviterService.state(),
-          deps.bluestacksService.state(false),
-        ]);
+      const [
+        snapshot,
+        profiles,
+        activeModules,
+        posterState,
+        inviterState,
+        bluestacksState,
+        taskOverview,
+      ] = await Promise.all([
+        deps.workspaceService.snapshot(),
+        buildEnrichedProfiles(deps),
+        deps.featureExecution.activeModuleLabels(),
+        deps.groupPosterService.state(),
+        deps.groupInviterService.state(),
+        deps.bluestacksService.state(false),
+        deps.taskService ? deps.taskService.overview() : Promise.resolve(null),
+      ]);
       const bumperState = await deps.getGroupBumperService()?.state();
       const onlineProfiles = profiles.filter((p) => p.online);
       const posterTasks = posterState.tasks ?? [];
@@ -80,6 +89,9 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
         }));
 
       const dataDirectory = resolveDataDirIntegrity(deps.dataDir);
+      const activeAccountPlans = taskOverview
+        ? taskOverview.plans.filter((p) => !['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))
+        : [];
 
       return okResult({
         ok: true,
@@ -102,6 +114,30 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
           ).length,
         },
         onlineProfiles,
+        activeAccounts: taskOverview
+          ? {
+              dispatchEnabled: taskOverview.dispatchEnabled,
+              maxConcurrentProfiles: taskOverview.settings.maxConcurrentProfiles,
+              combinationsCount: snapshot.combinations.filter((c) => c.saved !== null).length,
+              runningPlansCount: activeAccountPlans.filter((p) => p.state === 'RUNNING').length,
+              queuedPlansCount: activeAccountPlans.filter((p) => p.state === 'QUEUED').length,
+              pausedPlansCount: activeAccountPlans.filter(
+                (p) => p.state === 'PAUSED' || p.state === 'PAUSING',
+              ).length,
+              reviewPlansCount: activeAccountPlans.filter((p) => p.state === 'REVIEW').length,
+              activePlans: activeAccountPlans.slice(0, 10).map((p) => ({
+                id: p.id,
+                profileId: p.profileId,
+                combinationId: p.combinationId,
+                combinationName: p.snapshot.name,
+                state: p.state,
+                reason: p.reason,
+                round: p.round,
+                position: p.position,
+                updatedAtLocal: formatLocalDateTime(p.updatedAt),
+              })),
+            }
+          : null,
         groupPoster: {
           running: posterState.running,
           statusText: posterState.statusText,
@@ -164,8 +200,14 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
           runId: inviterState.runId ?? null,
         },
         bluestacks: {
+          adbReady: Boolean(bluestacksState.config?.adbReady),
+          playerReady: Boolean(bluestacksState.config?.playerReady),
           running: bluestacksState.running,
           statusText: bluestacksState.statusText,
+          pageBumperRunning: bluestacksState.pageBumperRunning,
+          pageBumperStatusText: bluestacksState.pageBumperStatusText,
+          groupEnableSound: Boolean(bluestacksState.bumperSettings?.enableSound),
+          pageEnableSound: Boolean(bluestacksState.pageBumperSettings?.enableSound),
           totalInstances: bluestacksState.instances.length,
           onlineInstances: bluestacksState.instances.filter((i) => i.online).length,
           portraitReadyInstances: bluestacksState.instances.filter(

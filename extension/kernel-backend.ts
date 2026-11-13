@@ -53,7 +53,7 @@ export interface KernelNativeBackend extends KernelBackend {
   armTaskPresentation?(proof: TabProof): Promise<void>;
   setWindowExposure?(proof: TabProof, exposed: boolean): Promise<void>;
   adopt?(proof: TabProof): Promise<void>;
-  revealOwnedPage?(proof: TabProof): Promise<{ tabId: number; focused: true }>;
+  revealOwnedPage?(proof: TabProof, focus?: boolean): Promise<{ tabId: number; focused: boolean }>;
   consolidateWorkspace?(preferActiveTab?: boolean): Promise<{
     proof: TabProof;
     url: string;
@@ -180,6 +180,30 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     guard();
     await this.scope(proof.tabId);
     guard();
+    if (
+      typeof chrome !== 'undefined' &&
+      typeof chrome.tabs?.get === 'function' &&
+      typeof chrome.windows?.get === 'function'
+    ) {
+      const tab = await chrome.tabs.get(proof.tabId).catch(() => null);
+      guard();
+      if (tab && tab.windowId !== undefined) {
+        const win = await chrome.windows.get(tab.windowId).catch(() => null);
+        guard();
+        if (win?.state === 'minimized') {
+          await chrome.windows
+            .update(tab.windowId, { state: 'normal', focused: false })
+            .catch(() => {});
+          guard();
+        }
+        if (tab.active === false) {
+          await chrome.tabs.update(proof.tabId, { active: true }).catch(() => {});
+          guard();
+        }
+      }
+    }
+    await this.rendering.ensure(proof.tabId, owned.targetId, guard).catch(() => {});
+    guard();
     this.presentation = { proof: owned, checkedAt: -Infinity };
     this.reportPresentation(owned, { phase: 'ARMED' });
   }
@@ -206,7 +230,15 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       guard();
       const tab = await chrome.tabs.get(tabId);
       guard();
-      if (!kernelAccessURL(tab.url ?? '', 'facebook-task'))
+      let observedUrl = tab.url ?? '';
+      if (!observedUrl && typeof chrome.debugger?.getTargets === 'function') {
+        observedUrl =
+          (await chrome.debugger.getTargets().catch(() => [])).find((row) => row.tabId === tabId)
+            ?.url ?? '';
+        guard();
+      }
+      if (observedUrl === '' || observedUrl === 'about:blank') return;
+      if (!kernelAccessURL(observedUrl, 'facebook-task'))
         throw Error('KERNEL_PRESENTATION_URL_CHANGED');
       const window = await chrome.windows.get(tab.windowId);
       guard();
@@ -506,7 +538,10 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       this.access === 'agent-browser' && target.url === '' ? 'about:blank' : target.url;
     if (!kernelAccessURL(urlToCheck, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
   }
-  async revealOwnedPage(proof: TabProof): Promise<{ tabId: number; focused: true }> {
+  async revealOwnedPage(
+    proof: TabProof,
+    focus = true,
+  ): Promise<{ tabId: number; focused: boolean }> {
     proof = OwnedTabProof.parse(proof);
     const check = () => {
       const owned = this.owned.get(proof.tabId);
@@ -521,11 +556,36 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     const window = await chrome.windows.get(tab.windowId);
     check();
     if (window.state === 'minimized') {
-      await chrome.windows.update(tab.windowId, { state: 'normal' });
+      await chrome.windows.update(
+        tab.windowId,
+        focus ? { state: 'normal' } : { state: 'normal', focused: false },
+      );
       check();
     }
     await chrome.tabs.update(proof.tabId, { active: true });
     check();
+    if (!focus) {
+      if (this.attached.get(proof.tabId) === proof.targetId) {
+        await this.rendering.ensure(proof.tabId, proof.targetId, check).catch(() => {});
+        check();
+      }
+      const deadline = Date.now() + 1000;
+      let observedFocused = false;
+      while (true) {
+        const current = await chrome.tabs.get(proof.tabId);
+        check();
+        const observed = await chrome.windows.get(tab.windowId);
+        check();
+        observedFocused = Boolean(observed.focused);
+        if (current.windowId === tab.windowId && current.active) break;
+        if (Date.now() >= deadline) throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        check();
+      }
+      await this.scope(proof.tabId);
+      check();
+      return { tabId: proof.tabId, focused: observedFocused };
+    }
     // Explicit display command, not the automatic business foreground policy.
     await chrome.windows.update(tab.windowId, { focused: true });
     check();

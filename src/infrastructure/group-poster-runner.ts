@@ -646,13 +646,20 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
       if (!initialPage) throw Error('任务页面不存在');
       let page = initialPage;
 
+      const backgroundAllowed =
+        peer.capabilities?.includes('kernel-background-presentation-v1') === true ||
+        conn.taskRendering === true;
       let avatarObservedOnce = false;
       const assertIdentity = async () => {
         guard();
         let state = await readGroupInvitationState(page, guard);
         const deadline = Date.now() + 15000;
         let revealed = false;
-        while (!state.ready || !state.visible || state.accountId === null) {
+        while (
+          !state.ready ||
+          state.accountId === null ||
+          (!state.visible && !(backgroundAllowed && revealed))
+        ) {
           if (state.verificationRequired) {
             await dismissFeatureInterventionDialogIfPresent(page, guard);
             state = await readGroupInvitationState(page, guard);
@@ -665,7 +672,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
           }
           if (!state.visible && !revealed && identity.proof) {
             revealed = true;
-            await kernel.revealOwnedFacebookPage(peer, identity.proof);
+            await kernel.revealOwnedFacebookPage(peer, identity.proof, false);
           }
           if (Date.now() >= deadline) {
             throw Error('页面未就绪或不可见');

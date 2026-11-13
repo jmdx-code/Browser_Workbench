@@ -228,7 +228,7 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
         !kernel.usesExposedWindowLayout() &&
         peer.capabilities?.includes('kernel-owned-page-reveal-v1')
       ) {
-        await kernel.revealOwnedFacebookPage(peer, connection.proof).catch(() => {});
+        await kernel.revealOwnedFacebookPage(peer, connection.proof, false).catch(() => {});
         await assertIdentity();
       }
       return session;

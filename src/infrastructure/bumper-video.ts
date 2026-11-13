@@ -21,13 +21,18 @@ export async function watchBumperVideo(input: {
     deadline = start + (input.budgetMs ?? 180000);
   let current = input.initial,
     clicked = false,
+    completed = false,
+    hoverAttempts = 0,
+    unmuteClicks = 0,
     css = current.videoCSS;
   const center = async (selector: string) => {
     guard();
     await page
       .locator(selector)
       .first()
-      .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
+      .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }), undefined, {
+        timeout: 3000,
+      });
   };
   const read = async () => {
     guard();
@@ -37,24 +42,74 @@ export async function watchBumperVideo(input: {
       throw Error('观看中的目标帖子已变化');
     return next;
   };
+  const ensureUnmuted = async () => {
+    if (!input.sound) return;
+    const needsSpeakerWakeup =
+      !current.videoAudioCSS ||
+      current.videoSpeakerMuted === true ||
+      (current.videoSpeakerMuted === undefined && current.videoMuted !== false);
+    if (needsSpeakerWakeup && css && hoverAttempts < 2) {
+      hoverAttempts++;
+      guard();
+      const videoLocator = page.locator(css).first();
+      if (typeof videoLocator.hover === 'function') {
+        await videoLocator.hover({ timeout: 2000 }).catch(() => {});
+        await sleep(Math.min(250, tick));
+        current = await read().catch(() => current);
+        css = current.videoCSS ?? css;
+      }
+    }
+    const speakerNeedsClick =
+      current.videoSpeakerMuted === true ||
+      (current.videoSpeakerMuted === undefined && current.videoMuted !== false);
+    if (current.videoAudioCSS && speakerNeedsClick && unmuteClicks < 2) {
+      guard();
+      unmuteClicks++;
+      await page
+        .locator(current.videoAudioCSS)
+        .first()
+        .click({ timeout: 2500 })
+        .catch(() => {});
+      await sleep(Math.min(180, tick));
+      current = await read().catch(() => current);
+      css = current.videoCSS ?? css;
+    }
+  };
   const play = async () => {
     if (!css) return;
     guard();
     await page
       .locator(css)
       .first()
-      .evaluate((el, sound) => {
-        if (!(el instanceof HTMLVideoElement)) throw Error('视频节点已变化');
-        el.loop = false;
-        el.muted = !sound;
-        if (sound && el.volume < 0.5) el.volume = 0.8;
-        if (el.paused && !el.ended) {
-          void el.play().catch(() => {
+      .evaluate(
+        (el, sound) => {
+          if (!(el instanceof HTMLVideoElement)) throw Error('视频节点已变化');
+          el.loop = false;
+          if (!sound) {
             el.muted = true;
-            void el.play().catch(() => {});
-          });
-        }
-      }, input.sound);
+            if (el.paused && !el.ended) {
+              void el.play().catch(() => {});
+            }
+            return;
+          }
+          if (el.volume < 0.5) el.volume = 0.8;
+          const canUnmuteDirectly =
+            typeof navigator === 'undefined' ||
+            !('userActivation' in navigator) ||
+            Boolean(navigator.userActivation?.hasBeenActive);
+          if (el.muted && (canUnmuteDirectly || el.paused)) {
+            el.muted = false;
+          }
+          if (el.paused && !el.ended) {
+            void el.play().catch(() => {
+              el.muted = true;
+              void el.play().catch(() => {});
+            });
+          }
+        },
+        input.sound,
+        { timeout: 3000 },
+      );
   };
   try {
     const lazyUntil = Math.min(deadline, start + 6000);
@@ -70,6 +125,7 @@ export async function watchBumperVideo(input: {
     }
     if (!css) throw Error('视频播放器未加载，未执行本帖互动');
     await center(css);
+    await ensureUnmuted();
     await play().catch(() => {});
     let lastTime = current.videoCurrentTime ?? 0,
       lastFrames = current.videoFrames ?? 0,
@@ -84,11 +140,14 @@ export async function watchBumperVideo(input: {
         (typeof current.videoDuration === 'number' &&
           current.videoDuration >= 2 &&
           (current.videoCurrentTime ?? 0) >= current.videoDuration - 0.6)
-      )
+      ) {
+        completed = true;
         return 'ended';
+      }
       const now = performance.now();
       if (now >= deadline) {
         if (!progressed) throw Error('视频未实际播放，未执行本帖互动');
+        completed = true;
         return 'budget';
       }
       await sleep(Math.min(tick, deadline - now));
@@ -107,18 +166,34 @@ export async function watchBumperVideo(input: {
         lastProgress = performance.now();
         recovered = false;
       }
-      if (lastTime >= 3 && time + 1.5 < lastTime && progressed) return 'ended';
+      if (lastTime >= 3 && time + 1.5 < lastTime && progressed) {
+        completed = true;
+        return 'ended';
+      }
       lastTime = time;
       lastFrames = frames;
       css = current.videoCSS ?? css;
+      if (
+        input.sound &&
+        unmuteClicks < 2 &&
+        (current.videoSpeakerMuted === true ||
+          (current.videoSpeakerMuted === undefined && current.videoMuted === true))
+      ) {
+        await ensureUnmuted();
+        await play().catch(() => {});
+      }
       const offscreen = await page
         .locator(css)
         .first()
-        .evaluate((el) => {
-          const r = el.getBoundingClientRect(),
-            h = innerHeight || 800;
-          return r.bottom < h * 0.25 || r.top > h * 0.75;
-        })
+        .evaluate(
+          (el) => {
+            const r = el.getBoundingClientRect(),
+              h = innerHeight || 800;
+            return r.bottom < h * 0.25 || r.top > h * 0.75;
+          },
+          undefined,
+          { timeout: 3000 },
+        )
         .catch(() => false);
       if (offscreen) await center(css);
       if (
@@ -127,6 +202,7 @@ export async function watchBumperVideo(input: {
       ) {
         recovered = true;
         await center(css);
+        await ensureUnmuted();
         await play().catch(() => {});
         if (current.videoPaused && current.videoPlayCSS && !clicked) {
           guard();
@@ -138,15 +214,19 @@ export async function watchBumperVideo(input: {
         throw Error('视频播放长时间未推进，未执行本帖互动');
     }
   } finally {
-    if (input.sound && css) {
+    if (!completed && input.sound && css) {
       try {
         guard();
         await page
           .locator(css)
           .first()
-          .evaluate((el) => {
-            if (el instanceof HTMLVideoElement) el.muted = true;
-          });
+          .evaluate(
+            (el) => {
+              if (el instanceof HTMLVideoElement) el.muted = true;
+            },
+            undefined,
+            { timeout: 2000 },
+          );
       } catch {
         /* Revocation owns cleanup after stop. */
       }

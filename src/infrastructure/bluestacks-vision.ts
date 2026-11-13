@@ -55,6 +55,12 @@ export interface LitePostCard {
   cardBounds: RectBounds;
 }
 
+export interface LiteInlineVideoControls {
+  videoBounds: RectBounds | null;
+  soundBounds: RectBounds | null;
+  ended: boolean;
+}
+
 export function makeCanonicalRect(x1: number, y1: number, x2: number, y2: number): RectBounds {
   const cx1 = Math.max(0, Math.min(CANONICAL_WIDTH, Math.round(x1)));
   const cy1 = Math.max(0, Math.min(CANONICAL_HEIGHT, Math.round(y1)));
@@ -492,17 +498,26 @@ export function extractPostCards(root: LiteXmlNode | null): LitePostCard[] {
   for (const node of all) {
     const b = node.bounds;
     if (b.x1 > 4 || b.x2 < 896 || b.h < 66 || b.h > 118 || b.y1 < 76 || b.y2 > maxSafeY) continue;
-    const first = node.children[0];
-    if (!first || first.bounds.y1 < 96 || node.children.length < 2) continue;
-    const second = node.children.find((c) => c.bounds.x1 >= 78 && c.bounds.x1 <= 134);
-    if (
-      first.bounds.x1 <= 42 &&
-      first.bounds.x2 >= 68 &&
-      first.bounds.x2 <= 118 &&
-      first.bounds.w >= 42 &&
-      first.bounds.w <= 88 &&
-      second
-    ) {
+    if (node.children.length < 2) continue;
+
+    // In dumpsys activity top, FB Lite Page timelines without a Story ring draw the circular avatar
+    // after the author/more-menu blocks (children[2] instead of children[0]). Match spatially.
+    const avatarNode = node.children.find(
+      (c) =>
+        c.bounds.x1 <= 42 &&
+        c.bounds.x2 >= 66 &&
+        c.bounds.x2 <= 118 &&
+        c.bounds.w >= 42 &&
+        c.bounds.w <= 88 &&
+        c.bounds.h >= 42 &&
+        c.bounds.h <= 88 &&
+        c.bounds.y1 >= 84 &&
+        c.bounds.cy >= 110,
+    );
+    const second = node.children.find(
+      (c) => c !== avatarNode && c.bounds.x1 >= 78 && c.bounds.x1 <= 134,
+    );
+    if (avatarNode && second) {
       const sortedSub = [...second.children].sort((a, bSub) => a.bounds.y1 - bSub.bounds.y1);
       const clickableAuthorNode = sortedSub.find(
         (c) => c.clickable && c.bounds.x1 <= 124 && c.bounds.y1 <= second.bounds.y1 + 18,
@@ -522,12 +537,20 @@ export function extractPostCards(root: LiteXmlNode | null): LitePostCard[] {
       const tsX2 = tsNode ? Math.min(420, Math.max(190, tsNode.bounds.x2 + 28)) : 320;
       const timestampBounds = makeRect(84, tsY1, tsX2, Math.min(b.y2 + 6, tsY2));
       const moreNode =
-        node.children.find((c) => c.clickable && c.bounds.x1 >= 790 && c.bounds.x2 <= 900) ?? null;
+        node.children.find(
+          (c) =>
+            c !== avatarNode &&
+            c !== second &&
+            c.clickable &&
+            c.bounds.x1 >= 790 &&
+            c.bounds.x2 <= 900 &&
+            c.bounds.cy >= 110,
+        ) ?? null;
       if (!moreNode) continue;
       if (!headers.some((h) => Math.abs(h.bounds.y1 - b.y1) < 25)) {
         headers.push({
           bounds: b,
-          avatarBounds: first.bounds,
+          avatarBounds: avatarNode.bounds,
           authorNameBounds,
           timestampBounds,
           moreMenuBounds: moreNode.bounds,
@@ -561,6 +584,116 @@ export function extractPostCards(root: LiteXmlNode | null): LitePostCard[] {
     });
   }
   return cards;
+}
+
+export function hasPageTopBar(root: LiteXmlNode | null): boolean {
+  if (!root) return false;
+  const all = flattenLiteNodes(root);
+  const hasBack = all.some(
+    (n) =>
+      n.clickable &&
+      n.bounds.x1 <= 12 &&
+      n.bounds.x2 <= 96 &&
+      n.bounds.y1 >= 28 &&
+      n.bounds.y2 <= 112,
+  );
+  const hasRightAction = all.some(
+    (n) =>
+      n.clickable &&
+      n.bounds.x1 >= 730 &&
+      n.bounds.x2 <= 900 &&
+      n.bounds.y1 >= 28 &&
+      n.bounds.y2 <= 112,
+  );
+  return hasBack && hasRightAction;
+}
+
+export function extractInlineVideoControls(
+  root: LiteXmlNode | null,
+  minY: number,
+  maxY: number,
+  headerOnScreen = true,
+): LiteInlineVideoControls {
+  if (!root || maxY <= minY) {
+    return { videoBounds: null, soundBounds: null, ended: false };
+  }
+  const all = flattenLiteNodes(root);
+  let videoBounds: RectBounds | null = null;
+  let soundBounds: RectBounds | null = null;
+  let ended = false;
+
+  const matchesCardVerticalSpan = (b: RectBounds): boolean =>
+    headerOnScreen
+      ? b.y1 >= minY - 110 && b.y2 > minY + 32 && b.y1 < maxY - 24 && b.y2 <= maxY + 80
+      : b.y2 > 140 && b.y1 < maxY - 24 && b.y2 <= maxY + 80;
+
+  for (const n of all) {
+    if (
+      /(?:^|:id\/)video_view$/i.test(n.resourceId) &&
+      n.bounds.h >= 160 &&
+      matchesCardVerticalSpan(n.bounds)
+    ) {
+      if (!videoBounds || n.bounds.h > videoBounds.h) {
+        videoBounds = n.bounds;
+      }
+    }
+    if (
+      /(?:^|:id\/)(?:carbon_)?sound_image_view$/i.test(n.resourceId) &&
+      n.bounds.w >= 32 &&
+      n.bounds.h >= 32 &&
+      n.bounds.x1 >= 720 &&
+      n.bounds.y1 >= Math.max(108, headerOnScreen ? minY - 12 : 108) &&
+      n.bounds.y2 <= Math.min(1492, maxY + 24)
+    ) {
+      soundBounds = n.bounds;
+    }
+    if (
+      /(?:^|:id\/)end_of_video_cta$/i.test(n.resourceId) &&
+      n.bounds.h >= 120 &&
+      matchesCardVerticalSpan(n.bounds)
+    ) {
+      ended = true;
+    }
+  }
+
+  return { videoBounds, soundBounds, ended };
+}
+
+export function hasPageHeroHeader(root: LiteXmlNode | null): boolean {
+  if (!root) return false;
+  const { feedNodes } = selectMainFeedScope(root);
+  const hasHeroAvatar = feedNodes.some(
+    (n) =>
+      n.bounds.w >= 180 &&
+      n.bounds.w <= 360 &&
+      n.bounds.h >= 180 &&
+      n.bounds.h <= 360 &&
+      Math.abs(n.bounds.cx - 450) <= 45 &&
+      n.bounds.y1 >= 160 &&
+      n.bounds.y1 <= 460,
+  );
+  if (hasHeroAvatar) return true;
+  const hasLeftCta = feedNodes.some(
+    (n) =>
+      n.clickable &&
+      n.bounds.x1 <= 32 &&
+      Math.abs(n.bounds.x2 - 444) <= 26 &&
+      n.bounds.h >= 40 &&
+      n.bounds.h <= 80 &&
+      n.bounds.y1 >= 420 &&
+      n.bounds.y2 <= 1050,
+  );
+  const hasRightCta = feedNodes.some(
+    (n) =>
+      n.clickable &&
+      Math.abs(n.bounds.x1 - 456) <= 26 &&
+      n.bounds.x2 >= 868 &&
+      n.bounds.h >= 40 &&
+      n.bounds.h <= 80 &&
+      n.bounds.y1 >= 420 &&
+      n.bounds.y2 <= 1050,
+  );
+  return hasLeftCta && hasRightCta;
 }
 
 export function findSeeMoreButtonNode(root: LiteXmlNode | null): LiteXmlNode | null {
@@ -745,6 +878,55 @@ export async function isLikeButtonBlue(pngBuffer: Buffer, bounds: RectBounds): P
   return bluePixels >= 20;
 }
 
+export async function detectVideoSpeakerState(
+  pngBuffer: Buffer,
+  soundBounds: RectBounds,
+): Promise<'muted' | 'unmuted' | 'unknown'> {
+  const frame = await getCanonicalFrame(pngBuffer);
+  if (!frame) return 'unknown';
+  const crop = clampCrop(soundBounds.x1, soundBounds.y1, soundBounds.w, soundBounds.h, 24);
+  if (!crop) return 'unknown';
+  try {
+    const { createCanvas } = await import('@napi-rs/canvas');
+    const norm = createCanvas(60, 60);
+    const ctx = norm.getContext('2d');
+    ctx.drawImage(frame.canvas, crop.left, crop.top, crop.width, crop.height, 0, 0, 60, 60);
+    const { data } = ctx.getImageData(0, 0, 60, 60);
+    let darkBg = 0;
+    let coneBright = 0;
+    let waveBright = 0;
+    for (let y = 0; y < 60; y++) {
+      for (let x = 0; x < 60; x++) {
+        const idx = (y * 60 + x) * 4;
+        const r = data[idx] ?? 0;
+        const g = data[idx + 1] ?? 0;
+        const b = data[idx + 2] ?? 0;
+        const dx = x - 30;
+        const dy = y - 30;
+        if (dx * dx + dy * dy <= 24 * 24 && r < 95 && g < 95 && b < 95) {
+          darkBg++;
+        }
+        if (r < 175 || g < 175 || b < 175) continue;
+        if (x >= 15 && x <= 28 && y >= 22 && y <= 37) {
+          coneBright++;
+        }
+        const inTopWave = x >= 31 && x <= 48 && y >= 17 && y <= 23;
+        const inBottomWave = x >= 31 && x <= 48 && y >= 36 && y <= 41;
+        const inOuterWave = x >= 41 && x <= 48 && y >= 20 && y <= 39;
+        if (inTopWave || inBottomWave || inOuterWave) {
+          waveBright++;
+        }
+      }
+    }
+    if (darkBg < 320 || coneBright < 24) return 'unknown';
+    if (waveBright >= 20) return 'unmuted';
+    if (waveBright <= 6) return 'muted';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 function regionMeanBrightnessSync(
   frame: CanonicalFrame,
   left: number,
@@ -882,10 +1064,10 @@ function rgbaToNormalizedSignature(rgba: Uint8ClampedArray): Float32Array | null
     normSq += v * v;
   }
   const norm = Math.sqrt(normSq);
-  if (norm > 1e-5) {
-    for (let i = 0; i < vec.length; i++) {
-      vec[i] = (vec[i] ?? 0) / norm;
-    }
+  // Reject near-flat/blank white regions so two short-text posts never false-match
+  if (norm < 160) return null;
+  for (let i = 0; i < vec.length; i++) {
+    vec[i] = (vec[i] ?? 0) / norm;
   }
   return vec;
 }
@@ -900,13 +1082,10 @@ export async function getRegionSignature(
   if (!crop) return null;
   try {
     const { createCanvas } = await import('@napi-rs/canvas');
-    const c = createCanvas(24, 24);
+    const c = createCanvas(32, 24);
     const ctx = c.getContext('2d');
-    const side = Math.min(crop.width, crop.height);
-    const sx = crop.left + (crop.width - side) / 2;
-    const sy = crop.top + (crop.height - side) / 2;
-    ctx.drawImage(frame.canvas, sx, sy, side, side, 0, 0, 24, 24);
-    return rgbaToNormalizedSignature(ctx.getImageData(0, 0, 24, 24).data);
+    ctx.drawImage(frame.canvas, crop.left, crop.top, crop.width, crop.height, 0, 0, 32, 24);
+    return rgbaToNormalizedSignature(ctx.getImageData(0, 0, 32, 24).data);
   } catch {
     return null;
   }
@@ -1074,14 +1253,82 @@ export async function compareAvatarToRegion(
   return best;
 }
 
+function hashToNumericPostId(seed: string): string {
+  return BigInt('0x' + createHash('sha256').update(seed).digest('hex').slice(0, 14)).toString(10);
+}
+
 export async function resolveSharePostUrl(
   rawUrl: string,
   fallbackGroupId: string,
+  mode: 'group' | 'page' = 'group',
 ): Promise<{ postId: string; postUrl: string }> {
   const cleaned = rawUrl.trim();
   const extractFromUrl = (uStr: string): { postId: string; postUrl: string } | null => {
     try {
       const u = new URL(uStr);
+      if (mode === 'page') {
+        const reelMatch = /^\/reel\/(\d+)/i.exec(u.pathname);
+        if (reelMatch?.[1]) {
+          return {
+            postId: reelMatch[1],
+            postUrl: `https://www.facebook.com/reel/${reelMatch[1]}/`,
+          };
+        }
+        const pageVideoMatch =
+          /^\/([^/]+)\/videos\/(?:[^/]+\/)?(\d+)/i.exec(u.pathname) ??
+          /^\/videos\/(\d+)/i.exec(u.pathname);
+        if (pageVideoMatch) {
+          const vid = pageVideoMatch[2] ?? pageVideoMatch[1];
+          const owner = pageVideoMatch[2] ? pageVideoMatch[1] : fallbackGroupId;
+          if (vid && /^\d+$/.test(vid)) {
+            return {
+              postId: vid,
+              postUrl: owner
+                ? `https://www.facebook.com/${encodeURIComponent(owner)}/videos/${vid}/`
+                : `https://www.facebook.com/watch/?v=${vid}`,
+            };
+          }
+        }
+        const watchVid =
+          u.pathname === '/watch/' || u.pathname === '/watch' ? u.searchParams.get('v') : null;
+        if (watchVid && /^\d+$/.test(watchVid)) {
+          return {
+            postId: watchVid,
+            postUrl: `https://www.facebook.com/watch/?v=${watchVid}`,
+          };
+        }
+        const storyFbid = u.searchParams.get('story_fbid')?.trim() ?? '';
+        const ownerId = u.searchParams.get('id')?.trim() || fallbackGroupId;
+        if (storyFbid) {
+          const postId = /^\d+$/.test(storyFbid) ? storyFbid : hashToNumericPostId(storyFbid);
+          return {
+            postId,
+            postUrl: `https://www.facebook.com/permalink.php?story_fbid=${encodeURIComponent(storyFbid)}&id=${encodeURIComponent(ownerId)}`,
+          };
+        }
+        const pagePostMatch =
+          /^\/(?!groups\/|share\/)([^/]+)\/(?:posts|permalink)\/([^/?#]+)/i.exec(u.pathname);
+        if (pagePostMatch?.[1] && pagePostMatch[2]) {
+          const owner = pagePostMatch[1];
+          const rawPid = pagePostMatch[2];
+          const postId = /^\d+$/.test(rawPid) ? rawPid : hashToNumericPostId(rawPid);
+          return {
+            postId,
+            postUrl: `https://www.facebook.com/${encodeURIComponent(owner)}/posts/${encodeURIComponent(rawPid)}/`,
+          };
+        }
+        const fbid = u.searchParams.get('fbid')?.trim() ?? /pcb\.(\d+)/.exec(u.href)?.[1] ?? '';
+        if (fbid && /^\d+$/.test(fbid)) {
+          return {
+            postId: fbid,
+            postUrl: u.searchParams.get('fbid')
+              ? `https://www.facebook.com/photo.php?fbid=${fbid}`
+              : `https://www.facebook.com/${encodeURIComponent(fallbackGroupId)}/posts/${fbid}/`,
+          };
+        }
+        return null;
+      }
+
       const m = /^\/groups\/([^/]+)\/(?:posts|permalink)\/(\d+)/i.exec(u.pathname);
       const pid =
         m?.[2] ??
@@ -1122,14 +1369,27 @@ export async function resolveSharePostUrl(
     }
   }
 
-  const hashDigits = BigInt(
-    '0x' + createHash('sha256').update(cleaned).digest('hex').slice(0, 14),
-  ).toString(10);
+  const hashDigits = hashToNumericPostId(cleaned);
+  let cleanFallbackUrl = cleaned;
+  if (cleaned.startsWith('http')) {
+    try {
+      const u = new URL(cleaned);
+      u.searchParams.delete('app');
+      u.searchParams.delete('mibextid');
+      u.searchParams.delete('rdid');
+      u.searchParams.delete('share_url');
+      cleanFallbackUrl = u.toString();
+    } catch {
+      cleanFallbackUrl = cleaned;
+    }
+  }
   return {
     postId: hashDigits,
     postUrl: cleaned.startsWith('http')
-      ? cleaned
-      : `https://www.facebook.com/groups/${encodeURIComponent(fallbackGroupId)}/posts/${hashDigits}/`,
+      ? cleanFallbackUrl
+      : mode === 'page'
+        ? `https://www.facebook.com/${encodeURIComponent(fallbackGroupId)}/posts/${hashDigits}/`
+        : `https://www.facebook.com/groups/${encodeURIComponent(fallbackGroupId)}/posts/${hashDigits}/`,
   };
 }
 

@@ -15,8 +15,11 @@ import type { GroupInviterService } from '../../application/group-inviter-servic
 import type { BluestacksService } from '../../application/bluestacks-service.js';
 import type { TaskService } from '../../application/task-service.js';
 import type { Awaitable } from '../../domain/persistence.js';
+import { bluestacksDisplayTitle, type BluestacksInstance } from '../../shared/bluestacks.js';
+import type { BrowserWindowPort } from '../../shared/browser-window.js';
 import { isLocalAvatar } from '../../shared/group-bumper.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
+import type { WindowLayoutPort } from '../../shared/window-layout.js';
 import type { AgentBrowserManager, AgentBrowserSessionSummary } from './agent-browser-manager.js';
 
 export interface McpDiagnosticCaptureInput {
@@ -90,6 +93,8 @@ export interface WorkbenchMcpDependencies {
   bluestacksService: BluestacksService;
   agentBrowser: AgentBrowserManager;
   profileLifecycle?: ProfileLifecyclePort | undefined;
+  browserWindow?: BrowserWindowPort | undefined;
+  windowLayout?: WindowLayoutPort | undefined;
   captureDiagnostics?:
     ((input?: McpDiagnosticCaptureInput) => Awaitable<McpDiagnosticCaptureOutput>) | undefined;
   devDiagFilePath: string;
@@ -496,6 +501,110 @@ export async function resolveProfileIds(
     const trimmed = raw.trim();
     if (!trimmed) continue;
     const id = resolveProfileIdentifierFromList(profiles, trimmed);
+    if (!seen.has(id)) {
+      seen.add(id);
+      resolved.push(id);
+    }
+  }
+  return resolved;
+}
+
+export function resolveBluestacksInstanceIdentifierFromList(
+  instances: readonly BluestacksInstance[],
+  rawQuery: string,
+): string {
+  const query = rawQuery.trim();
+  if (!query) {
+    throw new ProductError('BLUESTACKS_INSTANCE_ID_REQUIRED', '蓝蝶窗口标识不能为空', 400);
+  }
+  const lower = query.toLowerCase();
+
+  // 1. Exact UUID match
+  const exactById = instances.find((inst) => inst.id.toLowerCase() === lower);
+  if (exactById) return exactById.id;
+
+  const pickUniqueOrSingleOnline = (candidates: readonly BluestacksInstance[]): string => {
+    if (candidates.length === 1 && candidates[0]) return candidates[0].id;
+    const onlineOnes = candidates.filter((c) => c.online);
+    if (onlineOnes.length === 1 && onlineOnes[0]) return onlineOnes[0].id;
+    const candidateLabels = candidates
+      .slice(0, 6)
+      .map(
+        (c) =>
+          `${bluestacksDisplayTitle(c)} (id=${c.id}, port=${c.adbPort}, account=${c.accountName || '未知'}, online=${c.online})`,
+      )
+      .join('；');
+    throw new ProductError(
+      'AMBIGUOUS_BLUESTACKS_IDENTIFIER',
+      `标识 "${query}" 同时匹配到多个蓝蝶窗口，请改传明确的实例 UUID 或端口：${candidateLabels}`,
+      409,
+    );
+  };
+
+  // 2. Exact match on displayTitle / displayName / alias / instanceKey / accountName / accountId / serial / adbPort
+  const exactLabelMatches = instances.filter((inst) => {
+    const portStr = String(inst.adbPort);
+    const fields = [
+      bluestacksDisplayTitle(inst),
+      inst.displayName,
+      inst.alias ?? '',
+      inst.instanceKey,
+      inst.accountName,
+      inst.accountId,
+      inst.serial,
+      portStr,
+      `:${portStr}`,
+    ];
+    return fields.some((v) => v.trim().length > 0 && v.trim().toLowerCase() === lower);
+  });
+  if (exactLabelMatches.length > 0) {
+    return pickUniqueOrSingleOnline(exactLabelMatches);
+  }
+
+  // 3. Fuzzy substring match when query has >= 2 chars
+  if (lower.length >= 2) {
+    const fuzzyMatches = instances.filter((inst) =>
+      [
+        bluestacksDisplayTitle(inst),
+        inst.displayName,
+        inst.alias ?? '',
+        inst.instanceKey,
+        inst.accountName,
+        inst.accountId,
+        inst.serial,
+      ].some((v) => v.trim().length > 0 && v.trim().toLowerCase().includes(lower)),
+    );
+    if (fuzzyMatches.length > 0) {
+      return pickUniqueOrSingleOnline(fuzzyMatches);
+    }
+  }
+
+  const onlineHints = instances
+    .filter((inst) => inst.online)
+    .slice(0, 8)
+    .map(
+      (inst) =>
+        `${bluestacksDisplayTitle(inst)} (id=${inst.id}, port=${inst.adbPort}${inst.accountName ? `, 账号=${inst.accountName}` : ''})`,
+    )
+    .join('；');
+  throw new ProductError(
+    'BLUESTACKS_INSTANCE_NOT_FOUND',
+    `未找到匹配 "${query}" 的蓝蝶窗口。${onlineHints ? `当前在线蓝蝶窗口：${onlineHints}` : '当前无在线蓝蝶窗口'}`,
+    404,
+  );
+}
+
+export function resolveBluestacksInstanceIds(
+  instances: readonly BluestacksInstance[],
+  rawQueries: readonly string[],
+): string[] {
+  if (rawQueries.length === 0) return [];
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawQueries) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const id = resolveBluestacksInstanceIdentifierFromList(instances, trimmed);
     if (!seen.has(id)) {
       seen.add(id);
       resolved.push(id);
