@@ -145,6 +145,8 @@ export class GroupBumperService {
   private groupSlotsInUse = 0;
   private pageSlotsInUse = 0;
   private fallbackPageSettings?: BumperSettings;
+  private liveGroupSettings = new Set<BumperSettings>();
+  private livePageSettings = new Set<BumperSettings>();
   private workers = new Map<string, Promise<void>>();
   private profiles = new Map<string, BumperProfileStat>();
   private pageProfiles = new Map<string, BumperProfileStat>();
@@ -561,16 +563,22 @@ export class GroupBumperService {
       case 'pages/delete':
         await this.repo.deleteTargets('pages', input);
         break;
-      case 'settings':
-        await this.repo.saveSettings(input);
+      case 'settings': {
+        const saved = (await this.repo.saveSettings(input)) ?? BumperSettings.parse(input);
+        for (const live of this.liveGroupSettings) Object.assign(live, saved);
         break;
-      case 'page-settings':
+      }
+      case 'page-settings': {
+        let saved: BumperSettings;
         if (this.repo.savePageSettings) {
-          await this.repo.savePageSettings(input);
+          saved = (await this.repo.savePageSettings(input)) ?? BumperSettings.parse(input);
         } else {
-          this.fallbackPageSettings = BumperSettings.parse(input);
+          saved = BumperSettings.parse(input);
+          this.fallbackPageSettings = saved;
         }
+        for (const live of this.livePageSettings) Object.assign(live, saved);
         break;
+      }
       case 'comments':
         await this.repo.saveComments(input, 'group');
         break;
@@ -782,12 +790,13 @@ export class GroupBumperService {
         mode === 'page-bumper' ? '请选择已保存的目标专页' : '请选择已保存的小组和目标主页',
         400,
       );
-    const settings =
+    const rawSettings =
       mode === 'page-bumper'
         ? this.repo.pageSettings
           ? await this.repo.pageSettings()
           : (this.fallbackPageSettings ?? (await this.repo.settings()))
         : await this.repo.settings();
+    const settings: BumperSettings = { ...rawSettings };
     if (
       executionMode === 'live' &&
       settings.likeProbability === 0 &&
@@ -970,6 +979,13 @@ export class GroupBumperService {
           if (!this.hasActiveExecutionInMode(mode)) setStatus('本轮已结束');
         });
       }
+      if (launched > 0) {
+        const liveSet = mode === 'page-bumper' ? this.livePageSettings : this.liveGroupSettings;
+        liveSet.add(settings);
+        void Promise.allSettled(workerPromises).finally(() => {
+          liveSet.delete(settings);
+        });
+      }
       const runningCount = [...this.active].filter((id) => this.modeOf(id) === mode).length;
       setStatus(
         launched
@@ -994,14 +1010,14 @@ export class GroupBumperService {
   }
   private async acquireSlot(
     id: string,
-    max: number,
+    getMax: () => number,
     stat: BumperProfileStat,
     runId: string,
     mode: BumperMode,
   ) {
     let queued = false;
     const getSlots = () => (mode === 'page-bumper' ? this.pageSlotsInUse : this.groupSlotsInUse);
-    while (getSlots() >= Math.max(1, max)) {
+    while (getSlots() >= Math.max(1, getMax())) {
       if (this.cancelled.has(id) || this.profileRunIds.get(id) !== runId) return false;
       if (!queued) {
         queued = true;
@@ -1037,7 +1053,13 @@ export class GroupBumperService {
       for (let left = delay; left > 0 && !this.cancelled.has(id); left -= 100)
         await new Promise((r) => setTimeout(r, Math.min(100, left)));
       if (!this.cancelled.has(id))
-        slot = await this.acquireSlot(id, settings.maxConcurrentProfiles ?? 8, stat, runId, mode);
+        slot = await this.acquireSlot(
+          id,
+          () => settings.maxConcurrentProfiles ?? 8,
+          stat,
+          runId,
+          mode,
+        );
       if (slot && !this.cancelled.has(id)) {
         if (stat.status === '排队等待并发槽位…') stat.status = '准备中';
         await this.runner.run(id, groups, pages, settings, {

@@ -732,3 +732,428 @@ it('watchBumperVideo clicks speaker button when sound=true so speaker icon turns
   expect(video.muted).toBe(false);
   expect(speakerMuted).toBe(false);
 });
+
+it('watchBumperVideo starts paused CometVideoPlayer first, hovers with force:true over sibling overlay, and clicks speaker button without poisoning el.muted beforehand', async () => {
+  vi.useFakeTimers();
+  const video = document.createElement('video');
+  document.body.append(video);
+  rect(video);
+  video.muted = true;
+  video.volume = 0.2;
+  let paused = true;
+  Object.defineProperty(video, 'paused', {
+    configurable: true,
+    get: () => paused,
+  });
+  video.scrollIntoView = vi.fn();
+  let mutedWhenPlayStarted: boolean | null = null;
+  video.play = vi.fn(async () => {
+    mutedWhenPlayStarted = video.muted;
+    paused = false;
+  });
+
+  let controlBarMounted = false;
+  let speakerMuted = true;
+  let speakerClicks = 0;
+  const hoverForceFlags: boolean[] = [];
+  const audioSelector = `[data-wb-bumper-video-audio="${postId}"]`;
+
+  const page = {
+    locator: (sel: string) => ({
+      first() {
+        return this;
+      },
+      evaluate: async (fn: Function, arg?: unknown) => {
+        const el = sel === audioSelector ? document.createElement('div') : video;
+        return fn(el, arg);
+      },
+      hover: async (opts?: { force?: boolean }) => {
+        hoverForceFlags.push(Boolean(opts?.force));
+        if (!opts?.force) {
+          throw new Error('TimeoutError: subtree intercepts pointer events');
+        }
+        // CometVideoPlayer only mounts bottom speaker control once playback has started
+        if (!paused) {
+          controlBarMounted = true;
+        }
+      },
+      click: async () => {
+        if (sel === audioSelector) {
+          speakerClicks++;
+          speakerMuted = false;
+          video.muted = false;
+        }
+      },
+    }),
+  } as unknown as Page;
+
+  let reads = 0;
+  const initial = {
+    postId,
+    feedbackId: 'fb',
+    videoCSS: 'video',
+    videoAudioCSS: null,
+    videoMuted: true,
+    videoCurrentTime: 0,
+    videoFrames: 0,
+    videoPaused: true,
+  } as BumperPost;
+
+  const p = watchBumperVideo({
+    page,
+    initial,
+    guard: () => {},
+    readCurrent: async () => {
+      if (!paused) reads++;
+      return {
+        ...initial,
+        videoPaused: paused,
+        videoAudioCSS: controlBarMounted ? audioSelector : null,
+        videoMuted: video.muted,
+        ...(controlBarMounted ? { videoSpeakerMuted: speakerMuted } : {}),
+        videoCurrentTime: reads,
+        videoFrames: reads * 30,
+      };
+    },
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    sound: true,
+    budgetMs: 2500,
+    tickMs: 800,
+    stallMs: 3000,
+  });
+  await vi.runAllTimersAsync();
+  expect(await p).toBe('budget');
+  expect(mutedWhenPlayStarted).toBe(true);
+  expect(hoverForceFlags.length).toBeGreaterThanOrEqual(1);
+  expect(hoverForceFlags.every(Boolean)).toBe(true);
+  expect(speakerClicks).toBe(1);
+  expect(speakerMuted).toBe(false);
+  expect(video.muted).toBe(false);
+});
+
+it('projectGroupBumper resolves videoCSS and videoAudioCSS for shared/attached Reel inside a Group post without absorbing comment videos', () => {
+  header('MEMBER');
+  const outerPostId = '1533589038599880';
+  const attachedReelId = '1471153598436852';
+  const a = document.createElement('div');
+  a.setAttribute('role', 'article');
+  a.innerHTML = `
+    <a href="/groups/${gid}/user/${actor}/">Goal of Faith Victory</a>
+    <a href="/groups/${gid}/posts/${outerPostId}/">8m</a>
+    <a href="/reel/${attachedReelId}/?group_id=${gid}&s=group">34s Reels</a>
+    <div id="reelAttachment">
+      <video id="sharedReelVideo" src="https://video.xx.fbcdn.net/reel.mp4"></video>
+      <div role="button" id="sharedReelSpeaker" aria-label="取消静音"></div>
+    </div>
+    <button id="outerLike" data-ad-rendering-role="like_button">Like</button>
+    <div role="article" id="commentItem">
+      <video id="commentVideo"></video>
+      <div role="button" id="commentSpeaker" aria-label="取消静音"></div>
+    </div>
+  `;
+  const main = document.querySelector('main');
+  if (!main) throw new Error('missing main');
+  main.append(a);
+  for (const e of [a, ...a.querySelectorAll('*')]) rect(e);
+
+  const outerStory = {
+    __id: btoa('group_share:' + outerPostId),
+    post_id: outerPostId,
+    actors: [{ id: actor }],
+    feedback: { id: 'feedback-' + outerPostId },
+    creation_time: Date.now() / 1000 - 480,
+  };
+  const outerCard = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story: outerStory },
+    return: null,
+  };
+  Reflect.set(a, '__reactFiber$test', outerCard);
+
+  const innerLogger = {
+    type: { displayName: 'CometFeedStoryClickLoggerContainer.react' },
+    memoizedProps: {
+      story: {
+        __id: btoa('attached_reel:' + attachedReelId),
+        post_id: attachedReelId,
+      },
+    },
+    return: outerCard,
+  };
+  const reelAttachment = a.querySelector('#reelAttachment');
+  const sharedVideo = a.querySelector<HTMLVideoElement>('#sharedReelVideo');
+  const sharedSpeaker = a.querySelector('#sharedReelSpeaker');
+  const outerLike = a.querySelector('#outerLike');
+  const commentItem = a.querySelector('#commentItem');
+  const commentVideo = a.querySelector('#commentVideo');
+  const commentSpeaker = a.querySelector('#commentSpeaker');
+  if (
+    !reelAttachment ||
+    !sharedVideo ||
+    !sharedSpeaker ||
+    !outerLike ||
+    !commentItem ||
+    !commentVideo ||
+    !commentSpeaker
+  ) {
+    throw new Error('missing fixture nodes');
+  }
+  sharedVideo.muted = true;
+  Reflect.set(reelAttachment, '__reactFiber$test', innerLogger);
+  Reflect.set(sharedVideo, '__reactFiber$test', {
+    type: 'video',
+    memoizedProps: {},
+    return: innerLogger,
+  });
+  Reflect.set(sharedSpeaker, '__reactFiber$test', {
+    type: { displayName: 'ReelsAudioButton.react' },
+    memoizedProps: { isMuted: true },
+    return: innerLogger,
+  });
+  fiber(
+    outerLike,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'feedback-' + outerPostId } },
+    outerCard,
+  );
+  const commentRowFiber = {
+    type: { displayName: 'CometUFICommentRow.react' },
+    memoizedProps: { comment: { id: 'c1', body: { text: 'amen' } }, depth: 0 },
+    return: outerCard,
+  };
+  Reflect.set(commentItem, '__reactFiber$test', commentRowFiber);
+  Reflect.set(commentVideo, '__reactFiber$test', {
+    type: 'video',
+    memoizedProps: {},
+    return: commentRowFiber,
+  });
+  Reflect.set(commentSpeaker, '__reactFiber$test', {
+    type: 'div',
+    memoizedProps: {},
+    return: commentRowFiber,
+  });
+
+  const surface = projectGroupBumper({ groupId: gid });
+  const post = surface.posts.find((p) => p.postId === outerPostId);
+  expect(post).toBeDefined();
+  expect(post?.authorId).toBe(actor);
+  expect(post?.likeCSS).toBe(`[data-wb-bumper-like="${outerPostId}"]`);
+  expect(post?.hasVideo).toBe(true);
+  expect(post?.videoCSS).toBe(`[data-wb-bumper-video="${outerPostId}"]`);
+  expect(post?.videoAudioCSS).toBe(`[data-wb-bumper-video-audio="${outerPostId}"]`);
+  expect(post?.videoSpeakerMuted).toBe(true);
+  expect(sharedVideo.getAttribute('data-wb-bumper-video')).toBe(outerPostId);
+  expect(sharedSpeaker.getAttribute('data-wb-bumper-video-audio')).toBe(outerPostId);
+  expect(commentVideo.getAttribute('data-wb-bumper-video')).toBeNull();
+  expect(commentSpeaker.getAttribute('data-wb-bumper-video-audio')).toBeNull();
+});
+
+it('projectGroupBumper matches top-right speaker button nested inside <a href="/reel/..."> wrapper and survives alternate Fiber re-render while rejecting external link buttons', () => {
+  header('MEMBER');
+  const outerPostId = '1871483144196559';
+  const attachedReelId = '1639415287921451';
+  const a = document.createElement('div');
+  a.setAttribute('role', 'article');
+  a.innerHTML = `
+    <a href="/groups/${gid}/user/${actor}/">Jesus Loves You</a>
+    <a href="/groups/${gid}/posts/${outerPostId}/">7h</a>
+    <a id="externalLink" href="https://example.com/promo">
+      <div role="button" id="fakeLinkSpeaker" aria-label="取消静音">Fake</div>
+    </a>
+    <a id="reelCardAnchor" href="/reel/${attachedReelId}/?group_id=${gid}&s=group">
+      <video id="anchorReelVideo" playsinline></video>
+      <div tabindex="0" role="button" id="anchorReelSpeaker" aria-label="取消静音"></div>
+    </a>
+    <button id="outerLike2" data-ad-rendering-role="like_button">Like</button>
+  `;
+  const main = document.querySelector('main');
+  if (!main) throw new Error('missing main');
+  main.append(a);
+  for (const e of [a, ...a.querySelectorAll('*')]) rect(e);
+
+  const outerStory = {
+    __id: btoa('group_reel_anchor:' + outerPostId),
+    post_id: outerPostId,
+    actors: [{ id: actor }],
+    feedback: { id: 'feedback-' + outerPostId },
+    creation_time: Date.now() / 1000 - 600,
+  };
+  const outerCard = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story: outerStory },
+    return: null,
+    alternate: null as unknown,
+  };
+  Reflect.set(a, '__reactFiber$test', outerCard);
+
+  const innerLogger = {
+    type: { displayName: 'CometFeedStoryClickLoggerContainer.react' },
+    memoizedProps: {
+      story: {
+        __id: btoa('reel_inner:' + attachedReelId),
+        post_id: attachedReelId,
+      },
+    },
+    return: outerCard,
+  };
+  const reelAnchor = a.querySelector('#reelCardAnchor');
+  const reelVideo = a.querySelector<HTMLVideoElement>('#anchorReelVideo');
+  const reelSpeaker = a.querySelector('#anchorReelSpeaker');
+  const fakeLinkSpeaker = a.querySelector('#fakeLinkSpeaker');
+  const outerLike2 = a.querySelector('#outerLike2');
+  if (!reelAnchor || !reelVideo || !reelSpeaker || !fakeLinkSpeaker || !outerLike2) {
+    throw new Error('missing anchor reel fixture nodes');
+  }
+  Reflect.set(reelAnchor, '__reactFiber$test', innerLogger);
+  Reflect.set(reelVideo, '__reactFiber$test', {
+    type: 'video',
+    memoizedProps: {},
+    return: innerLogger,
+  });
+  Reflect.set(reelSpeaker, '__reactFiber$test', {
+    type: 'div',
+    memoizedProps: { 'aria-label': '取消静音' },
+    return: innerLogger,
+  });
+  fiber(
+    outerLike2,
+    'CometUFIReactButtonBase.react',
+    { feedback: { id: 'feedback-' + outerPostId } },
+    outerCard,
+  );
+
+  const beforeClick = projectGroupBumper({ groupId: gid });
+  const postBefore = beforeClick.posts.find((p) => p.postId === outerPostId);
+  expect(postBefore?.videoAudioCSS).toBe(`[data-wb-bumper-video-audio="${outerPostId}"]`);
+  expect(postBefore?.videoSpeakerMuted).toBe(true);
+  expect(reelSpeaker.getAttribute('data-wb-bumper-video-audio')).toBe(outerPostId);
+  expect(fakeLinkSpeaker.getAttribute('data-wb-bumper-video-audio')).toBeNull();
+
+  // Simulate React double-buffered alternate Fiber commit when speaker flips to 静音
+  reelSpeaker.setAttribute('aria-label', '静音');
+  const alternateOuterCard = {
+    type: { displayName: 'CometFeedUnitCard.react' },
+    memoizedProps: { story: outerStory },
+    return: null,
+    alternate: outerCard,
+  };
+  outerCard.alternate = alternateOuterCard;
+  const alternateLogger = {
+    ...innerLogger,
+    return: alternateOuterCard,
+  };
+  Reflect.set(reelSpeaker, '__reactFiber$test', {
+    type: 'div',
+    memoizedProps: { 'aria-label': '静音' },
+    return: alternateLogger,
+  });
+
+  const afterClick = projectGroupBumper({ groupId: gid, targetPostId: outerPostId });
+  const postAfter = afterClick.posts.find((p) => p.postId === outerPostId);
+  expect(postAfter?.videoAudioCSS).toBe(`[data-wb-bumper-video-audio="${outerPostId}"]`);
+  expect(postAfter?.videoSpeakerMuted).toBe(false);
+});
+
+it('watchBumperVideo scrolls top-right Reel speaker icon out from behind sticky header in tiled 602px windows before clicking', async () => {
+  vi.useFakeTimers();
+  Object.defineProperty(window, 'innerHeight', { value: 602, configurable: true });
+  const video = document.createElement('video');
+  const speaker = document.createElement('div');
+  speaker.setAttribute('role', 'button');
+  document.body.append(video, speaker);
+  rect(video);
+  let speakerTop = -40;
+  const syncSpeakerRect = () => {
+    speaker.getBoundingClientRect = () => ({
+      x: 700,
+      y: speakerTop,
+      left: 700,
+      top: speakerTop,
+      right: 732,
+      bottom: speakerTop + 32,
+      width: 32,
+      height: 32,
+      toJSON: () => ({}),
+    });
+  };
+  syncSpeakerRect();
+  const scrollSpy = vi.spyOn(window, 'scrollBy').mockImplementation(((
+    xOrOpts?: number | ScrollToOptions,
+    y?: number,
+  ) => {
+    const dy = typeof xOrOpts === 'number' ? (y ?? 0) : (xOrOpts?.top ?? 0);
+    speakerTop -= dy;
+    syncSpeakerRect();
+  }) as typeof window.scrollBy);
+
+  video.muted = true;
+  video.scrollIntoView = vi.fn();
+  video.play = vi.fn(async () => {});
+  let speakerMuted = true;
+  let speakerTopAtClick: number | null = null;
+  const audioSelector = `[data-wb-bumper-video-audio="${postId}"]`;
+  const page = {
+    locator: (sel: string) => ({
+      first() {
+        return this;
+      },
+      evaluate: async (fn: Function, arg?: unknown) =>
+        fn(sel === audioSelector ? speaker : video, arg),
+      hover: async () => {},
+      click: async () => {
+        if (sel === audioSelector) {
+          speakerTopAtClick = speakerTop;
+          speakerMuted = false;
+          video.muted = false;
+        }
+      },
+    }),
+  } as unknown as Page;
+
+  let reads = 0;
+  let summaryObserved: { speakerConfirmedUnmuted: boolean; unmuteClicks: number } | null = null;
+  const initial = {
+    postId,
+    feedbackId: 'fb',
+    videoCSS: 'video',
+    videoAudioCSS: audioSelector,
+    videoMuted: true,
+    videoSpeakerMuted: true,
+    videoCurrentTime: 0,
+    videoFrames: 0,
+    videoPaused: false,
+  } as BumperPost;
+
+  const p = watchBumperVideo({
+    page,
+    initial,
+    guard: () => {},
+    readCurrent: async () => {
+      reads++;
+      return {
+        ...initial,
+        videoMuted: video.muted,
+        videoSpeakerMuted: speakerMuted,
+        videoCurrentTime: reads,
+        videoFrames: reads * 30,
+      };
+    },
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    sound: true,
+    budgetMs: 1800,
+    tickMs: 800,
+    stallMs: 3000,
+    onSummary: (s) => {
+      summaryObserved = {
+        speakerConfirmedUnmuted: s.speakerConfirmedUnmuted,
+        unmuteClicks: s.unmuteClicks,
+      };
+    },
+  });
+  await vi.runAllTimersAsync();
+  expect(await p).toBe('budget');
+  expect(scrollSpy).toHaveBeenCalled();
+  expect(speakerTopAtClick).not.toBeNull();
+  expect(speakerTopAtClick!).toBeGreaterThanOrEqual(148);
+  expect(summaryObserved).toEqual({ speakerConfirmedUnmuted: true, unmuteClicks: 1 });
+});

@@ -4027,6 +4027,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                               budgetMs: maxWatchMs,
                               tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
                               stallMs: Math.max(120, Math.round(12000 * this.paceScale)),
+                              onSummary: (summary) => {
+                                devDiag.record({
+                                  level: 'INFO',
+                                  category: 'GROUP_BUMPER',
+                                  event: 'BUMPER_VIDEO_WATCH',
+                                  profileId,
+                                  data: {
+                                    groupId: group.id,
+                                    postId: refreshedPost.postId,
+                                    sound: Boolean(settings.enableSound),
+                                    ...summary,
+                                  },
+                                });
+                              },
                             });
                           } else {
                             callbacks.status(

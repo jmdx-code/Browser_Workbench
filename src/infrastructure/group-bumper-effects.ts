@@ -1191,7 +1191,10 @@ export function projectGroupBumper(input: {
         }
       }
     }
-    const markerRank = single ? 3 : primaryCard ? 2 : 1;
+    const isCompleteFeedUnitCard = Boolean(
+      primaryCard && /CometFeedUnitCard|CometFeedUnitErrorBoundary/.test(primaryCard.name),
+    );
+    const markerRank = single ? 4 : isCompleteFeedUnitCard ? 3 : primaryCard ? 2 : 1;
     mark(article, 'data-wb-bumper-post', postId, markerRank);
     if (like) {
       if (reactionState === 'unknown' && like.getAttribute('aria-pressed') === 'false')
@@ -1234,8 +1237,59 @@ export function projectGroupBumper(input: {
       authorAvatarUrl ??= imageURL(link);
       if (authorAvatarUrl) break;
     }
+    const findEnclosingFeedUnitCard = (el: Element) => {
+      const direct = chain(el, 256).find(
+        (f) =>
+          /CometFeedUnitCard|CometFeedUnitErrorBoundary/.test(f.name) &&
+          record(f.props.story ?? f.props.feedUnit),
+      );
+      if (direct) return direct;
+      let parent = el.parentElement;
+      for (
+        let depth = 0;
+        parent && article.contains(parent) && depth < 48;
+        depth++, parent = parent.parentElement
+      ) {
+        const candidate = chain(parent, 256).find(
+          (f) =>
+            /CometFeedUnitCard|CometFeedUnitErrorBoundary/.test(f.name) &&
+            record(f.props.story ?? f.props.feedUnit),
+        );
+        if (candidate) return candidate;
+      }
+      return undefined;
+    };
+    // Shared/attached Reels or videos inside a Group post carry an inner attachment
+    // ClickLogger story while still belonging to the outer Group post's FeedUnitCard.
+    // Media playback & speaker controls may resolve from that attached player, while
+    // postId/author/UFI stay strictly bound via belongsToStory.
+    const belongsToPostMedia = (el: Element) => {
+      if (commentRow(el)) return false;
+      if (belongsToStory(el)) return true;
+      const nestedArticle = el.closest('[role="article"]');
+      if (
+        nestedArticle &&
+        nestedArticle !== article &&
+        (!article.contains(nestedArticle) || commentRow(nestedArticle))
+      ) {
+        return false;
+      }
+      if (single) return article.contains(el);
+      if (!isCompleteFeedUnitCard || !primaryCard) return false;
+      const enclosingCard = findEnclosingFeedUnitCard(el);
+      if (!enclosingCard) return false;
+      if (
+        enclosingCard.fiber === primaryCard.fiber ||
+        enclosingCard.fiber.alternate === primaryCard.fiber
+      ) {
+        return true;
+      }
+      const enclosingStory = obj(enclosingCard.props.story ?? enclosingCard.props.feedUnit);
+      const enclosingKey = text(enclosingStory.__id ?? enclosingStory.id);
+      return !!storyKey && enclosingKey === storyKey;
+    };
     const candidateVideos = Array.from(article.querySelectorAll<HTMLVideoElement>('video')).filter(
-      (v) => !commentRow(v) && belongsToStory(v),
+      (v) => !commentRow(v) && belongsToPostMedia(v),
     );
     const videoEl =
       candidateVideos.filter(belongsToStory).find(visible) ??
@@ -1249,7 +1303,7 @@ export function projectGroupBumper(input: {
         article.querySelectorAll(
           '[data-pagelet*="video" i],a[href*="/reel/"],a[href*="/videos/"],a[href*="/watch/"]',
         ),
-      ).some(belongsToStory);
+      ).some(belongsToPostMedia);
     let hasVideo = false,
       videoCurrentTime = 0,
       videoDuration: number | null = null,
@@ -1257,18 +1311,17 @@ export function projectGroupBumper(input: {
     let videoPlayCSS: string | null = null;
     let videoAudioCSS: string | null = null;
     let videoSpeakerMuted: boolean | undefined = undefined;
-    const playControl = controls
-      .filter(belongsToStory)
-      .find(
-        (el) =>
-          el.matches('[role="button"],button') &&
-          visible(el) &&
-          chain(el).some(
-            (f) =>
-              (/VideoPlayerPlayButton/.test(f.name) && f.props.isVisible !== false) ||
-              (/VideoPlayerPlaybackControlBase/.test(f.name) && f.props.playbackIcon === 'play'),
-          ),
+    const isPlayControl = (el: HTMLElement) =>
+      el.matches('[role="button"],button') &&
+      visible(el) &&
+      chain(el).some(
+        (f) =>
+          (/VideoPlayerPlayButton/.test(f.name) && f.props.isVisible !== false) ||
+          (/VideoPlayerPlaybackControlBase/.test(f.name) && f.props.playbackIcon === 'play'),
       );
+    const playControl =
+      controls.filter(belongsToStory).find(isPlayControl) ??
+      controls.filter(belongsToPostMedia).find(isPlayControl);
     if (playControl) {
       mark(playControl, 'data-wb-bumper-video-play', postId, markerRank);
       videoPlayCSS = '[data-wb-bumper-video-play="' + postId + '"]';
@@ -1276,9 +1329,9 @@ export function projectGroupBumper(input: {
     if (videoEl || hasVideoContainer) {
       hasVideo = true;
       const unmuteLabelRx =
-        /^(?:Unmute(?:\s+(?:video|audio))?|Turn on sound|Tap to unmute|Click to unmute|取消静音|取消靜音|开启声音|開啟聲音|打开声音|打開聲音|点击开启声音|點擊開啟聲音|Bật âm thanh|เปิดเสียง|အသံဖွင့်(?:ပါ)?|Nyalakan suara)$/i;
+        /^(?:Unmute(?:\s+(?:video|audio))?|Turn on (?:sound|audio)|Sound is off|Tap to unmute|Click to unmute|取消(?:视频)?静音|取消(?:影片)?靜音|开启(?:视频)?声音|開啟(?:影片)?聲音|打开(?:视频)?声音|打開(?:影片)?聲音|点击开启声音|點擊開啟聲音|恢复声音|恢復聲音|Bật âm thanh|เปิดเสียง|အသံဖွင့်(?:ပါ)?|Nyalakan suara)$/i;
       const muteLabelRx =
-        /^(?:Mute(?:\s+(?:video|audio))?|Turn off sound|Tap to mute|Click to mute|静音|靜音|关闭声音|關閉聲音|Tắt âm thanh|ปิดเสียง|အသံပိတ်(?:ပါ)?|Matikan suara)$/i;
+        /^(?:Mute(?:\s+(?:video|audio))?|Turn off (?:sound|audio)|Sound is on|Tap to mute|Click to mute|(?:将视频)?静音|(?:將影片)?靜音|关闭(?:视频)?声音|關閉(?:影片)?聲音|Tắt âm thanh|ปิดเสียง|အသံပိတ်(?:ပါ)?|Matikan suara)$/i;
       const audioControlBoxReady = (el: Element | null): el is HTMLElement => {
         if (!(el instanceof HTMLElement)) return false;
         const r = el.getBoundingClientRect();
@@ -1290,11 +1343,21 @@ export function projectGroupBumper(input: {
         el: Element,
         allowZeroOpacityOverlay: boolean,
       ): el is HTMLElement => {
+        const enclosingAnchor = el.closest('a[href]');
+        const isInlineMediaCardAnchor =
+          !!enclosingAnchor &&
+          article.contains(enclosingAnchor) &&
+          Boolean(
+            (videoEl && enclosingAnchor.contains(videoEl)) ||
+            /\/(?:reel|reels|videos|watch)(?:\/|\?|$)/i.test(
+              enclosingAnchor.getAttribute('href') ?? '',
+            ),
+          );
         if (
           !el.matches('[role="button"],button') ||
           commentRow(el) ||
           el.matches('a[href]') ||
-          el.closest('a[href]') ||
+          (enclosingAnchor && !isInlineMediaCardAnchor) ||
           !(visible(el) || (allowZeroOpacityOverlay && audioControlBoxReady(el)))
         )
           return false;
@@ -1313,10 +1376,13 @@ export function projectGroupBumper(input: {
         );
       };
       const storyControls = controls.filter(belongsToStory);
+      const mediaControls = controls.filter(belongsToPostMedia);
       const audioControl =
         storyControls.find((el) => matchesAudioControl(el, false)) ??
+        mediaControls.find((el) => matchesAudioControl(el, false)) ??
         (videoEl && visible(videoEl)
-          ? storyControls.find((el) => matchesAudioControl(el, true))
+          ? (storyControls.find((el) => matchesAudioControl(el, true)) ??
+            mediaControls.find((el) => matchesAudioControl(el, true)))
           : undefined);
       if (audioControl) {
         mark(audioControl, 'data-wb-bumper-video-audio', postId, markerRank);

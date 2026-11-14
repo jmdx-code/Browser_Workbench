@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { ChromeKernelBackend } from '../extension/kernel-backend.js';
+import {
+  GroupBumperService,
+  type BumperRepository,
+} from '../src/application/group-bumper-service.js';
 import { FacebookGroupSessionHelper } from '../src/infrastructure/facebook-group-session.js';
 import { requireBumperPost } from '../src/infrastructure/group-bumper-runner.js';
 import type { BumperPost } from '../src/infrastructure/group-bumper-effects.js';
-import type { BumperTarget } from '../src/shared/group-bumper.js';
+import { BumperSettings, type BumperTarget } from '../src/shared/group-bumper.js';
 
 function makeBumperPost(overrides: Partial<BumperPost> = {}): BumperPost {
   return {
@@ -220,4 +224,87 @@ test('Issue 3: passive revealOwnedPage(proof, false) and armTaskPresentation nev
     if (presentationTimer) clearInterval(presentationTimer);
     Reflect.set(globalThis, 'chrome', prevChrome);
   }
+});
+
+test('GroupBumperService live-updates active worker settings when enableSound is toggled mid-run', async () => {
+  const profileId = randomUUID();
+  let storedSettings = BumperSettings.parse({ enableSound: false });
+  const groupTarget: BumperTarget = {
+    id: '1088761839749271',
+    name: 'သမ္မာကျမ်းစာ',
+    avatarUrl: null,
+    folderId: null,
+    sortOrder: 0,
+    totalBumpedCount: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const pageTarget: BumperTarget = {
+    id: '61587441638801',
+    name: 'ယေရှု၏ဖိတ်ခေါ်သံတော်',
+    avatarUrl: null,
+    folderId: null,
+    sortOrder: 0,
+    totalBumpedCount: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  let observedBeforeToggle: boolean | null = null;
+  let observedAfterToggle: boolean | null = null;
+  const latches: { releaseWorker?: () => void; markEntered?: () => void } = {};
+  const workerEntered = new Promise<void>((resolve) => {
+    latches.markEntered = resolve;
+  });
+
+  const repo: BumperRepository = {
+    settings: () => storedSettings,
+    saveSettings: (input) => {
+      storedSettings = BumperSettings.parse(input);
+      return storedSettings;
+    },
+    targets: (kind) => (kind === 'groups' ? [groupTarget] : [pageTarget]),
+    upsertTargets: () => [],
+    deleteTargets: () => 0,
+    saveComments: () => [],
+    logs: () => [],
+    deleteLogs: () => 0,
+    todayCounts: () => ({}),
+  };
+
+  const service = new GroupBumperService(
+    repo,
+    {
+      ready: () => true,
+      busy: async () => false,
+      run: async (_id, _groups, _pages, liveSettings) => {
+        observedBeforeToggle = Boolean(liveSettings.enableSound);
+        latches.markEntered?.();
+        await new Promise<void>((resolve) => {
+          latches.releaseWorker = resolve;
+        });
+        observedAfterToggle = Boolean(liveSettings.enableSound);
+      },
+      stop: async () => {
+        latches.releaseWorker?.();
+      },
+    },
+    async () => ({ comments: [], total: 0 }),
+    () => {},
+    undefined,
+    0,
+  );
+
+  await service.start({
+    profileIds: [profileId],
+    groupIds: [groupTarget.id],
+    pageIds: [pageTarget.id],
+  });
+  await workerEntered;
+  assert.equal(observedBeforeToggle, false);
+
+  await service.manage('settings', { ...storedSettings, enableSound: true });
+  latches.releaseWorker?.();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(observedAfterToggle, true);
 });

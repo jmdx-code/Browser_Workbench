@@ -118,6 +118,7 @@ export class BluestacksService {
   private readonly pageProfileStats = new Map<string, BumperProfileStat>();
   private readonly activeWorkers = new Map<string, Promise<void>>();
   private readonly activeWorkerModes = new Map<string, BluestacksBumperMode>();
+  private readonly activeWorkerSettings = new Map<string, BumperSettings>();
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly queuedTasks: QueuedBluestacksTask[] = [];
   private readonly launchingIds = new Set<string>();
@@ -345,6 +346,8 @@ export class BluestacksService {
     }
     for (const [id, m] of this.activeWorkerModes.entries()) {
       if (m === 'group') {
+        const live = this.activeWorkerSettings.get(id);
+        if (live) Object.assign(live, saved);
         void this.devices.setInstanceSoundEnabled?.(id, Boolean(saved.enableSound)).catch(() => {});
       }
     }
@@ -363,6 +366,8 @@ export class BluestacksService {
     }
     for (const [id, m] of this.activeWorkerModes.entries()) {
       if (m === 'page') {
+        const live = this.activeWorkerSettings.get(id);
+        if (live) Object.assign(live, saved);
         void this.devices.setInstanceSoundEnabled?.(id, Boolean(saved.enableSound)).catch(() => {});
       }
     }
@@ -706,10 +711,13 @@ export class BluestacksService {
           continue;
         }
         const slotIndex = this.activeWorkers.size;
+        nextTask.settings = { ...nextTask.settings };
         this.activeWorkerModes.set(nextTask.instanceId, nextTask.mode);
+        this.activeWorkerSettings.set(nextTask.instanceId, nextTask.settings);
         const workerPromise = this.executeInstanceTask(nextTask, slotIndex * 650).finally(() => {
           this.activeWorkers.delete(nextTask.instanceId);
           this.activeWorkerModes.delete(nextTask.instanceId);
+          this.activeWorkerSettings.delete(nextTask.instanceId);
           this.abortControllers.delete(nextTask.instanceId);
           if (nextTask.mode === 'page') {
             if (this.hasActiveExecution('page')) {
