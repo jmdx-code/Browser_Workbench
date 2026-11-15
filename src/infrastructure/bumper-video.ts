@@ -24,7 +24,7 @@ export async function watchBumperVideo(input: {
 }) {
   const { page, guard, sleep } = input;
   const tick = input.tickMs ?? 1000,
-    stall = input.stallMs ?? 12000;
+    stall = input.stallMs ?? 25000;
   const start = performance.now(),
     deadline = start + (input.budgetMs ?? 180000);
   let current = input.initial,
@@ -188,27 +188,16 @@ export async function watchBumperVideo(input: {
     if (current.videoAudioCSS && speakerNeedsClick && unmuteClicks < 3) {
       unmuteClicks++;
       await clickSpeakerControl(current.videoAudioCSS);
-      await sleep(Math.min(200, tick));
-      current = await read().catch(() => current);
-      css = current.videoCSS ?? css;
-      // If normal click hit an animating/covered control and speaker stayed muted, fallback to DOM click once.
-      if (current.videoAudioCSS && current.videoSpeakerMuted === true && unmuteClicks < 3) {
-        unmuteClicks++;
-        guard();
-        await page
-          .locator(current.videoAudioCSS)
-          .first()
-          .evaluate(
-            (el) => {
-              if (el instanceof HTMLElement) el.click();
-            },
-            undefined,
-            { timeout: 2000 },
-          )
-          .catch(() => {});
-        await sleep(Math.min(200, tick));
+      const pollWindow = Math.min(1200, Math.max(200, Math.round(tick * 1.2)));
+      const pollStep = Math.min(300, Math.max(50, Math.round(tick * 0.3)));
+      let waited = 0;
+      while (waited < pollWindow) {
+        const step = Math.min(pollStep, pollWindow - waited);
+        await sleep(step);
+        waited += step;
         current = await read().catch(() => current);
         css = current.videoCSS ?? css;
+        if (current.videoSpeakerMuted === false) break;
       }
     }
   };
@@ -302,7 +291,8 @@ export async function watchBumperVideo(input: {
       lastFrames = current.videoFrames ?? 0,
       lastProgress = performance.now(),
       progressed = false,
-      recovered = false,
+      recoveryAttempts = 0,
+      lastRecoveryAt = 0,
       missing = 0;
     while (true) {
       guard();
@@ -333,7 +323,8 @@ export async function watchBumperVideo(input: {
       if (time > lastTime + 0.03 || frames > lastFrames) {
         progressed = true;
         lastProgress = performance.now();
-        recovered = false;
+        recoveryAttempts = 0;
+        lastRecoveryAt = 0;
       }
       if (lastTime >= 3 && time + 1.5 < lastTime && progressed) {
         return finish('ended');
@@ -367,11 +358,15 @@ export async function watchBumperVideo(input: {
         )
         .catch(() => false);
       if (offscreen) await center(css);
+      const wakeupInterval = Math.min(5000, Math.max(250, Math.round(stall / 4)));
+      const nowForWakeup = performance.now();
       if (
-        !recovered &&
-        (current.videoPaused || performance.now() - lastProgress >= Math.min(4000, stall / 2))
+        recoveryAttempts < 3 &&
+        (lastRecoveryAt === 0 || nowForWakeup - lastRecoveryAt >= wakeupInterval) &&
+        (current.videoPaused || nowForWakeup - lastProgress >= Math.min(4000, stall / 2))
       ) {
-        recovered = true;
+        recoveryAttempts++;
+        lastRecoveryAt = nowForWakeup;
         await center(css);
         if (current.videoPaused && current.videoPlayCSS && !clicked) {
           guard();

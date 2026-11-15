@@ -1,23 +1,35 @@
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 if (!process.versions.electron) {
+  const fixtureDir = path.join(os.tmpdir(), 'wb-feed-projection-fixture-' + randomUUID());
   const child = spawn(
     path.resolve('node_modules/electron/dist/electron.exe'),
     [path.resolve('scripts/facebook-feed-projection-fixture.mjs')],
-    { windowsHide: true, stdio: 'inherit' },
+    {
+      windowsHide: true,
+      stdio: 'inherit',
+      env: { ...process.env, WB_FEED_FIXTURE_DIR: fixtureDir },
+    },
   );
   const code = await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', resolve);
   });
-  if (code !== 0) process.exitCode = 1;
+  if (code === 0) {
+    await rm(fixtureDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(
+      () => {},
+    );
+  } else process.exitCode = 1;
 } else {
   const { app, BrowserWindow } = await import('electron');
-  const directory = path.resolve('audit/feed-projection-fixture-' + randomUUID());
+  const directory = process.env.WB_FEED_FIXTURE_DIR
+    ? path.resolve(process.env.WB_FEED_FIXTURE_DIR)
+    : path.join(os.tmpdir(), 'wb-feed-projection-fixture-' + randomUUID());
   await mkdir(directory, { recursive: true });
   app.setPath('userData', path.join(directory, 'user'));
   void run();

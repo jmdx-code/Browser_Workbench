@@ -63,7 +63,8 @@ function failureReason(error: unknown): InspectionReasonCode {
     return 'INSPECTION_CONNECTION_CHANGED';
   if (['KERNEL_RPC_RESULT_UNKNOWN', 'KERNEL_RPC_SEND_UNKNOWN'].includes(message))
     return 'INSPECTION_TRANSPORT_UNCONFIRMED';
-  if (message === 'KERNEL_DEBUGGER_DETACHED') return 'INSPECTION_CONTROL_INTERRUPTED';
+  if (message === 'KERNEL_DEBUGGER_DETACHED' || message === 'KERNEL_DEBUGGER_CANCELED_BY_USER')
+    return 'INSPECTION_CONTROL_INTERRUPTED';
   if (
     ['FACEBOOK_READ_CAPABILITY_REQUIRED', 'FACEBOOK_RICH_READ_CAPABILITY_REQUIRED'].includes(
       message,

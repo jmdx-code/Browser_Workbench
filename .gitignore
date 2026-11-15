@@ -22,7 +22,6 @@ audit/
 *.webm
 *.zip
 /启动*.cmd
-!/启动可测试工作台.cmd
 /核对发帖分享对象.cmd
 /config/publication-acceptance-scope.json
 /vendor/media-runtime/

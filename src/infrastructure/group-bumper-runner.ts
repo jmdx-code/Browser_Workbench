@@ -958,16 +958,72 @@ function extractTargetCandidateInPage(input: {
     summary,
   };
 }
+export const BUMPER_DEBUGGER_CANCELED_MESSAGE =
+  '调试横幅已被手动取消，已停止顶贴（运行中请勿点击浏览器顶部“取消”）';
+export function isBumperDebuggerCanceledByUser(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  return /KERNEL_DEBUGGER_CANCELED_BY_USER|调试横幅已被手动取消/.test(msg);
+}
+export function formatBumperDisconnectReason(raw: unknown): string {
+  const rawMsg = raw instanceof Error ? raw.message : String(raw ?? '');
+  const cleaned =
+    rawMsg
+      .replace(/\u001b\[[0-9;]*m/g, '')
+      .split(/\r?\nCall log:/)[0]
+      ?.split(/\r?\n/)[0]
+      ?.trim() || rawMsg.trim();
+  if (/KERNEL_DEBUGGER_CANCELED_BY_USER|调试横幅已被手动取消/.test(cleaned)) {
+    return '调试横幅已被手动取消';
+  }
+  if (/KERNEL_DEBUGGER_DETACHED|Inspector\.detached/i.test(cleaned)) {
+    return '浏览器调试连接已断开';
+  }
+  if (
+    /Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Navigation failed because page was closed|Session closed/i.test(
+      cleaned,
+    )
+  ) {
+    return '任务标签页被关闭或调试连接已断开';
+  }
+  if (
+    /Execution context was destroyed|Cannot find context|FRAME_DETACHED|Frame was detached/i.test(
+      cleaned,
+    )
+  ) {
+    return '页面发生跳转或刷新';
+  }
+  if (/KERNEL_CONNECTION_LOST|BROWSER_OFFLINE/i.test(cleaned)) {
+    return '浏览器扩展连接暂时中断';
+  }
+  if (
+    /KERNEL_(?:CONTROL_STOPPED|FENCED|LEASE|CONTEXT|BOUND_EXECUTION|OPERATION_CONTEXT|PEER_NOT_IDLE)|SESSION_CHANGED|CONNECTION_CHANGED|账号控制已失效|浏览器连接已变化/i.test(
+      cleaned,
+    )
+  ) {
+    return '浏览器控制会话已切换';
+  }
+  if (/KERNEL_RPC_(?:RESULT_UNKNOWN|SEND_UNKNOWN)|KERNEL_EXECUTE_TIMEOUT/i.test(cleaned)) {
+    return '浏览器响应超时';
+  }
+  return cleaned.slice(0, 120) || '连接中断';
+}
+function isRawDisconnectTechnicalError(raw: unknown): boolean {
+  const msg = raw instanceof Error ? raw.message : String(raw ?? '');
+  return /KERNEL_(?:DEBUGGER_|CONNECTION_LOST|CONTROL_STOPPED|RPC_SEND_UNKNOWN|FENCED|CONTEXT|LEASE|BOUND_EXECUTION|OPERATION_CONTEXT|RPC_RESULT_UNKNOWN|PEER_NOT_IDLE|EXECUTE_TIMEOUT)|SESSION_CHANGED|CONNECTION_CHANGED|Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Navigation failed because page was closed|Session closed|Inspector\.detached|FRAME_DETACHED|Frame was detached|Execution context was destroyed|Cannot find context|BROWSER_OFFLINE/i.test(
+    msg,
+  );
+}
 export function isBumperFatal(error: unknown): boolean {
   return (
     error instanceof BumperFatalError ||
     (error instanceof Error &&
-      /KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|CONTROL_STOPPED|RPC_SEND_UNKNOWN|FENCED|CONTEXT|LEASE|BOUND_EXECUTION|OPERATION_(?:CONTEXT|REVIEW)|RPC_RESULT_UNKNOWN)|SESSION_CHANGED|CONNECTION_CHANGED|Target.*closed|Browser.*closed|FRAME_DETACHED/i.test(
+      /KERNEL_(?:DEBUGGER_(?:DETACHED|CANCELED_BY_USER)|CONNECTION_LOST|CONTROL_STOPPED|RPC_SEND_UNKNOWN|FENCED|CONTEXT|LEASE|BOUND_EXECUTION|OPERATION_(?:CONTEXT|REVIEW)|RPC_RESULT_UNKNOWN)|SESSION_CHANGED|CONNECTION_CHANGED|Target.*closed|Browser.*closed|FRAME_DETACHED/i.test(
         error.message,
       ))
   );
 }
 export function isBumperRecoverableDisconnectError(error: unknown): boolean {
+  if (isBumperDebuggerCanceledByUser(error)) return false;
   if (error instanceof BumperSetupUnconfirmed) return true;
   if (error instanceof BumperFatalError) {
     return /^浏览器连接已变化$/.test(error.message);
@@ -2323,6 +2379,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       }
       throw new BumperFatalError('等待浏览器重连超时，已停止顶贴');
     };
+    let activeConn: Awaited<ReturnType<typeof kernel.connectFacebook>> | undefined;
+    const isCanceledByUserDetach = (err?: unknown): boolean => {
+      if (isBumperDebuggerCanceledByUser(err)) return true;
+      if (activeConn?.failureReason === 'KERNEL_DEBUGGER_CANCELED_BY_USER') return true;
+      if (
+        kernel.lastSessionFailureReason?.(profileId, epoch) === 'KERNEL_DEBUGGER_CANCELED_BY_USER'
+      ) {
+        return true;
+      }
+      return false;
+    };
     let preparedConnection: Awaited<ReturnType<typeof prepareConnection>> | undefined;
     try {
       let lastStartupErr: unknown;
@@ -2336,6 +2403,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         } catch (startupErr) {
           lastStartupErr = startupErr;
           if (callbacks.cancelled()) throw new BumperFatalError('已停止');
+          if (isCanceledByUserDetach(startupErr)) {
+            throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+          }
           if (startupErr instanceof BumperFatalError && startupErr.message !== '浏览器连接已变化') {
             throw startupErr;
           }
@@ -2351,6 +2421,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       }
       if (!preparedConnection) throw lastStartupErr ?? Error('未能建立顶贴控制连接');
     } catch (error) {
+      const finalStartupErr = isCanceledByUserDetach(error)
+        ? new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE)
+        : !(error instanceof BumperFatalError) && isRawDisconnectTechnicalError(error)
+          ? new Error(`未能建立顶贴控制连接（${formatBumperDisconnectReason(error)}）`)
+          : error;
       devDiag.record({
         level: 'WARN',
         category: 'GROUP_BUMPER',
@@ -2358,10 +2433,11 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         profileId,
         reason: error instanceof Error ? error.message : String(error),
       });
-      throw error;
+      throw finalStartupErr;
     }
     let identity = preparedConnection.identity;
     let conn = preparedConnection.connection;
+    activeConn = conn;
     const accountId = identity.actor.accountId;
     if (identity.proof?.browserSessionEpoch && initialBrowserSessionEpoch === null) {
       initialBrowserSessionEpoch = identity.proof.browserSessionEpoch;
@@ -2407,6 +2483,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         throw new BumperFatalError('登录账号已变化，已停止顶贴');
       }
       conn = nextConn;
+      activeConn = nextConn;
       identity = nextIdentity;
       this.connections.set(profileId, conn);
       this.closing.set(profileId, {
@@ -2505,13 +2582,20 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     let consecutiveNoProgressRecoveries = 0;
     let recoveryPromise: Promise<void> | null = null;
     const recoverBumperSession = async (reason: string): Promise<void> => {
+      if (isCanceledByUserDetach(reason)) {
+        throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+      }
       if (recoveryPromise) return recoveryPromise;
       const runRecovery = async () => {
+        if (isCanceledByUserDetach(reason)) {
+          throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+        }
+        const displayReason = formatBumperDisconnectReason(reason);
         if (consecutiveNoProgressRecoveries >= 2) {
-          throw new BumperFatalError(`连续 2 次中断恢复无实质进展，已停止顶贴（${reason}）`);
+          throw new BumperFatalError(`连续 2 次中断恢复无实质进展，已停止顶贴（${displayReason}）`);
         }
         consecutiveNoProgressRecoveries++;
-        callbacks.status('连接中断，正在恢复 · ' + reason);
+        callbacks.status('连接中断，正在恢复 · ' + displayReason);
         await waitPeerOnlineAndSynced(15_000);
         await this.stop(profileId);
         await waitPeerOnlineAndIdle(12_000);
@@ -2600,10 +2684,17 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             this.connections.get(profileId) === conn ? this.stop(profileId) : Promise.resolve(),
         });
       } catch (error) {
-        if (submission && !reviewed)
+        if (isCanceledByUserDetach(error)) {
+          throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+        }
+        if (submission && !reviewed && !isBumperRecoverableDisconnectError(error))
           reportIssue({
             kind: 'failed',
-            reason: error instanceof Error ? error.message : String(error),
+            reason: isRawDisconnectTechnicalError(error)
+              ? formatBumperDisconnectReason(error)
+              : error instanceof Error
+                ? error.message
+                : String(error),
           });
         if (!(error instanceof BumperSetupUnconfirmed)) throw error;
         // Dispose this uncertain setup only after a real stop, then resume with a fresh lease.
@@ -3998,85 +4089,122 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       continue;
                     }
                     // Pre-like/comment mandatory human-like browsing dwell inside bound op
+                    const isDeterministicPostSkipError = (err: unknown): boolean => {
+                      const msg = err instanceof Error ? err.message : String(err ?? '');
+                      return /目标帖子仍在加载或控件未就绪|视频播放器未加载|视频未实际播放|视频播放长时间未推进|视频节点已变化/.test(
+                        msg,
+                      );
+                    };
                     if (!activePostState.browseDone) {
-                      await op(
+                      const browseOutcome = await op(
                         post.hasVideo ? '观看目标视频' : '浏览目标帖子',
-                        async () => {
-                          const maxWatchMs = Math.round(180_000 * this.paceScale);
-                          // A scan supplies a candidate ID, never a durable DOM locator.
-                          const refreshedPost = await prepareBumperPost({
-                            page,
-                            readCurrent: checkPost,
-                            guard,
-                            candidateCardCSS: post.postCSS,
-                            paceScale: this.paceScale,
-                          });
-                          expectedFeedbackId = refreshedPost.feedbackId;
-                          if (refreshedPost.hasVideo) {
-                            callbacks.status(
-                              `正在观看视频 · ${group.name} · ${target.name}`,
-                              q.today,
-                            );
-                            await watchBumperVideo({
+                        async (): Promise<{ ok: true } | { ok: false; skippedReason: string }> => {
+                          try {
+                            const maxWatchMs = Math.round(180_000 * this.paceScale);
+                            // A scan supplies a candidate ID, never a durable DOM locator.
+                            const refreshedPost = await prepareBumperPost({
                               page,
-                              initial: refreshedPost,
                               readCurrent: checkPost,
                               guard,
-                              sleep: (ms) => paceWait(ms / (this.paceScale || 1)),
-                              sound: Boolean(settings.enableSound),
-                              budgetMs: maxWatchMs,
-                              tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
-                              stallMs: Math.max(120, Math.round(12000 * this.paceScale)),
-                              onSummary: (summary) => {
-                                devDiag.record({
-                                  level: 'INFO',
-                                  category: 'GROUP_BUMPER',
-                                  event: 'BUMPER_VIDEO_WATCH',
-                                  profileId,
-                                  data: {
-                                    groupId: group.id,
-                                    postId: refreshedPost.postId,
-                                    sound: Boolean(settings.enableSound),
-                                    ...summary,
-                                  },
-                                });
-                              },
+                              candidateCardCSS: post.postCSS,
+                              paceScale: this.paceScale,
                             });
-                          } else {
-                            callbacks.status(
-                              `正在浏览目标帖子 · ${group.name} · ${target.name}`,
-                              q.today,
-                            );
-                            const totalDwell = Math.round(
-                              (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
-                            );
-                            await paceWait(totalDwell / (this.paceScale || 1));
-                            guard();
-                            const latest = await checkPost();
-                            const latestAnchor =
-                              latest.likeCSS ??
-                              latest.commentButtonCSS ??
-                              latest.commentCSS ??
-                              latest.videoCSS ??
-                              latest.postCSS;
-                            if (latestAnchor) {
-                              await revealBumperControlIfNeeded(
-                                page.locator(latestAnchor).first(),
-                                this.paceScale,
-                              ).catch(() => {});
+                            expectedFeedbackId = refreshedPost.feedbackId;
+                            if (refreshedPost.hasVideo) {
+                              callbacks.status(
+                                `正在观看视频 · ${group.name} · ${target.name}`,
+                                q.today,
+                              );
+                              await watchBumperVideo({
+                                page,
+                                initial: refreshedPost,
+                                readCurrent: checkPost,
+                                guard,
+                                sleep: (ms) => paceWait(ms / (this.paceScale || 1)),
+                                sound: Boolean(settings.enableSound),
+                                budgetMs: maxWatchMs,
+                                tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
+                                stallMs: Math.max(120, Math.round(25000 * this.paceScale)),
+                                onSummary: (summary) => {
+                                  devDiag.record({
+                                    level: 'INFO',
+                                    category: 'GROUP_BUMPER',
+                                    event: 'BUMPER_VIDEO_WATCH',
+                                    profileId,
+                                    data: {
+                                      groupId: group.id,
+                                      postId: refreshedPost.postId,
+                                      sound: Boolean(settings.enableSound),
+                                      ...summary,
+                                    },
+                                  });
+                                },
+                              });
+                            } else {
+                              callbacks.status(
+                                `正在浏览目标帖子 · ${group.name} · ${target.name}`,
+                                q.today,
+                              );
+                              const totalDwell = Math.round(
+                                (3000 + Math.floor(Math.random() * 2001)) * this.paceScale,
+                              );
+                              await paceWait(totalDwell / (this.paceScale || 1));
+                              guard();
+                              const latest = await checkPost();
+                              const latestAnchor =
+                                latest.likeCSS ??
+                                latest.commentButtonCSS ??
+                                latest.commentCSS ??
+                                latest.videoCSS ??
+                                latest.postCSS;
+                              if (latestAnchor) {
+                                await revealBumperControlIfNeeded(
+                                  page.locator(latestAnchor).first(),
+                                  this.paceScale,
+                                ).catch(() => {});
+                              }
                             }
+                            return { ok: true };
+                          } catch (watchErr) {
+                            if (
+                              !callbacks.cancelled() &&
+                              !conn.hasPendingCommands &&
+                              !conn.failureReason &&
+                              !isCanceledByUserDetach(watchErr) &&
+                              isDeterministicPostSkipError(watchErr)
+                            ) {
+                              return {
+                                ok: false,
+                                skippedReason:
+                                  watchErr instanceof Error ? watchErr.message : String(watchErr),
+                              };
+                            }
+                            throw watchErr;
                           }
-                          return true;
                         },
                         async () => true,
-                      ).catch((error) => {
-                        if (!callbacks.cancelled())
-                          reportIssue({
-                            kind: 'failed',
-                            reason: error instanceof Error ? error.message : String(error),
-                          });
-                        throw error;
-                      });
+                        async (val, _binding, resolution) =>
+                          val.ok
+                            ? resolution
+                            : {
+                                ...resolution,
+                                outcome: 'NOT_APPLIED',
+                              },
+                      );
+                      if (!browseOutcome.ok) {
+                        resumablePost = null;
+                        reportIssue({ kind: 'skipped', reason: browseOutcome.skippedReason });
+                        callbacks.status(`跳过慢速帖子 · ${browseOutcome.skippedReason}`, q.today);
+                        devDiag.record({
+                          level: 'WARN',
+                          category: 'GROUP_BUMPER',
+                          event: 'BUMPER_POST_SKIPPED',
+                          profileId,
+                          reason: browseOutcome.skippedReason,
+                          data: { groupId: group.id, postId: post.postId },
+                        });
+                        continue;
+                      }
                       activePostState.browseDone = true;
                       consecutiveNoProgressRecoveries = 0;
                     } else {
@@ -4576,17 +4704,28 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       await paceWait(4000 + Math.floor(Math.random() * 5001));
                     }
                   } catch (error) {
+                    if (isCanceledByUserDetach(error)) {
+                      throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+                    }
                     if (isBumperRecoverableDisconnectError(error)) {
                       throw error;
                     }
+                    const wasCredited = resumablePost?.credited === true;
                     resumablePost = null;
                     guard();
                     if (isBumperFatal(error)) throw error;
-                    if (issueCount === issueCountBeforePost)
+                    const errText = error instanceof Error ? error.message : String(error);
+                    if (issueCount === issueCountBeforePost) {
+                      const skipOnly =
+                        !wasCredited &&
+                        /目标帖子仍在加载或控件未就绪|视频播放器未加载|视频未实际播放|视频播放长时间未推进|视频节点已变化/.test(
+                          errText,
+                        );
                       reportIssue({
-                        kind: 'failed',
-                        reason: error instanceof Error ? error.message : String(error),
+                        kind: skipOnly ? 'skipped' : 'failed',
+                        reason: errText,
                       });
+                    }
                     if (consecutiveUnconfirmed >= 3) {
                       throw new BumperFatalError(
                         '连续 3 次互动结果未确认，本轮已结束，原操作保留待核对',
@@ -4597,7 +4736,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                       category: 'GROUP_BUMPER',
                       event: 'BUMPER_POST_SKIPPED',
                       profileId,
-                      reason: error instanceof Error ? error.message : String(error),
+                      reason: errText,
                       data: { groupId: group.id, postId: post.postId },
                     });
                   } finally {
@@ -4683,6 +4822,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 );
                 await paceWait(1800 + Math.floor(Math.random() * 2201));
               } catch (scrollError) {
+                if (isCanceledByUserDetach(scrollError)) {
+                  throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+                }
                 if (callbacks.cancelled() || !isBumperRecoverableDisconnectError(scrollError)) {
                   throw scrollError;
                 }
@@ -4744,6 +4886,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
             }
           }
         } catch (error) {
+          if (isCanceledByUserDetach(error)) {
+            throw new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE);
+          }
           if (!callbacks.cancelled() && isBumperRecoverableDisconnectError(error)) {
             const reason = error instanceof Error ? error.message : String(error);
             await recoverBumperSession(reason);
@@ -4788,26 +4933,34 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         }
       }
     } catch (runErr) {
+      const effectiveRunErr = isCanceledByUserDetach(runErr)
+        ? new BumperFatalError(BUMPER_DEBUGGER_CANCELED_MESSAGE)
+        : !(runErr instanceof BumperFatalError) && isRawDisconnectTechnicalError(runErr)
+          ? new Error(formatBumperDisconnectReason(runErr))
+          : runErr;
       await kernel.observeExternalPageAccount?.(profileId, page, null)?.catch(() => {});
-      if (runErr instanceof BumperFatalError) {
-        const currentUrl = page.url();
-        const scope = inferAbnormalScopeFromUrl(currentUrl) ?? runErr.scope;
+      if (effectiveRunErr instanceof BumperFatalError) {
+        let currentUrl = '';
+        try {
+          currentUrl = page.url();
+        } catch {}
+        const scope = inferAbnormalScopeFromUrl(currentUrl) ?? effectiveRunErr.scope;
         if (scope === 'global_route') {
           const abnormalState =
             inferAbnormalStateFromCodeOrMessage(
-              classifyFacebookAbnormalUrl(currentUrl) ?? runErr.message,
+              classifyFacebookAbnormalUrl(currentUrl) ?? effectiveRunErr.message,
             ) ??
-            runErr.abnormalState ??
+            effectiveRunErr.abnormalState ??
             'restricted';
           await this.onAccountAbnormal?.({
             profileId,
             scope: 'global_route',
             state: abnormalState,
-            reason: runErr.message,
+            reason: effectiveRunErr.message,
           });
         }
       }
-      throw runErr;
+      throw effectiveRunErr;
     } finally {
       if (this.connections.get(profileId) === conn) {
         await this.stop(profileId).catch(() => {});

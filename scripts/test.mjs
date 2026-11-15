@@ -21,5 +21,6 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/bumper-like-confirmation.test.ts',
   'tests/bumper-workflow.test.ts',
   'tests/wo-bumper-stability.test.ts',
+  'tests/feedback-20261114-fixes.test.ts',
   'tests/finder-list-ui.test.tsx',
 ]);

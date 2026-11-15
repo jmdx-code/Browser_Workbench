@@ -1075,8 +1075,8 @@ if (typeof chrome !== 'undefined' && chrome?.debugger?.onEvent) {
     if (method === 'Target.detachedFromTarget')
       for (const [id, f] of frames) if (f.sessionId === p.sessionId) frames.delete(id);
   });
-  chrome.debugger.onDetach.addListener((source) => {
-    if (source.tabId !== undefined) kernel.detached(source.tabId);
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    if (source.tabId !== undefined) kernel.detached(source.tabId, reason);
     if (source.tabId === undefined || !attached.has(source.tabId)) return;
     if (!stopping) {
       void freeze('DEBUGGER_DETACHED').catch(() => {});

@@ -821,6 +821,17 @@ export class KernelBridge implements KernelBridgeHooks {
   private readonly renewing = new Set<KernelRpcSession>();
   private readonly sequences = new WeakMap<Peer, number>();
   private readonly traces = new Map<string, { at: number; event: string }[]>();
+  private readonly lastFailureReasons = new Map<
+    string,
+    { reason: string; epoch: string; at: number }
+  >();
+  lastSessionFailureReason(profileId: string, expectedEpoch?: string): string | null {
+    const entry = this.lastFailureReasons.get(profileId);
+    if (!entry) return null;
+    if (expectedEpoch !== undefined && entry.epoch !== expectedEpoch) return null;
+    if (Date.now() - entry.at > 60_000) return null;
+    return entry.reason;
+  }
   private accountObserver?: {
     shouldRefreshAvatar(profileId: string, accountId: string): Awaitable<boolean>;
     onObserved(
@@ -2255,6 +2266,11 @@ export class KernelBridge implements KernelBridgeHooks {
     };
     if (typeof page.on === 'function') page.on('dialog', onDialog);
     try {
+      const isFatalClosedPageError = (err: unknown): boolean =>
+        err instanceof Error &&
+        /Target page, context or browser has been closed|Session closed|Inspector\.detached|KERNEL_DEBUGGER_|KERNEL_CONNECTION_LOST/i.test(
+          err.message,
+        );
       await page
         .evaluate(() => {
           try {
@@ -2262,14 +2278,19 @@ export class KernelBridge implements KernelBridgeHooks {
           } catch {}
           location.assign('https://www.facebook.com/');
         })
-        .catch(() => {});
+        .catch((err: unknown) => {
+          if (isFatalClosedPageError(err)) throw err;
+        });
       const started = performance.now();
       while (performance.now() - started < 15_000) {
         await new Promise<void>((resolve) => setTimeout(resolve, 120));
         await guard();
         const state = await page
           .evaluate(() => ({ url: location.href, ready: document.readyState }))
-          .catch(() => null);
+          .catch((err: unknown) => {
+            if (isFatalClosedPageError(err)) throw err;
+            return null;
+          });
         if (
           state &&
           FacebookBrowseURL.safeParse(state.url).success &&
@@ -3065,13 +3086,17 @@ export class KernelBridge implements KernelBridgeHooks {
       readError = error;
       hasReadError = true;
     } finally {
-      const closeRequestId = randomUUID();
+      let closeRequestId = connection.stopRequestId;
       try {
         stop = await connection.close(closeRequestId);
       } catch (closeError) {
         try {
           await connection.stopOnCloseFailure();
-          stop = await connection.retryClose(closeRequestId);
+          closeRequestId = connection.stopRequestId;
+          stop =
+            closeError instanceof Error && closeError.message === 'KERNEL_CONTROL_ID_CONFLICT'
+              ? await connection.close(closeRequestId)
+              : await connection.retryClose(closeRequestId);
         } catch (retryError) {
           if (hasReadError) {
             devDiag.record({
@@ -3683,7 +3708,10 @@ export class KernelBridge implements KernelBridgeHooks {
       const connection = {
         browser,
         get stopRequestId() {
-          const requestId = (session.stopControlId ??= randomUUID());
+          if (!session.stopControlId && peer.phase === 'STOPPING' && peer.controlId) {
+            session.stopControlId = peer.controlId;
+          }
+          const requestId = (session.stopControlId ??= closingId ?? randomUUID());
           if (thisBridge.core.hasFixtureKernelOwner(peer, owner))
             thisBridge.core.bindFixtureStopRequest(peer, owner, requestId);
           return requestId;
@@ -4324,8 +4352,25 @@ export class KernelBridge implements KernelBridgeHooks {
     }
     if (rawType !== 'KERNEL_REPLY' && rawType !== 'KERNEL_EVENT') return false;
     const session = this.sessions.get(peer.profileId);
-    // Late replies from a closed fixture session cannot affect any new session.
-    if (!session) return true;
+    if (!session) {
+      if (rawType === 'KERNEL_EVENT') {
+        const late = KernelEvent.safeParse(value);
+        if (
+          late.success &&
+          late.data.connectionEpoch === peer.epoch &&
+          late.data.method === 'Inspector.detached' &&
+          late.data.params?.reason === 'canceled_by_user'
+        ) {
+          this.lastFailureReasons.set(peer.profileId, {
+            reason: 'KERNEL_DEBUGGER_CANCELED_BY_USER',
+            epoch: peer.epoch,
+            at: Date.now(),
+          });
+        }
+      }
+      // Late replies from a closed fixture session cannot affect any new session.
+      return true;
+    }
     if (session.peer !== peer) throw Error('KERNEL_SESSION_NOT_CURRENT');
     if (rawType === 'KERNEL_REPLY') session.response(value);
     else {
@@ -4400,10 +4445,28 @@ export class KernelBridge implements KernelBridgeHooks {
         return true;
       }
       if (event.method === 'Inspector.detached') {
+        const rawDetachReason = typeof event.params?.reason === 'string' ? event.params.reason : '';
+        const detachFailure =
+          rawDetachReason === 'canceled_by_user'
+            ? 'KERNEL_DEBUGGER_CANCELED_BY_USER'
+            : 'KERNEL_DEBUGGER_DETACHED';
         this.idlePages.delete(peer.profileId);
-        session.record('event:Inspector.detached');
+        session.record(
+          'event:Inspector.detached' + (rawDetachReason ? ':' + rawDetachReason.slice(0, 64) : ''),
+        );
         session.closing = true;
-        session.fail('KERNEL_DEBUGGER_DETACHED');
+        if (
+          detachFailure === 'KERNEL_DEBUGGER_CANCELED_BY_USER' &&
+          session.failureReason === 'KERNEL_DEBUGGER_DETACHED'
+        ) {
+          session.failureReason = 'KERNEL_DEBUGGER_CANCELED_BY_USER';
+        }
+        session.fail(detachFailure);
+        this.lastFailureReasons.set(peer.profileId, {
+          reason: session.failureReason ?? detachFailure,
+          epoch: peer.epoch,
+          at: Date.now(),
+        });
         void session.endpoint?.close().catch(() => {});
         await this.stopOwnedSessionOnCloseFailure(peer, session, session.owner, true);
       } else session.model?.debuggerEventValidated(event.source, event.method, event.params);

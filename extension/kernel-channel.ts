@@ -9,6 +9,7 @@ import {
 import { KernelRequest, type KernelRequest as Request } from '../src/shared/kernel-wire.js';
 import { ChromeKernelBackend, type KernelNativeBackend } from './kernel-backend.js';
 import {
+  isBenignScrollPreconditionError,
   kernelAccessURL,
   kernelRequiresOperation,
   type KernelAccess,
@@ -719,14 +720,9 @@ export class ExtensionKernelChannel {
         try {
           return await executor.send(request.target, request.method, request.params);
         } catch (error) {
-          const isBenignScrollPreconditionError =
-            request.method === 'DOM.scrollIntoViewIfNeeded' &&
-            /Node is detached from document|Could not find node|Node does not have a layout object|Cannot find context/i.test(
-              error instanceof Error ? error.message : String(error),
-            );
           if (
-            (input || executor.reviewRequired) &&
-            !isBenignScrollPreconditionError &&
+            (executor.reviewRequired ||
+              (input && !isBenignScrollPreconditionError(request.method, error))) &&
             this.activeOperation
           ) {
             const binding = this.activeOperation;
@@ -877,18 +873,20 @@ export class ExtensionKernelChannel {
       params,
     });
   }
-  detached(tabId: number): void {
+  detached(tabId: number, reason?: string): void {
     if (!this.backend?.owns(tabId)) return;
     this.backend.detached(tabId);
     if (this.backend.expectedDetach(tabId)) return;
+    const leaseId = this.activeLeaseId;
+    const epoch = this.context().epoch;
     void this.freeze().catch(() => {});
     this.emit({
       type: 'KERNEL_EVENT',
-      connectionEpoch: this.context().epoch,
-      leaseId: this.activeLeaseId,
+      connectionEpoch: epoch,
+      leaseId,
       source: { tabId },
       method: 'Inspector.detached',
-      params: {},
+      params: typeof reason === 'string' && reason.length > 0 ? { reason } : {},
     });
   }
   removed(tabId: number): void {

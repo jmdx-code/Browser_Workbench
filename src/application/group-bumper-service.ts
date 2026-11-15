@@ -117,7 +117,7 @@ export interface BumperRunner {
       cancelled(): boolean;
       status(text: string, today?: number): void;
       added(today: number): void;
-      issue?(issue: { kind: 'pending' | 'failed'; reason: string }): void;
+      issue?(issue: { kind: 'pending' | 'failed' | 'skipped'; reason: string }): void;
     },
   ): Promise<void>;
   stop(id: string): Promise<void>;
@@ -1046,7 +1046,9 @@ export class GroupBumperService {
     let failed = false;
     let pending = 0;
     let failedActions = 0;
+    let skippedPosts = 0;
     let issueReason = '';
+    let skipReason = '';
     let slot = false;
     const current = () => this.profileRunIds.get(id) === runId;
     try {
@@ -1073,9 +1075,16 @@ export class GroupBumperService {
           },
           issue: (issue) => {
             if (!current() || targetProfiles.get(id) !== stat) return;
-            if (issue.kind === 'pending') pending++;
-            else failedActions++;
-            issueReason = issue.reason;
+            if (issue.kind === 'pending') {
+              pending++;
+              issueReason = issue.reason;
+            } else if (issue.kind === 'skipped') {
+              skippedPosts++;
+              skipReason = issue.reason;
+            } else {
+              failedActions++;
+              issueReason = issue.reason;
+            }
           },
           added: (today) => {
             if (!current() || targetProfiles.get(id) !== stat) return;
@@ -1088,13 +1097,17 @@ export class GroupBumperService {
         const detail = [
           pending ? `${pending} 项待核对` : '',
           failedActions ? `${failedActions} 项未完成` : '',
+          skippedPosts ? `跳过 ${skippedPosts} 帖` : '',
         ]
           .filter(Boolean)
           .join(' · ');
         stat.status = `本轮 ${stat.session} 次已确认 · ${detail} · ${issueReason}`;
       } else if (!stat.status.startsWith('今日已达上限')) {
         if (this.cancelled.has(id)) stat.status = '已停止';
-        else if (stat.session > 0 || !stat.status.startsWith('已完成 · 0 次'))
+        else if (skippedPosts > 0) {
+          const shortSkip = /视频/.test(skipReason) ? '视频加载超时' : '帖子加载超时';
+          stat.status = `已完成 · 本轮 ${stat.session} 次 · 跳过 ${skippedPosts} 帖（${shortSkip}）`;
+        } else if (stat.session > 0 || !stat.status.startsWith('已完成 · 0 次'))
           stat.status = `已完成 · 本轮 ${stat.session} 次`;
       }
     } catch (e) {
@@ -1129,7 +1142,7 @@ export class GroupBumperService {
             reason: stat.status,
             finishedAt: Date.now(),
             failedSteps: pending + failedActions + (failed ? 1 : 0),
-            skippedSteps: 0,
+            skippedSteps: skippedPosts,
           });
         } catch {}
       } else {

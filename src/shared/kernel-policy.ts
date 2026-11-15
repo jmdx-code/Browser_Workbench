@@ -18,6 +18,18 @@ export function kernelRequiresOperation(method: string, access: KernelAccess): b
   );
 }
 
+export function isBenignScrollPreconditionError(
+  method: string,
+  error: unknown,
+  fenced = false,
+): boolean {
+  if (fenced || method !== 'DOM.scrollIntoViewIfNeeded') return false;
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /Node is detached from document|Could not find (?:node|object)|Node does not have a layout object|Cannot find context/i.test(
+    message,
+  );
+}
+
 export function kernelFacebookReadURL(value: string): boolean {
   try {
     const url = new URL(value);
