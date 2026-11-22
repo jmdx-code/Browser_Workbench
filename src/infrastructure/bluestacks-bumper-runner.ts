@@ -5,14 +5,17 @@ import {
   hasUnsupportedOcrScript,
   nameSimilarity,
   relativePostAge,
+  type BluestacksAccountState,
   type BluestacksBumperMode,
   type BluestacksInstance,
 } from '../shared/bluestacks.js';
+import { inferBumperSourceMode, isDirectFacebookPostUrl } from '../shared/google-sheets.js';
 import {
   isLocalAvatar,
   isPlaceholderTargetName,
   type BumperComment,
   type BumperLog,
+  type BumperReactionType,
   type BumperScope,
   type BumperSettings,
   type BumperTarget,
@@ -21,10 +24,12 @@ import { abortableWait, type BluestacksDeviceManager } from './bluestacks-device
 import {
   compareAvatarToRegion,
   cropToDataUrl,
+  detectHomeTabBar,
   detectVideoSpeakerState,
   extractActionBars,
   extractInlineVideoControls,
   extractPostCards,
+  extractReactionPopupButtons,
   findGroupSortButtonNode,
   findJoinGroupButtonNode,
   findRelatedGroupsCloseButtonNode,
@@ -37,6 +42,7 @@ import {
   isBottomSheetOpen,
   isDarkScreenOrReelMode,
   isLikeButtonBlue,
+  isReactionButtonActive,
   makeCanonicalRect,
   resolveSharePostUrl,
   signatureSimilarity,
@@ -75,7 +81,7 @@ export interface BluestacksBumperRunnerRepo {
   saveInspectionResult(input: {
     id: string;
     fbLiteInstalled: boolean;
-    accountState: 'unknown' | 'logged-in' | 'logged-out' | 'missing-app';
+    accountState: BluestacksAccountState;
     accountId?: string;
     accountName?: string;
     avatarUrl?: string | null;
@@ -116,6 +122,301 @@ export class BluestacksGroupBumperRunner {
     public readonly devices: BluestacksDeviceManager,
     private readonly ocr: OcrRecognizer,
   ) {}
+
+  private pickConfiguredReaction(settings: BumperSettings): BumperReactionType {
+    const pool =
+      settings.reactionTypes && settings.reactionTypes.length > 0
+        ? settings.reactionTypes
+        : (['like'] as const);
+    return pool[Math.floor(Math.random() * pool.length)] ?? 'like';
+  }
+
+  /**
+   * Performs either a standard tap-Like or a real FB Lite Long-Press 2-row Reaction selection,
+   * verifying the post's reaction button visually transitions to an active saturated state.
+   */
+  private async applyLikeOrReaction(
+    serial: string,
+    likeBounds: RectBounds,
+    settings: BumperSettings,
+    sw: number,
+    sh: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const chosenReaction = settings.useLongPressReaction
+      ? this.pickConfiguredReaction(settings)
+      : 'like';
+
+    if (settings.useLongPressReaction && chosenReaction !== 'like') {
+      // Long-press Like button (750ms) to open FB Lite's 2-row (3+4) reaction popup card
+      await this.devices.swipe900(
+        serial,
+        likeBounds.cx,
+        likeBounds.cy,
+        likeBounds.cx,
+        likeBounds.cy,
+        750,
+        sw,
+        sh,
+        signal,
+      );
+      await abortableWait(650, signal);
+      const popupXml = await this.devices.dumpXml(serial, sw, sh, signal);
+      const popupMap = extractReactionPopupButtons(popupXml, likeBounds);
+      const targetRect = popupMap[chosenReaction] ?? popupMap.love ?? popupMap.like;
+      if (targetRect) {
+        await this.devices.tap900(serial, targetRect.cx, targetRect.cy, sw, sh, signal);
+        await abortableWait(1400, signal);
+        const verifyPng = await this.devices.screencap(serial, signal);
+        if (await isReactionButtonActive(verifyPng, likeBounds)) {
+          return true;
+        }
+      } else {
+        // Dismiss any lingering overlay before falling back to direct tap
+        await this.devices.keyevent(serial, 4, signal).catch(() => null);
+        await abortableWait(500, signal);
+      }
+    }
+
+    // Standard tap-Like (also fallback if long-press popup did not open)
+    await this.devices.tap900(serial, likeBounds.cx, likeBounds.cy, sw, sh, signal);
+    await abortableWait(1400, signal);
+    const verifyPng = await this.devices.screencap(serial, signal);
+    return await isReactionButtonActive(verifyPng, likeBounds);
+  }
+
+  private async submitCommentOnActionBar(
+    serial: string,
+    commentBounds: RectBounds,
+    commentText: string,
+    sw: number,
+    sh: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    await this.devices.tap900(serial, commentBounds.cx, commentBounds.cy, sw, sh, signal);
+    await abortableWait(1800, signal);
+
+    const commentOpenXml = await this.devices.dumpXml(serial, sw, sh, signal);
+    const inputNode = findTextInputNode(commentOpenXml);
+    const inputX = inputNode?.bounds.cx ?? 300;
+    const inputY = inputNode?.bounds.cy ?? 1480;
+
+    await this.devices.pasteIntoFocused(serial, inputX, inputY, commentText, sw, sh, signal);
+    await abortableWait(800, signal);
+
+    const sendRowY = inputNode ? inputNode.bounds.cy : 1484;
+    const primarySendBounds: RectBounds = makeCanonicalRect(
+      790,
+      Math.max(0, sendRowY - 42),
+      900,
+      Math.min(1600, sendRowY + 42),
+    );
+    const fallbackSendBounds: RectBounds = makeCanonicalRect(790, 1440, 900, 1520);
+
+    const typedPng = await this.devices.screencap(serial, signal);
+    const primaryBlue = await isLikeButtonBlue(typedPng, primarySendBounds);
+    const activeSendBounds = primaryBlue
+      ? primarySendBounds
+      : (await isLikeButtonBlue(typedPng, fallbackSendBounds))
+        ? fallbackSendBounds
+        : null;
+
+    let sent = false;
+    if (activeSendBounds) {
+      await this.devices.tap900(serial, 854, activeSendBounds.cy, sw, sh, signal);
+      await abortableWait(2400, signal);
+
+      const afterSendPng = await this.devices.screencap(serial, signal);
+      const stillBlueAfterSend = await isLikeButtonBlue(afterSendPng, activeSendBounds);
+      if (!stillBlueAfterSend) {
+        sent = true;
+      }
+    }
+
+    await this.devices.keyevent(serial, 4, signal);
+    await abortableWait(950, signal);
+    const afterBackXml = await this.devices.dumpXml(serial, sw, sh, signal);
+    if (findTextInputNode(afterBackXml)) {
+      await this.devices.keyevent(serial, 4, signal);
+      await abortableWait(1100, signal);
+    }
+    return sent;
+  }
+
+  /**
+   * Direct Post URL bumper for Cloud Sheets (`云表协同 · 发帖记录`):
+   * opens each exact postUrl on a BlueStacks instance, verifies it isn't already reacted,
+   * applies like/reaction & optional comment, and persists real BumperLog records.
+   */
+  async runDirectPosts(
+    instanceId: string,
+    posts: ReadonlyArray<{
+      postId: string;
+      postUrl: string;
+      groupId: string;
+      groupName: string;
+      pageId: string;
+      pageName: string;
+    }>,
+    settings: BumperSettings,
+    commentPool: readonly string[],
+    signal: AbortSignal,
+    callbacks: {
+      status(text: string): void;
+      onPostDone?: (res: {
+        postId: string;
+        liked: boolean;
+        commented: boolean;
+        commentText: string | null;
+      }) => void | Promise<void>;
+    },
+  ): Promise<{ bumped: number; attempted: number }> {
+    const guard = () => {
+      if (signal.aborted) throw new Error('TASK_STOPPED');
+    };
+    callbacks.status('正在校验蓝蝶账号与连接…');
+    const inst = await this.devices.ensureReadyAndLoggedIn(instanceId, signal);
+    const { serial, fbWidth: sw, fbHeight: sh, accountId } = inst;
+    guard();
+
+    let bumped = 0;
+    let attempted = 0;
+
+    for (const post of posts) {
+      guard();
+      if (!isDirectFacebookPostUrl(post.postUrl)) {
+        continue;
+      }
+      const sourceMode = inferBumperSourceMode({
+        groupId: post.groupId,
+        postUrl: post.postUrl,
+      });
+      const q = await this.repo.eligibility(
+        accountId,
+        instanceId,
+        post.postId,
+        Date.now(),
+        sourceMode,
+      );
+      if (q.today >= settings.dailyMaxLikesPerAccount) {
+        callbacks.status(`今日顶贴已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`);
+        break;
+      }
+      if (!q.allowed) continue;
+
+      attempted++;
+      callbacks.status(`云表直达顶贴 · ${post.pageName || post.groupName || post.postId}`);
+      try {
+        await this.devices.openDeepLink(serial, post.postUrl, sw, sh, signal);
+        await abortableWait(2600, signal);
+
+        let [xml, png] = await Promise.all([
+          this.devices.dumpXml(serial, sw, sh, signal),
+          this.devices.screencap(serial, signal),
+        ]);
+        const abnormal = await this.devices.detectAbnormalScreen(serial, xml, png, signal);
+        if (abnormal) {
+          await this.repo.saveInspectionResult({
+            id: inst.id,
+            fbLiteInstalled: true,
+            accountState: abnormal,
+            fbWidth: sw,
+            fbHeight: sh,
+          });
+          throw new AccountCircuitBreakError('FB Lite 账号已退出、需验证或受限');
+        }
+        // Guard against wrong-post bumping: if deep link fell back to Home feed or unavailable notice, skip!
+        if (detectHomeTabBar(xml)) {
+          continue;
+        }
+        const screenText = (
+          await this.ocr.recognizeBounds(png, makeCanonicalRect(40, 180, 860, 1180)).catch(() => '')
+        ).replace(/\s+/g, '');
+        if (
+          /此内容目前无法查看|无法查看此内容|contentisn'?tavailable|内容不可用|贴文已删除|linkmaybebroken/i.test(
+            screenText,
+          )
+        ) {
+          continue;
+        }
+
+        let bar = extractActionBars(xml)[0] ?? null;
+        if (!bar) {
+          await this.devices.swipe900(serial, 115, 1180, 115, 520, 520, sw, sh, signal);
+          await abortableWait(1400, signal);
+          [xml, png] = await Promise.all([
+            this.devices.dumpXml(serial, sw, sh, signal),
+            this.devices.screencap(serial, signal),
+          ]);
+          if (detectHomeTabBar(xml)) continue;
+          bar = extractActionBars(xml)[0] ?? null;
+        }
+        if (!bar) continue;
+
+        const alreadyReacted = await isReactionButtonActive(png, bar.likeBounds);
+        const wantLike = !alreadyReacted && Math.random() * 100 < settings.likeProbability;
+        const chosenText =
+          commentPool.length > 0 && Math.random() * 100 < settings.commentProbability
+            ? (commentPool[Math.floor(Math.random() * commentPool.length)] ?? null)
+            : null;
+        if (!wantLike && !chosenText) continue;
+
+        let didLike = false;
+        let didComment: string | null = null;
+        if (wantLike) {
+          didLike = await this.applyLikeOrReaction(
+            serial,
+            bar.likeBounds,
+            settings,
+            sw,
+            sh,
+            signal,
+          );
+        }
+        if (chosenText) {
+          guard();
+          const ok = await this.submitCommentOnActionBar(
+            serial,
+            bar.commentBounds,
+            chosenText,
+            sw,
+            sh,
+            signal,
+          );
+          if (ok) didComment = chosenText;
+        }
+        if (didLike || didComment) {
+          await this.repo.recordBump({
+            id: randomUUID(),
+            profileId: instanceId,
+            accountId,
+            groupId: post.groupId || '-',
+            groupName: post.groupName || '云表直达',
+            pageId: post.pageId || '-',
+            pageName: post.pageName || '云表帖子',
+            postId: post.postId,
+            postUrl: post.postUrl,
+            liked: didLike,
+            commentText: didComment,
+            bumpedAt: Date.now(),
+            sourceMode,
+          });
+          bumped++;
+          await callbacks.onPostDone?.({
+            postId: post.postId,
+            liked: didLike,
+            commented: Boolean(didComment),
+            commentText: didComment,
+          });
+        }
+        await abortableWait(1500 + Math.floor(Math.random() * 1500), signal);
+      } catch (err) {
+        if (isFatalDeviceOrStopError(err, signal)) throw err;
+      }
+    }
+
+    return { bumped, attempted };
+  }
 
   private async resolveLiveEnableSound(
     fallback: BumperSettings,
@@ -236,6 +537,24 @@ export class BluestacksGroupBumperRunner {
     return searchMode === 'time_sort' ? `${base}?sorting_setting=CHRONOLOGICAL` : base;
   }
 
+  private async checkAbnormalScreen(
+    serial: string,
+    xml: LiteXmlNode | null,
+    png: Buffer | undefined,
+    signal: AbortSignal,
+  ): Promise<'logged-out' | 'restricted' | 'verification' | null> {
+    if (typeof this.devices.detectAbnormalScreen === 'function') {
+      return await this.devices.detectAbnormalScreen(serial, xml, png, signal);
+    }
+    if (
+      typeof this.devices.isLoginOrLoggedOutXml === 'function' &&
+      this.devices.isLoginOrLoggedOutXml(xml)
+    ) {
+      return 'logged-out';
+    }
+    return null;
+  }
+
   private async enterAndVerifyGroup(
     inst: BluestacksInstance,
     group: BumperTarget,
@@ -255,15 +574,16 @@ export class BluestacksGroupBumperRunner {
       this.devices.dumpXml(serial, sw, sh, signal),
       this.devices.screencap(serial, signal),
     ]);
-    if (this.devices.isLoginOrLoggedOutXml(groupXml)) {
+    const groupAbnormal = await this.checkAbnormalScreen(serial, groupXml, groupPng, signal);
+    if (groupAbnormal) {
       await this.repo.saveInspectionResult({
         id: inst.id,
         fbLiteInstalled: true,
-        accountState: 'logged-out',
+        accountState: groupAbnormal,
         fbWidth: sw,
         fbHeight: sh,
       });
-      throw new AccountCircuitBreakError('FB Lite 账号已退出登录或需验证');
+      throw new AccountCircuitBreakError('FB Lite 账号已退出、需验证或受限');
     }
 
     const joinBtn = searchMode !== 'random_browse' ? findJoinGroupButtonNode(groupXml) : null;
@@ -392,16 +712,20 @@ export class BluestacksGroupBumperRunner {
     );
     await abortableWait(2200, signal);
 
-    const feedXml = await this.devices.dumpXml(serial, sw, sh, signal);
-    if (this.devices.isLoginOrLoggedOutXml(feedXml)) {
+    const [feedXml, feedPng] = await Promise.all([
+      this.devices.dumpXml(serial, sw, sh, signal),
+      this.devices.screencap(serial, signal),
+    ]);
+    const feedAbnormal = await this.checkAbnormalScreen(serial, feedXml, feedPng, signal);
+    if (feedAbnormal) {
       await this.repo.saveInspectionResult({
         id: inst.id,
         fbLiteInstalled: true,
-        accountState: 'logged-out',
+        accountState: feedAbnormal,
         fbWidth: sw,
         fbHeight: sh,
       });
-      throw new AccountCircuitBreakError('FB Lite 账号已退出登录或需验证');
+      throw new AccountCircuitBreakError('FB Lite 账号已退出、需验证或受限');
     }
 
     const topCards = extractPostCards(feedXml);
@@ -435,16 +759,20 @@ export class BluestacksGroupBumperRunner {
     await this.devices.openDeepLink(serial, targetUrl, sw, sh, signal);
     await abortableWait(2400, signal);
 
-    let pageXml = await this.devices.dumpXml(serial, sw, sh, signal);
-    if (this.devices.isLoginOrLoggedOutXml(pageXml)) {
+    let [pageXml, pagePng] = await Promise.all([
+      this.devices.dumpXml(serial, sw, sh, signal),
+      this.devices.screencap(serial, signal),
+    ]);
+    const pageAbnormal = await this.checkAbnormalScreen(serial, pageXml, pagePng, signal);
+    if (pageAbnormal) {
       await this.repo.saveInspectionResult({
         id: inst.id,
         fbLiteInstalled: true,
-        accountState: 'logged-out',
+        accountState: pageAbnormal,
         fbWidth: sw,
         fbHeight: sh,
       });
-      throw new AccountCircuitBreakError('FB Lite 账号已退出登录或需验证');
+      throw new AccountCircuitBreakError('FB Lite 账号已退出、需验证或受限');
     }
 
     const closeCarouselBtn = findRelatedGroupsCloseButtonNode(pageXml);
@@ -1056,7 +1384,10 @@ export class BluestacksGroupBumperRunner {
               }
               if (!q.allowed) continue;
 
-              const alreadyLiked = await isLikeButtonBlue(workingPng, workingActionBar.likeBounds);
+              const alreadyLiked = await isReactionButtonActive(
+                workingPng,
+                workingActionBar.likeBounds,
+              );
               const doLike = !alreadyLiked && Math.random() * 100 < settings.likeProbability;
               const chosenComment =
                 Math.random() * 100 < settings.commentProbability
@@ -1131,22 +1462,21 @@ export class BluestacksGroupBumperRunner {
               }
 
               if (doLike) {
-                callbacks.status(`正在点赞 · ${actionTargetLabel}`, q.today);
-                await this.devices.tap900(
+                callbacks.status(
+                  settings.useLongPressReaction
+                    ? `正在长按表情互动 · ${actionTargetLabel}`
+                    : `正在点赞 · ${actionTargetLabel}`,
+                  q.today,
+                );
+                const confirmed = await this.applyLikeOrReaction(
                   serial,
-                  workingActionBar.likeBounds.cx,
-                  workingActionBar.likeBounds.cy,
+                  workingActionBar.likeBounds,
+                  settings,
                   sw,
                   sh,
                   signal,
                 );
-                await abortableWait(1400, signal);
-                const verifyPng = await this.devices.screencap(serial, signal);
-                const confirmedBlue = await isLikeButtonBlue(
-                  verifyPng,
-                  workingActionBar.likeBounds,
-                );
-                if (confirmedBlue) {
+                if (confirmed) {
                   record.liked = true;
                   await persistRecord();
                 }
@@ -1155,67 +1485,17 @@ export class BluestacksGroupBumperRunner {
               if (chosenComment) {
                 guard();
                 callbacks.status(`正在留言 · ${actionTargetLabel}`, q.today);
-                await this.devices.tap900(
+                const commentSent = await this.submitCommentOnActionBar(
                   serial,
-                  workingActionBar.commentBounds.cx,
-                  workingActionBar.commentBounds.cy,
-                  sw,
-                  sh,
-                  signal,
-                );
-                await abortableWait(1800, signal);
-
-                const commentOpenXml = await this.devices.dumpXml(serial, sw, sh, signal);
-                const inputNode = findTextInputNode(commentOpenXml);
-                const inputX = inputNode?.bounds.cx ?? 300;
-                const inputY = inputNode?.bounds.cy ?? 1480;
-
-                await this.devices.pasteIntoFocused(
-                  serial,
-                  inputX,
-                  inputY,
+                  workingActionBar.commentBounds,
                   chosenComment.text,
                   sw,
                   sh,
                   signal,
                 );
-                await abortableWait(800, signal);
-
-                const sendRowY = inputNode ? inputNode.bounds.cy : 1484;
-                const primarySendBounds: RectBounds = makeCanonicalRect(
-                  790,
-                  Math.max(0, sendRowY - 42),
-                  900,
-                  Math.min(1600, sendRowY + 42),
-                );
-                const fallbackSendBounds: RectBounds = makeCanonicalRect(790, 1440, 900, 1520);
-
-                const typedPng = await this.devices.screencap(serial, signal);
-                const primaryBlue = await isLikeButtonBlue(typedPng, primarySendBounds);
-                const activeSendBounds = primaryBlue
-                  ? primarySendBounds
-                  : (await isLikeButtonBlue(typedPng, fallbackSendBounds))
-                    ? fallbackSendBounds
-                    : null;
-
-                if (activeSendBounds) {
-                  await this.devices.tap900(serial, 854, activeSendBounds.cy, sw, sh, signal);
-                  await abortableWait(2400, signal);
-
-                  const afterSendPng = await this.devices.screencap(serial, signal);
-                  const stillBlueAfterSend = await isLikeButtonBlue(afterSendPng, activeSendBounds);
-                  if (!stillBlueAfterSend) {
-                    record.commentText = chosenComment.text;
-                    await persistRecord();
-                  }
-                }
-
-                await this.devices.keyevent(serial, 4, signal);
-                await abortableWait(950, signal);
-                const afterBackXml = await this.devices.dumpXml(serial, sw, sh, signal);
-                if (findTextInputNode(afterBackXml)) {
-                  await this.devices.keyevent(serial, 4, signal);
-                  await abortableWait(1100, signal);
+                if (commentSent) {
+                  record.commentText = chosenComment.text;
+                  await persistRecord();
                 }
               }
             } finally {

@@ -1,6 +1,16 @@
 import type { TargetListKind, TargetListCommand, TargetFolder } from '../shared/target-list.js';
 import type { BumperState, BumperLog } from '../shared/group-bumper.js';
 import type { BluestacksState } from '../shared/bluestacks.js';
+import type { AutoSchedulerState } from '../shared/auto-scheduler.js';
+import type {
+  GoogleAuthStatus,
+  GoogleSheetLink,
+  GoogleSheetsOverview,
+  LibrarySyncSummary,
+  SheetGridSnapshot,
+  SheetImageHostStatus,
+  SpreadsheetMeta,
+} from '../shared/google-sheets.js';
 import type { PosterState, PosterLog } from '../shared/group-poster.js';
 import { MediaComponentStatus } from '../shared/media-component.js';
 import {
@@ -101,6 +111,21 @@ export class ApiError extends Error {
     super(message);
   }
 }
+function combineTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+async function parseJsonSafe(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return { error: response.ok ? '服务返回格式异常' : `请求失败（HTTP ${response.status}）` };
+  }
+}
+
 async function request(
   route: string,
   input?: unknown,
@@ -117,6 +142,7 @@ async function request(
   if (input !== undefined) headers['content-type'] = 'application/json';
   if (route === '/profiles/inspect' || route === '/profiles/inspection')
     headers[INSPECTION_DISPLAY_HEADER] = '2';
+  if (route === '/profiles/native-review') headers['x-workbench-native-review-contract'] = '2';
   if (route === '/materials/preflight') headers[MATERIAL_PREVIEW_HEADER] = '1';
   if (route === '/resource-tables/summaries') headers[RESOURCE_SUMMARY_HEADER] = '2';
   const options: RequestInit =
@@ -129,7 +155,7 @@ async function request(
           signal,
         };
   let response = await fetch(root + route, options);
-  let result: unknown = await response.json();
+  let result: unknown = await parseJsonSafe(response);
   if (
     response.status === 401 &&
     root === '/api/workspace' &&
@@ -149,24 +175,38 @@ async function request(
     });
     if (bootstrap.ok) {
       response = await fetch(root + route, options);
-      result = await response.json();
+      result = await parseJsonSafe(response);
     }
   }
   if (!response.ok) {
-    const error = result as { code?: string; error?: string };
-    throw new ApiError(error.code ?? 'REQUEST_FAILED', error.error ?? '请求失败');
+    const error =
+      typeof result === 'object' && result !== null
+        ? (result as { code?: unknown; error?: unknown })
+        : {};
+    throw new ApiError(
+      typeof error.code === 'string' && error.code ? error.code : 'REQUEST_FAILED',
+      typeof error.error === 'string' && error.error
+        ? error.error
+        : `请求失败（HTTP ${response.status}）`,
+    );
   }
   return result;
 }
 export const api = {
-  bumperState: async () => (await request('/group-bumper/state')) as BumperState,
+  bumperState: async (signal?: AbortSignal) =>
+    (await request(
+      '/group-bumper/state',
+      undefined,
+      combineTimeout(signal, 15_000),
+    )) as BumperState,
   bumperAction: async (action: string, input: unknown = {}) =>
-    (await request('/group-bumper/' + action, input)) as BumperState,
+    (await request('/group-bumper/' + action, input, AbortSignal.timeout(60_000))) as BumperState,
   bumperLogs: async (
     search = '',
     before?: number,
     beforeId?: string,
     sourceMode?: 'group' | 'page',
+    signal?: AbortSignal,
   ) =>
     (await request(
       '/group-bumper/logs?' +
@@ -175,11 +215,24 @@ export const api = {
           ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
           ...(sourceMode ? { sourceMode } : {}),
         }),
+      undefined,
+      combineTimeout(signal, 15_000),
     )) as BumperLog[],
-  posterState: async () => (await request('/group-poster/state')) as PosterState,
+  posterState: async (signal?: AbortSignal) =>
+    (await request(
+      '/group-poster/state',
+      undefined,
+      combineTimeout(signal, 15_000),
+    )) as PosterState,
   posterAction: async (action: string, input: unknown = {}) =>
-    (await request('/group-poster/' + action, input)) as PosterState,
-  posterLogs: async (search = '', before?: number, beforeId?: string, materialId?: string) =>
+    (await request('/group-poster/' + action, input, AbortSignal.timeout(60_000))) as PosterState,
+  posterLogs: async (
+    search = '',
+    before?: number,
+    beforeId?: string,
+    materialId?: string,
+    signal?: AbortSignal,
+  ) =>
     (await request(
       '/group-poster/logs?' +
         new URLSearchParams({
@@ -187,6 +240,8 @@ export const api = {
           ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
           ...(materialId ? { materialId } : {}),
         }),
+      undefined,
+      combineTimeout(signal, 15_000),
     )) as PosterLog[],
   savePosterMaterialThumbnail: async (id: string, thumbnailDataUrl: string) =>
     (await request('/group-poster/materials/thumbnail', { id, thumbnailDataUrl })) as {
@@ -236,8 +291,8 @@ export const api = {
       );
     }
   },
-  cleanupProgress: async () =>
-    request('/data-cleanup/progress', undefined, AbortSignal.timeout(10000)) as Promise<{
+  cleanupProgress: async (signal?: AbortSignal) =>
+    request('/data-cleanup/progress', undefined, combineTimeout(signal, 10_000)) as Promise<{
       running: boolean;
       current: number;
       total: number;
@@ -305,9 +360,13 @@ export const api = {
     TaskTestResult.parse(await request('/tasks/test', input, AbortSignal.timeout(65_000))),
   backupStatus: async (signal: AbortSignal) =>
     WorkspaceBackupStatus.parse(await request('/backups/status', undefined, signal)),
-  createBackup: async (directory: string) =>
+  createBackup: async (directory: string, redactSecrets = false) =>
     WorkspaceBackupResult.parse(
-      await request('/backups/create', { directory }, AbortSignal.timeout(310_000)),
+      await request(
+        '/backups/create',
+        { directory, ...(redactSecrets ? { redactSecrets: true } : {}) },
+        AbortSignal.timeout(310_000),
+      ),
     ),
   restoreStatus: async (signal: AbortSignal) =>
     WorkspaceRestoreStatus.parse(await request('/backups/restore-status', undefined, signal)),
@@ -533,10 +592,12 @@ export const api = {
     return blob;
   },
   inspectProfiles: async (profileIds: string[]) =>
-    ProfileInspections.parse(await request('/profiles/inspect', { profileIds })),
-  profileInspections: async () =>
     ProfileInspections.parse(
-      await request('/profiles/inspection', undefined, AbortSignal.timeout(10_000)),
+      await request('/profiles/inspect', { profileIds }, AbortSignal.timeout(20_000)),
+    ),
+  profileInspections: async (signal?: AbortSignal) =>
+    ProfileInspections.parse(
+      await request('/profiles/inspection', undefined, combineTimeout(signal, 10_000)),
     ),
   materialPreflight: async (directory: string) =>
     MaterialPreviewScan.parse(
@@ -698,12 +759,135 @@ export const api = {
       filePath: string;
       fileName: string;
     },
-  bluestacksState: async (refresh = false) =>
+  bluestacksState: async (refresh = false, signal?: AbortSignal) =>
     (await request(
       '/bluestacks/state' + (refresh ? '?refresh=1' : ''),
       undefined,
-      AbortSignal.timeout(15_000),
+      combineTimeout(signal, 15_000),
     )) as BluestacksState,
   bluestacksAction: async (action: string, body: unknown = {}) =>
-    (await request('/bluestacks/' + action, body, AbortSignal.timeout(30_000))) as BluestacksState,
+    (await request('/bluestacks/' + action, body, AbortSignal.timeout(90_000))) as BluestacksState,
+  autoSchedulerState: async (signal?: AbortSignal) =>
+    (await request(
+      '/auto-scheduler/state',
+      undefined,
+      combineTimeout(signal, 15_000),
+    )) as AutoSchedulerState,
+  autoSchedulerAction: async (action: string, body: unknown = {}) =>
+    (await request(
+      '/auto-scheduler/' + action,
+      body,
+      AbortSignal.timeout(30_000),
+    )) as AutoSchedulerState,
+  googleSheetsOverview: async (signal?: AbortSignal) =>
+    (await request(
+      '/google-sheets',
+      undefined,
+      combineTimeout(signal, 15_000),
+    )) as GoogleSheetsOverview,
+  googleSheetsImportCredentials: async (rawJson: string) =>
+    (await request(
+      '/google-sheets/auth/credentials',
+      { rawJson },
+      AbortSignal.timeout(15_000),
+    )) as GoogleAuthStatus,
+  googleSheetsStartAuth: async () =>
+    (await request('/google-sheets/auth/start', {}, AbortSignal.timeout(15_000))) as {
+      authUrl: string;
+      status: GoogleAuthStatus;
+    },
+  googleSheetsCompleteManualAuth: async (codeOrUrl: string) =>
+    (await request(
+      '/google-sheets/auth/manual',
+      { codeOrUrl },
+      AbortSignal.timeout(30_000),
+    )) as GoogleAuthStatus,
+  googleSheetsRevokeAuth: async () =>
+    (await request(
+      '/google-sheets/auth/revoke',
+      {},
+      AbortSignal.timeout(15_000),
+    )) as GoogleAuthStatus,
+  googleSheetsImageHostTokens: async () =>
+    (await request('/google-sheets/image-host/tokens', undefined, AbortSignal.timeout(15_000))) as {
+      tokens: string[];
+    },
+  googleSheetsSaveImageHost: async (body: unknown) =>
+    (await request(
+      '/google-sheets/image-host',
+      body,
+      AbortSignal.timeout(15_000),
+    )) as SheetImageHostStatus,
+  googleSheetsTestImageHost: async () =>
+    (await request('/google-sheets/image-host/test', {}, AbortSignal.timeout(45_000))) as {
+      remoteUrl: string;
+      host: 'gyazo' | 'drive';
+      tokenIndex?: number;
+      tokenCount?: number;
+      fallbackFromGyazo?: boolean;
+    },
+  googleSheetsInspect: async (urlOrId: string) =>
+    (await request(
+      '/google-sheets/inspect',
+      { urlOrId },
+      AbortSignal.timeout(30_000),
+    )) as SpreadsheetMeta & { suggestedGid: number | null },
+  googleSheetsCreateLink: async (body: unknown) =>
+    (await request(
+      '/google-sheets/links/create',
+      body,
+      AbortSignal.timeout(30_000),
+    )) as GoogleSheetLink,
+  googleSheetsUpdateLink: async (body: unknown) =>
+    (await request(
+      '/google-sheets/links/update',
+      body,
+      AbortSignal.timeout(20_000),
+    )) as GoogleSheetLink,
+  googleSheetsDeleteLink: async (id: string) =>
+    (await request('/google-sheets/links/delete', { id }, AbortSignal.timeout(15_000))) as {
+      deleted: boolean;
+    },
+  googleSheetsReadGrid: async (id: string, force = false) =>
+    (await request(
+      `/google-sheets/links/grid?id=${encodeURIComponent(id)}${force ? '&force=1' : ''}`,
+      undefined,
+      AbortSignal.timeout(30_000),
+    )) as SheetGridSnapshot,
+  googleSheetsImportLibrary: async (id: string, mode: 'incremental' | 'overwrite') =>
+    (await request(
+      '/google-sheets/links/import-library',
+      { id, mode },
+      AbortSignal.timeout(60_000),
+    )) as LibrarySyncSummary,
+  googleSheetsSyncLibrary: async (id: string) =>
+    (await request(
+      '/google-sheets/links/sync-library',
+      { id },
+      AbortSignal.timeout(180_000),
+    )) as LibrarySyncSummary,
+  googleSheetsPollSchedule: async (id: string) =>
+    (await request('/google-sheets/links/poll-schedule', { id }, AbortSignal.timeout(180_000))) as {
+      summary: string;
+    },
+  googleSheetsPollRecords: async (id: string) =>
+    (await request('/google-sheets/links/poll-records', { id }, AbortSignal.timeout(180_000))) as {
+      summary: string;
+    },
+  googleSheetsRefreshMetrics: async (id: string) =>
+    (await request(
+      '/google-sheets/links/refresh-metrics',
+      { id },
+      AbortSignal.timeout(180_000),
+    )) as { updated: number; failed: number; summary: string },
+  googleSheetsStopLink: async (id: string) =>
+    (await request('/google-sheets/links/stop', { id }, AbortSignal.timeout(15_000))) as {
+      stopped: boolean;
+    },
+  googleSheetsStopProfiles: async (profileIds: string[]) =>
+    (await request(
+      '/google-sheets/stop-profiles',
+      { profileIds },
+      AbortSignal.timeout(15_000),
+    )) as GoogleSheetsOverview,
 };

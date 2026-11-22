@@ -1,7 +1,7 @@
 {
   "name": "browser-workbench",
   "productName": "Browser Workbench",
-  "version": "0.1.228",
+  "version": "0.1.243",
   "private": true,
   "type": "module",
   "main": "dist/src/desktop/bootstrap.js",
@@ -36,6 +36,8 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@tanstack/react-table": "^9.3.1",
+    "@tanstack/react-virtual": "^3.14.26",
     "@types/chrome": "0.1.0",
     "@types/luxon": "3.7.6",
     "@types/node": "24.0.0",
@@ -71,6 +73,12 @@
       "dist/**",
       "web/**",
       "public/**",
+      "!public/sample.mp4",
+      "!public/fixture.*",
+      "!public/frame.html",
+      "!public/kernel-fixture.*",
+      "!public/kernel-frame.*",
+      "!public/style.css",
       "config/**",
       "!config/publication-acceptance-scope.json",
       "package.json",

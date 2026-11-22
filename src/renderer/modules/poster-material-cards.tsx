@@ -1,12 +1,20 @@
 import { useRef, useState } from 'react';
 import { hasPosterMaterialContent, type PosterState } from '../../shared/group-poster.js';
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
+import { ConfirmDialog } from '../confirm-dialog.js';
 import {
   formatCreatedDate,
   PosterMaterialCardPreview,
   PosterMediaPreviewModal,
   taskStatusBadge,
 } from './poster-material-modals.js';
+
+function resolveLocalFilePath(file: File): string {
+  return (
+    window.workbenchDesktop?.materialFilePath?.(file) ||
+    ((file as File & { path?: string }).path ?? '')
+  ).trim();
+}
 import {
   posterRowBadge,
   useSerialVideoThumbnailGenerator,
@@ -55,6 +63,7 @@ export function PosterMaterialCardGrid({
   const [query, setQuery] = useState('');
   const [previewRow, setPreviewRow] = useState<MaterialDraft | null>(null);
   const [selectedCardIds, setSelectedCardIds] = useState<Set<string>>(new Set());
+  const [confirmDelete, setConfirmDelete] = useState<{ ids: string[]; label: string } | null>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
 
   const validRows = rows.filter(hasPosterMaterialContent);
@@ -102,9 +111,7 @@ export function PosterMaterialCardGrid({
         const files = Array.from(e.dataTransfer?.files ?? []);
         if (files.length === 0) return;
         e.preventDefault();
-        const paths = files
-          .map((f) => ((f as File & { path?: string }).path ?? '').trim())
-          .filter(Boolean);
+        const paths = files.map(resolveLocalFilePath).filter(Boolean);
         if (paths.length > 0) onAddLocalFiles(paths);
       }}
     >
@@ -160,7 +167,7 @@ export function PosterMaterialCardGrid({
             style={{ display: 'none' }}
             onChange={(e) => {
               const picked = Array.from(e.target.files ?? [])
-                .map((f) => ((f as File & { path?: string }).path ?? '').trim())
+                .map(resolveLocalFilePath)
                 .filter(Boolean);
               e.target.value = '';
               if (picked.length > 0) onAddLocalFiles(picked);
@@ -190,13 +197,7 @@ export function PosterMaterialCardGrid({
                 disabled={busy}
                 onClick={() => {
                   const ids = [...selectedVisibleIds];
-                  setSelectedCardIds((prev) => {
-                    const next = new Set(prev);
-                    ids.forEach((id) => next.delete(id));
-                    return next;
-                  });
-                  if (onBatchDeleteCards) onBatchDeleteCards(ids);
-                  else ids.forEach((id) => onDeleteCard(id));
+                  setConfirmDelete({ ids, label: `所选的 ${ids.length} 条贴文素材` });
                 }}
               >
                 批量删除 ({selectedVisibleIds.length})
@@ -394,7 +395,14 @@ export function PosterMaterialCardGrid({
                     type="button"
                     className="btn btn-sm"
                     disabled={busy}
-                    onClick={() => onDeleteCard(row.id)}
+                    onClick={() =>
+                      setConfirmDelete({
+                        ids: [row.id],
+                        label: row.caption.trim()
+                          ? `贴文「${row.caption.trim().slice(0, 24)}」`
+                          : `贴文 #${index + 1}`,
+                      })
+                    }
                   >
                     删除
                   </button>
@@ -407,6 +415,28 @@ export function PosterMaterialCardGrid({
 
       {previewRow && (
         <PosterMediaPreviewModal row={previewRow} onClose={() => setPreviewRow(null)} />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title="删除贴文素材"
+          description={`确定要删除${confirmDelete.label}吗？删除后无法恢复。`}
+          confirmText="确认删除"
+          danger
+          busy={busy}
+          onConfirm={() => {
+            const ids = confirmDelete.ids;
+            setConfirmDelete(null);
+            setSelectedCardIds((prev) => {
+              const next = new Set(prev);
+              ids.forEach((id) => next.delete(id));
+              return next;
+            });
+            if (ids.length === 1 && ids[0]) onDeleteCard(ids[0]);
+            else if (onBatchDeleteCards) onBatchDeleteCards(ids);
+            else ids.forEach((id) => onDeleteCard(id));
+          }}
+          onCancel={() => setConfirmDelete(null)}
+        />
       )}
     </div>
   );

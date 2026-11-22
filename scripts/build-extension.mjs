@@ -3,6 +3,12 @@ import { clearGeneratedDirectory } from './generated-output.mjs';
 import { mkdir, copyFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 const manifest = JSON.parse(await readFile('extension/manifest.json', 'utf8'));
+const sharedExtVersionSource = await readFile('src/shared/extension-version.ts', 'utf8');
+if (!sharedExtVersionSource.includes(`'${manifest.version}'`)) {
+  throw Error(
+    `EXTENSION_VERSION_SYNC_MISMATCH: src/shared/extension-version.ts must match extension/manifest.json (${manifest.version})`,
+  );
+}
 const identity = JSON.parse(await readFile('config/extension-identity.json', 'utf8'));
 const id = createHash('sha256')
   .update(Buffer.from(manifest.key, 'base64'))

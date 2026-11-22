@@ -10,6 +10,8 @@ import type { GroupBumperService } from '../application/group-bumper-service.js'
 import type { GroupInviterService } from '../application/group-inviter-service.js';
 import type { GroupPosterService } from '../application/group-poster-service.js';
 import type { BluestacksService } from '../application/bluestacks-service.js';
+import type { AutoSchedulerService } from '../application/auto-scheduler-service.js';
+import type { GoogleSheetsService } from '../application/google-sheets-service.js';
 import type { MaterialCacheManagement } from '../application/material-cache-management.js';
 import type { MaterialPreflightService } from '../application/material-preflight.js';
 import type { MaterialUsageService } from '../application/material-usage-service.js';
@@ -126,6 +128,8 @@ export function workspaceApi(
   isProfileOnline?: (profileId: string) => boolean | Promise<boolean>,
   bluestacks?: BluestacksService,
   profileLifecycle?: ProfileLifecyclePort,
+  autoScheduler?: AutoSchedulerService,
+  googleSheets?: GoogleSheetsService,
 ) {
   const resolvedFeatureExecution = ensureFeatureExecutionRegistry(featureExecution, {
     tasks,
@@ -170,6 +174,8 @@ export function workspaceApi(
           groupBumper,
           groupPoster,
           bluestacks,
+          autoScheduler,
+          googleSheets,
           featureExecution: resolvedFeatureExecution,
         })
       ) {
@@ -188,9 +194,6 @@ export function workspaceApi(
           backups,
           softwareControl,
           maintenance,
-          groupInviter,
-          groupBumper,
-          groupPoster,
           featureExecution: resolvedFeatureExecution,
           captureDiagnostics,
           revealDiagnostics,

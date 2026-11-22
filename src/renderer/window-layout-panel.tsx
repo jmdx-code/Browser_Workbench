@@ -9,13 +9,7 @@ import {
   windowLayoutMessage,
 } from '../shared/window-layout.js';
 
-export function WindowLayoutPanel({
-  selected,
-  profiles,
-}: {
-  selected: ReadonlySet<string>;
-  profiles: Profile[];
-}) {
+export function WindowLayoutPanel({ profiles }: { profiles: Profile[] }) {
   const [overview, setOverview] = useState<z.infer<typeof WindowLayoutOverview> | null>(null);
   const [settings, setSettings] = useState(
     defaultWindowLayout as z.infer<typeof WindowLayoutOverview>['settings'],
@@ -42,50 +36,16 @@ export function WindowLayoutPanel({
   useEffect(() => {
     void load();
   }, []);
-  useEffect(() => {
-    if (busy) return;
-    let live = true;
-    let pending = false;
-    const timer = setInterval(() => {
-      if (pending) return;
-      pending = true;
-      void api
-        .windowLayout()
-        .then((value) => {
-          if (live) setOverview(value);
-        })
-        .catch(() => {})
-        .finally(() => {
-          pending = false;
-        });
-    }, 3000);
-    return () => {
-      live = false;
-      clearInterval(timer);
-    };
-  }, [busy]);
-  async function run(action: 'configure' | 'apply' | 'restore') {
+  async function saveLayout() {
     setBusy(true);
     setError('');
     setNotice('');
     try {
-      if (action !== 'restore') await api.windowLayout({ action: 'configure', settings });
-      const value =
-        action === 'configure'
-          ? await api.windowLayout()
-          : await api.windowLayout({
-              action,
-              ...(action === 'apply' ? { profileIds: [...selected] } : {}),
-            });
+      await api.windowLayout({ action: 'configure', settings });
+      const value = await api.windowLayout();
       setOverview(value);
       setSettings(value.settings);
-      setNotice(
-        action === 'restore'
-          ? '已关闭自动恢复，窗口保留当前位置。'
-          : action === 'apply'
-            ? '已整理窗口，过大的窗口已适当缩小。请保持部分网页露出。'
-            : '设置已保存。更换区域后，请选择浏览器并点击“整理已选”应用到现有窗口；新任务会按设置整理。',
-      );
+      setNotice('窗口布局设置已保存；后续新任务或点击侧栏「整理窗口」将按此区域排列。');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -94,11 +54,12 @@ export function WindowLayoutPanel({
   }
   const display = overview?.displays.find((d) => d.id === settings.displayId);
   const area = settings.reservedArea ?? display?.workArea;
+  let secondaryCount = 0;
   return (
     <div className="menu-panel window-layout-panel">
       <h3>任务窗口露边布局</h3>
       <p className="muted">
-        在最后激活的浏览器所在屏幕上，按统一尺寸与固定间隔整齐排列所有窗口。主屏、副屏均可；任务执行期间不再频繁移动或抢占焦点。
+        指定目标屏幕与露边间距后，任务窗口会按统一尺寸整齐排列在所选屏幕内；执行期间不再抢占焦点。需要立即整理窗口可在左侧浏览器选中条点击「整理窗口」。
       </p>
       <label>
         目标屏幕
@@ -110,12 +71,15 @@ export function WindowLayoutPanel({
           }
         >
           <option value="">请选择屏幕</option>
-          {overview?.displays.map((d, i) => (
-            <option key={d.id} value={d.id}>
-              {d.primary ? '主屏' : `副屏 ${i + 1}`} · {d.workArea.width} × {d.workArea.height} ·{' '}
-              {Math.round(d.scaleFactor * 100)}%
-            </option>
-          ))}
+          {overview?.displays.map((d) => {
+            const label = d.primary ? '主屏' : `副屏 ${++secondaryCount}`;
+            return (
+              <option key={d.id} value={d.id}>
+                {label} · {d.workArea.width} × {d.workArea.height} ·{' '}
+                {Math.round(d.scaleFactor * 100)}%
+              </option>
+            );
+          })}
         </select>
       </label>
       {display && area && (
@@ -155,22 +119,19 @@ export function WindowLayoutPanel({
                       defaultValue={currentVal}
                       value={currentVal}
                       onChange={(value) => {
-                        setSettings({
-                          ...settings,
-                          reservedArea: {
-                            ...area,
-                            [key]: value + (key === 'x' || key === 'y' ? display.workArea[key] : 0),
-                          },
-                        });
-                      }}
-                      onCommit={(value) => {
-                        setSettings({
-                          ...settings,
-                          reservedArea: {
-                            ...area,
-                            [key]: value + (key === 'x' || key === 'y' ? display.workArea[key] : 0),
-                          },
-                        });
+                        setSettings((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                reservedArea: {
+                                  ...(prev.reservedArea ?? area),
+                                  [key]:
+                                    value +
+                                    (key === 'x' || key === 'y' ? display.workArea[key] : 0),
+                                },
+                              }
+                            : prev,
+                        );
                       }}
                     />
                   </label>
@@ -244,29 +205,14 @@ export function WindowLayoutPanel({
       )}
       <div className="button-row">
         <button
-          className="btn"
+          type="button"
+          className="btn btn-primary btn-sm"
           disabled={busy || !overview || !settings.displayId}
-          onClick={() => void run('configure')}
+          onClick={() => void saveLayout()}
         >
-          保存设置
-        </button>
-        <button
-          className="btn btn-primary"
-          disabled={
-            busy || !overview || !settings.displayId || selected.size === 0 || selected.size > 100
-          }
-          onClick={() => void run('apply')}
-        >
-          整理已选（{selected.size}）
-        </button>
-        <button className="btn" disabled={busy || !overview} onClick={() => void run('restore')}>
-          关闭自动恢复
-        </button>
-        <button className="btn btn-ghost" disabled={busy} onClick={() => void load()}>
-          重新读取
+          {busy ? '保存中…' : '保存布局设置'}
         </button>
       </div>
-      <p className="muted">停止任务或关闭自动恢复后，窗口留在当前位置，不再自动还原。</p>
       {notice && <p role="status">{notice}</p>}
       {overview?.recovery?.map((item) => (
         <p key={item.profileId} role={item.state === 'NEEDS_ATTENTION' ? 'alert' : 'status'}>

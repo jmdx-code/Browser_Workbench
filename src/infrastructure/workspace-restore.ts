@@ -65,6 +65,7 @@ async function inspect(directory: string) {
       throw Error('备份文件已改变或损坏：' + record.name);
     const db = new DatabaseSync(file, { readOnly: true });
     try {
+      db.exec('PRAGMA busy_timeout = 5000');
       const version = db.prepare('PRAGMA user_version').get()?.user_version;
       const maximum =
         record.name === 'workspace.sqlite' ? workspaceSchemaVersion : bridgeSchemaVersion;
@@ -89,6 +90,8 @@ async function inspect(directory: string) {
   const workspace = new DatabaseSync(path.join(directory, 'workspace.sqlite'), { readOnly: true });
   const journal = new DatabaseSync(path.join(directory, 'journal.sqlite'), { readOnly: true });
   try {
+    workspace.exec('PRAGMA busy_timeout = 5000');
+    journal.exec('PRAGMA busy_timeout = 5000');
     const count = (db: DatabaseSync, table: string) =>
       Number(db.prepare('SELECT count(*) AS total FROM ' + table).get()?.total);
     return {
@@ -156,6 +159,22 @@ export class FilesystemWorkspaceRestore implements WorkspaceRestorePort {
   }
 }
 
+async function renameWithWindowsRetry(fromPath: string, toPath: string): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      await rename(fromPath, toPath);
+      return;
+    } catch (error) {
+      lastErr = error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function replacePair(
   dataDir: string,
   source: string,
@@ -165,13 +184,35 @@ async function replacePair(
   await inspect(source);
   for (const name of names) {
     const target = path.join(dataDir, name),
-      temp = target + '.restore-' + id;
-    await rm(temp, { force: true });
+      temp = target + '.restore-' + id,
+      oldBackup = target + '.prev-' + id;
+    await rm(temp, { force: true, maxRetries: 4, retryDelay: 100 });
+    await rm(oldBackup, { force: true, maxRetries: 4, retryDelay: 100 });
     await copyFile(path.join(source, name), temp, constants.COPYFILE_EXCL);
-    // Only original application DB names in its explicitly supplied data directory.
-    // Both DB connections are closed. Old WAL/SHM must not be applied to the restored snapshot.
-    for (const file of [target + '-wal', target + '-shm', target]) await rm(file, { force: true });
-    await rename(temp, target);
+    // Move existing live DB aside FIRST with Windows EBUSY retry before removing -wal/-shm,
+    // so a locked live DB never loses its WAL if rename cannot acquire the file.
+    let movedOld = false;
+    try {
+      await renameWithWindowsRetry(target, oldBackup);
+      movedOld = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        await rm(temp, { force: true }).catch(() => {});
+        throw error;
+      }
+    }
+    try {
+      await renameWithWindowsRetry(temp, target);
+    } catch (error) {
+      if (movedOld) {
+        await renameWithWindowsRetry(oldBackup, target).catch(() => {});
+      }
+      await rm(temp, { force: true }).catch(() => {});
+      throw error;
+    }
+    for (const file of [target + '-wal', target + '-shm', oldBackup]) {
+      await rm(file, { force: true, maxRetries: 6, retryDelay: 150 });
+    }
     await checkpoint(name);
   }
 }
@@ -199,6 +240,7 @@ export async function applyPendingWorkspaceRestore(
       const snapshot = async (name: string, target: string) => {
         const db = new DatabaseSync(path.join(dataDir, name));
         try {
+          db.exec('PRAGMA busy_timeout = 5000');
           await backup(db, target);
         } finally {
           db.close();

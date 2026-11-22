@@ -463,11 +463,91 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       pendingSetup: Map<string, Binding>;
     }
   >();
-  private readonly stopping = new Map<string, { connection: Connection; requestId: string }>();
+  private readonly stopping = new Map<
+    string,
+    {
+      connection: Connection;
+      requestId: string;
+      peerEpoch: string;
+      boundAccountId: string;
+      pendingSetup: Binding[];
+      pendingSubmission?: Binding | undefined;
+    }
+  >();
   async retryStop(profileId: string) {
     const pending = this.stopping.get(profileId);
     if (!pending) throw Error('GROUP_INVITER_STOP_NOT_PENDING');
-    await pending.connection.retryClose(pending.requestId);
+    const kernel = this.getKernel();
+    const core = this.getCore();
+    const currentPeer = core?.peers.get(profileId);
+    if (!currentPeer || !currentPeer.online || !currentPeer.synced) {
+      await pending.connection.closeLocalAfterDisconnect().catch(() => {});
+      throw Error('GROUP_INVITER_STOP_AWAITING_RECONNECT');
+    }
+    if (kernel && currentPeer.epoch !== pending.peerEpoch) {
+      if (currentPeer.phase !== 'PAUSED') {
+        await core?.reconcileRecoveringPeerIfPossible?.(profileId).catch(() => false);
+      }
+      if (currentPeer.phase !== 'PAUSED') {
+        await pending.connection.closeLocalAfterDisconnect().catch(() => {});
+        throw Error('GROUP_INVITER_STOP_AWAITING_RECONNECT');
+      }
+      await pending.connection.closeLocalAfterDisconnect();
+      await kernel.withSummary(currentPeer, async (port) => {
+        const receipt = await port.stopCurrent(pending.requestId);
+        if (
+          receipt.requestId !== pending.requestId ||
+          receipt.connectionEpoch !== currentPeer.epoch ||
+          receipt.state !== 'stopped'
+        ) {
+          throw Error('GROUP_INVITER_STOP_UNCONFIRMED');
+        }
+        await pending.connection.confirmReconnectedStop(receipt);
+        const inventory = await port.inventory();
+        for (const binding of pending.pendingSetup) {
+          if (
+            !inventory.operations.some(
+              (op) => op.binding.operationId === binding.operationId && kernelOperationPending(op),
+            )
+          ) {
+            continue;
+          }
+          await port.notify(binding, {
+            id: randomUUID(),
+            outcome: 'ENDED_UNKNOWN',
+            evidenceDigest: invitationDigest(
+              'Non-submit setup ended',
+              pending.boundAccountId,
+              binding.operationId,
+            ),
+          });
+        }
+        if (
+          pending.pendingSubmission &&
+          inventory.operations.some(
+            (op) =>
+              op.binding.operationId === pending.pendingSubmission?.operationId &&
+              kernelOperationPending(op),
+          )
+        ) {
+          await port.notify(pending.pendingSubmission, {
+            id: randomUUID(),
+            outcome: 'ENDED_UNKNOWN',
+            evidenceDigest: createHash('sha256')
+              .update(
+                JSON.stringify({
+                  pending: pending.pendingSubmission,
+                  reason:
+                    'Invitation batch ended; unconfirmed recipients remain PENDING and will not be resent',
+                }),
+              )
+              .digest('hex'),
+          });
+        }
+      });
+    } else {
+      await pending.connection.retryClose(pending.requestId);
+    }
     this.stopping.delete(profileId);
   }
   constructor(
@@ -1766,7 +1846,16 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             }),
           );
       } catch (cause) {
-        this.stopping.set(profileId, { connection: conn, requestId });
+        const scopeSnap = this.scopes.get(conn);
+        this.stopping.set(profileId, {
+          connection: conn,
+          requestId,
+          peerEpoch: peer.epoch,
+          boundAccountId,
+          pendingSetup: [...(scopeSnap?.pendingSetup.values() ?? [])],
+          pendingSubmission: scopeSnap?.pendingSubmission,
+        });
+        await conn.closeLocalAfterDisconnect().catch(() => {});
         throw new Error('GROUP_INVITER_STOP_UNCONFIRMED', { cause });
       } finally {
         this.scopes.delete(conn);

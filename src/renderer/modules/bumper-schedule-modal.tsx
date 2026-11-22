@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { BumperScheduledTask, BumperTaskStatus } from '../../shared/group-bumper.js';
 
 function toLocalDateTimeInputValue(ms: number): string {
@@ -47,11 +47,21 @@ export function BumperScheduleModal({
   );
   const [localError, setLocalError] = useState('');
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
   const applyQuickOffset = (minutesFromNow: number) => {
+    setLocalError('');
     setScheduledDateTime(toLocalDateTimeInputValue(Date.now() + minutesFromNow * 60_000));
   };
 
   const applyFixedHour = (daysAhead: number, hour: number) => {
+    setLocalError('');
     const d = new Date();
     d.setDate(d.getDate() + daysAhead);
     d.setHours(hour, 0, 0, 0);
@@ -87,11 +97,25 @@ export function BumperScheduleModal({
   const title = pageMode ? '创建专页顶贴定时任务' : '创建小组顶贴定时任务';
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={title}>
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
       <div className="modal bumper-modal" style={{ maxWidth: '520px', width: '92vw' }}>
         <div className="bumper-modal-heading">
           <h2>{title}</h2>
-          <button type="button" className="btn" aria-label="关闭弹窗" onClick={onClose}>
+          <button
+            type="button"
+            className="btn"
+            aria-label="关闭弹窗"
+            disabled={busy}
+            onClick={onClose}
+          >
             ×
           </button>
         </div>
@@ -162,7 +186,7 @@ export function BumperScheduleModal({
         </div>
 
         <div className="bumper-modal-footer">
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" disabled={busy} onClick={onClose}>
             取消
           </button>
           <button

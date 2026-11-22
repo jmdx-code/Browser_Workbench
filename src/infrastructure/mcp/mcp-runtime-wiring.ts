@@ -3,8 +3,11 @@ import type { Core } from '../../bridge/core.js';
 import type { BridgeStorePort, WorkspaceStorePort } from '../persistence-port.js';
 import type { LocalBrowserLabels } from '../local-browser-labels.js';
 import { BrowserLifecycleManager } from '../browser-lifecycle-manager.js';
+import { BluestacksActiveRunner } from '../bluestacks-active-runner.js';
 import { BluestacksDeviceManager } from '../bluestacks-device-manager.js';
 import { BluestacksGroupBumperRunner } from '../bluestacks-bumper-runner.js';
+import { BluestacksGroupInviterRunner } from '../bluestacks-inviter-runner.js';
+import { BluestacksGroupPosterRunner } from '../bluestacks-poster-runner.js';
 import { WindowsOcrClient } from '../bluestacks-vision.js';
 import type { FacebookPublishingRuntime } from '../facebook-publishing-runtime.js';
 import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
@@ -12,6 +15,8 @@ import type { GroupBumperService } from '../../application/group-bumper-service.
 import type { GroupPosterService } from '../../application/group-poster-service.js';
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
 import { BluestacksService } from '../../application/bluestacks-service.js';
+import type { AutoSchedulerService } from '../../application/auto-scheduler-service.js';
+import type { GoogleSheetsService } from '../../application/google-sheets-service.js';
 import { ProductError } from '../../domain/workspace.js';
 import { syncProductAiWorkspaceDirectory } from '../ai-workspace.js';
 import type { WorkspaceService } from '../../application/workspace-service.js';
@@ -44,6 +49,8 @@ export interface McpRuntimeWiringInput {
   groupBumperService: GroupBumperService;
   groupInviterService: GroupInviterService;
   bluestacksService: BluestacksService;
+  getAutoSchedulerService?: (() => AutoSchedulerService | undefined) | undefined;
+  getGoogleSheetsService?: (() => GoogleSheetsService | undefined) | undefined;
   browserWindow?: BrowserWindowPort | undefined;
   windowLayout?: WindowLayoutPort | undefined;
   captureDiagnostics: WorkbenchMcpDependencies['captureDiagnostics'];
@@ -55,6 +62,7 @@ export interface McpRuntimeWiringInput {
 export function createBluestacksRuntime(
   repository: WorkspaceStorePort,
   featureExecution: FeatureExecutionRegistry,
+  preparePosterMedia?: (mediaSource: string) => Promise<{ localFilePath: string }>,
 ): { ocrClient: WindowsOcrClient; service: BluestacksService } {
   const ocrClient = new WindowsOcrClient();
   const devices = new BluestacksDeviceManager(repository.bluestacks, ocrClient);
@@ -64,7 +72,29 @@ export function createBluestacksRuntime(
     devices,
     ocrClient,
   );
-  const service = new BluestacksService(repository.bluestacks, devices, runner, featureExecution);
+  const activeRunner = new BluestacksActiveRunner(devices, ocrClient);
+  const posterRunner = new BluestacksGroupPosterRunner(devices, ocrClient, {
+    recordPost: (log) => repository.groupPoster.recordPost(log),
+  });
+  const inviterRunner = new BluestacksGroupInviterRunner(devices, ocrClient, {
+    recordInvites: (entries) => repository.groupInviter.recordInvites(entries),
+  });
+  const service = new BluestacksService(repository.bluestacks, devices, runner, featureExecution, {
+    activeRunner,
+    posterRunner,
+    inviterRunner,
+    listCombinations: () => repository.combinations(),
+    listPosterMaterials: () => repository.groupPoster.materials(),
+    ...(preparePosterMedia
+      ? {
+          ensurePosterMaterialLocal: async (mat) => {
+            if (mat.localFilePath || !mat.mediaSource.trim()) return mat;
+            const prepared = await preparePosterMedia(mat.mediaSource);
+            return { ...mat, localFilePath: prepared.localFilePath };
+          },
+        }
+      : {}),
+  });
   return { ocrClient, service };
 }
 
@@ -167,6 +197,8 @@ export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
       getGroupBumperService: () => groupBumperService,
       groupInviterService,
       bluestacksService: input.bluestacksService,
+      getAutoSchedulerService: input.getAutoSchedulerService,
+      getGoogleSheetsService: input.getGoogleSheetsService,
       agentBrowser: agentBrowserManager,
       profileLifecycle,
       browserWindow: input.browserWindow,

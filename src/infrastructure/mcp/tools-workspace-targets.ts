@@ -92,6 +92,12 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
       const activeAccountPlans = taskOverview
         ? taskOverview.plans.filter((p) => !['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))
         : [];
+      const activeScheduler = deps.getAutoSchedulerService?.();
+      const schedulerState = activeScheduler
+        ? await activeScheduler.state().catch(() => null)
+        : null;
+      const activeSheets = deps.getGoogleSheetsService?.();
+      const sheetsOverview = activeSheets ? await activeSheets.overview().catch(() => null) : null;
 
       return okResult({
         ok: true,
@@ -214,6 +220,29 @@ export function createWorkspaceAndTargetTools(deps: WorkbenchMcpDependencies): M
             (i) => i.online && isBluestacksPortraitResolution(i.fbWidth, i.fbHeight),
           ).length,
         },
+        autoScheduler: schedulerState
+          ? {
+              running: schedulerState.running,
+              powerLockMode: schedulerState.powerLockMode,
+              schedulesCount: schedulerState.schedules.length,
+              enabledSchedulesCount: schedulerState.schedules.filter((s) => s.enabled).length,
+              activeBrowserWorkers: schedulerState.activeBrowserWorkers,
+              queuedBrowserTargets: schedulerState.queuedBrowserTargets,
+              activeBluestacksWorkers: schedulerState.activeBluestacksWorkers,
+              queuedBluestacksTargets: schedulerState.queuedBluestacksTargets,
+              activeRunsCount: schedulerState.activeRuns.length,
+            }
+          : null,
+        googleSheets: sheetsOverview
+          ? {
+              authorized: sheetsOverview.auth.authorized,
+              authorizedEmail: sheetsOverview.auth.authorizedEmail,
+              linksCount: sheetsOverview.links.length,
+              enabledLinksCount: sheetsOverview.links.filter((l) => l.enabled).length,
+              runningScheduleCount: sheetsOverview.runningScheduleCount,
+              runningRecordsCount: sheetsOverview.runningRecordsCount,
+            }
+          : null,
         agentBrowserSessions: deps.agentBrowser.listSessions(),
         recentWarningsAndErrors: recentAnomalies,
       });

@@ -16,6 +16,7 @@ import { CombinationList } from '../src/renderer/combination-list.js';
 import { TaskRecordsPage } from '../src/renderer/task-records.js';
 import {
   buildFeatureNavItems,
+  buildWorkbenchProjection,
   projectSelectionControls,
 } from '../src/renderer/modules/profile-activity-projector.js';
 import {
@@ -1764,8 +1765,11 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
   });
   const bsItems = navItems.filter((item) => item.group === 'bluestacks');
   expect(bsItems.map((i) => ({ id: i.id, title: i.title, runningCount: i.runningCount }))).toEqual([
+    { id: 'bluestacks-active', title: '蓝蝶活跃账号', runningCount: 0 },
+    { id: 'bluestacks-group-poster', title: '蓝蝶小组发帖', runningCount: 0 },
     { id: 'bluestacks-group-bumper', title: '蓝蝶小组顶贴', runningCount: 1 },
     { id: 'bluestacks-page-bumper', title: '蓝蝶专页顶贴', runningCount: 2 },
+    { id: 'bluestacks-group-inviter', title: '蓝蝶小组邀请人', runningCount: 0 },
   ]);
 
   const clickedNav: string[] = [];
@@ -1877,10 +1881,10 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
     ),
   );
 
-  // Single column: Page list rendered, Group list hidden
+  // Single column: Page list rendered, Group list hidden, concurrency unified into topbar
   expect(host.textContent).toContain('专页列表');
   expect(host.textContent).not.toContain('小组列表');
-  expect(host.textContent).toContain('最大并发模拟器数');
+  expect(host.textContent).not.toContain('最大并发模拟器数');
   expect(host.textContent).toContain('顶贴记录 (4 条)');
 
   // Select the Page row checkbox and click Start
@@ -1972,4 +1976,157 @@ it('PopoverMenu flips to align-start when trigger is near the left edge of .work
   expect(panel).toBeTruthy();
   expect(panel?.classList.contains('align-start')).toBe(true);
   expect(panel?.classList.contains('align-end')).toBe(false);
+});
+
+it('FeatureNavRail organizes 4 groups (调度与监控 → 浏览器自动化 → 蓝蝶模拟器 → 云表协同), persists folded groups, and projects live Google Sheets browser badges', async () => {
+  window.localStorage.removeItem('workbench.nav-rail-collapsed.v1');
+  window.localStorage.removeItem('workbench.nav-rail-closed-groups.v1');
+
+  const p1 = '10000000-0000-4000-8000-000000000011';
+  const p2 = '10000000-0000-4000-8000-000000000012';
+  const projection = buildWorkbenchProjection({
+    viewKind: 'sheets-schedule',
+    profiles: [
+      {
+        id: p1,
+        alias: '专页号A',
+        browserName: 'Chrome A',
+        groupId: null,
+        order: 0,
+        online: true,
+        phase: 'READY',
+        synced: true,
+        unresolved: 0,
+        extensionVersion: '0.3.84',
+        capabilities: [],
+        presentation: null,
+        account: { state: 'logged-in', id: 'page-1', name: 'Page A', avatar: null },
+      },
+      {
+        id: p2,
+        alias: '顶贴号B',
+        browserName: 'Chrome B',
+        groupId: null,
+        order: 1,
+        online: true,
+        phase: 'READY',
+        synced: true,
+        unresolved: 0,
+        extensionVersion: '0.3.84',
+        capabilities: [],
+        presentation: null,
+        account: { state: 'logged-in', id: 'user-2', name: 'User B', avatar: null },
+      },
+    ],
+    selected: new Set([p1, p2]),
+    tasks: null,
+    groupBumper: null,
+    groupInviter: null,
+    groupPoster: null,
+    bluestacks: null,
+    autoScheduler: null,
+    googleSheets: {
+      runningScheduleCount: 1,
+      runningRecordsCount: 1,
+      activeProfiles: [
+        {
+          profileId: p1,
+          linkId: 'link-sched',
+          kind: 'post_schedule',
+          title: '早班排贴表',
+          status: '正在发布第 2/5 群',
+        },
+        {
+          profileId: p2,
+          linkId: 'link-rec',
+          kind: 'post_records',
+          title: '总发帖记录',
+          status: '正在顶贴 (1/3)',
+        },
+      ],
+      links: [],
+    },
+    attentionCount: 2,
+    message: '',
+  });
+
+  expect(projection.breadcrumbText).toBe('云表协同 · 排贴表');
+  expect(projection.sheetsRunningIds.sort()).toEqual([p1, p2]);
+  expect(projection.projectedControls.isProfileBusy(p1)).toBe(true);
+  expect(projection.projectedControls.isProfileBusy(p2)).toBe(true);
+  expect(projection.projectedControls.stoppableModuleProfileIds.sort()).toEqual([p1, p2]);
+  expect(projection.projectedActivities?.get(p1)).toMatchObject({
+    moduleId: 'sheets-schedule',
+    moduleLabel: '云表排贴',
+    running: true,
+    tone: 'run',
+    text: '云表排贴 · 正在发布第 2/5 群',
+  });
+  expect(projection.projectedActivities?.get(p2)).toMatchObject({
+    moduleId: 'sheets-records',
+    moduleLabel: '云表顶贴',
+    running: true,
+    tone: 'run',
+    text: '云表顶贴 · 正在顶贴 (1/3)',
+  });
+
+  await act(async () =>
+    root.render(
+      <FeatureNavRail
+        activeModule="sheets-schedule"
+        items={projection.navItems}
+        onSelectModule={() => {}}
+      />,
+    ),
+  );
+
+  // Verify 4-group visual order (Chrome & BlueStacks adjacent, 云表协同 below both)
+  const groupTitles = [...host.querySelectorAll('.nav-rail-group-title-text')].map(
+    (el) => el.textContent,
+  );
+  expect(groupTitles).toEqual(['调度与监控', '浏览器自动化', '蓝蝶模拟器', '云表协同']);
+
+  // Verify item ordering inside groups
+  const itemLabels = [...host.querySelectorAll('.nav-rail-label')].map((el) => el.textContent);
+  expect(itemLabels).toEqual([
+    '定时排班',
+    '执行记录',
+    '活跃账号',
+    '小组发帖',
+    '小组顶贴',
+    '专页顶贴',
+    '小组邀请人',
+    '蓝蝶活跃账号',
+    '蓝蝶小组发帖',
+    '蓝蝶小组顶贴',
+    '蓝蝶专页顶贴',
+    '蓝蝶小组邀请人',
+    '排贴表',
+    '发帖记录',
+    '小组表',
+    '专页表',
+  ]);
+
+  // Fold 云表协同 -> persists to localStorage and surfaces running pill on header
+  const sheetsGroupBtn = [...host.querySelectorAll('.nav-rail-group-title')].find((b) =>
+    b.textContent?.includes('云表协同'),
+  );
+  await click(sheetsGroupBtn ?? null);
+  expect(window.localStorage.getItem('workbench.nav-rail-closed-groups.v1')).toBe('["sheets"]');
+  expect(sheetsGroupBtn?.textContent).toContain('2运行');
+  expect(host.textContent).not.toContain('排贴表');
+
+  // Re-mount should remember folded group
+  await act(async () => root.render(<div />));
+  await act(async () =>
+    root.render(
+      <FeatureNavRail
+        activeModule="active-accounts"
+        items={projection.navItems}
+        onSelectModule={() => {}}
+      />,
+    ),
+  );
+  expect(host.textContent).not.toContain('排贴表');
+  window.localStorage.removeItem('workbench.nav-rail-closed-groups.v1');
 });

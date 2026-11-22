@@ -1,5 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { access, open, stat } from 'node:fs/promises';
+import {
+  access,
+  copyFile,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+  utimes,
+} from 'node:fs/promises';
 import path from 'node:path';
 import type { Response } from 'playwright-core';
 import type { Awaitable, CompatibleRepository } from '../domain/persistence.js';
@@ -48,6 +60,7 @@ import { nativeSolidBackgrounds } from '../shared/facebook-background.js';
 import { facebookAILabelScope, facebookAILabelSwitch } from '../shared/facebook-ai-label.js';
 import { readFacebookAILabel } from './facebook-ai-label-reader.js';
 import { isLocalAvatar, isPlaceholderTargetName } from '../shared/group-bumper.js';
+import { PAGE_TIMELINE_SYNTHETIC_GROUP_ID } from '../shared/google-sheets.js';
 import { fetchAndLocalizeAccountAvatar, fetchAndLocalizeAvatar } from './group-bumper-avatar.js';
 import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
 import {
@@ -233,11 +246,64 @@ export async function recoverPosterOperations(
 }
 
 export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
+  private static readonly SOURCE_DEDUP_TTL_MS = 20 * 60_000;
+  private readonly sourceToDedupPath = new Map<
+    string,
+    { localFilePath: string; mediaKind: PosterMediaKind; cachedAt: number }
+  >();
+  private readonly activeCacheRefs = new Map<string, number>();
+
   constructor(
     private readonly cacheDir: string,
     private readonly request: typeof fetch = fetch,
     private readonly mediaComponent?: MediaRuntimeComponent | undefined,
   ) {}
+
+  private acquireCacheRef(filePath: string): void {
+    const key = path.resolve(filePath);
+    this.activeCacheRefs.set(key, (this.activeCacheRefs.get(key) ?? 0) + 1);
+  }
+
+  private async promoteToHashCache(
+    sourceFile: string,
+    digestHex: string,
+    ext: string,
+    cleanupFolder?: string,
+  ): Promise<string> {
+    const hashDir = path.join(this.cacheDir, 'by-hash');
+    await mkdir(hashDir, { recursive: true });
+    const safeExt = /^\.[A-Za-z0-9]{1,8}$/.test(ext) ? ext.toLowerCase() : '.bin';
+    const dest = path.join(hashDir, `${digestHex.toLowerCase()}${safeExt}`);
+    let alreadyExists = false;
+    try {
+      const existingStat = await stat(dest);
+      alreadyExists = existingStat.isFile() && existingStat.size > 0;
+    } catch {
+      alreadyExists = false;
+    }
+    if (alreadyExists) {
+      const now = new Date();
+      await utimes(dest, now, now).catch(() => {});
+    } else {
+      try {
+        await rename(sourceFile, dest);
+      } catch {
+        const tmpDest = `${dest}.${randomUUID().slice(0, 8)}.tmp`;
+        await copyFile(sourceFile, tmpDest);
+        try {
+          await rename(tmpDest, dest);
+        } catch {
+          await unlink(tmpDest).catch(() => {});
+        }
+      }
+    }
+    if (cleanupFolder) {
+      await rm(cleanupFolder, { recursive: true, force: true }).catch(() => {});
+    } else if (path.resolve(sourceFile) !== path.resolve(dest)) {
+      await unlink(sourceFile).catch(() => {});
+    }
+    return dest;
+  }
 
   async prepare(
     mediaSource: string,
@@ -246,15 +312,48 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
     const trimmed = mediaSource.trim();
     const ref = mediaReference(trimmed);
     if (ref.kind === 'drive') {
+      const cached = this.sourceToDedupPath.get(trimmed);
+      if (
+        cached &&
+        Date.now() - cached.cachedAt <= FilesystemPosterMediaPreparer.SOURCE_DEDUP_TTL_MS
+      ) {
+        if (await this.verifyExists(cached.localFilePath)) {
+          const now = new Date();
+          await utimes(cached.localFilePath, now, now).catch(() => {});
+          this.acquireCacheRef(cached.localFilePath);
+          const thumbnailDataUrl = await this.generateThumbnail(
+            cached.localFilePath,
+            cached.mediaKind,
+          );
+          return {
+            localFilePath: cached.localFilePath,
+            mediaKind: cached.mediaKind,
+            thumbnailDataUrl,
+          };
+        }
+        this.sourceToDedupPath.delete(trimmed);
+      }
       const downloaded = await new PublicDriveDownloader(
         this.cacheDir,
         undefined,
         this.request,
       ).download(trimmed, 0, assertCurrent);
+      const dedupPath = await this.promoteToHashCache(
+        downloaded.path,
+        downloaded.digest,
+        downloaded.extension,
+        path.dirname(downloaded.path),
+      );
       const mediaKind: PosterMediaKind = downloaded.extension === '.mp4' ? 'video' : 'image';
-      const thumbnailDataUrl = await this.generateThumbnail(downloaded.path, mediaKind);
+      this.sourceToDedupPath.set(trimmed, {
+        localFilePath: dedupPath,
+        mediaKind,
+        cachedAt: Date.now(),
+      });
+      this.acquireCacheRef(dedupPath);
+      const thumbnailDataUrl = await this.generateThumbnail(dedupPath, mediaKind);
       return {
-        localFilePath: downloaded.path,
+        localFilePath: dedupPath,
         mediaKind,
         thumbnailDataUrl,
       };
@@ -294,7 +393,247 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
   }
 
   async removeCachedDriveFile(localFilePath: string): Promise<boolean> {
+    const key = path.resolve(localFilePath);
+    const prevRefs = this.activeCacheRefs.get(key) ?? 0;
+    if (prevRefs > 1) {
+      this.activeCacheRefs.set(key, prevRefs - 1);
+      return false;
+    }
+    this.activeCacheRefs.delete(key);
+    for (const [srcKey, entry] of this.sourceToDedupPath.entries()) {
+      if (path.resolve(entry.localFilePath) === key) {
+        this.sourceToDedupPath.delete(srcKey);
+      }
+    }
     return await removePosterCachedFileIfSafe(this.cacheDir, localFilePath);
+  }
+
+  async prepareWithOAuthFallback(
+    mediaSource: string,
+    getAccessToken?: (() => Promise<string>) | undefined,
+  ): Promise<PreparedPosterMedia & { isTemporaryCache: boolean }> {
+    const trimmed = mediaSource.trim();
+    const ref = mediaReference(trimmed);
+    if (ref.kind !== 'drive') {
+      const base = await this.prepare(trimmed);
+      return { ...base, isTemporaryCache: false };
+    }
+    try {
+      const base = await this.prepare(trimmed);
+      return { ...base, isTemporaryCache: true };
+    } catch (publicErr) {
+      if (!getAccessToken) throw publicErr;
+      let token: string;
+      try {
+        token = await getAccessToken();
+      } catch {
+        throw publicErr;
+      }
+      const fileId = /(?:\/file\/d\/|[?&]id=)([A-Za-z0-9_-]{10,})/.exec(trimmed)?.[1];
+      if (!fileId) throw publicErr;
+      const metaRes = await this.request(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=name,mimeType&supportsAllDrives=true`,
+        {
+          headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      if (metaRes.status === 403 || metaRes.status === 404) {
+        throw new Error(
+          '该 Google 网盘素材未公开共享且当前授权无权读取私有网盘（请将素材设为「知道链接的任何人可查看」，或在菜单里重新授权 Google 读取私有网盘）',
+        );
+      }
+      const metaJson = metaRes.ok
+        ? ((await metaRes.json().catch(() => ({}))) as { name?: string; mimeType?: string })
+        : {};
+      const dlRes = await this.request(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
+        {
+          headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(120_000),
+        },
+      );
+      if (!dlRes.ok) {
+        throw publicErr;
+      }
+      const contentType = (
+        dlRes.headers.get('content-type') ||
+        metaJson.mimeType ||
+        ''
+      ).toLowerCase();
+      if (
+        contentType.includes('text/html') ||
+        contentType.includes('application/json') ||
+        contentType.includes('application/pdf')
+      ) {
+        await dlRes.body?.cancel().catch(() => {});
+        throw publicErr;
+      }
+      const origExt = metaJson.name ? path.extname(metaJson.name).toLowerCase() : '';
+      const isVideo =
+        contentType.startsWith('video/') || /\.(?:mp4|mov|webm|mkv|avi)$/i.test(origExt);
+      const ext = isVideo
+        ? origExt && /\.(?:mp4|mov|webm|mkv|avi)$/i.test(origExt)
+          ? origExt
+          : '.mp4'
+        : contentType.includes('png')
+          ? '.png'
+          : contentType.includes('webp')
+            ? '.webp'
+            : contentType.includes('gif')
+              ? '.gif'
+              : '.jpg';
+      const maxOAuthMediaBytes = isVideo ? 512 * 1024 * 1024 : 32 * 1024 * 1024;
+      const hashDir = path.join(this.cacheDir, 'by-hash');
+      await mkdir(hashDir, { recursive: true });
+      const tmpPath = path.join(hashDir, `.tmp-${randomUUID()}${ext}`);
+      const hasher = createHash('sha256');
+      const headChunks: Buffer[] = [];
+      let headBytes = 0;
+      let totalBytes = 0;
+      let fh: Awaited<ReturnType<typeof open>> | null = null;
+      try {
+        fh = await open(tmpPath, 'w');
+        if (!dlRes.body) {
+          throw publicErr;
+        }
+        const reader = dlRes.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = Buffer.from(value);
+            totalBytes += chunk.byteLength;
+            if (totalBytes > maxOAuthMediaBytes) {
+              await reader.cancel().catch(() => {});
+              throw new Error('DRIVE_MEDIA_TOO_LARGE');
+            }
+            if (headBytes < 16) {
+              const take = chunk.subarray(0, Math.min(chunk.byteLength, 16 - headBytes));
+              headChunks.push(take);
+              headBytes += take.byteLength;
+            }
+            hasher.update(chunk);
+            await fh.write(chunk);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        await fh.close();
+        fh = null;
+        const headBuf = Buffer.concat(headChunks);
+        const mediaKind: PosterMediaKind = isVideo ? 'video' : 'image';
+        if (totalBytes < 64 || !this.hasValidMediaHeader(headBuf, mediaKind)) {
+          throw publicErr;
+        }
+        const digestHex = hasher.digest('hex');
+        const targetPath = path.join(hashDir, `${digestHex}${ext}`);
+        if (await this.verifyExists(targetPath)) {
+          await rm(tmpPath, { force: true }).catch(() => {});
+          const now = new Date();
+          await utimes(targetPath, now, now).catch(() => {});
+        } else {
+          await rename(tmpPath, targetPath);
+        }
+        this.sourceToDedupPath.set(trimmed, {
+          localFilePath: targetPath,
+          mediaKind,
+          cachedAt: Date.now(),
+        });
+        this.acquireCacheRef(targetPath);
+        const thumbnailDataUrl = await this.generateThumbnail(targetPath, mediaKind);
+        return {
+          localFilePath: targetPath,
+          mediaKind,
+          thumbnailDataUrl,
+          isTemporaryCache: true,
+        };
+      } catch (streamErr) {
+        if (fh) {
+          await fh.close().catch(() => {});
+        }
+        await rm(tmpPath, { force: true }).catch(() => {});
+        throw streamErr;
+      }
+    }
+  }
+
+  async pruneOldCachedFiles(maxAgeMs = 24 * 60 * 60_000): Promise<number> {
+    let removed = 0;
+    const cutoff = Date.now() - Math.max(60_000, maxAgeMs);
+    try {
+      const entries = await readdir(this.cacheDir, { withFileTypes: true });
+      for (const ent of entries) {
+        const full = path.join(this.cacheDir, ent.name);
+        if (ent.isFile()) {
+          try {
+            const st = await stat(full);
+            if (st.mtimeMs < cutoff && !this.activeCacheRefs.has(path.resolve(full))) {
+              await unlink(full);
+              removed++;
+            }
+          } catch {}
+        } else if (ent.isDirectory()) {
+          if (ent.name === 'by-hash') {
+            const hashEntries = await readdir(full, { withFileTypes: true }).catch(() => []);
+            for (const sub of hashEntries) {
+              if (!sub.isFile()) continue;
+              const subFull = path.join(full, sub.name);
+              try {
+                const st = await stat(subFull);
+                if (st.mtimeMs < cutoff && !this.activeCacheRefs.has(path.resolve(subFull))) {
+                  await unlink(subFull);
+                  removed++;
+                }
+              } catch {}
+            }
+          } else {
+            // Reap legacy UUID download directories created by PublicDriveDownloader
+            try {
+              const st = await stat(full);
+              if (st.mtimeMs < cutoff) {
+                await rm(full, { recursive: true, force: true });
+                removed++;
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+    return removed;
+  }
+
+  private hasValidMediaHeader(head: Buffer, mediaKind: PosterMediaKind): boolean {
+    if (head.byteLength < 12) return false;
+    if (mediaKind === 'image') {
+      const isPng = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47;
+      const isJpeg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;
+      const isGif = head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x38;
+      const isWebp =
+        head[0] === 0x52 &&
+        head[1] === 0x49 &&
+        head[2] === 0x46 &&
+        head[3] === 0x46 &&
+        head[8] === 0x57 &&
+        head[9] === 0x45 &&
+        head[10] === 0x42 &&
+        head[11] === 0x50;
+      const isBmp = head[0] === 0x42 && head[1] === 0x4d;
+      return isPng || isJpeg || isGif || isWebp || isBmp;
+    }
+    const isMp4OrMov = head[4] === 0x66 && head[5] === 0x74 && head[6] === 0x79 && head[7] === 0x70;
+    const isWebmOrMkv =
+      head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
+    const isAvi =
+      head[0] === 0x52 &&
+      head[1] === 0x49 &&
+      head[2] === 0x46 &&
+      head[3] === 0x46 &&
+      head[8] === 0x41 &&
+      head[9] === 0x56 &&
+      head[10] === 0x49 &&
+      head[11] === 0x20;
+    return isMp4OrMov || isWebmOrMkv || isAvi;
   }
 
   async readMediaRange(
@@ -303,9 +642,17 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
     rangeHeader?: string | undefined,
   ): Promise<PosterMediaStreamChunk | null> {
     try {
-      const st = await stat(localFilePath);
-      if (!st.isFile() || st.size < 1) return null;
-      const total = st.size;
+      const linkSt = await lstat(localFilePath);
+      if (linkSt.isSymbolicLink() || !linkSt.isFile() || linkSt.size < 12) return null;
+      const total = linkSt.size;
+      const headerHandle = await open(localFilePath, 'r');
+      try {
+        const probe = Buffer.alloc(16);
+        const { bytesRead } = await headerHandle.read(probe, 0, 16, 0);
+        if (!this.hasValidMediaHeader(probe.subarray(0, bytesRead), mediaKind)) return null;
+      } finally {
+        await headerHandle.close();
+      }
       const ext = path.extname(localFilePath).toLowerCase();
       const contentType =
         mediaKind === 'image'
@@ -514,6 +861,17 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     string,
     Awaited<ReturnType<KernelBridge['connectFacebook']>>
   >();
+  private readonly closing = new Map<
+    string,
+    {
+      id: string;
+      failed: boolean;
+      peerEpoch: string;
+      leaseId: string;
+      ownershipId?: string | undefined;
+      connection: Awaited<ReturnType<KernelBridge['connectFacebook']>>;
+    }
+  >();
 
   constructor(
     private readonly bumperRepo: CompatibleRepository<SqliteGroupBumperRepository>,
@@ -547,6 +905,16 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
   }
 
   async busy(profileId: string): Promise<boolean> {
+    const staleStop = this.closing.get(profileId);
+    const livePeer = this.getCore()?.peers.get(profileId);
+    if (
+      staleStop?.failed &&
+      livePeer?.online &&
+      livePeer.synced &&
+      livePeer.epoch !== staleStop.peerEpoch
+    ) {
+      await this.stop(profileId).catch(() => {});
+    }
     if (this.connections.has(profileId) || (await this.isBusy(profileId))) return true;
     const kernel = this.getKernel();
     const peer = this.getCore()?.peers.get(profileId);
@@ -566,18 +934,78 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
   async stop(profileId: string): Promise<void> {
     const conn = this.connections.get(profileId);
     if (!conn) return;
-    const stopId = conn.stopRequestId ?? randomUUID();
+    const stopRec = this.closing.get(profileId);
+    const stopId = stopRec?.id ?? conn.stopRequestId ?? randomUUID();
+    conn.revokeInput?.('POSTER_STOP');
+    const kernel = this.getKernel();
+    const core = this.getCore();
+    const peer = core?.peers.get(profileId);
     try {
-      await conn.close(stopId);
-      if (this.connections.get(profileId) === conn) {
-        this.connections.delete(profileId);
+      if (core && (!peer || !peer.online || !peer.synced)) {
+        await conn.closeLocalAfterDisconnect?.().catch(() => {});
+        if (stopRec) stopRec.failed = true;
+        throw Error('POSTER_STOP_AWAITING_RECONNECT');
       }
-    } catch {
-      await conn.stopOnCloseFailure();
-      await conn.retryClose(stopId);
-      if (this.connections.get(profileId) === conn) {
-        this.connections.delete(profileId);
+      if (kernel && peer && stopRec && peer.epoch !== stopRec.peerEpoch) {
+        if (peer.phase !== 'PAUSED') {
+          await core?.reconcileRecoveringPeerIfPossible?.(profileId).catch(() => false);
+        }
+        if (peer.phase !== 'PAUSED') {
+          await conn.closeLocalAfterDisconnect().catch(() => {});
+          stopRec.failed = true;
+          throw Error('POSTER_STOP_AWAITING_RECONNECT');
+        }
+        await conn.closeLocalAfterDisconnect();
+        if (this.posterRepo) {
+          await recoverPosterOperations(kernel, peer, this.posterRepo, () => {
+            if (core?.peers.get(profileId) !== peer || !peer.online || !peer.synced) {
+              throw Error('POSTER_RECOVERY_CHANGED');
+            }
+          });
+        }
+        await kernel.withSummary(peer, async (port) => {
+          const state = await port.inventory();
+          if (
+            state.tabs.some(
+              (t) =>
+                t.ownershipId === stopRec.ownershipId && ['CREATING', 'UNKNOWN'].includes(t.state),
+            ) ||
+            state.operations.some(
+              (o) => o.binding.leaseId === stopRec.leaseId && o.state === 'DISPATCHING',
+            )
+          ) {
+            throw Error('POSTER_OLD_EXECUTION_UNCONFIRMED');
+          }
+          const receipt = await port.stopCurrent(stopId);
+          if (
+            receipt.requestId !== stopId ||
+            receipt.connectionEpoch !== peer.epoch ||
+            receipt.state !== 'stopped'
+          ) {
+            throw Error('POSTER_STOP_UNCONFIRMED');
+          }
+          await conn.confirmReconnectedStop(receipt);
+        });
+      } else if (stopRec?.failed) {
+        await conn.retryClose(stopId);
+      } else {
+        try {
+          await conn.close(stopId);
+        } catch {
+          if (stopRec) stopRec.failed = true;
+          await conn.stopOnCloseFailure();
+          await conn.retryClose(stopId);
+        }
       }
+    } catch (err) {
+      if (stopRec) stopRec.failed = true;
+      throw err;
+    }
+    if (this.connections.get(profileId) === conn) {
+      this.connections.delete(profileId);
+    }
+    if (this.closing.get(profileId) === stopRec) {
+      this.closing.delete(profileId);
     }
   }
 
@@ -639,7 +1067,21 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     let conn = await kernel.connectFacebook(peer, accountId, guard, identity.proof, false, [
       ...grantedFiles,
     ]);
-    this.connections.set(profileId, conn);
+    const registerConnection = async (
+      nextConn: Awaited<ReturnType<KernelBridge['connectFacebook']>>,
+    ) => {
+      const leaseId = (await nextConn.context(accountId).catch(() => null))?.leaseId ?? '';
+      this.connections.set(profileId, nextConn);
+      this.closing.set(profileId, {
+        id: nextConn.stopRequestId ?? randomUUID(),
+        failed: false,
+        peerEpoch: epoch,
+        leaseId,
+        ownershipId: nextConn.proof?.ownershipId,
+        connection: nextConn,
+      });
+    };
+    await registerConnection(conn);
 
     try {
       const initialPage = conn.browser.contexts()[0]?.pages()[0];
@@ -719,7 +1161,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
         conn = await kernel.connectFacebook(peer, accountId, guard, ready.proof, false, [
           ...grantedFiles,
         ]);
-        this.connections.set(profileId, conn);
+        await registerConnection(conn);
         const replacementPage = conn.browser.contexts()[0]?.pages()[0];
         if (!replacementPage) throw Error('任务页面不存在');
         page = replacementPage;
@@ -930,203 +1372,216 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
         }
       }
 
+      let consecutiveGroupComposerFailures = 0;
+
       while (!callbacks.cancelled() && (await callbacks.canContinueAccount(profileId))) {
         const task = await callbacks.claimNextTask();
         if (!task) break;
         const { group, material } = task;
         const rawGroupId = group.id;
-        let effectiveGroupId = group.id;
-        let effectiveGroupName = group.name;
+        const isPageTimeline = rawGroupId === PAGE_TIMELINE_SYNTHETIC_GROUP_ID;
+        let effectiveGroupId = isPageTimeline ? accountId : group.id;
+        let effectiveGroupName = isPageTimeline ? accountName || '专页时间线' : group.name;
         currentContext = {
           groupId: effectiveGroupId,
           groupName: effectiveGroupName,
           materialId: material.id,
         };
+        let markedPendingReview = false;
         try {
           if (material.localFilePath && !grantedFiles.has(material.localFilePath)) {
             grantedFiles.add(material.localFilePath);
             await reconnectAfterUncertainOp();
           }
-          // Step 1: Search group by name in top search box (up to 5 scrolls), fallback to direct URL
-          callbacks.status(`正在搜索小组 · ${effectiveGroupName}`);
-          const directUrl = `https://www.facebook.com/groups/${encodeURIComponent(rawGroupId)}/`;
-          let enteredGroup = false;
-          if (!isPlaceholderTargetName(effectiveGroupName, rawGroupId)) {
-            const searchUrl = `https://www.facebook.com/groups/search/groups/?q=${encodeURIComponent(effectiveGroupName)}`;
-            await execOp('打开搜索结果', async () => {
-              const markBannerSearch = async () =>
-                page
-                  .evaluate(() => {
-                    const isVis = (el: Element | null) => {
-                      if (!el) return false;
-                      const r = el.getBoundingClientRect();
-                      return r.width > 0 && r.height > 0;
-                    };
-                    document
-                      .querySelectorAll('[data-wb-poster-search]')
-                      .forEach((e) => e.removeAttribute('data-wb-poster-search'));
-                    const inputs = Array.from(
-                      document.querySelectorAll<HTMLInputElement>(
-                        '[role="banner"] input[type="search"], [role="banner"] input[role="combobox"], [role="banner"] input',
-                      ),
-                    );
-                    const hit = inputs.find(isVis);
-                    if (hit) {
-                      hit.setAttribute('data-wb-poster-search', '1');
-                      return 'input';
-                    }
-                    const searchToggle = Array.from(
-                      document.querySelectorAll<HTMLElement>(
-                        '[role="banner"] [role="button"][aria-label*="Search" i], [role="banner"] [role="button"][aria-label*="搜索"], [role="banner"] [role="button"][aria-label*="搜尋"], [role="banner"] [role="button"][aria-label*="ရှာ"], [role="banner"] label',
-                      ),
-                    ).find(isVis);
-                    if (searchToggle) {
-                      searchToggle.click();
-                      return 'toggled';
-                    }
-                    return 'none';
-                  })
-                  .catch(() => 'none');
-              let searchState = await markBannerSearch();
-              if (searchState === 'toggled') {
-                await wait(Math.max(50, Math.round(450 * this.paceScale)));
-                searchState = await markBannerSearch();
-              }
-              if (searchState === 'input') {
-                try {
-                  const box = page.locator('[data-wb-poster-search="1"]').first();
-                  await box.click({ timeout: 3000 });
-                  await box.fill(effectiveGroupName, { timeout: 3000 });
-                  await box.press('Enter', { timeout: 3000 });
-                  await page.waitForURL((u) => /^\/(?:groups\/)?search\//i.test(u.pathname), {
-                    timeout: 6000,
-                  });
-                  return page.url();
-                } catch {
-                  // fallback to goto searchUrl
-                }
-              }
-              await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          let surface: Awaited<ReturnType<typeof readGroupBumper>>;
+          let resolvedGroupAvatar: string | null = null;
+          if (isPageTimeline) {
+            callbacks.status(`正在打开专页时间线 · ${effectiveGroupName}`);
+            // Use current acting identity's Facebook Home feed so the native "Create a post" region
+            // sits right at the top (avoiding Page profile cover/dashboard buttons above the composer).
+            const pageUrl = 'https://www.facebook.com/';
+            await execOp('打开小组页面', async () => {
+              await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
               return page.url();
             });
-
-            for (let screen = 0; screen < 5 && !enteredGroup; screen++) {
-              guard();
-              let found = await readGroupBumper(page, {
-                groupId: rawGroupId,
-                groupName: effectiveGroupName,
+            await paceWait(1200);
+            surface = await readGroupBumper(page, { groupId: '-', pageId: accountId });
+            if (surface.restricted && !surface.restrictionReason) {
+              await dismissFeatureInterventionDialogIfPresent(page, guard);
+              surface = await readGroupBumper(page, { groupId: '-', pageId: accountId });
+            }
+            if (surface.restricted || /\/(?:checkpoint|login)(?:\/|$|\?)/i.test(page.url())) {
+              const scope = inferAbnormalScopeFromUrl(page.url()) ?? 'feature_action';
+              throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限', {
+                scope,
+                abnormalState:
+                  inferAbnormalStateFromCodeOrMessage(
+                    classifyFacebookAbnormalUrl(page.url()) ?? '受限',
+                  ) ?? 'restricted',
               });
-              if (found.restricted && !found.restrictionReason) {
-                await dismissFeatureInterventionDialogIfPresent(page, guard);
-                found = await readGroupBumper(page, {
+            }
+            resolvedGroupAvatar = identityMeta.accountAvatar;
+          } else {
+            // Step 1: Search group by name in top search box (up to 5 scrolls), fallback to direct URL
+            callbacks.status(`正在搜索小组 · ${effectiveGroupName}`);
+            const directUrl = `https://www.facebook.com/groups/${encodeURIComponent(rawGroupId)}/`;
+            let enteredGroup = false;
+            let enteredViaDirectOrId = false;
+            if (!isPlaceholderTargetName(effectiveGroupName, rawGroupId)) {
+              const searchUrl = `https://www.facebook.com/groups/search/groups/?q=${encodeURIComponent(effectiveGroupName)}`;
+              await execOp('打开搜索结果', async () => {
+                const markBannerSearch = async () =>
+                  page
+                    .evaluate(() => {
+                      const isVis = (el: Element | null) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      document
+                        .querySelectorAll('[data-wb-poster-search]')
+                        .forEach((e) => e.removeAttribute('data-wb-poster-search'));
+                      const inputs = Array.from(
+                        document.querySelectorAll<HTMLInputElement>(
+                          '[role="banner"] input[type="search"], [role="banner"] input[role="combobox"], [role="banner"] input',
+                        ),
+                      );
+                      const hit = inputs.find(isVis);
+                      if (hit) {
+                        hit.setAttribute('data-wb-poster-search', '1');
+                        return 'input';
+                      }
+                      const searchToggle = Array.from(
+                        document.querySelectorAll<HTMLElement>(
+                          '[role="banner"] [role="button"][aria-label*="Search" i], [role="banner"] [role="button"][aria-label*="搜索"], [role="banner"] [role="button"][aria-label*="搜尋"], [role="banner"] [role="button"][aria-label*="ရှာ"], [role="banner"] label',
+                        ),
+                      ).find(isVis);
+                      if (searchToggle) {
+                        searchToggle.click();
+                        return 'toggled';
+                      }
+                      return 'none';
+                    })
+                    .catch(() => 'none');
+                let searchState = await markBannerSearch();
+                if (searchState === 'toggled') {
+                  await wait(Math.max(50, Math.round(450 * this.paceScale)));
+                  searchState = await markBannerSearch();
+                }
+                if (searchState === 'input') {
+                  try {
+                    const box = page.locator('[data-wb-poster-search="1"]').first();
+                    await box.click({ timeout: 3000 });
+                    await box.fill(effectiveGroupName, { timeout: 3000 });
+                    await box.press('Enter', { timeout: 3000 });
+                    await page.waitForURL((u) => /^\/(?:groups\/)?search\//i.test(u.pathname), {
+                      timeout: 6000,
+                    });
+                    return page.url();
+                  } catch {
+                    // fallback to goto searchUrl
+                  }
+                }
+                await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+                return page.url();
+              });
+
+              for (let screen = 0; screen < 5 && !enteredGroup; screen++) {
+                guard();
+                let found = await readGroupBumper(page, {
                   groupId: rawGroupId,
                   groupName: effectiveGroupName,
                 });
-              }
-              if (found.restricted) {
-                throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限');
-              }
-              if (found.groupEntryCSS) {
-                try {
-                  await execOp('打开搜索到的小组', async () => {
-                    const refreshed = await readGroupBumper(page, {
-                      groupId: rawGroupId,
-                      groupName: effectiveGroupName,
-                    });
-                    if (!refreshed.groupEntryCSS) throw Error('未找到小组链接');
-                    const link = page.locator(refreshed.groupEntryCSS).first();
-                    await link.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-                    await wait(Math.max(50, Math.round(350 * this.paceScale)));
-                    await link.click({ timeout: 5000 });
-                    await page.waitForURL(
-                      (u) => /^\/groups\/(?!search(?:\/|$))[^/]+/i.test(u.pathname),
-                      { timeout: 12000 },
-                    );
-                    return page.url();
+                if (found.restricted && !found.restrictionReason) {
+                  await dismissFeatureInterventionDialogIfPresent(page, guard);
+                  found = await readGroupBumper(page, {
+                    groupId: rawGroupId,
+                    groupName: effectiveGroupName,
                   });
-                  enteredGroup = true;
-                  break;
-                } catch {
-                  break;
+                }
+                if (found.restricted) {
+                  throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限');
+                }
+                if (found.groupEntryCSS) {
+                  try {
+                    await execOp('打开搜索到的小组', async () => {
+                      const refreshed = await readGroupBumper(page, {
+                        groupId: rawGroupId,
+                        groupName: effectiveGroupName,
+                      });
+                      if (!refreshed.groupEntryCSS) throw Error('未找到小组链接');
+                      const link = page.locator(refreshed.groupEntryCSS).first();
+                      await link.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+                      await wait(Math.max(50, Math.round(350 * this.paceScale)));
+                      await link.click({ timeout: 5000 });
+                      await page.waitForURL(
+                        (u) => /^\/groups\/(?!search(?:\/|$))[^/]+/i.test(u.pathname),
+                        { timeout: 12000 },
+                      );
+                      return page.url();
+                    });
+                    enteredGroup = true;
+                    if (found.groupEntryMatchedBy === 'id') enteredViaDirectOrId = true;
+                    break;
+                  } catch {
+                    break;
+                  }
+                }
+                if (screen < 4) {
+                  await execOp('浏览目标帖子', async () => {
+                    await page.mouse.wheel(0, 620);
+                    return true;
+                  });
+                  await paceWait(650);
                 }
               }
-              if (screen < 4) {
-                await execOp('浏览目标帖子', async () => {
-                  await page.mouse.wheel(0, 620);
-                  return true;
-                });
-                await paceWait(650);
-              }
             }
-          }
 
-          if (!enteredGroup || !page.url().includes('/groups/')) {
-            await execOp('打开小组页面', async () => {
-              await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-              return page.url();
-            });
-          }
+            if (!enteredGroup || !page.url().includes('/groups/')) {
+              await execOp('打开小组页面', async () => {
+                await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                return page.url();
+              });
+              enteredViaDirectOrId = true;
+            }
 
-          // Verify we are on the target group and check restriction
-          await paceWait(1200);
-          let surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-          if (surface.restricted && !surface.restrictionReason) {
-            await dismissFeatureInterventionDialogIfPresent(page, guard);
+            // Verify we are on the target group and check restriction
+            await paceWait(1200);
             surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-          }
-          if (surface.restricted || /\/(?:checkpoint|login)(?:\/|$|\?)/i.test(page.url())) {
-            const scope = inferAbnormalScopeFromUrl(page.url()) ?? 'feature_action';
-            throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限', {
-              scope,
-              abnormalState:
-                inferAbnormalStateFromCodeOrMessage(
-                  classifyFacebookAbnormalUrl(page.url()) ?? '受限',
-                ) ?? 'restricted',
-            });
-          }
-          const localizeGroupAvatar = async (rawAvatar: string | null | undefined) => {
-            if (isLocalAvatar(group.avatarUrl)) return group.avatarUrl;
-            if (!rawAvatar) return null;
-            if (isLocalAvatar(rawAvatar)) return rawAvatar;
-            return (await fetchAndLocalizeAvatar(rawAvatar).catch(() => null)) ?? rawAvatar;
-          };
-          let resolvedGroupAvatar = await localizeGroupAvatar(surface.avatarUrl);
-          const redirectRes1 = await FacebookGroupSessionHelper.syncCanonicalGroupRedirect({
-            currentUrl: page.url(),
-            rawGroupId,
-            groupName: surface.groupTitle || effectiveGroupName,
-            avatarUrl: resolvedGroupAvatar,
-            surfaceGroupIds: surface.groupIds,
-            applyResolvedMetadata: (rawId, resolved) =>
-              this.bumperRepo.applyResolvedTargetMetadata?.('groups', rawId, resolved),
-          });
-          effectiveGroupId = redirectRes1.effectiveGroupId;
-          if (effectiveGroupId !== rawGroupId) {
-            currentContext = { ...currentContext, groupId: effectiveGroupId };
-            await callbacks.onGroupIdResolved?.(rawGroupId, effectiveGroupId);
-            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-            resolvedGroupAvatar =
-              (await localizeGroupAvatar(surface.avatarUrl)) ?? resolvedGroupAvatar;
-          }
-          if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
-            await execOp('打开小组页面', async () => {
-              await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-              return page.url();
-            });
-            await paceWait(1000);
-            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-            resolvedGroupAvatar =
-              (await localizeGroupAvatar(surface.avatarUrl)) ?? resolvedGroupAvatar;
-            const redirectRes2 = await FacebookGroupSessionHelper.syncCanonicalGroupRedirect({
+            if (surface.restricted && !surface.restrictionReason) {
+              await dismissFeatureInterventionDialogIfPresent(page, guard);
+              surface = await readGroupBumper(page, { groupId: effectiveGroupId });
+            }
+            if (surface.restricted || /\/(?:checkpoint|login)(?:\/|$|\?)/i.test(page.url())) {
+              const scope = inferAbnormalScopeFromUrl(page.url()) ?? 'feature_action';
+              throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限', {
+                scope,
+                abnormalState:
+                  inferAbnormalStateFromCodeOrMessage(
+                    classifyFacebookAbnormalUrl(page.url()) ?? '受限',
+                  ) ?? 'restricted',
+              });
+            }
+            const localizeGroupAvatar = async (rawAvatar: string | null | undefined) => {
+              if (isLocalAvatar(group.avatarUrl)) return group.avatarUrl;
+              if (!rawAvatar) return null;
+              if (isLocalAvatar(rawAvatar)) return rawAvatar;
+              return (await fetchAndLocalizeAvatar(rawAvatar).catch(() => null)) ?? rawAvatar;
+            };
+            resolvedGroupAvatar = await localizeGroupAvatar(surface.avatarUrl);
+            const redirectRes1 = await FacebookGroupSessionHelper.syncCanonicalGroupRedirect({
               currentUrl: page.url(),
               rawGroupId,
               groupName: surface.groupTitle || effectiveGroupName,
               avatarUrl: resolvedGroupAvatar,
               surfaceGroupIds: surface.groupIds,
-              applyResolvedMetadata: (rawId, resolved) =>
-                this.bumperRepo.applyResolvedTargetMetadata?.('groups', rawId, resolved),
+              allowAliasRedirect: enteredViaDirectOrId,
+              applyResolvedMetadata: enteredViaDirectOrId
+                ? (rawId, resolved) =>
+                    this.bumperRepo.applyResolvedTargetMetadata?.('groups', rawId, resolved)
+                : undefined,
             });
-            effectiveGroupId = redirectRes2.effectiveGroupId;
+            effectiveGroupId = redirectRes1.effectiveGroupId;
             if (effectiveGroupId !== rawGroupId) {
               currentContext = { ...currentContext, groupId: effectiveGroupId };
               await callbacks.onGroupIdResolved?.(rawGroupId, effectiveGroupId);
@@ -1134,94 +1589,87 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
               resolvedGroupAvatar =
                 (await localizeGroupAvatar(surface.avatarUrl)) ?? resolvedGroupAvatar;
             }
-          }
-          if (surface.restricted && !surface.restrictionReason) {
-            await dismissFeatureInterventionDialogIfPresent(page, guard);
-            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-          }
-          if (surface.restricted || /\/(?:checkpoint|login)(?:\/|$|\?)/i.test(page.url())) {
-            const scope = inferAbnormalScopeFromUrl(page.url()) ?? 'feature_action';
-            throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限', {
-              scope,
-              abnormalState:
-                inferAbnormalStateFromCodeOrMessage(
-                  classifyFacebookAbnormalUrl(page.url()) ?? '受限',
-                ) ?? 'restricted',
-            });
-          }
-
-          if (resolvedGroupAvatar) {
-            await this.bumperRepo.updateAvatar?.('groups', effectiveGroupId, resolvedGroupAvatar);
-          }
-          if (surface.groupTitle && isPlaceholderTargetName(effectiveGroupName, effectiveGroupId)) {
-            await this.bumperRepo.applyResolvedTargetMetadata?.('groups', effectiveGroupId, {
-              name: surface.groupTitle,
-              avatarUrl: resolvedGroupAvatar,
-            });
-            effectiveGroupName = surface.groupTitle;
-            currentContext = { ...currentContext, groupName: surface.groupTitle };
-          }
-
-          // Step 2: Browse 2 posts smoothly and smooth-scroll back to top
-          callbacks.status(`正在浏览小组贴文 · ${effectiveGroupName}`);
-          await execOp('浏览目标帖子', async () => {
-            await page.evaluate(() => {
-              window.scrollBy({ top: 520, behavior: 'smooth' });
-            });
-            await wait(Math.max(40, Math.round((1200 + Math.random() * 600) * this.paceScale)));
-            await page.evaluate(() => {
-              window.scrollBy({ top: 540, behavior: 'smooth' });
-            });
-            await wait(Math.max(40, Math.round((1300 + Math.random() * 600) * this.paceScale)));
-            await page.evaluate(() => {
-              window.scrollTo({ top: 0, behavior: 'smooth' });
-            });
-            await wait(Math.max(40, Math.round(900 * this.paceScale)));
-            await page.evaluate(() => {
-              if (window.scrollY > 40) window.scrollTo(0, 0);
-            });
-            return true;
-          });
-
-          // Step 3: Click Join group if not joined yet, and dismiss welcome modal if any
-          surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-          if (surface.welcomeDismissCSS) {
-            const dismissSel = surface.welcomeDismissCSS;
-            await execOp('关闭入组欢迎弹窗', async () => {
-              await page
-                .locator(dismissSel)
-                .first()
-                .click({ timeout: 4000 })
-                .catch(() => {});
-              return true;
-            });
-            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
-          }
-          if (surface.joinGroupCSS) {
-            const joinSel = surface.joinGroupCSS;
-            callbacks.status(`正在加入小组 · ${effectiveGroupName}`);
-            const joinOutcome = await execOp('加入小组', async () => {
-              await page
-                .locator(joinSel)
-                .first()
-                .click({ timeout: 4000 })
-                .catch(() => {});
-              await wait(Math.max(50, Math.round(2000 * this.paceScale)));
-              const afterJoin = await readGroupBumper(page, { groupId: effectiveGroupId });
-              if (afterJoin.restricted && !afterJoin.restrictionReason) {
-                await dismissFeatureInterventionDialogIfPresent(page, guard);
-                return { unjoinableIntervention: true };
+            if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
+              await execOp('打开小组页面', async () => {
+                await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                return page.url();
+              });
+              await paceWait(1000);
+              surface = await readGroupBumper(page, { groupId: effectiveGroupId });
+              resolvedGroupAvatar =
+                (await localizeGroupAvatar(surface.avatarUrl)) ?? resolvedGroupAvatar;
+              const redirectRes2 = await FacebookGroupSessionHelper.syncCanonicalGroupRedirect({
+                currentUrl: page.url(),
+                rawGroupId,
+                groupName: surface.groupTitle || effectiveGroupName,
+                avatarUrl: resolvedGroupAvatar,
+                surfaceGroupIds: surface.groupIds,
+                allowAliasRedirect: true,
+                applyResolvedMetadata: (rawId, resolved) =>
+                  this.bumperRepo.applyResolvedTargetMetadata?.('groups', rawId, resolved),
+              });
+              effectiveGroupId = redirectRes2.effectiveGroupId;
+              if (effectiveGroupId !== rawGroupId) {
+                currentContext = { ...currentContext, groupId: effectiveGroupId };
+                await callbacks.onGroupIdResolved?.(rawGroupId, effectiveGroupId);
+                surface = await readGroupBumper(page, { groupId: effectiveGroupId });
+                resolvedGroupAvatar =
+                  (await localizeGroupAvatar(surface.avatarUrl)) ?? resolvedGroupAvatar;
               }
-              return { unjoinableIntervention: false };
-            });
-            if (joinOutcome.unjoinableIntervention) {
-              throw Error('跳过：当前身份暂不支持直接加入该群');
             }
-            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
             if (surface.restricted && !surface.restrictionReason) {
               await dismissFeatureInterventionDialogIfPresent(page, guard);
-              throw Error('跳过：当前身份暂不支持直接加入该群');
+              surface = await readGroupBumper(page, { groupId: effectiveGroupId });
             }
+            if (surface.restricted || /\/(?:checkpoint|login)(?:\/|$|\?)/i.test(page.url())) {
+              const scope = inferAbnormalScopeFromUrl(page.url()) ?? 'feature_action';
+              throw new PosterAccountRestrictedError('受限 · 需要手机验证或操作受限', {
+                scope,
+                abnormalState:
+                  inferAbnormalStateFromCodeOrMessage(
+                    classifyFacebookAbnormalUrl(page.url()) ?? '受限',
+                  ) ?? 'restricted',
+              });
+            }
+
+            if (resolvedGroupAvatar) {
+              await this.bumperRepo.updateAvatar?.('groups', effectiveGroupId, resolvedGroupAvatar);
+            }
+            if (
+              surface.groupTitle &&
+              isPlaceholderTargetName(effectiveGroupName, effectiveGroupId)
+            ) {
+              await this.bumperRepo.applyResolvedTargetMetadata?.('groups', effectiveGroupId, {
+                name: surface.groupTitle,
+                avatarUrl: resolvedGroupAvatar,
+              });
+              effectiveGroupName = surface.groupTitle;
+              currentContext = { ...currentContext, groupName: surface.groupTitle };
+            }
+
+            // Step 2: Browse 2 posts smoothly and smooth-scroll back to top
+            callbacks.status(`正在浏览小组贴文 · ${effectiveGroupName}`);
+            await execOp('浏览目标帖子', async () => {
+              await page.evaluate(() => {
+                window.scrollBy({ top: 520, behavior: 'smooth' });
+              });
+              await wait(Math.max(40, Math.round((1200 + Math.random() * 600) * this.paceScale)));
+              await page.evaluate(() => {
+                window.scrollBy({ top: 540, behavior: 'smooth' });
+              });
+              await wait(Math.max(40, Math.round((1300 + Math.random() * 600) * this.paceScale)));
+              await page.evaluate(() => {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              });
+              await wait(Math.max(40, Math.round(900 * this.paceScale)));
+              await page.evaluate(() => {
+                if (window.scrollY > 40) window.scrollTo(0, 0);
+              });
+              return true;
+            });
+
+            // Step 3: Click Join group if not joined yet, and dismiss welcome modal if any
+            surface = await readGroupBumper(page, { groupId: effectiveGroupId });
             if (surface.welcomeDismissCSS) {
               const dismissSel = surface.welcomeDismissCSS;
               await execOp('关闭入组欢迎弹窗', async () => {
@@ -1232,44 +1680,84 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                   .catch(() => {});
                 return true;
               });
+              surface = await readGroupBumper(page, { groupId: effectiveGroupId });
+            }
+            if (surface.joinGroupCSS) {
+              const joinSel = surface.joinGroupCSS;
+              callbacks.status(`正在加入小组 · ${effectiveGroupName}`);
+              const joinOutcome = await execOp('加入小组', async () => {
+                await page
+                  .locator(joinSel)
+                  .first()
+                  .click({ timeout: 4000 })
+                  .catch(() => {});
+                await wait(Math.max(50, Math.round(2000 * this.paceScale)));
+                const afterJoin = await readGroupBumper(page, { groupId: effectiveGroupId });
+                if (afterJoin.restricted && !afterJoin.restrictionReason) {
+                  await dismissFeatureInterventionDialogIfPresent(page, guard);
+                  return { unjoinableIntervention: true };
+                }
+                return { unjoinableIntervention: false };
+              });
+              if (joinOutcome.unjoinableIntervention) {
+                throw Error('跳过：当前身份暂不支持直接加入该群');
+              }
+              surface = await readGroupBumper(page, { groupId: effectiveGroupId });
+              if (surface.restricted && !surface.restrictionReason) {
+                await dismissFeatureInterventionDialogIfPresent(page, guard);
+                throw Error('跳过：当前身份暂不支持直接加入该群');
+              }
+              if (surface.welcomeDismissCSS) {
+                const dismissSel = surface.welcomeDismissCSS;
+                await execOp('关闭入组欢迎弹窗', async () => {
+                  await page
+                    .locator(dismissSel)
+                    .first()
+                    .click({ timeout: 4000 })
+                    .catch(() => {});
+                  return true;
+                });
+              }
+            }
+            const isGroupPendingOrQuestions = await page
+              .evaluate(() => {
+                const pendingRx =
+                  /^(?:Cancel request|Requested|Membership pending|Pending|取消请求|取消申請|已请求|已申請|待审核|待審核|等待批准|တောင်းဆိုထားသည်|တောင်းဆိုမှုကို ပယ်ဖျက်ပါ|Đã yêu cầu|Hủy yêu cầu|Chờ phê duyệt)$/i;
+                const questionRx =
+                  /Answer questions|Membership questions|回答问题|回答問題|入组问题|入群问题|社團問題|မေးခွန်းများဖြေဆိုရန်|Trả lời câu hỏi/i;
+                const buttons = Array.from(
+                  document.querySelectorAll<HTMLElement>('[role="button"], button'),
+                );
+                const hasPending = buttons.some((b) => {
+                  const r = b.getBoundingClientRect();
+                  if (r.width <= 0 || r.height <= 0) return false;
+                  const txt = (b.textContent ?? '').replace(/\s+/g, ' ').trim();
+                  const aria = (b.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
+                  return (
+                    (txt.length > 0 && txt.length <= 40 && pendingRx.test(txt)) ||
+                    (aria.length > 0 && aria.length <= 40 && pendingRx.test(aria))
+                  );
+                });
+                const dialogs = Array.from(
+                  document.querySelectorAll<HTMLElement>('[role="dialog"]'),
+                );
+                const hasQuestions = dialogs.some((d) => {
+                  const r = d.getBoundingClientRect();
+                  return r.width > 120 && r.height > 100 && questionRx.test(d.textContent ?? '');
+                });
+                return hasPending || hasQuestions;
+              })
+              .catch(() => false);
+            if (isGroupPendingOrQuestions) {
+              throw Error('跳过：该群需管理员审核或回答入群问题');
             }
           }
-          const isGroupPendingOrQuestions = await page
-            .evaluate(() => {
-              const pendingRx =
-                /^(?:Cancel request|Requested|Membership pending|Pending|取消请求|取消申請|已请求|已申請|待审核|待審核|等待批准|တောင်းဆိုထားသည်|တောင်းဆိုမှုကို ပယ်ဖျက်ပါ|Đã yêu cầu|Hủy yêu cầu|Chờ phê duyệt)$/i;
-              const questionRx =
-                /Answer questions|Membership questions|回答问题|回答問題|入组问题|入群问题|社團問題|မေးခွန်းများဖြေဆိုရန်|Trả lời câu hỏi/i;
-              const buttons = Array.from(
-                document.querySelectorAll<HTMLElement>('[role="button"], button'),
-              );
-              const hasPending = buttons.some((b) => {
-                const r = b.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) return false;
-                const txt = (b.textContent ?? '').replace(/\s+/g, ' ').trim();
-                const aria = (b.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
-                return (
-                  (txt.length > 0 && txt.length <= 40 && pendingRx.test(txt)) ||
-                  (aria.length > 0 && aria.length <= 40 && pendingRx.test(aria))
-                );
-              });
-              const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
-              const hasQuestions = dialogs.some((d) => {
-                const r = d.getBoundingClientRect();
-                return r.width > 120 && r.height > 100 && questionRx.test(d.textContent ?? '');
-              });
-              return hasPending || hasQuestions;
-            })
-            .catch(() => false);
-          if (isGroupPendingOrQuestions) {
-            throw Error('跳过：该群需管理员审核或回答入群问题');
-          }
 
-          // Step 4: Open group post composer dialog, attach file, type caption
+          // Step 4: Open post composer dialog, attach file, type caption
           callbacks.status(`正在打开发帖框 · ${effectiveGroupName}`);
           await execOp('打开发帖弹窗', async () => {
             await dismissUnexpectedFacebookOverlays(page);
-            const triggerResult = await page.evaluate(() => {
+            const triggerResult = await page.evaluate((timelineMode: boolean) => {
               document
                 .querySelectorAll('[data-wb-poster-trigger]')
                 .forEach((e) => e.removeAttribute('data-wb-poster-trigger'));
@@ -1279,34 +1767,84 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                 const s = getComputedStyle(el);
                 return s.display !== 'none' && s.visibility !== 'hidden';
               };
+
+              // Detect explicit group-posting restriction banners before searching trigger
+              if (!timelineMode) {
+                const restrictionBannerRx =
+                  /You can['’]?t post in groups|temporarily blocked from posting|restricted from posting in groups|can['’]?t participate in groups|你目前无法在小组发帖|暂时无法在小组|无法在小组发帖|暂时被禁止发帖|限制了某些活动|restrict certain activity|အဖွဲ့တွင်\s*ပို့စ်တင်၍မရ/i;
+                const mainText = (
+                  document.querySelector('[role="main"]')?.textContent ??
+                  document.body?.innerText ??
+                  ''
+                ).slice(0, 6000);
+                if (restrictionBannerRx.test(mainText)) {
+                  return {
+                    ok: false as const,
+                    restricted: true as const,
+                    diag: 'group-posting-restricted-banner',
+                  };
+                }
+              }
+
+              const excludeRx =
+                /^(?:Manage|Promote|Advertise|Professional dashboard|Edit|Edit profile|Add to story|Create story|Boost|Insights|Live video|Photo\/video|Feeling\/activity|Reel|Reels|专业仪表板|管理|推广|广告|编辑|编辑主页|添加快拍|创建快拍|速推|数据洞察|直播视频|直播|照片\/视频|感受\/活动|打卡)$/i;
               const rx =
-                /Write something|What's on your mind|留個言吧|留个言吧|写点什么|寫點什麼|写些什么|寫些什麼|分享你的|在想些什么|在想些什麼|Create a public post|Create post|建立公開貼文|建立貼文|Start a discussion|发起讨论|發起討論|တစ်ခုခု\s*ရေးပါ|ဘာတွေ\s*တွေးနေလဲ|ပို့စ်\s*ဖန်တီးရန်|ပို့စ်\s*တင်ပါ|ပို့စ်\s*ရေးပါ|အများမြင်သာအောင်|ဆွေးနွေးမှု|Viết gì đó|Bạn đang nghĩ gì/i;
+                /Write something|What['’]?s on your mind|留個言吧|留个言吧|写点什么|寫點什麼|写些什么|寫些什麼|分享你的|有什么新鲜事|有什麼新鮮事|在想些什么|在想些什麼|Create a public post|Create post|Create a post|建立公開貼文|建立貼文|创建帖子|Start a discussion|发起讨论|發起討論|တစ်ခုခု\s*ရေးပါ|ဘာတွေ\s*တွေးနေလဲ|သင့်စိတ်ထဲ|ဘာတွေရှိ|ပို့စ်\s*ဖန်တီး|ပို့စ်\s*တင်ပါ|ပို့စ်\s*ရေးပါ|အများမြင်သာအောင်|ဆွေးနွေးမှု|Viết gì đó|Bạn đang nghĩ gì|بم تفكر/i;
+
+              // 1. Official localized composer region ("Create a post" / "创建帖子" / "建立貼文" / "ပို့စ် ဖန်တီးရန်" / "إنشاء منشور")
+              const composerRegionSelector =
+                '[role="region"][aria-label="Create a post"], [role="region"][aria-label="创建帖子"], [role="region"][aria-label="建立貼文"], [role="region"][aria-label="ပို့စ် ဖန်တီးရန်"], [role="region"][aria-label="إنشاء منشور"]';
+              const regionButtons = Array.from(
+                document.querySelectorAll<HTMLElement>(
+                  `${composerRegionSelector} [role="button"], ${composerRegionSelector} button`,
+                ),
+              ).filter((b) => {
+                if (!isVis(b)) return false;
+                const r = b.getBoundingClientRect();
+                if (r.width < 120 || r.height > 90) return false;
+                const text = `${b.getAttribute('aria-label') ?? ''} ${b.textContent ?? ''}`.trim();
+                return !excludeRx.test(text);
+              });
+              const regionPrompt =
+                regionButtons.find((b) =>
+                  rx.test(`${b.getAttribute('aria-label') ?? ''} ${b.textContent ?? ''}`),
+                ) ?? regionButtons.find((b) => !b.getAttribute('aria-label'));
+
               const allButtons = Array.from(
                 document.querySelectorAll<HTMLElement>('[role="button"], button, [role="textbox"]'),
-              ).filter(
-                (el) =>
-                  isVis(el) &&
-                  !el.closest('[role="banner"]') &&
-                  !el.closest('[role="tablist"]') &&
-                  !el.closest('[role="feed"]'),
-              );
+              ).filter((el) => {
+                if (
+                  !isVis(el) ||
+                  el.closest('[role="banner"]') ||
+                  el.closest('[role="tablist"]') ||
+                  el.closest('[role="feed"]')
+                ) {
+                  return false;
+                }
+                const label = (el.getAttribute('aria-label') ?? el.textContent ?? '').trim();
+                return !excludeRx.test(label);
+              });
+
               const matched =
+                regionPrompt ??
                 allButtons.find((b) =>
                   rx.test(
                     `${b.getAttribute('aria-label') ?? ''} ${b.textContent ?? ''} ${b.getAttribute('placeholder') ?? ''}`,
                   ),
                 ) ??
-                Array.from(
-                  document.querySelectorAll<HTMLElement>(
-                    '[data-pagelet*="GroupInlineComposer"] [role="button"], [role="region"] [role="button"]',
-                  ),
-                ).find(
-                  (b) =>
-                    isVis(b) &&
-                    !b.closest('[role="banner"]') &&
-                    b.getBoundingClientRect().left >= 220 &&
-                    b.getBoundingClientRect().width >= 160,
-                ) ??
+                (!timelineMode
+                  ? Array.from(
+                      document.querySelectorAll<HTMLElement>(
+                        '[data-pagelet*="GroupInlineComposer"] [role="button"]',
+                      ),
+                    ).find(
+                      (b) =>
+                        isVis(b) &&
+                        !b.closest('[role="banner"]') &&
+                        b.getBoundingClientRect().left >= 220 &&
+                        b.getBoundingClientRect().width >= 160,
+                    )
+                  : undefined) ??
                 allButtons.find((b) => {
                   const r = b.getBoundingClientRect();
                   if (
@@ -1333,7 +1871,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                 });
               if (matched) {
                 matched.setAttribute('data-wb-poster-trigger', '1');
-                return { ok: true as const, diag: '' };
+                return { ok: true as const, restricted: false as const, diag: '' };
               }
               const wideSample = allButtons
                 .filter((b) => b.getBoundingClientRect().width >= 140)
@@ -1345,35 +1883,86 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                 .join('|');
               return {
                 ok: false as const,
+                restricted: false as const,
                 diag: `all=${allButtons.length}[${wideSample}] url=${location.pathname}`,
               };
-            });
+            }, isPageTimeline);
             if (!triggerResult.ok) {
-              throw Error(`小组未开放发帖框 (${triggerResult.diag})`);
+              if (triggerResult.restricted) {
+                throw new PosterAccountRestrictedError('发小组受限 · 该账号当前无法在小组发帖', {
+                  scope: 'feature_action',
+                });
+              }
+              throw Error(
+                isPageTimeline
+                  ? `专页时间线未找到发帖框 (${triggerResult.diag})`
+                  : `小组未开放发帖框 (${triggerResult.diag})`,
+              );
             }
             const trigger = page.locator('[data-wb-poster-trigger="1"]').first();
             await trigger.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
             await trigger.click({ timeout: 5000 });
             const dialogDeadline = Date.now() + Math.max(500, Math.round(8000 * this.paceScale));
+            let composerOpened = false;
+            let restrictedPopupText: string | null = null;
             while (Date.now() < dialogDeadline) {
-              const hasDialog = await page.evaluate(() => {
-                return Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).some(
-                  (d) => {
-                    const r = d.getBoundingClientRect();
-                    if (r.width <= 200 || r.height <= 150) return false;
-                    return Array.from(
-                      d.querySelectorAll<HTMLElement>(
-                        '[role="textbox"][contenteditable="true"], div[contenteditable="true"]',
-                      ),
-                    ).some((el) => {
-                      const er = el.getBoundingClientRect();
-                      return er.width > 50 && er.height > 14;
-                    });
-                  },
+              const dialogProbe = await page.evaluate(() => {
+                const restrictionRx =
+                  /You can['’]?t post|temporarily blocked|restricted from posting|can['’]?t participate|feature is temporarily unavailable|暂时无法在小组|无法在小组发帖|你目前无法|暂时被禁止|限制了某些活动|restrict certain activity|Account restricted|账号受限|操作受限|违反社区|Community Standards|အဖွဲ့တွင်\s*ပို့စ်တင်၍မရ|ကန့်သတ်/i;
+                const dialogs = Array.from(
+                  document.querySelectorAll<HTMLElement>(
+                    '[role="dialog"], [role="alertdialog"], [aria-modal="true"]',
+                  ),
                 );
+                let hasEditor = false;
+                let restrictionText: string | null = null;
+                for (const d of dialogs) {
+                  const r = d.getBoundingClientRect();
+                  if (r.width <= 180 || r.height <= 100) continue;
+                  const editorFound = Array.from(
+                    d.querySelectorAll<HTMLElement>(
+                      '[role="textbox"][contenteditable="true"], div[contenteditable="true"]',
+                    ),
+                  ).some((el) => {
+                    const er = el.getBoundingClientRect();
+                    return er.width > 50 && er.height > 14;
+                  });
+                  if (editorFound) {
+                    hasEditor = true;
+                    break;
+                  }
+                  const txt = (d.textContent ?? '').replace(/\s+/g, ' ').trim();
+                  if (txt && restrictionRx.test(txt)) {
+                    restrictionText = txt.slice(0, 120);
+                  }
+                }
+                return { hasEditor, restrictionText };
               });
-              if (hasDialog) break;
+              if (dialogProbe.hasEditor) {
+                composerOpened = true;
+                break;
+              }
+              if (dialogProbe.restrictionText) {
+                restrictedPopupText = dialogProbe.restrictionText;
+                break;
+              }
               await wait(200);
+            }
+            if (restrictedPopupText) {
+              await dismissFeatureInterventionDialogIfPresent(page, guard).catch(() => {});
+              throw new PosterAccountRestrictedError(
+                isPageTimeline
+                  ? `专页发帖受限：${restrictedPopupText.slice(0, 48)}`
+                  : '发小组受限 · 该账号当前无法在小组发帖',
+                { scope: 'feature_action' },
+              );
+            }
+            if (!composerOpened) {
+              throw Error(
+                isPageTimeline
+                  ? '专页时间线发帖弹窗未打开'
+                  : '小组发帖弹窗未打开（可能发小组受限或无发帖权限）',
+              );
             }
             return true;
           });
@@ -1770,6 +2359,15 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                 materialId: material.id,
               });
             }
+            const preSubmitSurface = await readGroupBumper(page, {
+              groupId: isPageTimeline ? '-' : effectiveGroupId,
+              pageId: accountId,
+            }).catch(() => null);
+            const preSubmitPostIds = new Set(
+              (preSubmitSurface?.posts ?? [])
+                .map((p) => p.postId)
+                .filter((id): id is string => Boolean(id)),
+            );
             const preSubmitNotices = await page
               .evaluate(() => {
                 const rx =
@@ -1912,13 +2510,17 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
                 pendingApproval = true;
               } else {
                 const afterSurface = await readGroupBumper(page, {
-                  groupId: effectiveGroupId,
+                  groupId: isPageTimeline ? '-' : effectiveGroupId,
                   pageId: accountId,
                 }).catch(() => null);
                 const ownPost = afterSurface?.posts.find(
                   (p) =>
+                    Boolean(
+                      p.postId && /^\d+$/.test(p.postId) && !preSubmitPostIds.has(p.postId),
+                    ) &&
                     (p.authorId === accountId || p.authorAliases.includes(accountId)) &&
-                    (p.ageHours === null || p.ageHours <= 1),
+                    p.ageHours !== null &&
+                    p.ageHours <= 5 / 60,
                 );
                 if (ownPost?.postId && /^\d+$/.test(ownPost.postId)) {
                   createdPostId = ownPost.postId;
@@ -1927,6 +2529,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             }
 
             if (graphqlRestricted) {
+              markedPendingReview = true;
               if (this.posterRepo) {
                 await this.posterRepo.markOperationReview(submitOpId, '发布受限，结果待核对');
               }
@@ -1953,6 +2556,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
               const reviewReason = errMsg
                 ? `发布中断待核对: ${errMsg.slice(0, 48)}`
                 : '发布结果未确认';
+              markedPendingReview = true;
               if (this.posterRepo) {
                 await this.posterRepo.markOperationReview(submitOpId, reviewReason);
               }
@@ -1984,9 +2588,13 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             }
 
             const finalPostId = createdPostId ?? 'pending_approval';
+            // Only emit a real direct post permalink when createdPostId was actually confirmed;
+            // pending_approval posts must NOT emit group/page homepage URLs (prevents wrong-post bumping!).
             const postUrl = createdPostId
-              ? `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/posts/${encodeURIComponent(createdPostId)}/`
-              : `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/`;
+              ? isPageTimeline
+                ? `https://www.facebook.com/${encodeURIComponent(accountId)}/posts/${encodeURIComponent(createdPostId)}/`
+                : `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroupId)}/posts/${encodeURIComponent(createdPostId)}/`
+              : '';
 
             const logEntry: PosterLog = {
               id: randomUUID(),
@@ -2028,6 +2636,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             if (this.posterRepo) {
               await this.posterRepo.markOperationKernelSettled(submitOpId);
             }
+            if (!isPageTimeline) consecutiveGroupComposerFailures = 0;
             await callbacks.onTaskPosted(logEntry);
           } finally {
             page.off('response', onResponse);
@@ -2098,12 +2707,41 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             })
             .catch(() => {});
           const msg = err instanceof Error ? err.message : String(err);
+          callbacks.onTargetError?.(rawGroupId, msg);
+          const connectionLost = this.connections.get(profileId) !== conn;
           if (err instanceof PosterAccountRestrictedError) {
-            callbacks.returnTaskOnRestriction(task);
+            if (!markedPendingReview) {
+              callbacks.returnTaskOnRestriction(task);
+            }
             throw err;
           }
+          if (connectionLost) {
+            // Never loop with a closed/disconnected connection and burn the shared taskQueue!
+            if (!markedPendingReview) {
+              callbacks.returnTaskOnRestriction(task);
+            }
+            throw err;
+          }
+          if (
+            !isPageTimeline &&
+            /发帖弹窗未打开|未开放发帖框|发帖弹窗中未找到文字输入框|发小组受限/i.test(msg)
+          ) {
+            consecutiveGroupComposerFailures++;
+            if (consecutiveGroupComposerFailures >= 2) {
+              const restrictedErr = new PosterAccountRestrictedError(
+                '发小组受限 · 连续多个小组无法打开发帖框，已自动停止发小组',
+                { scope: 'feature_action' },
+              );
+              callbacks.returnTaskOnRestriction(task);
+              throw restrictedErr;
+            }
+          }
           // Single-group error (e.g., group closed posting or not accessible): record status and continue to next group
-          callbacks.status(`跳过小组 ${effectiveGroupName} · ${msg.slice(0, 48)}`);
+          callbacks.status(
+            isPageTimeline
+              ? `专页时间线发布失败 · ${msg.slice(0, 48)}`
+              : `跳过小组 ${effectiveGroupName} · ${msg.slice(0, 48)}`,
+          );
           await paceWait(1000);
         }
       }

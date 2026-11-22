@@ -192,12 +192,15 @@ export class GroupBumperService {
     timer.unref?.();
     this.scheduleTimer = timer;
   }
-  shutdown(): void {
+  async shutdown(): Promise<void> {
     if (this.scheduleTimer) {
       clearInterval(this.scheduleTimer);
       this.scheduleTimer = null;
     }
     this.refreshAbort?.abort();
+    if (this.hasActiveExecution()) {
+      await this.stop().catch(() => {});
+    }
   }
   private async readScheduledTasks(limit = 100): Promise<BumperScheduledTask[]> {
     if (this.repo.scheduledTasks) {
@@ -261,10 +264,20 @@ export class GroupBumperService {
             runId: meta.runId,
             statusReason: `运行中（已分配 ${meta.admittedCount} 个账号）`,
           });
+          const runIdsAtStart = new Map(
+            meta.admittedIds.map((pid) => [pid, this.profileRunIds.get(pid) ?? '']),
+          );
           void Promise.allSettled(meta.workerPromises).then(async () => {
             const latest = (await this.readScheduledTasks(200)).find((r) => r.id === task.id);
             if (!latest || latest.status !== 'running') return;
-            const anyCancelled = meta.admittedIds.every((pid) => this.cancelled.has(pid));
+            const anyCancelled =
+              meta.admittedIds.length > 0 &&
+              meta.admittedIds.every((pid) => {
+                const sameRun = this.profileRunIds.get(pid) === runIdsAtStart.get(pid);
+                if (sameRun) return this.cancelled.has(pid);
+                const prof = this.profilesForMode(task.mode).get(pid);
+                return prof?.status === '已停止';
+              });
             await this.writeScheduledTaskPatch(task.id, {
               status: anyCancelled ? 'cancelled' : 'completed',
               statusReason: anyCancelled
@@ -297,6 +310,7 @@ export class GroupBumperService {
   }
   isProfileRunning(id: string) {
     return (
+      this.admitting.has(id) ||
       this.active.has(id) ||
       this.starting.has(id) ||
       this.workers.has(id) ||
@@ -305,6 +319,7 @@ export class GroupBumperService {
   }
   hasActiveExecution() {
     return (
+      this.admitting.size > 0 ||
       this.active.size > 0 ||
       this.starting.size > 0 ||
       this.workers.size > 0 ||
@@ -313,16 +328,24 @@ export class GroupBumperService {
     );
   }
   private modeOf(id: string): BumperMode {
-    return this.profileModes.get(id) ?? 'group-bumper';
+    return this.profileModes.get(id) ?? this.admittingModes.get(id) ?? 'group-bumper';
   }
-  isProfileRunningInMode(id: string, mode: BumperMode) {
+  isProfileRunningInMode(id: string, mode: BumperMode, includeAdmitting = true) {
     return (
       this.modeOf(id) === mode &&
-      (this.active.has(id) || this.starting.has(id) || this.workers.has(id))
+      ((includeAdmitting && this.admitting.has(id)) ||
+        this.active.has(id) ||
+        this.starting.has(id) ||
+        this.workers.has(id))
     );
   }
   hasActiveExecutionInMode(mode: BumperMode) {
-    for (const id of new Set([...this.active, ...this.starting, ...this.workers.keys()]))
+    for (const id of new Set([
+      ...this.admitting,
+      ...this.active,
+      ...this.starting,
+      ...this.workers.keys(),
+    ]))
       if (this.modeOf(id) === mode) return true;
     return false;
   }
@@ -504,8 +527,10 @@ export class GroupBumperService {
           return;
         }
         if (pending.length && this.refreshAvatars) {
+          this.refreshAbort?.abort(new Error('FACEBOOK_METADATA_BATCH_SUPERSEDED'));
           const abortController = new AbortController();
           this.refreshAbort = abortController;
+          this.refreshing = true;
           this.refreshingKind = 'groups';
           void this.refreshAvatars('groups', pending, {
             signal: abortController.signal,
@@ -519,6 +544,7 @@ export class GroupBumperService {
             .finally(() => {
               if (this.refreshAbort === abortController) {
                 this.refreshAbort = null;
+                this.refreshing = false;
                 if (this.refreshingKind === 'groups') this.refreshingKind = null;
               }
             });
@@ -535,8 +561,10 @@ export class GroupBumperService {
           return;
         }
         if (pending.length && this.refreshAvatars) {
+          this.refreshAbort?.abort(new Error('FACEBOOK_METADATA_BATCH_SUPERSEDED'));
           const abortController = new AbortController();
           this.refreshAbort = abortController;
+          this.refreshing = true;
           this.refreshingKind = 'pages';
           void this.refreshAvatars('pages', pending, {
             signal: abortController.signal,
@@ -551,6 +579,7 @@ export class GroupBumperService {
             .finally(() => {
               if (this.refreshAbort === abortController) {
                 this.refreshAbort = null;
+                this.refreshing = false;
                 if (this.refreshingKind === 'pages') this.refreshingKind = null;
               }
             });
@@ -820,7 +849,13 @@ export class GroupBumperService {
         );
     }
 
-    const newlyAdmitting = requested.filter(
+    const candidateAdmitting = requested.filter(
+      (id) => !this.isProfileRunningInMode(id, mode) && !this.admitting.has(id),
+    );
+    const reservedIds = this.featureExecution
+      ? (await this.featureExecution.tryReserve(mode, candidateAdmitting)).reservedIds
+      : candidateAdmitting;
+    const newlyAdmitting = reservedIds.filter(
       (id) => !this.isProfileRunningInMode(id, mode) && !this.admitting.has(id),
     );
     for (const id of newlyAdmitting) {
@@ -876,10 +911,7 @@ export class GroupBumperService {
         requestedProfileIds: activeRequested,
         currentModuleId: mode,
         isAlreadyRunningInCurrentModule: (id) =>
-          this.isProfileRunningInMode(id, mode) ||
-          (this.admitting.has(id) &&
-            !newlyAdmitting.includes(id) &&
-            this.admittingModes.get(id) === mode),
+          this.isProfileRunningInMode(id, mode, !newlyAdmitting.includes(id)),
         busyModuleLabelsForProfile: async (id) => {
           const labels = this.featureExecution
             ? await this.featureExecution.busyModuleLabels([id], mode)
@@ -1006,6 +1038,7 @@ export class GroupBumperService {
         this.admittingModes.delete(id);
       }
       for (const id of admittedIds) this.starting.delete(id);
+      this.featureExecution?.releaseReservation(mode, reservedIds);
     }
   }
   private async acquireSlot(
@@ -1163,7 +1196,7 @@ export class GroupBumperService {
       .map((id) => this.workers.get(id))
       .filter((work): work is Promise<void> => work !== undefined);
     for (const id of ids) this.cancelled.add(id);
-    await Promise.all(
+    const stopResults = await Promise.allSettled(
       ids.map(async (id) => {
         if (!this.active.has(id)) return;
         await this.runner.stop(id);
@@ -1178,6 +1211,236 @@ export class GroupBumperService {
       }),
     );
     await Promise.allSettled(workers);
+    const firstRejected = stopResults.find(
+      (r): r is PromiseRejectedResult => r.status === 'rejected',
+    );
+    if (firstRejected) {
+      throw firstRejected.reason;
+    }
     return this.state();
+  }
+
+  /**
+   * 供「定时排班」流水线调用的单浏览器顶贴执行入口：
+   * - 复用完整顶贴执行器、去重账本与 `stop()` 控制；
+   * - 实时回调每一步状态（含长视频播放秒数推进）以喂养活性看门狗；
+   * - 精确区分账号全局硬阻断（掉登/封号/验证页）与局部软受限（点赞受限弹窗/慢帖跳过）。
+   */
+  async runScheduledProfileStep(input: {
+    profileId: string;
+    mode: BumperMode;
+    groupIds: string[];
+    pageIds: string[];
+    minConcurrency: number;
+    onProgress: (status: string, sessionBumps: number) => void;
+  }): Promise<{
+    bumpedCount: number;
+    status: string;
+    hardBlocked: boolean;
+    softIssue: boolean;
+  }> {
+    this.assertAllowed();
+    const { profileId, mode, onProgress } = input;
+    const allGroups = await this.repo.targets('groups');
+    const groups =
+      mode === 'page-bumper'
+        ? [PAGE_BUMPER_SYNTHETIC_GROUP]
+        : input.groupIds.flatMap((id) => allGroups.filter((g) => g.id === id));
+    const allPages = await this.repo.targets('pages');
+    const pages = input.pageIds.flatMap((id) => allPages.filter((p) => p.id === id));
+    if (!groups.length || !pages.length) {
+      return {
+        bumpedCount: 0,
+        status:
+          mode === 'page-bumper' ? '跳过：未找到已保存的目标专页' : '跳过：未找到有效的小组或专页',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+
+    const rawSettings =
+      mode === 'page-bumper'
+        ? this.repo.pageSettings
+          ? await this.repo.pageSettings()
+          : (this.fallbackPageSettings ?? (await this.repo.settings()))
+        : await this.repo.settings();
+    const settings: BumperSettings = {
+      ...rawSettings,
+      maxConcurrentProfiles: Math.max(rawSettings.maxConcurrentProfiles ?? 8, input.minConcurrency),
+    };
+    if (settings.likeProbability === 0 && settings.commentProbability === 0) {
+      settings.likeProbability = 100;
+    }
+
+    if (!this.runner.ready(profileId) && this.profileLifecycle) {
+      onProgress('正在唤醒浏览器连接…', 0);
+      await this.profileLifecycle.ensureProfilesOnline([profileId]);
+    }
+    if (!this.runner.ready(profileId)) {
+      return {
+        bumpedCount: 0,
+        status: '浏览器未就绪或连接断开',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+    if (this.isProfileRunning(profileId)) {
+      return {
+        bumpedCount: 0,
+        status: '跳过：该浏览器正在执行其他顶贴任务',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+
+    const runId = globalThis.crypto.randomUUID();
+    const targetProfiles = this.profilesForMode(mode);
+    this.cancelled.delete(profileId);
+    this.active.add(profileId);
+    this.profileRunIds.set(profileId, runId);
+    this.profileModes.set(profileId, mode);
+    const stat: BumperProfileStat = { today: 0, session: 0, status: '准备顶贴…', running: true };
+    targetProfiles.set(profileId, stat);
+
+    const shuffledGroups =
+      mode === 'page-bumper'
+        ? groups
+        : (buildStaggeredBumperQueues([profileId], groups).get(profileId) ?? groups);
+    const shuffledPages = buildStaggeredBumperQueues([profileId], pages).get(profileId) ?? pages;
+
+    let hardBlocked = false;
+    let softIssue = false;
+    const work = (async () => {
+      let failed = false;
+      let pending = 0;
+      let failedActions = 0;
+      let skippedPosts = 0;
+      let issueReason = '';
+      const current = () => this.profileRunIds.get(profileId) === runId;
+      try {
+        await this.runner.run(profileId, shuffledGroups, shuffledPages, settings, {
+          runId,
+          executionMode: 'live',
+          cancelled: () => !current() || this.cancelled.has(profileId),
+          status: (text, today) => {
+            if (!current()) return;
+            stat.status = text;
+            if (today !== undefined) stat.today = today;
+            onProgress(text, stat.session);
+          },
+          issue: (issue) => {
+            if (!current()) return;
+            if (issue.kind === 'pending') {
+              pending++;
+              issueReason = issue.reason;
+            } else if (issue.kind === 'skipped') {
+              skippedPosts++;
+            } else {
+              failedActions++;
+              issueReason = issue.reason;
+            }
+            onProgress(stat.status, stat.session);
+          },
+          added: (today) => {
+            if (!current()) return;
+            stat.session++;
+            stat.today = today;
+            onProgress(stat.status, stat.session);
+          },
+        });
+        if (pending + failedActions > 0 && !this.cancelled.has(profileId)) {
+          softIssue = true;
+          stat.status = `本轮 ${stat.session} 次 · 局部跳过 (${issueReason || '部分操作未完成'})`;
+        } else if (this.cancelled.has(profileId)) {
+          stat.status = '已停止';
+        } else if (skippedPosts > 0) {
+          stat.status = `已完成 · 本轮 ${stat.session} 次 · 跳过 ${skippedPosts} 帖`;
+        } else {
+          stat.status = `已完成 · 本轮 ${stat.session} 次`;
+        }
+      } catch (e) {
+        failed = !this.cancelled.has(profileId);
+        const rawMsg = e instanceof Error ? e.message : '顶贴执行异常';
+        stat.status = this.cancelled.has(profileId) ? '已停止' : rawMsg;
+        if (!this.cancelled.has(profileId)) {
+          if (
+            /未登录|登录失效|退出登录|账号受限|封号|封禁|验证页面|手机验证|身份验证|checkpoint|login/i.test(
+              rawMsg,
+            ) &&
+            !/点赞或评论被 Facebook 限制|暂时限制/.test(rawMsg)
+          ) {
+            hardBlocked = true;
+          } else {
+            softIssue = true;
+          }
+        }
+      } finally {
+        stat.running = this.runner.hasControl?.(profileId) === true;
+        if (!stat.running) {
+          this.active.delete(profileId);
+          try {
+            await this.repo.saveProfileResult?.({
+              profileId,
+              source: mode === 'page-bumper' ? 'page-bumper' : 'group-bumper',
+              runId,
+              name: mode === 'page-bumper' ? '专页顶贴' : '小组顶贴',
+              state: this.cancelled.has(profileId)
+                ? 'STOPPED'
+                : failed || pending + failedActions > 0
+                  ? 'FAILED'
+                  : 'COMPLETED',
+              reason: stat.status,
+              finishedAt: Date.now(),
+              failedSteps: pending + failedActions + (failed ? 1 : 0),
+              skippedSteps: skippedPosts,
+            });
+          } catch {}
+        }
+      }
+    })();
+
+    this.workers.set(profileId, work);
+    try {
+      await work;
+    } finally {
+      if (this.workers.get(profileId) === work) this.workers.delete(profileId);
+    }
+
+    return {
+      bumpedCount: stat.session,
+      status: stat.status,
+      hardBlocked,
+      softIssue,
+    };
+  }
+
+  async syncMaxConcurrency(maxConcurrentProfiles: number): Promise<void> {
+    const capped = Math.max(1, Math.min(50, Math.round(maxConcurrentProfiles)));
+    const groupCurrent = await this.repo.settings();
+    if (groupCurrent.maxConcurrentProfiles !== capped) {
+      const savedGroup =
+        (await this.repo.saveSettings({ ...groupCurrent, maxConcurrentProfiles: capped })) ??
+        BumperSettings.parse({ ...groupCurrent, maxConcurrentProfiles: capped });
+      for (const live of this.liveGroupSettings) Object.assign(live, savedGroup);
+    } else {
+      for (const live of this.liveGroupSettings) live.maxConcurrentProfiles = capped;
+    }
+
+    const pageCurrent = this.repo.pageSettings
+      ? await this.repo.pageSettings()
+      : (this.fallbackPageSettings ?? groupCurrent);
+    if (pageCurrent.maxConcurrentProfiles !== capped) {
+      const nextPage = { ...pageCurrent, maxConcurrentProfiles: capped };
+      if (this.repo.savePageSettings) {
+        const savedPage =
+          (await this.repo.savePageSettings(nextPage)) ?? BumperSettings.parse(nextPage);
+        for (const live of this.livePageSettings) Object.assign(live, savedPage);
+      } else {
+        this.fallbackPageSettings = BumperSettings.parse(nextPage);
+        for (const live of this.livePageSettings) live.maxConcurrentProfiles = capped;
+      }
+    } else {
+      for (const live of this.livePageSettings) live.maxConcurrentProfiles = capped;
+    }
   }
 }

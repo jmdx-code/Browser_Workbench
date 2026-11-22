@@ -8,6 +8,86 @@ export interface FeatureExecutionParticipant {
 
 export class FeatureExecutionRegistry {
   private readonly items = new Map<string, FeatureExecutionParticipant>();
+  private readonly delegatedSubmodules = new Map<string, string>();
+  private readonly reservations = new Map<string, string>();
+  private readonly reserveLocks = new Map<string, Promise<unknown>>();
+
+  setDelegatedSubmodule(profileId: string, submoduleId: string | null): void {
+    if (submoduleId) {
+      this.delegatedSubmodules.set(profileId, submoduleId);
+    } else {
+      this.delegatedSubmodules.delete(profileId);
+    }
+  }
+
+  private normalizeExcludes(
+    excludeModuleId?: string | readonly string[],
+  ): ReadonlySet<string> | null {
+    if (!excludeModuleId) return null;
+    if (typeof excludeModuleId === 'string') return new Set([excludeModuleId]);
+    return excludeModuleId.length > 0 ? new Set(excludeModuleId) : null;
+  }
+
+  private isDelegatedBypass(
+    participantId: string,
+    profileId: string,
+    excludes: ReadonlySet<string> | null,
+  ): boolean {
+    if (!excludes) return false;
+    const delegated = this.delegatedSubmodules.get(profileId);
+    if (!delegated) return false;
+    if (participantId === 'auto-scheduler' && excludes.has(delegated)) return true;
+    if (excludes.has('auto-scheduler') && delegated === participantId) return true;
+    return false;
+  }
+
+  private withProfileReserveLock<T>(profileId: string, run: () => Promise<T>): Promise<T> {
+    const prev = this.reserveLocks.get(profileId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(run);
+    this.reserveLocks.set(profileId, next);
+    void next
+      .finally(() => {
+        if (this.reserveLocks.get(profileId) === next) {
+          this.reserveLocks.delete(profileId);
+        }
+      })
+      .catch(() => {});
+    return next;
+  }
+
+  async tryReserve(
+    moduleId: string,
+    profileIds: readonly string[],
+  ): Promise<{ reservedIds: string[]; busyIds: string[] }> {
+    const unique = [...new Set(profileIds)];
+    const reservedIds: string[] = [];
+    const busyIds: string[] = [];
+    const excludes = new Set([moduleId]);
+    for (const profileId of unique) {
+      const ok = await this.withProfileReserveLock(profileId, async () => {
+        const busy = await this.isProfileBusy(profileId, moduleId);
+        if (busy) return false;
+        // Same synchronous tick re-check + atomic reservation write (no intervening await).
+        const holder = this.reservations.get(profileId);
+        if (holder && holder !== moduleId && !this.isDelegatedBypass(holder, profileId, excludes)) {
+          return false;
+        }
+        this.reservations.set(profileId, moduleId);
+        return true;
+      });
+      if (ok) reservedIds.push(profileId);
+      else busyIds.push(profileId);
+    }
+    return { reservedIds, busyIds };
+  }
+
+  releaseReservation(moduleId: string, profileIds: readonly string[]): void {
+    for (const profileId of profileIds) {
+      if (this.reservations.get(profileId) === moduleId) {
+        this.reservations.delete(profileId);
+      }
+    }
+  }
 
   register(participant: FeatureExecutionParticipant): void {
     this.items.set(participant.id, participant);
@@ -21,9 +101,22 @@ export class FeatureExecutionRegistry {
     return [...this.items.values()];
   }
 
-  async isProfileBusy(profileId: string, excludeModuleId?: string): Promise<boolean> {
+  async isProfileBusy(
+    profileId: string,
+    excludeModuleId?: string | readonly string[],
+  ): Promise<boolean> {
+    const excludes = this.normalizeExcludes(excludeModuleId);
+    const reservedBy = this.reservations.get(profileId);
+    if (
+      reservedBy &&
+      !excludes?.has(reservedBy) &&
+      !this.isDelegatedBypass(reservedBy, profileId, excludes)
+    ) {
+      return true;
+    }
     for (const item of this.items.values()) {
-      if (excludeModuleId && item.id === excludeModuleId) continue;
+      if (excludes?.has(item.id)) continue;
+      if (this.isDelegatedBypass(item.id, profileId, excludes)) continue;
       if (await item.isProfileRunning(profileId)) return true;
     }
     return false;
@@ -31,14 +124,34 @@ export class FeatureExecutionRegistry {
 
   async busyModuleLabels(
     profileIds: readonly string[],
-    excludeModuleId?: string,
+    excludeModuleId?: string | readonly string[],
   ): Promise<string[]> {
+    const excludes = this.normalizeExcludes(excludeModuleId);
     const labels: string[] = [];
+    const seen = new Set<string>();
+    for (const pid of profileIds) {
+      const reservedBy = this.reservations.get(pid);
+      if (
+        reservedBy &&
+        !excludes?.has(reservedBy) &&
+        !this.isDelegatedBypass(reservedBy, pid, excludes)
+      ) {
+        const label = this.items.get(reservedBy)?.label ?? reservedBy;
+        if (!seen.has(label)) {
+          seen.add(label);
+          labels.push(label);
+        }
+      }
+    }
     for (const item of this.items.values()) {
-      if (excludeModuleId && item.id === excludeModuleId) continue;
+      if (excludes?.has(item.id)) continue;
       for (const pid of profileIds) {
+        if (this.isDelegatedBypass(item.id, pid, excludes)) continue;
         if (await item.isProfileRunning(pid)) {
-          labels.push(item.label);
+          if (!seen.has(item.label)) {
+            seen.add(item.label);
+            labels.push(item.label);
+          }
           break;
         }
       }
@@ -116,6 +229,12 @@ export interface FeatureExecutionFallbackServices {
     isProfileRunning(profileId: string, mode?: 'group' | 'page'): boolean;
     hasActiveExecution(mode?: 'group' | 'page'): boolean;
     stopBumper(profileIds?: readonly string[], mode?: 'group' | 'page'): Promise<unknown>;
+    isProfileRunningExtra?(profileId: string, kind: 'active' | 'poster' | 'inviter'): boolean;
+    hasExtraExecution?(kind: 'active' | 'poster' | 'inviter'): boolean;
+    stopExtra?(
+      kind: 'active' | 'poster' | 'inviter',
+      profileIds?: readonly string[],
+    ): Promise<unknown>;
   };
 }
 
@@ -219,6 +338,28 @@ export function ensureFeatureExecutionRegistry(
             await bluestacks.stopBumper(profileIds, mode);
           },
         });
+      }
+    }
+    if (bluestacks.isProfileRunningExtra && bluestacks.hasExtraExecution && bluestacks.stopExtra) {
+      const isExtra = bluestacks.isProfileRunningExtra.bind(bluestacks);
+      const hasExtra = bluestacks.hasExtraExecution.bind(bluestacks);
+      const stopExtra = bluestacks.stopExtra.bind(bluestacks);
+      for (const [id, label, kind] of [
+        ['bluestacks-active', '蓝蝶活跃账号', 'active'],
+        ['bluestacks-group-poster', '蓝蝶小组发帖', 'poster'],
+        ['bluestacks-group-inviter', '蓝蝶小组邀请人', 'inviter'],
+      ] as const) {
+        if (!registry.hasParticipant(id)) {
+          registry.register({
+            id,
+            label,
+            isProfileRunning: (profileId) => isExtra(profileId, kind),
+            hasActiveExecution: () => hasExtra(kind),
+            stopProfiles: async (profileIds) => {
+              await stopExtra(kind, profileIds);
+            },
+          });
+        }
       }
     }
   }

@@ -3,13 +3,21 @@ import type { Step } from '../../shared/contracts.js';
 import type { Progress, TaskCommand, TaskStepBudget } from '../../shared/task-contracts.js';
 
 export type FeatureModuleId =
+  | 'auto-scheduler'
   | 'active-accounts'
   | 'group-inviter'
   | 'group-bumper'
   | 'page-bumper'
   | 'group-poster'
+  | 'sheets-groups'
+  | 'sheets-pages'
+  | 'sheets-schedule'
+  | 'sheets-records'
+  | 'bluestacks-active'
+  | 'bluestacks-group-poster'
   | 'bluestacks-group-bumper'
   | 'bluestacks-page-bumper'
+  | 'bluestacks-group-inviter'
   | 'records';
 
 export type StepBudget = z.infer<typeof TaskStepBudget>;
@@ -34,8 +42,9 @@ export interface ProfileActivityDescriptor {
 
 export interface FeatureNavItem {
   id: FeatureModuleId;
-  group: 'automation' | 'bluestacks' | 'monitor';
+  group: 'control' | 'automation' | 'bluestacks' | 'sheets' | 'monitor';
   title: string;
+  tooltip?: string | undefined;
   icon: FeatureModuleId;
   runningCount?: number | undefined;
   badgeCount?: number | undefined;

@@ -3,11 +3,10 @@ import type { SavedCombination, Workspace } from '../shared/contracts.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 import { TEST_COMBINATION_NOTE } from '../shared/task-tests.js';
 import { api } from './api.js';
-import { BrowserRunMonitor } from './browser-run-monitor.js';
 import type { useCardColors } from './card-colors.js';
 import { copyTextToClipboard } from './clipboard.js';
 import { CombinationList, formatCombinationForClipboard } from './combination-list.js';
-import { newCombination } from './editor.js';
+import { newCombination } from './combination-defaults.js';
 import type { SelectionControlSummary } from './modules/module-contracts.js';
 import { TaskScheduleDialog } from './task-schedule-dialog.js';
 import { TaskTestsPanel } from './task-tests-panel.js';
@@ -67,11 +66,6 @@ export function ActiveAccountsPage({
           tasks.refresh();
           void onRefreshWorkspace();
         }}
-      />
-      <BrowserRunMonitor
-        profiles={workspace.profiles}
-        selected={selected}
-        runtime={tasks.runtime}
       />
       <CombinationList
         capabilities={tasks.capabilities}
@@ -136,6 +130,8 @@ export function ActiveAccountsPage({
           const eligibleScheduleIds = [...selected].filter((id) => !busyIds.has(id)).sort();
           if (eligibleScheduleIds.length) {
             setSchedule({ row, profileIds: eligibleScheduleIds });
+          } else {
+            onNotify('所选浏览器当前已有任务运行中，请先停止或另选资料');
           }
         }}
         onNew={() =>
@@ -158,15 +154,13 @@ export function ActiveAccountsPage({
           })();
         }}
         onImport={async (parsed) => {
-          await onMutate(async () => {
-            if (parsed.mode === 'published') {
-              await api.create(parsed.value);
-            } else {
-              await api.createDraft(parsed.value);
-            }
-            await onRefreshResources();
-            return `已导入任务组合「${parsed.value.name || '未命名组合'}」`;
-          });
+          if (parsed.mode === 'published') {
+            await api.create(parsed.value);
+          } else {
+            await api.createDraft(parsed.value);
+          }
+          await Promise.all([onRefreshWorkspace(), onRefreshResources()]);
+          onNotify(`已导入任务组合「${parsed.value.name || '未命名组合'}」`);
         }}
         onDeleteMany={async (rows) => {
           const deleted: string[] = [];

@@ -43,6 +43,9 @@ export async function handleBluestacksRoutes(ctx: BluestacksRouteContext): Promi
     case 'page-settings':
       json(res, 200, await bluestacks.savePageBumperSettings(input));
       return true;
+    case 'risk-limits':
+      json(res, 200, await bluestacks.saveRiskLimitSettings(input));
+      return true;
     case 'folders/create':
       json(res, 200, await bluestacks.createFolder(input));
       return true;
@@ -73,6 +76,33 @@ export async function handleBluestacksRoutes(ctx: BluestacksRouteContext): Promi
     case 'instances/inspect':
       json(res, 200, await bluestacks.inspectInstances(input));
       return true;
+    case 'instances/show':
+      json(res, 200, await bluestacks.showInstance(input));
+      return true;
+    case 'instances/arrange':
+      json(res, 200, await bluestacks.arrangeWindows(input));
+      return true;
+    case 'instances/install-apk':
+      json(res, 200, await bluestacks.installApk(input));
+      return true;
+    case 'instances/switch-identity':
+      json(res, 200, await bluestacks.switchIdentity(input));
+      return true;
+    case 'instances/login':
+      json(res, 200, await bluestacks.loginInstance(input));
+      return true;
+    case 'batch-login/start':
+      json(res, 200, await bluestacks.startBatchLogin(input));
+      return true;
+    case 'batch-login/stop':
+      json(res, 200, await bluestacks.stopBatchLogin());
+      return true;
+    case 'health-check/start':
+      json(res, 200, await bluestacks.startHealthCheck(input));
+      return true;
+    case 'health-check/stop':
+      json(res, 200, await bluestacks.stopHealthCheck());
+      return true;
     case 'bumper/start':
       json(res, 200, await bluestacks.startBumper(input));
       return true;
@@ -86,6 +116,27 @@ export async function handleBluestacksRoutes(ctx: BluestacksRouteContext): Promi
     }
     case 'bumper/stop-page':
       json(res, 200, await bluestacks.stopBumper(bluestacks.parseStopInput(input), 'page'));
+      return true;
+    case 'active/start':
+      json(res, 200, await bluestacks.startActive(input));
+      return true;
+    case 'active/stop':
+      json(res, 200, await bluestacks.stopExtra('active', bluestacks.parseStopInput(input)));
+      return true;
+    case 'poster/start':
+      json(res, 200, await bluestacks.startPoster(input));
+      return true;
+    case 'poster/stop':
+      json(res, 200, await bluestacks.stopExtra('poster', bluestacks.parseStopInput(input)));
+      return true;
+    case 'inviter/start':
+      json(res, 200, await bluestacks.startInviter(input));
+      return true;
+    case 'inviter/stop':
+      json(res, 200, await bluestacks.stopExtra('inviter', bluestacks.parseStopInput(input)));
+      return true;
+    case 'stop-all':
+      json(res, 200, await bluestacks.stopAllForInstances(bluestacks.parseStopInput(input)));
       return true;
     default:
       return false;

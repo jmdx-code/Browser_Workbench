@@ -28,21 +28,21 @@ export function MaterialUsagePanel() {
     return () => controller.abort();
   }, [revision]);
   return (
-    <section aria-label="素材使用记录">
-      <h3>素材使用记录</h3>
+    <section aria-label="活跃账号素材使用记录">
+      <h3>活跃账号素材使用记录</h3>
       <p>
-        原素材位置保持不变。确认发布后标记资源已使用，默认跳过；任务勾选“允许重复”或清空使用记录后，可再次取用。
+        仅针对「活跃账号」模块的发帖/快拍素材防重（不影响小组发帖与云表协同）。原素材位置保持不变；清空后可再次取用。
       </p>
       {usage && (
         <p>
-          本次记录：{usage.contents} 条已使用资源 · {usage.published} 次已确认发布
+          当前已用：{usage.contents} 条资源 · {usage.published} 次已确认发布
           {usage.lastClearedAt
             ? ' · 最近清空：' + new Date(usage.lastClearedAt).toLocaleString()
             : ''}
         </p>
       )}
       {usage?.activePublishing && (
-        <p className="field-hint">有发帖任务尚未结束，先停止后再清空。</p>
+        <p className="field-hint">有活跃账号发帖任务尚未结束，先停止后再清空。</p>
       )}
       {error && (
         <p role="alert" className="text-danger">
@@ -50,8 +50,9 @@ export function MaterialUsagePanel() {
         </p>
       )}
       {notice && <p role="status">{notice}</p>}
-      <button onClick={() => setRevision((value) => value + 1)}>重新读取使用记录</button>{' '}
       <button
+        type="button"
+        className="btn btn-sm"
         disabled={!usage || usage.activePublishing || !usage.published}
         onClick={() => {
           if (usage)
@@ -62,7 +63,7 @@ export function MaterialUsagePanel() {
             });
         }}
       >
-        清空素材使用记录
+        清空活跃账号素材记录
       </button>
       {clear && (
         <ConfirmDialog

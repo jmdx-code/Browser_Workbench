@@ -6,17 +6,13 @@ import { taskTestModules, TaskTestRequest, type TestRequest } from '../shared/ta
 import { api } from './api.js';
 import { taskReasonDescription } from './task-alerts.js';
 import { ConfirmDialog } from './confirm-dialog.js';
-import { IconMinus, IconPlus } from './icons.js';
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
-import { MAX_CONCURRENT_PROFILES } from '../shared/task-capacity.js';
 
 type BrowseModule = TestRequest['module'];
-const concurrencyLimit = MAX_CONCURRENT_PROFILES;
-// Home toolbar: sub-task test entries and the single global concurrency control.
+// Home toolbar: sub-task test entries (concurrency unified into WorkbenchTopbar).
 export function TaskTestsPanel({
   profiles,
   selected,
-  runtime,
   capabilities,
   busy,
   onRefresh,
@@ -25,7 +21,7 @@ export function TaskTestsPanel({
 }: {
   profiles: Profile[];
   selected: ReadonlySet<string>;
-  runtime: z.infer<typeof TaskRuntimeOverview> | null;
+  runtime?: z.infer<typeof TaskRuntimeOverview> | null;
   capabilities: z.infer<typeof TaskCapabilities> | null;
   busy: boolean;
   onRefresh: () => void;
@@ -33,85 +29,10 @@ export function TaskTestsPanel({
   notify: (message: string) => void;
 }) {
   const [module, setModule] = useState<{ id: BrowseModule; ids: string[] } | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [pendingLimit, setPendingLimit] = useState<number | null>(null);
-  const [limitText, setLimitText] = useState('');
-  const [editingLimit, setEditingLimit] = useState(false);
-  const savingLimit = useRef(false);
-  const cancelLimitEdit = useRef(false);
-  const current = runtime?.settings.maxConcurrentProfiles ?? null;
-  const shown = pendingLimit ?? current;
-  const enteredLimit = Number(limitText);
-  const controlLimit =
-    editingLimit && /^\d+$/.test(limitText) && enteredLimit >= 1 && enteredLimit <= concurrencyLimit
-      ? enteredLimit
-      : shown;
-  function adjustLimit(delta: number) {
-    if (controlLimit === null) return;
-    setEditingLimit(false);
-    setLimitText(String(controlLimit + delta));
-    void saveLimit(controlLimit + delta);
-  }
-  useEffect(() => {
-    if (!editingLimit) setLimitText(shown === null ? '' : String(shown));
-  }, [shown, editingLimit]);
-  useEffect(() => {
-    if (pendingLimit === current) setPendingLimit(null);
-  }, [current, pendingLimit]);
-  async function saveLimit(value: number) {
-    if (
-      !Number.isInteger(value) ||
-      value < 1 ||
-      value > concurrencyLimit ||
-      savingLimit.current ||
-      busy
-    )
-      return;
-    if (value === current && pendingLimit === null) return;
-    savingLimit.current = true;
-    setPendingLimit(value);
-    setSaving(true);
-    try {
-      const saved = await api.saveTaskSettings(
-        { maxConcurrentProfiles: value },
-        AbortSignal.timeout(10000),
-      );
-      setPendingLimit(saved.maxConcurrentProfiles);
-      onRefresh();
-    } catch (error) {
-      setPendingLimit(null);
-      setLimitText(current === null ? '' : String(current));
-      notify(error instanceof Error ? error.message : '并发设置保存失败');
-    } finally {
-      setSaving(false);
-      savingLimit.current = false;
-    }
-  }
-  function commitLimit() {
-    setEditingLimit(false);
-    if (cancelLimitEdit.current) {
-      cancelLimitEdit.current = false;
-      setLimitText(shown === null ? '' : String(shown));
-      return;
-    }
-    const value = Number(limitText);
-    if (
-      !/^\d+$/.test(limitText) ||
-      !Number.isInteger(value) ||
-      value < 1 ||
-      value > concurrencyLimit
-    ) {
-      setLimitText(shown === null ? '' : String(shown));
-      notify(`请输入1–${concurrencyLimit}之间的整数`);
-      return;
-    }
-    setLimitText(String(value));
-    void saveLimit(value);
-  }
   return (
-    <section className="home-toolbar" aria-label="子任务测试与并发">
+    <section className="home-toolbar" aria-label="快速单任务">
       <div className="toolbar-group">
-        <span className="toolbar-label">子任务测试</span>
+        <span className="toolbar-label">快速单任务</span>
         <div className="chip-row">
           {taskTestModules.map((item) => {
             const configure = item.id === 'post' || item.id === 'story';
@@ -119,14 +40,15 @@ export function TaskTestsPanel({
             return (
               <button
                 key={item.id}
+                type="button"
                 className={'chip type-' + item.id + (ready ? '' : ' is-pending')}
-                disabled={busy || saving}
+                disabled={busy}
                 title={
                   configure
                     ? item.detail + '（新建一个组合进行配置）'
                     : ready
-                      ? item.detail + '（对左侧已选浏览器执行一次）'
-                      : item.detail + '（尚未接通）'
+                      ? item.detail + '（对左侧已选浏览器快速执行一次）'
+                      : item.detail + '（尚未就绪）'
                 }
                 onClick={() => {
                   if (configure) {
@@ -134,7 +56,7 @@ export function TaskTestsPanel({
                     return;
                   }
                   if (!ready) {
-                    notify(item.detail + ' 该入口尚不能执行；浏览任务可独立测试。');
+                    notify(item.detail + ' 当前尚未就绪。');
                     return;
                   }
                   if (!selected.size) {
@@ -150,59 +72,6 @@ export function TaskTestsPanel({
             );
           })}
         </div>
-      </div>
-      <div
-        className="toolbar-group stepper-group"
-        title="同时执行任务的浏览器数量，其余排队等待；调低不会强停正在执行的任务"
-      >
-        <span className="toolbar-label">同时运行</span>
-        <div className="stepper" aria-label="并发数">
-          <button
-            className="btn btn-icon"
-            aria-label="减少并发"
-            disabled={busy || saving || !controlLimit || controlLimit <= 1}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => adjustLimit(-1)}
-          >
-            <IconMinus size={14} />
-          </button>
-          <input
-            aria-label="同时运行数量"
-            title={`可直接输入1–${concurrencyLimit}；回车或离开输入框保存`}
-            type="number"
-            inputMode="numeric"
-            min={1}
-            max={concurrencyLimit}
-            step={1}
-            value={limitText}
-            placeholder="–"
-            disabled={busy || saving || current === null}
-            onFocus={() => setEditingLimit(true)}
-            onChange={(event) => setLimitText(event.currentTarget.value)}
-            onBlur={commitLimit}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault();
-                event.currentTarget.blur();
-              }
-              if (event.key === 'Escape') {
-                event.preventDefault();
-                cancelLimitEdit.current = true;
-                event.currentTarget.blur();
-              }
-            }}
-          />
-          <button
-            className="btn btn-icon"
-            aria-label="增加并发"
-            disabled={busy || saving || !controlLimit || controlLimit >= concurrencyLimit}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => adjustLimit(1)}
-          >
-            <IconPlus size={14} />
-          </button>
-        </div>
-        <span className="toolbar-unit">个浏览器</span>
       </div>
       {module && (
         <TaskTestDialog

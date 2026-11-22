@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import type { RestoreInspection, RestoreStatus } from '../shared/workspace-backup.js';
 import { api } from './api.js';
+import { ConfirmDialog } from './confirm-dialog.js';
 import { FileLocationButton } from './file-location-button.js';
 export function WorkspaceRestorePanel() {
   const [directory, setDirectory] = useState(''),
     [inspection, setInspection] = useState<RestoreInspection | null>(null),
+    [confirmRestore, setConfirmRestore] = useState(false),
     [status, setStatus] = useState<RestoreStatus | null>(null),
     [busy, setBusy] = useState(false),
     [error, setError] = useState('');
@@ -32,14 +34,8 @@ export function WorkspaceRestorePanel() {
       setBusy(false);
     }
   }
-  async function restore() {
-    if (
-      !inspection ||
-      !window.confirm(
-        '恢复这份备份将替换当前软件数据。重启前会自动保留当前数据备份；原素材不会移动。恢复后的旧任务不会自动发布。是否继续？',
-      )
-    )
-      return;
+  async function executeRestore() {
+    if (!inspection) return;
     setBusy(true);
     setError('');
     try {
@@ -75,6 +71,8 @@ export function WorkspaceRestorePanel() {
         />
         {typeof window.workbenchDesktop?.chooseRestoreBackup === 'function' && (
           <button
+            type="button"
+            className="btn btn-sm"
             disabled={busy || status?.state === 'READY'}
             onClick={() =>
               void window.workbenchDesktop
@@ -92,6 +90,8 @@ export function WorkspaceRestorePanel() {
           </button>
         )}
         <button
+          type="button"
+          className="btn btn-sm"
           disabled={busy || !status?.available || !directory.trim() || status.state === 'READY'}
           onClick={() => void check()}
         >
@@ -105,17 +105,32 @@ export function WorkspaceRestorePanel() {
             {inspection.groups} 个分组、{inspection.combinations} 个组合、{inspection.profiles}{' '}
             份资料、{inspection.tasks} 条任务
           </p>
-          <button disabled={busy} onClick={() => void restore()}>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={busy}
+            onClick={() => setConfirmRestore(true)}
+          >
             使用这份备份恢复…
           </button>
         </div>
+      )}
+      {confirmRestore && inspection && (
+        <ConfirmDialog
+          title="确认恢复备份"
+          description="恢复这份备份将替换当前软件数据。重启前会自动保留当前数据备份；原素材不会移动。恢复后的旧任务不会自动发布。是否继续？"
+          label="确认恢复"
+          onClose={() => setConfirmRestore(false)}
+          onConfirm={executeRestore}
+        />
       )}
       {status && status.state !== 'NONE' && (
         <div role="status">
           <p>{status.reason}</p>
           {status.state === 'READY' && (
             <button
-              className="primary"
+              type="button"
+              className="btn btn-primary btn-sm"
               disabled={busy}
               onClick={() => {
                 if (window.workbenchDesktop?.restartSoftware)

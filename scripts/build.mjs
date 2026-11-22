@@ -1,9 +1,11 @@
+import { access } from 'node:fs/promises';
 import { clearGeneratedDirectory } from './generated-output.mjs';
 import { requireRuntime, runNode } from './run-node.mjs';
 requireRuntime();
 await runNode('scripts/build-icons.mjs');
 await clearGeneratedDirectory('dist');
 await runNode('node_modules/typescript/bin/tsc', ['-p', 'tsconfig.node.json']);
+await access('dist/src/desktop/server-bootstrap.js');
 await runNode('scripts/build-persistence-worker.mjs');
 await runNode('node_modules/typescript/bin/tsc', ['-p', 'tsconfig.renderer.json']);
 await runNode('node_modules/vite/bin/vite.js', ['build']);

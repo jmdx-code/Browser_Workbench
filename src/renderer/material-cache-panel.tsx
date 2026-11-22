@@ -48,10 +48,9 @@ export function MaterialCachePanel() {
         </p>
       )}
       {notice && <p role="status">{notice}</p>}
-      <button disabled={busy} onClick={() => setRevision((value) => value + 1)}>
-        重新读取缓存
-      </button>{' '}
       <button
+        type="button"
+        className="btn btn-sm"
         disabled={busy || !eligible.length}
         onClick={() => setConfirm(eligible.slice(0, 50).map((entry) => entry.stageId))}
       >

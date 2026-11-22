@@ -325,7 +325,7 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
     });
     assert.equal(notifRes.status, 202);
 
-    // 4. tools/list exposes all 21 operational tools (including wb_active_accounts_control)
+    // 4. tools/list exposes all 23 operational tools (including wb_active_accounts_control, wb_scheduler_control & wb_google_sheets_control)
     const listRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -334,9 +334,11 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
     const listJson = (await listRes.json()) as {
       result: { tools: Array<{ name: string }> };
     };
-    assert.equal(listJson.result.tools.length, 21);
+    assert.equal(listJson.result.tools.length, 23);
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_get_overview'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_active_accounts_control'));
+    assert.ok(listJson.result.tools.some((t) => t.name === 'wb_scheduler_control'));
+    assert.ok(listJson.result.tools.some((t) => t.name === 'wb_google_sheets_control'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_poster_dispatch'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_browser_open'));
     assert.ok(listJson.result.tools.some((t) => t.name === 'wb_browser_lifecycle'));

@@ -69,6 +69,8 @@ export function createMonitorAndDiagnosticTools(
             'group-inviter',
             'bluestacks-bumper',
             'bluestacks-page-bumper',
+            'auto-scheduler',
+            'google-sheets',
           ],
           description: '要监控的业务模块',
         },
@@ -116,12 +118,16 @@ export function createMonitorAndDiagnosticTools(
         'bluestacks-bumper': 'bluestacks-bumper',
         'bluestacks-group-bumper': 'bluestacks-bumper',
         'bluestacks-page-bumper': 'bluestacks-page-bumper',
+        scheduler: 'auto-scheduler',
+        'auto-scheduler': 'auto-scheduler',
+        sheets: 'google-sheets',
+        'google-sheets': 'google-sheets',
       };
       const moduleName = moduleAliasMap[rawModule];
       if (!moduleName) {
         return errorResult(
           'INVALID_MODULE',
-          `不支持的监控模块 "${rawModule}"，可选值：active-accounts、group-poster、group-bumper、page-bumper、group-inviter、bluestacks-bumper、bluestacks-page-bumper`,
+          `不支持的监控模块 "${rawModule}"，可选值：active-accounts、group-poster、group-bumper、page-bumper、group-inviter、bluestacks-bumper、bluestacks-page-bumper、auto-scheduler、google-sheets`,
         );
       }
       const waitMs = Math.max(1, Math.min(90, Number(args.waitSeconds ?? 25))) * 1000;
@@ -289,6 +295,7 @@ export function createMonitorAndDiagnosticTools(
           | 'scheduled_in_future'
           | 'account_restricted_detected'
           | 'pending_review_detected'
+          | 'task_not_found'
           | 'timeout_still_running' = 'timeout_still_running';
 
         while (true) {
@@ -299,6 +306,10 @@ export function createMonitorAndDiagnosticTools(
               ? allTasks.filter((t) => taskIds.includes(t.id))
               : allTasks.filter((t) => t.status === 'running' || t.status === 'scheduled');
 
+          if (taskIds.length > 0 && tracked.length === 0) {
+            wakeReason = 'task_not_found';
+            break;
+          }
           if (taskIds.length > 0 && tracked.length > 0) {
             const terminal = tracked.every((t) =>
               ['completed', 'partial', 'failed', 'cancelled'].includes(t.status),
@@ -364,7 +375,8 @@ export function createMonitorAndDiagnosticTools(
 
         const settled =
           taskIds.length > 0
-            ? trackedTasks.every((t) =>
+            ? trackedTasks.length > 0 &&
+              trackedTasks.every((t) =>
                 ['completed', 'partial', 'failed', 'cancelled'].includes(t.status),
               )
             : !finalState.running;
@@ -406,6 +418,7 @@ export function createMonitorAndDiagnosticTools(
           | 'completed'
           | 'scheduled_in_future'
           | 'pending_review_detected'
+          | 'task_not_found'
           | 'timeout_still_running' = 'timeout_still_running';
 
         while (true) {
@@ -415,6 +428,10 @@ export function createMonitorAndDiagnosticTools(
           const tracked =
             taskIds.length > 0 ? allScheduled.filter((t) => taskIds.includes(t.id)) : [];
 
+          if (taskIds.length > 0 && tracked.length === 0) {
+            wakeReason = 'task_not_found';
+            break;
+          }
           if (taskIds.length > 0 && tracked.length > 0) {
             const terminal = tracked.every((t) =>
               ['completed', 'failed', 'cancelled'].includes(t.status),
@@ -467,7 +484,8 @@ export function createMonitorAndDiagnosticTools(
         }));
         const settled =
           taskIds.length > 0
-            ? monitoredTasks.every((t) => ['completed', 'failed', 'cancelled'].includes(t.status))
+            ? monitoredTasks.length > 0 &&
+              monitoredTasks.every((t) => ['completed', 'failed', 'cancelled'].includes(t.status))
             : !running;
 
         return okResult({
@@ -483,6 +501,63 @@ export function createMonitorAndDiagnosticTools(
           newVerifiedBumpsCount: newBumps.length,
           newVerifiedBumps: newBumps,
           pendingReviewOperations: finalSt.pendingReviewOperations ?? [],
+          newDiagnostics: collectNewDiagnostics(),
+        });
+      }
+
+      if (moduleName === 'auto-scheduler') {
+        const schedulerSvc = deps.getAutoSchedulerService?.();
+        if (!schedulerSvc) {
+          return errorResult('AUTO_SCHEDULER_UNAVAILABLE', '定时排班服务尚未初始化');
+        }
+        let wakeReason: 'completed' | 'timeout_still_running' = 'timeout_still_running';
+        while (true) {
+          const st = await schedulerSvc.state();
+          if (!st.running) {
+            wakeReason = 'completed';
+            break;
+          }
+          if (Date.now() >= deadline) break;
+          await new Promise<void>((r) => setTimeout(r, 1000));
+        }
+        const finalSt = await schedulerSvc.state();
+        return okResult({
+          ok: true,
+          module: moduleName,
+          settled: !finalSt.running,
+          wakeReason,
+          elapsedMs: Date.now() - startedAt,
+          running: finalSt.running,
+          activeRuns: finalSt.activeRuns,
+          recentRuns: finalSt.recentRuns.slice(0, 5),
+          newDiagnostics: collectNewDiagnostics(),
+        });
+      }
+
+      if (moduleName === 'google-sheets') {
+        const sheetsSvc = deps.getGoogleSheetsService?.();
+        if (!sheetsSvc) {
+          return errorResult('GOOGLE_SHEETS_UNAVAILABLE', 'Google 云表协同服务尚未初始化');
+        }
+        let wakeReason: 'completed' | 'timeout_still_running' = 'timeout_still_running';
+        while (true) {
+          if (!sheetsSvc.hasActiveExecution()) {
+            wakeReason = 'completed';
+            break;
+          }
+          if (Date.now() >= deadline) break;
+          await new Promise<void>((r) => setTimeout(r, 1000));
+        }
+        const finalOv = await sheetsSvc.overview();
+        return okResult({
+          ok: true,
+          module: moduleName,
+          settled: !sheetsSvc.hasActiveExecution(),
+          wakeReason,
+          elapsedMs: Date.now() - startedAt,
+          runningScheduleCount: finalOv.runningScheduleCount,
+          runningRecordsCount: finalOv.runningRecordsCount,
+          recentLogs: finalOv.logs.slice(0, 15),
           newDiagnostics: collectNewDiagnostics(),
         });
       }

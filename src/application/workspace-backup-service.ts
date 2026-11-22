@@ -16,6 +16,10 @@ export class WorkspaceBackupService {
     private readonly restore?: WorkspaceRestorePort,
     private readonly active?: () => boolean | Promise<boolean>,
   ) {}
+  assertNotBusy() {
+    if (this.busy)
+      throw new ProductError('BACKUP_IN_PROGRESS', '正在保存数据备份，请稍后再试', 409);
+  }
   assertIdle() {
     if (this.restorePrepared)
       throw new ProductError(
@@ -23,23 +27,21 @@ export class WorkspaceBackupService {
         '数据恢复已准备，请先重启软件再运行任务',
         409,
       );
-    if (this.busy)
-      throw new ProductError('BACKUP_IN_PROGRESS', '正在保存数据备份，请稍后启动任务', 409);
+    this.assertNotBusy();
   }
   private async assertStopped() {
-    if (
-      this.active
-        ? await this.active()
-        : (await this.tasks.livePlans()).some(
-            (plan) =>
-              ['RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state) ||
-              (plan.state === 'QUEUED' &&
-                (!plan.timing ||
-                  plan.timingReleased ||
-                  taskTimingEligibility(plan.timing, Date.now()) !== 'WAIT')) ||
-              (plan.state === 'REVIEW' && !plan.controlConfirmed),
-          )
-    )
+    const active = this.active
+      ? await this.active()
+      : (await this.tasks.livePlans()).some(
+          (plan) =>
+            ['RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state) ||
+            (plan.state === 'QUEUED' &&
+              (!plan.timing ||
+                plan.timingReleased ||
+                taskTimingEligibility(plan.timing, Date.now()) !== 'WAIT')) ||
+            (plan.state === 'REVIEW' && !plan.controlConfirmed),
+        );
+    if (active)
       throw new ProductError('BACKUP_TASKS_ACTIVE', '请先暂停或停止任务，确认停止后再备份', 409);
   }
   async status() {
@@ -65,7 +67,9 @@ export class WorkspaceBackupService {
     try {
       await this.assertStopped();
       return WorkspaceBackupResult.parse(
-        await this.writer.write(request.directory, async () => await this.assertStopped()),
+        await this.writer.write(request.directory, async () => await this.assertStopped(), {
+          redactSecrets: Boolean(request.redactSecrets),
+        }),
       );
     } finally {
       this.busy = false;

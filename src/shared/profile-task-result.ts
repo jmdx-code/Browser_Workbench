@@ -12,7 +12,9 @@ export function profileTaskResultLabel(result: ProfileTaskResultValue): {
         : result.source === 'group-poster'
           ? '小组发帖'
           : result.name;
-  const name = (result.name.trim() || defaultName).replace(/^单项测试\s*·\s*/, '');
+  const name = (result.name.trim() || defaultName)
+    .replace(/^单项测试\s*·\s*/, '')
+    .replace(/^排班快捷\s*·\s*/, '');
   if (
     result.source === 'group-inviter' &&
     result.state === 'FAILED' &&

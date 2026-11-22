@@ -393,7 +393,7 @@ export class SqliteDataCleanup {
     this.assertResettable();
     // Also release ordinary records hidden by an older software version.
     while (transaction(this.db, () => this.purgeHiddenPlans()) > 0) {}
-    this.db.exec('VACUUM');
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
     return { completed: true };
   }
 }

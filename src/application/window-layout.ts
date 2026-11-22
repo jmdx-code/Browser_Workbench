@@ -29,6 +29,7 @@ export class WindowLayoutService {
   private readonly slotOrder: string[] = [];
   private uniformSize?: { width: number; height: number; displayId: string };
   private lastArrangedAt = 0;
+  private layoutGeneration = 0;
   private readonly recoveries = new Map<
     string,
     { positions: TaskWindow['rect'][]; lastMoveAt: number; exhausted: boolean }
@@ -46,9 +47,18 @@ export class WindowLayoutService {
     return this.settings.enabled;
   }
   private load() {
-    return (this.loaded ??= this.loadSettings().then((value) => {
-      this.settings = value;
-    }));
+    if (!this.loaded) {
+      const work = this.loadSettings()
+        .then((value) => {
+          this.settings = value;
+        })
+        .catch((error: unknown) => {
+          if (this.loaded === work) this.loaded = undefined;
+          throw error;
+        });
+      this.loaded = work;
+    }
+    return this.loaded;
   }
   private serial<T>(run: () => Promise<T>): Promise<T> {
     const operation = this.tail.catch(() => {}).then(run);
@@ -255,8 +265,10 @@ export class WindowLayoutService {
           }
           await this.saveSettings(settings);
           this.settings = settings;
+          this.layoutGeneration++;
           this.recoveries.clear();
         } else if (request.action === 'apply') {
+          this.layoutGeneration++;
           if (!request.profileIds) throw Error('WINDOW_LAYOUT_SELECTION_REQUIRED');
           if (this.lastFocusedProfileId) {
             const settled = await Promise.allSettled(
@@ -351,6 +363,7 @@ export class WindowLayoutService {
           const disabled = { ...this.settings, enabled: false };
           await this.saveSettings(disabled);
           this.settings = disabled;
+          this.layoutGeneration++;
           this.managed.clear();
           this.slotOrder.length = 0;
           this.uniformSize = undefined;
@@ -368,10 +381,13 @@ export class WindowLayoutService {
       await this.load();
       guard();
       if (!this.settings.enabled) return;
+      const gen = this.layoutGeneration;
       const current = await this.read(profileId, guard);
+      if (!this.settings.enabled || this.layoutGeneration !== gen) return;
       if (this.lastFocusedProfileId) {
         const { display, referenceRect } = await this.resolveActiveDisplay(current.rect);
         guard();
+        if (!this.settings.enabled || this.layoutGeneration !== gen) return;
         if (!this.uniformSize || this.uniformSize.displayId !== display.id) {
           const size = normalizeTaskWindowSize(display, referenceRect ?? current.rect);
           this.uniformSize = { ...size, displayId: display.id };
@@ -394,6 +410,7 @@ export class WindowLayoutService {
           false,
         );
       }
+      if (!this.settings.enabled || this.layoutGeneration !== gen) return;
       this.recoveries.delete(profileId);
       this.error = '';
     });

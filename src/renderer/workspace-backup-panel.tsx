@@ -10,6 +10,7 @@ export function WorkspaceBackupPanel() {
     () => localStorage.getItem('workspace-backup-directory') ?? '',
   );
   const [busy, setBusy] = useState(false),
+    [redactSecrets, setRedactSecrets] = useState(false),
     [result, setResult] = useState<BackupResult | null>(null),
     [error, setError] = useState('');
   useEffect(() => {
@@ -33,7 +34,7 @@ export function WorkspaceBackupPanel() {
     setError('');
     setResult(null);
     try {
-      const value = await api.createBackup(directory.trim());
+      const value = await api.createBackup(directory.trim(), redactSecrets);
       localStorage.setItem('workspace-backup-directory', directory.trim());
       setResult(value);
     } catch (failure) {
@@ -58,15 +59,16 @@ export function WorkspaceBackupPanel() {
         />
         {typeof window.workbenchDesktop?.chooseBackupDirectory === 'function' && (
           <button
+            type="button"
+            className="btn btn-sm"
             disabled={busy}
             onClick={() => {
               const previous = directory;
-              setDirectory('');
               setBusy(true);
               void window.workbenchDesktop
                 ?.chooseBackupDirectory()
                 .then((value) => {
-                  setDirectory(value || previous);
+                  if (value) setDirectory(value);
                 })
                 .catch(() => {
                   setDirectory(previous);
@@ -79,13 +81,23 @@ export function WorkspaceBackupPanel() {
           </button>
         )}
         <button
-          className="primary"
+          type="button"
+          className="btn btn-primary btn-sm"
           disabled={busy || !status?.available || !directory.trim()}
           onClick={() => void create()}
         >
           {busy ? '正在备份…' : '创建数据备份'}
         </button>
       </div>
+      <label className="gs-inline-check" style={{ marginTop: 8, fontSize: 12 }}>
+        <input
+          type="checkbox"
+          checked={redactSecrets}
+          disabled={busy}
+          onChange={(e) => setRedactSecrets(e.target.checked)}
+        />
+        <span>导出时移除 Google 授权与图床密钥（发给团队其他电脑复刻配置时勾选）</span>
+      </label>
       {status?.reason && <p>{status.reason}</p>}
       {error && (
         <p role="alert" className="text-danger">

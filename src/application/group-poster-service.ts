@@ -88,6 +88,7 @@ export interface GroupPosterBrowserCallbacks {
   onTaskPosted(log: PosterLog): Promise<void>;
   canContinueAccount(profileId: string): Promise<boolean>;
   onGroupIdResolved?(rawGroupId: string, canonicalGroupId: string): Promise<void> | void;
+  onTargetError?(groupId: string, reason: string): void;
 }
 
 export interface GroupPosterBrowserPort {
@@ -156,6 +157,7 @@ export interface PosterRepository {
     updatedAt: number;
   }>;
   hasGroupPostedMaterial(groupId: string, materialId: string): boolean;
+  hasGroupVerifiedPost?(groupId: string, materialId: string): boolean;
   postedGroupIdsByMaterial?(): Record<string, string[]>;
   listTasks?(limit?: number): PosterTask[];
   saveTask?(task: PosterTask): PosterTask;
@@ -232,6 +234,18 @@ export class GroupPosterService {
       void this.tickScheduledTasks().catch(() => {});
     }, 2000);
     this.scheduleTimer.unref?.();
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.scheduleTimer) {
+      clearInterval(this.scheduleTimer);
+      this.scheduleTimer = null;
+    }
+    this.refreshAbort?.abort();
+    this.refreshAbort = null;
+    if (this.hasActiveExecution()) {
+      await this.stop().catch(() => {});
+    }
   }
 
   isProfileRunning(id: string): boolean {
@@ -326,10 +340,23 @@ export class GroupPosterService {
     };
   }
 
+  private liveMaxConcurrentCap: number | null = null;
+
   async saveSettings(input: unknown): Promise<PosterState> {
     this.assertAllowed();
-    await this.repo.saveSettings(input);
+    const saved = await this.repo.saveSettings(input);
+    const effective = saved ?? (await this.repo.settings());
+    this.liveMaxConcurrentCap = Math.max(1, effective.maxConcurrentProfiles);
     return this.state();
+  }
+
+  async syncMaxConcurrency(maxConcurrentProfiles: number): Promise<void> {
+    const capped = Math.max(1, Math.min(50, Math.round(maxConcurrentProfiles)));
+    const current = await this.repo.settings();
+    if (current.maxConcurrentProfiles !== capped) {
+      await this.repo.saveSettings({ ...current, maxConcurrentProfiles: capped });
+    }
+    this.liveMaxConcurrentCap = capped;
   }
 
   async addGroups(
@@ -809,7 +836,22 @@ export class GroupPosterService {
     this.activeGroupIds.add(claimed.group.id);
     this.inFlightByWorker.set(profileId, claimed);
 
-    const postedNow = await this.repo.hasGroupPostedMaterial(claimed.group.id, claimed.material.id);
+    let postedNow: boolean;
+    let verifiedNow = true;
+    try {
+      postedNow = await this.repo.hasGroupPostedMaterial(claimed.group.id, claimed.material.id);
+      if (postedNow) {
+        verifiedNow = this.repo.hasGroupVerifiedPost
+          ? await this.repo.hasGroupVerifiedPost(claimed.group.id, claimed.material.id)
+          : true;
+      }
+    } catch (error) {
+      if (this.inFlightByWorker.get(profileId) === claimed) {
+        this.inFlightByWorker.delete(profileId);
+      }
+      this.activeGroupIds.delete(claimed.group.id);
+      throw error;
+    }
     if (postedNow) {
       this.inFlightByWorker.delete(profileId);
       this.activeGroupIds.delete(claimed.group.id);
@@ -818,7 +860,11 @@ export class GroupPosterService {
         for (const tid of claimed.taskIds) {
           const task = this.runningTasks.get(tid);
           if (task && task.status === 'running') {
-            task.postedCount = Math.min(task.totalGroups, task.postedCount + 1);
+            if (verifiedNow) {
+              task.postedCount = Math.min(task.totalGroups, task.postedCount + 1);
+            } else {
+              task.skippedCount += 1;
+            }
             await this.repo.saveTask?.(task);
           }
         }
@@ -835,6 +881,7 @@ export class GroupPosterService {
     settings: PosterSettings,
     todayCounts: Record<string, number>,
   ): void {
+    this.liveMaxConcurrentCap = Math.max(1, settings.maxConcurrentProfiles);
     const batchRunId = globalThis.crypto.randomUUID();
     for (const pid of profileIds) {
       if (this.isProfileRunning(pid)) continue;
@@ -851,7 +898,8 @@ export class GroupPosterService {
         restricted: false,
       });
 
-      const workerPromise = (async () => {
+      let workerPromise: Promise<void> | undefined;
+      workerPromise = (async () => {
         await Promise.resolve();
         const runId = this.profileRunIds.get(pid) ?? batchRunId;
         let slotAcquired = false;
@@ -867,7 +915,7 @@ export class GroupPosterService {
         };
         try {
           while (
-            this.slotsInUse >= settings.maxConcurrentProfiles &&
+            this.slotsInUse >= (this.liveMaxConcurrentCap ?? settings.maxConcurrentProfiles) &&
             !this.cancelled.has(pid) &&
             (this.hasEligibleQueueItem(pid) || this.hasEligibleInFlightItem(pid))
           ) {
@@ -928,6 +976,25 @@ export class GroupPosterService {
                   this.queuedKeys.add(`${canonicalGroupId}::${inFlight.material.id}`);
                   inFlight.group = { ...inFlight.group, id: canonicalGroupId };
                 }
+                // Pre-compute async hasGroupPostedMaterial lookups BEFORE mutating this.taskQueue so
+                // concurrent claims/pushes/cancels are never clobbered by a stale snapshot!
+                const candidateMaterialIds = [
+                  ...new Set(
+                    this.taskQueue
+                      .filter((it) => it.group.id === rawGroupId)
+                      .map((it) => it.material.id),
+                  ),
+                ];
+                const postedByMaterial = new Map<string, boolean>();
+                for (const mid of candidateMaterialIds) {
+                  postedByMaterial.set(
+                    mid,
+                    await this.repo.hasGroupPostedMaterial(canonicalGroupId, mid),
+                  );
+                }
+
+                // Synchronous in-place rewrite of current this.taskQueue (zero await during mutation!)
+                const tasksToSave = new Set<PosterTask>();
                 const nextQueue: GroupPosterTaskItem[] = [];
                 for (const item of this.taskQueue) {
                   if (item.group.id !== rawGroupId) {
@@ -958,7 +1025,7 @@ export class GroupPosterService {
                           if (t && t.totalGroups > 0) {
                             t.totalGroups = Math.max(1, t.totalGroups - 1);
                             t.skippedCount += 1;
-                            await this.repo.saveTask?.(t);
+                            tasksToSave.add(t);
                           }
                         } else {
                           existing.taskIds.add(tid);
@@ -967,10 +1034,7 @@ export class GroupPosterService {
                     }
                     continue;
                   }
-                  const alreadyPosted = await this.repo.hasGroupPostedMaterial(
-                    canonicalGroupId,
-                    item.material.id,
-                  );
+                  const alreadyPosted = postedByMaterial.get(item.material.id) ?? false;
                   if (!alreadyPosted) {
                     this.queuedKeys.add(pairKey);
                     nextQueue.push({
@@ -983,16 +1047,35 @@ export class GroupPosterService {
                       if (t && t.status === 'running') {
                         t.totalGroups = Math.max(0, t.totalGroups - 1);
                         t.skippedCount += 1;
-                        await this.repo.saveTask?.(t);
+                        tasksToSave.add(t);
                       }
                     }
                   }
                 }
                 this.taskQueue = nextQueue;
+                for (const t of tasksToSave) {
+                  await this.repo.saveTask?.(t);
+                }
               },
               returnTaskOnRestriction: (task) => {
                 this.inFlightByWorker.delete(pid);
                 releaseClaimedGroups(task.group.id);
+                if (this.cancelled.has(pid)) {
+                  this.queuedKeys.delete(`${task.group.id}::${task.material.id}`);
+                  return;
+                }
+                if (task.taskIds) {
+                  for (const tid of [...task.taskIds]) {
+                    const rt = this.runningTasks.get(tid);
+                    if (!rt || rt.status !== 'running') {
+                      task.taskIds.delete(tid);
+                    }
+                  }
+                  if (task.taskIds.size === 0) {
+                    this.queuedKeys.delete(`${task.group.id}::${task.material.id}`);
+                    return;
+                  }
+                }
                 this.taskQueue.push(task);
               },
               onTaskPosted: async (log) => {
@@ -1047,17 +1130,19 @@ export class GroupPosterService {
             running: false,
             restricted: false,
           });
-          await this.repo.saveProfileResult?.({
-            profileId: pid,
-            source: 'group-poster',
-            runId,
-            name: '小组发帖',
-            state: wasCancelled ? 'STOPPED' : 'COMPLETED',
-            reason: finalStatus,
-            finishedAt: Date.now(),
-            failedSteps: 0,
-            skippedSteps: 0,
-          });
+          await this.repo
+            .saveProfileResult?.({
+              profileId: pid,
+              source: 'group-poster',
+              runId,
+              name: '小组发帖',
+              state: wasCancelled ? 'STOPPED' : 'COMPLETED',
+              reason: finalStatus,
+              finishedAt: Date.now(),
+              failedSteps: 0,
+              skippedSteps: 0,
+            })
+            ?.catch?.(() => {});
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const isRestricted = err instanceof PosterAccountRestrictedError;
@@ -1071,17 +1156,19 @@ export class GroupPosterService {
               running: false,
               restricted: true,
             });
-            await this.repo.saveProfileResult?.({
-              profileId: pid,
-              source: 'group-poster',
-              runId,
-              name: '小组发帖',
-              state: 'FAILED',
-              reason: restrictReason,
-              finishedAt: Date.now(),
-              failedSteps: 1,
-              skippedSteps: 0,
-            });
+            await Promise.resolve(
+              this.repo.saveProfileResult?.({
+                profileId: pid,
+                source: 'group-poster',
+                runId,
+                name: '小组发帖',
+                state: 'FAILED',
+                reason: restrictReason,
+                finishedAt: Date.now(),
+                failedSteps: 1,
+                skippedSteps: 0,
+              }),
+            ).catch(() => {});
           } else {
             const failReason = `发帖中断 · ${msg.slice(0, 80)}`;
             this.profiles.set(pid, {
@@ -1091,17 +1178,19 @@ export class GroupPosterService {
               running: false,
               restricted: false,
             });
-            await this.repo.saveProfileResult?.({
-              profileId: pid,
-              source: 'group-poster',
-              runId,
-              name: '小组发帖',
-              state: 'FAILED',
-              reason: failReason,
-              finishedAt: Date.now(),
-              failedSteps: 1,
-              skippedSteps: 0,
-            });
+            await Promise.resolve(
+              this.repo.saveProfileResult?.({
+                profileId: pid,
+                source: 'group-poster',
+                runId,
+                name: '小组发帖',
+                state: 'FAILED',
+                reason: failReason,
+                finishedAt: Date.now(),
+                failedSteps: 1,
+                skippedSteps: 0,
+              }),
+            ).catch(() => {});
           }
         } finally {
           if (this.inFlightByWorker.has(pid)) {
@@ -1113,7 +1202,9 @@ export class GroupPosterService {
           if (slotAcquired) {
             this.slotsInUse = Math.max(0, this.slotsInUse - 1);
           }
-          this.workers.delete(pid);
+          if (workerPromise && this.workers.get(pid) === workerPromise) {
+            this.workers.delete(pid);
+          }
           await this.settleRunningTasks();
           if (!this.hasActiveExecution()) {
             this.queuedKeys.clear();
@@ -1504,7 +1595,8 @@ export class GroupPosterService {
       }
       this.taskQueue = nextQueue;
 
-      const orphanedWorkersToStop: string[] = [];
+      const workersToStop: string[] = [];
+      const workersToRespawn: string[] = [];
       for (const [pid, item] of this.inFlightByWorker.entries()) {
         if (item.taskIds?.has(id)) {
           item.taskIds.delete(id);
@@ -1512,8 +1604,11 @@ export class GroupPosterService {
             this.inFlightByWorker.delete(pid);
             this.activeGroupIds.delete(item.group.id);
             this.queuedKeys.delete(`${item.group.id}::${item.material.id}`);
-            if (!this.hasEligibleQueueItem(pid)) {
-              orphanedWorkersToStop.push(pid);
+            // Always stop a worker whose in-flight post belonged solely to the cancelled task so it
+            // cannot finish publishing the cancelled post; respawn it afterward if other tasks need it.
+            workersToStop.push(pid);
+            if (this.hasEligibleQueueItem(pid)) {
+              workersToRespawn.push(pid);
             }
           }
         }
@@ -1522,8 +1617,13 @@ export class GroupPosterService {
       if (this.runningTasks.size === 0 && this.taskQueue.length === 0) {
         const ids = [...new Set([...this.active, ...this.starting, ...this.workers.keys()])];
         await this.stopProfiles(ids);
-      } else if (orphanedWorkersToStop.length > 0) {
-        await this.stopProfiles(orphanedWorkersToStop);
+      } else if (workersToStop.length > 0) {
+        await this.stopProfiles(workersToStop);
+        if (workersToRespawn.length > 0 && this.taskQueue.length > 0) {
+          const settings = await this.repo.settings();
+          const todayCounts = await this.repo.todayCounts();
+          this.spawnWorkers(workersToRespawn, settings, todayCounts);
+        }
       }
       this.statusText = running.statusReason;
       return this.state();
@@ -1727,5 +1827,234 @@ export class GroupPosterService {
         new Promise<void>((r) => setTimeout(r, 3000)),
       ]);
     }
+  }
+
+  /**
+   * 供「定时排班」流水线调用的单浏览器小组发帖步骤：
+   * - 仅使用独立本号专属队列，不干扰其他并发发帖任务；
+   * - 精确区分 `PosterAccountRestrictedError.scope === 'global_route'`（掉登/封号/验证页 -> 硬阻断关窗）
+   *   与 `feature_action`（当前小组禁发/功能临时受限 -> 软跳过继续后续收尾浏览）。
+   */
+  async runScheduledProfileStep(input: {
+    profileId: string;
+    materialIds: string[];
+    groupIds: string[];
+    maxGroupsPerProfile: number;
+    onProgress: (status: string, sessionPosted: number) => void;
+  }): Promise<{
+    postedCount: number;
+    status: string;
+    hardBlocked: boolean;
+    softIssue: boolean;
+  }> {
+    this.assertAllowed();
+    const { profileId, onProgress } = input;
+    const [allGroups, allMaterials, rawSettings, todayCounts] = await Promise.all([
+      this.repo.targets(),
+      this.repo.materials(),
+      this.repo.settings(),
+      this.repo.todayCounts(),
+    ]);
+    const selectedGroups = allGroups.filter((g) => input.groupIds.includes(g.id));
+    const rawMaterials = allMaterials.filter((m) => input.materialIds.includes(m.id));
+    if (selectedGroups.length === 0 || rawMaterials.length === 0) {
+      return {
+        postedCount: 0,
+        status: '跳过：未找到有效的发帖素材卡或目标小组',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+
+    onProgress('正在校验发帖素材文件…', 0);
+    const preparedMaterials: PosterMaterial[] = [];
+    const localFiles: string[] = [];
+    for (const mat of rawMaterials) {
+      try {
+        const readyMat = await this.ensureMaterialPrepared(mat);
+        preparedMaterials.push(readyMat);
+        if (readyMat.localFilePath) localFiles.push(readyMat.localFilePath);
+      } catch {
+        /* Skip broken material card without blocking valid ones */
+      }
+    }
+    if (preparedMaterials.length === 0) {
+      return {
+        postedCount: 0,
+        status: '跳过：所选发帖素材文件不可用',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+
+    if (!this.runner.ready(profileId) && this.profileLifecycle) {
+      onProgress('正在唤醒浏览器连接…', 0);
+      await this.profileLifecycle.ensureProfilesOnline([profileId]);
+    }
+    if (!this.runner.ready(profileId)) {
+      return {
+        postedCount: 0,
+        status: '浏览器未就绪或连接断开',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+
+    const privateQueue: GroupPosterTaskItem[] = [];
+    for (const group of selectedGroups) {
+      for (const material of preparedMaterials) {
+        const already = await this.repo.hasGroupPostedMaterial(group.id, material.id);
+        if (!already) {
+          privateQueue.push({
+            group,
+            material,
+            allowedProfileIds: new Set([profileId]),
+          });
+        }
+      }
+    }
+    if (privateQueue.length === 0) {
+      return {
+        postedCount: 0,
+        status: '所选小组已发过所选素材，自动跳过',
+        hardBlocked: false,
+        softIssue: false,
+      };
+    }
+
+    const maxPosts = Math.max(1, input.maxGroupsPerProfile);
+    if (this.isProfileRunning(profileId)) {
+      return {
+        postedCount: 0,
+        status: '跳过：该浏览器正在执行其他发帖任务',
+        hardBlocked: false,
+        softIssue: true,
+      };
+    }
+    const scopedSettings: PosterSettings = {
+      ...rawSettings,
+      maxPostsPerAccount: maxPosts,
+    };
+    const runId = globalThis.crypto.randomUUID();
+    this.cancelled.delete(profileId);
+    this.active.add(profileId);
+    this.profileRunIds.set(profileId, runId);
+    const stat: PosterProfileStat = {
+      today: todayCounts[profileId] ?? 0,
+      session: 0,
+      status: '准备发帖…',
+      running: true,
+      restricted: false,
+    };
+    this.profiles.set(profileId, stat);
+
+    let hardBlocked = false;
+    let softIssue = false;
+
+    const workerPromise = (async () => {
+      try {
+        while (
+          !this.cancelled.has(profileId) &&
+          stat.session < maxPosts &&
+          privateQueue.length > 0
+        ) {
+          await this.runner.runProfileWorker(profileId, localFiles, scopedSettings, {
+            runId,
+            cancelled: () => this.cancelled.has(profileId),
+            status: (text) => {
+              stat.status = text;
+              onProgress(text, stat.session);
+            },
+            claimNextTask: async () => {
+              while (privateQueue.length > 0 && !this.cancelled.has(profileId)) {
+                const idx = Math.floor(Math.random() * privateQueue.length);
+                const [item] = privateQueue.splice(idx, 1);
+                if (!item) continue;
+                const postedNow = await this.repo.hasGroupPostedMaterial(
+                  item.group.id,
+                  item.material.id,
+                );
+                if (!postedNow) return item;
+              }
+              return null;
+            },
+            returnTaskOnRestriction: () => {
+              /* Do not re-enqueue into this same account's private queue */
+            },
+            onTaskPosted: async (log) => {
+              await this.repo.recordPost(log);
+              stat.today += 1;
+              stat.session += 1;
+              stat.status = `已发帖 (${stat.session}/${maxPosts}) · ${log.groupName}`;
+              onProgress(stat.status, stat.session);
+            },
+            canContinueAccount: async () =>
+              stat.session < maxPosts && !this.cancelled.has(profileId),
+          });
+        }
+        stat.running = false;
+        stat.status = this.cancelled.has(profileId)
+          ? '已停止'
+          : `已完成 · 本轮发帖 ${stat.session} 条`;
+        await this.repo.saveProfileResult?.({
+          profileId,
+          source: 'group-poster',
+          runId,
+          name: '小组发帖',
+          state: this.cancelled.has(profileId) ? 'STOPPED' : 'COMPLETED',
+          reason: stat.status,
+          finishedAt: Date.now(),
+          failedSteps: 0,
+          skippedSteps: 0,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        stat.running = false;
+        if (this.cancelled.has(profileId)) {
+          stat.status = '已停止';
+        } else if (err instanceof PosterAccountRestrictedError) {
+          stat.restricted = true;
+          stat.status = err.message || '受限 · 操作受限';
+          if (err.scope === 'global_route' || err.abnormalState !== 'restricted') {
+            hardBlocked = true;
+          } else {
+            softIssue = true;
+          }
+        } else if (/未登录|登录失效|验证页面|checkpoint|login/i.test(msg)) {
+          hardBlocked = true;
+          stat.status = msg.slice(0, 100);
+        } else {
+          softIssue = true;
+          stat.status = `发帖局部跳过 · ${msg.slice(0, 80)}`;
+        }
+        await this.repo.saveProfileResult?.({
+          profileId,
+          source: 'group-poster',
+          runId,
+          name: '小组发帖',
+          state: this.cancelled.has(profileId) ? 'STOPPED' : 'FAILED',
+          reason: stat.status,
+          finishedAt: Date.now(),
+          failedSteps: this.cancelled.has(profileId) ? 0 : 1,
+          skippedSteps: 0,
+        });
+      } finally {
+        this.active.delete(profileId);
+      }
+    })();
+
+    this.workers.set(profileId, workerPromise);
+    try {
+      await workerPromise;
+    } finally {
+      if (this.workers.get(profileId) === workerPromise) this.workers.delete(profileId);
+    }
+
+    return {
+      postedCount: stat.session,
+      status: stat.status,
+      hardBlocked,
+      softIssue,
+    };
   }
 }

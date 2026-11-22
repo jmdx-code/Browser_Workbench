@@ -13,6 +13,7 @@ export async function watchBumperVideo(input: {
   budgetMs?: number;
   tickMs?: number;
   stallMs?: number;
+  onProgress?: (currentSec: number, durationSec: number | null) => void;
   onSummary?: (summary: {
     outcome: 'ended' | 'budget';
     speakerConfirmedUnmuted: boolean;
@@ -325,6 +326,12 @@ export async function watchBumperVideo(input: {
         lastProgress = performance.now();
         recoveryAttempts = 0;
         lastRecoveryAt = 0;
+        input.onProgress?.(
+          time,
+          typeof current.videoDuration === 'number' && Number.isFinite(current.videoDuration)
+            ? current.videoDuration
+            : null,
+        );
       }
       if (lastTime >= 3 && time + 1.5 < lastTime && progressed) {
         return finish('ended');

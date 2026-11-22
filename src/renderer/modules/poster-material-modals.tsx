@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { canPosterMaterialUseColorBackground, type PosterTask } from '../../shared/group-poster.js';
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
 
@@ -251,17 +252,30 @@ export function PosterMediaPreviewModal({
   row: MaterialDraft | null;
   onClose: () => void;
 }) {
+  useEffect(() => {
+    if (!row) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [row, onClose]);
+
   if (!row) return null;
+  const hasMedia = row.mediaSource.trim().length > 0;
   const mediaUrl = `/api/workspace/group-poster/materials/media?id=${encodeURIComponent(row.id)}`;
   const thumbUrl = `/api/workspace/group-poster/materials/thumbnail?id=${encodeURIComponent(row.id)}&v=${row.updatedAt ?? 0}`;
-  const canStreamMedia = row.cacheStatus === 'ready' && Boolean(row.localFilePath);
+  const canStreamMedia = hasMedia && row.cacheStatus === 'ready' && Boolean(row.localFilePath);
 
   return (
     <div
-      className="modal-backdrop"
+      className="modal-backdrop poster-lightbox-backdrop"
       role="dialog"
       aria-modal="true"
-      aria-label="预览贴文素材媒体"
+      aria-label={hasMedia ? '预览贴文素材媒体' : '预览贴文文案'}
       onClick={onClose}
     >
       <div
@@ -269,7 +283,7 @@ export function PosterMediaPreviewModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="bumper-modal-heading">
-          <h2>预览素材媒体</h2>
+          <h2>{hasMedia ? '预览素材媒体' : '预览贴文文案'}</h2>
           <button type="button" className="btn btn-sm" onClick={onClose}>
             关闭
           </button>
@@ -284,7 +298,24 @@ export function PosterMediaPreviewModal({
             padding: '16px',
           }}
         >
-          {canStreamMedia ? (
+          {!hasMedia ? (
+            <div
+              style={{
+                width: '100%',
+                maxHeight: '65vh',
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                padding: '16px',
+                borderRadius: '8px',
+                background: 'var(--surface-2)',
+                border: '1px solid var(--line)',
+                lineHeight: 1.6,
+              }}
+            >
+              {row.caption.trim() || '（未填写发帖文案）'}
+            </div>
+          ) : canStreamMedia ? (
             row.mediaKind === 'video' ? (
               <video
                 controls
@@ -318,9 +349,11 @@ export function PosterMediaPreviewModal({
           ) : (
             <p className="muted">当前媒体尚未缓存就绪，保存或发帖时会自动准备。</p>
           )}
-          <small className="muted" style={{ wordBreak: 'break-all' }}>
-            {row.mediaSource}
-          </small>
+          {hasMedia && (
+            <small className="muted" style={{ wordBreak: 'break-all' }}>
+              {row.mediaSource}
+            </small>
+          )}
         </div>
       </div>
     </div>

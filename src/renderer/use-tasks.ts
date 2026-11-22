@@ -16,6 +16,8 @@ export function useTasks() {
   const replay = useRef<{ cursor?: string; terminals: NonNullable<typeof runtime>['plans'] }>({
     terminals: [],
   });
+  const lastCapsSig = useRef<string | null>(null);
+  const lastRuntimeSig = useRef<string | null>(null);
   const pendingStart = useRef<{ key: string; input: Assignment } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -32,7 +34,11 @@ export function useTasks() {
           api.taskRuntime(signal, cursor),
         ]);
         if (!controller.signal.aborted) {
-          setCapabilities(caps);
+          const capsSig = JSON.stringify(caps);
+          if (capsSig !== lastCapsSig.current) {
+            lastCapsSig.current = capsSig;
+            setCapabilities(caps);
+          }
           if (value.resetRequired) terminalPlans = [];
           const latest = new Map(terminalPlans.map((plan) => [plan.id, plan]));
           for (const plan of value.recentTerminalPlans ?? []) latest.set(plan.id, plan);
@@ -42,12 +48,18 @@ export function useTasks() {
             .slice(0, 50);
           cursor = value.cursor;
           replay.current = { cursor, terminals: terminalPlans };
-          setRuntime({ ...value, plans: [...value.plans, ...terminalPlans] });
+          const nextRuntime = { ...value, plans: [...value.plans, ...terminalPlans] };
+          const runtimeSig = JSON.stringify(nextRuntime);
+          if (runtimeSig !== lastRuntimeSig.current) {
+            lastRuntimeSig.current = runtimeSig;
+            setRuntime(nextRuntime);
+          }
           if (value.hasMore && !controller.signal.aborted) setTimeout(() => void load(), 0);
-          setError('');
+          setError((prev) => (prev ? '' : prev));
         }
       } catch (failure) {
         if (!controller.signal.aborted) {
+          lastCapsSig.current = null;
           setCapabilities(null);
           setError(
             failure instanceof ApiError && failure.code === 'TASK_CONTRACT_UPGRADE_REQUIRED'

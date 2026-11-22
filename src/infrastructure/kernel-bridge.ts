@@ -581,7 +581,21 @@ export class KernelBridge implements KernelBridgeHooks {
       peer.phase !== 'PAUSED'
     )
       throw Error('WORKSPACE_CLEANUP_SESSION_RECHECK_REQUIRED');
-    await endInvitationSetupOperations(this, peer, undefined, true);
+    const protectedIds = new Set<string>();
+    const preCleanupInventory = await endInvitationSetupOperations(
+      this,
+      peer,
+      undefined,
+      true,
+      undefined,
+      protectedIds,
+    );
+    if (
+      preCleanupInventory.operations.some(
+        (op) => kernelOperationPending(op) && protectedIds.has(op.binding.operationId),
+      )
+    )
+      throw Error('WORKSPACE_CLEANUP_OPERATION_PENDING');
     const idle = this.idlePages.get(peer.profileId);
     if (idle) {
       if (idle.peer !== peer) throw Error('WORKSPACE_CLEANUP_CHANNEL_BUSY');
@@ -613,7 +627,7 @@ export class KernelBridge implements KernelBridgeHooks {
       return sequence;
     });
     session.access = 'facebook-task';
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     const current = () => {
       guard();
@@ -746,7 +760,7 @@ export class KernelBridge implements KernelBridgeHooks {
       return sequence;
     });
     session.access = 'facebook-task';
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     const current = async () => {
       await guard();
@@ -810,6 +824,11 @@ export class KernelBridge implements KernelBridgeHooks {
     }
   }
   private readonly sessions = new Map<string, KernelRpcSession>();
+  private readonly sessionsByPeer = new WeakMap<Peer, KernelRpcSession>();
+  private registerSession(peer: Peer, session: KernelRpcSession): void {
+    this.sessions.set(peer.profileId, session);
+    this.sessionsByPeer.set(peer, session);
+  }
   private readonly idlePages = new Map<
     string,
     {
@@ -1151,7 +1170,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.sequences.set(peer, sequence);
       return sequence;
     });
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     let proof: TabProof | undefined;
     let displayRemoveRequested = false;
@@ -1318,7 +1337,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.sequences.set(peer, sequence);
       return sequence;
     });
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     const assertCurrent = () => {
       if (
@@ -1429,7 +1448,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.sequences.set(peer, next);
       return next;
     });
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     const assertCurrent = () => {
       if (
@@ -1690,7 +1709,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.sequences.set(peer, sequence);
       return sequence;
     });
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     session.access = 'agent-browser';
     session.boundInputRequired = false;
@@ -1914,8 +1933,15 @@ export class KernelBridge implements KernelBridgeHooks {
       const close = (requestId: string = closingId ?? session.stopControlId ?? randomUUID()) => {
         if (closingId && closingId !== requestId)
           return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
-        if (session.stopControlId && session.stopControlId !== requestId)
+        if (session.stopControlId && session.stopControlId !== requestId) {
+          if (
+            !closingId &&
+            session.failureReason &&
+            /^KERNEL_DEBUGGER_(?:DETACHED|CANCELED_BY_USER)/.test(session.failureReason)
+          )
+            return Promise.reject(Error(session.failureReason));
           return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
+        }
         closingId = requestId;
         session.stopControlId = requestId;
         if (this.core.hasFixtureKernelOwner(peer, owner))
@@ -3094,7 +3120,9 @@ export class KernelBridge implements KernelBridgeHooks {
           await connection.stopOnCloseFailure();
           closeRequestId = connection.stopRequestId;
           stop =
-            closeError instanceof Error && closeError.message === 'KERNEL_CONTROL_ID_CONFLICT'
+            closeError instanceof Error &&
+            (closeError.message === 'KERNEL_CONTROL_ID_CONFLICT' ||
+              /^KERNEL_DEBUGGER_(?:DETACHED|CANCELED_BY_USER)/.test(closeError.message))
               ? await connection.close(closeRequestId)
               : await connection.retryClose(closeRequestId);
         } catch (retryError) {
@@ -3168,7 +3196,7 @@ export class KernelBridge implements KernelBridgeHooks {
       this.sequences.set(peer, sequence);
       return sequence;
     });
-    this.sessions.set(peer.profileId, session);
+    this.registerSession(peer, session);
     this.traces.set(peer.profileId, session.trace);
     session.access = access;
     session.identityFence = facebook?.assertIdentity;
@@ -3488,8 +3516,15 @@ export class KernelBridge implements KernelBridgeHooks {
       const close = (requestId: string = closingId ?? session.stopControlId ?? randomUUID()) => {
         if (closingId && closingId !== requestId)
           return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
-        if (session.stopControlId && session.stopControlId !== requestId)
+        if (session.stopControlId && session.stopControlId !== requestId) {
+          if (
+            !closingId &&
+            session.failureReason &&
+            /^KERNEL_DEBUGGER_(?:DETACHED|CANCELED_BY_USER)/.test(session.failureReason)
+          )
+            return Promise.reject(Error(session.failureReason));
           return Promise.reject(Error('KERNEL_CONTROL_ID_CONFLICT'));
+        }
         closingId = requestId;
         session.stopControlId = requestId;
         if (this.core.hasFixtureKernelOwner(peer, owner))
@@ -4477,11 +4512,15 @@ export class KernelBridge implements KernelBridgeHooks {
     if (this.idlePages.get(peer.profileId)?.peer === peer) {
       this.idlePages.delete(peer.profileId);
     }
-    const session = this.sessions.get(peer.profileId);
+    const currentSession = this.sessions.get(peer.profileId);
+    const session = currentSession?.peer === peer ? currentSession : this.sessionsByPeer.get(peer);
     if (!session || session.peer !== peer) return;
-    this.presentationFocusGate.cancel(peer.profileId);
-    this.positionRecoveryGate.cancel(peer.profileId);
-    this.idlePages.delete(peer.profileId);
+    this.sessionsByPeer.delete(peer);
+    if (currentSession === session) {
+      this.presentationFocusGate.cancel(peer.profileId);
+      this.positionRecoveryGate.cancel(peer.profileId);
+      this.idlePages.delete(peer.profileId);
+    }
     session.closing = true;
     session.record(
       'peer-disconnected' + (peer.transportFailure ? ':' + peer.transportFailure : ''),

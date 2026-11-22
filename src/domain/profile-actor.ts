@@ -24,6 +24,7 @@ export interface ManagedProfileSession extends ProfileActorSession {
   // Local fences must not wait for persistence. Metadata identifies the exact
   // already-owned plan; it does not grant permission for an input.
   ownedPlanId?(): string;
+  openedContext?(): ExecutionSession;
   revokeInput?(reason: string): void;
   confirmTaskTab?(proof: TabProof): Promise<void>;
   setFailureHandler(handler: (reason: string) => Promise<void>): Awaitable<void>;

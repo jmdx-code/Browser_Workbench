@@ -65,8 +65,10 @@ export function ResourceTableEditor({
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<ResourceFilter>('all');
   const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const saving = useRef(false);
+  const activeSaveRef = useRef<Promise<ResourceTableValue | false> | null>(null);
   const checking = useRef<AbortController | null>(null);
   const downloading = useRef<AbortController | null>(null);
   const mounted = useRef(true);
@@ -115,12 +117,13 @@ export function ResourceTableEditor({
     };
   }, [combination.id]);
   useEffect(() => {
+    if (window.workbenchDesktop) return;
     const handler = (event: BeforeUnloadEvent) => {
-      if (dirty) event.preventDefault();
+      if (dirtyRef.current) event.preventDefault();
     };
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
-  }, [dirty]);
+  }, []);
   function edit(next: ResourceRowValue[], remember = true) {
     setDownloadReport(null);
     setSourceReport(null);
@@ -128,6 +131,7 @@ export function ResourceTableEditor({
     setFilter('all');
     setUndo((history) => (remember ? [...history.slice(-9), rows] : history));
     setRows(next);
+    dirtyRef.current = true;
     setDirty(true);
     setError('');
     setDiscard(false);
@@ -154,36 +158,52 @@ export function ResourceTableEditor({
     saving.current = true;
     setBusy(true);
     setError('');
-    try {
-      const next = preparedRows();
-      const saved = dirty
-        ? await api.saveResourceTable(combination.id, table.revision, next)
-        : table;
-      if (
-        saved.combinationId !== combination.id ||
-        (dirty && saved.revision !== table.revision + 1) ||
-        (dirty && JSON.stringify(saved.rows) !== JSON.stringify(next))
-      )
-        throw Error('RESOURCE_RESPONSE_MISMATCH');
-      setTable(saved);
-      editingRef.current = null;
-      setEditing(null);
-      setRows(saved.rows);
-      setDirty(false);
-      await onSaved();
-      if (close) onClose();
-      return saved;
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : '保存未确认，当前编辑保留');
-      return false;
-    } finally {
-      saving.current = false;
-      setBusy(false);
-    }
+    let shouldClose = false;
+    const work = (async (): Promise<ResourceTableValue | false> => {
+      try {
+        const next = preparedRows();
+        const saved = dirtyRef.current
+          ? await api.saveResourceTable(combination.id, table.revision, next)
+          : table;
+        if (
+          saved.combinationId !== combination.id ||
+          (dirtyRef.current && saved.revision !== table.revision + 1) ||
+          (dirtyRef.current && JSON.stringify(saved.rows) !== JSON.stringify(next))
+        )
+          throw Error('RESOURCE_RESPONSE_MISMATCH');
+        setTable(saved);
+        editingRef.current = null;
+        setEditing(null);
+        setRows(saved.rows);
+        dirtyRef.current = false;
+        setDirty(false);
+        await onSaved();
+        if (close) shouldClose = true;
+        return saved;
+      } catch (failure) {
+        setError(failure instanceof Error ? failure.message : '保存未确认，当前编辑保留');
+        return false;
+      } finally {
+        saving.current = false;
+        activeSaveRef.current = null;
+        setBusy(false);
+      }
+    })();
+    activeSaveRef.current = work;
+    const result = await work;
+    if (shouldClose) onClose();
+    return result;
   }
   useImperativeHandle(ref, () => ({
-    persist: () =>
-      !dirty ? Promise.resolve(true) : busy ? Promise.resolve(false) : save(false).then(Boolean),
+    persist: async () => {
+      if (activeSaveRef.current) {
+        const prevOk = await activeSaveRef.current;
+        if (!prevOk && dirtyRef.current) return false;
+      }
+      if (!dirtyRef.current) return true;
+      if (busy && !saving.current) return false;
+      return Boolean(await save(false));
+    },
   }));
   async function checkSources() {
     if (!table || checking.current || saving.current) return;

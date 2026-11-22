@@ -2,7 +2,10 @@ import { everyAsync } from '../shared/async-collections.js';
 import type { Awaitable } from '../domain/persistence.js';
 import type { TaskRepository } from '../domain/tasks.js';
 import { stepComplete, terminal, FRIENDS_EXHAUSTED_CURSOR } from '../domain/tasks.js';
-import { postFailureRequiresEnding } from '../domain/step-failure-policy.js';
+import {
+  postFailureRequiresEnding,
+  stepFailureAllowsAutoContinuation,
+} from '../domain/step-failure-policy.js';
 import type { TaskTabRepository } from '../domain/task-tabs.js';
 import { sameTabProof } from '../domain/task-tabs.js';
 import type {
@@ -69,7 +72,7 @@ export class TaskStepRunner {
     string,
     { stepId: string; context: ExecutionSession; at: number }
   >();
-  private readonly postWaits = new Map<string, number>();
+  private readonly postWaits = new Map<string, { profileId: string; startedAt: number }>();
   private readonly browseSelfHeals = new Map<string, { key: string; count: number }>();
   private readonly browseWaits = new Map<
     string,
@@ -100,6 +103,7 @@ export class TaskStepRunner {
     private readonly post?: PostStepAdapter,
     private readonly executionAllowed: (plan: Plan) => Awaitable<boolean> = () => true,
     private readonly onBrowseInterval?: (sample: BrowseIntervalDiagnostic) => void,
+    private readonly autoSettleUncertainAndContinue = false,
   ) {
     this.executors = new Map(executors.map((executor) => [executor.type, executor]));
     if (this.executors.size !== executors.length) throw Error('DUPLICATE_STEP_EXECUTOR');
@@ -173,14 +177,21 @@ export class TaskStepRunner {
       .map((plan) => {
         const previous = this.cycles.get(plan.profileId);
         if (previous) return previous;
-        const work = this.cycle(plan).catch(async (error) =>
-          this.result(await this.tasks.get(plan.id), 'CYCLE_FAILED', this.reason(error)),
-        );
-        this.cycles.set(plan.profileId, work);
-        void work.then((result) => {
-          if (this.cycles.get(plan.profileId) === work) this.cycles.delete(plan.profileId);
-          if (!this.closed) this.completedCycles.push(result);
+        const work = this.cycle(plan).catch(async (error) => {
+          let latest = plan;
+          try {
+            latest = await this.tasks.get(plan.id);
+          } catch {}
+          return this.result(latest, 'CYCLE_FAILED', this.reason(error));
         });
+        this.cycles.set(plan.profileId, work);
+        void work
+          .then((result) => {
+            if (!this.closed) this.completedCycles.push(result);
+          })
+          .finally(() => {
+            if (this.cycles.get(plan.profileId) === work) this.cycles.delete(plan.profileId);
+          });
         return work;
       });
   }
@@ -349,6 +360,7 @@ export class TaskStepRunner {
   private async waitForWindow(plan: Plan) {
     this.samples.delete(plan.profileId);
     this.browseStepClocks.delete(plan.profileId);
+    this.clearPostWaits(plan.profileId);
     await this.tasks.noteRunningWait?.(plan.id, 'SCHEDULE_WINDOW_CLOSED');
     return this.result(await this.tasks.get(plan.id), 'WAITING', 'SCHEDULE_WINDOW_CLOSED');
   }
@@ -440,6 +452,7 @@ export class TaskStepRunner {
       this.samples.delete(plan.profileId);
       this.browseStepClocks.delete(plan.profileId);
       this.clearBrowseWaits(plan.profileId);
+      this.clearPostWaits(plan.profileId);
       return this.result(plan, 'WAITING', plan.reason);
     }
     try {
@@ -1034,6 +1047,7 @@ export class TaskStepRunner {
       this.samples.delete(plan.profileId);
       this.browseStepClocks.delete(plan.profileId);
       this.clearBrowseWaits(plan.profileId);
+      this.clearPostWaits(plan.profileId);
       const current = await this.tasks.get(jobId),
         reason = this.reason(error);
       if (terminal(current.state)) return this.result(current, 'OWNER_RELEASE_UNCONFIRMED', reason);
@@ -1107,9 +1121,16 @@ export class TaskStepRunner {
         }
       }
       if (
-        (failedStep?.spec.type === 'post' &&
+        failedStep &&
+        ((failedStep.spec.type === 'post' &&
           postFailureRequiresEnding(reason, failedPostPurpose)) ||
-        (failedStep?.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE')
+          (failedStep.spec.type === 'marketplace' &&
+            reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE') ||
+          (this.autoSettleUncertainAndContinue &&
+            current.controlMode !== 'stop' &&
+            !current.reason.startsWith('USER_') &&
+            current.reason !== 'SCHEDULE_WINDOW_CLOSED' &&
+            stepFailureAllowsAutoContinuation(reason)))
       )
         await this.tasks.noteStepFailure?.(jobId, failedStep.id, reason);
       if (operation?.binding) {
@@ -1215,6 +1236,10 @@ export class TaskStepRunner {
     for (const [id, wait] of this.browseWaits)
       if (wait.binding.profileId === profileId && id !== except) this.browseWaits.delete(id);
   }
+  private clearPostWaits(profileId: string) {
+    for (const [key, wait] of this.postWaits)
+      if (wait.profileId === profileId) this.postWaits.delete(key);
+  }
   private async advancePost(
     plan: Plan,
     step: StepInstance,
@@ -1252,8 +1277,8 @@ export class TaskStepRunner {
       await assertCurrent();
       if (verdict.kind === 'wait') {
         const now = this.clock.nowMilliseconds();
-        const started = this.postWaits.get(pending.id) ?? now;
-        this.postWaits.set(pending.id, started);
+        const started = this.postWaits.get(pending.id)?.startedAt ?? now;
+        this.postWaits.set(pending.id, { profileId: plan.profileId, startedAt: started });
         const limit =
           link.purpose === 'UPLOAD_MEDIA'
             ? intent.snapshot.format === 'video'
@@ -1316,10 +1341,12 @@ export class TaskStepRunner {
         )
       ) {
         const now = this.clock.nowMilliseconds();
-        const started = this.postWaits.get(preparationKey) ?? now;
-        this.postWaits.set(preparationKey, started);
-        if (now < started || now - started >= 30_000)
+        const started = this.postWaits.get(preparationKey)?.startedAt ?? now;
+        this.postWaits.set(preparationKey, { profileId: plan.profileId, startedAt: started });
+        if (now < started || now - started >= 30_000) {
+          this.postWaits.delete(preparationKey);
           throw Error(`POST_PREPARATION_TIMEOUT:${decision.reason}`.slice(0, 200));
+        }
       }
       await this.tasks.noteRunningWait?.(plan.id, decision.reason);
       return this.result(plan, 'WAITING', decision.reason);

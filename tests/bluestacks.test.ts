@@ -16,21 +16,42 @@ import { BluestacksGroupBumperRunner } from '../src/infrastructure/bluestacks-bu
 import { persistenceRoutes } from '../src/infrastructure/persistence-routes.js';
 import type { CompatibleRepository } from '../src/domain/persistence.js';
 import {
+  classifyAbnormalScreenText,
   compareAvatarToRegion,
   cropToDataUrl,
+  detectBottomSheetIdentityRows,
+  detectHomeTabBar,
   detectVideoSpeakerState,
   extractActionBars,
   extractInlineVideoControls,
   extractPostCards,
+  extractReactionPopupButtons,
+  findAllTextInputNodes,
   isBottomSheetOpen,
   isDarkScreenOrReelMode,
   isLikeButtonBlue,
+  isReactionButtonActive,
+  isSolidBlueButton,
   makeCanonicalRect,
   parseDumpsysTop,
   parseLiteXml,
   resolveSharePostUrl,
   scalePointFrom900,
 } from '../src/infrastructure/bluestacks-vision.js';
+import {
+  closeBlueStacksPids,
+  generateTotpCode,
+  isPrintableAscii,
+  quoteForAndroidInputText,
+} from '../src/infrastructure/bluestacks-win32.js';
+import { SaveAutoScheduleInput, estimatePipelineMinutes } from '../src/shared/auto-scheduler.js';
+import {
+  isValidTotpSecret,
+  maskLoginAccountLabel,
+  normalizeTotpSecret,
+  parseBatchLoginText,
+} from '../src/shared/bluestacks.js';
+import { PostRecordsSheetConfig } from '../src/shared/google-sheets.js';
 import {
   BluestacksService,
   type BluestacksBumperRunnerPort,
@@ -1439,4 +1460,1463 @@ test('BlueStacks enableSound controls Android STREAM_MUSIC and FB Lite inline sp
     store.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('Android 13 aid= parsing, v524 TextInputView, Home tab dual-identity, 2-row 7-reaction popup, solid-blue CTA vs checkbox, reaction colors, and checkpoint classifier', async () => {
+  // 1. Android 13 dumpsys with aid=... + FB Lite v524 TextInputView
+  const android13Dump = [
+    '  ACTIVITY com.facebook.lite/.MainActivity abcd1234 pid=2222',
+    '    mResumed=true mStopped=false',
+    '    View Hierarchy:',
+    '      com.android.internal.policy.DecorView{111 V.E...... ........ 0,0-900,1600 aid=1073741824}',
+    '        com.facebook.primitive.textinput.TextInputView{222 VFED..CL. F....... 40,500-860,590 #1 aid=1073741825}',
+    '        com.facebook.primitive.textinput.TextInputView{333 VFED..CL. ........ 40,620-860,710 #2 aid=1073741826}',
+  ].join('\n');
+  const root13 = parseDumpsysTop(android13Dump, 900, 1600);
+  assert.ok(root13);
+  const inputs = findAllTextInputNodes(root13);
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0]?.bounds.y1, 500);
+  assert.equal(inputs[1]?.bounds.y1, 620);
+
+  // 2. Dual-identity Home Tab Bar detection: 6 tabs = Personal, 4 tabs = Page
+  const buildTabBarXml = (count: number) => {
+    const w = Math.floor(900 / count);
+    const tabs = Array.from(
+      { length: count },
+      (_, i) =>
+        `<node index="${i}" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[${i * w},128][${(i + 1) * w},214]" />`,
+    ).join('\n');
+    return `<hierarchy rotation="0"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.facebook.lite" content-desc="" clickable="false" long-clickable="false" focused="false" scrollable="false" bounds="[0,0][900,1600]"><node index="0" text="" resource-id="" class="android.view.ViewGroup" package="com.facebook.lite" content-desc="" clickable="false" long-clickable="false" focused="false" scrollable="false" bounds="[0,128][900,214]">${tabs}</node></node></hierarchy>`;
+  };
+  const personalRoot = parseLiteXml(buildTabBarXml(6), 900, 1600);
+  const pageRoot = parseLiteXml(buildTabBarXml(4), 900, 1600);
+  assert.ok(personalRoot && pageRoot);
+  const personalBar = detectHomeTabBar(personalRoot);
+  const pageBar = detectHomeTabBar(pageRoot);
+  assert.equal(personalBar?.identityHint, 'personal');
+  assert.equal(personalBar?.tabs.length, 6);
+  assert.equal(pageBar?.identityHint, 'page');
+  assert.equal(pageBar?.tabs.length, 4);
+
+  // 3. 2-row 7-Reaction popup (3 top: like/love/care + 4 bottom: haha/wow/sad/angry)
+  const popupXml = `<hierarchy rotation="0">
+    <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.facebook.lite" content-desc="" clickable="false" long-clickable="false" focused="false" scrollable="false" bounds="[0,0][900,1600]">
+      <node index="0" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[80,480][210,590]" />
+      <node index="1" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[220,480][350,590]" />
+      <node index="2" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[360,480][490,590]" />
+      <node index="3" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[40,600][170,710]" />
+      <node index="4" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[180,600][310,710]" />
+      <node index="5" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[320,600][450,710]" />
+      <node index="6" text="" resource-id="" class="android.view.View" package="com.facebook.lite" content-desc="" clickable="true" long-clickable="false" focused="false" scrollable="false" bounds="[460,600][590,710]" />
+    </node>
+  </hierarchy>`;
+  const popupRoot = parseLiteXml(popupXml, 900, 1600);
+  assert.ok(popupRoot);
+  const reactions = extractReactionPopupButtons(popupRoot, makeCanonicalRect(20, 740, 290, 810));
+  assert.equal(Object.keys(reactions).length, 7);
+  assert.equal(reactions.like?.x1, 80);
+  assert.equal(reactions.love?.x1, 220);
+  assert.equal(reactions.care?.x1, 360);
+  assert.equal(reactions.haha?.x1, 40);
+  assert.equal(reactions.angry?.x1, 460);
+
+  // 4. Solid blue CTA button vs small blue checkbox on white background, plus multi-color active reaction check
+  const canvas = createCanvas(900, 1600);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, 900, 1600);
+  // Solid blue primary button [40, 200, 860, 280]
+  ctx.fillStyle = '#1877f2';
+  ctx.fillRect(40, 200, 820, 80);
+  // Small blue checkbox inside a wide row [40, 320, 860, 400]
+  ctx.fillStyle = '#1877f2';
+  ctx.fillRect(50, 345, 26, 26);
+  // Red heart reaction [20, 700, 280, 770]
+  ctx.fillStyle = '#f33e58';
+  ctx.fillRect(100, 715, 36, 36);
+  // Amber Haha reaction [300, 700, 560, 770]
+  ctx.fillStyle = '#f7b125';
+  ctx.fillRect(380, 715, 36, 36);
+  // Gray unreacted button [600, 700, 860, 770]
+  ctx.fillStyle = '#65676b';
+  ctx.fillRect(680, 715, 36, 36);
+  const png = canvas.toBuffer('image/png');
+
+  assert.equal(await isSolidBlueButton(png, makeCanonicalRect(40, 200, 860, 280)), true);
+  assert.equal(await isSolidBlueButton(png, makeCanonicalRect(40, 320, 860, 400)), false);
+  assert.equal(await isReactionButtonActive(png, makeCanonicalRect(20, 700, 280, 770)), true);
+  assert.equal(await isReactionButtonActive(png, makeCanonicalRect(300, 700, 560, 770)), true);
+  assert.equal(await isReactionButtonActive(png, makeCanonicalRect(600, 700, 860, 770)), false);
+
+  // 5. Abnormal screen text classification
+  assert.equal(
+    classifyAbnormalScreenText(
+      'We need to secure your account to keep using Facebook. Pass a security check',
+    ),
+    'verification',
+  );
+  assert.equal(
+    classifyAbnormalScreenText('Meta detected suspicious activity on your account'),
+    'verification',
+  );
+  assert.equal(
+    classifyAbnormalScreenText('Your account has been disabled for violating Community Standards'),
+    'restricted',
+  );
+  assert.equal(classifyAbnormalScreenText('手机号或邮箱 密码 登录 忘记密码'), 'logged-out');
+  assert.equal(classifyAbnormalScreenText('在想些什么？ 照片 直播'), null);
+});
+
+test('RFC 6238 TOTP generator and Android ASCII input quoting handle complex secrets and passwords', () => {
+  // Official RFC 6238 SHA-1 test secret "12345678901234567890" = Base32 "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+  assert.equal(generateTotpCode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 59_000), '287082');
+  assert.equal(
+    generateTotpCode('GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ', 1_111_111_109_000),
+    '081804',
+  );
+
+  assert.equal(isPrintableAscii('Pass^+:?<>!},123'), true);
+  assert.equal(isPrintableAscii('你好世界'), false);
+  assert.equal(isPrintableAscii('hello 😊'), false);
+
+  assert.equal(quoteForAndroidInputText('a b'), "'a%sb'");
+  assert.equal(quoteForAndroidInputText("it's^<>!"), "'it'\\''s^<>!'");
+});
+
+test('SqliteBluestacksRepository migrates legacy 4-state CHECK table to 6-state without data loss and preserves metadata on verification/restricted', () => {
+  const db = new DatabaseSync(':memory:');
+  try {
+    // Seed legacy 4-state bluestacks_instances table
+    db.exec(`
+      CREATE TABLE bluestacks_instances (
+        id TEXT PRIMARY KEY,
+        instance_key TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        alias TEXT,
+        folder_id TEXT,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        adb_port INTEGER NOT NULL DEFAULT 5555,
+        fb_width INTEGER NOT NULL DEFAULT 0,
+        fb_height INTEGER NOT NULL DEFAULT 0,
+        fb_lite_installed INTEGER NOT NULL DEFAULT 0,
+        account_state TEXT NOT NULL DEFAULT 'unknown'
+          CHECK (account_state IN ('unknown','logged-in','logged-out','missing-app')),
+        account_id TEXT NOT NULL DEFAULT '',
+        account_name TEXT NOT NULL DEFAULT '',
+        avatar_url TEXT,
+        last_status TEXT,
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const instId = deterministicBluestacksId('Pie64_1');
+    db.prepare(
+      `INSERT INTO bluestacks_instances (id, instance_key, display_name, alias, adb_port, fb_width, fb_height, fb_lite_installed, account_state, account_id, account_name, avatar_url, updated_at)
+       VALUES (?, 'Pie64_1', 'p023', '主力号', 5565, 900, 1600, 1, 'logged-in', '10001234', 'Mawi Lee', 'data:image/webp;base64,UklGRkAAAABXRUJQVlA4IDQAAADQAQCdASoBAAEAAUAmJYgCdAEO/gHOAAD++P////////////////////8AAAA=', 1000)`,
+    ).run(instId);
+
+    // Open repository -> runs non-destructive migration!
+    const repo = new SqliteBluestacksRepository(db);
+    const before = repo.getInstance(instId);
+    assert.ok(before);
+    assert.equal(before.alias, '主力号');
+    assert.equal(before.accountName, 'Mawi Lee');
+
+    // Save 'verification' state -> MUST NOT throw CHECK constraint error AND MUST preserve accountName & avatarUrl!
+    const updated = repo.saveInspectionResult({
+      id: instId,
+      fbLiteInstalled: true,
+      accountState: 'verification',
+      identityType: 'personal',
+      numericAccountId: '10001234',
+      managedIdentities: [
+        { name: 'Mawi Lee', identityType: 'personal', active: true },
+        { name: 'Thu', identityType: 'page', active: false },
+      ],
+      androidSdk: 33,
+      fbLiteVersion: '524.0.0.7.106',
+    });
+    assert.ok(updated);
+    assert.equal(updated.accountState, 'verification');
+    assert.equal(updated.accountName, 'Mawi Lee');
+    assert.ok(updated.avatarUrl?.startsWith('data:image/webp;base64,'));
+    assert.equal(updated.numericAccountId, '10001234');
+    assert.equal(updated.managedIdentities?.length, 2);
+    assert.equal(updated.androidSdk, 33);
+    assert.equal(updated.fbLiteVersion, '524.0.0.7.106');
+
+    // Save apkPath setting
+    const paths = repo.savePaths({ apkPath: 'D:\\apks\\fb-lite.apk' });
+    assert.equal(paths.apkPath, 'D:\\apks\\fb-lite.apk');
+  } finally {
+    db.close();
+  }
+});
+
+test('Auto-Scheduler 6-step BlueStacks schema & Cloud Sheets BlueStacks binding validate cleanly', () => {
+  const comboId = randomUUID();
+  const matId = randomUUID();
+  const sched = SaveAutoScheduleInput.parse({
+    name: '蓝蝶全链路自动化',
+    carrier: 'bluestacks',
+    enabled: true,
+    targetSelector: {
+      mode: 'explicit',
+      targetIds: [deterministicBluestacksId('Pie64_1')],
+      skipAbnormalAccounts: true,
+    },
+    trigger: {
+      weekdays: [1, 2, 3, 4, 5],
+      times: ['08:00'],
+      timeZone: 'Asia/Shanghai',
+    },
+    steps: [
+      { id: randomUUID(), type: 'bluestacks-quick-browse', target: 'feed', durationMinutes: 2 },
+      { id: randomUUID(), type: 'bluestacks-active-combination', combinationId: comboId },
+      {
+        id: randomUUID(),
+        type: 'bluestacks-group-poster',
+        materialIds: [matId],
+        groupIds: ['123456789'],
+        maxGroupsPerProfile: 2,
+        postToTimeline: true,
+      },
+      {
+        id: randomUUID(),
+        type: 'bluestacks-group-bumper',
+        groupIds: ['123456789'],
+        pageIds: ['987654321'],
+      },
+      { id: randomUUID(), type: 'bluestacks-page-bumper', pageIds: ['987654321'] },
+      {
+        id: randomUUID(),
+        type: 'bluestacks-group-inviter',
+        groupIds: ['123456789'],
+        invitesPerGroup: 5,
+      },
+    ],
+  });
+  assert.equal(sched.steps.length, 6);
+  const est = estimatePipelineMinutes(sched.steps, () => 8);
+  assert.ok(est >= 20, `expected combined estimate >= 20m, got ${est}`);
+
+  const defaultRecordsCfg = PostRecordsSheetConfig.parse({});
+  assert.deepEqual(defaultRecordsCfg.bumperBluestacksFolderIds, []);
+  assert.deepEqual(defaultRecordsCfg.bumperBluestacksIds, []);
+
+  const boundRecordsCfg = PostRecordsSheetConfig.parse({
+    bumperBluestacksFolderIds: [randomUUID()],
+    bumperBluestacksIds: [deterministicBluestacksId('Pie64_1')],
+  });
+  assert.equal(boundRecordsCfg.bumperBluestacksFolderIds.length, 1);
+  assert.equal(boundRecordsCfg.bumperBluestacksIds.length, 1);
+});
+
+test('detectBottomSheetIdentityRows locates 3 identity rows and active blue checkmark from overlay PNG', async () => {
+  const c = createCanvas(900, 1600);
+  const ctx = c.getContext('2d');
+  // Dimmed backdrop above bottom sheet
+  ctx.fillStyle = '#555555';
+  ctx.fillRect(0, 0, 900, 1020);
+  // White bottom sheet starting at y=1020
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 1020, 900, 580);
+  // 3 circular avatars at x=84, y=1090, 1200, 1310 (r=30 -> 60x60)
+  const ys = [1090, 1200, 1310];
+  for (let i = 0; i < ys.length; i++) {
+    const cy = ys[i] ?? 1090;
+    ctx.fillStyle = i === 0 ? '#3b5998' : i === 1 ? '#2e7d32' : '#c62828';
+    ctx.beginPath();
+    ctx.arc(84, cy, 30, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Blue active checkmark circle on row 0 at x=832, y=1090
+  ctx.fillStyle = '#1877f2';
+  ctx.beginPath();
+  ctx.arc(832, 1090, 18, 0, Math.PI * 2);
+  ctx.fill();
+
+  const rows = await detectBottomSheetIdentityRows(c.toBuffer('image/png'));
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0]?.isActiveBlueCheck, true);
+  assert.equal(rows[1]?.isActiveBlueCheck, false);
+  assert.equal(rows[2]?.isActiveBlueCheck, false);
+  assert.ok((rows[0]?.fullTextBounds.x1 ?? 0) >= 120);
+});
+
+test('parseBatchLoginText handles multi-line labeled blocks with special-char passwords, delimited rows, and validation', () => {
+  const mixedInput = [
+    '# comment line',
+    '账号: alice@example.com',
+    '密码: Pa:ss,Word!#123',
+    'totp: jbsw y3dp ehpk 3pxp',
+    '',
+    '账号：bob_user',
+    '密码：SimplePass99',
+    '',
+    '账号,密码,2FA',
+    'carol@test.io|PipePass!|MFRGGZDFMZTWQ2LK',
+    'dave@test.io\tTabPass:88\tNOTE_COL\tGEZDGNBVGY3TQOJQ',
+    'eve@test.io----DashPass123----ORSXG5A=',
+    '"frank@test.io","Csv,Pass,1","JBSWY3DPEHPK3PXP"',
+    'bad@test.io|Pass1|NOT_BASE32_!!!',
+    'broken_single_token',
+  ].join('\n');
+
+  const parsed = parseBatchLoginText(mixedInput);
+  assert.equal(parsed.entries.length, 6);
+  assert.equal(parsed.errors.length, 2);
+
+  // Multi-line block preserves literal ':' and ',' inside password!
+  assert.equal(parsed.entries[0]?.account, 'alice@example.com');
+  assert.equal(parsed.entries[0]?.password, 'Pa:ss,Word!#123');
+  assert.equal(parsed.entries[0]?.totpSecret, 'JBSWY3DPEHPK3PXP');
+
+  // 2-line block without 2FA
+  assert.equal(parsed.entries[1]?.account, 'bob_user');
+  assert.equal(parsed.entries[1]?.password, 'SimplePass99');
+  assert.equal(parsed.entries[1]?.totpSecret, '');
+
+  // Pipe, Tab (picking valid Base32 from trailing col), ----, and quoted CSV
+  assert.equal(parsed.entries[2]?.account, 'carol@test.io');
+  assert.equal(parsed.entries[2]?.totpSecret, 'MFRGGZDFMZTWQ2LK');
+  assert.equal(parsed.entries[3]?.account, 'dave@test.io');
+  assert.equal(parsed.entries[3]?.password, 'TabPass:88');
+  assert.equal(parsed.entries[3]?.totpSecret, 'GEZDGNBVGY3TQOJQ');
+  assert.equal(parsed.entries[4]?.account, 'eve@test.io');
+  assert.equal(parsed.entries[4]?.totpSecret, 'ORSXG5A=');
+  assert.equal(parsed.entries[5]?.account, 'frank@test.io');
+  assert.equal(parsed.entries[5]?.password, 'Csv,Pass,1');
+
+  assert.equal(normalizeTotpSecret('jbsw y3dp-ehpk'), 'JBSWY3DPEHPK');
+  assert.equal(isValidTotpSecret('JBSW Y3DP EHPK 3PXP'), true);
+  assert.equal(isValidTotpSecret('12345'), false);
+
+  assert.equal(maskLoginAccountLabel('alice@example.com'), 'al***e@example.com');
+  assert.equal(maskLoginAccountLabel('10001234567890'), '1000***90');
+});
+
+test('BluestacksService.startBatchLogin orchestrates auto-launch, auto-APK, skip-logged-in, checkpoint classification, auto-close, and zero secret leakage', async () => {
+  const { BluestacksService } = await import('../src/application/bluestacks-service.js');
+  const { ProductError } = await import('../src/domain/workspace.js');
+
+  const idOk = deterministicBluestacksId('Pie64_5');
+  const idAlready = deterministicBluestacksId('Pie64_1');
+  const idCheck = deterministicBluestacksId('Pie64_4');
+
+  const liveInstances: BluestacksInstance[] = [
+    {
+      id: idOk,
+      instanceKey: 'Pie64_5',
+      displayName: 'App Player 5',
+      alias: null,
+      folderId: null,
+      sortOrder: 0,
+      adbPort: 5605,
+      serial: '127.0.0.1:5605',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: false,
+      fbLiteInstalled: false,
+      accountState: 'missing-app',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: 1,
+    },
+    {
+      id: idAlready,
+      instanceKey: 'Pie64_1',
+      displayName: 'p023',
+      alias: null,
+      folderId: null,
+      sortOrder: 1,
+      adbPort: 5565,
+      serial: '127.0.0.1:5565',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: true,
+      fbLiteInstalled: true,
+      accountState: 'logged-in',
+      accountId: '61591261366732',
+      accountName: 'Mawi Lee',
+      numericAccountId: '61591261366732',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: 1,
+    },
+    {
+      id: idCheck,
+      instanceKey: 'Pie64_4',
+      displayName: 'App Player 4',
+      alias: null,
+      folderId: null,
+      sortOrder: 2,
+      adbPort: 5595,
+      serial: '127.0.0.1:5595',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: false,
+      fbLiteInstalled: true,
+      accountState: 'unknown',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: 1,
+    },
+  ];
+
+  const config: BluestacksRuntimeConfig = {
+    installDir: 'C:\\Program Files\\BlueStacks_nxt',
+    confPath: 'C:\\ProgramData\\BlueStacks_nxt\\bluestacks.conf',
+    apkPath: 'D:\\fb-lite.apk',
+    detectedInstallDir: 'C:\\Program Files\\BlueStacks_nxt',
+    detectedConfPath: 'C:\\ProgramData\\BlueStacks_nxt\\bluestacks.conf',
+    detectedApkPath: 'D:\\fb-lite.apk',
+    adbReady: true,
+    playerReady: true,
+  };
+
+  const launched: string[] = [];
+  const installed: string[] = [];
+  const closed: string[] = [];
+
+  const defaultBumperSettings = {
+    searchMode: 'time_sort' as const,
+    maxPostAgeHours: 24,
+    maxPostsPerGroupPage: 5,
+    maxPostsPerPage: 3,
+    maxConcurrentProfiles: 4,
+    dailyMaxLikesPerAccount: 20,
+    maxLikesPerPost: 50,
+    likeProbability: 100,
+    commentProbability: 30,
+    consumeCommentOnUse: false,
+    enableSound: false,
+    useLongPressReaction: false,
+    reactionTypes: ['like' as const],
+  };
+
+  const repo: BluestacksServiceRepository = {
+    savePaths: () => ({
+      installDir: null,
+      confPath: null,
+      apkPath: 'D:\\fb-lite.apk',
+      bumperSettings: defaultBumperSettings,
+    }),
+    savedSettings: () => ({
+      installDir: null,
+      confPath: null,
+      apkPath: 'D:\\fb-lite.apk',
+      bumperSettings: defaultBumperSettings,
+    }),
+    saveBumperSettings: () => {
+      throw new Error('unused');
+    },
+    folders: () => [],
+    createFolder: () => {
+      throw new Error('unused');
+    },
+    renameFolder: () => {
+      throw new Error('unused');
+    },
+    deleteFolder: () => {},
+    reorderFolders: () => {},
+    listInstances: () => liveInstances,
+    getInstance: (id) => liveInstances.find((x) => x.id === id) ?? null,
+    saveLastStatus: () => {},
+    renameInstance: () => {
+      throw new Error('unused');
+    },
+    reorderInstances: () => {},
+    deleteInstances: () => 0,
+    targets: () => [],
+    todayCounts: () => ({}),
+    total: () => 0,
+    weeklyDailyCounts: () => [],
+  };
+
+  const devices: BluestacksDeviceController = {
+    getOnlineKeys: () => new Set(liveInstances.filter((x) => x.online).map((x) => x.instanceKey)),
+    discoverInstances: async () => ({ config, instances: liveInstances }),
+    launchInstance: async (id) => {
+      launched.push(id);
+      const item = liveInstances.find((x) => x.id === id);
+      if (!item) throw new Error('missing');
+      item.online = true;
+      return item;
+    },
+    closeInstance: async (id) => {
+      closed.push(id);
+      const item = liveInstances.find((x) => x.id === id);
+      if (item) item.online = false;
+    },
+    inspectAccount: async (id) => {
+      const item = liveInstances.find((x) => x.id === id);
+      if (!item) throw new Error('missing');
+      return item;
+    },
+    probeFbLiteInstalled: async (serial) => {
+      const item = liveInstances.find((x) => x.serial === serial);
+      return item?.fbLiteInstalled ?? false;
+    },
+    installFbLiteApk: async (id) => {
+      installed.push(id);
+      const item = liveInstances.find((x) => x.id === id);
+      if (!item) throw new Error('missing');
+      item.fbLiteInstalled = true;
+      item.accountState = 'logged-out';
+      return item;
+    },
+    loginAccountDetailed: async (id) => {
+      const item = liveInstances.find((x) => x.id === id);
+      if (!item) throw new Error('missing');
+      if (id === idCheck) {
+        item.accountState = 'verification';
+        throw new ProductError('BLUESTACKS_ACCOUNT_CHECKPOINT', '账号触发 Checkpoint 验证', 409);
+      }
+      item.accountState = 'logged-in';
+      item.accountName = 'Fresh Account';
+      item.numericAccountId = '61599988877766';
+      return { instance: item, skippedAlreadyLoggedIn: false };
+    },
+  };
+
+  const service = new BluestacksService(repo, devices, { run: async () => {} });
+  const secretPass = 'UltraSecret:Pass,999!';
+  const secretTotp = 'JBSWY3DPEHPK3PXP';
+
+  await service.startBatchLogin({
+    items: [
+      {
+        instanceId: idOk,
+        account: 'fresh@example.com',
+        password: secretPass,
+        totpSecret: secretTotp,
+      },
+      { instanceId: idAlready, account: 'other@example.com', password: secretPass },
+      { instanceId: idCheck, account: 'check@example.com', password: secretPass },
+    ],
+    maxConcurrency: 2,
+    autoLaunch: true,
+    autoInstallApk: true,
+    ifAlreadyLoggedIn: 'skip',
+    saveLoginInfo: true,
+    closeOnFinish: true,
+  });
+
+  // Wait for batch login to settle
+  for (let i = 0; i < 40; i++) {
+    const st = await service.state(false);
+    if (st.batchLogin && !st.batchLogin.running) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  const finalState = await service.state(false);
+  const bl = finalState.batchLogin;
+  assert.ok(bl);
+  assert.equal(bl.running, false);
+  assert.equal(bl.total, 3);
+  assert.equal(bl.completed, 3);
+  assert.equal(bl.succeeded, 1);
+  assert.equal(bl.skipped, 1);
+  assert.equal(bl.verification, 1);
+  assert.equal(bl.failed, 0);
+
+  // Verify auto-launch, auto-APK, and auto-close did NOT touch already-online skipped idAlready
+  assert.ok(launched.includes(idOk));
+  assert.ok(launched.includes(idCheck));
+  assert.ok(!launched.includes(idAlready));
+  assert.deepEqual(installed, [idOk]);
+  assert.ok(closed.includes(idOk));
+  assert.ok(closed.includes(idCheck));
+  assert.ok(!closed.includes(idAlready));
+
+  // Hard security invariant: ZERO plaintext passwords, TOTP secrets, or raw emails in state JSON!
+  const serialized = JSON.stringify(finalState);
+  assert.equal(serialized.includes(secretPass), false);
+  assert.equal(serialized.includes(secretTotp), false);
+  assert.equal(serialized.includes('fresh@example.com'), false);
+});
+
+test('BluestacksService.startHealthCheck classifies healthy, landscape, missing-app auto-repair, verification & restricted cleanly', async () => {
+  const idHealthy = deterministicBluestacksId('Pie64_hc_ok');
+  const idLand = deterministicBluestacksId('Pie64_hc_land');
+  const idMissing = deterministicBluestacksId('Pie64_hc_miss');
+  const idVerify = deterministicBluestacksId('Pie64_hc_ver');
+  const idRestrict = deterministicBluestacksId('Pie64_hc_ban');
+
+  const liveInstances: BluestacksInstance[] = [
+    {
+      id: idHealthy,
+      instanceKey: 'Pie64_hc_ok',
+      displayName: 'OK-1',
+      alias: null,
+      folderId: null,
+      sortOrder: 0,
+      adbPort: 5601,
+      serial: '127.0.0.1:5601',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: false,
+      fbLiteInstalled: true,
+      accountState: 'unknown',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: Date.now(),
+    },
+    {
+      id: idLand,
+      instanceKey: 'Pie64_hc_land',
+      displayName: 'Land-1',
+      alias: null,
+      folderId: null,
+      sortOrder: 1,
+      adbPort: 5602,
+      serial: '127.0.0.1:5602',
+      fbWidth: 1920,
+      fbHeight: 1080,
+      online: false,
+      fbLiteInstalled: null,
+      accountState: 'unknown',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: Date.now(),
+    },
+    {
+      id: idMissing,
+      instanceKey: 'Pie64_hc_miss',
+      displayName: 'Miss-1',
+      alias: null,
+      folderId: null,
+      sortOrder: 2,
+      adbPort: 5603,
+      serial: '127.0.0.1:5603',
+      fbWidth: 720,
+      fbHeight: 1280,
+      online: false,
+      fbLiteInstalled: false,
+      accountState: 'missing-app',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: Date.now(),
+    },
+    {
+      id: idVerify,
+      instanceKey: 'Pie64_hc_ver',
+      displayName: 'Ver-1',
+      alias: null,
+      folderId: null,
+      sortOrder: 3,
+      adbPort: 5604,
+      serial: '127.0.0.1:5604',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: false,
+      fbLiteInstalled: true,
+      accountState: 'unknown',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: Date.now(),
+    },
+    {
+      id: idRestrict,
+      instanceKey: 'Pie64_hc_ban',
+      displayName: 'Ban-1',
+      alias: null,
+      folderId: null,
+      sortOrder: 4,
+      adbPort: 5605,
+      serial: '127.0.0.1:5605',
+      fbWidth: 900,
+      fbHeight: 1600,
+      online: false,
+      fbLiteInstalled: true,
+      accountState: 'unknown',
+      accountId: '',
+      accountName: '',
+      avatarUrl: null,
+      lastStatus: null,
+      updatedAt: Date.now(),
+    },
+  ];
+
+  const launched: string[] = [];
+  const closed: string[] = [];
+  const installed: string[] = [];
+
+  const repo: BluestacksServiceRepository = {
+    savedSettings: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: BumperSettings.parse({ maxConcurrentProfiles: 4 }),
+      pageBumperSettings: BumperSettings.parse({ maxConcurrentProfiles: 4 }),
+    }),
+    savePaths: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: BumperSettings.parse({ maxConcurrentProfiles: 4 }),
+    }),
+    saveBumperSettings: (v) => BumperSettings.parse(v),
+    folders: () => [],
+    createFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    renameFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    deleteFolder: () => {},
+    reorderFolders: () => {},
+    listInstances: () => liveInstances.map((x) => ({ ...x })),
+    getInstance: (id) => {
+      const f = liveInstances.find((x) => x.id === id);
+      return f ? { ...f } : null;
+    },
+    saveLastStatus: (id, status) => {
+      const f = liveInstances.find((x) => x.id === id);
+      if (f) f.lastStatus = status;
+    },
+    renameInstance: () => liveInstances[0]!,
+    reorderInstances: () => {},
+    deleteInstances: () => 0,
+    targets: () => [],
+    todayCounts: () => ({}),
+    total: () => 0,
+    weeklyDailyCounts: () => [],
+  };
+
+  const devices: BluestacksDeviceController = {
+    getOnlineKeys: () => new Set(liveInstances.filter((x) => x.online).map((x) => x.instanceKey)),
+    discoverInstances: async () => ({
+      instances: liveInstances.map((x) => ({ ...x })),
+      config: {
+        installDir: null,
+        confPath: null,
+        detectedInstallDir: null,
+        detectedConfPath: null,
+        adbReady: true,
+        playerReady: true,
+      },
+    }),
+    launchInstance: async (id) => {
+      launched.push(id);
+      const item = liveInstances.find((x) => x.id === id)!;
+      item.online = true;
+      item.androidSdk = 28;
+      return { ...item };
+    },
+    closeInstance: async (id) => {
+      closed.push(id);
+      const item = liveInstances.find((x) => x.id === id);
+      if (item) item.online = false;
+    },
+    probeFbLiteInstalled: async (serial) => {
+      const item = liveInstances.find((x) => x.serial === serial);
+      return item?.fbLiteInstalled ?? false;
+    },
+    installFbLiteApk: async (id) => {
+      installed.push(id);
+      const item = liveInstances.find((x) => x.id === id)!;
+      item.fbLiteInstalled = true;
+      item.fbLiteVersion = '524.0.0.7.106';
+      item.accountState = 'logged-out';
+      return { ...item };
+    },
+    inspectAccount: async (id) => {
+      const item = liveInstances.find((x) => x.id === id)!;
+      if (id === idHealthy) {
+        item.accountState = 'logged-in';
+        item.accountName = 'Healthy User';
+        item.numericAccountId = '61588877766655';
+        item.identityType = 'personal';
+        item.fbLiteVersion = '524.0.0.7.106';
+        item.managedIdentities = [
+          { name: 'Healthy User', identityType: 'personal', active: true },
+          { name: 'My Page', identityType: 'page', active: false },
+        ];
+        return { ...item };
+      }
+      if (id === idMissing) {
+        item.accountState = 'logged-out';
+        throw new Error('FB Lite 未登录账号');
+      }
+      if (id === idVerify) {
+        item.accountState = 'verification';
+        item.fbLiteVersion = '488.0.0.15.106';
+        return { ...item };
+      }
+      if (id === idRestrict) {
+        item.accountState = 'restricted';
+        item.fbLiteVersion = '488.0.0.15.106';
+        return { ...item };
+      }
+      return { ...item };
+    },
+  };
+
+  const service = new BluestacksService(repo, devices, { run: async () => {} });
+  await service.startHealthCheck({
+    instanceIds: [idHealthy, idLand, idMissing, idVerify, idRestrict],
+    maxConcurrency: 3,
+    autoLaunch: true,
+    autoInstallApk: true,
+    closeOnFinish: true,
+  });
+
+  for (let i = 0; i < 40; i++) {
+    const st = await service.state(false);
+    if (st.healthCheck && !st.healthCheck.running) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  const finalState = await service.state(false);
+  const hc = finalState.healthCheck;
+  assert.ok(hc);
+  assert.equal(hc.running, false);
+  assert.equal(hc.total, 5);
+  assert.equal(hc.completed, 5);
+  assert.equal(hc.healthy, 1);
+  assert.equal(hc.landscape, 1);
+  assert.equal(hc.loggedOut, 1);
+  assert.equal(hc.verification, 1);
+  assert.equal(hc.restricted, 1);
+  assert.equal(hc.autoRepaired, 1);
+
+  // Landscape instance must NEVER be launched or closed!
+  assert.equal(launched.includes(idLand), false);
+  assert.equal(closed.includes(idLand), false);
+  assert.deepEqual(installed, [idMissing]);
+  assert.equal(closed.length, 4);
+
+  const healthyRow = hc.items.find((x) => x.instanceId === idHealthy);
+  assert.equal(healthyRow?.numericAccountId, '61588877766655');
+  assert.equal(healthyRow?.managedPageCount, 1);
+  const repairedRow = hc.items.find((x) => x.instanceId === idMissing);
+  assert.equal(repairedRow?.autoRepaired, true);
+  assert.equal(repairedRow?.category, 'logged-out');
+});
+
+test('BlueStacks daily risk limits persist across restarts, aggregate all 4 action types, and enforce pre-flight & mid-run protective sleep', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'wb-bs-risk-'));
+  const dbPath = path.join(dir, 'workspace.sqlite');
+  let store = await WorkspaceStore.open(dbPath);
+  try {
+    const idA = deterministicBluestacksId('Pie64_risk_a');
+    const idB = deterministicBluestacksId('Pie64_risk_b');
+    store.bluestacks.upsertDiscoveredInstances([
+      {
+        instanceKey: 'Pie64_risk_a',
+        displayName: 'Risk-A',
+        adbPort: 5611,
+        fbWidth: 900,
+        fbHeight: 1600,
+        online: true,
+        fbLiteInstalled: true,
+      },
+      {
+        instanceKey: 'Pie64_risk_b',
+        displayName: 'Risk-B',
+        adbPort: 5612,
+        fbWidth: 900,
+        fbHeight: 1600,
+        online: true,
+        fbLiteInstalled: true,
+      },
+    ]);
+
+    const now = Date.now();
+    // Global cap: 5 total actions, 3 bumps, 2 active likes; override idB to tighter cap (1 total)
+    store.bluestacks.saveRiskLimitSettings({
+      enabled: true,
+      dailyMaxTotalActions: 5,
+      dailyMaxBumps: 3,
+      dailyMaxPosts: 2,
+      dailyMaxInvites: 4,
+      dailyMaxActiveLikes: 2,
+      perInstanceOverrides: {
+        [idB]: { dailyMaxTotalActions: 1, dailyMaxBumps: 1 },
+      },
+    });
+
+    // Record 1 group bump + 1 page bump + 1 post + 1 invite + 1 active like on idA => total = 5 (reached!)
+    store.bluestacks.recordBump({
+      id: randomUUID(),
+      profileId: idA,
+      accountId: 'accA',
+      groupId: '1001',
+      groupName: 'G1',
+      pageId: '2001',
+      pageName: 'P1',
+      postId: '30001',
+      postUrl: 'https://www.facebook.com/groups/1001/posts/30001/',
+      liked: true,
+      commentText: null,
+      bumpedAt: now,
+      sourceMode: 'group',
+    });
+    store.bluestacks.recordBump({
+      id: randomUUID(),
+      profileId: idA,
+      accountId: 'accA',
+      groupId: '-',
+      groupName: '',
+      pageId: '2001',
+      pageName: 'P1',
+      postId: '30002',
+      postUrl: 'https://www.facebook.com/2001/posts/30002/',
+      liked: true,
+      commentText: null,
+      bumpedAt: now,
+      sourceMode: 'page',
+    });
+    store.groupPoster.recordPost({
+      id: randomUUID(),
+      profileId: idA,
+      accountId: 'accA',
+      accountName: 'Acc A',
+      accountAvatar: null,
+      identityType: 'personal',
+      groupId: '1001',
+      groupName: 'G1',
+      groupAvatar: null,
+      materialId: 'mat-1',
+      captionPreview: 'hello',
+      postId: '40001',
+      postUrl: 'https://www.facebook.com/groups/1001/posts/40001/',
+      postedAt: now,
+    });
+    store.groupInviter.recordInvites([
+      {
+        profileId: idA,
+        accountId: 'accA',
+        friendId: 'f-1',
+        friendName: 'Friend 1',
+        groupId: '1001',
+        invitedAt: now,
+      },
+    ]);
+    store.bluestacks.recordDailyActiveAction(idA, 'like', 1, now);
+
+    // Reopen SQLite to prove cross-restart persistence
+    store.close();
+    store = await WorkspaceStore.open(dbPath);
+
+    const usageToday = store.bluestacks.dailyInstanceUsage(now);
+    assert.equal(usageToday.totalGroupBumps, 1);
+    assert.equal(usageToday.totalPageBumps, 1);
+    assert.equal(usageToday.totalPosts, 1);
+    assert.equal(usageToday.totalInvites, 1);
+    assert.equal(usageToday.totalActiveLikes, 1);
+    assert.equal(usageToday.totalActions, 5);
+    assert.equal(usageToday.reachedLimitInstances, 1);
+    assert.equal(usageToday.perInstance[idA]?.limitReached, true);
+    assert.equal(usageToday.perInstance[idB]?.limitReached, false);
+    assert.equal(usageToday.perInstance[idB]?.hasOverride, true);
+    assert.equal(usageToday.perInstance[idB]?.effectiveLimits.dailyMaxTotalActions, 1);
+
+    // Eligibility blocks idA (at total 5/5) while allowing idB (0/1)
+    assert.equal(store.bluestacks.eligibility('accA', idA, '99999', now, 'group').allowed, false);
+    assert.equal(store.bluestacks.eligibility('accB', idB, '99999', now, 'group').allowed, true);
+
+    // Next calendar day resets cleanly!
+    const tomorrow = now + 26 * 3600_000;
+    const usageTomorrow = store.bluestacks.dailyInstanceUsage(tomorrow);
+    assert.equal(usageTomorrow.totalActions, 0);
+    assert.equal(usageTomorrow.perInstance[idA]?.limitReached, false);
+
+    // Service-level enforcement: startActive on [idA, idB] skips idA (already 5/5) and runs idB,
+    // then mid-run aborts idB with soft protective sleep as soon as idB hits its 1/1 override!
+    const ranIds: string[] = [];
+    let idBAbortedByRisk = false;
+    const fakeDevices: BluestacksDeviceController = {
+      getOnlineKeys: () => new Set(['Pie64_risk_a', 'Pie64_risk_b']),
+      discoverInstances: async () => ({
+        instances: store.bluestacks.listInstances(['Pie64_risk_a', 'Pie64_risk_b']),
+        config: {
+          installDir: null,
+          confPath: null,
+          detectedInstallDir: null,
+          detectedConfPath: null,
+          adbReady: true,
+          playerReady: true,
+        },
+      }),
+      launchInstance: async (id) => store.bluestacks.getInstance(id)!,
+      closeInstance: async () => {},
+      inspectAccount: async (id) => store.bluestacks.getInstance(id)!,
+    };
+    const service = new BluestacksService(
+      store.bluestacks,
+      fakeDevices,
+      { run: async () => {} },
+      undefined,
+      {
+        activeRunner: {
+          run: async (instanceId, _steps, signal, cb) => {
+            ranIds.push(instanceId);
+            cb.action(); // pushes idB to 1/1 -> triggers RISK_LIMIT_REACHED abort!
+            await new Promise((r) => setTimeout(r, 40));
+            if (signal.aborted) {
+              idBAbortedByRisk = true;
+              throw new Error('TASK_STOPPED');
+            }
+            return {
+              completedSteps: 1,
+              skippedSteps: 0,
+              likes: 1,
+              acceptedFriends: 0,
+              published: 0,
+              notes: [],
+            };
+          },
+        },
+      },
+    );
+
+    await service.startActive({
+      instanceIds: [idA, idB],
+      quickStep: { type: 'feed', durationMinutes: 1, maxLikes: 5 },
+    });
+    for (let i = 0; i < 30; i++) {
+      const st = await service.state(false);
+      if (!st.activeRunning) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    assert.deepEqual(ranIds, [idB]);
+    assert.equal(idBAbortedByRisk, true);
+    const stAfter = await service.state(false);
+    assert.match(stAfter.activeProfileCounts?.[idA]?.status ?? '', /自动休眠保护/);
+    assert.match(stAfter.activeProfileCounts?.[idB]?.status ?? '', /自动休眠保护/);
+
+    // Scheduled step on limited idA must return softIssue=true & hardBlocked=false (never banned!)
+    const schedRes = await service.runScheduledActiveStep({
+      instanceId: idA,
+      quickStep: { type: 'feed', durationMinutes: 1 },
+      onProgress: () => {},
+    });
+    assert.equal(schedRes.hardBlocked, false);
+    assert.equal(schedRes.softIssue, true);
+    assert.match(schedRes.status, /自动休眠保护/);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('BluestacksService.runDirectPosterForSheet auto-launches, switches to managed Page identity, invokes onPosted, and auto-closes', async () => {
+  const instId = deterministicBluestacksId('Pie64_sheet_post');
+  const inst: BluestacksInstance = {
+    id: instId,
+    instanceKey: 'Pie64_sheet_post',
+    displayName: 'Sheet-BS',
+    alias: null,
+    folderId: null,
+    sortOrder: 0,
+    adbPort: 5620,
+    serial: '127.0.0.1:5620',
+    fbWidth: 900,
+    fbHeight: 1600,
+    online: false,
+    fbLiteInstalled: true,
+    accountState: 'logged-in',
+    accountId: 'p023',
+    accountName: 'Mawi Lee',
+    numericAccountId: '61591261366732',
+    identityType: 'personal',
+    managedIdentities: [
+      { name: 'Mawi Lee', identityType: 'personal', active: true },
+      { name: 'Thu', identityType: 'page', active: false },
+    ],
+    avatarUrl: null,
+    lastStatus: null,
+    updatedAt: Date.now(),
+  };
+
+  const events: string[] = [];
+  const repo: BluestacksServiceRepository = {
+    savedSettings: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: BumperSettings.parse({ maxConcurrentProfiles: 4 }),
+    }),
+    savePaths: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: BumperSettings.parse({ maxConcurrentProfiles: 4 }),
+    }),
+    saveBumperSettings: (v) => BumperSettings.parse(v),
+    folders: () => [],
+    createFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    renameFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    deleteFolder: () => {},
+    reorderFolders: () => {},
+    listInstances: () => [{ ...inst }],
+    getInstance: () => ({ ...inst }),
+    saveLastStatus: () => {},
+    renameInstance: () => ({ ...inst }),
+    reorderInstances: () => {},
+    deleteInstances: () => 0,
+    targets: () => [],
+    todayCounts: () => ({}),
+    total: () => 0,
+    weeklyDailyCounts: () => [],
+  };
+  const devices: BluestacksDeviceController = {
+    getOnlineKeys: () => new Set(inst.online ? [inst.instanceKey] : []),
+    discoverInstances: async () => ({
+      instances: [{ ...inst }],
+      config: {
+        installDir: null,
+        confPath: null,
+        detectedInstallDir: null,
+        detectedConfPath: null,
+        adbReady: true,
+        playerReady: true,
+      },
+    }),
+    launchInstance: async () => {
+      events.push('launch');
+      inst.online = true;
+      return { ...inst };
+    },
+    switchIdentity: async (_id, target) => {
+      events.push(`switch:${target.targetName}:${target.targetType}`);
+      inst.accountName = target.targetName ?? 'Thu';
+      inst.identityType = 'page';
+      return { ...inst };
+    },
+    closeInstance: async () => {
+      events.push('close');
+      inst.online = false;
+    },
+    inspectAccount: async () => ({ ...inst }),
+  };
+
+  const service = new BluestacksService(repo, devices, { run: async () => {} }, undefined, {
+    posterRunner: {
+      run: async (_id, _mats, grps, opts, _sig, cb) => {
+        events.push(`post:tl=${opts.postToTimeline}:grps=${grps.length}`);
+        await cb.onPostLog?.(
+          {
+            id: randomUUID(),
+            profileId: instId,
+            accountId: '61580000111222',
+            accountName: 'Thu',
+            accountAvatar: null,
+            identityType: 'page',
+            groupId: '__page_timeline__',
+            groupName: 'Thu',
+            groupAvatar: null,
+            materialId: 'm1',
+            captionPreview: 'test',
+            postId: '12345',
+            postUrl: 'https://www.facebook.com/61580000111222',
+            postedAt: Date.now(),
+          },
+          true,
+        );
+        return { posted: 1, skipped: 0, notes: [] };
+      },
+    },
+  });
+
+  const receivedPosts: Array<{ isTimeline: boolean; postId: string }> = [];
+  const res = await service.runDirectPosterForSheet({
+    instanceId: instId,
+    targetPageId: '61580000111222',
+    targetPageName: 'Thu',
+    material: {
+      id: 'm1',
+      caption: 'Hello from Sheet',
+      mediaSource: '',
+      mediaKind: 'none',
+      background: 'plain',
+      aiLabel: 'default',
+      localFilePath: null,
+      hasThumbnail: false,
+      cacheStatus: 'ready',
+      cacheError: null,
+      selected: true,
+      sortOrder: 0,
+      usedCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+    targets: [
+      {
+        id: '__page_timeline__',
+        name: 'Thu（专页时间线）',
+        avatarUrl: null,
+        folderId: null,
+        sortOrder: 0,
+        totalBumpedCount: 0,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ],
+    closeOnFinish: true,
+    onPosted: (log, isTimeline) => {
+      receivedPosts.push({ isTimeline, postId: log.postId });
+    },
+  });
+
+  assert.equal(res.timelinePosted, true);
+  assert.equal(res.postedCount, 0);
+  assert.equal(res.error, undefined);
+  assert.deepEqual(events, ['launch', 'switch:Thu:page', 'post:tl=true:grps=0', 'close']);
+  assert.deepEqual(receivedPosts, [{ isTimeline: true, postId: '12345' }]);
+});
+
+test('closeBlueStacksPids sends WM_CLOSE + UIA confirmation with 22s graceful wait instead of premature kill', async () => {
+  if (process.platform !== 'win32') return;
+  const calls: Array<{ exe: string; args: string[]; timeoutMs?: number }> = [];
+  await closeBlueStacksPids(
+    async (exe, args, opts) => {
+      calls.push({
+        exe,
+        args,
+        ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      });
+      return Buffer.alloc(0);
+    },
+    [{ pid: 12345, hwnd: '987654' }, { pid: 12345, hwnd: '' }, { pid: 22222 }],
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.exe, 'powershell.exe');
+  assert.ok((calls[0]?.timeoutMs ?? 0) >= 30_000);
+  const script = calls[0]?.args[calls[0].args.length - 1] ?? '';
+  assert.match(script, /Pid = 12345; Hwnd = \[Int64\]987654/);
+  assert.match(script, /Pid = 22222; Hwnd = \[Int64\]0/);
+  assert.match(script, /0x0010/); // WM_CLOSE
+  assert.match(script, /InvokePattern/); // UIA confirmation dialog handler
+  assert.match(script, /AddSeconds\(22\)/); // generous graceful wait
+  assert.doesNotMatch(script, /reboot\s+-p/);
+});
+
+test('BluestacksService manual tasks auto-launch closed portrait instances while still blocking landscape', async () => {
+  const portraitId = deterministicBluestacksId('Pie64_closed_ok');
+  const landscapeId = deterministicBluestacksId('Pie64_closed_land');
+  const liveInstances: BluestacksInstance[] = [
+    {
+      id: portraitId,
+      instanceKey: 'Pie64_closed_ok',
+      displayName: 'Closed Portrait',
+      alias: 'p023',
+      adbPort: 5565,
+      serial: '127.0.0.1:5565',
+      fbWidth: 720,
+      fbHeight: 1280,
+      folderId: null,
+      sortOrder: 0,
+      online: false,
+      fbLiteInstalled: true,
+      accountName: 'Mawi Lee',
+      accountId: '1000111',
+      numericAccountId: '1000111',
+      identityType: 'personal',
+      managedIdentities: [],
+      avatarUrl: null,
+      accountState: 'logged-in',
+      lastStatus: '未启动',
+      updatedAt: Date.now(),
+    },
+    {
+      id: landscapeId,
+      instanceKey: 'Pie64_closed_land',
+      displayName: '不使用',
+      alias: null,
+      adbPort: 5555,
+      serial: '127.0.0.1:5555',
+      fbWidth: 1920,
+      fbHeight: 1080,
+      folderId: null,
+      sortOrder: 1,
+      online: false,
+      fbLiteInstalled: false,
+      accountName: '',
+      accountId: '',
+      numericAccountId: '',
+      identityType: 'unknown',
+      managedIdentities: [],
+      avatarUrl: null,
+      accountState: 'unknown',
+      lastStatus: '未启动',
+      updatedAt: Date.now(),
+    },
+  ];
+
+  const events: string[] = [];
+  const defaultSettings = BumperSettings.parse({ maxConcurrentProfiles: 2 });
+  const repo: BluestacksServiceRepository = {
+    listInstances: () => liveInstances.map((x) => ({ ...x })),
+    getInstance: (id) => liveInstances.find((x) => x.id === id) ?? null,
+    folders: () => [],
+    savedSettings: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: defaultSettings,
+      pageBumperSettings: defaultSettings,
+    }),
+    saveBumperSettings: (v) => BumperSettings.parse(v),
+    savePageBumperSettings: (v) => BumperSettings.parse(v),
+    savePaths: () => ({
+      installDir: null,
+      confPath: null,
+      bumperSettings: defaultSettings,
+    }),
+    createFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    renameFolder: () => ({ id: randomUUID(), name: 'f', sortOrder: 0 }),
+    deleteFolder: () => {},
+    reorderFolders: () => {},
+    renameInstance: () => ({ ...liveInstances[0]! }),
+    reorderInstances: () => {},
+    deleteInstances: () => 0,
+    saveLastStatus: (id, status) => {
+      const target = liveInstances.find((x) => x.id === id);
+      if (target) target.lastStatus = status;
+    },
+    targets: (kind) =>
+      kind === 'groups'
+        ? [
+            {
+              id: '1072811415396195',
+              name: 'Test Group',
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalBumpedCount: 0,
+              createdAt: 0,
+              updatedAt: 0,
+            },
+          ]
+        : [
+            {
+              id: '61588452821652',
+              name: 'Test Page',
+              avatarUrl: null,
+              folderId: null,
+              sortOrder: 0,
+              totalBumpedCount: 0,
+              createdAt: 0,
+              updatedAt: 0,
+            },
+          ],
+    todayCounts: () => ({}),
+    total: () => 0,
+    weeklyDailyCounts: () => [],
+  };
+
+  const devices: BluestacksDeviceController = {
+    discoverInstances: async () => ({
+      instances: liveInstances.map((x) => ({ ...x })),
+      config: {
+        installDir: null,
+        confPath: null,
+        detectedInstallDir: null,
+        detectedConfPath: null,
+        adbReady: true,
+        playerReady: true,
+        apkPath: null,
+        detectedApkPath: null,
+      },
+    }),
+    getOnlineKeys: () => new Set(liveInstances.filter((x) => x.online).map((x) => x.instanceKey)),
+    launchInstance: async (id) => {
+      events.push(`launch:${id}`);
+      const target = liveInstances.find((x) => x.id === id)!;
+      target.online = true;
+      return { ...target };
+    },
+    closeInstance: async (id) => {
+      const target = liveInstances.find((x) => x.id === id);
+      if (target) target.online = false;
+    },
+    inspectAccount: async (id) => {
+      events.push(`inspect:${id}`);
+      const target = liveInstances.find((x) => x.id === id)!;
+      return { ...target };
+    },
+  };
+
+  const runner: BluestacksBumperRunnerPort = {
+    run: async (id, _g, _p, _s, _sig, _cb, mode) => {
+      events.push(`bumper:${mode ?? 'group'}:${id}`);
+    },
+  };
+
+  const service = new BluestacksService(repo, devices, runner, undefined, {
+    activeRunner: {
+      run: async (id) => {
+        events.push(`active:${id}`);
+        return {
+          completedSteps: 1,
+          likes: 0,
+          acceptedFriends: 0,
+          published: 0,
+          skippedSteps: 0,
+          notes: [],
+        };
+      },
+    },
+    inviterRunner: {
+      run: async (id) => {
+        events.push(`inviter:${id}`);
+        return { invited: 2, skippedGroups: 0, notes: [] };
+      },
+    },
+  });
+
+  // 1. Landscape closed instance MUST still be rejected (never boot landscape!)
+  await assert.rejects(
+    () =>
+      service.startActive({
+        instanceIds: [landscapeId],
+        quickStep: { type: 'feed', durationMinutes: 1, maxLikes: 0 },
+      }),
+    /横屏/,
+  );
+  assert.equal(events.length, 0);
+
+  // 2. Closed portrait instance auto-launches & runs Active Feed seamlessly!
+  await service.startActive({
+    instanceIds: [portraitId],
+    quickStep: { type: 'feed', durationMinutes: 1, maxLikes: 0 },
+  });
+  for (let i = 0; i < 40 && !events.includes(`active:${portraitId}`); i++) {
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  assert.deepEqual(events, [`launch:${portraitId}`, `active:${portraitId}`]);
+
+  // 3. Close again and verify startInviter also auto-launches!
+  liveInstances[0]!.online = false;
+  events.length = 0;
+  await service.startInviter({
+    instanceIds: [portraitId],
+    groupIds: ['1072811415396195'],
+    invitesPerGroup: 5,
+  });
+  for (let i = 0; i < 40 && !events.includes(`inviter:${portraitId}`); i++) {
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  assert.deepEqual(events, [`launch:${portraitId}`, `inviter:${portraitId}`]);
+
+  // 4. Close again and verify startBumper also auto-launches!
+  liveInstances[0]!.online = false;
+  events.length = 0;
+  await service.startBumper({
+    profileIds: [portraitId],
+    groupIds: ['1072811415396195'],
+    pageIds: ['61588452821652'],
+  });
+  for (let i = 0; i < 40 && !events.includes(`bumper:group:${portraitId}`); i++) {
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  assert.deepEqual(events, [`launch:${portraitId}`, `bumper:group:${portraitId}`]);
 });

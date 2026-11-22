@@ -7,6 +7,7 @@ export function MediaComponentPanel() {
   const [status, setStatus] = useState<z.infer<typeof MediaComponentStatus> | null>(null);
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
+  const isInstalling = Boolean(status?.busy);
   useEffect(() => {
     const controller = new AbortController();
     let loading = false;
@@ -26,12 +27,15 @@ export function MediaComponentPanel() {
       }
     };
     void load();
+    if (!isInstalling) {
+      return () => controller.abort();
+    }
     const timer = setInterval(() => void load(), 1500);
     return () => {
       controller.abort();
       clearInterval(timer);
     };
-  }, []);
+  }, [isInstalling]);
   async function act(action: 'install' | 'cancel') {
     setPending(true);
     setError('');

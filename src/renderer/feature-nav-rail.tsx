@@ -3,6 +3,7 @@ import type { FeatureModuleId, FeatureNavItem } from './modules/module-contracts
 import { IconBack, IconCheckList, IconChevron, IconChevronDown, IconLayers } from './icons.js';
 
 const RAIL_COLLAPSED_STORAGE_KEY = 'workbench.nav-rail-collapsed.v1';
+const RAIL_CLOSED_GROUPS_STORAGE_KEY = 'workbench.nav-rail-closed-groups.v1';
 
 function readInitialCollapsed(): boolean {
   try {
@@ -12,8 +13,39 @@ function readInitialCollapsed(): boolean {
   }
 }
 
+function readInitialClosedGroups(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(RAIL_CLOSED_GROUPS_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((item): item is string => typeof item === 'string'));
+  } catch {
+    return new Set();
+  }
+}
+
 function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
   switch (icon) {
+    case 'auto-scheduler':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <circle cx="12" cy="13" r="8" />
+          <path d="M12 9v4l2.8 2" />
+          <path d="M5 3 2 6M22 6l-3-3" />
+        </svg>
+      );
     case 'active-accounts':
       return <IconLayers size={16} />;
     case 'group-inviter':
@@ -89,6 +121,137 @@ function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
           <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
         </svg>
       );
+    case 'sheets-groups':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M3 10h18M9 4v16" />
+        </svg>
+      );
+    case 'sheets-pages':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M3 10h18M15 4v16" />
+        </svg>
+      );
+    case 'sheets-schedule':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="3" y="4" width="18" height="17" rx="2" />
+          <path d="M8 2v4M16 2v4M3 10h18" />
+          <path d="M8 14h3M8 17h7" />
+        </svg>
+      );
+    case 'sheets-records':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M4 5h16M4 12h16M4 19h10" />
+          <path d="M18 16v6M15 19l3-3 3 3" />
+        </svg>
+      );
+    case 'bluestacks-active':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+          <path d="M9 10.5h2l1.5-3 2 6 1.5-3h1" />
+        </svg>
+      );
+    case 'bluestacks-group-poster':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+          <path d="M9 13.5 14.5 8l1.5 1.5L10.5 15H9v-1.5z" />
+        </svg>
+      );
+    case 'bluestacks-group-inviter':
+      return (
+        <svg
+          width={16}
+          height={16}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
+          <path d="M10 18.5h4" />
+          <circle cx="11" cy="9.5" r="2" />
+          <path d="M8.5 14.5c0-1.4 1.1-2.4 2.5-2.4s2.5 1 2.5 2.4M15.5 9.5v3M14 11h3" />
+        </svg>
+      );
     case 'bluestacks-group-bumper':
       return (
         <svg
@@ -142,7 +305,7 @@ export function FeatureNavRail({
   onSelectModule: (moduleId: FeatureModuleId) => void;
 }) {
   const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
-  const [closedGroups, setClosedGroups] = useState<Set<string>>(() => new Set());
+  const [closedGroups, setClosedGroups] = useState<Set<string>>(readInitialClosedGroups);
 
   useEffect(() => {
     try {
@@ -152,9 +315,28 @@ export function FeatureNavRail({
     }
   }, [collapsed]);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        RAIL_CLOSED_GROUPS_STORAGE_KEY,
+        JSON.stringify([...closedGroups].sort()),
+      );
+    } catch {
+      // Ignore storage write errors in restricted contexts.
+    }
+  }, [closedGroups]);
+
+  const controlItems = items.filter((item) => item.group === 'control' || item.group === 'monitor');
   const automationItems = items.filter((item) => item.group === 'automation');
   const bluestacksItems = items.filter((item) => item.group === 'bluestacks');
-  const monitorItems = items.filter((item) => item.group === 'monitor');
+  const sheetsItems = items.filter((item) => item.group === 'sheets');
+
+  const navGroups: Array<{ key: string; label: string; items: readonly FeatureNavItem[] }> = [
+    { key: 'control', label: '调度与监控', items: controlItems },
+    { key: 'automation', label: '浏览器自动化', items: automationItems },
+    { key: 'bluestacks', label: '蓝蝶模拟器', items: bluestacksItems },
+    { key: 'sheets', label: '云表协同', items: sheetsItems },
+  ].filter((group) => group.items.length > 0);
 
   function toggleGroup(groupKey: string) {
     setClosedGroups((prev) => {
@@ -171,6 +353,8 @@ export function FeatureNavRail({
     const badgeCount = item.badgeCount ?? 0;
     const showRunning = runningCount > 0;
     const showBadge = badgeCount > 0;
+    const isHealthyBadge = item.badgeTone === 'ok';
+    const badgeDesc = isHealthyBadge ? `${badgeCount} 项已启用` : `${badgeCount} 项需要处理`;
     return (
       <button
         key={item.id}
@@ -178,9 +362,9 @@ export function FeatureNavRail({
         className={'nav-rail-item' + (isActive ? ' active' : '')}
         aria-current={isActive ? 'page' : undefined}
         title={
-          item.title +
+          (item.tooltip ?? item.title) +
           (showRunning ? `（${runningCount} 运行中）` : '') +
-          (showBadge ? `（${badgeCount} 需处理）` : '')
+          (showBadge ? `（${badgeDesc}）` : '')
         }
         onClick={() => onSelectModule(item.id)}
       >
@@ -199,16 +383,13 @@ export function FeatureNavRail({
         {!collapsed && showRunning && (
           <span
             className="nav-rail-badge tone-run"
-            title={`${runningCount} 个浏览器正在运行${item.title}`}
+            title={`${runningCount} 个任务正在运行${item.title}`}
           >
             {runningCount > 1 ? `${runningCount}运行` : '运行中'}
           </span>
         )}
         {!collapsed && !showRunning && showBadge && (
-          <span
-            className={'nav-rail-badge tone-' + (item.badgeTone ?? 'err')}
-            title={`${badgeCount} 项需要处理`}
-          >
+          <span className={'nav-rail-badge tone-' + (item.badgeTone ?? 'err')} title={badgeDesc}>
             {badgeCount}
           </span>
         )}
@@ -235,67 +416,48 @@ export function FeatureNavRail({
       </div>
 
       <div className="nav-rail-groups">
-        <div className="nav-rail-group">
-          {!collapsed && (
-            <button
-              type="button"
-              className={
-                'nav-rail-group-title' + (closedGroups.has('automation') ? ' is-closed' : '')
-              }
-              aria-expanded={!closedGroups.has('automation')}
-              onClick={() => toggleGroup('automation')}
-            >
-              <IconChevronDown size={12} />
-              <span>自动化功能</span>
-            </button>
-          )}
-          {(collapsed || !closedGroups.has('automation')) && (
-            <div className="nav-rail-list">{automationItems.map(renderItem)}</div>
-          )}
-        </div>
-
-        {bluestacksItems.length > 0 && (
-          <>
-            <div className="nav-rail-divider" role="separator" />
-            <div className="nav-rail-group">
-              {!collapsed && (
-                <button
-                  type="button"
-                  className={
-                    'nav-rail-group-title' + (closedGroups.has('bluestacks') ? ' is-closed' : '')
-                  }
-                  aria-expanded={!closedGroups.has('bluestacks')}
-                  onClick={() => toggleGroup('bluestacks')}
-                >
-                  <IconChevronDown size={12} />
-                  <span>蓝蝶自动化</span>
-                </button>
-              )}
-              {(collapsed || !closedGroups.has('bluestacks')) && (
-                <div className="nav-rail-list">{bluestacksItems.map(renderItem)}</div>
-              )}
+        {navGroups.map((group, idx) => {
+          const isClosed = closedGroups.has(group.key);
+          const groupRunning = group.items.reduce((sum, it) => sum + (it.runningCount ?? 0), 0);
+          const groupAlert = group.items.reduce(
+            (sum, it) => sum + (it.badgeTone !== 'ok' ? (it.badgeCount ?? 0) : 0),
+            0,
+          );
+          const groupEnabled = group.items.reduce(
+            (sum, it) => sum + (it.badgeTone === 'ok' ? (it.badgeCount ?? 0) : 0),
+            0,
+          );
+          return (
+            <div key={group.key} className="nav-rail-group-wrap">
+              {idx > 0 && <div className="nav-rail-divider" role="separator" />}
+              <div className="nav-rail-group">
+                {!collapsed && (
+                  <button
+                    type="button"
+                    className={'nav-rail-group-title' + (isClosed ? ' is-closed' : '')}
+                    aria-expanded={!isClosed}
+                    onClick={() => toggleGroup(group.key)}
+                  >
+                    <IconChevronDown size={12} />
+                    <span className="nav-rail-group-title-text">{group.label}</span>
+                    {isClosed && groupRunning > 0 && (
+                      <span className="nav-rail-group-pill tone-run">{groupRunning}运行</span>
+                    )}
+                    {isClosed && groupRunning === 0 && groupAlert > 0 && (
+                      <span className="nav-rail-group-pill tone-err">{groupAlert}</span>
+                    )}
+                    {isClosed && groupRunning === 0 && groupAlert === 0 && groupEnabled > 0 && (
+                      <span className="nav-rail-group-pill tone-ok">{groupEnabled}</span>
+                    )}
+                  </button>
+                )}
+                {(collapsed || !isClosed) && (
+                  <div className="nav-rail-list">{group.items.map(renderItem)}</div>
+                )}
+              </div>
             </div>
-          </>
-        )}
-
-        <div className="nav-rail-divider" role="separator" />
-
-        <div className="nav-rail-group nav-rail-group-bottom">
-          {!collapsed && (
-            <button
-              type="button"
-              className={'nav-rail-group-title' + (closedGroups.has('monitor') ? ' is-closed' : '')}
-              aria-expanded={!closedGroups.has('monitor')}
-              onClick={() => toggleGroup('monitor')}
-            >
-              <IconChevronDown size={12} />
-              <span>全局中心</span>
-            </button>
-          )}
-          {(collapsed || !closedGroups.has('monitor')) && (
-            <div className="nav-rail-list">{monitorItems.map(renderItem)}</div>
-          )}
-        </div>
+          );
+        })}
       </div>
     </nav>
   );

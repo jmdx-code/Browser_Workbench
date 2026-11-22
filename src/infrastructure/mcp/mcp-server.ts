@@ -7,7 +7,9 @@ import {
   type WorkbenchMcpDependencies,
 } from './mcp-context.js';
 import { createActiveAccountsTools } from './tools-active-accounts.js';
+import { createAutoSchedulerTools } from './tools-auto-scheduler.js';
 import { createAgentBrowserTools } from './tools-browser.js';
+import { createGoogleSheetsTools } from './tools-google-sheets.js';
 import { createMonitorAndDiagnosticTools } from './tools-monitor-diagnostics.js';
 import { createPosterAndModuleTools } from './tools-poster-modules.js';
 import { createWorkspaceAndTargetTools } from './tools-workspace-targets.js';
@@ -62,6 +64,8 @@ export function buildWorkbenchMcpTools(deps: WorkbenchMcpDependencies): McpToolD
   return [
     ...createWorkspaceAndTargetTools(deps),
     ...createActiveAccountsTools(deps),
+    ...createAutoSchedulerTools(deps),
+    ...createGoogleSheetsTools(deps),
     ...createPosterAndModuleTools(deps),
     ...createMonitorAndDiagnosticTools(deps),
     ...createAgentBrowserTools(deps),
@@ -207,10 +211,20 @@ export function createWorkbenchMcpHttpHandler(
           : {};
 
       const startedAt = Date.now();
-      const isReadOnly = tool.annotations?.readOnlyHint === true;
+      const nonWorkspaceMutationTools = new Set([
+        'wb_browser_open',
+        'wb_browser_observe',
+        'wb_browser_act',
+        'wb_browser_screenshot',
+        'wb_browser_close',
+        'wb_inspect_profiles',
+        'wb_wait_for_task',
+      ]);
+      const skipMutationLock =
+        tool.annotations?.readOnlyHint === true || nonWorkspaceMutationTools.has(toolName);
       try {
         const result =
-          !isReadOnly && deps.withMutation
+          !skipMutationLock && deps.withMutation
             ? await deps.withMutation(() => tool.handler(rawArgs))
             : await tool.handler(rawArgs);
         devDiag.record({
@@ -271,6 +285,7 @@ export function createWorkbenchMcpHttpHandler(
     }
 
     if (req.method === 'DELETE') {
+      await deps.agentBrowser.closeAll().catch(() => {});
       sendJson(res, 200, { terminated: true });
       return true;
     }

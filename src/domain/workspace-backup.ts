@@ -2,7 +2,11 @@ import type { Awaitable } from './persistence.js';
 import type { BackupResult } from '../shared/workspace-backup.js';
 export interface WorkspaceBackupWriter {
   defaultDirectory?(): string;
-  write(directory: string, guard: () => Awaitable<void>): Promise<BackupResult>;
+  write(
+    directory: string,
+    guard: () => Awaitable<void>,
+    options?: { redactSecrets?: boolean | undefined },
+  ): Promise<BackupResult>;
 }
 export interface WorkspaceRestorePort {
   inspect(directory: string): Promise<import('../shared/workspace-backup.js').RestoreInspection>;

@@ -19,7 +19,11 @@ export class FilesystemWorkspaceBackupWriter implements WorkspaceBackupWriter {
   defaultDirectory() {
     return defaultBackupDirectory();
   }
-  async write(directory: string, guard: () => Awaitable<void>) {
+  async write(
+    directory: string,
+    guard: () => Awaitable<void>,
+    options?: { redactSecrets?: boolean | undefined },
+  ) {
     if (!path.isAbsolute(directory) || !(await stat(directory)).isDirectory())
       throw Error('请选择已存在的本机备份文件夹');
     if (this.protectedDataDirectory) {
@@ -53,7 +57,37 @@ export class FilesystemWorkspaceBackupWriter implements WorkspaceBackupWriter {
       // Make the new backup self-contained; opening it must not require external WAL files.
       const saved = new DatabaseSync(file);
       try {
+        saved.exec('PRAGMA busy_timeout = 5000');
         saved.exec('PRAGMA journal_mode=DELETE');
+        if (options?.redactSecrets && name === 'workspace.sqlite') {
+          // Redact Google OAuth tokens/clientSecret and Gyazo tokens ONLY inside the exported backup copy
+          try {
+            const row = saved
+              .prepare('SELECT auth_json, image_host_json FROM google_sheets_config WHERE id = 1')
+              .get() as { auth_json?: string; image_host_json?: string } | undefined;
+            if (row) {
+              const auth = JSON.parse(row.auth_json ?? '{}') as Record<string, unknown>;
+              const img = JSON.parse(row.image_host_json ?? '{}') as Record<string, unknown>;
+              const scrubbedAuth = {
+                ...auth,
+                clientSecret: '',
+                accessToken: null,
+                refreshToken: null,
+                expiryDate: null,
+              };
+              const scrubbedImg = {
+                ...img,
+                gyazoAccessToken: '',
+                gyazoAccessTokens: [],
+              };
+              saved
+                .prepare(
+                  'UPDATE google_sheets_config SET auth_json = ?, image_host_json = ? WHERE id = 1',
+                )
+                .run(JSON.stringify(scrubbedAuth), JSON.stringify(scrubbedImg));
+            }
+          } catch {}
+        }
       } finally {
         saved.close();
       }

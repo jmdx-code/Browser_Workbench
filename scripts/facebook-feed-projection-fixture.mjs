@@ -55,8 +55,18 @@ if (!process.versions.electron) {
       response.writeHead(200, { 'content-type': 'text/html;charset=utf-8' });
       response.end(documentHTML);
     });
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const origin = 'http://127.0.0.1:' + server.address().port;
+    const unsafeChromiumPorts = new Set([
+      1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669,
+      6697, 10080,
+    ]);
+    let port = 0;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      port = server.address().port;
+      if (!unsafeChromiumPorts.has(port)) break;
+      await new Promise((resolve) => server.close(resolve));
+    }
+    const origin = 'http://127.0.0.1:' + port;
     const actions =
       '<i data-ad-rendering-role="like_button"></i><i data-ad-rendering-role="share_button"></i>';
     const author = '<h4 data-ad-rendering-role="profile_name">Fixture author</h4>';

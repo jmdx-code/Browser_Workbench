@@ -324,6 +324,8 @@ export class GroupInviterService {
     );
   }
 
+  private readonly workerPromises = new Map<string, Promise<void>>();
+
   async stop(): Promise<GroupInviterState> {
     this.startGeneration++;
     for (const id of [...this.startingProfiles, ...this.admittingProfiles]) {
@@ -331,7 +333,8 @@ export class GroupInviterService {
     }
     if (this.activeRun) {
       this.activeRun.cancelled = true;
-      for (const pid of this.activeRun.activeProfiles) {
+      const targetPids = [...this.activeRun.activeProfiles];
+      for (const pid of targetPids) {
         this.activeRun.cancelledProfiles.add(pid);
         this.activeRun.profileStatus.set(pid, '正在停止…');
       }
@@ -340,9 +343,15 @@ export class GroupInviterService {
         level: 'INFO',
         category: 'GROUP_INVITER',
         event: 'GROUP_INVITER_STOP_ALL',
-        data: { runId: this.activeRun.id, profiles: [...this.activeRun.activeProfiles] },
+        data: { runId: this.activeRun.id, profiles: targetPids },
       });
       await this.retryUnconfirmedStops(this.activeRun, [...this.activeRun.unconfirmedStops]);
+      const pendingWorkers = targetPids
+        .map((pid) => this.workerPromises.get(pid))
+        .filter((p): p is Promise<void> => Boolean(p));
+      if (pendingWorkers.length > 0) {
+        await Promise.race([Promise.allSettled(pendingWorkers), sleep(6_000)]);
+      }
     }
     return await this.state();
   }
@@ -369,11 +378,20 @@ export class GroupInviterService {
           });
         }
       }
-      if (run.activeProfiles.size === 0) {
+      const allActiveCancelled =
+        run.activeProfiles.size === 0 ||
+        [...run.activeProfiles].every((pid) => run.cancelledProfiles.has(pid));
+      if (allActiveCancelled) {
         run.cancelled = true;
         run.statusText = '正在停止…';
       }
       await this.retryUnconfirmedStops(run, profileIds);
+      const pendingWorkers = profileIds
+        .map((pid) => this.workerPromises.get(pid))
+        .filter((p): p is Promise<void> => Boolean(p));
+      if (pendingWorkers.length > 0) {
+        await Promise.race([Promise.allSettled(pendingWorkers), sleep(6_000)]);
+      }
     }
     return await this.state();
   }
@@ -397,7 +415,10 @@ export class GroupInviterService {
       );
     }
     const generation = this.startGeneration;
-    for (const id of candidateProfiles) {
+    const reservedIds = this.featureExecution
+      ? (await this.featureExecution.tryReserve('group-inviter', candidateProfiles)).reservedIds
+      : candidateProfiles;
+    for (const id of reservedIds) {
       this.admittingProfiles.add(id);
       this.startingCancelled.delete(id);
     }
@@ -585,9 +606,10 @@ export class GroupInviterService {
       });
       return await this.state();
     } finally {
-      for (const id of candidateProfiles) {
+      for (const id of reservedIds) {
         this.admittingProfiles.delete(id);
       }
+      this.featureExecution?.releaseReservation('group-inviter', reservedIds);
       if (admittedBatch && this.startingProfiles === admittedBatch) {
         this.startingProfiles.clear();
         this.startingCancelled.clear();
@@ -988,7 +1010,13 @@ export class GroupInviterService {
       await Promise.all(
         profileIds.map((pid, index) => {
           if (index > 0) startupDelay += randInt(800, 1500);
-          return runWorkerForProfile(pid, startupDelay);
+          const workerPromise = runWorkerForProfile(pid, startupDelay).finally(() => {
+            if (this.workerPromises.get(pid) === workerPromise) {
+              this.workerPromises.delete(pid);
+            }
+          });
+          this.workerPromises.set(pid, workerPromise);
+          return workerPromise;
         }),
       );
 

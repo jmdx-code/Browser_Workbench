@@ -11,6 +11,7 @@ export function NameDialog({
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const submittingRef = useRef(false);
   const [name, setName] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -18,19 +19,29 @@ export function NameDialog({
     dialog.current?.showModal();
   }, []);
   async function save() {
-    if (!name.trim() || busy) return;
+    if (!name.trim() || submittingRef.current || busy) return;
+    submittingRef.current = true;
     setBusy(true);
+    setError('');
     try {
       await onSubmit(name.trim());
       onClose();
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : '保存失败');
     } finally {
+      submittingRef.current = false;
       setBusy(false);
     }
   }
   return (
-    <dialog ref={dialog} className="name-dialog" onCancel={onClose}>
+    <dialog
+      ref={dialog}
+      className="name-dialog"
+      onCancel={(event) => {
+        if (busy) event.preventDefault();
+        else onClose();
+      }}
+    >
       <form
         onSubmit={(event) => {
           event.preventDefault();

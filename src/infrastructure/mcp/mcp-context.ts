@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import { lstat, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { open as openZip, type Entry, type ZipFile } from 'yauzl';
 import { ProductError } from '../../domain/workspace.js';
@@ -13,6 +13,8 @@ import type { GroupPosterService } from '../../application/group-poster-service.
 import type { GroupBumperService } from '../../application/group-bumper-service.js';
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
 import type { BluestacksService } from '../../application/bluestacks-service.js';
+import type { AutoSchedulerService } from '../../application/auto-scheduler-service.js';
+import type { GoogleSheetsService } from '../../application/google-sheets-service.js';
 import type { TaskService } from '../../application/task-service.js';
 import type { Awaitable } from '../../domain/persistence.js';
 import { bluestacksDisplayTitle, type BluestacksInstance } from '../../shared/bluestacks.js';
@@ -91,6 +93,8 @@ export interface WorkbenchMcpDependencies {
   getGroupBumperService: () => GroupBumperService | undefined;
   groupInviterService: GroupInviterService;
   bluestacksService: BluestacksService;
+  getAutoSchedulerService?: (() => AutoSchedulerService | undefined) | undefined;
+  getGoogleSheetsService?: (() => GoogleSheetsService | undefined) | undefined;
   agentBrowser: AgentBrowserManager;
   profileLifecycle?: ProfileLifecyclePort | undefined;
   browserWindow?: BrowserWindowPort | undefined;
@@ -216,6 +220,20 @@ export function parseFlexibleScheduleTime(raw: unknown, nowMs = Date.now()): Par
   if (/^\d{10,13}$/.test(text)) {
     const num = Number(text);
     const ms = text.length === 10 ? num * 1000 : num;
+    return {
+      scheduledAt: ms,
+      scheduledAtLocal: formatLocalDateTime(ms),
+      mode: ms > nowMs ? 'scheduled' : 'immediate',
+      rolledToNextDay: false,
+    };
+  }
+  const shortRelMatch = /^\+(\d+)\s*(s|m|h|d)$/i.exec(text);
+  if (shortRelMatch) {
+    const amount = Number(shortRelMatch[1]);
+    const unit = (shortRelMatch[2] ?? 'm').toLowerCase();
+    const mult =
+      unit === 's' ? 1000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000;
+    const ms = nowMs + amount * mult;
     return {
       scheduledAt: ms,
       scheduledAtLocal: formatLocalDateTime(ms),
@@ -978,6 +996,10 @@ export async function readSpreadsheetOrTableFile(
   options?: TableReadOptions,
 ): Promise<TableReadResult> {
   const resolved = path.resolve(rawFilePath.trim());
+  const linkStat = await lstat(resolved);
+  if (linkStat.isSymbolicLink()) {
+    throw new Error(`SYMLINK_REJECTED: 不允许读取符号链接路径 "${resolved}"`);
+  }
   const fileStat = await stat(resolved);
   if (!fileStat.isFile()) {
     throw new Error(`NOT_A_FILE: "${resolved}" 不是有效文件`);
@@ -987,6 +1009,12 @@ export async function readSpreadsheetOrTableFile(
   }
 
   const ext = path.extname(resolved).toLowerCase();
+  const allowedTableExts = new Set(['.xlsx', '.csv', '.tsv', '.json', '.jsonl', '.txt']);
+  if (!allowedTableExts.has(ext)) {
+    throw new Error(
+      `UNSUPPORTED_TABLE_FILE: 仅允许读取表格或文本文件（.xlsx/.csv/.tsv/.json/.jsonl/.txt），拒绝读取 "${ext || '(无扩展名)'}"`,
+    );
+  }
   const hasHeader = options?.hasHeader !== false;
   const offset = Math.max(0, Math.floor(options?.offset ?? 0));
   const limit = Math.max(1, Math.min(1000, Math.floor(options?.limit ?? 200)));

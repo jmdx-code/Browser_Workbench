@@ -52,14 +52,13 @@ export function BridgeConnectionPanel({ profiles }: { profiles: Profile[] }) {
   };
   return (
     <div className="connection-health">
-      <h3>连接诊断</h3>
+      <h3>连接状态</h3>
       {error && (
         <p className="text-danger" role="alert">
           {error}
         </p>
       )}
       {notice && <p role="status">{notice}</p>}
-      <button onClick={() => setRevision((value) => value + 1)}>刷新连接诊断</button>
       {health && (
         <>
           {health.pending.map((attempt) => (
@@ -68,6 +67,8 @@ export function BridgeConnectionPanel({ profiles }: { profiles: Profile[] }) {
                 {name(attempt.profileId)} · {attempt.profileId.slice(0, 8)} · 等待本机认证恢复
               </span>
               <button
+                type="button"
+                className="btn btn-sm"
                 disabled={
                   attempt.expiresAt <= Date.now() ||
                   profiles.some((row) => row.id === attempt.profileId && row.online)
@@ -79,7 +80,7 @@ export function BridgeConnectionPanel({ profiles }: { profiles: Profile[] }) {
             </div>
           ))}
           {health.failures.length === 0 && health.pending.length === 0 && (
-            <p>本次软件启动后未记录连接拒绝。</p>
+            <p className="muted">本地桥接连接正常，本次启动后无连接拒绝记录。</p>
           )}
           {health.failures.map((failure) => (
             <p key={failure.profileId ?? 'unidentified'}>

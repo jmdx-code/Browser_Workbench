@@ -356,6 +356,7 @@ export class LocalBrowserLabels {
                 ids: new Set(activeIds),
               };
         let complete = true;
+        let readFailed = false;
         for (const extensionId of this.extensionIds) {
           if (!/^[a-p]{32}$/.test(extensionId)) continue;
           const directory = path.join(
@@ -400,10 +401,28 @@ export class LocalBrowserLabels {
                 if (bytes.includes(Buffer.from(id))) progress.found.add(id);
               progress.files.add(location);
             } catch {
-              complete = false; /* Retry a file rotated/locked by the browser next pass. */
+              readFailed = true; /* Locked/rotated file: advance past this folder so other profiles aren't head-of-line blocked. */
             }
           }
           if (exhausted) break;
+        }
+        if (exhausted) {
+          this.partial = progress;
+          this.nextCursor = index;
+          break;
+        }
+        if (readFailed) {
+          // Record any IDs already discovered from readable files in this folder,
+          // then advance cursor to avoid head-of-line livelock on a permanently locked file.
+          for (const id of activeIds) {
+            const state = this.inProgress.get(id);
+            if (!state || !state.remainingFolders.has(entry.key)) continue;
+            if (progress.found.has(id)) state.matchedByFolder.set(entry.key, entry);
+            state.remainingFolders.delete(entry.key);
+          }
+          this.partial = undefined;
+          this.nextCursor = (index + 1) % entries.length;
+          continue;
         }
         if (!complete) {
           this.partial = progress;

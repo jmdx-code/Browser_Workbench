@@ -6,7 +6,11 @@ import type { GroupBumperService } from '../../application/group-bumper-service.
 import type { GroupInviterService } from '../../application/group-inviter-service.js';
 import type { GroupPosterService } from '../../application/group-poster-service.js';
 import type { BluestacksService } from '../../application/bluestacks-service.js';
+import type { AutoSchedulerService } from '../../application/auto-scheduler-service.js';
+import type { GoogleSheetsService } from '../../application/google-sheets-service.js';
+import { handleAutoSchedulerRoutes } from './auto-scheduler-routes.js';
 import { handleBluestacksRoutes } from './bluestacks-routes.js';
+import { handleGoogleSheetsRoutes } from './google-sheets-routes.js';
 import { handleGroupPosterRoutes } from './group-poster-routes.js';
 import type { NativeReviewService } from '../../application/native-review.js';
 import type { ProfileInspectionService } from '../../application/profile-inspection.js';
@@ -48,6 +52,8 @@ export interface FeatureModuleRouteContext {
   groupBumper?: GroupBumperService | undefined;
   groupPoster?: GroupPosterService | undefined;
   bluestacks?: BluestacksService | undefined;
+  autoScheduler?: AutoSchedulerService | undefined;
+  googleSheets?: GoogleSheetsService | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
 }
 
@@ -68,8 +74,18 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
     groupBumper,
     groupPoster,
     bluestacks,
+    autoScheduler,
+    googleSheets,
     featureExecution,
   } = ctx;
+
+  if (await handleGoogleSheetsRoutes({ req, res, route, input, json, cleanup, googleSheets })) {
+    return true;
+  }
+
+  if (await handleAutoSchedulerRoutes({ req, res, route, input, json, cleanup, autoScheduler })) {
+    return true;
+  }
 
   if (await handleBluestacksRoutes({ req, res, route, input, json, cleanup, bluestacks })) {
     return true;

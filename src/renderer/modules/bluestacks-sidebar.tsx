@@ -1,5 +1,9 @@
 import { useRef, useState } from 'react';
-import { bluestacksDisplayTitle, type BluestacksState } from '../../shared/bluestacks.js';
+import {
+  bluestacksDisplayTitle,
+  type BluestacksInstance,
+  type BluestacksState,
+} from '../../shared/bluestacks.js';
 import { api } from '../api.js';
 import { nudgeFinderIds } from '../finder-list-model.js';
 import {
@@ -15,7 +19,10 @@ import {
 } from '../icons.js';
 import { PopoverMenu } from '../popover-menu.js';
 import { selectionState, toggleSet } from '../selection.js';
+import { BluestacksBatchLoginModal } from './bluestacks-batch-login-modal.js';
 import { BluestacksSidebarDialogs } from './bluestacks-config-dialog.js';
+import { BluestacksHealthCheckModal } from './bluestacks-health-check-modal.js';
+import { BluestacksRiskDashboardModal } from './bluestacks-risk-dashboard-modal.js';
 import { BluestacksGroupCheck, BluestacksInstanceRow } from './bluestacks-sidebar-row.js';
 
 export function BluestacksSidebar({
@@ -31,7 +38,12 @@ export function BluestacksSidebar({
   selected: ReadonlySet<string>;
   onSelect: (ids: Set<string>) => void;
   onError: (msg: string) => void;
-  mode?: 'bluestacks-group-bumper' | 'bluestacks-page-bumper';
+  mode?:
+    | 'bluestacks-active'
+    | 'bluestacks-group-poster'
+    | 'bluestacks-group-bumper'
+    | 'bluestacks-page-bumper'
+    | 'bluestacks-group-inviter';
 }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'online' | 'selected'>('all');
@@ -42,7 +54,12 @@ export function BluestacksSidebar({
   const [deletingFolder, setDeletingFolder] = useState<{ id: string; name: string } | null>(null);
   const [renamingInst, setRenamingInst] = useState<{ id: string; alias: string } | null>(null);
   const [deletingInsts, setDeletingInsts] = useState<{ ids: string[]; label: string } | null>(null);
+  const [loginInst, setLoginInst] = useState<BluestacksInstance | null>(null);
+  const [switchIdentityInst, setSwitchIdentityInst] = useState<BluestacksInstance | null>(null);
   const [selectByIdsOpen, setSelectByIdsOpen] = useState(false);
+  const [batchLoginOpen, setBatchLoginOpen] = useState(false);
+  const [healthCheckOpen, setHealthCheckOpen] = useState(false);
+  const [riskDashboardOpen, setRiskDashboardOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const rangeAnchor = useRef<string | null>(null);
@@ -53,14 +70,23 @@ export function BluestacksSidebar({
   const launchingSet = new Set(state?.launchingIds ?? []);
   const closingSet = new Set(state?.closingIds ?? []);
   const inspectingSet = new Set(state?.inspectingIds ?? []);
+  const installingSet = new Set(state?.installingIds ?? []);
+  const loggingInSet = new Set(state?.loggingInIds ?? []);
+  const switchingSet = new Set(state?.switchingIds ?? []);
 
-  async function exec(action: string, payload: unknown = {}) {
+  const busyRef = useRef(false);
+  async function exec(action: string, payload: unknown = {}): Promise<boolean> {
+    if (busyRef.current) return false;
+    busyRef.current = true;
     setBusy(true);
     try {
       onChange(await api.bluestacksAction(action, payload));
+      return true;
     } catch (err) {
       onError(err instanceof Error ? err.message : '操作未成功');
+      return false;
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -83,7 +109,9 @@ export function BluestacksSidebar({
     (g) => g.id !== 'ungrouped' || instances.some((i) => !i.folderId) || folders.length === 0,
   );
   const visibleIds = visibleGroups.flatMap((g) =>
-    matched.filter((i) => (i.folderId ?? 'ungrouped') === g.id).map((i) => i.id),
+    closed.has(g.id)
+      ? []
+      : matched.filter((i) => (i.folderId ?? 'ungrouped') === g.id).map((i) => i.id),
   );
   const matchedState = selectionState(selected, visibleIds);
 
@@ -122,11 +150,21 @@ export function BluestacksSidebar({
   }
 
   function getEffectiveStat(id: string) {
+    const activeStat = state?.activeProfileCounts?.[id];
+    const posterStat = state?.posterProfileCounts?.[id];
+    const inviterStat = state?.inviterProfileCounts?.[id];
     const groupStat = state?.profileCounts[id];
     const pageStat = state?.pageBumperProfileCounts?.[id];
+    if (activeStat?.running) return activeStat;
+    if (posterStat?.running) return posterStat;
+    if (inviterStat?.running) return inviterStat;
     if (pageStat?.running) return pageStat;
     if (groupStat?.running) return groupStat;
-    return mode === 'bluestacks-page-bumper' ? (pageStat ?? groupStat) : (groupStat ?? pageStat);
+    if (mode === 'bluestacks-active') return activeStat ?? groupStat;
+    if (mode === 'bluestacks-group-poster') return posterStat ?? groupStat;
+    if (mode === 'bluestacks-group-inviter') return inviterStat ?? groupStat;
+    if (mode === 'bluestacks-page-bumper') return pageStat ?? groupStat;
+    return groupStat ?? pageStat;
   }
 
   const selectedIds = [...selected];
@@ -140,42 +178,36 @@ export function BluestacksSidebar({
         <span className="count-chip" title="在线窗口 / 全部实例">
           {onlineCount}/{instances.length}
         </span>
-        <button
-          type="button"
-          className="btn btn-sm sidebar-select-ids-btn"
-          disabled={instances.length === 0}
-          onClick={() => setSelectByIdsOpen(true)}
-        >
-          按 ID 选中
-        </button>
-        <button
-          type="button"
-          className="btn btn-icon btn-ghost"
-          title="刷新蓝蝶多开列表"
-          aria-label="刷新蓝蝶多开列表"
-          disabled={busy}
-          onClick={() => void exec('refresh')}
-        >
-          <IconRefresh />
-        </button>
-        <button
-          type="button"
-          className="btn btn-icon btn-ghost"
-          title="蓝蝶路径设置"
-          aria-label="蓝蝶路径设置"
-          onClick={() => setConfigOpen(true)}
-        >
-          <IconSettings size={15} />
-        </button>
-        <button
-          type="button"
-          className="btn btn-icon btn-ghost"
-          title="新建分组"
-          aria-label="新建分组"
-          onClick={() => setCreating(!creating)}
-        >
-          <IconPlus />
-        </button>
+        <div className="sidebar-heading-actions">
+          <button
+            type="button"
+            className="btn btn-icon btn-ghost"
+            title="刷新蓝蝶多开列表"
+            aria-label="刷新蓝蝶多开列表"
+            disabled={busy}
+            onClick={() => void exec('refresh')}
+          >
+            <IconRefresh />
+          </button>
+          <button
+            type="button"
+            className="btn btn-icon btn-ghost"
+            title="蓝蝶路径与 APK 设置"
+            aria-label="蓝蝶路径与 APK 设置"
+            onClick={() => setConfigOpen(true)}
+          >
+            <IconSettings size={15} />
+          </button>
+          <button
+            type="button"
+            className="btn btn-icon btn-ghost"
+            title="新建分组"
+            aria-label="新建分组"
+            onClick={() => setCreating(!creating)}
+          >
+            <IconPlus />
+          </button>
+        </div>
       </div>
 
       <div className="search-area">
@@ -212,6 +244,76 @@ export function BluestacksSidebar({
             ))}
           </div>
         </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 6 }}>
+          <div style={{ display: 'flex', gap: 5 }}>
+            <button
+              type="button"
+              className="btn btn-sm sidebar-select-ids-btn"
+              style={{ flex: 1, padding: '0 6px', fontSize: 12 }}
+              disabled={instances.length === 0}
+              onClick={() => setSelectByIdsOpen(true)}
+            >
+              按 ID 选中
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{
+                flex: 1,
+                padding: '0 6px',
+                fontSize: 12,
+                ...((state?.dailyUsage?.reachedLimitInstances ?? 0) > 0
+                  ? { color: '#b45309', borderColor: 'rgba(245,158,11,0.5)' }
+                  : {}),
+              }}
+              disabled={instances.length === 0}
+              title="查看今日蓝蝶各模块动作统计并配置单号每日风控安全限额"
+              onClick={() => setRiskDashboardOpen(true)}
+            >
+              {(state?.dailyUsage?.reachedLimitInstances ?? 0) > 0
+                ? `风控·休眠${state?.dailyUsage?.reachedLimitInstances}`
+                : (state?.dailyUsage?.totalActions ?? 0) > 0
+                  ? `风控(${state?.dailyUsage?.totalActions})`
+                  : '风控看板'}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{ padding: '0 8px', fontSize: 12 }}
+              disabled={busy || onlineCount === 0}
+              title="自动整齐平铺当前在线的蓝蝶模拟器窗口"
+              onClick={() => void exec('instances/arrange', {})}
+            >
+              平铺
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 5 }}>
+            <button
+              type="button"
+              className={state?.batchLogin?.running ? 'btn btn-sm btn-primary' : 'btn btn-sm'}
+              style={{ padding: '0 6px', fontSize: 12 }}
+              disabled={instances.length === 0}
+              title="粘贴账号清单批量自动登录 FB Lite（支持 2FA、自动开机与自动装包）"
+              onClick={() => setBatchLoginOpen(true)}
+            >
+              {state?.batchLogin?.running
+                ? `登录 ${state.batchLogin.completed}/${state.batchLogin.total}`
+                : '批量登录'}
+            </button>
+            <button
+              type="button"
+              className={state?.healthCheck?.running ? 'btn btn-sm btn-primary' : 'btn btn-sm'}
+              style={{ padding: '0 6px', fontSize: 12 }}
+              disabled={instances.length === 0}
+              title="并发巡检蓝蝶窗口健康状态（未登录 / Checkpoint / 封禁 / 缺 App / 横屏，并支持缺包自装）"
+              onClick={() => setHealthCheckOpen(true)}
+            >
+              {state?.healthCheck?.running
+                ? `体检 ${state.healthCheck.completed}/${state.healthCheck.total}`
+                : '批量体检'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {creating && (
@@ -219,22 +321,25 @@ export function BluestacksSidebar({
           className="inline-create"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!folderName.trim()) return;
-            void exec('folders/create', { name: folderName.trim() }).then(() => {
-              setFolderName('');
-              setCreating(false);
+            if (busy || !folderName.trim()) return;
+            void exec('folders/create', { name: folderName.trim() }).then((ok) => {
+              if (ok) {
+                setFolderName('');
+                setCreating(false);
+              }
             });
           }}
         >
           <input
             required
             autoFocus
+            disabled={busy}
             maxLength={80}
             placeholder="分组名称"
             value={folderName}
             onChange={(e) => setFolderName(e.target.value)}
           />
-          <button className="btn btn-primary" type="submit">
+          <button className="btn btn-primary" type="submit" disabled={busy}>
             创建
           </button>
           <button
@@ -249,109 +354,142 @@ export function BluestacksSidebar({
       )}
 
       <div className="profile-list">
-        {visibleGroups.map((group) => {
-          const allInGroup = instances.filter((i) => (i.folderId ?? 'ungrouped') === group.id);
-          const visibleInGroup = matched.filter((i) => (i.folderId ?? 'ungrouped') === group.id);
-          const groupVisIds = visibleInGroup.map((i) => i.id);
-          const gState = selectionState(selected, groupVisIds);
-          const isClosed = closed.has(group.id);
-          const runningCount = allInGroup.filter((i) => getEffectiveStat(i.id)?.running).length;
+        {instances.length === 0 ? (
+          <div className="sidebar-empty-guide">
+            <strong>未检测到蓝蝶多开实例</strong>
+            <p className="hint">
+              请确认已安装 BlueStacks 5，或点击下方按钮手动配置安装目录与{' '}
+              <code>bluestacks.conf</code> 路径。
+            </p>
+            <div className="sidebar-empty-actions">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => setConfigOpen(true)}
+              >
+                配置蓝蝶路径
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => void exec('refresh')}
+              >
+                重新扫描
+              </button>
+            </div>
+          </div>
+        ) : (
+          visibleGroups.map((group) => {
+            const allInGroup = instances.filter((i) => (i.folderId ?? 'ungrouped') === group.id);
+            const visibleInGroup = matched.filter((i) => (i.folderId ?? 'ungrouped') === group.id);
+            const groupVisIds = visibleInGroup.map((i) => i.id);
+            const gState = selectionState(selected, groupVisIds);
+            const isClosed = closed.has(group.id);
+            const runningCount = allInGroup.filter((i) => getEffectiveStat(i.id)?.running).length;
 
-          return (
-            <section className="group color-blue" key={group.id}>
-              <div className="group-head">
-                <BluestacksGroupCheck
-                  {...gState}
-                  label={'选择整组 ' + group.name}
-                  onChange={(checked) => onSelect(toggleSet(selected, groupVisIds, checked))}
-                />
-                <button
-                  type="button"
-                  className={'group-title' + (isClosed ? ' is-closed' : '')}
-                  aria-expanded={!isClosed}
-                  onClick={() => setClosed(toggleSet(closed, [group.id], !isClosed))}
-                >
-                  <IconChevronDown size={14} />
-                  <span>{group.name}</span>
-                </button>
-                {runningCount > 0 && (
-                  <span className="group-running">
-                    <IconPlay size={10} /> {runningCount}
+            return (
+              <section className="group color-blue" key={group.id}>
+                <div className="group-head">
+                  <BluestacksGroupCheck
+                    {...gState}
+                    label={'选择整组 ' + group.name}
+                    onChange={(checked) => onSelect(toggleSet(selected, groupVisIds, checked))}
+                  />
+                  <button
+                    type="button"
+                    className={'group-title' + (isClosed ? ' is-closed' : '')}
+                    aria-expanded={!isClosed}
+                    onClick={() => setClosed(toggleSet(closed, [group.id], !isClosed))}
+                  >
+                    <IconChevronDown size={14} />
+                    <span>{group.name}</span>
+                  </button>
+                  {runningCount > 0 && (
+                    <span className="group-running">
+                      <IconPlay size={10} /> {runningCount}
+                    </span>
+                  )}
+                  <span className="group-count">
+                    {allInGroup.filter((i) => selected.has(i.id)).length}/{allInGroup.length}
                   </span>
-                )}
-                <span className="group-count">
-                  {allInGroup.filter((i) => selected.has(i.id)).length}/{allInGroup.length}
-                </span>
-                {group.id !== 'ungrouped' && (
-                  <PopoverMenu
-                    className="group-menu"
-                    label={'分组操作 · ' + group.name}
-                    trigger={<IconMore size={15} />}
-                    items={[
-                      {
-                        label: '↑ 上移分组',
-                        onSelect: () => {
-                          const next = nudgeFinderIds(
-                            folders.map((f) => f.id),
-                            new Set([group.id]),
-                            -1,
-                          );
-                          void exec('folders/reorder', { ids: next });
+                  {group.id !== 'ungrouped' && (
+                    <PopoverMenu
+                      className="group-menu"
+                      label={'分组操作 · ' + group.name}
+                      trigger={<IconMore size={15} />}
+                      items={[
+                        {
+                          label: '↑ 上移分组',
+                          onSelect: () => {
+                            const next = nudgeFinderIds(
+                              folders.map((f) => f.id),
+                              new Set([group.id]),
+                              -1,
+                            );
+                            void exec('folders/reorder', { ids: next });
+                          },
                         },
-                      },
-                      {
-                        label: '↓ 下移分组',
-                        onSelect: () => {
-                          const next = nudgeFinderIds(
-                            folders.map((f) => f.id),
-                            new Set([group.id]),
-                            1,
-                          );
-                          void exec('folders/reorder', { ids: next });
+                        {
+                          label: '↓ 下移分组',
+                          onSelect: () => {
+                            const next = nudgeFinderIds(
+                              folders.map((f) => f.id),
+                              new Set([group.id]),
+                              1,
+                            );
+                            void exec('folders/reorder', { ids: next });
+                          },
                         },
-                      },
-                      {
-                        label: '重命名分组',
-                        icon: <IconEdit />,
-                        onSelect: () => setRenamingFolder({ id: group.id, name: group.name }),
-                      },
-                      {
-                        label: '删除分组',
-                        icon: <IconClose />,
-                        danger: true,
-                        onSelect: () => setDeletingFolder({ id: group.id, name: group.name }),
-                      },
-                    ]}
-                  />
+                        {
+                          label: '重命名分组',
+                          icon: <IconEdit />,
+                          onSelect: () => setRenamingFolder({ id: group.id, name: group.name }),
+                        },
+                        {
+                          label: '删除分组',
+                          icon: <IconClose />,
+                          danger: true,
+                          onSelect: () => setDeletingFolder({ id: group.id, name: group.name }),
+                        },
+                      ]}
+                    />
+                  )}
+                </div>
+                {!isClosed &&
+                  visibleInGroup.map((inst) => (
+                    <BluestacksInstanceRow
+                      key={inst.id}
+                      inst={inst}
+                      stat={getEffectiveStat(inst.id)}
+                      dailyStat={state?.dailyUsage?.perInstance[inst.id]}
+                      selected={selected.has(inst.id)}
+                      busy={busy}
+                      isLaunching={launchingSet.has(inst.id)}
+                      isClosing={closingSet.has(inst.id)}
+                      isInspecting={inspectingSet.has(inst.id)}
+                      isInstalling={installingSet.has(inst.id)}
+                      isLoggingIn={loggingInSet.has(inst.id)}
+                      isSwitching={switchingSet.has(inst.id)}
+                      onSelectRow={selectRow}
+                      onExec={(action, payload) => void exec(action, payload)}
+                      onRename={() =>
+                        setRenamingInst({ id: inst.id, alias: inst.alias ?? inst.displayName })
+                      }
+                      onDelete={() =>
+                        setDeletingInsts({ ids: [inst.id], label: bluestacksDisplayTitle(inst) })
+                      }
+                      onLogin={() => setLoginInst(inst)}
+                      onSwitchIdentity={() => setSwitchIdentityInst(inst)}
+                    />
+                  ))}
+                {!isClosed && visibleInGroup.length === 0 && (
+                  <p className="group-empty">暂无匹配的蓝蝶窗口</p>
                 )}
-              </div>
-              {!isClosed &&
-                visibleInGroup.map((inst) => (
-                  <BluestacksInstanceRow
-                    key={inst.id}
-                    inst={inst}
-                    stat={getEffectiveStat(inst.id)}
-                    selected={selected.has(inst.id)}
-                    busy={busy}
-                    isLaunching={launchingSet.has(inst.id)}
-                    isClosing={closingSet.has(inst.id)}
-                    isInspecting={inspectingSet.has(inst.id)}
-                    onSelectRow={selectRow}
-                    onExec={(action, payload) => void exec(action, payload)}
-                    onRename={() =>
-                      setRenamingInst({ id: inst.id, alias: inst.alias ?? inst.displayName })
-                    }
-                    onDelete={() =>
-                      setDeletingInsts({ ids: [inst.id], label: bluestacksDisplayTitle(inst) })
-                    }
-                  />
-                ))}
-              {!isClosed && visibleInGroup.length === 0 && (
-                <p className="group-empty">暂无匹配的蓝蝶窗口</p>
-              )}
-            </section>
-          );
-        })}
+              </section>
+            );
+          })
+        )}
       </div>
 
       {selected.size > 0 && (
@@ -389,8 +527,8 @@ export function BluestacksSidebar({
           <button
             type="button"
             className="btn btn-sm"
-            disabled={busy || !anySelectedOnline}
-            title="自动进入菜单识别所选在线模拟器的 FB Lite 账号名与头像"
+            disabled={busy || anySelectedRunning}
+            title="自动进入菜单识别所选模拟器的 FB Lite 账号名与头像（未启动窗口会自动拉起）"
             onClick={() => void exec('instances/inspect', { instanceIds: selectedIds })}
           >
             识别账号
@@ -400,7 +538,7 @@ export function BluestacksSidebar({
               type="button"
               className="btn btn-sm btn-danger"
               disabled={busy}
-              onClick={() => void exec('bumper/stop', { profileIds: selectedIds })}
+              onClick={() => void exec('stop-all', { profileIds: selectedIds })}
             >
               停止
             </button>
@@ -410,6 +548,16 @@ export function BluestacksSidebar({
             align="end"
             trigger={<IconMore size={15} />}
             items={[
+              {
+                label: '平铺所选窗口',
+                disabled: busy || !anySelectedOnline,
+                onSelect: () => void exec('instances/arrange', { instanceIds: selectedIds }),
+              },
+              {
+                label: '批量安装 FB Lite APK',
+                disabled: busy || anySelectedRunning,
+                onSelect: () => void exec('instances/install-apk', { instanceIds: selectedIds }),
+              },
               { label: '移至：未分组', onSelect: () => void moveInstancesTo(null) },
               ...folders.map((f) => ({
                 label: '移至：' + f.name,
@@ -420,6 +568,39 @@ export function BluestacksSidebar({
             ]}
           />
         </div>
+      )}
+
+      {batchLoginOpen && state && (
+        <BluestacksBatchLoginModal
+          state={state}
+          selected={selected}
+          onSelect={onSelect}
+          onChange={onChange}
+          onClose={() => setBatchLoginOpen(false)}
+        />
+      )}
+
+      {healthCheckOpen && state && (
+        <BluestacksHealthCheckModal
+          state={state}
+          selected={selected}
+          onSelect={onSelect}
+          onChange={onChange}
+          onOpenBatchLogin={(ids) => {
+            onSelect(new Set(ids));
+            setHealthCheckOpen(false);
+            setBatchLoginOpen(true);
+          }}
+          onClose={() => setHealthCheckOpen(false)}
+        />
+      )}
+
+      {riskDashboardOpen && state && (
+        <BluestacksRiskDashboardModal
+          state={state}
+          onChange={onChange}
+          onClose={() => setRiskDashboardOpen(false)}
+        />
       )}
 
       <BluestacksSidebarDialogs
@@ -439,6 +620,10 @@ export function BluestacksSidebar({
         onCloseDeletingFolder={() => setDeletingFolder(null)}
         deletingInsts={deletingInsts}
         onCloseDeletingInsts={() => setDeletingInsts(null)}
+        loginInst={loginInst}
+        onCloseLoginInst={() => setLoginInst(null)}
+        switchIdentityInst={switchIdentityInst}
+        onCloseSwitchIdentityInst={() => setSwitchIdentityInst(null)}
       />
     </aside>
   );

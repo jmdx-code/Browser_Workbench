@@ -116,6 +116,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
   if (existingDatabase && !options.store) {
     const previous = new DatabaseSync(databasePath, { readOnly: true });
     try {
+      previous.exec('PRAGMA busy_timeout = 5000');
       if ((previous.prepare('PRAGMA user_version').get() as any).user_version < 3)
         await backupDatabase(previous, path.join(data, 'before-v3-' + Date.now() + '.sqlite'));
     } finally {
@@ -226,7 +227,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
         return;
       res.setHeader(
         'Content-Security-Policy',
-        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob: https://*.fbcdn.net https://*.fbsbx.com; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob: https://*.fbcdn.net https://*.fbsbx.com https://i.gyazo.com https://*.gyazo.com https://*.googleusercontent.com https://drive.google.com; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
       );
       if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/workbench/')) {
         res.setHeader('Set-Cookie', `bridgeAdmin=${admin}; HttpOnly; SameSite=Strict; Path=/`);
@@ -341,13 +342,22 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       if (req.method === 'POST') {
         if (req.headers.origin !== ORIGIN || req.headers['content-type'] !== 'application/json')
           return json(res, 403, { error: 'ORIGIN_REJECTED' });
-        const input = await body(
-          req,
+        const bodyLimit =
           u.pathname === '/api/workspace/resource-tables/save' ||
-            u.pathname === '/api/workspace/group-poster/materials/save'
+          u.pathname === '/api/workspace/group-poster/materials/save'
             ? 4 * 1024 * 1024
-            : 131072,
-        );
+            : u.pathname === '/api/workspace/profiles/reorder' ||
+                u.pathname === '/api/workspace/group-bumper/targets/add' ||
+                u.pathname === '/api/workspace/group-bumper/comments/save' ||
+                u.pathname === '/api/workspace/group-poster/targets/add' ||
+                u.pathname === '/api/workspace/group-inviter/groups/add'
+              ? 1024 * 1024
+              : u.pathname === '/api/workspace/google-sheets/auth/credentials'
+                ? 512 * 1024
+                : u.pathname === '/api/workspace/group-poster/materials/thumbnail'
+                  ? 256 * 1024
+                  : 131072;
+        const input = await body(req, bodyLimit);
         if (u.pathname === '/api/bridge-connections/recover') {
           const request = z.object({ id: z.uuid(), profileId: z.uuid() }).strict().parse(input);
           const pending = pendingRecovery.get(request.id);
@@ -487,6 +497,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
           reason: 'HEARTBEAT_TIMEOUT',
           data: { epoch: peer.epoch, silentMs, leaseMs: LEASE_MS },
         });
+        void Promise.resolve(kernel?.disconnected(peer)).catch(() => {});
         void core.disconnect(peer).catch(() => {});
         ws.terminate();
       });
@@ -907,7 +918,11 @@ export async function startBridgeServer(options: BridgeServerOptions) {
         try {
           p.send({ type: 'HEARTBEAT', connectionEpoch: p.epoch, leaseMs: LEASE_MS });
         } catch {
+          void Promise.resolve(kernel?.disconnected(p)).catch(() => {});
           void core.disconnect(p).catch(() => {});
+          try {
+            p.close();
+          } catch {}
         }
     if (!tickInFlight) {
       tickInFlight = true;

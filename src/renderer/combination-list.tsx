@@ -496,19 +496,19 @@ export function CombinationList({
                 </ol>
               </div>
               <div className="combo-stats">
-                <div
-                  className="combo-stat resource-count"
-                  title={
-                    usesTable
-                      ? resourceUsageLabel(summary, resourceSummaries !== null) +
-                        '\n' +
-                        resourceUsageTitle
-                      : '此组合没有使用发帖资源表'
-                  }
-                >
-                  <strong>{remaining}</strong>
-                  <span>剩余资源</span>
-                </div>
+                {usesTable && (
+                  <div
+                    className="combo-stat resource-count"
+                    title={
+                      resourceUsageLabel(summary, resourceSummaries !== null) +
+                      '\n' +
+                      resourceUsageTitle
+                    }
+                  >
+                    <strong>{remaining}</strong>
+                    <span>剩余资源</span>
+                  </div>
+                )}
                 <div
                   className="combo-stat"
                   title={
@@ -799,9 +799,9 @@ function ImportCombinationDialog({
             lineHeight: '1.45',
             padding: '8px 10px',
             borderRadius: '6px',
-            border: '1px solid var(--line, #2e323b)',
-            background: 'var(--bg-subtle, #15181e)',
-            color: ' inherit',
+            border: '1px solid var(--line, #d6dce4)',
+            background: 'var(--bg-subtle, #f6f7f9)',
+            color: 'var(--text, #1d2127)',
             resize: 'vertical',
           }}
           onChange={(e) => {

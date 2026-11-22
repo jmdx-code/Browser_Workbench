@@ -1378,7 +1378,12 @@ export class SqliteTaskRepository implements TaskRepository {
         step = this.currentStep(plan, stepId);
       if (
         step.status !== 'ACTIVE' ||
-        plan.controlMode !== 'pause' ||
+        (plan.controlMode !== 'pause' &&
+          !(
+            plan.controlMode === null &&
+            plan.state === 'REVIEW' &&
+            plan.reason.startsWith('INITIAL_SESSION_FAILED:')
+          )) ||
         (plan.reason !== reason && this.stepEnding(id)?.reason !== reason) ||
         !['PAUSING', 'PAUSED', 'REVIEW'].includes(plan.state)
       )

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Profile, Workspace } from '../../shared/contracts.js';
 import type { PosterState, PosterTaskAccountMode } from '../../shared/group-poster.js';
 
@@ -10,7 +10,11 @@ import {
   orderedFinderItems,
   type FinderDisabledItemInfo,
 } from '../finder-target-list.js';
-import { formatCreatedDate, PosterMaterialCardPreview } from './poster-material-cards.js';
+import {
+  formatCreatedDate,
+  PosterMaterialCardPreview,
+  PosterMediaPreviewModal,
+} from './poster-material-modals.js';
 import { posterRowBadge } from './poster-material-thumbnail-cell.js';
 import { PosterProfileSelector } from './poster-profile-selector.js';
 
@@ -117,14 +121,27 @@ export function PosterTaskDispatchModal({
     toLocalDateTimeInputValue(Date.now() + 10 * 60_000),
   );
   const [localError, setLocalError] = useState('');
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy && !previewOpen && !document.querySelector('dialog[open]')) {
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [busy, previewOpen, onClose]);
 
   const effectiveSelectedGroups = allGroups
     .filter((g) => chosenGroupIds.has(g.id) && !isGroupDisabled(g.id))
     .map((g) => g.id);
   const applyQuickScheduleOffset = (minutesFromNow: number) => {
+    setLocalError('');
     setScheduledDateTime(toLocalDateTimeInputValue(Date.now() + minutesFromNow * 60_000));
   };
   const applyTomorrowMorning = () => {
+    setLocalError('');
     const d = new Date();
     d.setDate(d.getDate() + 1);
     d.setHours(9, 0, 0, 0);
@@ -160,7 +177,15 @@ export function PosterTaskDispatchModal({
   };
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="创建贴文发帖任务">
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="创建贴文发帖任务"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
+    >
       <div className="modal bumper-modal poster-dispatch-modal poster-dispatch-three-col-modal">
         <div className="poster-dispatch-three-cols">
           <div className="poster-dispatch-col poster-dispatch-finder-col">
@@ -227,7 +252,13 @@ export function PosterTaskDispatchModal({
           <div className="poster-dispatch-col poster-dispatch-right-col">
             <div className="bumper-modal-heading poster-dispatch-right-head">
               <h2>创建发帖任务</h2>
-              <button className="btn" aria-label="关闭弹窗" onClick={onClose}>
+              <button
+                type="button"
+                className="btn"
+                aria-label="关闭弹窗"
+                disabled={busy}
+                onClick={onClose}
+              >
                 ×
               </button>
             </div>
@@ -235,7 +266,10 @@ export function PosterTaskDispatchModal({
             <div className="poster-dispatch-right-body">
               <div className="poster-dispatch-post-card">
                 <div className="poster-dispatch-post-card-media">
-                  <PosterMaterialCardPreview row={material} onPreview={() => {}} />
+                  <PosterMaterialCardPreview
+                    row={material}
+                    onPreview={() => setPreviewOpen(true)}
+                  />
                 </div>
                 <div className="poster-dispatch-post-card-info">
                   <div className="poster-dispatch-post-badges">
@@ -400,13 +434,16 @@ export function PosterTaskDispatchModal({
                     ? `⏰ 确认创建定时任务（${effectiveSelectedGroups.length} 个小组）`
                     : `🚀 立即开始发帖（${effectiveSelectedGroups.length} 个小组）`}
               </button>
-              <button type="button" className="btn" onClick={onClose}>
+              <button type="button" className="btn" disabled={busy} onClick={onClose}>
                 取消
               </button>
             </div>
           </div>
         </div>
       </div>
+      {previewOpen && (
+        <PosterMediaPreviewModal row={material} onClose={() => setPreviewOpen(false)} />
+      )}
     </div>
   );
 }

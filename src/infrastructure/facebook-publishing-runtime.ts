@@ -89,6 +89,7 @@ export class FacebookPublishingRuntime {
     private readonly publicationAcceptanceScope: PublicationScope | null = null,
     uploadCacheRoot?: string,
     profileInventory?: (profileId: string) => Awaitable<RuntimeProfile | undefined>,
+    private readonly autoSettleUncertainAndContinue = false,
   ) {
     this.ending = new TaskEndingCoordinator(kernel, core, store);
     this.adapters = new FacebookPublishingAdapters(
@@ -188,6 +189,8 @@ export class FacebookPublishingRuntime {
       inventory,
       randomUUID,
       profileInventory,
+      Date.now,
+      this.autoSettleUncertainAndContinue,
     );
     this.runtime.setStartupSlotFreedHook(() => {
       void this.tick().catch(() => {});
@@ -275,6 +278,7 @@ export class FacebookPublishingRuntime {
         this.lastBrowseInterval.set(sample.profileId, at);
         console.warn(JSON.stringify({ event: 'BROWSE_INTERVAL', ...sample }));
       },
+      this.autoSettleUncertainAndContinue,
     );
   }
   private featureAvailable(type: TaskFeatureId | 'friends') {
@@ -644,6 +648,27 @@ export class FacebookPublishingRuntime {
     }
     // Stop/disposition recovery can wait on one browser. It must not hold up the other
     // original actors; their own guards still enforce account locks and current control.
+    if (this.autoSettleUncertainAndContinue) {
+      const liveForReconcile = await this.store.tasks.livePlans();
+      const profileIdsWithPendingSettlement = new Set(
+        liveForReconcile
+          .filter(
+            (p) => ['PAUSING', 'STOPPING', 'REVIEW'].includes(p.state) || isErroredPausedPlan(p),
+          )
+          .map((p) => p.profileId),
+      );
+      for (const profileId of profileIdsWithPendingSettlement) {
+        const peer = this.core.peers.get(profileId);
+        if (
+          peer?.online &&
+          (!peer.synced || peer.phase === 'RECOVERING') &&
+          !this.runtime.registry.hasOwner(profileId) &&
+          !this.endingRecoveries.has(profileId)
+        ) {
+          await this.core.reconcileRecoveringPeerIfPossible(profileId).catch(() => false);
+        }
+      }
+    }
     for (const peer of this.core.peers.values()) {
       if (
         !peer.online ||
@@ -824,6 +849,30 @@ export class FacebookPublishingRuntime {
     )) {
       if (!this.runtime.registry.hasOwner(plan.profileId))
         await this.ending.end(plan.id).catch(() => {});
+    }
+    if (this.autoSettleUncertainAndContinue && !this.runtime.registry.hasOwner(profileId)) {
+      const pausedPlans = await this.store.tasks.plansForProfile(profileId, ['PAUSED']);
+      const erroredIds: string[] = [];
+      for (const p of pausedPlans) {
+        if (!isErroredPausedPlan(p)) continue;
+        if (await this.store.tasks.stepEnding(p.id)) {
+          try {
+            if (!(await this.store.tasks.endingId(p.id))) await this.store.tasks.requestEnd(p.id);
+            await this.ending.end(p.id);
+          } catch {}
+        } else if (!(await this.store.tasks.unresolved(p.id))) {
+          erroredIds.push(profileId);
+        }
+      }
+      if (erroredIds.length > 0) {
+        await this.store.tasks.releaseErroredPausedPlans(erroredIds);
+      }
+      const nextLive = await this.store.tasks.plansForProfile(profileId, ['QUEUED']);
+      if (nextLive.length > 0 && !this.closed) {
+        setImmediate(() => {
+          if (!this.closed) void this.tick().catch(() => {});
+        });
+      }
     }
   }
   close(): Promise<void> {

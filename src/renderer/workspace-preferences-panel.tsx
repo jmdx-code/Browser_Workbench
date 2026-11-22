@@ -8,9 +8,29 @@ export function WorkspacePreferencesPanel() {
   const [zone, setZone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone);
   const [notifications, setNotifications] = useState<Preferences['desktopNotifications']>('off');
   const [busy, setBusy] = useState(false);
-  const [revision, setRevision] = useState(0);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [autoLaunch, setAutoLaunch] = useState<{ supported: boolean; enabled: boolean } | null>(
+    null,
+  );
+  const [autoLaunchBusy, setAutoLaunchBusy] = useState(false);
+  const [autoLaunchNotice, setAutoLaunchNotice] = useState('');
+  useEffect(() => {
+    const desktop = window.workbenchDesktop;
+    if (typeof desktop?.getAutoLaunch !== 'function') return;
+    let active = true;
+    void desktop
+      .getAutoLaunch()
+      .then((res) => {
+        if (active) setAutoLaunch(res);
+      })
+      .catch(() => {
+        if (active) setAutoLaunch({ supported: false, enabled: false });
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
     void api
@@ -27,12 +47,12 @@ export function WorkspacePreferencesPanel() {
         () => {
           if (!controller.signal.aborted) {
             setSaved(null);
-            setError('默认设置读取失败，请重新读取。');
+            setError('默认设置读取失败。');
           }
         },
       );
     return () => controller.abort();
-  }, [revision]);
+  }, []);
   const values = WorkspacePreferenceValues.safeParse({
     defaultTimeZone: systemZone ? null : zone.trim(),
     desktopNotifications: notifications,
@@ -113,18 +133,8 @@ export function WorkspacePreferencesPanel() {
             <option value="all">完成与失败</option>
           </select>
         </label>
-        <button className="primary" disabled={!changed || busy}>
-          {busy ? '保存中…' : '保存默认设置'}
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => {
-            setNotice('');
-            setRevision((value) => value + 1);
-          }}
-        >
-          重新读取
+        <button type="submit" className="btn btn-primary btn-sm" disabled={!changed || busy}>
+          {busy ? '保存中…' : '保存偏好设置'}
         </button>
       </form>
       {!values.success && (
@@ -138,6 +148,43 @@ export function WorkspacePreferencesPanel() {
         </p>
       )}
       {notice && <p role="status">{notice}</p>}
+      {autoLaunch?.supported && (
+        <div className="settings-form" style={{ marginTop: 18 }}>
+          <h3>桌面开机自启</h3>
+          <label>
+            <input
+              type="checkbox"
+              checked={autoLaunch.enabled}
+              disabled={autoLaunchBusy}
+              onChange={(event) => {
+                const nextEnabled = event.target.checked;
+                const desktop = window.workbenchDesktop;
+                if (typeof desktop?.setAutoLaunch !== 'function' || autoLaunchBusy) return;
+                setAutoLaunchBusy(true);
+                setAutoLaunchNotice('');
+                void desktop
+                  .setAutoLaunch(nextEnabled)
+                  .then((res) => {
+                    setAutoLaunch(res);
+                    setAutoLaunchNotice(
+                      res.enabled
+                        ? '已开启开机自动启动（开机后静默驻留系统托盘，适合 7×24 无人值守）。'
+                        : '已关闭开机自动启动。',
+                    );
+                  })
+                  .catch(() => {
+                    setAutoLaunchNotice('修改开机自启失败，请检查系统权限。');
+                  })
+                  .finally(() => {
+                    setAutoLaunchBusy(false);
+                  });
+              }}
+            />
+            开机自动启动并最小化到系统托盘（适合 7×24 无人值守排贴 / 顶贴 / 排班）
+          </label>
+          {autoLaunchNotice && <p role="status">{autoLaunchNotice}</p>}
+        </div>
+      )}
     </>
   );
 }

@@ -37,8 +37,19 @@ export function DiagnosticFeedbackModal({
   useEffect(() => {
     if (open) {
       setDiagError('');
+      setDiagResult(null);
+      setDiagNote('');
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !diagGenerating) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, diagGenerating, onClose]);
 
   function updateTargetDir(dir: string) {
     setTargetDir(dir);
@@ -56,11 +67,11 @@ export function DiagnosticFeedbackModal({
       role="dialog"
       aria-modal="true"
       aria-label="记录并导出问题反馈包"
-      onClick={() => {
-        if (!diagGenerating) onClose();
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !diagGenerating) onClose();
       }}
     >
-      <div className="modal select-by-ids-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal select-by-ids-modal">
         <div className="modal-head">
           <h3>记录并导出问题反馈包</h3>
           <button

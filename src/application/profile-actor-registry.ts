@@ -424,7 +424,7 @@ export class ProfileActorRegistry {
         } catch (stopError) {
           if (
             stopError instanceof Error &&
-            /^KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
+            /^KERNEL_(?:DEBUGGER_(?:DETACHED|CANCELED_BY_USER)|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
               stopError.message,
             )
           ) {
@@ -484,7 +484,7 @@ export class ProfileActorRegistry {
         } catch (stopError) {
           if (
             stopError instanceof Error &&
-            /^KERNEL_(?:DEBUGGER_DETACHED|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
+            /^KERNEL_(?:DEBUGGER_(?:DETACHED|CANCELED_BY_USER)|CONNECTION_LOST|LEASE_RENEW_FAILED|PEER_NOT_IDLE)/.test(
               stopError.message,
             )
           ) {

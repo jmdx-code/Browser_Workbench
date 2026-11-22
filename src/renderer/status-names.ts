@@ -1,7 +1,7 @@
 export const resultNames: Record<string, string> = {
   VERIFIED: '已核验',
   ACKNOWLEDGED: '已派发 · 待核验',
-  UNKNOWN: '结果未知 · 待核对',
+  UNKNOWN: '结果未确认（已防重）',
   FAILED: '失败',
   INTERRUPTED: '已中断',
   PREPARED: '等待执行',

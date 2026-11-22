@@ -200,7 +200,7 @@ export async function syncProductAiWorkspaceDirectory(options: {
     version: options.softwareVersion,
     displayName: '浏览器工作台（Browser Workbench）',
     description:
-      '控制在线 Chrome 浏览器与蓝蝶模拟器：支持活跃账号任务组合与全局执行记录、自动匹配专页与小组定时发帖、Chrome 与蓝蝶小组/专页顶贴、邀请人、读取 Excel/CSV 排期表及通用网页自动化。',
+      '控制在线 Chrome 浏览器与蓝蝶模拟器：支持定时排班无人值守流水线、活跃账号任务组合与全局执行记录、自动匹配专页与小组定时发帖、Chrome 与蓝蝶小组/专页顶贴、邀请人、读取 Excel/CSV 排期表及通用网页自动化。',
     mcpServers: './mcp_config.json',
     suggestedPrompts: [
       {

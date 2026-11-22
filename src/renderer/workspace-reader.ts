@@ -3,6 +3,8 @@ import type { Workspace } from '../shared/contracts.js';
 export class WorkspaceReader {
   private pending: { controller: AbortController; work: Promise<void> } | null = null;
   private disposed = false;
+  private lastSignature: string | null = null;
+  private lastHadError = false;
   constructor(
     private readonly read: (signal: AbortSignal) => Promise<Workspace>,
     private readonly emit: (value: Workspace | null, error: string) => void,
@@ -24,12 +26,20 @@ export class WorkspaceReader {
       .then(() => Promise.race([this.read(signal), aborted]))
       .then(
         (value) => {
-          if (!this.disposed && this.pending?.controller === controller && !signal.aborted)
-            this.emit(value, '');
+          if (!this.disposed && this.pending?.controller === controller && !signal.aborted) {
+            const sig = JSON.stringify(value);
+            if (force || this.lastHadError || sig !== this.lastSignature) {
+              this.lastSignature = sig;
+              this.lastHadError = false;
+              this.emit(value, '');
+            }
+          }
         },
         () => {
-          if (!this.disposed && this.pending?.controller === controller)
+          if (!this.disposed && this.pending?.controller === controller) {
+            this.lastHadError = true;
             this.emit(null, '控制服务连接失败或超时；当前列表可能是旧状态，请重新连接。');
+          }
         },
       )
       .finally(() => {

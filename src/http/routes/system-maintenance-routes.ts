@@ -2,9 +2,6 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { DataCleanupService } from '../../application/data-cleanup.js';
 import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
-import type { GroupBumperService } from '../../application/group-bumper-service.js';
-import type { GroupInviterService } from '../../application/group-inviter-service.js';
-import type { GroupPosterService } from '../../application/group-poster-service.js';
 import type { MediaComponentPort } from '../../application/media-component.js';
 import type { SoftwareUpdateService } from '../../application/software-update-service.js';
 import type { TaskService } from '../../application/task-service.js';
@@ -35,9 +32,6 @@ export interface SystemMaintenanceRouteContext {
   backups?: WorkspaceBackupService | undefined;
   softwareControl?: { restart: () => void } | undefined;
   maintenance?: WorkspaceMaintenance | undefined;
-  groupInviter?: GroupInviterService | undefined;
-  groupBumper?: GroupBumperService | undefined;
-  groupPoster?: GroupPosterService | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
   captureDiagnostics?:
     ((input?: DiagnosticCaptureInput) => Awaitable<DiagnosticCaptureOutput>) | undefined;
@@ -344,7 +338,7 @@ export async function handleSystemMaintenanceRoutes(
             : '请先停止或暂停任务，再重启软件',
           409,
         );
-      backups?.assertIdle();
+      backups?.assertNotBusy();
       json(res, 200, { requested: true });
       softwareControl.restart();
       return true;

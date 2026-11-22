@@ -1,6 +1,20 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { DesktopBridge } from '../shared/desktop.js';
-let closeHandler: ((_event: Electron.IpcRendererEvent, requestId: string) => void) | null = null;
+let closeCallback: (() => Promise<boolean>) | null = null;
+ipcRenderer.on(
+  'workbench:prepare-close',
+  (_event: Electron.IpcRendererEvent, requestId: string) => {
+    const cb = closeCallback;
+    if (!cb) {
+      ipcRenderer.send('workbench:close-result', { requestId, ok: true });
+      return;
+    }
+    void cb().then(
+      (ok) => ipcRenderer.send('workbench:close-result', { requestId, ok }),
+      () => ipcRenderer.send('workbench:close-result', { requestId, ok: false }),
+    );
+  },
+);
 const bridge: DesktopBridge = {
   materialFilePath: (file) => webUtils.getPathForFile(file),
   revealLocalFile: (source) =>
@@ -8,18 +22,9 @@ const bridge: DesktopBridge = {
       DesktopBridge['revealLocalFile']
     >,
   onBeforeClose(callback) {
-    if (closeHandler) ipcRenderer.removeListener('workbench:prepare-close', closeHandler);
-    const handler = (_event: Electron.IpcRendererEvent, requestId: string) => {
-      void callback().then(
-        (ok) => ipcRenderer.send('workbench:close-result', { requestId, ok }),
-        () => ipcRenderer.send('workbench:close-result', { requestId, ok: false }),
-      );
-    };
-    closeHandler = handler;
-    ipcRenderer.on('workbench:prepare-close', handler);
+    closeCallback = callback;
     return () => {
-      ipcRenderer.removeListener('workbench:prepare-close', handler);
-      if (closeHandler === handler) closeHandler = null;
+      if (closeCallback === callback) closeCallback = null;
     };
   },
   chooseMaterialDirectory: () =>
@@ -31,5 +36,15 @@ const bridge: DesktopBridge = {
   chooseFeedbackDirectory: () =>
     ipcRenderer.invoke('workbench:choose-feedback-directory') as Promise<string | null>,
   restartSoftware: () => ipcRenderer.invoke('workbench:restart') as Promise<void>,
+  getAutoLaunch: () =>
+    ipcRenderer.invoke('workbench:get-auto-launch') as Promise<{
+      supported: boolean;
+      enabled: boolean;
+    }>,
+  setAutoLaunch: (enabled) =>
+    ipcRenderer.invoke('workbench:set-auto-launch', { enabled }) as Promise<{
+      supported: boolean;
+      enabled: boolean;
+    }>,
 };
 contextBridge.exposeInMainWorld('workbenchDesktop', bridge);

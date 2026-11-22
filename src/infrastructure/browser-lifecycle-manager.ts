@@ -257,7 +257,7 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
 
     const existingPeer = this.opts.core.peers.get(profileId);
     if (isPeerWindowOnline(existingPeer)) {
-      if (existingPeer?.synced) {
+      if (existingPeer?.synced && existingPeer.phase === 'PAUSED') {
         return this.buildCurrentStatus(profileId, action, startedAt, {
           alreadyInTargetState: true,
         });
@@ -266,6 +266,14 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       if (syncedWait.ready) {
         return this.buildCurrentStatus(profileId, action, startedAt, {
           alreadyInTargetState: true,
+        });
+      }
+      const afterWaitPeer = this.opts.core.peers.get(profileId);
+      if (isPeerWindowOnline(afterWaitPeer)) {
+        return this.buildCurrentStatus(profileId, action, startedAt, {
+          ok: false,
+          errorCode: 'BROWSER_LAUNCH_SYNC_TIMEOUT',
+          reason: `浏览器窗口已在线但插件状态尚未就绪（当前阶段：${afterWaitPeer?.phase ?? 'UNKNOWN'}）`,
         });
       }
     }
@@ -417,10 +425,15 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
     }
 
     if (!peer.capabilities?.includes('browser-window-close-v1')) {
-      try {
-        this.opts.core.reloadExtension(profileId);
-      } catch {
-        // Ignore if socket closed concurrently
+      const reloadResult = await Promise.resolve(this.opts.core.reloadExtension(profileId)).catch(
+        () => ({ requested: false, reason: 'RELOAD_FAILED' }),
+      );
+      if (!reloadResult.requested) {
+        return this.buildCurrentStatus(profileId, action, startedAt, {
+          ok: false,
+          errorCode: 'BROWSER_CLOSE_CAPABILITY_MISSING',
+          reason: '该浏览器内工作台插件尚未升级到支持安全单资料关窗的版本，请先重载插件',
+        });
       }
       const reloadDeadline = Date.now() + 5000;
       while (Date.now() < reloadDeadline) {
@@ -538,14 +551,20 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
             if (!id) continue;
             const res = await this.launchProfile(id, { timeoutMs });
             itemsByProfile.set(id, res);
-            if (res.ok && res.online && res.synced) {
+            if (res.ok && res.online && res.synced && res.phase === 'PAUSED') {
               readyIds.push(id);
               if (!res.alreadyInTargetState) launchedIds.push(id);
             } else {
               failed.push({
                 profileId: id,
-                errorCode: res.errorCode ?? 'BROWSER_LAUNCH_FAILED',
-                reason: res.reason ?? '启动未就绪',
+                errorCode:
+                  res.errorCode ??
+                  (res.phase !== 'PAUSED' ? 'BROWSER_NOT_IDLE' : 'BROWSER_LAUNCH_FAILED'),
+                reason:
+                  res.reason ??
+                  (res.phase !== 'PAUSED'
+                    ? `浏览器当前阶段为 ${res.phase}，尚未进入空闲就绪态`
+                    : '启动未就绪'),
               });
             }
           }

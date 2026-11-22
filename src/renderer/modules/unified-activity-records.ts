@@ -3,12 +3,18 @@ import type { TaskRecord } from '../../shared/task-contracts.js';
 import type { GroupInviteLogRow, GroupInviterState } from '../../shared/group-inviter.js';
 import type { BumperLog, BumperState } from '../../shared/group-bumper.js';
 import type { PosterLog, PosterState } from '../../shared/group-poster.js';
+import type { GoogleSheetsOverview } from '../../shared/google-sheets.js';
 import { endedTask, groupTaskRecords } from '../../domain/task-run-records.js';
 import { runSummary, stepResultLabel } from '../task-record-summary.js';
 import { taskReasonDescription } from '../../shared/task-issues.js';
 
 export type ActivityRecordModuleId =
-  'active-accounts' | 'group-inviter' | 'group-bumper' | 'page-bumper' | 'group-poster';
+  | 'active-accounts'
+  | 'group-inviter'
+  | 'group-bumper'
+  | 'page-bumper'
+  | 'group-poster'
+  | 'google-sheets';
 export type ActivityRecordModuleFilter = 'all' | ActivityRecordModuleId;
 export type ActivityRecordStatus = 'running' | 'completed' | 'failed' | 'attention';
 export type ActivityRecordStatusFilter = 'all' | ActivityRecordStatus;
@@ -43,6 +49,7 @@ export interface UnifiedActivityFeedInput {
   bumperLogs?: readonly BumperLog[] | undefined;
   posterState?: PosterState | null | undefined;
   posterLogs?: readonly PosterLog[] | undefined;
+  googleSheetsOverview?: GoogleSheetsOverview | null | undefined;
   profileId?: string | null | undefined;
   moduleFilter?: ActivityRecordModuleFilter | undefined;
   statusFilter?: ActivityRecordStatusFilter | undefined;
@@ -53,6 +60,7 @@ export interface UnifiedActivityFeedInput {
 export interface UnifiedActivityFeedResult {
   items: UnifiedActivityItem[];
   statusCounts: Record<ActivityRecordStatusFilter, number>;
+  nonActiveStatusCounts: Record<ActivityRecordStatusFilter, number>;
   moduleCounts: Record<ActivityRecordModuleFilter, number>;
 }
 
@@ -390,6 +398,61 @@ export function buildUnifiedActivityFeed(
     });
   }
 
+  // 6. Google Sheets Cloud Collaboration (live runs + sync/publish/bump logs)
+  if (input.googleSheetsOverview) {
+    const linkTitleById = new Map(input.googleSheetsOverview.links.map((l) => [l.id, l.title]));
+    for (const active of input.googleSheetsOverview.activeProfiles ?? []) {
+      allItems.push({
+        moduleId: 'google-sheets',
+        moduleLabel: '云表协同',
+        id: `gs-live:${active.linkId}:${active.profileId}`,
+        profileId: active.profileId,
+        profileName: resolveProfileName(byProfile, active.profileId),
+        title:
+          active.kind === 'post_schedule'
+            ? '云表排贴 · 实时发布'
+            : active.kind === 'metrics'
+              ? '云表记录 · 采集赞评'
+              : '云表顶贴 · 实时执行',
+        targetLabel: active.title || linkTitleById.get(active.linkId) || '云表协同',
+        detailText: active.status || '正在执行云表任务',
+        status: 'running',
+        statusLabel: '执行中',
+        tone: 'run',
+        timestamp: now,
+      });
+    }
+    for (const log of input.googleSheetsOverview.logs ?? []) {
+      const sheetTitle = log.linkId ? (linkTitleById.get(log.linkId) ?? '云表') : '云表全局';
+      const isErr = log.level === 'error' || /失败|异常/.test(log.summary);
+      const isWarn =
+        !isErr && (log.level === 'warn' || /部分完成|跳过|暂无|未找到|需在线/.test(log.summary));
+      const actionTitle = log.action.startsWith('schedule_')
+        ? '云表排贴'
+        : log.action.startsWith('records_')
+          ? '云表顶贴'
+          : log.action.startsWith('metrics_')
+            ? '云表采赞评'
+            : log.action.startsWith('library_')
+              ? '云表库同步'
+              : '云表协同';
+      allItems.push({
+        moduleId: 'google-sheets',
+        moduleLabel: '云表协同',
+        id: `gs-log:${log.id}`,
+        profileId: '__google_sheets__',
+        profileName: sheetTitle,
+        title: actionTitle,
+        targetLabel: sheetTitle,
+        detailText: log.summary,
+        status: isErr ? 'failed' : isWarn ? 'attention' : 'completed',
+        statusLabel: isErr ? '失败' : isWarn ? '需留意' : '已完成',
+        tone: isErr ? 'err' : isWarn ? 'warn' : 'ok',
+        timestamp: log.createdAt,
+      });
+    }
+  }
+
   const profileFiltered = input.profileId
     ? allItems.filter((item) => item.profileId === input.profileId)
     : allItems;
@@ -413,6 +476,7 @@ export function buildUnifiedActivityFeed(
     'group-bumper': 0,
     'page-bumper': 0,
     'group-poster': 0,
+    'google-sheets': 0,
   };
   for (const item of queryFiltered) moduleCounts[item.moduleId] += 1;
 
@@ -429,7 +493,20 @@ export function buildUnifiedActivityFeed(
     failed: 0,
     attention: 0,
   };
-  for (const item of moduleFiltered) statusCounts[item.status] += 1;
+  const nonActiveStatusCounts: Record<ActivityRecordStatusFilter, number> = {
+    all: 0,
+    running: 0,
+    completed: 0,
+    failed: 0,
+    attention: 0,
+  };
+  for (const item of moduleFiltered) {
+    statusCounts[item.status] += 1;
+    if (item.moduleId !== 'active-accounts') {
+      nonActiveStatusCounts.all += 1;
+      nonActiveStatusCounts[item.status] += 1;
+    }
+  }
 
   const statusFilter = input.statusFilter ?? 'all';
   const finalItems =
@@ -442,5 +519,5 @@ export function buildUnifiedActivityFeed(
     return b.timestamp - a.timestamp;
   });
 
-  return { items: finalItems, statusCounts, moduleCounts };
+  return { items: finalItems, statusCounts, nonActiveStatusCounts, moduleCounts };
 }

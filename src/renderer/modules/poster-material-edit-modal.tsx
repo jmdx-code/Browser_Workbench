@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { PosterMaterialAiLabel, PosterMaterialBackground } from '../../shared/group-poster.js';
 import { mediaReference } from '../../domain/resource-table.js';
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
@@ -23,11 +23,22 @@ export function PosterMaterialEditModal({
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [busy, onClose]);
+
   const handlePickLocalFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] as (File & { path?: string }) | undefined;
+    const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    const localPath = (file.path ?? '').trim();
+    const localPath = (
+      window.workbenchDesktop?.materialFilePath?.(file) ||
+      ((file as File & { path?: string }).path ?? '')
+    ).trim();
     if (!localPath) {
       setError('当前环境未能读取本地文件路径，请直接在下方粘贴文件完整路径');
       return;
@@ -71,11 +82,20 @@ export function PosterMaterialEditModal({
       role="dialog"
       aria-modal="true"
       aria-label={isNew ? '新建贴文素材' : '编辑贴文素材'}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onClose();
+      }}
     >
       <div className="modal bumper-modal poster-edit-material-modal">
         <div className="bumper-modal-heading">
           <h2>{isNew ? '新建贴文素材' : '编辑贴文素材'}</h2>
-          <button className="btn" aria-label="关闭弹窗" onClick={onClose}>
+          <button
+            type="button"
+            className="btn"
+            aria-label="关闭弹窗"
+            disabled={busy}
+            onClick={onClose}
+          >
             ×
           </button>
         </div>
@@ -159,7 +179,7 @@ export function PosterMaterialEditModal({
         )}
 
         <div className="bumper-modal-footer">
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" disabled={busy} onClick={onClose}>
             取消
           </button>
           <button

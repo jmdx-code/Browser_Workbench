@@ -1219,7 +1219,7 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
   const wbBluestacksControl: McpToolDefinition = {
     name: 'wb_bluestacks_control',
     description:
-      '控制与监控「蓝蝶模拟器多开（BlueStacks FB Lite — 蓝蝶小组顶贴与蓝蝶专页顶贴）」全功能模块：查询/强制刷新全部模拟器实例与在线竖屏状态（state / refresh）、启动/关闭窗口（launch / close）、识别 FB Lite 账号（inspect）、重命名实例备注（rename_instance）、配置蓝蝶安装目录与配置文件路径（save_paths）、修改蓝蝶小组顶贴或蓝蝶专页顶贴参数（save_settings / save_page_settings，含 enableSound 开启声音、最大扫描贴文数、并发数、点赞/留言概率等，运行中即时生效）、保存留言话术池（save_comments）、查询蓝蝶顶贴回执记录（logs）、启动或停止蓝蝶小组顶贴（start_bumper / stop_bumper）、启动或停止蓝蝶专页顶贴（start_page_bumper / stop_page_bumper）。instanceIds 支持直接传窗口名（如 "p023"）、备注名、FB 账号名（如 "Mawi Lee"）、ADB 端口（如 "5565"）或 UUID。',
+      '控制与监控「蓝蝶模拟器多开（BlueStacks FB Lite 全功能：活跃账号 / 小组发帖 / 小组顶贴 / 专页顶贴 / 小组邀请人 / 窗口管理 / 身份切换 / APK 安装）」模块：查询/强制刷新实例（state / refresh）、启动/关闭/置前/自动平铺窗口（launch / close / show / arrange）、安装 FB Lite APK（install_apk）、识别 FB Lite 账号与个人/专页身份（inspect）、切换个人/专页身份（switch_identity）、重命名备注（rename_instance）、配置目录与 APK 路径（save_paths）、保存顶贴设置与留言池（save_settings / save_page_settings / save_comments）、查日志（logs）、启停蓝蝶活跃账号（start_active / stop_active）、启停蓝蝶小组发帖（start_poster / stop_poster）、启停蓝蝶小组顶贴（start_bumper / stop_bumper）、启停蓝蝶专页顶贴（start_page_bumper / stop_page_bumper）、启停蓝蝶小组邀请人（start_inviter / stop_inviter）及一键全停（stop_all）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1230,17 +1230,31 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
             'refresh',
             'launch',
             'close',
+            'show',
+            'arrange',
+            'install_apk',
             'inspect',
+            'switch_identity',
             'rename_instance',
             'save_paths',
             'save_settings',
             'save_page_settings',
+            'save_risk_limits',
             'save_comments',
             'logs',
+            'start_active',
+            'stop_active',
+            'start_poster',
+            'stop_poster',
             'start_bumper',
             'stop_bumper',
             'start_page_bumper',
             'stop_page_bumper',
+            'start_inviter',
+            'stop_inviter',
+            'start_health_check',
+            'stop_health_check',
+            'stop_all',
           ],
           description: '操作类型',
         },
@@ -1248,18 +1262,18 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           type: 'string',
           enum: ['group', 'page'],
           description:
-            'save_settings / save_comments / logs 时指定作用于蓝蝶小组顶贴（group）还是蓝蝶专页顶贴（page，默认 group；action="save_page_settings" 等价于 mode="page" + action="save_settings"）',
+            'save_settings / save_comments / logs 时指定作用于蓝蝶小组顶贴（group）还是蓝蝶专页顶贴（page，默认 group）',
         },
         instanceIds: {
           type: 'array',
           items: { type: 'string' },
           description:
-            '目标蓝蝶实例标识列表（支持窗口名如 "p023"、备注名、instanceKey 如 "Pie64_1"、FB 账号名如 "Mawi Lee"、ADB 端口如 "5565" 或实例 UUID）',
+            '目标蓝蝶实例标识列表（支持窗口名如 "p023"、备注名、instanceKey 如 "Pie64_1"、FB 账号名、ADB 端口或 UUID）',
         },
         instanceId: {
           type: 'string',
           description:
-            '单个目标蓝蝶实例标识（rename_instance 必填，其他动作等价于 instanceIds: [instanceId]）',
+            '单个目标蓝蝶实例标识（rename_instance / show / switch_identity 必填，其他动作等价于 instanceIds: [instanceId]）',
         },
         alias: {
           type: ['string', 'null'],
@@ -1273,10 +1287,65 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           type: ['string', 'null'],
           description: 'save_paths 时设置 bluestacks.conf 路径（传 null 恢复自动探测）',
         },
+        apkPath: {
+          type: ['string', 'null'],
+          description: 'save_paths 或 install_apk 时指定的 FB Lite APK 路径',
+        },
+        columns: {
+          type: 'number',
+          minimum: 1,
+          maximum: 8,
+          description: 'arrange 平铺窗口时的列数（可选）',
+        },
+        gap: {
+          type: 'number',
+          minimum: 0,
+          maximum: 40,
+          description: 'arrange 平铺窗口时的像素间距（可选）',
+        },
+        targetName: {
+          type: 'string',
+          description: 'switch_identity 时要切换的目标专页/个人号名称（可选）',
+        },
+        targetType: {
+          type: 'string',
+          enum: ['personal', 'page'],
+          description: 'switch_identity 时要切换的目标身份类型（personal 个人号 / page 专页）',
+        },
+        combinationId: {
+          type: 'string',
+          description: 'start_active 时要执行的已保存任务组合 ID',
+        },
+        quickStep: {
+          type: 'object',
+          description:
+            'start_active 时的快捷单步动作（{ type: "feed"|"video"|"marketplace"|"friends"|"post"|"story", durationMinutes?, maxLikes?, maxAccepts?, caption?, mediaPath?, background? }）',
+        },
+        materialIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'start_poster 时选择的共享发帖素材 ID 列表',
+        },
+        maxGroupsPerInstance: {
+          type: 'number',
+          minimum: 1,
+          maximum: 50,
+          description: 'start_poster 时单台蓝蝶最多发多少个小组（默认 3）',
+        },
+        postToTimeline: {
+          type: 'boolean',
+          description: 'start_poster 时是否同时发布到账号时间线（默认 false）',
+        },
+        invitesPerGroup: {
+          type: 'number',
+          minimum: 1,
+          maximum: 50,
+          description: 'start_inviter 时每个小组最多邀请人数（默认 5）',
+        },
         groupIds: {
           type: 'array',
           items: { type: 'string' },
-          description: 'start_bumper 时选择的目标小组 ID 或 Facebook 小组链接列表',
+          description: 'start_bumper / start_poster / start_inviter 时选择的目标小组 ID 或链接列表',
         },
         pageIds: {
           type: 'array',
@@ -1287,12 +1356,12 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         autoAddMissingTargets: {
           type: 'boolean',
           description:
-            'start_bumper / start_page_bumper 时若目标小组或专页不在共享目标库中，是否自动补入（默认 true）',
+            'start_bumper / start_page_bumper / start_poster / start_inviter 时若目标不在共享库中是否自动补入（默认 true）',
         },
         settings: {
           type: 'object',
           description:
-            'save_settings / save_page_settings 时的参数补丁（未传字段自动保留当前设置；支持 enableSound 开启声音、maxPostsPerPage、maxPostsPerGroupPage、maxConcurrentProfiles、dailyMaxLikesPerAccount、maxLikesPerPost、likeProbability、commentProbability、consumeCommentOnUse、searchMode、maxPostAgeHours、useLongPressReaction、reactionTypes）',
+            'save_settings / save_page_settings 时的参数补丁（未传字段自动保留当前设置；支持 enableSound、useLongPressReaction、reactionTypes 等）',
         },
         comments: {
           type: 'array',
@@ -1320,6 +1389,29 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
         bluestacksOnly: {
           type: 'boolean',
           description: 'logs 查询时是否仅返回蓝蝶模拟器实例产生的顶贴记录（默认 true）',
+        },
+        maxConcurrency: {
+          type: 'number',
+          minimum: 1,
+          maximum: 10,
+          description: 'start_health_check 时的并发体检台数（默认 3）',
+        },
+        autoLaunch: {
+          type: 'boolean',
+          description: 'start_health_check 时是否自动拉起离线蓝蝶窗口（默认 true）',
+        },
+        autoInstallApk: {
+          type: 'boolean',
+          description: 'start_health_check 时若缺 FB Lite 是否自动装包修复（默认 false）',
+        },
+        closeOnFinish: {
+          type: 'boolean',
+          description: 'start_health_check 体检结束后是否自动关窗释放内存（默认 true）',
+        },
+        riskLimits: {
+          type: 'object',
+          description:
+            'save_risk_limits 时的每日风控限额设置（enabled / dailyMaxTotalActions / dailyMaxBumps / dailyMaxPosts / dailyMaxInvites / dailyMaxActiveLikes / perInstanceOverrides）',
         },
       },
       required: ['action'],
@@ -1356,9 +1448,21 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           statusText: st.statusText,
           pageBumperRunning: st.pageBumperRunning,
           pageBumperStatusText: st.pageBumperStatusText,
+          activeRunning: Boolean(st.activeRunning),
+          activeStatusText: st.activeStatusText ?? '',
+          posterRunning: Boolean(st.posterRunning),
+          posterStatusText: st.posterStatusText ?? '',
+          inviterRunning: Boolean(st.inviterRunning),
+          inviterStatusText: st.inviterStatusText ?? '',
           launchingIds: st.launchingIds,
           closingIds: st.closingIds,
           inspectingIds: st.inspectingIds,
+          installingIds: st.installingIds ?? [],
+          loggingInIds: st.loggingInIds ?? [],
+          switchingIds: st.switchingIds ?? [],
+          healthCheck: st.healthCheck ?? null,
+          riskLimitSettings: st.riskLimitSettings ?? null,
+          dailyUsage: st.dailyUsage ?? null,
           totalBumpedAllTime: st.total,
           totalPageBumpedAllTime: st.pageTotal,
           config: st.config,
@@ -1384,11 +1488,19 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
             resolution: `${inst.fbWidth}x${inst.fbHeight}`,
             portraitReady: isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight),
             fbLiteInstalled: inst.fbLiteInstalled,
+            fbLiteVersion: inst.fbLiteVersion ?? null,
+            androidSdk: inst.androidSdk ?? null,
             accountState: inst.accountState,
+            identityType: inst.identityType ?? 'unknown',
             accountId: inst.accountId,
+            numericAccountId: inst.numericAccountId ?? null,
             accountName: inst.accountName,
+            managedIdentities: inst.managedIdentities ?? [],
             stat: st.profileCounts[inst.id] ?? null,
             pageStat: st.pageBumperProfileCounts[inst.id] ?? null,
+            activeStat: st.activeProfileCounts?.[inst.id] ?? null,
+            posterStat: st.posterProfileCounts?.[inst.id] ?? null,
+            inviterStat: st.inviterProfileCounts?.[inst.id] ?? null,
           })),
         };
       };
@@ -1435,6 +1547,10 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           payload.confPath =
             typeof args.confPath === 'string' && args.confPath.trim() ? args.confPath.trim() : null;
         }
+        if ('apkPath' in args) {
+          payload.apkPath =
+            typeof args.apkPath === 'string' && args.apkPath.trim() ? args.apkPath.trim() : null;
+        }
         return okResult(await formatBsState(await deps.bluestacksService.updatePaths(payload)));
       }
 
@@ -1477,6 +1593,19 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           appliedSettings:
             scopeMode === 'page' ? updated.pageBumperSettings : updated.bumperSettings,
         });
+      }
+
+      if (action === 'save_risk_limits') {
+        const current = await deps.bluestacksService.state(false);
+        const patch =
+          typeof args.riskLimits === 'object' && args.riskLimits !== null
+            ? (args.riskLimits as Record<string, unknown>)
+            : typeof args.settings === 'object' && args.settings !== null
+              ? (args.settings as Record<string, unknown>)
+              : {};
+        const merged = { ...(current.riskLimitSettings ?? {}), ...patch };
+        const updated = await deps.bluestacksService.saveRiskLimitSettings(merged);
+        return okResult(await formatBsState(updated));
       }
 
       if (action === 'save_comments') {
@@ -1560,6 +1689,208 @@ export function createPosterAndModuleTools(deps: WorkbenchMcpDependencies): McpT
           count: filtered.length,
           logs: filtered,
         });
+      }
+
+      if (action === 'show') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult('INSTANCE_ID_REQUIRED', 'show 需要提供 instanceId 或 instanceIds');
+        }
+        const instanceIds = await resolveTargetInstanceIds(false);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.showInstance({ instanceId: instanceIds[0] }),
+          ),
+        );
+      }
+      if (action === 'arrange') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : undefined;
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.arrangeWindows({
+              ...(instanceIds && instanceIds.length > 0 ? { instanceIds } : {}),
+              ...(typeof args.columns === 'number' ? { columns: args.columns } : {}),
+              ...(typeof args.gap === 'number' ? { gap: args.gap } : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'install_apk') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'install_apk 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(false);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.installApk({
+              instanceIds,
+              ...(typeof args.apkPath === 'string' && args.apkPath.trim()
+                ? { apkPath: args.apkPath.trim() }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'switch_identity') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_ID_REQUIRED',
+            'switch_identity 需要提供 instanceId 或 instanceIds',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(false);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.switchIdentity({
+              instanceId: instanceIds[0],
+              ...(typeof args.targetName === 'string' && args.targetName.trim()
+                ? { targetName: args.targetName.trim() }
+                : {}),
+              ...(args.targetType === 'personal' || args.targetType === 'page'
+                ? { targetType: args.targetType }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'start_active') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'start_active 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(true);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.startActive({
+              instanceIds,
+              ...(typeof args.combinationId === 'string' && args.combinationId.trim()
+                ? { combinationId: args.combinationId.trim() }
+                : {}),
+              ...(typeof args.quickStep === 'object' && args.quickStep !== null
+                ? { quickStep: args.quickStep }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'stop_active') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : undefined;
+        return okResult(
+          await formatBsState(await deps.bluestacksService.stopExtra('active', instanceIds)),
+        );
+      }
+      if (action === 'start_poster') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'start_poster 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(true);
+        const groupIds = Array.isArray(args.groupIds)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
+          : [];
+        const materialIds = Array.isArray(args.materialIds)
+          ? args.materialIds.map((x) => String(x).trim()).filter(Boolean)
+          : [];
+        await ensureSharedTargetsForBluestacks(groupIds, []);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.startPoster({
+              instanceIds,
+              materialIds,
+              groupIds,
+              ...(typeof args.maxGroupsPerInstance === 'number'
+                ? { maxGroupsPerInstance: args.maxGroupsPerInstance }
+                : {}),
+              ...(typeof args.postToTimeline === 'boolean'
+                ? { postToTimeline: args.postToTimeline }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'stop_poster') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : undefined;
+        return okResult(
+          await formatBsState(await deps.bluestacksService.stopExtra('poster', instanceIds)),
+        );
+      }
+      if (action === 'start_inviter') {
+        if (rawInstanceQueries.length === 0) {
+          return errorResult(
+            'INSTANCE_IDS_REQUIRED',
+            'start_inviter 需要提供 instanceIds 或 instanceId',
+          );
+        }
+        const instanceIds = await resolveTargetInstanceIds(true);
+        const groupIds = Array.isArray(args.groupIds)
+          ? args.groupIds.map((x) => extractFacebookGroupId(String(x).trim())).filter(Boolean)
+          : [];
+        await ensureSharedTargetsForBluestacks(groupIds, []);
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.startInviter({
+              instanceIds,
+              groupIds,
+              ...(typeof args.invitesPerGroup === 'number'
+                ? { invitesPerGroup: args.invitesPerGroup }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'stop_inviter') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : undefined;
+        return okResult(
+          await formatBsState(await deps.bluestacksService.stopExtra('inviter', instanceIds)),
+        );
+      }
+      if (action === 'start_health_check') {
+        let instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : [];
+        if (instanceIds.length === 0) {
+          const cur = await deps.bluestacksService.state(true);
+          instanceIds = cur.instances.map((i) => i.id);
+        }
+        if (instanceIds.length === 0) {
+          return errorResult('INSTANCE_IDS_REQUIRED', '未找到可体检的蓝蝶实例');
+        }
+        return okResult(
+          await formatBsState(
+            await deps.bluestacksService.startHealthCheck({
+              instanceIds,
+              ...(typeof args.maxConcurrency === 'number'
+                ? { maxConcurrency: args.maxConcurrency }
+                : {}),
+              ...(typeof args.autoLaunch === 'boolean' ? { autoLaunch: args.autoLaunch } : {}),
+              ...(typeof args.autoInstallApk === 'boolean'
+                ? { autoInstallApk: args.autoInstallApk }
+                : {}),
+              ...(typeof args.closeOnFinish === 'boolean'
+                ? { closeOnFinish: args.closeOnFinish }
+                : {}),
+            }),
+          ),
+        );
+      }
+      if (action === 'stop_health_check') {
+        return okResult(await formatBsState(await deps.bluestacksService.stopHealthCheck()));
+      }
+      if (action === 'stop_all') {
+        const instanceIds =
+          rawInstanceQueries.length > 0 ? await resolveTargetInstanceIds(false) : undefined;
+        return okResult(
+          await formatBsState(await deps.bluestacksService.stopAllForInstances(instanceIds)),
+        );
       }
 
       if (action === 'launch') {

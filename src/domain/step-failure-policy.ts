@@ -47,3 +47,22 @@ export function postFailureRequiresEnding(reason: string, purpose?: string): boo
     reason,
   );
 }
+
+export function isAccountHardBlockTaskReason(reason: string): boolean {
+  return /(?:ACCOUNT_(?:CHANGED|MISMATCH|VERIFICATION|RESTRICTED|LOGGED_OUT)|IDENTITY_REQUIRED|FACEBOOK_NATIVE_ACCOUNT_CHANGED)/.test(
+    reason,
+  );
+}
+
+export function stepFailureAllowsAutoContinuation(reason: string): boolean {
+  if (!reason) return false;
+  if (/^(?:USER_|MANUAL_|SCHEDULE_)/.test(reason)) return false;
+  if (
+    /^(?:CONCURRENCY_LIMIT|STARTUP_BACKOFF|OWNER|REVOKED|CONTROL_|LEASE_|SOFTWARE_RESTART)/.test(
+      reason,
+    )
+  )
+    return false;
+  if (isAccountHardBlockTaskReason(reason)) return false;
+  return true;
+}

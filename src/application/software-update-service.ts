@@ -103,7 +103,11 @@ export class SoftwareUpdateService {
     this.state.error = null;
     try {
       await this.port.install(release, () => this.port.assertCanApply());
-      await this.port.reloadExtensions();
+      try {
+        await this.port.reloadExtensions();
+      } catch {
+        // Runtime files are already swapped on disk; proceed to restart cleanly.
+      }
       this.port.restart();
       return { requested: true };
     } catch (error) {

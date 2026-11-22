@@ -1,5 +1,6 @@
 import { RecordCleanupActions } from './data-cleanup-panel.js';
-import { useEffect, useRef, useState } from 'react';
+import { ConfirmDialog } from './confirm-dialog.js';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { z } from 'zod';
 import type { Profile } from '../shared/contracts.js';
 import type { TaskRecord, TaskRuntimeOverview } from '../shared/task-contracts.js';
@@ -7,6 +8,7 @@ import type { Inspection } from '../shared/profile-inspection.js';
 import type { GroupInviteLogRow, GroupInviterState } from '../shared/group-inviter.js';
 import type { BumperLog, BumperState } from '../shared/group-bumper.js';
 import type { PosterLog, PosterState } from '../shared/group-poster.js';
+import type { GoogleSheetsOverview } from '../shared/google-sheets.js';
 import { attentionPlans, taskReasonDescription } from './task-alerts.js';
 import { groupTaskRecords, endedTask } from '../domain/task-run-records.js';
 import { isMarketplaceUnavailableSkip, isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
@@ -72,6 +74,8 @@ export function TaskRecordsPage({
   groupBumperState,
   onGroupBumperState,
   groupPosterState,
+  googleSheetsOverview,
+  onOpenCleanupSettings,
   onNotify,
 }: {
   runtime: z.infer<typeof TaskRuntimeOverview> | null;
@@ -85,9 +89,15 @@ export function TaskRecordsPage({
   groupBumperState?: BumperState | null | undefined;
   onGroupBumperState?: ((next: BumperState) => void) | undefined;
   groupPosterState?: PosterState | null | undefined;
+  googleSheetsOverview?: GoogleSheetsOverview | null | undefined;
+  onOpenCleanupSettings?: (() => void) | undefined;
   onNotify?: ((msg: string) => void) | undefined;
 }) {
   const [moduleTab, setModuleTab] = useState<ActivityRecordModuleFilter>('all');
+  const [visibleLimit, setVisibleLimit] = useState(80);
+  const [confirmClearBumperScope, setConfirmClearBumperScope] = useState<'group' | 'page' | null>(
+    null,
+  );
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectedBumperIds, setSelectedBumperIds] = useState<Set<string>>(new Set());
   const [selectedPosterIds, setSelectedPosterIds] = useState<Set<string>>(new Set());
@@ -113,8 +123,13 @@ export function TaskRecordsPage({
     return () => window.removeEventListener('task-records-deleted', handle);
   }, []);
 
+  const scopeGenerationRef = useRef(0);
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+
   const quickDelete = async (ids: string[]) => {
     if (ids.some((id) => deleting.current.has(id))) return;
+    const deleteScope = currentScope.current;
     for (const id of ids) deleting.current.add(id);
     const removed = new Set(ids);
     const previous = rowsRef.current.filter((row) => removed.has(row.stepId));
@@ -126,11 +141,15 @@ export function TaskRecordsPage({
       if (result.protected) throw Error('部分记录状态已变化，已重新读取');
       window.dispatchEvent(new CustomEvent('task-records-deleted', { detail: { stepIds: ids } }));
     } catch (error) {
-      setRows((rows) => {
-        const known = new Set(rows.map((r) => r.stepId));
-        return [...rows, ...previous.filter((r) => !known.has(r.stepId))];
-      });
-      setLoadError(error instanceof Error ? error.message : '删除失败，请重试');
+      const msg = error instanceof Error ? error.message : '删除失败，请重试';
+      if (currentScope.current === deleteScope) {
+        setRows((rows) => {
+          const known = new Set(rows.map((r) => r.stepId));
+          return [...rows, ...previous.filter((r) => !known.has(r.stepId))];
+        });
+      }
+      if (onNotify) onNotify(msg);
+      else setLoadError(msg);
       setRetry((v) => v + 1);
     } finally {
       for (const id of ids) deleting.current.delete(id);
@@ -163,41 +182,73 @@ export function TaskRecordsPage({
     return () => clearInterval(timer);
   }, []);
 
-  // Load inviter, bumper & poster logs for cross-module center
+  // Load inviter, bumper & poster logs on-demand per module so one module's ticks or tab switches never spam unrelated APIs
+  const inviterFetchedSigRef = useRef('');
+  const bumperFetchedSigRef = useRef('');
+  const posterFetchedSigRef = useRef('');
+
+  const inviterLogSig = `${retry}|${groupInviterState?.running ?? ''}|${groupInviterState?.finishedAt ?? ''}`;
   useEffect(() => {
+    const needFetch =
+      !inviterFetchedSigRef.current || moduleTab === 'all' || moduleTab === 'group-inviter';
+    if (!needFetch || inviterFetchedSigRef.current === inviterLogSig) return;
     let active = true;
     void api
       .groupInviterLogs('')
       .then((list) => {
-        if (active && Array.isArray(list)) setInviterLogs(list);
-      })
-      .catch(() => {});
-    void api
-      .bumperLogs('')
-      .then((list) => {
-        if (active && Array.isArray(list)) setBumperLogs(list);
-      })
-      .catch(() => {});
-    void api
-      .posterLogs('')
-      .then((list) => {
-        if (active && Array.isArray(list)) setPosterLogs(list);
+        if (active && Array.isArray(list)) {
+          setInviterLogs(list);
+          inviterFetchedSigRef.current = inviterLogSig;
+        }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [
-    retry,
-    groupInviterState?.running,
-    groupInviterState?.finishedAt,
-    groupBumperState?.running,
-    groupBumperState?.pageBumperRunning,
-    groupBumperState?.total,
-    groupBumperState?.pageTotal,
-    groupPosterState?.running,
-    groupPosterState?.total,
-  ]);
+  }, [moduleTab, inviterLogSig]);
+
+  const bumperLogSig = `${retry}|${groupBumperState?.running ?? ''}|${groupBumperState?.pageBumperRunning ?? ''}|${groupBumperState?.total ?? ''}|${groupBumperState?.pageTotal ?? ''}`;
+  useEffect(() => {
+    const needFetch =
+      !bumperFetchedSigRef.current ||
+      moduleTab === 'all' ||
+      moduleTab === 'group-bumper' ||
+      moduleTab === 'page-bumper';
+    if (!needFetch || bumperFetchedSigRef.current === bumperLogSig) return;
+    let active = true;
+    void api
+      .bumperLogs('')
+      .then((list) => {
+        if (active && Array.isArray(list)) {
+          setBumperLogs(list);
+          bumperFetchedSigRef.current = bumperLogSig;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [moduleTab, bumperLogSig]);
+
+  const posterLogSig = `${retry}|${groupPosterState?.running ?? ''}|${groupPosterState?.total ?? ''}`;
+  useEffect(() => {
+    const needFetch =
+      !posterFetchedSigRef.current || moduleTab === 'all' || moduleTab === 'group-poster';
+    if (!needFetch || posterFetchedSigRef.current === posterLogSig) return;
+    let active = true;
+    void api
+      .posterLogs('')
+      .then((list) => {
+        if (active && Array.isArray(list)) {
+          setPosterLogs(list);
+          posterFetchedSigRef.current = posterLogSig;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [moduleTab, posterLogSig]);
 
   const rowsRef = useRef<TaskRecord[]>([]);
   rowsRef.current = rows;
@@ -247,10 +298,17 @@ export function TaskRecordsPage({
   useEffect(
     () => () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      loadMoreAbortRef.current?.abort();
+      exportAbortRef.current?.abort();
     },
     [],
   );
-  const now = Date.now();
+  useEffect(() => {
+    scopeGenerationRef.current += 1;
+    loadMoreAbortRef.current?.abort();
+    loadMoreAbortRef.current = null;
+  }, [scopeKey]);
+  const now = Math.floor(Date.now() / 60_000) * 60_000;
   useEffect(() => {
     const timer = setTimeout(() => setQuery(searchText), 300);
     return () => clearTimeout(timer);
@@ -319,24 +377,42 @@ export function TaskRecordsPage({
 
   async function loadMore() {
     if (!nextCursor || loadingMore) return;
+    const gen = scopeGenerationRef.current;
+    loadMoreAbortRef.current?.abort();
+    const controller = new AbortController();
+    loadMoreAbortRef.current = controller;
     setLoadingMore(true);
     try {
-      const res = await api.taskRecords({
-        ...(filterId ? { profileId: filterId } : {}),
-        status: apiStatus,
-        ...(query.trim() ? { query: query.trim() } : {}),
-        cursor: nextCursor,
-        groupBy: 'run',
-        limit: 100,
-      });
-      if (currentScope.current !== scopeKey) return;
+      const res = await api.taskRecords(
+        {
+          ...(filterId ? { profileId: filterId } : {}),
+          status: apiStatus,
+          ...(query.trim() ? { query: query.trim() } : {}),
+          cursor: nextCursor,
+          groupBy: 'run',
+          limit: 100,
+        },
+        controller.signal,
+      );
+      if (
+        controller.signal.aborted ||
+        scopeGenerationRef.current !== gen ||
+        currentScope.current !== scopeKey
+      )
+        return;
       setRows((prev) => {
         const known = new Set(prev.map((row) => row.stepId));
-        return [...prev, ...res.records.filter((row) => !known.has(row.stepId))];
+        return [
+          ...prev,
+          ...res.records.filter(
+            (row) => !known.has(row.stepId) && !deleting.current.has(row.stepId),
+          ),
+        ];
       });
       setNextCursor(res.nextCursor);
       setTotal(res.total);
     } catch (failure) {
+      if (controller.signal.aborted || scopeGenerationRef.current !== gen) return;
       if (failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED') {
         viewRef.current = undefined;
         setNextCursor(null);
@@ -344,20 +420,29 @@ export function TaskRecordsPage({
         setLoadError('记录已变化，正在重新读取。');
       } else setLoadError('加载更多失败，请再试一次。');
     } finally {
-      setLoadingMore(false);
+      if (loadMoreAbortRef.current === controller) loadMoreAbortRef.current = null;
+      if (scopeGenerationRef.current === gen) setLoadingMore(false);
     }
   }
 
-  async function deleteBumperLogs(ids: string[], deleteAll = false) {
+  async function deleteBumperLogs(
+    ids: string[],
+    deleteAll = false,
+    scope: 'group' | 'page' = 'group',
+  ) {
     if (bumperBusy) return;
     setBumperBusy(true);
     try {
-      const next = await api.bumperAction('logs/delete', deleteAll ? { all: true } : { ids });
+      const next = await api.bumperAction(
+        'logs/delete',
+        deleteAll ? { all: true, sourceMode: scope } : { ids },
+      );
       onGroupBumperState?.(next);
       const refreshed = await api.bumperLogs('');
       if (Array.isArray(refreshed)) setBumperLogs(refreshed);
       setSelectedBumperIds(new Set());
-      onNotify?.(deleteAll ? '已清空全部小组顶贴历史记录' : `已删除 ${ids.length} 条小组顶贴记录`);
+      const label = scope === 'page' ? '专页顶贴' : '小组顶贴';
+      onNotify?.(deleteAll ? `已清空全部${label}历史记录` : `已删除 ${ids.length} 条顶贴记录`);
     } catch (err) {
       onNotify?.(err instanceof Error ? err.message : '删除顶贴记录失败');
     } finally {
@@ -365,94 +450,114 @@ export function TaskRecordsPage({
     }
   }
 
-  const groups = groupTaskRecords(rows);
-  const byGroupPlanRound = new Map(
-    groups.map((g) => {
-      const first = g.rows[0];
-      return [first ? `${first.planId}:${first.round}` : g.key, g];
-    }),
+  const groups = useMemo(() => groupTaskRecords(rows), [rows]);
+  const byGroupPlanRound = useMemo(
+    () =>
+      new Map(
+        groups.map((g) => {
+          const first = g.rows[0];
+          return [first ? `${first.planId}:${first.round}` : g.key, g];
+        }),
+      ),
+    [groups],
   );
-  const eligibleIds = groups
-    .filter((g) => endedTask(g.rows[0]?.planState ?? ''))
-    .flatMap((g) => g.rows.map((r) => r.stepId));
+  const eligibleIds = useMemo(
+    () =>
+      groups
+        .filter((g) => endedTask(g.rows[0]?.planState ?? ''))
+        .flatMap((g) => g.rows.map((r) => r.stepId)),
+    [groups],
+  );
   const filtered = filterId ? byProfile.get(filterId) : undefined;
 
   // Build unified cross-module feed
-  const unifiedFeed = buildUnifiedActivityFeed({
-    profiles,
-    taskRecords: rows,
-    attentionPlanIds: attention,
-    inviterState: groupInviterState,
-    inviterLogs,
-    bumperState: groupBumperState,
-    bumperLogs,
-    posterState: groupPosterState,
-    posterLogs,
-    profileId: filterId,
-    moduleFilter: moduleTab,
-    statusFilter: filter,
-    query,
-    now,
-  });
+  const unifiedFeed = useMemo(
+    () =>
+      buildUnifiedActivityFeed({
+        profiles,
+        taskRecords: rows,
+        attentionPlanIds: attention,
+        inviterState: groupInviterState,
+        inviterLogs,
+        bumperState: groupBumperState,
+        bumperLogs,
+        posterState: groupPosterState,
+        posterLogs,
+        googleSheetsOverview,
+        profileId: filterId,
+        moduleFilter: moduleTab,
+        statusFilter: filter,
+        query,
+        now,
+      }),
+    [
+      profiles,
+      rows,
+      attention,
+      groupInviterState,
+      inviterLogs,
+      groupBumperState,
+      bumperLogs,
+      groupPosterState,
+      posterLogs,
+      googleSheetsOverview,
+      filterId,
+      moduleTab,
+      filter,
+      query,
+      now,
+    ],
+  );
+
+  useEffect(() => {
+    setVisibleLimit(80);
+  }, [moduleTab, filter, query, filterId]);
 
   const nonActiveTotal =
     unifiedFeed.moduleCounts['group-inviter'] +
     unifiedFeed.moduleCounts['group-bumper'] +
     unifiedFeed.moduleCounts['page-bumper'] +
-    unifiedFeed.moduleCounts['group-poster'];
+    unifiedFeed.moduleCounts['group-poster'] +
+    unifiedFeed.moduleCounts['google-sheets'];
 
-  // For moduleTab === 'active-accounts', use exact backend counts; for other tabs, use unifiedFeed.statusCounts
+  // For moduleTab === 'active-accounts', use exact backend counts; for 'all', add pre-statusFilter non-active counts!
   const displayedStatusCounts: Record<Filter, number> =
     moduleTab === 'active-accounts'
       ? counts
-      : {
-          all: moduleTab === 'all' ? counts.all + nonActiveTotal : unifiedFeed.statusCounts.all,
-          running:
-            moduleTab === 'all'
-              ? counts.running +
-                unifiedFeed.items.filter(
-                  (i) => i.moduleId !== 'active-accounts' && i.status === 'running',
-                ).length
-              : unifiedFeed.statusCounts.running,
-          completed:
-            moduleTab === 'all'
-              ? counts.completed +
-                unifiedFeed.items.filter(
-                  (i) => i.moduleId !== 'active-accounts' && i.status === 'completed',
-                ).length
-              : unifiedFeed.statusCounts.completed,
-          failed:
-            moduleTab === 'all'
-              ? counts.failed +
-                unifiedFeed.items.filter(
-                  (i) => i.moduleId !== 'active-accounts' && i.status === 'failed',
-                ).length
-              : unifiedFeed.statusCounts.failed,
-          attention:
-            moduleTab === 'all'
-              ? counts.attention +
-                unifiedFeed.items.filter(
-                  (i) => i.moduleId !== 'active-accounts' && i.status === 'attention',
-                ).length
-              : unifiedFeed.statusCounts.attention,
-        };
+      : moduleTab === 'all'
+        ? {
+            all: counts.all + unifiedFeed.nonActiveStatusCounts.all,
+            running: counts.running + unifiedFeed.nonActiveStatusCounts.running,
+            completed: counts.completed + unifiedFeed.nonActiveStatusCounts.completed,
+            failed: counts.failed + unifiedFeed.nonActiveStatusCounts.failed,
+            attention: counts.attention + unifiedFeed.nonActiveStatusCounts.attention,
+          }
+        : unifiedFeed.statusCounts;
 
   async function exportRows() {
     if (exporting) return;
+    exportAbortRef.current?.abort();
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
     setExporting(true);
     try {
       const allRecords: TaskRecord[] = [];
       if (moduleTab === 'all' || moduleTab === 'active-accounts') {
         let cursor: string | undefined;
         while (true) {
-          const res = await api.taskRecords({
-            ...(filterId ? { profileId: filterId } : {}),
-            status: apiStatus,
-            ...(query.trim() ? { query: query.trim() } : {}),
-            ...(cursor ? { cursor } : {}),
-            groupBy: 'run',
-            limit: 200,
-          });
+          if (controller.signal.aborted) return;
+          const res = await api.taskRecords(
+            {
+              ...(filterId ? { profileId: filterId } : {}),
+              status: apiStatus,
+              ...(query.trim() ? { query: query.trim() } : {}),
+              ...(cursor ? { cursor } : {}),
+              groupBy: 'run',
+              limit: 200,
+            },
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
           allRecords.push(...res.records);
           if (!res.nextCursor) break;
           cursor = res.nextCursor;
@@ -539,7 +644,18 @@ export function TaskRecordsPage({
         anchor.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
+    } catch (failure) {
+      if (controller.signal.aborted) return;
+      const msg =
+        failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED'
+          ? '导出期间记录已更新，请重新点击导出'
+          : failure instanceof Error
+            ? `导出失败：${failure.message}`
+            : '导出失败，请稍后重试';
+      if (onNotify) onNotify(msg);
+      else setLoadError(msg);
     } finally {
+      if (exportAbortRef.current === controller) exportAbortRef.current = null;
       setExporting(false);
     }
   }
@@ -722,6 +838,7 @@ export function TaskRecordsPage({
   const moduleTabs: [ActivityRecordModuleFilter, string, number][] = [
     ['all', '全部模块', counts.all + nonActiveTotal],
     ['active-accounts', '活跃账号', counts.all],
+    ['google-sheets', '云表协同', unifiedFeed.moduleCounts['google-sheets']],
     ['group-inviter', '小组邀请人', unifiedFeed.moduleCounts['group-inviter']],
     ['group-bumper', '小组顶贴', unifiedFeed.moduleCounts['group-bumper']],
     ['page-bumper', '专页顶贴', unifiedFeed.moduleCounts['page-bumper']],
@@ -878,7 +995,11 @@ export function TaskRecordsPage({
     const isPosterLog = Boolean(item.posterLogId);
     const posterId = item.posterLogId ?? '';
     return (
-      <div className={'records-row unified-module-row tone-' + item.tone} role="row" key={item.id}>
+      <div
+        className={'records-row run-record-row unified-module-row tone-' + item.tone}
+        role="row"
+        key={item.id}
+      >
         <span role="cell" onClick={(e) => e.stopPropagation()}>
           {isBumperLog ? (
             <input
@@ -1047,7 +1168,8 @@ export function TaskRecordsPage({
             </button>
           )}
           <button
-            className={'btn btn-icon' + (exporting ? ' is-busy' : '')}
+            type="button"
+            className={'btn btn-sm' + (exporting ? ' is-busy' : '')}
             title={exporting ? '正在导出…' : '导出当前筛选全部执行记录（JSON）'}
             aria-label="导出任务记录"
             disabled={
@@ -1056,12 +1178,23 @@ export function TaskRecordsPage({
             }
             onClick={() => void exportRows()}
           >
-            <IconDownload />
+            <IconDownload size={14} />
+            导出
           </button>
+          {onOpenCleanupSettings && (
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              title="前往设置历史记录自动保留规则与数据库清理"
+              onClick={onOpenCleanupSettings}
+            >
+              保留规则
+            </button>
+          )}
         </div>
       </div>
 
-      {moduleTab === 'group-bumper' ? (
+      {moduleTab === 'group-bumper' || moduleTab === 'page-bumper' ? (
         <div className="records-toolbar">
           <div className="status-tabs" role="tablist">
             {tabs.map(([key, label]) => (
@@ -1083,27 +1216,57 @@ export function TaskRecordsPage({
                 type="button"
                 className="btn btn-sm danger"
                 disabled={bumperBusy}
-                onClick={() => void deleteBumperLogs([...selectedBumperIds])}
+                onClick={() =>
+                  void deleteBumperLogs(
+                    [...selectedBumperIds],
+                    false,
+                    moduleTab === 'page-bumper' ? 'page' : 'group',
+                  )
+                }
               >
-                删除所选顶贴记录 ({selectedBumperIds.size})
+                删除所选记录 ({selectedBumperIds.size})
               </button>
             )}
             <button
               type="button"
               className="btn btn-sm"
-              disabled={bumperBusy || bumperLogs.length === 0 || Boolean(groupBumperState?.running)}
-              onClick={() => {
-                if (confirm('清空全部小组顶贴记录？清空后对应的历史防重和累计统计也会重置。')) {
-                  void deleteBumperLogs([], true);
-                }
-              }}
+              disabled={
+                bumperBusy ||
+                bumperSelectableIds.length === 0 ||
+                Boolean(
+                  moduleTab === 'page-bumper'
+                    ? groupBumperState?.pageBumperRunning
+                    : groupBumperState?.running,
+                )
+              }
+              onClick={() =>
+                setConfirmClearBumperScope(moduleTab === 'page-bumper' ? 'page' : 'group')
+              }
             >
-              清空顶贴记录
+              {moduleTab === 'page-bumper' ? '清空专页顶贴记录' : '清空小组顶贴记录'}
             </button>
+          </div>
+        </div>
+      ) : moduleTab === 'group-poster' || moduleTab === 'group-inviter' ? (
+        <div className="records-toolbar">
+          <div className="status-tabs" role="tablist">
+            {tabs.map(([key, label]) => (
+              <button
+                key={key}
+                role="tab"
+                aria-selected={filter === key}
+                className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
+                onClick={() => setFilter(key)}
+              >
+                {label}
+                <span>{displayedStatusCounts[key]}</span>
+              </button>
+            ))}
           </div>
         </div>
       ) : (
         <RecordCleanupActions
+          showRetention={false}
           filters={
             <div className="status-tabs" role="tablist">
               {tabs.map(([key, label]) => (
@@ -1124,6 +1287,21 @@ export function TaskRecordsPage({
           selectedCount={groups.filter((g) => g.rows.every((r) => selected.has(r.stepId))).length}
           {...(filterId ? { profileId: filterId } : {})}
           onDone={afterDelete}
+        />
+      )}
+      {confirmClearBumperScope && (
+        <ConfirmDialog
+          title={
+            confirmClearBumperScope === 'page' ? '清空全部专页顶贴记录' : '清空全部小组顶贴记录'
+          }
+          description={`确定清空全部${confirmClearBumperScope === 'page' ? '专页顶贴' : '小组顶贴'}历史记录？仅清理该模式记录与对应累计统计，不会影响另一模式。`}
+          label="确认清空"
+          onClose={() => setConfirmClearBumperScope(null)}
+          onConfirm={async () => {
+            const scope = confirmClearBumperScope;
+            setConfirmClearBumperScope(null);
+            await deleteBumperLogs([], true, scope);
+          }}
         />
       )}
 
@@ -1243,7 +1421,7 @@ export function TaskRecordsPage({
             <span role="columnheader">成果与说明</span>
             <span role="columnheader">时间与操作</span>
           </div>
-          {unifiedFeed.items.map((item) => {
+          {unifiedFeed.items.slice(0, visibleLimit).map((item) => {
             if (item.moduleId === 'active-accounts' && item.planId !== undefined) {
               const group = byGroupPlanRound.get(`${item.planId}:${item.round ?? 1}`);
               if (group) return renderActiveAccountGroupRow(group, moduleTab === 'all');
@@ -1251,7 +1429,19 @@ export function TaskRecordsPage({
             return renderUnifiedNonTaskRow(item, moduleTab === 'all');
           })}
           <div className="records-foot">
-            <span>已显示 {unifiedFeed.items.length} 条执行记录</span>
+            <span>
+              已显示 {Math.min(visibleLimit, unifiedFeed.items.length)} / {unifiedFeed.items.length}{' '}
+              条执行记录
+            </span>
+            {unifiedFeed.items.length > visibleLimit && (
+              <button
+                type="button"
+                className="btn btn-sm records-more"
+                onClick={() => setVisibleLimit((v) => v + 80)}
+              >
+                展开更多（剩余 {unifiedFeed.items.length - visibleLimit} 条）
+              </button>
+            )}
             {moduleTab === 'all' && nextCursor && (
               <button
                 className="btn btn-sm records-more"

@@ -60,7 +60,10 @@ export class LogCleanup {
           deleted++;
           bytes += stat.size;
         } catch (error) {
-          if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+          const code = error instanceof Error && 'code' in error ? String(error.code) : '';
+          if (code !== 'ENOENT' && code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+            throw error;
+          }
         }
       }
       return { deleted, bytes, protected: files.length - deleted };

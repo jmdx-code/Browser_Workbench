@@ -15,6 +15,7 @@ import { taskTimingEligibility } from '../domain/task-timing.js';
 import type { TabProof } from '../shared/kernel-state.js';
 import { MAX_CONCURRENT_STARTUPS } from '../shared/task-capacity.js';
 import { isRecoverableBrowseFault } from '../shared/browse-execution.js';
+import { stepFailureAllowsAutoContinuation } from '../domain/step-failure-policy.js';
 
 // Composition of the original host/registry, not another scheduler. A QUEUED plan first gets
 // a finite private native observation; only the original SQL claim grants the account lock.
@@ -75,6 +76,7 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
       profileId: string,
     ) => Awaitable<RuntimeProfile | undefined>,
     private readonly now: () => number = Date.now,
+    private readonly autoSettleUncertainAndContinue = false,
   ) {
     this.registry = new ProfileActorRegistry(
       async () => await this.profiles(),
@@ -267,6 +269,7 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
     };
   }
   private readonly queuedAdmissions = new Set<string>();
+  private readonly admissionRetryCounts = new Map<string, { key: string; count: number }>();
   private async observeOnce(profileId: string) {
     if (this.registry.hasOwner(profileId)) {
       this.startupBackoffs.delete(profileId);
@@ -327,10 +330,35 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
         this.recordStartupBackoff(profileId, error);
         throw error;
       }
+      if (
+        this.autoSettleUncertainAndContinue &&
+        activeStep &&
+        (errReason === 'KERNEL_PROFILE_NOT_IDLE' || isRecoverableBrowseFault(errReason))
+      ) {
+        const retryKey = `${plan.id}:${activeStep.id}`;
+        const prev = this.admissionRetryCounts.get(profileId);
+        const count = prev?.key === retryKey ? prev.count + 1 : 1;
+        this.admissionRetryCounts.set(profileId, { key: retryKey, count });
+        if (count <= 3) {
+          this.reopeningProfiles.add(profileId);
+          this.recordStartupBackoff(profileId, error);
+          throw error;
+        }
+      }
+      this.admissionRetryCounts.delete(profileId);
       this.reopeningProfiles.delete(profileId);
       this.startupBackoffs.delete(profileId);
-      if (plan.accountId)
+      if (plan.accountId) {
+        const failureReason = ('INITIAL_SESSION_FAILED:' + errReason).slice(0, 200);
+        if (
+          this.autoSettleUncertainAndContinue &&
+          activeStep &&
+          stepFailureAllowsAutoContinuation(errReason)
+        ) {
+          await this.tasks.noteStepFailure?.(plan.id, activeStep.id, failureReason);
+        }
         await this.tasks.reviewFailedAdmission(plan.id, plan.accountId, errReason);
+      }
       throw error;
     }
     try {
@@ -341,30 +369,35 @@ export class AdmittedTaskRuntime implements TaskCycleRuntime {
       this.startupBackoffs.delete(profileId);
     } catch (error) {
       this.startupBackoffs.delete(profileId);
-      const context = await port.current();
-      if (!context) throw Error('TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED');
-      const cancelled = await this.tasks.get(plan.id);
-      if (
-        cancelled.controlRequestId &&
-        cancelled.controlMode &&
-        ['PAUSING', 'STOPPING'].includes(cancelled.state) &&
-        this.openingControls.get(plan.id) === cancelled.controlRequestId
-      ) {
-        // This explicit control arrived while opening. Bind its actual returned owner,
-        // then confirm only that owner's matching native receipt; never invent a receipt
-        // for an opening which rejected before returning a session.
-        const binding = {
-          ...context,
-          requestId: cancelled.controlRequestId,
-          jobId: plan.id,
-          mode: cancelled.controlMode,
-        };
-        await this.controls.bind(binding);
-        await this.controls.confirm(
-          binding,
-          await port.stop({ ...context, requestId: binding.requestId }),
-        );
-      } else await port.stop({ ...context, requestId: this.id() });
+      try {
+        const context = (await port.current()) ?? port.openedContext?.() ?? null;
+        if (!context) throw Error('TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED');
+        const cancelled = await this.tasks.get(plan.id);
+        if (
+          cancelled.controlRequestId &&
+          cancelled.controlMode &&
+          ['PAUSING', 'STOPPING'].includes(cancelled.state) &&
+          this.openingControls.get(plan.id) === cancelled.controlRequestId
+        ) {
+          // This explicit control arrived while opening. Bind its actual returned owner,
+          // then confirm only that owner's matching native receipt; never invent a receipt
+          // for an opening which rejected before returning a session.
+          const binding = {
+            ...context,
+            requestId: cancelled.controlRequestId,
+            jobId: plan.id,
+            mode: cancelled.controlMode,
+          };
+          await this.controls.bind(binding);
+          await this.controls.confirm(
+            binding,
+            await port.stop({ ...context, requestId: binding.requestId }),
+          );
+        } else await port.stop({ ...context, requestId: this.id() });
+      } finally {
+        this.reopeningProfiles.delete(profileId);
+        await this.factory.forget(profileId);
+      }
       throw error;
     }
     await this.factory.forget(profileId);

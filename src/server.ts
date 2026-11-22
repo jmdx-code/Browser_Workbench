@@ -1,5 +1,6 @@
 import { recoverBumperOperations } from './infrastructure/group-bumper-recovery.js';
 import { retireClosedKernelSession } from './infrastructure/kernel-session-retirement.js';
+import { runBoundedServerShutdown } from './infrastructure/server-shutdown.js';
 const controllerStartedAt = Date.now();
 import {
   fetchAndLocalizeAccountAvatar,
@@ -8,6 +9,14 @@ import {
 import { isLocalAvatar } from './shared/group-bumper.js';
 import { GroupBumperService } from './application/group-bumper-service.js';
 import { GroupPosterService } from './application/group-poster-service.js';
+import { AutoSchedulerService } from './application/auto-scheduler-service.js';
+import { GoogleSheetsService } from './application/google-sheets-service.js';
+import { GoogleOAuthManager } from './infrastructure/google-oauth.js';
+import { startDesktopHostingMonitor } from './infrastructure/desktop-hosting-monitor.js';
+import { GoogleSheetsRestClient } from './infrastructure/google-sheets-client.js';
+import { SheetImageHostClient } from './infrastructure/sheet-image-host.js';
+import { GoogleSheetsAutomationBridge } from './infrastructure/google-sheets-automation-bridge.js';
+import { syncGlobalConcurrencyToModules } from './application/global-concurrency-sync.js';
 import {
   FeatureExecutionRegistry,
   ensureFeatureExecutionRegistry,
@@ -224,7 +233,12 @@ let dataCleanup: DataCleanupService | undefined;
 let bluestacksOcrClient: WindowsOcrClient | undefined;
 let bluestacksServiceRef: BluestacksService | undefined;
 let groupBumperServiceRef: GroupBumperService | undefined;
+let groupPosterServiceRef: GroupPosterService | undefined;
+let autoSchedulerServiceRef: AutoSchedulerService | undefined;
+let googleSheetsServiceRef: GoogleSheetsService | undefined;
+let featureExecutionRef: FeatureExecutionRegistry | undefined;
 let agentBrowserManagerRef: AgentBrowserManager | undefined;
+let autoInspectSweepRef: (() => Promise<void>) | undefined;
 let mcpHttpHandler:
   ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>) | undefined;
 const materialPreflight = new MaterialPreflightService(
@@ -326,6 +340,7 @@ try {
               (id, at) => layout.visible(id, at),
             );
             windowLayout = layout;
+            void layout.snapshot().catch(() => {});
             const localizeAvatar = (url: string, key: string) =>
               fetchAndLocalizeAccountAvatar(url, undefined, key).catch(() => null);
             kernel.setAccountObserver({
@@ -420,7 +435,9 @@ try {
                     ? null
                     : ['restricted', 'verification'].includes(account.state)
                       ? undefined
-                      : account.avatar;
+                      : account.avatar
+                        ? account.avatar
+                        : undefined;
                 if (resolvedAvatar && !isLocalAvatar(resolvedAvatar)) {
                   const localized = await localizeAvatar(
                     resolvedAvatar,
@@ -496,6 +513,7 @@ try {
                       }
                     : undefined;
                 },
+                true,
               );
             return {
               message: async (peer, value) => await kernel.message(peer, value),
@@ -531,6 +549,7 @@ try {
       : [identity.extensionId, 'penkjbecaaekdcpbpcfjekhikhjhoaai'],
     appRoutes: ({ core, store, tasks }) => {
       const featureExecution = new FeatureExecutionRegistry();
+      featureExecutionRef = featureExecution;
       backups = new WorkspaceBackupService(
         repository.tasks,
         new FilesystemWorkspaceBackupWriter(
@@ -553,6 +572,31 @@ try {
           (id) => mainKernel?.presentationStatus(id) ?? null,
         ),
       );
+      autoInspectSweepRef = async () => {
+        if (!inspection || shuttingDown || process.env.WORKBENCH_DIAGNOSTICS === '1') return;
+        const cache = await repository.profileAccountCache();
+        const candidates: string[] = [];
+        for (const peer of core.peers.values()) {
+          if (
+            !peer.online ||
+            !peer.synced ||
+            peer.phase !== 'PAUSED' ||
+            peer.browserWindowCount === 0 ||
+            !peer.capabilities?.includes('facebook-existing-display-v1')
+          ) {
+            continue;
+          }
+          const cached = cache.get(peer.profileId);
+          // Skip profiles that already have both confirmed account ID and localized avatar
+          if (cached?.id && isLocalAvatar(cached.avatar)) continue;
+          if ((await core.store.unresolved(peer.profileId)).length > 0) continue;
+          if (await featureExecution.isProfileBusy(peer.profileId)) continue;
+          candidates.push(peer.profileId);
+        }
+        if (candidates.length > 0) {
+          inspection.observeConnections(candidates);
+        }
+      };
       const assertSystemIdle = () => {
         dataCleanup?.assertNotResetting();
         backups?.assertIdle();
@@ -609,13 +653,7 @@ try {
         repository.groupBumper,
         () => mainKernel,
         () => core,
-        async (id) => {
-          for (const participant of featureExecution.participants()) {
-            if (participant.id === 'group-bumper' || participant.id === 'page-bumper') continue;
-            if (await participant.isProfileRunning(id)) return true;
-          }
-          return false;
-        },
+        (id) => featureExecution.isProfileBusy(id, ['group-bumper', 'page-bumper']),
         1,
         accountAbnormalReporter,
       );
@@ -659,20 +697,23 @@ try {
         repository.groupPoster,
         accountAbnormalReporter,
       );
+      const posterMediaPreparer = new FilesystemPosterMediaPreparer(
+        path.join(uploadCacheRoot, 'group-poster-media'),
+        fetch,
+        mediaComponent,
+      );
       const groupPosterService = new GroupPosterService(
         repository.groupPoster,
         posterAdapter,
-        new FilesystemPosterMediaPreparer(
-          path.join(uploadCacheRoot, 'group-poster-media'),
-          fetch,
-          mediaComponent,
-        ),
+        posterMediaPreparer,
         featureExecution,
         assertSystemIdle,
         (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
         () => targetMetadataRefresh.stopRefresh('groups'),
       );
-      const bsRuntime = createBluestacksRuntime(repository, featureExecution);
+      const bsRuntime = createBluestacksRuntime(repository, featureExecution, (mediaSource) =>
+        posterMediaPreparer.prepare(mediaSource),
+      );
       bluestacksOcrClient = bsRuntime.ocrClient;
       const bluestacksService = bsRuntime.service;
       bluestacksServiceRef = bluestacksService;
@@ -716,7 +757,7 @@ try {
           assertCanApply: async () => {
             if (!process.parentPort)
               throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中执行更新', 409);
-            const activeLabels = await featureExecution.activeModuleLabels();
+            const activeLabels = (await featureExecutionRef?.activeModuleLabels()) ?? [];
             const hasLiveTaskPlan = (await repository.tasks.livePlans()).some((p) =>
               taskBlocksSoftwareUpdate(
                 p.state,
@@ -765,7 +806,7 @@ try {
             }
           : undefined,
         async () => {
-          const activeLabels = await featureExecution.activeModuleLabels();
+          const activeLabels = (await featureExecutionRef?.activeModuleLabels()) ?? [];
           if (activeLabels.length > 0) {
             throw new ProductError(
               'RESET_TASKS_ACTIVE',
@@ -800,6 +841,7 @@ try {
         devDiagFilePath: devDiagWriter.filePath,
       });
       groupBumperServiceRef = groupBumperService;
+      groupPosterServiceRef = groupPosterService;
       const browserWindow = new BridgeBrowserWindow(
         core,
         repository.tasks,
@@ -839,6 +881,8 @@ try {
         groupBumperService,
         groupInviterService,
         bluestacksService,
+        getAutoSchedulerService: () => autoSchedulerServiceRef,
+        getGoogleSheetsService: () => googleSheetsServiceRef,
         browserWindow,
         windowLayout,
         captureDiagnostics,
@@ -858,6 +902,64 @@ try {
         },
       });
       const { profileLifecycle } = wired;
+      const autoSchedulerService = new AutoSchedulerService(repository.autoScheduler, {
+        workspace: workspaceService,
+        tasks: taskService,
+        groupBumper: groupBumperService,
+        groupPoster: groupPosterService,
+        groupInviter: groupInviterService,
+        bluestacks: bluestacksService,
+        profileLifecycle,
+        featureExecution,
+        assertAllowed: () => softwareUpdate?.assertIdle(),
+        onPowerLockChange: (mode) => {
+          process.parentPort?.postMessage({ type: 'SET_POWER_LOCK', mode });
+        },
+        onConcurrencyChanged: (next) =>
+          syncGlobalConcurrencyToModules(next, {
+            tasks: taskService,
+            groupBumper: groupBumperService,
+            groupPoster: groupPosterService,
+            groupInviter: groupInviterService,
+            bluestacks: bluestacksService,
+            googleSheets: googleSheetsServiceRef,
+          }),
+      });
+      autoSchedulerServiceRef = autoSchedulerService;
+      const googleOAuthManager = new GoogleOAuthManager(repository.googleSheets);
+      const googleSheetsService = new GoogleSheetsService(repository.googleSheets, {
+        workspace: workspaceService,
+        groupBumper: groupBumperService,
+        bluestacks: bluestacksService,
+        oauth: googleOAuthManager,
+        sheetsApi: new GoogleSheetsRestClient(googleOAuthManager),
+        imageHost: new SheetImageHostClient(repository.googleSheets, googleOAuthManager),
+        automation: new GoogleSheetsAutomationBridge(
+          core,
+          () => mainKernel ?? null,
+          posterAdapter,
+          posterMediaPreparer,
+          repository.groupBumper,
+          googleOAuthManager,
+        ),
+        featureExecution,
+        profileLifecycle,
+        assertSystemIdle,
+      });
+      featureExecution.register({
+        id: 'google-sheets',
+        label: 'Google 云表协同',
+        isProfileRunning: (profileId) => googleSheetsService.isProfileRunning(profileId),
+        hasActiveExecution: () => googleSheetsService.hasActiveExecution(),
+        stopProfiles: (profileIds) => googleSheetsService.stopProfiles(profileIds),
+      });
+      googleSheetsServiceRef = googleSheetsService;
+      void posterMediaPreparer.pruneOldCachedFiles(24 * 60 * 60_000).catch(() => {});
+      void Promise.resolve(repository.autoScheduler.settings())
+        .then((s) =>
+          googleSheetsService.syncMaxConcurrency(s.browserConcurrency, s.bluestacksConcurrency),
+        )
+        .catch(() => {});
       agentBrowserManagerRef = wired.agentBrowserManager;
       mcpHttpHandler = wired.mcpHttpHandler;
       const handler = workspaceApi(
@@ -906,10 +1008,24 @@ try {
         (id) => Boolean(core.peers.get(id)?.online),
         bluestacksService,
         profileLifecycle,
+        autoSchedulerService,
+        googleSheetsService,
       );
       return async (...args) => {
         const [req] = args;
         if (req.method !== 'POST') return handler(...args);
+        const rawPath = (req.url ?? '').split('?')[0] ?? '';
+        // Read-only grid POST compat or long-running Sheets browser tasks (already guarded via featureExecution)
+        if (
+          rawPath === '/api/workspace/google-sheets/links/grid' ||
+          rawPath === '/api/workspace/google-sheets/links/poll-schedule' ||
+          rawPath === '/api/workspace/google-sheets/links/poll-records' ||
+          rawPath === '/api/workspace/google-sheets/links/refresh-metrics' ||
+          rawPath === '/api/workspace/google-sheets/links/sync-library' ||
+          rawPath === '/api/workspace/google-sheets/links/import-library'
+        ) {
+          return handler(...args);
+        }
         mutations++;
         try {
           return await handler(...args);
@@ -921,6 +1037,8 @@ try {
   });
   // Product policy: source files remain in place. Historical archive records are read-only;
   // no archive worker, preparation, copy, source delete or movement is launched.
+  await autoSchedulerServiceRef?.start();
+  googleSheetsServiceRef?.start();
 } catch (error) {
   await persistence.close();
   await releaseControllerPort(binding.server);
@@ -960,9 +1078,35 @@ devDiag.record({
     logFilePath: devDiagWriter.filePath,
   },
 });
+let shuttingDown = false;
 const cleanupTimer = setInterval(() => {
   void dataCleanup?.automatic().catch(() => {});
 }, 60000);
+let autoInspectRunning = false;
+const runAutoInspectSweep = () => {
+  if (autoInspectRunning || shuttingDown || !autoInspectSweepRef) return;
+  autoInspectRunning = true;
+  void autoInspectSweepRef()
+    .catch(() => {})
+    .finally(() => {
+      autoInspectRunning = false;
+    });
+};
+const autoInspectInitialTimer = setTimeout(runAutoInspectSweep, 1500);
+autoInspectInitialTimer.unref?.();
+const autoInspectTimer = setInterval(runAutoInspectSweep, 4000);
+autoInspectTimer.unref?.();
+const stopHostingMonitor = process.parentPort
+  ? startDesktopHostingMonitor({
+      isShuttingDown: () => shuttingDown,
+      getFeatureExecution: () => featureExecutionRef,
+      getGoogleSheets: () => googleSheetsServiceRef,
+      listAutoSchedules: () => repository.autoScheduler.listSchedules(),
+      isPreventSystemSleepEnabled: async () =>
+        (await repository.autoScheduler.settings()).preventSystemSleep,
+      postMessage: (msg) => process.parentPort?.postMessage(msg),
+    })
+  : () => {};
 const notificationTimer = setInterval(async () => {
   try {
     await notifications.tick();
@@ -972,7 +1116,6 @@ const notificationTimer = setInterval(async () => {
 }, 1000);
 console.log('Browser Workbench dashboard: ' + bridge.origin);
 process.parentPort?.postMessage({ type: 'READY', origin: bridge.origin });
-let shuttingDown = false;
 const startupAvatarLocalization = scheduleStartupAccountAvatarLocalization({
   repository,
   inspection,
@@ -982,37 +1125,44 @@ const startupAvatarLocalization = scheduleStartupAccountAvatarLocalization({
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  startupAvatarLocalization.cancel();
-  controllerLoopDelay.disable();
-  if (notificationTimer) clearInterval(notificationTimer);
-  clearInterval(cleanupTimer);
-  groupBumperServiceRef?.shutdown();
-  await agentBrowserManagerRef?.closeAll().catch(() => {});
-  await bluestacksServiceRef?.stopBumper().catch(() => {});
-  bluestacksOcrClient?.close();
-  devDiag.record({
-    level: 'INFO',
-    category: 'SYSTEM',
-    event: 'SOFTWARE_STOPPING',
+  await runBoundedServerShutdown({
+    stopTimers: () => {
+      startupAvatarLocalization.cancel();
+      controllerLoopDelay.disable();
+      if (notificationTimer) clearInterval(notificationTimer);
+      clearTimeout(autoInspectInitialTimer);
+      clearInterval(autoInspectTimer);
+      stopHostingMonitor();
+      clearInterval(cleanupTimer);
+    },
+    stopServices: async () => {
+      await Promise.allSettled([
+        autoSchedulerServiceRef?.shutdown(),
+        googleSheetsServiceRef?.shutdown(),
+        groupBumperServiceRef?.shutdown(),
+        groupPosterServiceRef?.shutdown(),
+        agentBrowserManagerRef?.closeAll(),
+        bluestacksServiceRef?.stopAllForInstances(),
+      ]);
+      bluestacksOcrClient?.close();
+    },
+    recordStopping: () => {
+      devDiag.record({ level: 'INFO', category: 'SYSTEM', event: 'SOFTWARE_STOPPING' });
+    },
+    closeBridge: () => bridge.close(),
+    flushLogs: async () => {
+      await Promise.all([
+        runtimeLog
+          .append(
+            [{ version: 1, observedAt: new Date().toISOString(), event: 'SOFTWARE_STOPPED' }],
+            (await repository.maintenanceSettings()).logRetentionDays,
+          )
+          .catch(() => {}),
+        devDiagWriter.flush(),
+      ]);
+    },
+    closePersistence: () => persistence.close(),
   });
-  await bridge.close();
-  let logTimer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    Promise.all([
-      runtimeLog
-        .append(
-          [{ version: 1, observedAt: new Date().toISOString(), event: 'SOFTWARE_STOPPED' }],
-          (await repository.maintenanceSettings()).logRetentionDays,
-        )
-        .catch(() => {}),
-      devDiagWriter.flush(),
-    ]),
-    new Promise<void>((resolve) => {
-      logTimer = setTimeout(resolve, 1000);
-    }),
-  ]);
-  if (logTimer) clearTimeout(logTimer);
-  await persistence.close();
   process.parentPort?.postMessage({ type: 'STOPPED' });
   process.exit(0);
 }

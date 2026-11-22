@@ -1,4 +1,6 @@
 import { DataCleanupPanel } from './data-cleanup-panel.js';
+import { MaterialCachePanel } from './material-cache-panel.js';
+import { MaterialUsagePanel } from './material-usage-panel.js';
 import { useEffect, useRef, useState } from 'react';
 import type { z } from 'zod';
 import { MaintenanceOverview } from '../shared/runtime-log.js';
@@ -7,7 +9,6 @@ import { api } from './api.js';
 export function WorkspaceMaintenancePanel() {
   const [saved, setSaved] = useState<z.infer<typeof MaintenanceOverview> | null>(null);
   const [days, setDays] = useState('14');
-  const [revision, setRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -30,7 +31,7 @@ export function WorkspaceMaintenancePanel() {
       },
     );
     return () => controller.abort();
-  }, [revision]);
+  }, []);
   const valid = Number.isInteger(Number(days)) && Number(days) >= 1 && Number(days) <= 90;
   async function execute(kind: 'save' | 'export') {
     const current = owner.current;
@@ -112,21 +113,18 @@ export function WorkspaceMaintenancePanel() {
           />
         </label>
         <button
+          type="submit"
+          className="btn btn-primary btn-sm"
           disabled={!saved || busy || !valid || Number(days) === saved.settings.logRetentionDays}
         >
           保存日志设置
         </button>
         <button
           type="button"
-          disabled={busy}
-          onClick={() => {
-            setNotice('');
-            setRevision((value) => value + 1);
-          }}
+          className="btn btn-sm"
+          disabled={!saved || busy}
+          onClick={() => void execute('export')}
         >
-          重新读取
-        </button>
-        <button type="button" disabled={!saved || busy} onClick={() => void execute('export')}>
           导出运行日志
         </button>
       </form>
@@ -141,6 +139,11 @@ export function WorkspaceMaintenancePanel() {
         </p>
       )}
       {notice && <p role="status">{notice}</p>}
+      <hr className="menu-divider" />
+      <MaterialCachePanel />
+      <hr className="menu-divider" />
+      <MaterialUsagePanel />
+      <hr className="menu-divider" />
       <DataCleanupPanel />
     </section>
   );

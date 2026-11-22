@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { api } from './api.js';
+import { ConfirmDialog } from './confirm-dialog.js';
 import { NameDialog } from './name-dialog.js';
 import { PopoverMenu, type MenuItem } from './popover-menu.js';
 import { SelectByIdsDialog, buildTargetCandidates } from './select-by-ids-dialog.js';
@@ -40,7 +41,7 @@ export function FinderCheck({
     />
   );
 }
-function FinderAvatar({ item }: { item: FinderItem }) {
+export function FinderAvatar({ item }: { item: Pick<FinderItem, 'name' | 'avatarUrl'> }) {
   const [broken, setBroken] = useState(false);
   useEffect(() => setBroken(false), [item.avatarUrl]);
   return item.avatarUrl && !broken ? (
@@ -89,6 +90,11 @@ export function FinderTargetList({
     [closed, setClosed] = useState<Set<string>>(new Set()),
     [name, setName] = useState<{ id?: string; name: string } | null>(null),
     [selectByIdsOpen, setSelectByIdsOpen] = useState(false),
+    [confirmDelete, setConfirmDelete] = useState<
+      | { kind: 'items'; ids: string[]; label: string }
+      | { kind: 'folder'; id: string; name: string }
+      | null
+    >(null),
     [error, setError] = useState(''),
     [working, setWorking] = useState(false),
     [drop, setDrop] = useState('');
@@ -268,16 +274,15 @@ export function FinderTargetList({
         ]
       : []),
   ];
-  const selectableFilteredIds = filtered.filter((i) => !disabledItems?.has(i.id)).map((i) => i.id);
   return (
     <section className="finder-target-list" aria-label={title}>
       <div className="finder-toolbar">
         <FinderCheck
-          ids={selectableFilteredIds}
+          ids={visible}
           selected={selected}
           label={'全选' + title}
-          disabled={unavailable || selectableFilteredIds.length === 0}
-          onChange={(checked) => select(selectableFilteredIds, checked)}
+          disabled={unavailable || visible.length === 0}
+          onChange={(checked) => select(visible, checked)}
         />
         <strong>{title}</strong>
         <small>
@@ -286,9 +291,16 @@ export function FinderTargetList({
         <div className="finder-toolbar-right">
           {selected.size > 0 && (
             <button
+              type="button"
               className="btn btn-sm btn-danger"
               disabled={unavailable}
-              onClick={() => void remove([...selected])}
+              onClick={() =>
+                setConfirmDelete({
+                  kind: 'items',
+                  ids: [...selected],
+                  label: `所选的 ${selected.size} 个条目`,
+                })
+              }
             >
               删除 ({selected.size})
             </button>
@@ -431,9 +443,10 @@ export function FinderTargetList({
                         重命名
                       </button>
                       <button
+                        type="button"
                         disabled={unavailable}
                         title="删除分组，条目移到未分组"
-                        onClick={() => void command({ action: 'delete', id: f.id }).catch(() => {})}
+                        onClick={() => setConfirmDelete({ kind: 'folder', id: f.id, name: f.name })}
                       >
                         ×
                       </button>
@@ -590,12 +603,17 @@ export function FinderTargetList({
                         )}
                       </span>
                       <button
+                        type="button"
                         className="finder-delete"
                         disabled={unavailable}
                         aria-label={'删除 ' + item.name}
                         onClick={(e) => {
                           e.stopPropagation();
-                          void remove([item.id]);
+                          setConfirmDelete({
+                            kind: 'items',
+                            ids: [item.id],
+                            label: `「${item.name}」`,
+                          });
                         }}
                       >
                         ×
@@ -669,6 +687,29 @@ export function FinderTargetList({
                 : { action: 'create', listKind, name: value },
             );
           }}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={confirmDelete.kind === 'folder' ? '删除分组' : `删除${title}条目`}
+          description={
+            confirmDelete.kind === 'folder'
+              ? `确定要删除分组「${confirmDelete.name}」吗？组内条目将保留并自动移至「未分组」。`
+              : `确定要从${title}中删除${confirmDelete.label}吗？`
+          }
+          confirmText="确认删除"
+          danger
+          busy={working}
+          onConfirm={() => {
+            const target = confirmDelete;
+            setConfirmDelete(null);
+            if (target.kind === 'folder') {
+              void command({ action: 'delete', id: target.id }).catch(() => {});
+            } else {
+              void remove(target.ids);
+            }
+          }}
+          onCancel={() => setConfirmDelete(null)}
         />
       )}
     </section>

@@ -870,16 +870,21 @@ export class SqliteGroupPosterRepository {
 
   deleteMaterials(input: unknown): number {
     const { ids } = PosterMaterialIdsInput.parse(input);
-    this.db
-      .prepare(
-        "DELETE FROM group_poster_tasks WHERE material_id IN (SELECT value FROM json_each(?)) AND status = 'scheduled'",
-      )
-      .run(JSON.stringify(ids));
-    return Number(
+    const idsJson = JSON.stringify(ids);
+    return transaction(this.db, () => {
       this.db
-        .prepare('DELETE FROM group_poster_materials WHERE id IN (SELECT value FROM json_each(?))')
-        .run(JSON.stringify(ids)).changes,
-    );
+        .prepare(
+          "DELETE FROM group_poster_tasks WHERE material_id IN (SELECT value FROM json_each(?)) AND status = 'scheduled'",
+        )
+        .run(idsJson);
+      return Number(
+        this.db
+          .prepare(
+            'DELETE FROM group_poster_materials WHERE id IN (SELECT value FROM json_each(?))',
+          )
+          .run(idsJson).changes,
+      );
+    });
   }
 
   toggleMaterials(input: unknown): PosterMaterial[] {
@@ -1021,6 +1026,23 @@ export class SqliteGroupPosterRepository {
         "UPDATE group_poster_materials SET local_file_path = NULL, cache_status = 'expired', cache_error = NULL, updated_at = ? WHERE id = ?",
       )
       .run(Date.now(), id);
+  }
+
+  hasGroupVerifiedPost(groupId: string, materialId: string): boolean {
+    if (
+      this.db
+        .prepare('SELECT 1 FROM group_poster_usage WHERE group_id=? AND material_id=? LIMIT 1')
+        .get(groupId, materialId)
+    ) {
+      return true;
+    }
+    return Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM group_poster_operations WHERE group_id=? AND material_id=? AND status = 'VERIFIED' LIMIT 1",
+        )
+        .get(groupId, materialId),
+    );
   }
 
   hasGroupPostedMaterial(groupId: string, materialId: string): boolean {

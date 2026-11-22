@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { Canvas, SKRSContext2D } from '@napi-rs/canvas';
-import { isLocalAvatar } from '../shared/group-bumper.js';
+import { isLocalAvatar, type BumperReactionType } from '../shared/group-bumper.js';
 
 export const CANONICAL_WIDTH = 900;
 export const CANONICAL_HEIGHT = 1600;
@@ -253,7 +253,7 @@ export function parseDumpsysTop(
   };
 
   const viewRegex =
-    /^(\s+)([^\s{]+)\{[0-9a-f]+\s+(\S+)\s+(\S+)\s+(-?\d+),(-?\d+)-(-?\d+),(-?\d+)(?:\s+#[0-9a-f]+(?:\s+([^\s}]+))?)?\}/;
+    /^(\s+)([^\s{]+)\{[0-9a-f]+\s+(\S+)\s+(\S+)\s+(-?\d+),(-?\d+)-(-?\d+),(-?\d+)(?:\s+#[0-9a-f]+(?:\s+([^\s}]+))?)?[^}]*\}/;
 
   for (const line of lines) {
     if (/^\s*ACTIVITY\s+(\S+)/.test(line)) {
@@ -356,7 +356,11 @@ export function parseDumpsysTop(
       continue;
     }
 
-    const isRecycler = rawClass === 'X.10N' || rawClass.includes('RecyclerView');
+    const isRecycler =
+      rawClass === 'X.10N' ||
+      rawClass === 'X.0wX' ||
+      rawClass.includes('RecyclerView') ||
+      parent.node.className.includes('SwipeRefreshLayout');
     const node: LiteXmlNode = {
       index: parent.node.children.length,
       text: '',
@@ -390,16 +394,210 @@ export function flattenLiteNodes(root: LiteXmlNode | null): LiteXmlNode[] {
   return out;
 }
 
-export function findTextInputNode(root: LiteXmlNode | null): LiteXmlNode | null {
-  const all = flattenLiteNodes(root);
+export function isLiteTextInputClass(className: string): boolean {
   return (
-    all.find(
-      (n) =>
-        n.className.includes('MultiAutoCompleteTextView') ||
-        n.className.includes('EditText') ||
-        (n.focused && n.clickable && n.longClickable && n.bounds.w >= 400 && n.bounds.h <= 120),
-    ) ?? null
+    className.includes('TextInputView') ||
+    className.includes('MultiAutoCompleteTextView') ||
+    className.includes('EditText')
   );
+}
+
+export function findAllTextInputNodes(root: LiteXmlNode | null): LiteXmlNode[] {
+  return flattenLiteNodes(root)
+    .filter(
+      (n) =>
+        isLiteTextInputClass(n.className) ||
+        (n.focused && n.clickable && n.longClickable && n.bounds.w >= 400 && n.bounds.h <= 140),
+    )
+    .sort((a, b) => a.bounds.y1 - b.bounds.y1);
+}
+
+export function findTextInputNode(root: LiteXmlNode | null): LiteXmlNode | null {
+  return findAllTextInputNodes(root)[0] ?? null;
+}
+
+export interface DetectedHomeTabBar {
+  identityHint: 'personal' | 'page';
+  collapsed: boolean;
+  tabs: RectBounds[];
+}
+
+/**
+ * Detects FB Lite's top navigation tab bar in both expanded (y≈95..185) and collapsed (y≈28..112)
+ * layouts: 5-6 equal ~150px tabs indicate Personal identity; 4 equal ~225px tabs indicate Page identity.
+ */
+export function detectHomeTabBar(root: LiteXmlNode | null): DetectedHomeTabBar | null {
+  if (!root) return null;
+  const all = flattenLiteNodes(root);
+  const groupByRow = (nodes: LiteXmlNode[]) => {
+    const rows: LiteXmlNode[][] = [];
+    for (const n of nodes) {
+      const match = rows.find(
+        (r) =>
+          r[0] &&
+          Math.abs(r[0].bounds.y1 - n.bounds.y1) <= 14 &&
+          Math.abs(r[0].bounds.h - n.bounds.h) <= 14,
+      );
+      if (match) {
+        if (!match.some((x) => Math.abs(x.bounds.x1 - n.bounds.x1) < 35)) match.push(n);
+      } else {
+        rows.push([n]);
+      }
+    }
+    return rows;
+  };
+
+  const personalCandidates = all.filter(
+    (n) =>
+      n.clickable &&
+      n.bounds.y1 >= 24 &&
+      n.bounds.y2 <= 235 &&
+      n.bounds.w >= 125 &&
+      n.bounds.w <= 175 &&
+      n.bounds.h >= 46 &&
+      n.bounds.h <= 98,
+  );
+  for (const row of groupByRow(personalCandidates)) {
+    if (row.length >= 5) {
+      const sorted = [...row].sort((a, b) => a.bounds.x1 - b.bounds.x1);
+      const y1 = sorted[0]?.bounds.y1 ?? 100;
+      return {
+        identityHint: 'personal',
+        collapsed: y1 < 75,
+        tabs: sorted.map((n) => n.bounds),
+      };
+    }
+  }
+
+  const pageCandidates = all.filter(
+    (n) =>
+      n.clickable &&
+      n.bounds.y1 >= 24 &&
+      n.bounds.y2 <= 215 &&
+      n.bounds.w >= 200 &&
+      n.bounds.w <= 250 &&
+      n.bounds.h >= 46 &&
+      n.bounds.h <= 98,
+  );
+  for (const row of groupByRow(pageCandidates)) {
+    if (row.length === 4) {
+      const sorted = [...row].sort((a, b) => a.bounds.x1 - b.bounds.x1);
+      const y1 = sorted[0]?.bounds.y1 ?? 100;
+      return {
+        identityHint: 'page',
+        collapsed: y1 < 75,
+        tabs: sorted.map((n) => n.bounds),
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Classifies Facebook Lite abnormal / gate screens from OCR text.
+ * Never treats unknown or loading text as banned.
+ */
+export function classifyAbnormalScreenText(
+  rawOcrText: string,
+): 'logged-out' | 'verification' | 'restricted' | null {
+  const compact = rawOcrText.replace(/\s+/g, '').toLowerCase();
+  if (!compact) return null;
+  if (
+    /accountdisabled|youraccount(?:is|hasbeen)disabled|wedisabledyouraccount|suspendedyouraccount|we'vesuspendedyouraccount|wehavedisabled|账号已停用|账户已停用|帐户已停用|已停用你的账户|已封禁|永久封禁|账户被封/i.test(
+      compact,
+    )
+  ) {
+    return 'restricted';
+  }
+  if (
+    /secureyouraccount|suspiciousactivity|passasecuritycheck|createanewpassword|confirmyouridentity|accountlocked|we'velockedyouraccount|weneedtoconfirm|checkpoint|验证你的身份|确认你的身份|安全检查|保护你的账户|检测到可疑活动|账户已锁定|账号已锁定|申诉|上传身份证/i.test(
+      compact,
+    )
+  ) {
+    return 'verification';
+  }
+  if (
+    /手机号或邮箱.*密码.*登录|创建新账户|创建新账号|createnewaccount|forgotpassword\?|忘记密码了/i.test(
+      compact,
+    )
+  ) {
+    return 'logged-out';
+  }
+  return null;
+}
+
+/**
+ * Extracts FB Lite's 2-row long-press reaction popup cells (top row: like/love/care; bottom row: haha/wow/sad/angry)
+ * positioned directly above the target post's Like button.
+ */
+export function extractReactionPopupButtons(
+  root: LiteXmlNode | null,
+  likeBounds: RectBounds,
+): Partial<Record<BumperReactionType, RectBounds>> {
+  const result: Partial<Record<BumperReactionType, RectBounds>> = {};
+  if (!root) return result;
+  const all = flattenLiteNodes(root);
+  const candidates = all.filter(
+    (n) =>
+      n.clickable &&
+      n.bounds.w >= 70 &&
+      n.bounds.w <= 170 &&
+      n.bounds.h >= 70 &&
+      n.bounds.h <= 160 &&
+      n.bounds.y1 >= Math.max(0, likeBounds.y1 - 320) &&
+      n.bounds.y2 <= likeBounds.y1 + 24,
+  );
+  // Deduplicate overlapping boxes
+  const unique: LiteXmlNode[] = [];
+  for (const c of candidates) {
+    if (
+      !unique.some(
+        (u) => Math.abs(u.bounds.cx - c.bounds.cx) < 40 && Math.abs(u.bounds.cy - c.bounds.cy) < 40,
+      )
+    ) {
+      unique.push(c);
+    }
+  }
+  // Group into horizontal rows by cy
+  const rows: LiteXmlNode[][] = [];
+  for (const n of unique) {
+    const r = rows.find((row) => row[0] && Math.abs(row[0].bounds.cy - n.bounds.cy) <= 45);
+    if (r) r.push(n);
+    else rows.push([n]);
+  }
+  rows.sort((a, b) => (a[0]?.bounds.cy ?? 0) - (b[0]?.bounds.cy ?? 0));
+  for (const row of rows) row.sort((a, b) => a.bounds.x1 - b.bounds.x1);
+
+  if (rows.length >= 2) {
+    const topRow = rows[0] ?? [];
+    const bottomRow = rows[1] ?? [];
+    if (topRow.length === 3 && bottomRow.length === 4) {
+      const topTypes: BumperReactionType[] = ['like', 'love', 'care'];
+      const bottomTypes: BumperReactionType[] = ['haha', 'wow', 'sad', 'angry'];
+      topTypes.forEach((t, i) => {
+        const b = topRow[i]?.bounds;
+        if (b) result[t] = b;
+      });
+      bottomTypes.forEach((t, i) => {
+        const b = bottomRow[i]?.bounds;
+        if (b) result[t] = b;
+      });
+      return result;
+    }
+  }
+  // Fallback: single-row 6 or 7 reactions (some FB Lite builds)
+  const widestRow = rows.find((r) => r.length >= 6);
+  if (widestRow) {
+    const seq: BumperReactionType[] =
+      widestRow.length >= 7
+        ? ['like', 'love', 'care', 'haha', 'wow', 'sad', 'angry']
+        : ['like', 'love', 'haha', 'wow', 'sad', 'angry'];
+    seq.forEach((t, i) => {
+      const b = widestRow[i]?.bounds;
+      if (b) result[t] = b;
+    });
+  }
+  return result;
 }
 
 function makeRect(x1: number, y1: number, x2: number, y2: number): RectBounds {
@@ -878,6 +1076,69 @@ export async function isLikeButtonBlue(pngBuffer: Buffer, bounds: RectBounds): P
   return bluePixels >= 20;
 }
 
+/**
+ * Checks whether a button has a solid Facebook-blue filled background (>= 40% saturated blue pixels).
+ * Distinguishes primary CTA buttons ("登录", "继续", "发布", "确认", "邀请") from checkboxes or icons.
+ */
+export async function isSolidBlueButton(pngBuffer: Buffer, bounds: RectBounds): Promise<boolean> {
+  const frame = await getCanonicalFrame(pngBuffer);
+  if (!frame) return false;
+  const insetX = Math.min(18, Math.floor(bounds.w * 0.12));
+  const insetY = Math.min(8, Math.floor(bounds.h * 0.15));
+  const crop = clampCrop(
+    bounds.x1 + insetX,
+    bounds.y1 + insetY,
+    Math.max(8, bounds.w - insetX * 2),
+    Math.max(8, bounds.h - insetY * 2),
+    6,
+  );
+  if (!crop) return false;
+  const { data } = frame.ctx.getImageData(crop.left, crop.top, crop.width, crop.height);
+  const total = data.length / 4;
+  if (total <= 0) return false;
+  let blue = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i] ?? 0;
+    const g = data[i + 1] ?? 0;
+    const b = data[i + 2] ?? 0;
+    if (b >= 150 && b - r >= 55 && b - g >= 18) blue++;
+  }
+  return blue / total >= 0.4;
+}
+
+/**
+ * Detects whether a post's Like/Reaction button is currently in ANY active reaction state:
+ * Like (blue), Love (red/pink), Care/Haha/Wow/Sad (vivid yellow/amber), or Angry (orange/red).
+ */
+export async function isReactionButtonActive(
+  pngBuffer: Buffer,
+  bounds: RectBounds,
+): Promise<boolean> {
+  const frame = await getCanonicalFrame(pngBuffer);
+  if (!frame) return false;
+  const insetX = bounds.w >= 160 ? 24 : 4;
+  const crop = clampCrop(
+    bounds.x1 + insetX,
+    bounds.y1 + 6,
+    Math.max(10, bounds.w - insetX * 2),
+    Math.max(10, bounds.h - 12),
+    8,
+  );
+  if (!crop) return false;
+  const { data } = frame.ctx.getImageData(crop.left, crop.top, crop.width, crop.height);
+  let vividPixels = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i] ?? 0;
+    const g = data[i + 1] ?? 0;
+    const b = data[i + 2] ?? 0;
+    const isBlue = b >= 135 && b - r >= 35 && b - g >= 8;
+    const isRedPink = r >= 175 && r - g >= 55 && r - b >= 35;
+    const isAmberYellow = r >= 180 && g >= 115 && r - b >= 65 && g - b >= 40;
+    if (isBlue || isRedPink || isAmberYellow) vividPixels++;
+  }
+  return vividPixels >= 20;
+}
+
 export async function detectVideoSpeakerState(
   pngBuffer: Buffer,
   soundBounds: RectBounds,
@@ -977,6 +1238,145 @@ export async function isBottomSheetOpen(pngBuffer: Buffer): Promise<boolean> {
   const sheetMean = regionMeanBrightnessSync(frame, 520, 1220, 260, 180);
   if (topBarMean === null || sheetMean === null) return false;
   return topBarMean < 165 && sheetMean > 220;
+}
+
+export interface BottomSheetIdentityRow {
+  avatarBounds: RectBounds;
+  rowBounds: RectBounds;
+  titleBounds: RectBounds;
+  fullTextBounds: RectBounds;
+  checkBounds: RectBounds;
+  isActiveBlueCheck: boolean;
+}
+
+/**
+ * Pixel-detects identity rows inside FB Lite's bottom-sheet account/page switcher
+ * (rendered in an overlay window that `dumpsys activity top` does not include in MainActivity's tree).
+ * Works cleanly across 720×1280 and 900×1600, FB Lite v488 and v524.
+ */
+export async function detectBottomSheetIdentityRows(
+  pngBuffer: Buffer,
+): Promise<BottomSheetIdentityRow[]> {
+  try {
+    const frame = await getCanonicalFrame(pngBuffer);
+    if (!frame) return [];
+    const { data } = frame.ctx.getImageData(0, 0, CANONICAL_WIDTH, CANONICAL_HEIGHT);
+
+    const lumAt = (x: number, y: number): number => {
+      const idx = (y * CANONICAL_WIDTH + x) * 4;
+      const r = data[idx] ?? 0;
+      const g = data[idx + 1] ?? 0;
+      const b = data[idx + 2] ?? 0;
+      return 0.299 * r + 0.587 * g + 0.114 * b;
+    };
+
+    // 1. Locate top edge of white bottom sheet using the outer sheet margins (x=18 & x=882),
+    //    which are pure white (#FFFFFF) inside the sheet and dimmed (<165) above it — never blocked by row text!
+    let sheetTopY = -1;
+    for (let y = 1520; y >= 340; y -= 2) {
+      const marginWhite = lumAt(18, y) >= 235 && lumAt(882, y) >= 235;
+      if (!marginWhite) {
+        sheetTopY = y + 2;
+        break;
+      }
+    }
+    if (sheetTopY < 0 || sheetTopY > 1390) return [];
+
+    // 2. Scan left avatar column (x = 50..118) for circular avatar blobs inside the white card
+    //    Exclude bottom CTA button area (y >= 1455 -> "前往 Meta 账户设置" / "Meta")
+    const scanStartY = Math.min(1450, sheetTopY + 20);
+    const scanEndY = 1455;
+    const isAvatarRowY = new Uint8Array(CANONICAL_HEIGHT);
+    for (let y = scanStartY; y < scanEndY; y++) {
+      let nonWhiteAvatar = 0;
+      for (let x = 50; x <= 118; x += 2) {
+        if (lumAt(x, y) < 228) nonWhiteAvatar++;
+      }
+      // Reject thin horizontal card border lines (where mid-card is also uniformly gray)
+      let midBorderGray = 0;
+      for (let x = 180; x <= 740; x += 8) {
+        const l = lumAt(x, y);
+        if (l >= 195 && l <= 238) midBorderGray++;
+      }
+      if (nonWhiteAvatar >= 9 && midBorderGray < 55) {
+        isAvatarRowY[y] = 1;
+      }
+    }
+
+    // 3. Group contiguous y-runs into avatar blobs (allowing 4px internal white gaps inside bright avatars)
+    const blobs: Array<{ y1: number; y2: number }> = [];
+    let runStart = -1;
+    let whiteGap = 0;
+    for (let y = scanStartY; y <= scanEndY; y++) {
+      if (isAvatarRowY[y] === 1) {
+        if (runStart < 0) runStart = y;
+        whiteGap = 0;
+      } else if (runStart >= 0) {
+        whiteGap++;
+        if (whiteGap > 4) {
+          const y2 = y - whiteGap;
+          if (y2 - runStart >= 36 && y2 - runStart <= 96) {
+            blobs.push({ y1: runStart, y2 });
+          }
+          runStart = -1;
+          whiteGap = 0;
+        }
+      }
+    }
+    if (runStart >= 0) {
+      const y2 = scanEndY - whiteGap;
+      if (y2 - runStart >= 36 && y2 - runStart <= 96) {
+        blobs.push({ y1: runStart, y2 });
+      }
+    }
+
+    const rows: BottomSheetIdentityRow[] = [];
+    for (const blob of blobs) {
+      const h = blob.y2 - blob.y1;
+      const checkBounds = makeCanonicalRect(
+        785,
+        Math.max(0, blob.y1 - 8),
+        875,
+        Math.min(CANONICAL_HEIGHT, blob.y2 + 8),
+      );
+      let bluePx = 0;
+      for (let y = checkBounds.y1; y < checkBounds.y2; y += 2) {
+        for (let x = checkBounds.x1; x < checkBounds.x2; x += 2) {
+          const idx = (y * CANONICAL_WIDTH + x) * 4;
+          const r = data[idx] ?? 0;
+          const g = data[idx + 1] ?? 0;
+          const b = data[idx + 2] ?? 0;
+          if (b >= 175 && b - r >= 65 && b - g >= 25) bluePx++;
+        }
+      }
+      rows.push({
+        avatarBounds: makeCanonicalRect(46, blob.y1, 120, blob.y2),
+        rowBounds: makeCanonicalRect(
+          36,
+          Math.max(0, blob.y1 - 14),
+          864,
+          Math.min(CANONICAL_HEIGHT, blob.y2 + 14),
+        ),
+        titleBounds: makeCanonicalRect(
+          126,
+          Math.max(0, blob.y1 - 8),
+          775,
+          Math.min(CANONICAL_HEIGHT, blob.y1 + Math.round(h * 0.58)),
+        ),
+        fullTextBounds: makeCanonicalRect(
+          126,
+          Math.max(0, blob.y1 - 8),
+          775,
+          Math.min(CANONICAL_HEIGHT, blob.y2 + 8),
+        ),
+        checkBounds,
+        isActiveBlueCheck: bluePx >= 18,
+      });
+    }
+    return rows;
+  } catch {
+    return [];
+  }
 }
 
 export async function isDarkScreenOrReelMode(pngBuffer: Buffer): Promise<boolean> {
@@ -1393,6 +1793,48 @@ export async function resolveSharePostUrl(
   };
 }
 
+export async function resolveProfileShareUrl(
+  rawUrl: string,
+): Promise<{ numericId: string | null; resolvedUrl: string }> {
+  const extractNumeric = (urlStr: string): string | null => {
+    try {
+      const u = new URL(urlStr);
+      const qId = u.searchParams.get('id')?.trim() ?? '';
+      if (/^\d{5,}$/.test(qId)) return qId;
+      const peopleMatch = /^\/people\/[^/]+\/(\d{5,})/i.exec(u.pathname);
+      if (peopleMatch?.[1]) return peopleMatch[1];
+      const pMatch = /^\/(\d{5,})(?:\/|$)/.exec(u.pathname);
+      if (pMatch?.[1]) return pMatch[1];
+    } catch {
+      /* ignore */
+    }
+    return null;
+  };
+
+  let current = rawUrl.trim();
+  const direct = extractNumeric(current);
+  if (direct) return { numericId: direct, resolvedUrl: current };
+
+  for (let hop = 0; hop < 3 && /^https?:\/\//i.test(current); hop++) {
+    try {
+      const res = await fetch(current, {
+        method: 'HEAD',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(5000),
+        headers: { 'User-Agent': 'facebookexternalhit/1.1' },
+      });
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      current = new URL(loc, current).href;
+      const found = extractNumeric(current);
+      if (found) return { numericId: found, resolvedUrl: current };
+    } catch {
+      break;
+    }
+  }
+  return { numericId: null, resolvedUrl: current };
+}
+
 const WINRT_OCR_POWERSHELL_SCRIPT = `
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -1425,21 +1867,29 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       continue
     }
     $bytes = [Convert]::FromBase64String([string]$req.b64)
-    $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
-    $writer = New-Object Windows.Storage.Streams.DataWriter($stream.GetOutputStreamAt(0))
-    $writer.WriteBytes($bytes)
-    $null = Await-WinRT ($writer.StoreAsync()) ([uint32])
-    $writer.DetachStream() | Out-Null
-    $writer.Dispose()
-    $stream.Seek(0)
-    $decoder = Await-WinRT ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $bmp = Await-WinRT ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    $res = Await-WinRT ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
-    $bmp.Dispose()
-    $stream.Dispose()
-    $out = @{ id = $reqId; text = [string]$res.Text } | ConvertTo-Json -Compress
-    [Console]::Out.WriteLine($out)
-    [Console]::Out.Flush()
+    $stream = $null
+    $writer = $null
+    $bmp = $null
+    try {
+      $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+      $writer = New-Object Windows.Storage.Streams.DataWriter($stream.GetOutputStreamAt(0))
+      $writer.WriteBytes($bytes)
+      $null = Await-WinRT ($writer.StoreAsync()) ([uint32])
+      $writer.DetachStream() | Out-Null
+      $writer.Dispose()
+      $writer = $null
+      $stream.Seek(0)
+      $decoder = Await-WinRT ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+      $bmp = Await-WinRT ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+      $res = Await-WinRT ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
+      $out = @{ id = $reqId; text = [string]$res.Text } | ConvertTo-Json -Compress
+      [Console]::Out.WriteLine($out)
+      [Console]::Out.Flush()
+    } finally {
+      if ($null -ne $bmp) { try { $bmp.Dispose() } catch {} }
+      if ($null -ne $writer) { try { $writer.Dispose() } catch {} }
+      if ($null -ne $stream) { try { $stream.Dispose() } catch {} }
+    }
   } catch {
     $out = @{ id = $reqId; text = "" } | ConvertTo-Json -Compress
     [Console]::Out.WriteLine($out)
@@ -1512,6 +1962,10 @@ export class WindowsOcrClient implements OcrRecognizer {
       }
       if (this.proc === child) this.proc = null;
     };
+    // Drain stderr so PowerShell warnings never fill the Windows pipe buffer and deadlock OCR,
+    // and attach stdin error handler so an early exit never crashes the server with EPIPE.
+    child.stderr.resume();
+    child.stdin.on('error', flushPendingEmpty);
     child.on('exit', flushPendingEmpty);
     child.on('error', flushPendingEmpty);
     this.proc = child;
@@ -1593,6 +2047,13 @@ export class WindowsOcrClient implements OcrRecognizer {
         const rawText = await new Promise<string>((resolve) => {
           const timer = setTimeout(() => {
             this.pending.delete(id);
+            // Recycle hung WinRT worker so one stuck OCR call never causes permanent global blackout
+            if (this.proc === child) this.proc = null;
+            try {
+              child.kill();
+            } catch {
+              /* ignore */
+            }
             resolve('');
           }, 8000);
           this.pending.set(id, { resolve, timer });

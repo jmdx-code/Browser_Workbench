@@ -514,11 +514,7 @@ export function GroupInviterPage({
   const [folders, setFolders] = useState<TargetFolder[]>([]);
   const [addFolder, setAddFolder] = useState<string | null>(null);
   const [invitesInput, setInvitesInput] = useState<number>(state?.invitesPerGroup ?? 30);
-  const [concurrencyInput, setConcurrencyInput] = useState<number>(
-    state?.maxConcurrentProfiles ?? 4,
-  );
   const invitesInputRef = useRef<ControlledNumberInputHandle>(null);
-  const concurrencyInputRef = useRef<ControlledNumberInputHandle>(null);
   const [addingModalOpen, setAddingModalOpen] = useState(false);
   const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
     Array.from({ length: 5 }, () => makeDraftRow()),
@@ -527,13 +523,19 @@ export function GroupInviterPage({
   const [submittingAdd, setSubmittingAdd] = useState(false);
 
   useEffect(() => {
+    if (!addingModalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !submittingAdd) setAddingModalOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [addingModalOpen, submittingAdd]);
+
+  useEffect(() => {
     if (state?.invitesPerGroup !== undefined) {
       setInvitesInput(state.invitesPerGroup);
     }
-    if (state?.maxConcurrentProfiles !== undefined) {
-      setConcurrencyInput(state.maxConcurrentProfiles);
-    }
-  }, [state?.invitesPerGroup, state?.maxConcurrentProfiles]);
+  }, [state?.invitesPerGroup]);
 
   // Keep selectedGroups pruned to existing groups
   useEffect(() => {
@@ -624,31 +626,6 @@ export function GroupInviterPage({
                 />
                 <span>人</span>
               </label>
-              <label
-                className="bumper-policy-field"
-                title="同时运行的最大浏览器并发数（默认 4，范围 1-50）"
-              >
-                <span>最大并发</span>
-                <ControlledNumberInput
-                  ref={concurrencyInputRef}
-                  ariaLabel="最大并发"
-                  min={1}
-                  max={50}
-                  defaultValue={4}
-                  disabled={busy}
-                  value={concurrencyInput}
-                  onChange={setConcurrencyInput}
-                  onCommit={(normalized) => {
-                    setConcurrencyInput(normalized);
-                    if (state && normalized !== state.maxConcurrentProfiles) {
-                      return api
-                        .saveGroupInviterSettings({ maxConcurrentProfiles: normalized })
-                        .then(() => onRefresh())
-                        .catch(() => {});
-                    }
-                  }}
-                />
-              </label>
               <label className="bumper-policy-field" title="所有账号邀请完成后播放提示音">
                 <input
                   type="checkbox"
@@ -659,7 +636,9 @@ export function GroupInviterPage({
                     void api
                       .saveGroupInviterSettings({ playSoundOnComplete: e.target.checked })
                       .then(() => onRefresh())
-                      .catch(() => {});
+                      .catch((err) => {
+                        onMessage?.(err instanceof Error ? err.message : '保存提示音设置失败');
+                      });
                   }}
                 />
                 <span>完成后播放提示音</span>
@@ -691,7 +670,6 @@ export function GroupInviterPage({
                 onClick={() => {
                   void (async () => {
                     const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
-                    await concurrencyInputRef.current?.flush();
                     await onStart(
                       orderedFinderItems(groups, folders)
                         .filter((g) => selectedGroups.has(g.groupId))
@@ -728,7 +706,6 @@ export function GroupInviterPage({
                 onClick={() => {
                   void (async () => {
                     const flushedInvites = (await invitesInputRef.current?.flush()) ?? invitesInput;
-                    await concurrencyInputRef.current?.flush();
                     await onStart(
                       orderedFinderItems(groups, folders)
                         .filter((g) => selectedGroups.has(g.groupId))

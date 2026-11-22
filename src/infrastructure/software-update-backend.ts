@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { mkdir, readFile, writeFile, rename, rm, access } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile, rename, rm, access } from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { open, type ZipFile, type Entry } from 'yauzl';
@@ -22,6 +22,38 @@ import {
 import { syncProductExtensionDirectory, productExtensionDirectory } from './paths.js';
 import { syncProductAiWorkspaceDirectory } from './ai-workspace.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
+
+const STALE_BACKUP_DIR_RX =
+  /^(?:runtime-before-|runtime-backup-|runtime-wo53-|runtime-composer-|installation-before-)/i;
+
+/**
+ * Safely reclaim orphaned historical update backup folders inside `%APPDATA%\Browser Workbench`.
+ * NEVER touches active `runtime`, single latest `runtime-previous`, `data`, or `extension`.
+ */
+export async function pruneStaleRuntimeBackups(
+  appDataRoot: string,
+): Promise<{ removedDirs: number }> {
+  let removedDirs = 0;
+  // Disable Electron's ASAR virtual FS interception while removing legacy `installation-before-*` dirs containing `app.asar`.
+  const proc = process as NodeJS.Process & { noAsar?: boolean };
+  const prevNoAsar = proc.noAsar;
+  proc.noAsar = true;
+  try {
+    const entries = await readdir(appDataRoot, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      if (!STALE_BACKUP_DIR_RX.test(ent.name)) continue;
+      try {
+        await rm(path.join(appDataRoot, ent.name), { recursive: true, force: true });
+        removedDirs++;
+      } catch {}
+    }
+  } catch {
+  } finally {
+    proc.noAsar = Boolean(prevNoAsar);
+  }
+  return { removedDirs };
+}
 
 export async function extractRuntimeArchive(archive: string, destination: string) {
   const zip = await new Promise<ZipFile>((resolve, reject) =>
@@ -143,14 +175,29 @@ export class SoftwareUpdateBackend {
     await writeFile(file + '.tmp', JSON.stringify(config, null, 2));
     await rename(file + '.tmp', file);
   }
-  private async response(url: string) {
+  private async response(url: string, timeoutMs = 15000) {
     const validatedUrl = this.validateUrl(url);
     const response = await this.fetcher(validatedUrl, {
       headers: { 'User-Agent': 'Browser-Workbench-Updater', Accept: 'application/vnd.github+json' },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) throw Error('更新源请求失败：HTTP ' + response.status);
     return response;
+  }
+  private async renameWithRetry(fromPath: string, toPath: string): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await rename(fromPath, toPath);
+        return;
+      } catch (error) {
+        lastError = error;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+      }
+    }
+    throw lastError;
   }
   private async fingerprint() {
     const base = process.env.WORKBENCH_BASE_ROOT ?? this.options.root;
@@ -209,17 +256,18 @@ export class SoftwareUpdateBackend {
       release.requiresInstaller
     )
       throw Error('UPDATE_RELEASE_RECHECK_REQUIRED');
-    const stage = path.join(this.options.dataDir, 'update-staging'),
-      extracted = path.join(stage, 'extracted');
     const runtime = this.options.runtimeDir ?? runtimeDirectory(),
       previous = runtime + '-previous';
+    const stage = path.join(path.dirname(runtime), 'update-staging'),
+      extracted = path.join(stage, 'extracted');
     const ext = this.options.extensionDir ?? productExtensionDirectory();
-    await rm(stage, { recursive: true, force: true });
+    await mkdir(path.dirname(runtime), { recursive: true });
+    await rm(stage, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 });
     await mkdir(extracted, { recursive: true });
     let moved = false,
       installed = false;
     try {
-      const response = await this.response(release.downloadUrl);
+      const response = await this.response(release.downloadUrl, 10 * 60_000);
       const length = Number(response.headers.get('content-length') ?? 0);
       if (length > 256 * 1024 * 1024) throw Error('UPDATE_DOWNLOAD_TOO_LARGE');
       const chunks: Buffer[] = [];
@@ -228,7 +276,18 @@ export class SoftwareUpdateBackend {
       const reader = response.body.getReader();
       try {
         for (;;) {
-          const chunk = await reader.read();
+          let chunkTimer: ReturnType<typeof setTimeout> | undefined;
+          const chunk = await Promise.race([
+            reader.read(),
+            new Promise<never>((_, reject) => {
+              chunkTimer = setTimeout(() => {
+                void reader.cancel().catch(() => {});
+                reject(Error('更新包下载超时，请检查网络连接后重试'));
+              }, 30_000);
+            }),
+          ]).finally(() => {
+            if (chunkTimer) clearTimeout(chunkTimer);
+          });
           if (chunk.done) break;
           const buffer = Buffer.from(chunk.value);
           bytes += buffer.length;
@@ -250,15 +309,15 @@ export class SoftwareUpdateBackend {
       );
       await guard();
       await mkdir(path.dirname(runtime), { recursive: true });
-      await rm(previous, { recursive: true, force: true });
+      await rm(previous, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 });
       try {
         await access(runtime);
-        await rename(runtime, previous);
+        await this.renameWithRetry(runtime, previous);
         moved = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
-      await rename(extracted, runtime);
+      await this.renameWithRetry(extracted, runtime);
       installed = true;
       await syncProductExtensionDirectory(path.join(runtime, 'extension-build'), ext);
       if (this.options.aiWorkspaceDir) {
@@ -281,11 +340,25 @@ export class SoftwareUpdateBackend {
         });
       }
     } catch (error) {
-      if (installed) await rm(runtime, { recursive: true, force: true });
-      if (moved) await rename(previous, runtime);
+      if (installed) {
+        const failedRuntime = runtime + '-failed-' + Date.now();
+        await this.renameWithRetry(runtime, failedRuntime)
+          .then(() => rm(failedRuntime, { recursive: true, force: true }).catch(() => {}))
+          .catch(() =>
+            rm(runtime, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 }).catch(
+              () => {},
+            ),
+          );
+      }
+      if (moved) {
+        await this.renameWithRetry(previous, runtime).catch(() => {});
+      }
       throw error;
     } finally {
-      await rm(stage, { recursive: true, force: true });
+      await rm(stage, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 }).catch(
+        () => {},
+      );
+      await pruneStaleRuntimeBackups(path.dirname(runtime)).catch(() => {});
     }
   }
 }

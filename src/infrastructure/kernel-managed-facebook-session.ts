@@ -19,7 +19,7 @@ import type { RuntimeProfile, TaskRepository } from '../domain/tasks.js';
 import type { TaskTabRepository } from '../domain/task-tabs.js';
 import { sameTabProof } from '../domain/task-tabs.js';
 import { Action, canonicalAction } from '../shared/browser-actions.js';
-import { sameExecution, type Binding } from '../shared/task-execution.js';
+import { sameExecution, type Binding, type ExecutionSession } from '../shared/task-execution.js';
 import {
   SessionStopBinding,
   SessionStopReceipt,
@@ -256,6 +256,9 @@ export class KernelManagedFacebookSession implements ManagedProfileSession {
   }
   ownedPlanId(): string {
     return this.plan.id;
+  }
+  openedContext(): ExecutionSession {
+    return structuredClone(this.context);
   }
   revokeInput(reason: string): void {
     this.connection.revokeInput(reason);

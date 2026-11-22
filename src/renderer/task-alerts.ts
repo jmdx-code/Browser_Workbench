@@ -33,12 +33,10 @@ export function taskAlertReason(
 export function attentionPlans(plans: Plan[], profiles: Profile[]) {
   const byId = new Map(profiles.map((profile) => [profile.id, profile]));
   return plans
-    .filter(
-      (plan) =>
-        plan.state === 'REVIEW' ||
-        ['PAUSING', 'STOPPING'].includes(plan.state) ||
-        (plan.state === 'PAUSED' && !!plan.reason && !/^(USER_|MANUAL_)/.test(plan.reason)) ||
-        (plan.state === 'QUEUED' && !byId.get(plan.profileId)?.online),
-    )
+    .filter((plan) => {
+      const online = Boolean(byId.get(plan.profileId)?.online);
+      if (plan.state === 'REVIEW' && !online) return true;
+      return false;
+    })
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }

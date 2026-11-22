@@ -22,5 +22,10 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/bumper-workflow.test.ts',
   'tests/wo-bumper-stability.test.ts',
   'tests/feedback-20261114-fixes.test.ts',
+  'tests/auto-scheduler.test.ts',
+  'tests/google-sheets.test.ts',
+  'tests/google-sheets-ux.test.tsx',
   'tests/finder-list-ui.test.tsx',
+  'tests/unified-target-picker.test.tsx',
+  'tests/cycle3-hardening.test.tsx',
 ]);

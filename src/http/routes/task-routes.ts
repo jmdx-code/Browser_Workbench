@@ -113,58 +113,68 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
       );
       await service.requireProfiles(value.profileIds);
       if (!previous.length) {
-        await tasks.releaseErroredPausedPlans(value.profileIds);
-        const checkOnline = !value.timing && typeof ctx.isProfileOnline === 'function';
-        if (checkOnline && ctx.profileLifecycle && ctx.isProfileOnline) {
-          const offlineCandidates: string[] = [];
-          for (const id of value.profileIds) {
-            if (await tasks.hasProfilePlanInStates(id, ACTIVE_PLAN_STATES)) continue;
-            if (await ctx.isProfileOnline(id)) continue;
-            const busyElsewhere = featureExecution
-              ? await featureExecution.isProfileBusy(id, 'active-accounts')
-              : false;
-            if (!busyElsewhere) offlineCandidates.push(id);
+        const reservedIds = featureExecution
+          ? (await featureExecution.tryReserve('active-accounts', value.profileIds)).reservedIds
+          : value.profileIds;
+        const reservedSet = new Set(reservedIds);
+        try {
+          await tasks.releaseErroredPausedPlans(value.profileIds);
+          const checkOnline = !value.timing && typeof ctx.isProfileOnline === 'function';
+          if (checkOnline && ctx.profileLifecycle && ctx.isProfileOnline) {
+            const offlineCandidates: string[] = [];
+            for (const id of value.profileIds) {
+              if (!reservedSet.has(id)) continue;
+              if (await tasks.hasProfilePlanInStates(id, ACTIVE_PLAN_STATES)) continue;
+              if (await ctx.isProfileOnline(id)) continue;
+              offlineCandidates.push(id);
+            }
+            if (offlineCandidates.length > 0) {
+              await ctx.profileLifecycle.ensureProfilesOnline(offlineCandidates);
+            }
           }
-          if (offlineCandidates.length > 0) {
-            await ctx.profileLifecycle.ensureProfilesOnline(offlineCandidates);
-          }
-        }
-        const admission = await admitProfilesForStart({
-          requestedProfileIds: value.profileIds,
-          currentModuleId: 'active-accounts',
-          isAlreadyRunningInCurrentModule: (id) =>
-            tasks.hasProfilePlanInStates(id, ACTIVE_PLAN_STATES),
-          busyModuleLabelsForProfile: async (id) =>
-            featureExecution
-              ? await featureExecution.busyModuleLabels([id], 'active-accounts')
-              : [],
-          isProfileBusyInOtherModule: async (id) =>
-            featureExecution ? await featureExecution.isProfileBusy(id, 'active-accounts') : false,
-          isProfileReady: (id) =>
-            checkOnline && ctx.isProfileOnline ? ctx.isProfileOnline(id) : true,
-        });
-        if (admission.admittedProfileIds.length === 0) {
-          if (admission.skippedBusy.length > 0) {
+          const admission = await admitProfilesForStart({
+            requestedProfileIds: value.profileIds,
+            currentModuleId: 'active-accounts',
+            isAlreadyRunningInCurrentModule: (id) =>
+              tasks.hasProfilePlanInStates(id, ACTIVE_PLAN_STATES),
+            busyModuleLabelsForProfile: async (id) =>
+              featureExecution
+                ? await featureExecution.busyModuleLabels([id], 'active-accounts')
+                : [],
+            isProfileBusyInOtherModule: async (id) =>
+              featureExecution
+                ? await featureExecution.isProfileBusy(id, 'active-accounts')
+                : false,
+            isProfileReady: (id) =>
+              checkOnline && ctx.isProfileOnline ? ctx.isProfileOnline(id) : true,
+          });
+          if (admission.admittedProfileIds.length === 0) {
+            if (admission.skippedBusy.length > 0) {
+              throw new ProductError(
+                'PROFILE_GROUP_INVITER_BUSY',
+                '所选浏览器正在执行其他功能模块任务，请先停止后再启动任务组合',
+                409,
+              );
+            }
+            if (admission.alreadyRunningIds.length > 0 && admission.skippedOffline.length === 0) {
+              throw new ProductError(
+                'PROFILE_PLAN_BUSY',
+                '所选浏览器已有运行或等待中的任务组合',
+                409,
+              );
+            }
             throw new ProductError(
-              'PROFILE_GROUP_INVITER_BUSY',
-              '所选浏览器正在执行其他功能模块任务，请先停止后再启动任务组合',
+              'PROFILE_OFFLINE',
+              admission.skippedOffline[0]?.reason ?? '所选浏览器未连接，请先打开对应浏览器',
               409,
             );
           }
-          if (admission.alreadyRunningIds.length > 0 && admission.skippedOffline.length === 0) {
-            throw new ProductError(
-              'PROFILE_PLAN_BUSY',
-              '所选浏览器已有运行或等待中的任务组合',
-              409,
-            );
-          }
-          throw new ProductError(
-            'PROFILE_OFFLINE',
-            admission.skippedOffline[0]?.reason ?? '所选浏览器未连接，请先打开对应浏览器',
-            409,
-          );
+          value.profileIds = admission.admittedProfileIds;
+          json(res, 200, await tasks.start(value));
+          return true;
+        } finally {
+          featureExecution?.releaseReservation('active-accounts', reservedIds);
         }
-        value.profileIds = admission.admittedProfileIds;
       }
       json(res, 200, await tasks.start(value));
       return true;

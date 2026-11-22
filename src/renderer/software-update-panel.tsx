@@ -1,28 +1,41 @@
 import { copyTextToClipboard } from './clipboard.js';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { UpdateStatus } from '../shared/software-update.js';
 import { api } from './api.js';
 
 export function useSoftwareUpdate() {
   const [status, setStatus] = useState<UpdateStatus | null>(null),
     [error, setError] = useState('');
+  const recheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (recheckTimerRef.current) clearTimeout(recheckTimerRef.current);
+    };
+  }, []);
   const refresh = useCallback(async () => {
     try {
       const next = await api.softwareUpdateStatus();
+      if (!mountedRef.current) return;
       setStatus(next);
       setError('');
       if (next.checking) {
-        setTimeout(
+        if (recheckTimerRef.current) clearTimeout(recheckTimerRef.current);
+        recheckTimerRef.current = setTimeout(
           () =>
             void api
               .softwareUpdateStatus()
-              .then(setStatus)
+              .then((res) => {
+                if (mountedRef.current) setStatus(res);
+              })
               .catch(() => {}),
           16000,
         );
       }
     } catch (error) {
-      setError(error instanceof Error ? error.message : '更新状态读取失败');
+      if (mountedRef.current) setError(error instanceof Error ? error.message : '更新状态读取失败');
     }
   }, []);
   useEffect(() => {
@@ -79,18 +92,7 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
       <p className="update-path">{status?.extensionDirectory ?? '正在读取…'}</p>
       <div className="update-actions">
         <button
-          className="btn btn-sm"
-          disabled={busy || !status}
-          onClick={() =>
-            void action(async () => {
-              await copyTextToClipboard(status?.extensionDirectory ?? '');
-              return '已复制固定插件路径';
-            })
-          }
-        >
-          复制固定插件路径
-        </button>
-        <button
+          type="button"
           className="btn btn-sm"
           disabled={busy || !status}
           onClick={() =>
@@ -103,7 +105,8 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
           打开插件文件夹
         </button>
         <button
-          className="btn btn-sm"
+          type="button"
+          className="btn btn-sm btn-primary"
           disabled={busy || !!status?.applying}
           onClick={() =>
             void action(async () => {
@@ -116,7 +119,7 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
         </button>
       </div>
       <p className="muted">
-        首次在浏览器加载插件时请选择上方固定插件目录；此后软件更新时会自动同步该目录并让所有空闲浏览器自动热刷新，软件移动位置也不受影响。仍加载旧目录的浏览器需要先手动改用此目录。
+        首次加载插件请点击顶栏「复制插件路径」加载上方目录；此后软件更新会自动同步并热刷新空闲浏览器。
       </p>
       {status?.aiWorkspaceDirectory && (
         <>
@@ -126,6 +129,7 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
           <p className="update-path">{status.aiWorkspaceDirectory}</p>
           <div className="update-actions">
             <button
+              type="button"
               className="btn btn-sm"
               disabled={busy}
               onClick={() =>
@@ -138,6 +142,7 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
               复制工作夹路径
             </button>
             <button
+              type="button"
               className="btn btn-sm"
               disabled={busy}
               onClick={() =>
@@ -151,8 +156,8 @@ export function ExtensionUpdateControls({ status: provided }: { status?: UpdateS
             </button>
           </div>
           <p className="muted">
-            在 Antigravity 或 Codex（需点选信任此项目）中打开该文件夹，即可仅在当前 AI
-            窗口启用工作台控制能力，与其他项目窗口完全隔离；日常发帖排期表格与素材也可直接放入此文件夹。
+            在 Antigravity 或 Codex
+            中打开该文件夹，即可仅在该窗口启用工作台控制能力，与其他项目隔离。
           </p>
         </>
       )}

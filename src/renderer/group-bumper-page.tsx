@@ -1,5 +1,6 @@
 import { FinderTargetList, orderedFinderItems } from './finder-target-list.js';
 import { PopoverMenu } from './popover-menu.js';
+import { ConfirmDialog } from './confirm-dialog.js';
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import type { TargetFolder } from '../shared/target-list.js';
 import { useEffect, useRef, useState } from 'react';
@@ -187,10 +188,17 @@ export function GroupBumperPage({
   const [settings, setSettings] = useState<BumperSettings | null>(effectiveStateSettings);
   const latestSettingsRef = useRef<BumperSettings | null>(effectiveStateSettings);
   const dirtySettingsRef = useRef(false);
+  const inFlightSettingsSavesRef = useRef(0);
+  const settingsSaveChainRef = useRef<Promise<unknown>>(Promise.resolve());
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsJSON = JSON.stringify(effectiveStateSettings);
   useEffect(() => {
-    if (settingsJSON && !dirtySettingsRef.current) {
+    if (
+      settingsJSON &&
+      !dirtySettingsRef.current &&
+      inFlightSettingsSavesRef.current === 0 &&
+      !saveTimerRef.current
+    ) {
       const parsed = JSON.parse(settingsJSON) as BumperSettings;
       latestSettingsRef.current = parsed;
       setSettings(parsed);
@@ -212,11 +220,22 @@ export function GroupBumperPage({
     setCommentText(effectiveComments.map((c) => c.text).join('\n'));
   }, [modal, effectiveComments]);
   const [logs, setLogs] = useState<BumperLog[]>([]),
+    [hasMoreLogs, setHasMoreLogs] = useState(false),
     [logSearch, setLogSearch] = useState(''),
     [logScopeFilter, setLogScopeFilter] = useState<'current' | 'all'>('current'),
     [logSelected, setLogSelected] = useState<Set<string>>(new Set()),
-    [copyingLogs, setCopyingLogs] = useState(false);
+    [copyingLogs, setCopyingLogs] = useState(false),
+    [confirmClearLogs, setConfirmClearLogs] = useState(false);
   const loadedLogKeyRef = useRef('');
+  const logsReqSeqRef = useRef(0);
+  useEffect(() => {
+    if (!modal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy && !confirmClearLogs) setModal(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [modal, busy, confirmClearLogs]);
   async function action(name: string, input: unknown = {}) {
     setBusy(true);
     setError('');
@@ -233,24 +252,43 @@ export function GroupBumperPage({
       setBusy(false);
     }
   }
-  async function saveSettings(next: BumperSettings) {
-    if (bluestacksMode) {
-      setBusy(true);
-      setError('');
+  function saveSettings(next: BumperSettings) {
+    inFlightSettingsSavesRef.current += 1;
+    const run = async () => {
       try {
-        const updated = await api.bluestacksAction(settingsActionName, next);
-        onBluestacksState?.(updated);
-        return updated;
-      } catch (e) {
-        const message = e instanceof Error ? e.message : '操作失败';
-        setError(message);
-        onMessage(message);
-        return null;
+        if (bluestacksMode) {
+          setBusy(true);
+          setError('');
+          try {
+            const updated = await api.bluestacksAction(settingsActionName, next);
+            onBluestacksState?.(updated);
+            return updated;
+          } catch (e) {
+            const message = e instanceof Error ? e.message : '操作失败';
+            setError(message);
+            onMessage(message);
+            if (effectiveStateSettings) {
+              latestSettingsRef.current = effectiveStateSettings;
+              setSettings(effectiveStateSettings);
+            }
+            return null;
+          } finally {
+            setBusy(false);
+          }
+        }
+        const res = await action(settingsActionName, next);
+        if (!res && effectiveStateSettings) {
+          latestSettingsRef.current = effectiveStateSettings;
+          setSettings(effectiveStateSettings);
+        }
+        return res;
       } finally {
-        setBusy(false);
+        inFlightSettingsSavesRef.current = Math.max(0, inFlightSettingsSavesRef.current - 1);
       }
-    }
-    return action(settingsActionName, next);
+    };
+    const chained = settingsSaveChainRef.current.then(run, run);
+    settingsSaveChainRef.current = chained;
+    return chained;
   }
   async function runBluestacksAction(name: string, input: unknown = {}) {
     setBusy(true);
@@ -280,13 +318,17 @@ export function GroupBumperPage({
     beforeId?: string,
     scope = logScopeFilter,
   ) {
+    const reqSeq = ++logsReqSeqRef.current;
     try {
       const sourceMode = scope === 'current' ? (pageMode ? 'page' : 'group') : undefined;
       const values = await api.bumperLogs(search, before, beforeId, sourceMode);
+      if (logsReqSeqRef.current !== reqSeq) return;
       loadedLogKeyRef.current = `${scope}|${search}`;
+      setHasMoreLogs(values.length >= 200);
       setLogs((old) => (before ? [...old, ...values] : values));
       if (!before) setLogSelected(new Set());
     } catch (e) {
+      if (logsReqSeqRef.current !== reqSeq) return;
       onMessage(e instanceof Error ? e.message : '记录读取失败');
     }
   }
@@ -405,20 +447,7 @@ export function GroupBumperPage({
             latestSettingsRef.current = next;
             dirtySettingsRef.current = false;
             setSettings(next);
-            if (bluestacksMode) {
-              return api
-                .bluestacksAction(settingsActionName, next)
-                .then((s) => {
-                  onBluestacksState?.(s);
-                })
-                .catch(() => {});
-            }
-            return api
-              .bumperAction(settingsActionName, next)
-              .then((s) => {
-                onState(s);
-              })
-              .catch(() => {});
+            return saveSettings(next);
           }}
         />
       </label>
@@ -621,10 +650,6 @@ export function GroupBumperPage({
             {settings && pageMode && (
               <div className="bumper-search-highlight bumper-policy">
                 {renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')}
-                {renderSettingInput(
-                  'maxConcurrentProfiles',
-                  bluestacksMode ? '最大并发模拟器数' : '最大并发浏览器数',
-                )}
                 {renderSoundToggle()}
               </div>
             )}
@@ -638,11 +663,16 @@ export function GroupBumperPage({
                     onChange={(e) => {
                       const searchMode = e.target.value as BumperSettings['searchMode'];
                       const base = latestSettingsRef.current ?? settings;
+                      const oldDefault = base.searchMode === 'page_group_feed' ? 5 : 15;
+                      const nextDefault = searchMode === 'page_group_feed' ? 5 : 15;
                       const next = normalizeBumperSettings(
                         {
                           ...base,
                           searchMode,
-                          maxPostsPerGroupPage: searchMode === 'page_group_feed' ? 5 : 15,
+                          maxPostsPerGroupPage:
+                            base.maxPostsPerGroupPage === oldDefault
+                              ? nextDefault
+                              : base.maxPostsPerGroupPage,
                         },
                         effectiveStateSettings ?? base,
                       );
@@ -698,15 +728,11 @@ export function GroupBumperPage({
                       {renderSettingInput('likeProbability', '点赞概率 %')}
                       {renderSettingInput('commentProbability', '留言概率 %')}
                     </div>
-                    <div className="bumper-advanced-group">
-                      {pageMode
-                        ? renderSettingInput('maxPostsPerPage', '最大扫描贴文数量')
-                        : renderSettingInput('maxPostsPerGroupPage', '每组每主页最多扫帖')}
-                      {renderSettingInput(
-                        'maxConcurrentProfiles',
-                        bluestacksMode ? '最大并发模拟器数' : '最大并发浏览器数',
-                      )}
-                    </div>
+                    {!pageMode && (
+                      <div className="bumper-advanced-group">
+                        {renderSettingInput('maxPostsPerGroupPage', '每组每主页最多扫帖')}
+                      </div>
+                    )}
                   </div>
                 )}
               </PopoverMenu>
@@ -731,7 +757,9 @@ export function GroupBumperPage({
                   </button>
                 )}
                 <button
+                  type="button"
                   className="btn btn-danger"
+                  disabled={busy}
                   onClick={() =>
                     void (bluestacksMode
                       ? runBluestacksAction(pageMode ? 'bumper/stop-page' : 'bumper/stop', {})
@@ -809,10 +837,16 @@ export function GroupBumperPage({
           }}
         />
       )}
-      <div className={'bumper-columns' + (pageMode ? ' is-single' : '')}>
-        {!pageMode && targets('groups', state?.groups ?? [])}
-        {targets('pages', state?.pages ?? [])}
-      </div>
+      {!state ? (
+        <div className="empty" role="status">
+          <strong>正在加载顶贴配置与目标列表…</strong>
+        </div>
+      ) : (
+        <div className={'bumper-columns' + (pageMode ? ' is-single' : '')}>
+          {!pageMode && targets('groups', state.groups)}
+          {targets('pages', state.pages)}
+        </div>
+      )}
       {modal && (
         <div
           className="modal-backdrop"
@@ -827,6 +861,9 @@ export function GroupBumperPage({
                   ? '留言列表'
                   : '顶贴记录'
           }
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !busy) setModal(null);
+          }}
         >
           <div
             className={
@@ -1064,20 +1101,7 @@ export function GroupBumperPage({
                           )
                         : isRunning)
                     }
-                    onClick={() => {
-                      const sourceMode =
-                        logScopeFilter === 'current' ? (pageMode ? 'page' : 'group') : undefined;
-                      if (confirm('清空全部顶贴记录？清空后对应的历史防重和次数统计也会清除。'))
-                        void action('logs/delete', { all: true, sourceMode }).then(async () => {
-                          if (bluestacksMode) {
-                            await api.bluestacksState(false).then(
-                              (s) => onBluestacksState?.(s),
-                              () => {},
-                            );
-                          }
-                          await loadLogs();
-                        });
-                    }}
+                    onClick={() => setConfirmClearLogs(true)}
                   >
                     清空历史记录
                   </button>
@@ -1111,58 +1135,72 @@ export function GroupBumperPage({
                           </tr>
                         </thead>
                         <tbody>
-                          {logs.map((row) => {
-                            const p = profiles?.find((item) => item.id === row.profileId);
-                            const profileTitle = p
-                              ? p.browserName || p.alias || p.name || row.profileId
-                              : row.profileId;
-                            return (
-                              <tr key={row.id}>
-                                <td>
-                                  <input
-                                    type="checkbox"
-                                    checked={logSelected.has(row.id)}
-                                    onChange={() => setLogSelected(toggle(logSelected, row.id))}
-                                  />
-                                </td>
-                                <td>{new Date(row.bumpedAt).toLocaleString()}</td>
-                                <td>
-                                  <strong>{profileTitle}</strong>
-                                  <small>{row.accountId}</small>
-                                </td>
-                                <td>
-                                  {row.groupName}
-                                  {row.groupName !== row.groupId && <small>{row.groupId}</small>}
-                                </td>
-                                <td>
-                                  {row.pageName}
-                                  <small>{row.pageId}</small>
-                                </td>
-                                <td>
-                                  {row.liked ? '👍 点赞 ' : ''}
-                                  {row.commentText ? '💬 ' + row.commentText : ''}
-                                </td>
-                                <td>
-                                  <button
-                                    className="btn btn-sm"
-                                    title={row.postUrl}
-                                    onClick={() =>
-                                      void copyTextToClipboard(row.postUrl)
-                                        .then(() => onMessage('已复制帖子链接'))
-                                        .catch((e) => onMessage(String(e)))
-                                    }
-                                  >
-                                    复制链接
-                                  </button>
-                                </td>
-                              </tr>
-                            );
-                          })}
+                          {logs.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={7}
+                                className="muted"
+                                style={{ textAlign: 'center', padding: 24 }}
+                              >
+                                暂无顶贴记录
+                              </td>
+                            </tr>
+                          ) : (
+                            logs.map((row) => {
+                              const p = profiles?.find((item) => item.id === row.profileId);
+                              const profileTitle = p
+                                ? p.browserName || p.alias || p.name || row.profileId
+                                : row.profileId;
+                              return (
+                                <tr key={row.id}>
+                                  <td>
+                                    <input
+                                      type="checkbox"
+                                      checked={logSelected.has(row.id)}
+                                      onChange={() => setLogSelected(toggle(logSelected, row.id))}
+                                    />
+                                  </td>
+                                  <td>{new Date(row.bumpedAt).toLocaleString()}</td>
+                                  <td>
+                                    <strong>{profileTitle}</strong>
+                                    <small>{row.accountId}</small>
+                                  </td>
+                                  <td>
+                                    {row.groupName}
+                                    {row.groupName !== row.groupId && <small>{row.groupId}</small>}
+                                  </td>
+                                  <td>
+                                    {row.pageName}
+                                    <small>{row.pageId}</small>
+                                  </td>
+                                  <td>
+                                    {row.liked ? '👍 点赞 ' : ''}
+                                    {row.commentText ? '💬 ' + row.commentText : ''}
+                                  </td>
+                                  <td>
+                                    <button
+                                      type="button"
+                                      className="btn btn-sm"
+                                      title={row.postUrl}
+                                      onClick={() =>
+                                        void copyTextToClipboard(row.postUrl)
+                                          .then(() => onMessage('已复制帖子链接'))
+                                          .catch((e) => onMessage(String(e)))
+                                      }
+                                    >
+                                      复制链接
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
                         </tbody>
                       </table>
                     </div>
-                    {logs.length >= 200 && (
+                    {hasMoreLogs && (
                       <button
+                        type="button"
                         className="btn"
                         onClick={() =>
                           void loadLogs(logSearch, logs.at(-1)?.bumpedAt, logs.at(-1)?.id)
@@ -1182,12 +1220,24 @@ export function GroupBumperPage({
                         </tr>
                       </thead>
                       <tbody>
-                        {effectiveDailyStats.map((row) => (
-                          <tr key={row.date}>
-                            <td>{row.date}</td>
-                            <td>{row.count}</td>
+                        {effectiveDailyStats.length === 0 ? (
+                          <tr>
+                            <td
+                              colSpan={2}
+                              className="muted"
+                              style={{ textAlign: 'center', padding: 12 }}
+                            >
+                              近 7 天暂无记录
+                            </td>
                           </tr>
-                        ))}
+                        ) : (
+                          effectiveDailyStats.map((row) => (
+                            <tr key={row.date}>
+                              <td>{row.date}</td>
+                              <td>{row.count}</td>
+                            </tr>
+                          ))
+                        )}
                       </tbody>
                     </table>
                   </aside>
@@ -1201,6 +1251,34 @@ export function GroupBumperPage({
             )}
           </div>
         </div>
+      )}
+      {confirmClearLogs && (
+        <ConfirmDialog
+          title="清空顶贴历史记录"
+          description={
+            logScopeFilter === 'all'
+              ? '确定要清空全部顶贴记录吗？清空后对应的历史防重和次数统计也会一并清除。'
+              : `确定要清空当前模块（${pageMode ? '专页顶贴' : '小组顶贴'}）的全部顶贴记录吗？清空后对应的历史防重和次数统计也会清除。`
+          }
+          confirmText="确认清空"
+          danger
+          busy={busy}
+          onConfirm={() => {
+            setConfirmClearLogs(false);
+            const sourceMode =
+              logScopeFilter === 'current' ? (pageMode ? 'page' : 'group') : undefined;
+            void action('logs/delete', { all: true, sourceMode }).then(async () => {
+              if (bluestacksMode) {
+                await api.bluestacksState(false).then(
+                  (s) => onBluestacksState?.(s),
+                  () => {},
+                );
+              }
+              await loadLogs();
+            });
+          }}
+          onCancel={() => setConfirmClearLogs(false)}
+        />
       )}
     </section>
   );

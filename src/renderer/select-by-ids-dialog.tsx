@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   buildTargetCandidates,
   normalizeTargetToken,
@@ -68,15 +68,25 @@ export function SelectByIdsDialog({
   const [text, setText] = useState('');
   const { tokens, matchedIds, unmatchedTokens } = resolveSelectByIds(text, kind, candidates);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   return (
     <div
       className="modal-backdrop"
       role="dialog"
       aria-modal="true"
       aria-label={title}
-      onClick={onClose}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
-      <div className="modal select-by-ids-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal select-by-ids-modal">
         <div className="modal-head">
           <h3>{title}</h3>
           <button

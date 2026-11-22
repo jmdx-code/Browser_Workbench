@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Profile } from '../../shared/contracts.js';
 import type {
   PosterActiveGroupItem,
@@ -13,8 +13,9 @@ import { copyTextToClipboard } from '../clipboard.js';
 import {
   formatCreatedDate,
   PosterMaterialCardPreview,
+  PosterMediaPreviewModal,
   taskStatusBadge,
-} from './poster-material-cards.js';
+} from './poster-material-modals.js';
 import { posterRowBadge } from './poster-material-thumbnail-cell.js';
 
 export function PosterMaterialDetailModal({
@@ -37,10 +38,14 @@ export function PosterMaterialDetailModal({
   onMessage: (text: string) => void;
 }) {
   const [logs, setLogs] = useState<PosterLog[]>([]);
+  const [hasMoreLogs, setHasMoreLogs] = useState(false);
   const [search, setSearch] = useState('');
+  const searchRef = useRef('');
+  searchRef.current = search;
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [selectedLogIds, setSelectedLogIds] = useState<Set<string>>(new Set());
   const [copyingLogs, setCopyingLogs] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   const activeGroups: PosterActiveGroupItem[] = state?.activeGroupsByMaterial?.[material.id] ?? [];
   const materialTasks: PosterTask[] = (state?.tasks ?? []).filter(
@@ -48,16 +53,21 @@ export function PosterMaterialDetailModal({
   );
   const postedGroupIds = state?.postedGroupIdsByMaterial?.[material.id] ?? [];
 
-  const loadMaterialLogs = async (q = search, before?: number, beforeId?: string) => {
+  const logsReqSeqRef = useRef(0);
+  const loadMaterialLogs = async (q = searchRef.current, before?: number, beforeId?: string) => {
+    const reqSeq = ++logsReqSeqRef.current;
     if (!before) setLoadingLogs(true);
     try {
       const rows = await api.posterLogs(q, before, beforeId, material.id);
+      if (logsReqSeqRef.current !== reqSeq) return;
+      setHasMoreLogs(rows.length >= 200);
       setLogs((prev) => (before ? [...prev, ...rows] : rows));
       if (!before) setSelectedLogIds(new Set());
     } catch (e) {
+      if (logsReqSeqRef.current !== reqSeq) return;
       onMessage(e instanceof Error ? e.message : String(e));
     } finally {
-      if (!before) setLoadingLogs(false);
+      if (!before && logsReqSeqRef.current === reqSeq) setLoadingLogs(false);
     }
   };
 
@@ -95,22 +105,46 @@ export function PosterMaterialDetailModal({
   };
 
   useEffect(() => {
+    setSearch('');
+    searchRef.current = '';
     void loadMaterialLogs('');
-  }, [material.id, state?.total]);
+  }, [material.id]);
+
+  useEffect(() => {
+    if (state?.total !== undefined) {
+      void loadMaterialLogs(searchRef.current);
+    }
+  }, [state?.total]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !previewOpen) onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [previewOpen, onClose]);
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="贴文发帖详情与记录">
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="贴文发帖详情与记录"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
       <div className="modal bumper-modal poster-detail-modal">
         <div className="bumper-modal-heading">
           <h2>贴文发帖详情（正在发小组 · 已发小组 · 发帖链接 · 定时任务）</h2>
-          <button className="btn" aria-label="关闭弹窗" onClick={onClose}>
+          <button type="button" className="btn" aria-label="关闭弹窗" onClick={onClose}>
             ×
           </button>
         </div>
 
         <div className="poster-dispatch-post-summary">
           <div className="poster-dispatch-post-thumb">
-            <PosterMaterialCardPreview row={material} onPreview={() => {}} />
+            <PosterMaterialCardPreview row={material} onPreview={() => setPreviewOpen(true)} />
           </div>
           <div className="poster-dispatch-post-info">
             <div className="poster-dispatch-post-badges">
@@ -399,7 +433,7 @@ export function PosterMaterialDetailModal({
                     })}
                   </tbody>
                 </table>
-                {logs.length >= 200 && (
+                {hasMoreLogs && (
                   <button
                     type="button"
                     className="btn btn-sm"
@@ -415,6 +449,9 @@ export function PosterMaterialDetailModal({
           </div>
         </div>
       </div>
+      {previewOpen && (
+        <PosterMediaPreviewModal row={material} onClose={() => setPreviewOpen(false)} />
+      )}
     </div>
   );
 }

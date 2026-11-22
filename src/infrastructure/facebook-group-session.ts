@@ -128,6 +128,8 @@ export class FacebookGroupSessionHelper {
     groupName?: string | null;
     avatarUrl?: string | null;
     surfaceGroupIds?: readonly string[];
+    /** Only allow resolving vanity alias -> numeric ID when navigated via authentic direct URL (never on name-only search clicks). */
+    allowAliasRedirect?: boolean;
     applyResolvedMetadata?: (
       rawId: string,
       resolved: { canonicalId?: string | null; name?: string | null; avatarUrl?: string | null },
@@ -146,7 +148,11 @@ export class FacebookGroupSessionHelper {
     const surfaceNumeric = (input.surfaceGroupIds ?? []).find((gid) => isCompleteNumericId(gid));
     const candidateCanonical = isCompleteNumericId(extracted) ? extracted : (surfaceNumeric ?? '');
 
+    // Never overwrite an already-numeric group ID with a different numeric ID, and only accept
+    // alias -> numeric redirect when explicitly confirmed via direct navigation or exact ID match.
+    const canResolveAlias = input.allowAliasRedirect !== false && !isCompleteNumericId(rawId);
     const redirectedToCanonical = Boolean(
+      canResolveAlias &&
       candidateCanonical &&
       candidateCanonical.toLowerCase() !== rawId.toLowerCase() &&
       isCompleteNumericId(candidateCanonical),

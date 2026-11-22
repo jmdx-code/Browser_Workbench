@@ -6,6 +6,19 @@ import { pipeline } from 'node:stream/promises';
 import { ZipFile } from 'yazl';
 import { engineFingerprint, sha256 } from '../dist/src/infrastructure/runtime-installation.js';
 import { ReleaseManifest } from '../dist/src/shared/software-update.js';
+const RELEASE_EXCLUDED_FILES = new Set([
+  'config/publication-acceptance-scope.json',
+  'public/sample.mp4',
+  'public/fixture.html',
+  'public/fixture.js',
+  'public/frame.html',
+  'public/kernel-fixture.html',
+  'public/kernel-fixture.js',
+  'public/kernel-frame.html',
+  'public/kernel-frame.js',
+  'public/style.css',
+]);
+
 export async function copyInstallerAliases(
   root = process.cwd(),
   output = path.join(root, 'release'),
@@ -48,7 +61,7 @@ export async function buildReleaseBundle(
     for (const entry of await readdir(path.join(root, name), { withFileTypes: true })) {
       const next = name + '/' + entry.name;
       if (entry.isSymbolicLink()) throw Error('RELEASE_SYMLINK_REJECTED');
-      if (next === 'config/publication-acceptance-scope.json' || next.endsWith('.map')) continue;
+      if (RELEASE_EXCLUDED_FILES.has(next) || next.endsWith('.map')) continue;
       if (entry.isDirectory()) await walk(next);
       else await add(next);
     }

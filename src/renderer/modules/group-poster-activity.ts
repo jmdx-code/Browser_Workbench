@@ -1,7 +1,110 @@
+import type { AutoScheduleRun } from '../../shared/auto-scheduler.js';
+import type { GoogleSheetsActiveProfile } from '../../shared/google-sheets.js';
 import type { BumperProfileStat } from '../../shared/group-bumper.js';
 import type { GroupInviterProfileStat } from '../../shared/group-inviter.js';
 import type { PosterProfileStat } from '../../shared/group-poster.js';
-import type { ProfileActivityDescriptor } from './module-contracts.js';
+import type { FeatureModuleId, ProfileActivityDescriptor } from './module-contracts.js';
+
+export function runningStatIds(counts?: Record<string, { running: boolean }>): string[] {
+  return Object.entries(counts ?? {})
+    .filter(([, stat]) => stat.running)
+    .map(([id]) => id);
+}
+
+export function backgroundRunningDescriptor(
+  moduleId: FeatureModuleId,
+  moduleLabel: string,
+): ProfileActivityDescriptor {
+  return {
+    moduleId,
+    moduleLabel,
+    running: true,
+    tone: 'run',
+    text: `${moduleLabel} · 运行中`,
+    tooltipLines: [`${moduleLabel}正在后台运行`],
+  };
+}
+
+export interface SchedulerActiveProfileInfo {
+  scheduleName: string;
+  phase: 'prewarm' | 'main';
+  status: 'running' | 'queued';
+  currentStep: string;
+  summary: string;
+}
+
+export function extractSchedulerActiveBrowserMap(
+  activeRuns?: readonly Pick<AutoScheduleRun, 'carrier' | 'scheduleName' | 'phase' | 'items'>[],
+): Record<string, SchedulerActiveProfileInfo> {
+  const map: Record<string, SchedulerActiveProfileInfo> = {};
+  for (const run of activeRuns ?? []) {
+    if (run.carrier !== 'browser') continue;
+    for (const item of run.items ?? []) {
+      if (item.status === 'running' || item.status === 'queued') {
+        if (!map[item.targetId] || item.status === 'running') {
+          map[item.targetId] = {
+            scheduleName: run.scheduleName,
+            phase: run.phase,
+            status: item.status,
+            currentStep: item.currentStep,
+            summary: item.summary,
+          };
+        }
+      }
+    }
+  }
+  return map;
+}
+
+export function formatSchedulerProfileActivity(
+  info: SchedulerActiveProfileInfo,
+): ProfileActivityDescriptor {
+  const phaseTag = info.phase === 'prewarm' ? '预热' : '排班';
+  return {
+    moduleId: 'auto-scheduler',
+    moduleLabel: '定时排班',
+    running: true,
+    tone: info.status === 'running' ? 'run' : 'queue',
+    text:
+      info.status === 'running'
+        ? `${phaseTag} · ${info.currentStep}`
+        : `${phaseTag}排队 · ${info.scheduleName}`,
+    tooltipLines: [
+      `定时排班：${info.scheduleName}（${info.phase === 'prewarm' ? '提前预热场' : '正点冲锋场'}）`,
+      `${info.currentStep} · ${info.summary}`,
+    ],
+  };
+}
+
+export function extractSheetsActiveBrowserMap(
+  activeProfiles?: readonly GoogleSheetsActiveProfile[],
+): Record<string, GoogleSheetsActiveProfile> {
+  const map: Record<string, GoogleSheetsActiveProfile> = {};
+  for (const item of activeProfiles ?? []) {
+    if (item.profileId) {
+      map[item.profileId] = item;
+    }
+  }
+  return map;
+}
+
+export function formatSheetsProfileActivity(
+  info: GoogleSheetsActiveProfile,
+): ProfileActivityDescriptor {
+  const isSchedule = info.kind === 'post_schedule';
+  const moduleId: FeatureModuleId = isSchedule ? 'sheets-schedule' : 'sheets-records';
+  const moduleLabel =
+    info.kind === 'post_schedule' ? '云表排贴' : info.kind === 'metrics' ? '云表采集' : '云表顶贴';
+  const status = info.status.trim() || '运行中';
+  return {
+    moduleId,
+    moduleLabel,
+    running: true,
+    tone: 'run',
+    text: `${moduleLabel} · ${status}`,
+    tooltipLines: [`${moduleLabel}：${info.title}`, status],
+  };
+}
 
 export function extractPosterRunningIds(
   groupPoster:

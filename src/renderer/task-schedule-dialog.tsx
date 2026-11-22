@@ -46,8 +46,10 @@ export function TaskScheduleDialog({
       );
     return () => controller.abort();
   }, []);
+  const submittingRef = useRef(false);
   async function submit() {
-    if (busy) return;
+    if (submittingRef.current || busy) return;
+    submittingRef.current = true;
     zoneEdited.current = true;
     setBusy(true);
     setError('');
@@ -55,6 +57,7 @@ export function TaskScheduleDialog({
       const at = DateTime.fromISO(date, { zone });
       if (mode === 'at' && (!at.isValid || at.toMillis() <= Date.now()))
         throw Error('请选择未来的启动时间，并核对时区');
+      if (mode === 'window' && days.length === 0) throw Error('请至少选择一个运行日期');
       const parsed = TaskTiming.safeParse(
         mode === 'at'
           ? { mode, startAt: at.toMillis(), timeZone: zone }
@@ -66,6 +69,7 @@ export function TaskScheduleDialog({
     } catch (e) {
       setError(e instanceof Error ? e.message : '定时设置未保存');
     } finally {
+      submittingRef.current = false;
       setBusy(false);
     }
   }
@@ -178,10 +182,15 @@ export function TaskScheduleDialog({
         </p>
       )}
       <footer>
-        <button disabled={busy} onClick={onClose}>
+        <button type="button" className="btn" disabled={busy} onClick={onClose}>
           取消
         </button>
-        <button className="primary" disabled={busy} onClick={() => void submit()}>
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={busy}
+          onClick={() => void submit()}
+        >
           {busy ? '正在安排…' : '确认安排'}
         </button>
       </footer>

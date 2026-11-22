@@ -28,19 +28,40 @@ export function CleanupDialog({
   );
   const [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
+  const submittingRef = useRef(false);
   useEffect(() => {
     if (!busy) return;
-    const timer = setInterval(() => {
+    let disposed = false;
+    let inFlight = false;
+    let activeController: AbortController | null = null;
+    const poll = () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      const ctrl = new AbortController();
+      activeController = ctrl;
       void api
-        .cleanupProgress()
-        .then(setProgress)
-        .catch(() => {});
-    }, 500);
-    return () => clearInterval(timer);
+        .cleanupProgress(ctrl.signal)
+        .then((next) => {
+          if (!disposed && !ctrl.signal.aborted) setProgress(next);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (activeController === ctrl) activeController = null;
+          inFlight = false;
+        });
+    };
+    const timer = setInterval(poll, 500);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      activeController?.abort();
+    };
   }, [busy]);
 
   useEffect(() => {
-    dialog.current?.showModal();
+    if (dialog.current && !dialog.current.open) {
+      dialog.current.showModal();
+    }
     const controller = new AbortController();
     if (!initialPreview)
       void api.cleanupPreview(selection, controller.signal).then(setPreview, (e: unknown) => {
@@ -83,7 +104,8 @@ export function CleanupDialog({
           className="danger"
           disabled={busy || (preview !== null ? !preview.eligible : !error)}
           onClick={() => {
-            if (busy) return;
+            if (submittingRef.current || busy) return;
+            submittingRef.current = true;
             if (!preview) {
               setBusy(true);
               void api
@@ -98,7 +120,10 @@ export function CleanupDialog({
                       '无法预览：' + (error instanceof Error ? error.message : '请稍后重试'),
                     ),
                 )
-                .finally(() => setBusy(false));
+                .finally(() => {
+                  submittingRef.current = false;
+                  setBusy(false);
+                });
               return;
             }
             setBusy(true);
@@ -133,7 +158,10 @@ export function CleanupDialog({
                   setPreview(null);
                 },
               )
-              .finally(() => setBusy(false));
+              .finally(() => {
+                submittingRef.current = false;
+                setBusy(false);
+              });
           }}
         >
           {busy
@@ -360,7 +388,6 @@ export function DataCleanupPanel() {
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false),
     [resetOpen, setResetOpen] = useState(false);
-  const [reload, setReload] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     void Promise.all([
@@ -387,7 +414,7 @@ export function DataCleanupPanel() {
       },
     );
     return () => controller.abort();
-  }, [reload]);
+  }, []);
   const run = async (work: () => Promise<string>) => {
     if (busy) return;
     setBusy(true);
@@ -407,17 +434,25 @@ export function DataCleanupPanel() {
       <p>
         超额自动回收最早的已结束记录。详细流水按全软件合计保留；防重复、素材使用和必要的未确认结果独立保存。
       </p>
-      <div className="settings-form">
-        <button disabled={busy} onClick={() => setSelection({ kind: 'logs' })}>
+      <div className="settings-form cleanup-log-row">
+        <button
+          type="button"
+          className="btn btn-sm"
+          disabled={busy}
+          onClick={() => setSelection({ kind: 'logs' })}
+        >
           预览清空运行与诊断日志
         </button>
         <input
           type="date"
+          style={{ minWidth: 148 }}
           aria-label="日志清理截止日期"
           value={logDate}
           onChange={(e) => setLogDate(e.target.value)}
         />
         <button
+          type="button"
+          className="btn btn-sm"
           disabled={!logDate || busy}
           onClick={() => setSelection({ kind: 'logs', before: cleanupDateEnd(logDate) })}
         >
@@ -479,7 +514,17 @@ export function DataCleanupPanel() {
             />
           </label>
         ))}
+        <label style={{ width: '100%' }}>
+          <input
+            type="checkbox"
+            checked={autoLogs}
+            onChange={(e) => setAutoLogs(e.target.checked)}
+          />
+          同时自动清理诊断日志（使用上方日志保留天数）
+        </label>
         <button
+          type="button"
+          className="btn btn-primary btn-sm"
           disabled={
             busy ||
             !settings ||
@@ -516,6 +561,8 @@ export function DataCleanupPanel() {
           保存自动清理设置
         </button>
         <button
+          type="button"
+          className="btn btn-sm"
           disabled={busy}
           onClick={() =>
             void run(async () => {
@@ -527,10 +574,6 @@ export function DataCleanupPanel() {
           整理数据库空间
         </button>
       </div>
-      <label>
-        <input type="checkbox" checked={autoLogs} onChange={(e) => setAutoLogs(e.target.checked)} />
-        同时自动清理诊断日志（使用上方日志保留天数；随“保存自动清理设置”保存）
-      </label>
       <h3>重置工作台</h3>
       {status?.dataDirectory && (
         <p style={{ overflowWrap: 'anywhere' }}>将清空的数据目录：{status.dataDirectory}</p>
@@ -543,25 +586,8 @@ export function DataCleanupPanel() {
       </p>
       <div className="settings-form">
         <button
-          disabled={busy}
-          onClick={() =>
-            void run(async () => {
-              const value = await api.backupStatus(AbortSignal.timeout(10000));
-              if (!value.canCreate) throw Error(value.reason);
-              const directory = await window.workbenchDesktop?.chooseBackupDirectory();
-              if (!directory) return '已取消备份';
-              await api.createBackup(directory);
-              return '数据备份已完成，备份目录在工作台数据目录之外。';
-            })
-          }
-        >
-          先备份数据…
-        </button>
-        <button disabled={busy} onClick={() => setReload((v) => v + 1)}>
-          重新检查停止状态
-        </button>
-        <button
-          className="danger"
+          type="button"
+          className="btn btn-sm danger"
           disabled={busy || !status?.available}
           onClick={() => setResetOpen(true)}
         >
@@ -589,6 +615,7 @@ export function DataCleanupPanel() {
 
 function ResetDialog({ onClose }: { onClose(): void }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const submittingRef = useRef(false);
   const [phrase, setPhrase] = useState(''),
     [ack, setAck] = useState(false),
     [busy, setBusy] = useState(false),
@@ -641,10 +668,14 @@ function ResetDialog({ onClose }: { onClose(): void }) {
           className="danger"
           disabled={busy || !ack || phrase !== '确认重置'}
           onClick={() => {
+            if (submittingRef.current || busy) return;
+            submittingRef.current = true;
             setBusy(true);
+            setError('');
             void api
               .resetWorkspace({ confirmation: phrase, acknowledgeUnknownResults: ack })
               .catch((e: unknown) => {
+                submittingRef.current = false;
                 setBusy(false);
                 setError(e instanceof Error ? e.message : '重置请求未确认，请重新检查状态');
               });

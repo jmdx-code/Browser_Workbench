@@ -1,0 +1,232 @@
+/* Shared Google Sheets Auth Panel & Form Controls (eagerly imported by AppMenu -> GoogleSheetsAuthPanel) */
+.gs-auth-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.gs-auth-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 14px;
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.gs-auth-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.gs-auth-card-head h3 {
+  margin: 0 0 3px;
+  font-size: var(--fs-md);
+}
+.gs-auth-head-pills {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.gs-autosave-pill.is-saving {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+.gs-autosave-pill.is-err {
+  background: var(--err-soft);
+  color: var(--err);
+}
+.gs-token-label-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gs-token-mini-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.gs-token-textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.gs-token-masked-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+.gs-token-masked-chip {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text-2);
+}
+.gs-doc-shortcut {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px dashed var(--line-strong);
+}
+.gs-auth-step-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.gs-auth-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 200px;
+}
+.gs-auth-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gs-file-btn {
+  position: relative;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.gs-file-btn:hover {
+  background: var(--surface-3);
+  border-color: #c4cad2;
+}
+.gs-file-btn.btn-primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.gs-file-btn.btn-primary:hover {
+  background: var(--brand-hover, #1e56c5);
+  border-color: var(--brand-hover, #1e56c5);
+}
+.gs-file-btn input[type='file'] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.gs-auth-paste-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.gs-auth-paste-box textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.gs-auth-url-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+}
+.gs-auth-url-head,
+.gs-auth-url-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gs-auth-url-box input {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.gs-manual-code-row,
+.gs-token-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gs-manual-code-row input,
+.gs-token-row input {
+  flex: 1 1 auto;
+}
+.gs-banner {
+  padding: 9px 12px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+}
+.gs-banner.is-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border: 1px solid #b8e6cc;
+}
+.gs-banner.is-err {
+  background: var(--err-soft);
+  color: var(--err);
+  border: 1px solid #f5c2c2;
+}
+.gs-inline-err {
+  color: var(--err);
+  margin: 0;
+  font-size: var(--fs-xs);
+}
+.gs-test-url code {
+  word-break: break-all;
+}
+.gs-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+.gs-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.gs-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+.gs-field-full {
+  grid-column: 1 / -1;
+}
+.gs-field input,
+.gs-field select,
+.gs-field textarea {
+  width: 100%;
+  font-size: var(--fs-sm);
+}

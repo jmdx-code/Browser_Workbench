@@ -81,7 +81,7 @@ export class TaskTestService {
           : !profile.synced || profile.unresolved
             ? '连接正在对账或有待处理操作，请先查看状态'
             : externalBusy
-              ? '正在执行小组邀请人任务，请先停止'
+              ? '该浏览器正在执行其他任务，请先停止'
               : live.some((plan) => plan.profileId === profileId)
                 ? '已有任务未结束，请先停止或处理原任务'
                 : '';

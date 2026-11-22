@@ -1,5 +1,10 @@
 import { z } from 'zod';
-export const CreateWorkspaceBackup = z.object({ directory: z.string().min(1).max(4096) }).strict();
+export const CreateWorkspaceBackup = z
+  .object({
+    directory: z.string().min(1).max(4096),
+    redactSecrets: z.boolean().optional(),
+  })
+  .strict();
 export const WorkspaceBackupManifest = z
   .object({
     version: z.literal(1),

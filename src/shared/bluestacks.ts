@@ -1,10 +1,41 @@
 import { z } from 'zod';
 import { Id } from './contracts.js';
+import {
+  BluestacksLoginExistingPolicy,
+  type BluestacksBatchLoginState,
+} from './bluestacks-batch-login.js';
+import type { BluestacksHealthCheckState } from './bluestacks-health-check.js';
+import type {
+  BluestacksDailyUsageOverview,
+  BluestacksRiskLimitSettings,
+} from './bluestacks-risk.js';
 import { BumperSettings, type BumperDailyStat, type BumperProfileStat } from './group-bumper.js';
 import { GroupIdString } from './group-inviter.js';
+export * from './bluestacks-batch-login.js';
+export * from './bluestacks-health-check.js';
+export * from './bluestacks-risk.js';
 
-export const BluestacksAccountState = z.enum(['unknown', 'logged-in', 'logged-out', 'missing-app']);
+export const BluestacksAccountState = z.enum([
+  'unknown',
+  'logged-in',
+  'logged-out',
+  'missing-app',
+  'restricted',
+  'verification',
+]);
 export type BluestacksAccountState = z.infer<typeof BluestacksAccountState>;
+
+export const BluestacksIdentityType = z.enum(['unknown', 'personal', 'page']);
+export type BluestacksIdentityType = z.infer<typeof BluestacksIdentityType>;
+
+export const BluestacksManagedIdentitySchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    identityType: z.enum(['personal', 'page']),
+    active: z.boolean(),
+  })
+  .strict();
+export type BluestacksManagedIdentity = z.infer<typeof BluestacksManagedIdentitySchema>;
 
 export const BluestacksInstanceSchema = z
   .object({
@@ -26,6 +57,11 @@ export const BluestacksInstanceSchema = z
     avatarUrl: z.string().nullable(),
     lastStatus: z.string().max(300).nullable(),
     updatedAt: z.number().int(),
+    identityType: BluestacksIdentityType.optional(),
+    numericAccountId: z.string().max(64).optional(),
+    managedIdentities: z.array(BluestacksManagedIdentitySchema).max(50).optional(),
+    androidSdk: z.number().int().min(1).max(99).nullable().optional(),
+    fbLiteVersion: z.string().max(64).nullable().optional(),
   })
   .strict();
 export type BluestacksInstance = z.infer<typeof BluestacksInstanceSchema>;
@@ -47,6 +83,8 @@ export const BluestacksRuntimeConfigSchema = z
     detectedConfPath: z.string().trim().max(500).nullable(),
     adbReady: z.boolean(),
     playerReady: z.boolean(),
+    apkPath: z.string().trim().max(600).nullable().optional(),
+    detectedApkPath: z.string().trim().max(600).nullable().optional(),
   })
   .strict();
 export type BluestacksRuntimeConfig = z.infer<typeof BluestacksRuntimeConfigSchema>;
@@ -55,6 +93,7 @@ export const UpdateBluestacksPathsInput = z
   .object({
     installDir: z.string().trim().max(500).nullable().optional(),
     confPath: z.string().trim().max(500).nullable().optional(),
+    apkPath: z.string().trim().max(600).nullable().optional(),
   })
   .strict();
 export type UpdateBluestacksPathsInput = z.infer<typeof UpdateBluestacksPathsInput>;
@@ -64,6 +103,121 @@ export const BluestacksInstanceIdsInput = z
     instanceIds: z.array(Id).min(1).max(200),
   })
   .strict();
+
+export const BluestacksShowInstanceInput = z
+  .object({
+    instanceId: Id,
+  })
+  .strict();
+
+export const BluestacksArrangeWindowsInput = z
+  .object({
+    instanceIds: z.array(Id).max(200).optional(),
+    columns: z.number().int().min(1).max(10).optional(),
+    gap: z.number().int().min(0).max(40).optional(),
+  })
+  .strict();
+
+export const BluestacksInstallApkInput = z
+  .object({
+    instanceIds: z.array(Id).min(1).max(200),
+    apkPath: z.string().trim().max(600).optional(),
+  })
+  .strict();
+
+export const BluestacksSwitchIdentityInput = z
+  .object({
+    instanceId: Id,
+    targetName: z.string().trim().min(1).max(200).optional(),
+    targetType: z.enum(['personal', 'page']).optional(),
+  })
+  .strict();
+
+export const BluestacksLoginInput = z
+  .object({
+    instanceId: Id,
+    account: z.string().trim().min(1).max(200),
+    password: z.string().min(1).max(200),
+    totpSecret: z.string().trim().max(200).optional(),
+    saveLoginInfo: z.boolean().optional(),
+    ifAlreadyLoggedIn: BluestacksLoginExistingPolicy.optional(),
+  })
+  .strict();
+export type BluestacksLoginInput = z.infer<typeof BluestacksLoginInput>;
+
+export const BluestacksQuickActiveStepType = z.enum([
+  'feed',
+  'video',
+  'marketplace',
+  'friends',
+  'post',
+  'story',
+]);
+export type BluestacksQuickActiveStepType = z.infer<typeof BluestacksQuickActiveStepType>;
+
+export const StartBluestacksActiveInput = z
+  .object({
+    instanceIds: z.array(Id).min(1).max(200),
+    combinationId: Id.optional(),
+    quickStep: z
+      .object({
+        type: BluestacksQuickActiveStepType,
+        durationMinutes: z.number().min(0.2).max(120).optional(),
+        maxLikes: z.number().int().min(0).max(50).optional(),
+        maxAccepts: z.number().int().min(0).max(50).optional(),
+        caption: z.string().max(4000).optional(),
+        mediaPath: z.string().max(600).optional(),
+        background: z.string().max(40).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .refine((v) => Boolean(v.combinationId || v.quickStep), {
+    message: '请指定活跃任务组合或单步活跃动作',
+  });
+export type StartBluestacksActiveInput = z.infer<typeof StartBluestacksActiveInput>;
+
+export const StartBluestacksPosterInput = z
+  .object({
+    instanceIds: z.array(Id).min(1).max(200),
+    materialIds: z.array(Id).min(1).max(100),
+    groupIds: z.array(GroupIdString).max(500).default([]),
+    maxGroupsPerInstance: z.number().int().min(1).max(50).default(3),
+    postToTimeline: z.boolean().default(false),
+  })
+  .strict()
+  .refine((v) => v.groupIds.length > 0 || v.postToTimeline, {
+    message: '请至少选择一个目标小组或开启发时间线',
+  });
+export type StartBluestacksPosterInput = z.infer<typeof StartBluestacksPosterInput>;
+
+export const StartBluestacksInviterInput = z
+  .object({
+    instanceIds: z.array(Id).min(1).max(200),
+    groupIds: z.array(GroupIdString).min(1).max(500),
+    invitesPerGroup: z.number().int().min(1).max(50).default(5),
+  })
+  .strict();
+export type StartBluestacksInviterInput = z.infer<typeof StartBluestacksInviterInput>;
+
+export type BluestacksWorkerKind =
+  | 'group-bumper'
+  | 'page-bumper'
+  | 'active'
+  | 'poster'
+  | 'inviter'
+  | 'sheets-bumper'
+  | 'sheets-poster'
+  | 'batch-login'
+  | 'health-check';
+
+export interface BluestacksModuleProfileStat {
+  running: boolean;
+  status: string;
+  session: number;
+  today: number;
+}
 
 export const CreateBluestacksFolderInput = z
   .object({
@@ -136,17 +290,33 @@ export interface BluestacksState {
   pageBumperSettings: BumperSettings;
   running: boolean;
   pageBumperRunning: boolean;
+  activeRunning?: boolean;
+  posterRunning?: boolean;
+  inviterRunning?: boolean;
   launchingIds: string[];
   closingIds: string[];
   inspectingIds: string[];
+  installingIds?: string[];
+  loggingInIds?: string[];
+  switchingIds?: string[];
   statusText: string;
   pageBumperStatusText: string;
+  activeStatusText?: string;
+  posterStatusText?: string;
+  inviterStatusText?: string;
   profileCounts: Record<string, BumperProfileStat>;
   pageBumperProfileCounts: Record<string, BumperProfileStat>;
+  activeProfileCounts?: Record<string, BluestacksModuleProfileStat>;
+  posterProfileCounts?: Record<string, BluestacksModuleProfileStat>;
+  inviterProfileCounts?: Record<string, BluestacksModuleProfileStat>;
   total: number;
   pageTotal: number;
   dailyStats: BumperDailyStat[];
   pageDailyStats: BumperDailyStat[];
+  batchLogin?: BluestacksBatchLoginState | null;
+  healthCheck?: BluestacksHealthCheckState | null;
+  riskLimitSettings?: BluestacksRiskLimitSettings;
+  dailyUsage?: BluestacksDailyUsageOverview;
 }
 
 export function isBluestacksPortraitResolution(fbWidth: number, fbHeight: number): boolean {
@@ -158,7 +328,12 @@ export function bluestacksDisplayTitle(
 ): string {
   const alias = instance.alias?.trim();
   if (alias) return alias;
-  return instance.displayName.trim() || instance.instanceKey;
+  const raw = instance.displayName.trim();
+  const bsMatch = /^BlueStacks\s+App\s+Player(?:\s+(\d+))?$/i.exec(raw);
+  if (bsMatch) {
+    return bsMatch[1] ? `蓝蝶 #${bsMatch[1]}` : '蓝蝶 #主';
+  }
+  return raw || instance.instanceKey;
 }
 
 export function relativePostAge(text: string, now = Date.now()): number | null {

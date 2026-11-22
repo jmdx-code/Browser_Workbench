@@ -74,8 +74,13 @@ test('WO-R3.2: poster material preparation isolates failures, verifies local/Dri
     try {
       const repo = new SqliteGroupPosterRepository(db);
       const validImgPath = path.join(dir, 'large-image.jpg');
-      // Write a 5MB image file (> 4MB chunk threshold)
-      writeFileSync(validImgPath, Buffer.alloc(5 * 1024 * 1024, 0x42));
+      // Write a 5MB image file (> 4MB chunk threshold) with valid JPEG SOI header
+      const largeJpeg = Buffer.alloc(5 * 1024 * 1024, 0x42);
+      largeJpeg[0] = 0xff;
+      largeJpeg[1] = 0xd8;
+      largeJpeg[2] = 0xff;
+      largeJpeg[3] = 0xe0;
+      writeFileSync(validImgPath, largeJpeg);
       const missingImgPath = path.join(dir, 'missing-image.jpg');
 
       const saved = repo.saveMaterials({

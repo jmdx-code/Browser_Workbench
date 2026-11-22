@@ -41,7 +41,10 @@ export function useInspections() {
       if (reader.current === current) reader.current = null;
     };
   }, []);
-  const refresh = useCallback(() => reader.current?.refresh() ?? Promise.resolve(), []);
+  const refresh = useCallback(
+    (force = false) => reader.current?.refresh(force) ?? Promise.resolve(),
+    [],
+  );
   const request = useCallback(async (ids: string[]) => {
     const current = reader.current;
     if (!current) throw Error('检查服务尚未连接，请稍候。');

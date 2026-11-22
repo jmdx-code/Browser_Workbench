@@ -14,7 +14,7 @@ import type { TargetFolder } from '../shared/target-list.js';
 import { collectAllPaginatedLogs, formatPosterLogsAsTsv } from '../shared/log-table-copy.js';
 import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
-import { orderedFinderItems } from './finder-target-list.js';
+import { ConfirmDialog } from './confirm-dialog.js';
 import { extractGroupId, type DraftGroupEntry } from './group-inviter-grid.js';
 import { GroupDraftGrid } from './group-inviter-page.js';
 import {
@@ -104,7 +104,6 @@ export function GroupPosterPage({
   onMessage: (text: string) => void;
 }) {
   const [settings, setSettings] = useState<PosterSettings | null>(state?.settings ?? null);
-  const [chosenGroups] = useState<Set<string>>(new Set());
   const [folders, setFolders] = useState<TargetFolder[]>([]);
   const [addFolder, setAddFolder] = useState<string | null>(null);
   const [modal, setModal] = useState<'groups' | 'logs' | 'materials' | null>(null);
@@ -112,9 +111,11 @@ export function GroupPosterPage({
   const [drafts, setDrafts] = useState<MaterialDraft[]>(() => [createEmptyMaterialDraft()]);
   const [dirtyMaterials, setDirtyMaterials] = useState(false);
   const [logs, setLogs] = useState<PosterLog[]>([]);
+  const [hasMoreLogs, setHasMoreLogs] = useState(false);
   const [logSearch, setLogSearch] = useState('');
   const [logSelected, setLogSelected] = useState<Set<string>>(new Set());
   const [copyingLogs, setCopyingLogs] = useState(false);
+  const [confirmClearLogs, setConfirmClearLogs] = useState(false);
   const loadedLogSearchRef = useRef('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -125,10 +126,17 @@ export function GroupPosterPage({
   const [detailMaterialId, setDetailMaterialId] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<{ row: MaterialDraft; isNew: boolean } | null>(null);
   const matrixRef = useRef<PosterMaterialMatrixHandle>(null);
-  const maxConcRef = useRef<ControlledNumberInputHandle>(null);
   const maxPostsRef = useRef<ControlledNumberInputHandle>(null);
   const matPerGroupRef = useRef<ControlledNumberInputHandle>(null);
   const settingsRef = useRef<PosterSettings | null>(state?.settings ?? null);
+  const editSeqRef = useRef(0);
+  const autoSaveFailedSeqRef = useRef<number | null>(null);
+  const onStateRef = useRef(onState);
+  onStateRef.current = onState;
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
+  const serverMaterialsRef = useRef(state?.materials ?? []);
+  serverMaterialsRef.current = state?.materials ?? [];
 
   useEffect(() => {
     void api
@@ -171,12 +179,20 @@ export function GroupPosterPage({
     }
   }, [state, dirtyMaterials]);
 
+  useEffect(() => {
+    if (!modal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || busy || confirmClearLogs) return;
+      if (modal === 'materials' && matrixRef.current?.isEditing()) return;
+      setModal(null);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [modal, busy, confirmClearLogs]);
+
   const isRunning = Boolean(state?.running);
   const persistedMaterialIds = new Set((state?.materials ?? []).map((m) => m.id));
   const selectedProfiles = [...selected].sort();
-  const selectedGroupIds = orderedFinderItems(state?.groups ?? [], folders)
-    .filter((g) => chosenGroups.has(g.id))
-    .map((g) => g.id);
 
   async function action(route: string, body: unknown = {}) {
     setBusy(true);
@@ -199,6 +215,7 @@ export function GroupPosterPage({
     try {
       const rows = await api.posterLogs(search, before, beforeId);
       loadedLogSearchRef.current = search;
+      setHasMoreLogs(rows.length >= 200);
       setLogs((prev) => (before ? [...prev, ...rows] : rows));
       if (!before) setLogSelected(new Set());
     } catch (e) {
@@ -248,22 +265,41 @@ export function GroupPosterPage({
 
   async function persistMaterials(itemsToSave = drafts) {
     const latest = matrixRef.current?.commitPendingEdit() ?? itemsToSave;
+    const seq = editSeqRef.current;
     const valid = toMaterialInputs(latest);
     const next = await action('materials/save', { items: valid, replaceAll: true });
     if (next) {
-      setDirtyMaterials(false);
-      setDrafts(mergeServerMaterialsIntoDrafts(latest, next.materials, true));
+      autoSaveFailedSeqRef.current = null;
+      if (editSeqRef.current === seq) {
+        setDirtyMaterials(false);
+        setDrafts(mergeServerMaterialsIntoDrafts(latest, next.materials, true));
+      }
       onMessage(`已保存 ${valid.length} 条发帖素材（含 Google Drive 媒体将在后台自动下载缓存）`);
     }
     return next;
   }
 
+  function closeMaterialsModal() {
+    if (modal === 'materials') {
+      const committed = matrixRef.current?.commitPendingEdit();
+      if (committed) {
+        editSeqRef.current += 1;
+        setDrafts(committed);
+        setDirtyMaterials(true);
+      }
+    }
+    setModal(null);
+  }
+
   useEffect(() => {
     if (!dirtyMaterials || busy) return;
+    const seq = editSeqRef.current;
+    if (autoSaveFailedSeqRef.current === seq) return;
     const timer = setTimeout(() => {
       if (matrixRef.current?.isEditing()) return;
+      if (editSeqRef.current !== seq) return;
       const valid = toMaterialInputs(drafts);
-      const serverInputs: PosterMaterialInput[] = (state?.materials ?? []).map((m) => ({
+      const serverInputs: PosterMaterialInput[] = serverMaterialsRef.current.map((m) => ({
         id: m.id,
         caption: m.caption.trim(),
         mediaSource: m.mediaSource.trim(),
@@ -272,19 +308,27 @@ export function GroupPosterPage({
         selected: m.selected,
       }));
       if (JSON.stringify(valid) === JSON.stringify(serverInputs)) {
-        setDirtyMaterials(false);
+        if (editSeqRef.current === seq) setDirtyMaterials(false);
         return;
       }
       void api
         .posterAction('materials/save', { items: valid, replaceAll: true })
         .then((next) => {
-          onState(next);
-          setDirtyMaterials(false);
+          autoSaveFailedSeqRef.current = null;
+          onStateRef.current(next);
+          if (editSeqRef.current === seq) {
+            setDirtyMaterials(false);
+          }
         })
-        .catch(() => {});
+        .catch((err) => {
+          autoSaveFailedSeqRef.current = seq;
+          const msg = err instanceof Error ? err.message : '自动保存素材失败，请手动点击保存';
+          setError(msg);
+          onMessageRef.current(msg);
+        });
     }, 600);
     return () => clearTimeout(timer);
-  }, [drafts, dirtyMaterials, busy, state?.materials, onState]);
+  }, [drafts, dirtyMaterials, busy]);
 
   function updateSettingField<K extends keyof PosterSettings>(key: K, rawValue: number) {
     const base = settingsRef.current ?? settings;
@@ -303,18 +347,6 @@ export function GroupPosterPage({
           <div className="bumper-primary-controls">
             {settings && (
               <div className="bumper-search-highlight bumper-policy">
-                <label className="bumper-policy-field">
-                  <span>最大并发浏览器</span>
-                  <ControlledNumberInput
-                    ref={maxConcRef}
-                    ariaLabel="最大并发浏览器"
-                    min={1}
-                    max={50}
-                    defaultValue={8}
-                    value={settings.maxConcurrentProfiles}
-                    onCommit={(val) => updateSettingField('maxConcurrentProfiles', val)}
-                  />
-                </label>
                 <label className="bumper-policy-field">
                   <span>单号本轮上限</span>
                   <ControlledNumberInput
@@ -368,7 +400,12 @@ export function GroupPosterPage({
               发帖记录 ({state?.total ?? 0} 条)
             </button>
             {isRunning && (
-              <button className="btn btn-danger" onClick={() => void action('stop')}>
+              <button
+                type="button"
+                className="btn btn-danger"
+                disabled={busy}
+                onClick={() => void action('stop')}
+              >
                 ■ 停止全部发帖
               </button>
             )}
@@ -476,7 +513,6 @@ export function GroupPosterPage({
               profiles={profiles ?? []}
               profileGroups={profileGroups ?? []}
               initialSelectedProfileIds={selectedProfiles}
-              initialSelectedGroupIds={selectedGroupIds}
               initialTimingMode={dispatchTimingMode}
               busy={busy}
               onClose={() => setDispatchMaterialId(null)}
@@ -496,9 +532,7 @@ export function GroupPosterPage({
               onSubmitTask={async (input) => {
                 if (settingsRef.current) {
                   const nextSettings: PosterSettings = {
-                    maxConcurrentProfiles:
-                      (await maxConcRef.current?.flush()) ??
-                      settingsRef.current.maxConcurrentProfiles,
+                    maxConcurrentProfiles: settingsRef.current.maxConcurrentProfiles,
                     maxPostsPerAccount:
                       (await maxPostsRef.current?.flush()) ??
                       settingsRef.current.maxPostsPerAccount,
@@ -583,6 +617,9 @@ export function GroupPosterPage({
                 ? '全屏编辑贴文素材库'
                 : '发帖记录'
           }
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !busy && modal !== 'materials') setModal(null);
+          }}
         >
           <div
             className={
@@ -602,7 +639,7 @@ export function GroupPosterPage({
                     ? '全屏编辑贴文素材库'
                     : '小组发帖记录'}
               </h2>
-              <button className="btn" aria-label="关闭弹窗" onClick={() => setModal(null)}>
+              <button className="btn" aria-label="关闭弹窗" onClick={closeMaterialsModal}>
                 ×
               </button>
             </div>
@@ -612,6 +649,8 @@ export function GroupPosterPage({
                 rows={drafts}
                 persistedIds={persistedMaterialIds}
                 onChange={(next) => {
+                  editSeqRef.current += 1;
+                  autoSaveFailedSeqRef.current = null;
                   setDrafts(next);
                   setDirtyMaterials(true);
                 }}
@@ -626,7 +665,7 @@ export function GroupPosterPage({
                 dirty={dirtyMaterials}
                 busy={busy}
                 isFullscreen={true}
-                onToggleFullscreen={() => setModal(null)}
+                onToggleFullscreen={closeMaterialsModal}
                 onThumbnailSaved={(id) =>
                   setDrafts((prev) =>
                     prev.map((d) =>
@@ -733,12 +772,10 @@ export function GroupPosterPage({
                     删除已选 ({logSelected.size})
                   </button>
                   <button
+                    type="button"
                     className="btn"
                     disabled={!state?.total || busy || isRunning}
-                    onClick={() => {
-                      if (confirm('清空全部发帖记录？清空后小组与素材的历史防重记录也会清除。'))
-                        void action('logs/delete', { all: true }).then(() => loadLogs());
-                    }}
+                    onClick={() => setConfirmClearLogs(true)}
                   >
                     清空历史记录
                   </button>
@@ -771,94 +808,108 @@ export function GroupPosterPage({
                           </tr>
                         </thead>
                         <tbody>
-                          {logs.map((row) => {
-                            const p = profiles?.find((item) => item.id === row.profileId);
-                            const profileTitle = p
-                              ? p.browserName || p.alias || p.account.name || row.profileId
-                              : row.profileId;
-                            const effectiveAccountAvatar =
-                              (p?.account.id === row.accountId && p?.account.avatar
-                                ? p.account.avatar
-                                : null) ?? row.accountAvatar;
-                            return (
-                              <tr key={row.id}>
-                                <td>
-                                  <input
-                                    type="checkbox"
-                                    checked={logSelected.has(row.id)}
-                                    onChange={() => {
-                                      const next = new Set(logSelected);
-                                      if (next.has(row.id)) next.delete(row.id);
-                                      else next.add(row.id);
-                                      setLogSelected(next);
-                                    }}
-                                  />
-                                </td>
-                                <td>{new Date(row.postedAt).toLocaleString()}</td>
-                                <td>
-                                  <div className="poster-log-entity">
-                                    {effectiveAccountAvatar && (
-                                      <img
-                                        src={effectiveAccountAvatar}
-                                        alt=""
-                                        className="poster-log-avatar"
-                                        referrerPolicy="no-referrer"
-                                      />
-                                    )}
-                                    <div>
-                                      <strong>{row.accountName || profileTitle}</strong>
-                                      <span
-                                        className={'poster-identity-badge is-' + row.identityType}
-                                      >
-                                        {row.identityType === 'page' ? '专页' : '个人'}
+                          {logs.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={6}
+                                className="muted"
+                                style={{ textAlign: 'center', padding: 24 }}
+                              >
+                                暂无发帖记录
+                              </td>
+                            </tr>
+                          ) : (
+                            logs.map((row) => {
+                              const p = profiles?.find((item) => item.id === row.profileId);
+                              const profileTitle = p
+                                ? p.browserName || p.alias || p.account.name || row.profileId
+                                : row.profileId;
+                              const effectiveAccountAvatar =
+                                (p?.account.id === row.accountId && p?.account.avatar
+                                  ? p.account.avatar
+                                  : null) ?? row.accountAvatar;
+                              return (
+                                <tr key={row.id}>
+                                  <td>
+                                    <input
+                                      type="checkbox"
+                                      checked={logSelected.has(row.id)}
+                                      onChange={() => {
+                                        const next = new Set(logSelected);
+                                        if (next.has(row.id)) next.delete(row.id);
+                                        else next.add(row.id);
+                                        setLogSelected(next);
+                                      }}
+                                    />
+                                  </td>
+                                  <td>{new Date(row.postedAt).toLocaleString()}</td>
+                                  <td>
+                                    <div className="poster-log-entity">
+                                      {effectiveAccountAvatar && (
+                                        <img
+                                          src={effectiveAccountAvatar}
+                                          alt=""
+                                          className="poster-log-avatar"
+                                          referrerPolicy="no-referrer"
+                                        />
+                                      )}
+                                      <div>
+                                        <strong>{row.accountName || profileTitle}</strong>
+                                        <span
+                                          className={'poster-identity-badge is-' + row.identityType}
+                                        >
+                                          {row.identityType === 'page' ? '专页' : '个人'}
+                                        </span>
+                                        <small>{row.accountId}</small>
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <div className="poster-log-entity">
+                                      {row.groupAvatar && (
+                                        <img
+                                          src={row.groupAvatar}
+                                          alt=""
+                                          className="poster-log-avatar"
+                                          referrerPolicy="no-referrer"
+                                        />
+                                      )}
+                                      <div>
+                                        <strong>{row.groupName}</strong>
+                                        <small>{row.groupId}</small>
+                                      </div>
+                                    </div>
+                                  </td>
+                                  <td className="poster-log-caption">{row.captionPreview}</td>
+                                  <td>
+                                    {row.postId === 'pending_approval' && (
+                                      <span className="poster-identity-badge is-page">
+                                        已提交待群管审核
                                       </span>
-                                      <small>{row.accountId}</small>
-                                    </div>
-                                  </div>
-                                </td>
-                                <td>
-                                  <div className="poster-log-entity">
-                                    {row.groupAvatar && (
-                                      <img
-                                        src={row.groupAvatar}
-                                        alt=""
-                                        className="poster-log-avatar"
-                                        referrerPolicy="no-referrer"
-                                      />
                                     )}
-                                    <div>
-                                      <strong>{row.groupName}</strong>
-                                      <small>{row.groupId}</small>
-                                    </div>
-                                  </div>
-                                </td>
-                                <td className="poster-log-caption">{row.captionPreview}</td>
-                                <td>
-                                  {row.postId === 'pending_approval' && (
-                                    <span className="poster-identity-badge is-page">
-                                      已提交待群管审核
-                                    </span>
-                                  )}
-                                  <button
-                                    className="btn btn-sm"
-                                    title={row.postUrl}
-                                    onClick={() =>
-                                      void copyTextToClipboard(row.postUrl)
-                                        .then(() => onMessage('已复制发帖链接'))
-                                        .catch((e) => onMessage(String(e)))
-                                    }
-                                  >
-                                    复制链接
-                                  </button>
-                                </td>
-                              </tr>
-                            );
-                          })}
+                                    <button
+                                      type="button"
+                                      className="btn btn-sm"
+                                      title={row.postUrl}
+                                      onClick={() =>
+                                        void copyTextToClipboard(row.postUrl)
+                                          .then(() => onMessage('已复制发帖链接'))
+                                          .catch((e) => onMessage(String(e)))
+                                      }
+                                    >
+                                      复制链接
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
                         </tbody>
                       </table>
                     </div>
-                    {logs.length >= 200 && logs.length < (state?.total ?? Infinity) && (
+                    {hasMoreLogs && (
                       <button
+                        type="button"
                         className="btn"
                         onClick={() =>
                           void loadLogs(logSearch, logs.at(-1)?.postedAt, logs.at(-1)?.id)
@@ -878,12 +929,24 @@ export function GroupPosterPage({
                         </tr>
                       </thead>
                       <tbody>
-                        {(state?.dailyStats ?? []).map((row) => (
-                          <tr key={row.date}>
-                            <td>{row.date}</td>
-                            <td>{row.count}</td>
+                        {(state?.dailyStats ?? []).length === 0 ? (
+                          <tr>
+                            <td
+                              colSpan={2}
+                              className="muted"
+                              style={{ textAlign: 'center', padding: 12 }}
+                            >
+                              近 7 天暂无记录
+                            </td>
                           </tr>
-                        ))}
+                        ) : (
+                          (state?.dailyStats ?? []).map((row) => (
+                            <tr key={row.date}>
+                              <td>{row.date}</td>
+                              <td>{row.count}</td>
+                            </tr>
+                          ))
+                        )}
                       </tbody>
                     </table>
                   </aside>
@@ -897,6 +960,20 @@ export function GroupPosterPage({
             )}
           </div>
         </div>
+      )}
+      {confirmClearLogs && (
+        <ConfirmDialog
+          title="清空全部发帖记录"
+          description="确定要清空全部发帖记录吗？清空后小组与素材的历史防重记录也会一并清除。"
+          confirmText="确认清空"
+          danger
+          busy={busy}
+          onConfirm={() => {
+            setConfirmClearLogs(false);
+            void action('logs/delete', { all: true }).then(() => loadLogs());
+          }}
+          onCancel={() => setConfirmClearLogs(false)}
+        />
       )}
     </section>
   );

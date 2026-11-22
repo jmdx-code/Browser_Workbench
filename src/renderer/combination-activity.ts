@@ -5,7 +5,7 @@ const liveNames: Partial<Record<Plan['state'], string>> = {
   QUEUED: '排队',
   PAUSING: '正在暂停',
   STOPPING: '正在停止',
-  REVIEW: '待核对',
+  REVIEW: '收尾中',
   PAUSED: '暂停',
 };
 const endedNames: Partial<Record<Plan['state'], string>> = {
@@ -43,9 +43,9 @@ export function combinationActivity(plans: Plan[], combinationId: string, versio
     .join(' · ');
   return {
     label: label ? (live.length ? label : '上次：' + label) : '未执行',
-    tone: selected.some((plan) => ['FAILED', 'REVIEW'].includes(plan.state))
+    tone: selected.some((plan) => plan.state === 'FAILED')
       ? 'orange'
-      : selected.some((plan) => plan.state === 'RUNNING')
+      : selected.some((plan) => ['RUNNING', 'REVIEW'].includes(plan.state))
         ? 'blue'
         : 'gray',
   };

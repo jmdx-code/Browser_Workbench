@@ -8,9 +8,16 @@ import {
   type Profile,
 } from '../shared/contracts.js';
 import { api } from './api.js';
+import {
+  newCombination,
+  newPostStep,
+  normalizeCombinationResources,
+} from './combination-defaults.js';
 import { DraftSession } from './draft-session.js';
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
+
+export { newCombination, normalizeCombinationResources };
 
 const stepNames = {
   video: '浏览 Reels',
@@ -21,59 +28,6 @@ const stepNames = {
 };
 export interface EditorHandle {
   persist(): Promise<boolean>;
-}
-export function normalizeCombinationResources(value: Combination): Combination {
-  return {
-    ...value,
-    steps: value.steps.map((step) =>
-      step.type === 'post'
-        ? { ...step, resourceMode: 'table' as const, resourceDirectory: '' }
-        : step.type === 'marketplace'
-          ? {
-              id: step.id,
-              type: 'marketplace' as const,
-              durationMinutes: step.durationMinutes,
-              keyword: '',
-              maxLikes: 0 as const,
-              minLikeCount: 0 as const,
-            }
-          : step,
-    ),
-  };
-}
-function newPostStep(id: string, destination: 'post' | 'story' = 'post'): Step {
-  return {
-    id,
-    type: 'post',
-    destination,
-    ...(destination === 'story' ? { audience: 'preserve-current' as const } : {}),
-    count: 1,
-    resourceDirectory: '',
-    resourceMode: 'table',
-    allowRepeat: false,
-    forbidSameAccountRepeat: true,
-    archivePublished: false,
-  };
-}
-export function newCombination(destination?: 'post' | 'story'): Combination {
-  return {
-    name:
-      destination === 'story' ? '新快拍组合' : destination === 'post' ? '新发帖组合' : '新任务组合',
-    note: '',
-    steps: destination
-      ? [newPostStep(crypto.randomUUID(), destination)]
-      : [
-          {
-            id: crypto.randomUUID(),
-            type: 'video',
-            durationMinutes: 15,
-            maxLikes: 0,
-            minLikeCount: 500,
-          },
-        ],
-    randomOrder: false,
-    loop: { mode: 'finite', rounds: 1 },
-  };
 }
 export function Editor({
   initial,
@@ -98,6 +52,8 @@ export function Editor({
   const [value, setValue] = useState<Combination>(
     normalizeCombinationResources(initial?.draft ?? initial?.saved ?? newCombination()),
   );
+  const valueRef = useRef(value);
+  valueRef.current = value;
   const [revision, setRevision] = useState(initial.revision);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -107,6 +63,7 @@ export function Editor({
   const generation = useRef(0);
   const dirtyRef = useRef(false);
   const saving = useRef(false);
+  const activeSaveRef = useRef<Promise<boolean> | null>(null);
   const session = useRef(
     new DraftSession(
       initial.id,
@@ -158,18 +115,24 @@ export function Editor({
       setBusy(false);
     }
   }
-  function change(next: Combination) {
+  function change(next: Combination | ((prev: Combination) => Combination)) {
     generation.current++;
-    setValue(normalizeCombinationResources(next));
+    setValue((prev) => {
+      const resolved = normalizeCombinationResources(
+        typeof next === 'function' ? next(prev) : next,
+      );
+      valueRef.current = resolved;
+      return resolved;
+    });
     setAutoSaveFailed(false);
     setDirty(true);
     dirtyRef.current = true;
   }
   function stepChange(id: string, patch: Partial<Step>) {
-    change({
-      ...value,
-      steps: value.steps.map((step) => (step.id === id ? ({ ...step, ...patch } as Step) : step)),
-    });
+    change((prev) => ({
+      ...prev,
+      steps: prev.steps.map((step) => (step.id === id ? ({ ...step, ...patch } as Step) : step)),
+    }));
   }
   function add(type: Step['type'], destination?: 'post' | 'story') {
     const id = crypto.randomUUID();
@@ -218,60 +181,82 @@ export function Editor({
     saving.current = true;
     const savingGeneration = generation.current;
     setBusy(true);
-    try {
-      const parsed = (publish ? CombinationSchema : CombinationDraftSchema).safeParse(
-        normalizeCombinationResources(value),
-      );
-      if (!parsed.success)
-        throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
-      const draft =
-        dirtyRef.current || publish ? await session.current.write(parsed.data) : { revision };
-      const saved = publish ? await api.publish(initial.id, draft.revision) : draft;
-      if (publish) session.current.acceptPublishedRevision(saved.revision);
-      setRevision(saved.revision);
-      if (generation.current === savingGeneration) {
-        setDirty(false);
-        dirtyRef.current = false;
+    let shouldClose = false;
+    const work = (async (): Promise<boolean> => {
+      try {
+        const parsed = (publish ? CombinationSchema : CombinationDraftSchema).safeParse(
+          normalizeCombinationResources(valueRef.current),
+        );
+        if (!parsed.success)
+          throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
+        const draft =
+          dirtyRef.current || publish ? await session.current.write(parsed.data) : { revision };
+        const saved = publish ? await api.publish(initial.id, draft.revision) : draft;
+        if (publish) session.current.acceptPublishedRevision(saved.revision);
+        setRevision(saved.revision);
+        if (generation.current === savingGeneration) {
+          setDirty(false);
+          dirtyRef.current = false;
+        }
+        setAutoSaveFailed(false);
+        setManualSaveRequired(false);
+        await onSaved();
+        notify(publish ? '组合已保存为新版本' : '草稿已保存，启动仍使用已保存版本');
+        if (publish) shouldClose = true;
+        return true;
+      } catch (error) {
+        setAutoSaveFailed(true);
+        notify(error instanceof Error ? error.message : '保存失败');
+        return false;
+      } finally {
+        saving.current = false;
+        activeSaveRef.current = null;
+        setBusy(false);
       }
-      setAutoSaveFailed(false);
-      setManualSaveRequired(false);
-      await onSaved();
-      notify(publish ? '组合已保存为新版本' : '草稿已保存，启动仍使用已保存版本');
-      if (publish) onClose();
-    } catch (error) {
-      setAutoSaveFailed(true);
-      notify(error instanceof Error ? error.message : '保存失败');
-    } finally {
-      saving.current = false;
-      setBusy(false);
-    }
+    })();
+    activeSaveRef.current = work;
+    await work;
+    if (shouldClose) onClose();
   }
   async function persist() {
+    if (activeSaveRef.current) {
+      const prevOk = await activeSaveRef.current;
+      if (!prevOk && dirtyRef.current) return false;
+    }
     if (!dirtyRef.current) return true;
     if (saving.current) return false;
     saving.current = true;
     setBusy(true);
     const savingGeneration = generation.current;
-    try {
-      const draft = CombinationDraftSchema.parse(normalizeCombinationResources(value));
-      const saved = await session.current.write(draft);
-      setRevision(saved.revision);
-      if (generation.current === savingGeneration) {
-        setDirty(false);
-        dirtyRef.current = false;
+    const work = (async (): Promise<boolean> => {
+      try {
+        const parsed = CombinationDraftSchema.safeParse(
+          normalizeCombinationResources(valueRef.current),
+        );
+        if (!parsed.success)
+          throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
+        const saved = await session.current.write(parsed.data);
+        setRevision(saved.revision);
+        if (generation.current === savingGeneration) {
+          setDirty(false);
+          dirtyRef.current = false;
+        }
+        await onSaved();
+        return generation.current === savingGeneration;
+      } catch (error) {
+        setAutoSaveFailed(true);
+        notify(
+          '草稿未保存，请保留当前编辑：' + (error instanceof Error ? error.message : '保存失败'),
+        );
+        return false;
+      } finally {
+        saving.current = false;
+        activeSaveRef.current = null;
+        setBusy(false);
       }
-      await onSaved();
-      return generation.current === savingGeneration;
-    } catch (error) {
-      setAutoSaveFailed(true);
-      notify(
-        '草稿未保存，请保留当前编辑：' + (error instanceof Error ? error.message : '保存失败'),
-      );
-      return false;
-    } finally {
-      saving.current = false;
-      setBusy(false);
-    }
+    })();
+    activeSaveRef.current = work;
+    return work;
   }
   useImperativeHandle(ref, () => ({ persist }));
   useEffect(() => {
@@ -433,7 +418,6 @@ export function Editor({
                         defaultValue={step.maxAccepts}
                         value={step.maxAccepts}
                         onChange={(maxAccepts) => stepChange(step.id, { maxAccepts })}
-                        onCommit={(maxAccepts) => stepChange(step.id, { maxAccepts })}
                       />
                       <span>个</span>
                     </div>
@@ -449,7 +433,6 @@ export function Editor({
                       defaultValue={step.durationMinutes}
                       value={step.durationMinutes}
                       onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
-                      onCommit={(durationMinutes) => stepChange(step.id, { durationMinutes })}
                     />
                     <span>分钟</span>
                   </div>
@@ -467,7 +450,6 @@ export function Editor({
                       defaultValue={step.durationMinutes}
                       value={step.durationMinutes}
                       onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
-                      onCommit={(durationMinutes) => stepChange(step.id, { durationMinutes })}
                     />
                     <span>分钟</span>
                   </div>
@@ -493,12 +475,11 @@ export function Editor({
                           <div className="unit-field">
                             <ControlledNumberInput
                               ariaLabel="随机点赞上限"
-                              min={0}
+                              min={1}
                               max={100}
                               defaultValue={step.maxLikes}
                               value={step.maxLikes}
                               onChange={(maxLikes) => stepChange(step.id, { maxLikes })}
-                              onCommit={(maxLikes) => stepChange(step.id, { maxLikes })}
                             />
                             <span>个</span>
                           </div>
@@ -514,7 +495,6 @@ export function Editor({
                               value={step.minLikeCount}
                               disabled={step.maxLikes === 0}
                               onChange={(minLikeCount) => stepChange(step.id, { minLikeCount })}
-                              onCommit={(minLikeCount) => stepChange(step.id, { minLikeCount })}
                             />
                             <span>赞</span>
                           </div>
@@ -530,9 +510,6 @@ export function Editor({
                               defaultValue={step.likeProbability ?? 35}
                               value={step.likeProbability ?? 35}
                               onChange={(likeProbability) =>
-                                stepChange(step.id, { likeProbability })
-                              }
-                              onCommit={(likeProbability) =>
                                 stepChange(step.id, { likeProbability })
                               }
                             />
@@ -592,7 +569,6 @@ export function Editor({
                       defaultValue={step.count}
                       value={step.count}
                       onChange={(count) => stepChange(step.id, { count })}
-                      onCommit={(count) => stepChange(step.id, { count })}
                     />
                     <span>条</span>
                   </div>
@@ -670,8 +646,9 @@ export function Editor({
               max={10000}
               defaultValue={value.loop.rounds}
               value={value.loop.rounds}
-              onChange={(rounds) => change({ ...value, loop: { mode: 'finite', rounds } })}
-              onCommit={(rounds) => change({ ...value, loop: { mode: 'finite', rounds } })}
+              onChange={(rounds) =>
+                change((prev) => ({ ...prev, loop: { mode: 'finite', rounds } }))
+              }
             />
           </label>
         )}

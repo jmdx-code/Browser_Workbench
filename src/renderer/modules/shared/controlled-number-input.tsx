@@ -1,4 +1,11 @@
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import {
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type CSSProperties,
+  type Ref,
+} from 'react';
 
 export interface ControlledNumberInputHandle {
   flush(): Promise<number>;
@@ -12,6 +19,7 @@ export function ControlledNumberInput({
   ariaLabel,
   disabled,
   className,
+  style,
   debounceMs = 300,
   onChange,
   onCommit,
@@ -24,9 +32,10 @@ export function ControlledNumberInput({
   ariaLabel: string;
   disabled?: boolean | undefined;
   className?: string | undefined;
+  style?: CSSProperties | undefined;
   debounceMs?: number | undefined;
   onChange?: ((next: number) => void) | undefined;
-  onCommit: (next: number) => void | Promise<unknown>;
+  onCommit?: ((next: number) => void | Promise<unknown>) | undefined;
   ref?: Ref<ControlledNumberInputHandle> | undefined;
 }) {
   const [text, setText] = useState<string>(() => (Number.isFinite(value) ? String(value) : ''));
@@ -43,6 +52,11 @@ export function ControlledNumberInput({
       setText(String(value));
     }
   }, [value]);
+
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const onCommitRef = useRef(onCommit);
+  onCommitRef.current = onCommit;
 
   useEffect(
     () => () => {
@@ -62,7 +76,9 @@ export function ControlledNumberInput({
   }
 
   function runCommit(clamped: number): Promise<unknown> {
-    const p = Promise.resolve(onCommit(clamped)).finally(() => {
+    const commitFn = onCommitRef.current;
+    if (!commitFn) return Promise.resolve();
+    const p = Promise.resolve(commitFn(clamped)).finally(() => {
       if (inFlightCommitRef.current === p) {
         inFlightCommitRef.current = null;
       }
@@ -82,9 +98,10 @@ export function ControlledNumberInput({
     const clamped = clampNumber(raw);
     setText(String(clamped));
     textRef.current = String(clamped);
-    if (hadPendingTimer || clamped !== latestCommittedRef.current || rawText !== String(clamped)) {
+    const valueChanged = clamped !== latestCommittedRef.current;
+    if (hadPendingTimer || valueChanged || rawText !== String(clamped)) {
       latestCommittedRef.current = clamped;
-      onChange?.(clamped);
+      if (valueChanged) onChangeRef.current?.(clamped);
       await runCommit(clamped);
     } else if (inFlightCommitRef.current) {
       await inFlightCommitRef.current;
@@ -101,12 +118,19 @@ export function ControlledNumberInput({
       type="number"
       aria-label={ariaLabel}
       className={className}
+      style={style}
       min={min}
       max={max}
       disabled={disabled}
       value={text}
       onFocus={() => {
         focusedRef.current = true;
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          void flush();
+        }
       }}
       onChange={(e) => {
         const nextText = e.target.value;
@@ -122,12 +146,15 @@ export function ControlledNumberInput({
         const parsed = Number(nextText);
         if (Number.isFinite(parsed)) {
           const clamped = clampNumber(parsed);
-          onChange?.(clamped);
-          timerRef.current = setTimeout(() => {
-            timerRef.current = null;
-            latestCommittedRef.current = clamped;
-            void runCommit(clamped);
-          }, debounceMs);
+          latestCommittedRef.current = clamped;
+          onChangeRef.current?.(clamped);
+          if (onCommitRef.current) {
+            timerRef.current = setTimeout(() => {
+              timerRef.current = null;
+              latestCommittedRef.current = clamped;
+              void runCommit(clamped);
+            }, debounceMs);
+          }
         }
       }}
       onBlur={() => {
@@ -142,13 +169,10 @@ export function ControlledNumberInput({
         const clamped = clampNumber(raw);
         setText(String(clamped));
         textRef.current = String(clamped);
-        if (
-          hadPendingTimer ||
-          clamped !== latestCommittedRef.current ||
-          rawText !== String(clamped)
-        ) {
+        const valueChanged = clamped !== latestCommittedRef.current;
+        if (hadPendingTimer || valueChanged || rawText !== String(clamped)) {
           latestCommittedRef.current = clamped;
-          onChange?.(clamped);
+          if (valueChanged) onChangeRef.current?.(clamped);
           void runCommit(clamped);
         }
       }}

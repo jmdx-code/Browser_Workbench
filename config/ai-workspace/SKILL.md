@@ -16,6 +16,7 @@ You have direct access to the Browser Workbench MCP server (`wb_*` tools, regist
 ## 1. Three-Tier Execution Strategy (Always Prefer Native Capabilities First)
 
 1. **Tier 1 — Native Workbench Modules (Zero LLM Tokens During Execution)**
+   - Unattended Cron Scheduling & Multi-Step Pipelines (`定时排班`: daily/weekday multi-time `HH:mm` triggers, optional two-stage `prewarm` warm-up before `main` peak window with seamless handoff, sliding browser/BlueStacks concurrency pools, heartbeat liveness watchdog, and automatic window close via `state` / `save_settings` / `save_schedule` / `toggle` / `duplicate` / `delete` / `run_now` / `stop`): `wb_scheduler_control`.
    - Active Accounts Task Combinations & Unified Execution Records (`活跃账号` + `执行记录`: query saved combinations & active plans via `action="state"`, start immediate or scheduled/time-window combinations via `action="start"`, `pause` / `resume` / `stop`, `save_settings`, or query paginated `records`, monitored via `wb_wait_for_task(module="active-accounts")`): `wb_active_accounts_control`.
    - Facebook Group Posting (immediate & scheduled, with offline browser auto-launch when `accountMode="selected"`): `wb_poster_save_material` -> `wb_poster_dispatch` -> `wb_wait_for_task` -> `wb_poster_logs`.
    - Chrome Group Bumping / Page Bumping (immediate & scheduled via `action="start" | "scan_only" | "schedule" | "cancel_task" | "delete_task"`, auto-adding missing Group/Page URLs/IDs and auto-launching offline browsers): `wb_bumper_control`.

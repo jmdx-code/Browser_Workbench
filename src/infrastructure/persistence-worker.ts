@@ -39,6 +39,7 @@ try {
   if (existsSync(journal)) {
     const previous = new DatabaseSync(journal, { readOnly: true });
     try {
+      previous.exec('PRAGMA busy_timeout = 5000');
       if (Number(previous.prepare('PRAGMA user_version').get()?.user_version) < 4)
         await backup(previous, path.join(config.directory, 'before-v4-' + Date.now() + '.sqlite'));
     } finally {

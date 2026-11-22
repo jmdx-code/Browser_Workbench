@@ -76,6 +76,8 @@ import { assertArchiveSourcesAvailable } from './material-archive-source-protect
 import { SqliteFacebookSubmissionObservationRepository } from './facebook-submission-observation-store.js';
 import { SqliteGroupInviterRepository } from './group-inviter-store.js';
 import { SqliteBluestacksRepository } from './bluestacks-store.js';
+import { SqliteAutoSchedulerRepository } from './auto-scheduler-store.js';
+import { SqliteGoogleSheetsRepository } from './google-sheets-store.js';
 import {
   type AccountCacheUpdateInput,
   mergeAccountCacheUpdate,
@@ -429,6 +431,8 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly groupBumper: SqliteGroupBumperRepository;
   readonly groupPoster: SqliteGroupPosterRepository;
   readonly bluestacks: SqliteBluestacksRepository;
+  readonly autoScheduler: SqliteAutoSchedulerRepository;
+  readonly googleSheets: SqliteGoogleSheetsRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
@@ -456,6 +460,8 @@ export class WorkspaceStore implements WorkspaceRepository {
     this.groupBumper = new SqliteGroupBumperRepository(db);
     this.groupPoster = new SqliteGroupPosterRepository(db);
     this.bluestacks = new SqliteBluestacksRepository(db);
+    this.autoScheduler = new SqliteAutoSchedulerRepository(db);
+    this.googleSheets = new SqliteGoogleSheetsRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -537,6 +543,20 @@ export class WorkspaceStore implements WorkspaceRepository {
       );
       const store = new WorkspaceStore(db);
       store.resourceTables.pruneConsumedRows();
+      // Auto-reclaim excessive SQLite freelist bloat (>10MB and >30% empty pages) safely on startup
+      if (existed && file !== ':memory:') {
+        try {
+          const pageCount = Number(db.prepare('PRAGMA page_count').get()?.page_count ?? 0);
+          const freelistCount = Number(
+            db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0,
+          );
+          if (pageCount > 0 && freelistCount >= 2560 && freelistCount / pageCount > 0.3) {
+            db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
+          }
+        } catch {
+          // Best-effort compaction; never block startup
+        }
+      }
       // Initialize only a new database. Existing user choices survive reopen
       // and upgrades; the running installation can be changed through Settings.
       if (version === 0)

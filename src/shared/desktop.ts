@@ -12,4 +12,6 @@ export interface DesktopBridge {
   restartSoftware(): Promise<void>;
   materialFilePath(file: File): string;
   revealLocalFile(source: string): Promise<z.infer<typeof FileLocationResult>>;
+  getAutoLaunch?(): Promise<{ supported: boolean; enabled: boolean }>;
+  setAutoLaunch?(enabled: boolean): Promise<{ supported: boolean; enabled: boolean }>;
 }

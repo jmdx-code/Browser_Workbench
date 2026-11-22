@@ -25,11 +25,15 @@ export async function endInvitationSetupOperations(
   guard: () => Awaitable<void> = () => {},
   includeOrphans = false,
   reconcileOperationIds?: ReadonlySet<string>,
+  outProtectedIds?: Set<string>,
 ) {
   await guard();
   const bumperProtected = await kernel.recoverBumperWorkspace?.(peer, guard);
   const posterProtected = await kernel.recoverPosterWorkspace?.(peer, guard);
   const protectedIds = new Set<string>([...(bumperProtected ?? []), ...(posterProtected ?? [])]);
+  if (outProtectedIds) {
+    for (const id of protectedIds) outProtectedIds.add(id);
+  }
   let inventory = await kernel.withSummary(peer, (port) => port.inventory());
   await guard();
   for (const operation of inventory.operations.filter(kernelOperationPending)) {
@@ -87,12 +91,14 @@ export async function prepareFacebookWorkspace(
   reconcileOperationIds?: ReadonlySet<string>,
   includeOrphans = false,
 ) {
+  const protectedIds = new Set<string>();
   let inventory = await endInvitationSetupOperations(
     kernel,
     peer,
     guard,
     includeOrphans,
     reconcileOperationIds,
+    protectedIds,
   );
   const ready = inventory.tabs.filter((t) => t.state === 'READY' && t.proof);
   let proof =
@@ -102,7 +108,10 @@ export async function prepareFacebookWorkspace(
     )?.proof ??
     ready[0]?.proof ??
     undefined;
-  if (!includeOrphans && inventory.operations.some(kernelOperationPending))
+  const hasProtectedPending = inventory.operations.some(
+    (op) => kernelOperationPending(op) && protectedIds.has(op.binding.operationId),
+  );
+  if (hasProtectedPending || (!includeOrphans && inventory.operations.some(kernelOperationPending)))
     return { inventory, proof };
   const conflict =
     (includeOrphans && inventory.operations.some(kernelOperationPending)) ||

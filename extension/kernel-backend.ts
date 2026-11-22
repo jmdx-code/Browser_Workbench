@@ -834,13 +834,38 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   ): Promise<{ tabId: number }> {
     if (!kernelAccessURL(url, this.access)) throw Error('KERNEL_URL_REJECTED');
     await this.journal.prepareTab(ownershipId, url);
+    let createdTabId: number | undefined;
+    let createAttempted = false;
     try {
       if (this.access !== 'fixture' && !this.allowRead()) throw Error('KERNEL_READ_FENCED');
       if (this.access === 'facebook-task')
         foreground = foreground && (await this.sameProfileForeground());
       if (this.access !== 'fixture' && !this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      const tab = await chrome.tabs.create({ url, active: foreground });
+      let targetWindowId: number | undefined;
+      if (this.access === 'facebook-task' && chrome.storage?.local) {
+        const main = await this.workspaceGroup
+          .read(() => {
+            if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+          })
+          .catch(() => null);
+        if (main?.windowId !== undefined) {
+          if (typeof chrome.windows?.get === 'function') {
+            const win = await chrome.windows.get(main.windowId).catch(() => null);
+            if (win?.id === main.windowId) targetWindowId = main.windowId;
+          } else {
+            targetWindowId = main.windowId;
+          }
+        }
+        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      }
+      createAttempted = true;
+      const tab = await chrome.tabs.create(
+        targetWindowId !== undefined
+          ? { url, active: foreground, windowId: targetWindowId }
+          : { url, active: foreground },
+      );
       if (tab.id === undefined) throw Error('KERNEL_CREATE_FAILED');
+      createdTabId = tab.id;
       if (foreground && this.access === 'facebook-task') {
         if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
         if (await this.sameProfileForeground()) {
@@ -889,7 +914,39 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         this.identityReadTabs.add(tab.id);
       return { tabId: tab.id };
     } catch (error) {
-      await this.journal.tabState(ownershipId, 'UNKNOWN', 'CREATE_RESULT_UNKNOWN').catch(() => {});
+      let cleanedUp = false;
+      if (!createAttempted) {
+        cleanedUp = true;
+      } else if (createdTabId !== undefined) {
+        this.owned.delete(createdTabId);
+        this.identityReadTabs.delete(createdTabId);
+        this.expectedDetaches.add(createdTabId);
+        this.expectedRemovals.add(createdTabId);
+        try {
+          if (this.attached.has(createdTabId)) {
+            await chrome.debugger.detach({ tabId: createdTabId }).catch(() => {});
+            this.attached.delete(createdTabId);
+          }
+          await chrome.tabs.remove(createdTabId);
+          cleanedUp = true;
+        } catch {
+          cleanedUp = false;
+        } finally {
+          this.expectedDetaches.delete(createdTabId);
+          this.expectedRemovals.delete(createdTabId);
+        }
+      }
+      await this.journal
+        .tabState(
+          ownershipId,
+          cleanedUp ? 'CLOSED' : 'UNKNOWN',
+          cleanedUp
+            ? createAttempted
+              ? 'CREATE_ABORTED_CLEANED'
+              : 'CREATE_ABORTED_BEFORE_OPEN'
+            : 'CREATE_RESULT_UNKNOWN',
+        )
+        .catch(() => {});
       throw error;
     }
   }

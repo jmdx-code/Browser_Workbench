@@ -552,11 +552,20 @@ function extractTargetCandidateInPage(input: {
   expectedId: string;
   targetKind: 'groups' | 'pages';
   previousHref: string;
+  previousTimeOrigin?: number;
+  requireNavigation?: boolean;
 }): InPageTargetProbeResult {
-  const { expectedId, targetKind, previousHref } = input;
+  const { expectedId, targetKind, previousHref, previousTimeOrigin, requireNavigation } = input;
   const href = location.href;
   const readyState = document.readyState;
-  if (previousHref && href === previousHref) {
+  const sameDocument =
+    typeof previousTimeOrigin === 'number' &&
+    previousTimeOrigin > 0 &&
+    performance.timeOrigin === previousTimeOrigin;
+  if (
+    (previousHref && href === previousHref) ||
+    (requireNavigation && sameDocument && (!previousHref || href === previousHref))
+  ) {
     return {
       href,
       readyState,
@@ -1553,7 +1562,14 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     continue;
                   }
                 }
+                let beforeNavHref = previousHref;
+                let beforeTimeOrigin = 0;
                 if (i > startItemIndex) {
+                  const snapBeforeNav = await page
+                    .evaluate(() => ({ href: location.href, timeOrigin: performance.timeOrigin }))
+                    .catch(() => null);
+                  if (snapBeforeNav?.href) beforeNavHref = snapBeforeNav.href;
+                  if (snapBeforeNav?.timeOrigin) beforeTimeOrigin = snapBeforeNav.timeOrigin;
                   try {
                     await page.evaluate((u) => {
                       location.assign(u);
@@ -1572,7 +1588,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     rawProbe = await page.evaluate(extractTargetCandidateInPage, {
                       expectedId: item.id,
                       targetKind: kind,
-                      previousHref: i === startItemIndex ? '' : previousHref,
+                      previousHref: i === startItemIndex ? '' : beforeNavHref,
+                      previousTimeOrigin: i === startItemIndex ? 0 : beforeTimeOrigin,
+                      requireNavigation: i > startItemIndex,
                     });
                   } catch (evalError) {
                     if (isTransientNavigationEvalError(evalError)) {
@@ -1622,10 +1640,12 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                     kind,
                     probe.canonicalId ?? item.id,
                   );
-                  if (probe.canonicalId && isCompleteNumericId(probe.canonicalId)) {
-                    bestCanonicalId = probe.canonicalId;
-                  } else if (parsed.canonicalId && isCompleteNumericId(parsed.canonicalId)) {
-                    bestCanonicalId = parsed.canonicalId;
+                  if (!isCompleteNumericId(item.id)) {
+                    if (probe.canonicalId && isCompleteNumericId(probe.canonicalId)) {
+                      bestCanonicalId = probe.canonicalId;
+                    } else if (parsed.canonicalId && isCompleteNumericId(parsed.canonicalId)) {
+                      bestCanonicalId = parsed.canonicalId;
+                    }
                   }
                   const candidateName =
                     parsed.name ?? (probe.domName ? decodeHtmlEntities(probe.domName) : null);
@@ -2448,6 +2468,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
     let identityDocument = '';
     let identityAt = 0;
     const registerActiveConnection = async (nextConn: Connection, nextIdentity: BumperIdentity) => {
+      // Resolve leaseId BEFORE mutating this.connections/this.closing so both maps update in the
+      // same synchronous tick with zero TOCTOU window against concurrent stop().
+      const nextLeaseId = (await nextConn.context(accountId).catch(() => null))?.leaseId ?? '';
       const proofEpoch =
         nextIdentity.proof?.browserSessionEpoch ?? nextConn.proof?.browserSessionEpoch;
       if (
@@ -2461,7 +2484,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           failed: false,
           accountId,
           peerEpoch: epoch,
-          leaseId: (await nextConn.context(accountId))?.leaseId ?? '',
+          leaseId: nextLeaseId,
           ownershipId: nextConn.proof?.ownershipId,
           connection: nextConn,
         });
@@ -2475,7 +2498,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           failed: false,
           accountId,
           peerEpoch: epoch,
-          leaseId: (await nextConn.context(accountId))?.leaseId ?? '',
+          leaseId: nextLeaseId,
           ownershipId: nextConn.proof?.ownershipId,
           connection: nextConn,
         });
@@ -2491,7 +2514,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         failed: false,
         accountId,
         peerEpoch: epoch,
-        leaseId: (await conn.context(accountId))?.leaseId ?? '',
+        leaseId: nextLeaseId,
         ownershipId: conn.proof?.ownershipId,
         connection: conn,
       });
@@ -2504,7 +2527,12 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       identityDocument = '';
       identityAt = 0;
     };
-    await registerActiveConnection(conn, identity);
+    try {
+      await registerActiveConnection(conn, identity);
+    } catch (regErr) {
+      await this.stop(profileId).catch(() => {});
+      throw regErr;
+    }
     const jobId = randomUUID(),
       stepId = randomUUID();
     let avatarObservedOnce = false;
@@ -3247,9 +3275,9 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 if (!targetHref) await wait(400);
               }
               if (targetHref) {
-                navigationChain = [
-                  'https://www.facebook.com/groups/' + encodeURIComponent(group.id) + '/',
-                ];
+                // Never fabricate a direct-URL navigationChain for search-result clicks;
+                // only authentic direct-URL redirects (via fallbackGroupUrl) may resolve alias -> canonicalId!
+                navigationChain = [];
                 try {
                   await op(
                     '打开搜索到的小组',
@@ -3290,7 +3318,10 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
               navigatedChronological = effectiveSearchMode === 'time_sort';
             }
             const applyGroupRedirectResolution = () => {
-              if (!surface.groupIds.includes(effectiveGroupId.toLowerCase())) {
+              if (
+                !isCompleteNumericId(group.id) &&
+                !surface.groupIds.includes(effectiveGroupId.toLowerCase())
+              ) {
                 const redirected = navigationChain.some((url) => {
                   const u = new URL(url);
                   return (
@@ -3525,28 +3556,24 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                 continue;
               }
               let pageFeed = await waitForFeed(feed.id);
-              if (!enteredViaDirectOrId) {
-                const pageIdConfirmed =
+              let pageIdConfirmed =
+                (pageFeed.pageIds ?? []).includes(feed.id.toLowerCase()) ||
+                pageFeed.posts.some((p) => p.authorId === feed.id);
+              if (!enteredViaDirectOrId && !pageIdConfirmed) {
+                await navigate(fallbackPageUrl);
+                enteredViaDirectOrId = true;
+                pageFeed = await waitForFeed(feed.id);
+                pageIdConfirmed =
                   (pageFeed.pageIds ?? []).includes(feed.id.toLowerCase()) ||
                   pageFeed.posts.some((p) => p.authorId === feed.id);
-                const hasConflictingAuthorId =
-                  /^\d+$/.test(feed.id) &&
-                  pageFeed.posts.some(
-                    (p) =>
-                      p.authorId &&
-                      /^\d+$/.test(p.authorId) &&
-                      p.authorId !== feed.id &&
-                      p.authorId !== accountId,
-                  );
-                if (!pageIdConfirmed && (hasConflictingAuthorId || pageFeed.posts.length === 0)) {
-                  await navigate(fallbackPageUrl);
-                  enteredViaDirectOrId = true;
-                  pageFeed = await waitForFeed(feed.id);
-                }
               }
               const pageAvatar = pageFeed.pageAvatarUrl ?? pageFeed.avatarUrl;
               const canonicalPageId = canonicalBumperPageIdFromURL(page.url());
-              if (canonicalPageId) {
+              if (
+                canonicalPageId &&
+                (enteredViaDirectOrId || pageIdConfirmed) &&
+                (!isCompleteNumericId(feed.id) || canonicalPageId === feed.id)
+              ) {
                 const resolvedName =
                   pageFeed.groupTitle && isPlaceholderTargetName(feed.name, feed.id)
                     ? pageFeed.groupTitle
@@ -4115,6 +4142,13 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                                 `正在观看视频 · ${group.name} · ${target.name}`,
                                 q.today,
                               );
+                              let lastVideoReportAt = 0;
+                              const fmtVideoSec = (sec: number) => {
+                                const s = Math.max(0, Math.floor(sec));
+                                const m = Math.floor(s / 60);
+                                const rem = s % 60;
+                                return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+                              };
                               await watchBumperVideo({
                                 page,
                                 initial: refreshedPost,
@@ -4125,6 +4159,19 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
                                 budgetMs: maxWatchMs,
                                 tickMs: Math.max(10, Math.round(1000 * this.paceScale)),
                                 stallMs: Math.max(120, Math.round(25000 * this.paceScale)),
+                                onProgress: (currentSec, durationSec) => {
+                                  const nowMs = Date.now();
+                                  if (nowMs - lastVideoReportAt < 4000) return;
+                                  lastVideoReportAt = nowMs;
+                                  const tag =
+                                    durationSec && durationSec >= 1
+                                      ? `${fmtVideoSec(currentSec)}/${fmtVideoSec(durationSec)}`
+                                      : fmtVideoSec(currentSec);
+                                  callbacks.status(
+                                    `正在观看视频 (${tag}) · ${group.name} · ${target.name}`,
+                                    q.today,
+                                  );
+                                },
                                 onSummary: (summary) => {
                                   devDiag.record({
                                     level: 'INFO',

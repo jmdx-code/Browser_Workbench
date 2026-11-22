@@ -47,7 +47,13 @@ export function RecordDetailDrawer({
 }) {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !document.querySelector('dialog[open]')) onClose();
+      if (
+        event.key === 'Escape' &&
+        !document.querySelector(
+          'dialog[open], .modal-backdrop, .popover-panel, .topbar-concurrency-popover',
+        )
+      )
+        onClose();
     };
     document.addEventListener('keydown', key);
     return () => document.removeEventListener('keydown', key);
@@ -65,14 +71,22 @@ export function RecordDetailDrawer({
     >
       <aside className="drawer drawer-wide" aria-label="任务详情">
         <header className="drawer-head">
-          {profile && (
-            <button className="btn btn-sm" onClick={() => onRename(profile)}>
-              <IconEdit size={14} /> 别名
+          <h2>{profile ? (profile.browserName ?? profile.alias) : '任务详情'}</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {profile && (
+              <button type="button" className="btn btn-sm" onClick={() => onRename(profile)}>
+                <IconEdit size={14} /> 别名
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn btn-icon btn-ghost"
+              aria-label="关闭"
+              onClick={onClose}
+            >
+              <IconClose />
             </button>
-          )}
-          <button className="btn btn-icon btn-ghost" aria-label="关闭" onClick={onClose}>
-            <IconClose />
-          </button>
+          </div>
         </header>
         <div className="drawer-body">
           {reason && (

@@ -9,6 +9,7 @@ import type { SqliteGroupBumperRepository } from './group-bumper-store.js';
 
 export const bumperSetupLabels = [
   '打开小组页面',
+  '打开目标贴文',
   '打开搜索结果',
   '打开搜索到的小组',
   '加入小组',
@@ -21,6 +22,7 @@ export const bumperSetupLabels = [
   '关闭帖子弹窗',
 ] as const;
 export const bumperSetupKinds = [
+  'setup_navigate',
   'setup_navigate',
   'setup_navigate',
   'setup_open_group',
@@ -65,8 +67,14 @@ export async function recoverBumperOperations(
       const index = bumperSetupLabels.findIndex(
         (label) =>
           op.binding.profileId === peer.profileId &&
-          op.binding.actionDigest ===
-            bumperDigest({ purpose: 'group-bumper', label, accountId: op.binding.accountId }),
+          (op.binding.actionDigest ===
+            bumperDigest({ purpose: 'group-bumper', label, accountId: op.binding.accountId }) ||
+            op.binding.actionDigest ===
+              bumperDigest({
+                purpose: 'sheet-direct-bumper',
+                label,
+                accountId: op.binding.accountId,
+              })),
       );
       if (index < 0) continue;
       row = await repo.prepareOperation({

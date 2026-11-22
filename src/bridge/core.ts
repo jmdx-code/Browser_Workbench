@@ -651,6 +651,7 @@ export class Core {
     return peer.online && this.peers.get(peer.profileId) === peer;
   }
   private clearControl(peer: Peer) {
+    if (this.peers.get(peer.profileId) !== peer) return;
     const timer = this.controls.get(peer.profileId);
     if (timer) clearTimeout(timer);
     this.controls.delete(peer.profileId);
@@ -694,13 +695,15 @@ export class Core {
   async sync(peer: Peer) {
     if (!this.current(peer)) throw new BridgeError('OFFLINE');
     peer.paused = true;
-    peer.phase = 'STOPPING';
+    peer.synced = false;
+    peer.phase = 'SYNCING';
     await this.store.cancelPrepared(peer.profileId);
     for (const [id, p] of this.pending)
       if (p.peer === peer)
         await this.finish(id, isWrite(p.action) ? 'UNKNOWN' : 'FAILED', {
           error: 'SYNC_IN_FLIGHT',
         });
+    if (!this.current(peer)) throw new BridgeError('OFFLINE');
     peer.synced = false;
     peer.phase = 'SYNCING';
     return await this.control(peer, 'SYNC');
@@ -785,7 +788,8 @@ export class Core {
   async stop(profileId: string, preferredRequestId?: string) {
     const p = this.peers.get(profileId);
     if (!p?.online) throw new BridgeError('OFFLINE');
-    if (p.phase === 'STOPPING') return { accepted: true, requestId: p.controlId, state: p.phase };
+    if (p.phase === 'STOPPING' && this.stoppingControllers.has(profileId))
+      return { accepted: true, requestId: p.controlId, state: p.phase };
     p.paused = true;
     p.phase = 'STOPPING';
     const owner = this.kernelOwners.get(profileId);
@@ -946,7 +950,12 @@ export class Core {
     this.pending.delete(id);
     await this.store.set(id, status, result);
     p.resolve();
-    if (status === 'UNKNOWN' && this.current(p.peer) && p.peer.phase !== 'STOPPING')
+    if (
+      status === 'UNKNOWN' &&
+      this.current(p.peer) &&
+      p.peer.phase !== 'STOPPING' &&
+      p.peer.phase !== 'SYNCING'
+    )
       await this.stop(p.peer.profileId);
   }
   async shutdown() {
