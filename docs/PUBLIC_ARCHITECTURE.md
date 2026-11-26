@@ -1,28 +1,23 @@
-# 架构概览
+# 架构概览（Public Architecture）
 
-工作台与浏览器插件通过本机 WebSocket 通道连接。桌面端承载界面与控制服务，业务数据由 SQLite 持久化工作线程管理。
+Browser Workbench 采用分层桌面架构：Electron 桌面壳承载本地 React 19 控制台与窗口管理，Node 24 本地 HTTP/SSE/WebSocket 网关负责任务调度、并发控制与持久化协调，Chromium MV3 扩展与 BlueStacks ADB 适配器分别执行浏览器与模拟器端原生操作。
 
-- `src/shared`：跨端契约、版本与数据校验。
-- `src/domain`：领域规则与端口，不访问平台API。
-- `src/application`：任务编排、状态转换与应用服务。
-- `src/infrastructure`：数据库、浏览器桥接、文件与更新实现。
-- `src/http`：认证后的本地HTTP接口。
-- `src/renderer`：React界面。
-- `src/desktop`：Electron启动器、桌面窗口及平台集成。
-- `extension`：浏览器端桥接、原生输入与任务页面管理。
+## 八层源码架构与依赖门禁
 
-业务操作使用既有任务、持久化操作记录和独立结果核验。每个账号的任务页与执行控制绑定，不以点击回执代替成功，也不自动重放未知提交。
+`scripts/check-boundaries.mjs` 对 `src/` 全部 8 个目录执行零豁免 AST 依赖与类型门禁（禁止 `any`、非空断言 `!` 及 `@ts-ignore`）：
 
-扩展内已结束操作先由控制器持久保存原回执，再批量回收；持久递增操作序号阻止已回收的旧操作重新执行。浏览器新执行世代或软件重启时，旧任务沿原停止与结算流程结束，业务历史和未知结果保留。
+- `src/shared`：跨进程契约、Zod Schema、纯数据格式化与状态归类规则，不依赖平台 API。
+- `src/domain`：纯领域逻辑（窗口露边几何、素材表校验、结算语义、浏览策略），仅依赖 `shared`。
+- `src/application`：任务看板（`Workboard`）、定时排班、蓝蝶调度、Google 表格协同、SSE 事件中心（`WorkspaceEventHub`）及模块应用服务，仅依赖 `domain` 与 `shared`。
+- `src/infrastructure`：单所有者 SQLite Worker（`persistence-worker.ts` / `workspace.sqlite` / `journal.sqlite`）、Chrome CDP 桥接（`kernel-bridge`）、各模块执行器（Reader / Actuator / Runner）、蓝蝶 ADB 设备管理、热更新校验与 MCP 服务。
+- `src/http`：鉴权后的本地 REST API 与 `/api/workspace/events` SSE 增量推送端点。
+- `src/bridge`：静态资源网关（`http-gateway.ts`）、WebSocket 扩展连接网关（`ws-peer-gateway.ts`）、无状态 `Core` 租约调度与 `journal.sqlite` 操作流水存储。
+- `src/desktop`：Electron 主进程、Preload 桥与受控热更新 `runtime` 加载器。
+- `src/renderer`：Tailwind v4 + 模块化 CSS + React 19 路由懒加载控制台，通过 SSE 增量失效与精准刷新协同工作。
 
-界面运行状态与历史记录分开读取；历史使用游标分页。资料/批次操作采用有范围的数据库查询。并发参数上限不代表已通过同等规模实机验收。
+## 核心工程不变量
 
-记录保留由既有 DataCleanupService 与 SQLite 持久化线程统一执行，默认顶贴结果30万、独立发帖结果10万、活动任务1万轮、可回收详细流水全软件合计1000条。活动终态快照独立于原始流水；必要防重、配额、留言与素材使用事实存入精简用量表，自动裁剪历史不重置业务状态。头像按精确实体ID共享读取，记录行不重复存图。未知操作与活跃执行所需证据不属于可回收流水。
-
-新增模块需区分最终结果、可回收流水和必要业务状态，再接入统一清理；实体ID归一化须同时更新精简用量。Workspace迁移55与Bridge版本4追加兼容升级，桥接回收保留绑定、序号水位和终态摘要以禁止重放。相关实现集中在 record-retention-migration.ts、record-retention-store.ts 与 DataCleanupService，回归入口为 tests/record-retention.test.ts。
-
-软件更新使用固定插件目录与可校验的外部runtime。基础安装包保留Electron与生产依赖；更新产物通过版本、完整性和依赖指纹校验后加载。详见SOFTWARE_UPDATES.md。
-
-商城明确不可用使用现有SKIPPED步骤结果与COMPLETED整次状态，结束前仍要求匹配的停止证明及已送达结算通知。其他步骤继续，真实故障和未知业务结果不因此降级；完成筛选、最终快照与界面采用同一成功口径，跳过不累计浏览时间。
-
-新快拍默认保持Facebook当前范围，显式好友设置不自动改为公开。上一轮准确保留页已结束且明确未提交时，可在原PREPARE_STORY操作中恢复遗留空编辑器；执行前核对当前账号、页面证明、正文及文件选择。非空草稿、已选媒体和结果未知的提交不自动清理；停止和发布结果核验沿用原流程。
+1. **证据驱动结算**：发帖、顶贴、邀人、好友确认均须以原生 GraphQL/Relay/二次回读结果为准，`BEFORE_SUBMIT` / `UNKNOWN` / `pending_approval` 与 `VERIFIED` 严格隔离，绝不以点击回执冒充成功或自动重发未知提交。
+2. **拉取式工作板与作用域租约**：浏览器扩展重启即回到无状态初始态；所有任务通过 `epoch` 代次、1.5 秒心跳租约与 `withBrowserSession` 闭环释放，单实例异常或离线不阻塞同批健康实例。
+3. **单所有者异步持久化**：业务库与日志库全部收敛于独立 `persistence-worker` 线程（WAL + `synchronous=FULL`），主线程仅通过受控 RPC 异步调用，确保 100 并发长连接心跳不被慢盘写阻塞。
+4. **可校验冷/热更新闭环**：热更新包严格核验 `release-manifest.json` 逐文件 SHA-256 与 `engineFingerprint`（Electron 及原生依赖指纹），校验失败自动回退基础包。详见 `docs/SOFTWARE_UPDATES.md` 与 `docs/MEDIA_RUNTIME.md`。

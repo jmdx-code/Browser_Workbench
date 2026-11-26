@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
-import { settlementFixture, prepareBound } from './fixtures/settlement.js';
+import { assignSamplePlan, workspaceFixture } from './fixtures/workspace-fixture.js';
 import { Store } from '../src/bridge/store.js';
 import { WorkspaceBackupService } from '../src/application/workspace-backup-service.js';
 import { FilesystemWorkspaceBackupWriter } from '../src/infrastructure/workspace-backup-writer.js';
@@ -13,7 +13,7 @@ import { mediaReference } from '../src/domain/resource-table.js';
 import { TaskService } from '../src/application/task-service.js';
 
 test('backup copies both live SQLite databases and saved resources with completion checksums, retaining sources and old backups', async () =>
-  settlementFixture(async (store, file) => {
+  workspaceFixture(async (store, file) => {
     const directory = path.dirname(file),
       journal = new Store(':memory:');
     try {
@@ -105,7 +105,7 @@ test('backup copies both live SQLite databases and saved resources with completi
     }
   }));
 test('backup blocks active tasks and competing launch before writing; failure releases busy state without a completion manifest', async () =>
-  settlementFixture(async (store, file) => {
+  workspaceFixture(async (store, file) => {
     let release = () => {},
       entered = () => {};
     const started = new Promise<void>((resolve) => {
@@ -138,8 +138,10 @@ test('backup blocks active tasks and competing launch before writing; failure re
     release();
     await assert.rejects(pending, /GENERATED_BACKUP_IO_FAILURE/);
     assert.equal((await service.status()).canCreate, true);
-    await prepareBound(store);
-    await assert.rejects(service.create({ directory: path.dirname(file) }), /请先暂停或停止/);
+    const { plan, profile } = assignSamplePlan(store);
+    store.tasks.claimPlanForProfile(profile.id, profile.account.id);
+    await assert.rejects(service.create({ directory: path.dirname(file) }), /请先停止运行中的任务/);
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     assert.deepEqual(
       (await readdir(path.dirname(file))).filter((name) =>
         name.startsWith('BrowserWorkbench-backup-'),
@@ -148,7 +150,7 @@ test('backup blocks active tasks and competing launch before writing; failure re
     );
   }));
 test('a failed second database save leaves an explicitly incomplete folder, preserving original task data', async () =>
-  settlementFixture(async (store, file) => {
+  workspaceFixture(async (store, file) => {
     const directory = path.dirname(file);
     const writer = new FilesystemWorkspaceBackupWriter(
       async (file) => store.backup(file),

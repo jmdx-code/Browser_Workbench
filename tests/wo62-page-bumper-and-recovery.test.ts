@@ -16,11 +16,7 @@ import {
   GroupBumperBrowserAdapter,
   sameBumperFeedbackId,
 } from '../src/infrastructure/group-bumper-runner.js';
-import {
-  SqliteGroupBumperRepository,
-  groupBumperMigration,
-  groupBumperOperationsMigration,
-} from '../src/infrastructure/group-bumper-store.js';
+import { SqliteGroupBumperRepository } from '../src/infrastructure/group-bumper-store.js';
 import { KernelJournal } from '../src/application/kernel-journal.js';
 import { MemoryKernelStorage } from './fixtures/kernel-storage.js';
 import type { Binding } from '../src/shared/task-execution.js';

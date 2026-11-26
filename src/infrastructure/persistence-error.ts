@@ -1,6 +1,5 @@
 import { ProductError } from '../domain/workspace.js';
 import { BridgeError } from '../bridge/protocol.js';
-
 // Preserve SQLite's diagnostic numbers and the repository unit, never SQL
 // arguments, cookies or material contents. Do not repair/rebuild on this error.
 export function persistenceError(error: unknown, route = 'startup') {

@@ -5,16 +5,136 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { readFile, open, stat, copyFile, rm } from 'node:fs/promises';
+import { readFile, open, stat, copyFile, rm, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { z } from 'zod';
 import type { VideoDerivation } from '../shared/story-video-derivation.js';
 import { renderStoryCaption } from './story-caption-raster.js';
-import { FfmpegStoryMedia } from './ffmpeg-story-media.js';
-import { AsyncWorkBudget } from '../application/async-work-budget.js';
-
+import { runMediaProcess } from './media-process.js';
+import { AsyncWorkBudget } from '../application/kernel-gates.js';
+const Probe = z.object({
+  streams: z.array(
+    z.object({
+      codec_type: z.string(),
+      width: z.number().int().positive().optional(),
+      height: z.number().int().positive().optional(),
+      side_data_list: z.array(z.object({ rotation: z.number().optional() })).optional(),
+    }),
+  ),
+  format: z.object({ duration: z.coerce.number().finite().positive() }),
+});
+async function probeStoryVideo(dir: string, file: string, guard: () => Awaitable<void>) {
+  if (!path.isAbsolute(file)) throw Error('MEDIA_INPUT_PATH_REQUIRED');
+  const bin = path.join(dir, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe');
+  const result = Probe.parse(
+    JSON.parse(
+      await runMediaProcess(
+        bin,
+        [
+          '-v',
+          'error',
+          '-protocol_whitelist',
+          'file,pipe',
+          '-show_streams',
+          '-show_format',
+          '-of',
+          'json',
+          file,
+        ],
+        guard,
+        30_000,
+      ),
+    ),
+  );
+  const videos = result.streams.filter((s) => s.codec_type === 'video'),
+    video = videos.length === 1 ? videos[0] : null;
+  if (!video?.width || !video.height || video.width * video.height > 12_000_000)
+    throw Error('STORY_VIDEO_STREAM_UNSUPPORTED');
+  const rotations =
+    video.side_data_list?.flatMap((r) => (r.rotation === undefined ? [] : [r.rotation])) ?? [];
+  if (rotations.length > 1 || rotations.some((r) => r % 90 !== 0))
+    throw Error('STORY_VIDEO_ROTATION_UNSUPPORTED');
+  const swap = Math.abs(rotations[0] ?? 0) % 180 === 90;
+  return {
+    width: swap ? video.height : video.width,
+    height: swap ? video.width : video.height,
+    duration: result.format.duration,
+  };
+}
+async function overlayStoryCaption(
+  dir: string,
+  input: string,
+  caption: string,
+  output: string,
+  guard: () => Awaitable<void>,
+  replaceOwnedEmpty = false,
+) {
+  const key = (f: string) => path.resolve(f).toLowerCase();
+  if (
+    ![input, caption, output].every(path.isAbsolute) ||
+    new Set([input, caption, output].map(key)).size !== 3 ||
+    path.extname(output).toLowerCase() !== '.mp4'
+  )
+    throw Error('MEDIA_DERIVATION_PATH_INVALID');
+  if (replaceOwnedEmpty) {
+    await guard();
+    const owned = await lstat(output);
+    await guard();
+    if (
+      !owned.isFile() ||
+      owned.isSymbolicLink() ||
+      owned.size !== 0 ||
+      path.dirname(input) !== path.dirname(output) ||
+      path.dirname(caption) !== path.dirname(output)
+    )
+      throw Error('MEDIA_DERIVATION_EMPTY_OUTPUT_REQUIRED');
+  }
+  await runMediaProcess(
+    path.join(dir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'),
+    [
+      '-nostdin',
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      replaceOwnedEmpty ? '-y' : '-n',
+      '-protocol_whitelist',
+      'file,pipe',
+      '-i',
+      input,
+      '-protocol_whitelist',
+      'file,pipe',
+      '-loop',
+      '1',
+      '-i',
+      caption,
+      '-filter_complex',
+      '[0:v:0]pad=ceil(iw/2)*2:ceil(ih/2)*2[v];[v][1:v:0]overlay=0:0:shortest=1:format=auto[out]',
+      '-filter_complex_threads',
+      '1',
+      '-map',
+      '[out]',
+      '-map',
+      '0:a?',
+      '-c:v',
+      'libopenh264',
+      '-threads',
+      '2',
+      '-b:v',
+      '4M',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-movflags',
+      '+faststart',
+      '-shortest',
+      output,
+    ],
+    guard,
+  );
+  return probeStoryVideo(dir, output, guard);
+}
 const videoDerivationBudget = new AsyncWorkBudget(2, 100);
-
 const Runtime = z
   .object({
     version: z.literal(1),
@@ -46,7 +166,6 @@ async function digest(file: string, guard: () => Awaitable<void>) {
   await guard();
   return hash.digest('hex');
 }
-
 export class StoryVideoCaptionDeriver {
   constructor(private readonly dataDirectory = productDataDirectory()) {}
   async derive(
@@ -75,8 +194,9 @@ export class StoryVideoCaptionDeriver {
       JSON.parse(await readFile(path.join(root, 'config/media-runtime.json'), 'utf8')),
     );
     await guard();
-    const media = new FfmpegStoryMedia(await mediaRuntimeComponent(this.dataDirectory).directory());
-    const before = await media.probe(source, guard);
+    const mediaDir = await mediaRuntimeComponent(this.dataDirectory).directory();
+    if (!path.isAbsolute(mediaDir)) throw Error('MEDIA_RUNTIME_PATH_REQUIRED');
+    const before = await probeStoryVideo(mediaDir, source, guard);
     const caption = await renderStoryCaption(
       text,
       Math.ceil(before.width / 2) * 2,
@@ -99,7 +219,7 @@ export class StoryVideoCaptionDeriver {
       await outputHandle.close();
     }
     await guard();
-    const after = await media.overlay(source, captionFile, temporary, guard, true);
+    const after = await overlayStoryCaption(mediaDir, source, captionFile, temporary, guard, true);
     await guard();
     if (
       after.width !== caption.width ||

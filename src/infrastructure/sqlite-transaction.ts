@@ -1,20 +1,16 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
-
 const readContexts = new AsyncLocalStorage<Set<DatabaseSync>>();
 const commitHooks = new WeakMap<DatabaseSync, () => void>();
 export function beforeCommit(db: DatabaseSync, hook: () => void) {
   commitHooks.set(db, hook);
 }
-
 interface ConnectionTransactionState {
   writeDepth: number;
   readDepth: number;
   ownedReadSnapshot: boolean;
 }
-
 const connectionStates = new WeakMap<DatabaseSync, ConnectionTransactionState>();
-
 function getState(db: DatabaseSync): ConnectionTransactionState {
   let state = connectionStates.get(db);
   if (!state) {
@@ -23,13 +19,11 @@ function getState(db: DatabaseSync): ConnectionTransactionState {
   }
   return state;
 }
-
 export function isUncommittedTransaction(db: DatabaseSync): boolean {
   if (!db.isTransaction) return false;
   const state = connectionStates.get(db);
   return !(state?.ownedReadSnapshot === true && state.writeDepth === 0);
 }
-
 function isThenable(value: unknown): boolean {
   return (
     value !== null &&
@@ -37,33 +31,14 @@ function isThenable(value: unknown): boolean {
     typeof (value as { then?: unknown }).then === 'function'
   );
 }
-
 let savepointIndex = 0;
-
 export function assertWriteContext(db: DatabaseSync) {
   const state = getState(db);
   if (state.readDepth > 0 || readContexts.getStore()?.has(db)) {
     throw Error('WRITE_IN_READ_SNAPSHOT_FORBIDDEN');
   }
 }
-
 // Only lock acquisition is non-blocking. Once BEGIN succeeds, restore the connection's
-// original policy before executing any work. There is never an async open transaction.
-export function transactionWithNonblockingBegin<T>(db: DatabaseSync, work: () => T): T {
-  assertWriteContext(db);
-  if (db.isTransaction) throw Error('ASYNC_COMMIT_REQUIRES_OWN_TRANSACTION');
-  const timeout = Number(db.prepare('PRAGMA busy_timeout').get()?.timeout ?? 0);
-  db.exec('PRAGMA busy_timeout=0');
-  try {
-    return transaction(db, () => {
-      db.exec(`PRAGMA busy_timeout=${timeout}`);
-      return work();
-    });
-  } finally {
-    db.exec(`PRAGMA busy_timeout=${timeout}`);
-  }
-}
-
 export function transaction<T>(db: DatabaseSync, work: () => T): T {
   assertWriteContext(db);
   const state = getState(db);
@@ -111,14 +86,12 @@ export function transaction<T>(db: DatabaseSync, work: () => T): T {
     state.writeDepth--;
   }
 }
-
 export function readSnapshot<T>(db: DatabaseSync, work: () => T): T {
   if (work.constructor.name === 'AsyncFunction') throw Error('READ_SNAPSHOT_ASYNC_FORBIDDEN');
   const contexts = new Set(readContexts.getStore());
   contexts.add(db);
   return readContexts.run(contexts, () => guardedReadSnapshot(db, work));
 }
-
 function guardedReadSnapshot<T>(db: DatabaseSync, work: () => T): T {
   const state = getState(db);
   // SQLite also fences direct prepare().run()/exec() writes, not only our helper.
@@ -130,7 +103,6 @@ function guardedReadSnapshot<T>(db: DatabaseSync, work: () => T): T {
     db.exec(`PRAGMA query_only=${queryOnly ? 'ON' : 'OFF'}`);
   }
 }
-
 function performReadSnapshot<T>(
   db: DatabaseSync,
   work: () => T,

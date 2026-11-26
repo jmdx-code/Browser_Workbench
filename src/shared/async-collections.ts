@@ -24,21 +24,6 @@ export async function mapAsync<T, R>(
   await Promise.all(workers);
   return result;
 }
-export async function filterAsync<T>(
-  values: readonly T[],
-  fn: (value: T, index: number, values: readonly T[]) => unknown | Promise<unknown>,
-): Promise<T[]> {
-  const result: T[] = [];
-  for (const [index, item] of values.entries())
-    if (await fn(item, index, values)) result.push(item);
-  return result;
-}
-export async function findAsync<T>(
-  values: readonly T[],
-  fn: (value: T, index: number, values: readonly T[]) => unknown | Promise<unknown>,
-): Promise<T | undefined> {
-  for (const [index, item] of values.entries()) if (await fn(item, index, values)) return item;
-}
 export async function someAsync<T>(
   values: readonly T[],
   fn: (value: T, index: number, values: readonly T[]) => unknown | Promise<unknown>,
@@ -61,11 +46,4 @@ export async function flatMapAsync<T, R>(
     else result.push(value as R);
   }
   return result;
-}
-export async function everyAsync<T>(
-  values: readonly T[],
-  fn: (value: T, index: number, values: readonly T[]) => unknown | Promise<unknown>,
-): Promise<boolean> {
-  for (const [index, item] of values.entries()) if (!(await fn(item, index, values))) return false;
-  return true;
 }

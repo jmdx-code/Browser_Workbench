@@ -1,5 +1,4 @@
 import type { TaskRepository } from '../domain/tasks.js';
-import type { SettlementRepository } from '../domain/settlement.js';
 import type { Core, Peer } from '../bridge/core.js';
 import type { Awaitable } from '../domain/persistence.js';
 import type { ReloadResult } from '../shared/software-update.js';
@@ -88,27 +87,17 @@ export class ExtensionUpdates {
     return result;
   }
 }
-
-// A queued plan alone has not acquired an execution session. Persisted operations and
-// every undelivered notice still block reload, including notices excluded from readiness.
 export async function extensionReloadTasksBusy(
-  tasks: Pick<TaskRepository, 'plansForProfile' | 'blockingOperations' | 'operations'>,
-  settlements: SettlementRepository,
+  tasks: Pick<TaskRepository, 'plansForProfile'> &
+    Partial<Pick<TaskRepository, 'blockingOperations'>>,
   profileId: string,
 ): Promise<boolean> {
-  const plans = await tasks.plansForProfile(profileId, [
-    'QUEUED',
-    'RUNNING',
-    'PAUSING',
-    'STOPPING',
-    'REVIEW',
-  ]);
-  for (const plan of plans) {
-    if (plan.state !== 'QUEUED') return true;
-    const operations = tasks.blockingOperations
-      ? await tasks.blockingOperations(plan.id)
-      : await tasks.operations(plan.id);
-    if (operations.length > 0) return true;
+  const plans = await tasks.plansForProfile(profileId);
+  if (plans.some((plan) => plan.state === 'RUNNING')) return true;
+  if (typeof tasks.blockingOperations === 'function') {
+    for (const plan of plans) {
+      if ((await tasks.blockingOperations(plan.id)).length > 0) return true;
+    }
   }
-  return (await settlements.list(profileId)).some((notice) => notice.state !== 'DELIVERED');
+  return false;
 }

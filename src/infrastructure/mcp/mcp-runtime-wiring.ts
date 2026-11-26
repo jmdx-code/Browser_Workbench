@@ -1,34 +1,42 @@
+import { existsSync } from 'node:fs';
 import type http from 'node:http';
+import path from 'node:path';
+import type { AutoSchedulerService } from '../../application/auto-scheduler-service.js';
+import { BluestacksService } from '../../application/bluestacks-service.js';
+import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
+import type { GoogleSheetsService } from '../../application/google-sheets-service.js';
+import type { GroupBumperService } from '../../application/group-bumper-service.js';
+import type { GroupInviterService } from '../../application/group-inviter-service.js';
+import type { GroupPosterService } from '../../application/group-poster-service.js';
+import type { ProfileInspectionService } from '../../application/profile-inspection.js';
+import type { TaskService } from '../../application/task-service.js';
+import type { WorkspaceService } from '../../application/workspace-service.js';
 import type { Core } from '../../bridge/core.js';
-import type { BridgeStorePort, WorkspaceStorePort } from '../persistence-port.js';
-import type { LocalBrowserLabels } from '../local-browser-labels.js';
-import { BrowserLifecycleManager } from '../browser-lifecycle-manager.js';
+import { ProductError } from '../../domain/workspace.js';
+import type { BrowserWindowPort } from '../../shared/browser-window.js';
+import type { PosterMaterial } from '../../shared/group-poster.js';
+import type { ReloadResult } from '../../shared/software-update.js';
+import type { WindowLayoutPort } from '../../shared/window-layout.js';
+import type { ActiveAccountRuntime } from '../active-account-runtime.js';
+import { syncProductAiWorkspaceDirectory } from '../ai-workspace.js';
 import { BluestacksActiveRunner } from '../bluestacks-active-runner.js';
-import { BluestacksDeviceManager } from '../bluestacks-device-manager.js';
 import { BluestacksGroupBumperRunner } from '../bluestacks-bumper-runner.js';
+import { BluestacksDeviceManager } from '../bluestacks-device-manager.js';
 import { BluestacksGroupInviterRunner } from '../bluestacks-inviter-runner.js';
 import { BluestacksGroupPosterRunner } from '../bluestacks-poster-runner.js';
 import { WindowsOcrClient } from '../bluestacks-vision.js';
-import type { FacebookPublishingRuntime } from '../facebook-publishing-runtime.js';
-import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
-import type { GroupBumperService } from '../../application/group-bumper-service.js';
-import type { GroupPosterService } from '../../application/group-poster-service.js';
-import type { GroupInviterService } from '../../application/group-inviter-service.js';
-import { BluestacksService } from '../../application/bluestacks-service.js';
-import type { AutoSchedulerService } from '../../application/auto-scheduler-service.js';
-import type { GoogleSheetsService } from '../../application/google-sheets-service.js';
-import { ProductError } from '../../domain/workspace.js';
-import { syncProductAiWorkspaceDirectory } from '../ai-workspace.js';
-import type { WorkspaceService } from '../../application/workspace-service.js';
-import type { TaskService } from '../../application/task-service.js';
-import type { ProfileInspectionService } from '../../application/profile-inspection.js';
+import { BrowserLifecycleManager } from '../browser-lifecycle-manager.js';
 import type { KernelBridge } from '../kernel-bridge.js';
-import type { BrowserWindowPort } from '../../shared/browser-window.js';
-import type { ReloadResult } from '../../shared/software-update.js';
-import type { WindowLayoutPort } from '../../shared/window-layout.js';
+import type { LocalBrowserLabels } from '../local-browser-labels.js';
+import type { BridgeStorePort, WorkspaceStorePort } from '../persistence-port.js';
+import {
+  cleanupAllLocalBrowserProfiles,
+  cleanupOfflineRegisteredProfiles,
+  defaultLocalBrowserUserDataRoots,
+} from '../saved-tab-groups-hygiene.js';
 import { AgentBrowserManager } from './agent-browser-manager.js';
-import { createWorkbenchMcpHttpHandler } from './mcp-server.js';
 import type { WorkbenchMcpDependencies } from './mcp-context.js';
+import { createWorkbenchMcpHttpHandler } from './mcp-server.js';
 
 export interface McpRuntimeWiringInput {
   softwareVersion: string;
@@ -40,7 +48,7 @@ export interface McpRuntimeWiringInput {
   repository: WorkspaceStorePort;
   browserLabels: LocalBrowserLabels;
   getMainKernel: () => KernelBridge | undefined;
-  publishingRuntime?: FacebookPublishingRuntime | undefined;
+  activeRuntime?: ActiveAccountRuntime | undefined;
   workspaceService: WorkspaceService;
   taskService: TaskService;
   inspection?: ProfileInspectionService | undefined;
@@ -62,55 +70,58 @@ export interface McpRuntimeWiringInput {
 export function createBluestacksRuntime(
   repository: WorkspaceStorePort,
   featureExecution: FeatureExecutionRegistry,
-  preparePosterMedia?: (mediaSource: string) => Promise<{ localFilePath: string }>,
-): { ocrClient: WindowsOcrClient; service: BluestacksService } {
+  posterMediaSource?:
+    GroupPosterService | ((mediaSource: string) => Promise<{ localFilePath: string }>),
+) {
   const ocrClient = new WindowsOcrClient();
   const devices = new BluestacksDeviceManager(repository.bluestacks, ocrClient);
-  const runner = new BluestacksGroupBumperRunner(
+  const ensurePosterMaterialLocal = posterMediaSource
+    ? async (mat: PosterMaterial) => {
+        if (!mat.mediaSource.trim()) return mat;
+        if (typeof posterMediaSource === 'function')
+          return mat.localFilePath && existsSync(mat.localFilePath)
+            ? mat
+            : { ...mat, localFilePath: (await posterMediaSource(mat.mediaSource)).localFilePath };
+        return (
+          (await posterMediaSource.prepareMaterialById(mat.id)) ??
+          (mat.localFilePath && existsSync(mat.localFilePath)
+            ? mat
+            : await posterMediaSource.prepareAdHocMaterial(mat))
+        );
+      }
+    : undefined;
+  const service = new BluestacksService(
     repository.bluestacks,
-    repository.targetLibrary,
     devices,
-    ocrClient,
+    new BluestacksGroupBumperRunner(
+      repository.bluestacks,
+      repository.targetLibrary,
+      devices,
+      ocrClient,
+    ),
+    featureExecution,
+    {
+      activeRunner: new BluestacksActiveRunner(devices, ocrClient),
+      posterRunner: new BluestacksGroupPosterRunner(devices, ocrClient, {
+        recordPost: (log) => repository.groupPoster.recordPost(log),
+      }),
+      inviterRunner: new BluestacksGroupInviterRunner(devices, ocrClient, {
+        recordInvites: (entries) => repository.groupInviter.recordInvites(entries),
+      }),
+      listCombinations: () => repository.combinations(),
+      listPosterMaterials: () => repository.groupPoster.materials(),
+      hasGroupPostedMaterial: (gid, mid) => repository.groupPoster.hasGroupPostedMaterial(gid, mid),
+      ...(ensurePosterMaterialLocal && { ensurePosterMaterialLocal }),
+    },
   );
-  const activeRunner = new BluestacksActiveRunner(devices, ocrClient);
-  const posterRunner = new BluestacksGroupPosterRunner(devices, ocrClient, {
-    recordPost: (log) => repository.groupPoster.recordPost(log),
-  });
-  const inviterRunner = new BluestacksGroupInviterRunner(devices, ocrClient, {
-    recordInvites: (entries) => repository.groupInviter.recordInvites(entries),
-  });
-  const service = new BluestacksService(repository.bluestacks, devices, runner, featureExecution, {
-    activeRunner,
-    posterRunner,
-    inviterRunner,
-    listCombinations: () => repository.combinations(),
-    listPosterMaterials: () => repository.groupPoster.materials(),
-    ...(preparePosterMedia
-      ? {
-          ensurePosterMaterialLocal: async (mat) => {
-            if (mat.localFilePath || !mat.mediaSource.trim()) return mat;
-            const prepared = await preparePosterMedia(mat.mediaSource);
-            return { ...mat, localFilePath: prepared.localFilePath };
-          },
-        }
-      : {}),
-  });
   return { ocrClient, service };
 }
 
 export function schedulePosterDriveCacheCleanup(groupPosterService: GroupPosterService): void {
-  const startupTimer = setTimeout(
-    () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
-    30_000,
-  ).unref();
-  const intervalTimer = setInterval(
-    () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {}),
-    6 * 3600_000,
-  ).unref();
-  process.once('exit', () => {
-    clearTimeout(startupTimer);
-    clearInterval(intervalTimer);
-  });
+  const run = () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {});
+  const t1 = setTimeout(run, 30_000).unref();
+  const t2 = setInterval(run, 6 * 3600_000).unref();
+  process.once('exit', () => (clearTimeout(t1), clearInterval(t2)));
 }
 
 export function openDesktopExtensionDirViaParent(): void {
@@ -119,10 +130,7 @@ export function openDesktopExtensionDirViaParent(): void {
   process.parentPort.postMessage({ type: 'OPEN_EXTENSION_DIRECTORY' });
 }
 
-export async function openDesktopAiWorkspaceViaParent(
-  rootDir: string,
-  softwareVersion: string,
-): Promise<{ directory: string }> {
+export async function openDesktopAiWorkspaceViaParent(rootDir: string, softwareVersion: string) {
   if (!process.parentPort)
     throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中打开 AI 专属工作夹', 409);
   const { directory } = await syncProductAiWorkspaceDirectory({ rootDir, softwareVersion });
@@ -135,81 +143,67 @@ export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
   agentBrowserManager: AgentBrowserManager;
   mcpHttpHandler: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
 } {
-  const {
-    core,
-    store,
-    repository,
-    browserLabels,
-    featureExecution,
-    publishingRuntime,
-    groupBumperService,
-    groupPosterService,
-    groupInviterService,
-  } = input;
-
+  const { core, store, repository, browserLabels, activeRuntime, featureExecution } = input;
   const profileLifecycle = new BrowserLifecycleManager({
     core,
     store,
     browserLabels,
-    persistBindings: async (bindings) => {
-      await repository.upsertProfileLaunchBindings(bindings);
-    },
+    persistBindings: (bindings) => repository.upsertProfileLaunchBindings(bindings),
     stopActiveTasksForProfile: async (profileId) => {
       await featureExecution.stopProfilesAcrossModules([profileId]);
       const peer = core.peers.get(profileId);
-      if (peer?.online && peer.phase === 'RUNNING') {
-        await core.stop(profileId);
-      }
+      if (peer?.online && peer.phase === 'RUNNING') await core.stop(profileId);
+    },
+    releaseIdleKernelSession: async (profileId) => {
+      await activeRuntime?.waitUntilProfileIdle(profileId, 5_000).catch(() => {});
+      const peer = core.peers.get(profileId);
+      if (peer?.online) await input.getMainKernel()?.releaseIdleForExtension(peer);
     },
   });
 
   void Promise.all([repository.profileLaunchBindings(), store.profileList()])
-    .then(([savedBindings, rows]) => {
-      browserLabels.hydrateBindings(savedBindings, new Set(rows.map((r) => String(r.profileId))));
+    .then(([bindings, rows]) => {
+      browserLabels.hydrateBindings(bindings, new Set(rows.map((r) => String(r.profileId))));
+      if (!process.env.BRIDGE_TEST_DATA_DIR && !process.env.WORKBENCH_SMOKE_OUT) {
+        setTimeout(() => {
+          try {
+            const all = browserLabels.allBindings();
+            const isOnline = (id: string) => Boolean(core.peers.get(id)?.online);
+            cleanupOfflineRegisteredProfiles(all, isOnline, 'keep-one');
+            cleanupAllLocalBrowserProfiles(
+              defaultLocalBrowserUserDataRoots(),
+              new Set(
+                all
+                  .filter((b) => isOnline(b.profileId))
+                  .map((b) => path.join(b.userDataDir, b.profileDirectory)),
+              ),
+              'keep-one',
+            );
+          } catch {}
+        }, 1500).unref();
+      }
     })
     .catch(() => {});
 
-  publishingRuntime?.setProfileLifecycle(profileLifecycle);
-  groupBumperService.setProfileLifecycle(profileLifecycle);
-  groupBumperService.startScheduler();
-  groupPosterService.setProfileLifecycle(profileLifecycle);
-  groupInviterService.setProfileLifecycle(profileLifecycle);
-
+  input.groupBumperService.setProfileLifecycle(profileLifecycle);
+  input.groupPosterService.setProfileLifecycle(profileLifecycle);
+  input.groupInviterService.setProfileLifecycle(profileLifecycle);
   const agentBrowserManager = new AgentBrowserManager(
     () => core,
     input.getMainKernel,
     featureExecution,
   );
-
-  const mcpHttpHandler = createWorkbenchMcpHttpHandler(
-    {
-      softwareVersion: input.softwareVersion,
-      extensionVersion: input.extensionVersion,
-      dataDir: input.dataDir,
-      core,
-      store,
-      getMainKernel: input.getMainKernel,
-      workspaceService: input.workspaceService,
-      taskService: input.taskService,
-      inspection: input.inspection,
-      featureExecution,
-      groupPosterService,
-      getGroupBumperService: () => groupBumperService,
-      groupInviterService,
-      bluestacksService: input.bluestacksService,
-      getAutoSchedulerService: input.getAutoSchedulerService,
-      getGoogleSheetsService: input.getGoogleSheetsService,
-      agentBrowser: agentBrowserManager,
-      profileLifecycle,
-      browserWindow: input.browserWindow,
-      windowLayout: input.windowLayout,
-      captureDiagnostics: input.captureDiagnostics,
-      devDiagFilePath: input.devDiagFilePath,
-      reloadExtensions: input.reloadExtensions,
-      withMutation: input.withMutation,
-    },
-    input.port,
-  );
-
-  return { profileLifecycle, agentBrowserManager, mcpHttpHandler };
+  return {
+    profileLifecycle,
+    agentBrowserManager,
+    mcpHttpHandler: createWorkbenchMcpHttpHandler(
+      {
+        ...input,
+        getGroupBumperService: () => input.groupBumperService,
+        agentBrowser: agentBrowserManager,
+        profileLifecycle,
+      },
+      input.port,
+    ),
+  };
 }

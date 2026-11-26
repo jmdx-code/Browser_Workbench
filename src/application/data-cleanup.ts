@@ -1,23 +1,20 @@
 import type { Awaitable } from '../domain/persistence.js';
-import type {
-  DetailBoundaryValue,
-  CleanupConfiguration,
-  RecordCleanup,
-} from '../shared/data-cleanup.js';
+import { ProductError } from '../domain/workspace.js';
 import {
   CleanupSelection,
   ExecuteCleanup,
   ResetWorkspace,
   SaveCleanupSettings,
+  type CleanupConfiguration,
+  type DetailBoundaryValue,
+  type RecordCleanup,
 } from '../shared/data-cleanup.js';
-import { ProductError } from '../domain/workspace.js';
 
 type Files = { name: string; bytes: number; modified: number; identity: string }[];
+const yieldTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 export class DataCleanupService {
   private progressValue = { running: false, current: 0, total: 0 };
-  progress() {
-    return { ...this.progressValue };
-  }
   private busy = false;
   private resetting = false;
   private tickets = new Map<
@@ -30,6 +27,7 @@ export class DataCleanupService {
       count: number;
     }
   >();
+
   constructor(
     private readonly repository: {
       reclaimHiddenRounds?(maximum?: number): Awaitable<number>;
@@ -71,36 +69,55 @@ export class DataCleanupService {
       ): Awaitable<number>;
     },
   ) {}
+
+  progress() {
+    return { ...this.progressValue };
+  }
   async recordAvatar(kind: unknown, id: string) {
     return (await this.repository.recordAvatar?.(kind, id)) ?? null;
   }
+  private async drainBatches(step: () => Awaitable<number>, shouldContinue = (n: number) => n > 0) {
+    let n: number;
+    do {
+      n = await step();
+      await yieldTick();
+    } while (shouldContinue(n));
+  }
+  private async runBusy<T>(fn: () => Promise<T>): Promise<T> {
+    this.busy = true;
+    try {
+      return await fn();
+    } finally {
+      this.busy = false;
+    }
+  }
+
   private async retainResultsAndDetails(settings: CleanupConfiguration) {
     if (this.repository.pruneResults) {
-      while (
-        await this.repository.pruneResults(settings.bumperMaxCount, settings.posterMaxCount, 100)
-      )
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      await this.drainBatches(
+        () =>
+          this.repository.pruneResults?.(settings.bumperMaxCount, settings.posterMaxCount, 100) ??
+          0,
+      );
     }
     if (!this.repository.detailHead || !this.repository.pruneDetails) return;
     const protectedIds = (await this.repository.protectedOperationIds?.()) ?? [];
     const heads = [
       ...(await this.repository.detailHead(settings.detailMaxCount)),
       ...((await this.bridgeHistory?.detailHead(settings.detailMaxCount, protectedIds)) ?? []),
-    ];
-    heads.sort((a, b) => b.at - a.at || (a.key < b.key ? 1 : a.key > b.key ? -1 : 0));
+    ].sort((a, b) => b.at - a.at || (a.key < b.key ? 1 : a.key > b.key ? -1 : 0));
     const boundary = heads[settings.detailMaxCount - 1];
     if (boundary) {
-      let removed: number;
-      do {
-        removed = await this.repository.pruneDetails(boundary, 100);
-        removed += (await this.bridgeHistory?.pruneDetails(boundary, protectedIds, 100)) ?? 0;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      } while (removed > 0);
+      await this.drainBatches(
+        async () =>
+          ((await this.repository.pruneDetails?.(boundary, 100)) ?? 0) +
+          ((await this.bridgeHistory?.pruneDetails(boundary, protectedIds, 100)) ?? 0),
+      );
     }
     if (this.repository.reclaimHiddenRounds)
-      while (await this.repository.reclaimHiddenRounds(100))
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      await this.drainBatches(() => this.repository.reclaimHiddenRounds?.(100) ?? 0);
   }
+
   assertNotResetting() {
     if (this.resetting)
       throw new ProductError('RESET_PENDING', '工作台正在重置，请等待重新打开', 409);
@@ -111,17 +128,19 @@ export class DataCleanupService {
     if (this.busy) throw new ProductError('CLEANUP_BUSY', '正在清理数据，请稍后重试', 409);
   }
   async settings() {
-    return this.repository.settings();
+    return await this.repository.settings();
   }
   async saveSettings(input: unknown) {
     this.assertIdle();
-    return this.repository.saveSettings(SaveCleanupSettings.parse(input));
+    return await this.repository.saveSettings(SaveCleanupSettings.parse(input));
   }
+
   async preview(input: unknown) {
     this.assertIdle();
     const selection = CleanupSelection.parse(input);
-    if (selection.kind === 'records' && selection.scope.before !== undefined)
+    if (selection.kind === 'records' && selection.scope.before !== undefined) {
       selection.scope.before = Math.min(selection.scope.before, Date.now() + 1);
+    }
     const files = selection.kind === 'logs' ? await this.logs.preview(selection.before) : [];
     const count =
       selection.kind === 'records'
@@ -134,52 +153,56 @@ export class DataCleanupService {
       files,
       count: count.eligible,
     };
-    for (const [token, previous] of this.tickets)
-      if (previous.expiresAt < Date.now()) this.tickets.delete(token);
+    for (const [t, prev] of this.tickets) if (prev.expiresAt < Date.now()) this.tickets.delete(t);
     if (this.tickets.size >= 16) this.tickets.delete(this.tickets.keys().next().value ?? '');
     this.tickets.set(ticket.token, ticket);
     return { token: ticket.token, expiresAt: ticket.expiresAt, kind: selection.kind, ...count };
   }
+
   async execute(input: unknown) {
     const request = ExecuteCleanup.parse(input);
     this.assertIdle();
     const ticket = this.tickets.get(request.token);
-    if (!ticket || ticket.token !== request.token || Date.now() > ticket.expiresAt)
+    if (!ticket || ticket.token !== request.token || Date.now() > ticket.expiresAt) {
       throw new ProductError('CLEANUP_PREVIEW_EXPIRED', '清理预览已过期，请重新预览', 409);
+    }
     this.tickets.delete(request.token);
     this.progressValue = { running: true, current: 0, total: ticket.count };
-    this.busy = true;
-    try {
-      if (ticket.selection.kind === 'logs') {
-        const result = await this.logs.remove(ticket.files, ticket.selection.before === undefined);
-        this.progressValue.current = result.deleted;
-        return result;
+    return this.runBusy(async () => {
+      try {
+        if (ticket.selection.kind === 'logs') {
+          const result = await this.logs.remove(
+            ticket.files,
+            ticket.selection.before === undefined,
+          );
+          this.progressValue.current = result.deleted;
+          return result;
+        }
+        let deleted = 0;
+        while (deleted < ticket.count) {
+          const n = await this.repository.removeBatch(
+            ticket.selection.scope,
+            Math.min(100, ticket.count - deleted),
+          );
+          deleted += n;
+          this.progressValue.current = deleted;
+          await yieldTick();
+          if (n < 100) break;
+        }
+        if (this.repository.purgeExpiredFeatureOperations) {
+          deleted += await this.repository.purgeExpiredFeatureOperations(ticket.selection.scope);
+        }
+        return {
+          deleted,
+          bytes: 0,
+          protected: (await this.repository.preview(ticket.selection.scope)).protected,
+        };
+      } finally {
+        this.progressValue.running = false;
       }
-      let deleted = 0;
-      // Limit to the amount explicitly previewed, and yield between bounded SQL units.
-      while (deleted < ticket.count) {
-        const n = await this.repository.removeBatch(
-          ticket.selection.scope,
-          Math.min(100, ticket.count - deleted),
-        );
-        deleted += n;
-        this.progressValue.current = deleted;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        if (n < 100) break;
-      }
-      if (this.repository.purgeExpiredFeatureOperations) {
-        deleted += await this.repository.purgeExpiredFeatureOperations(ticket.selection.scope);
-      }
-      return {
-        deleted,
-        bytes: 0,
-        protected: (await this.repository.preview(ticket.selection.scope)).protected,
-      };
-    } finally {
-      this.progressValue.running = false;
-      this.busy = false;
-    }
+    });
   }
+
   async automatic() {
     if (this.busy || this.resetting) return;
     const settings = await this.repository.settings();
@@ -189,11 +212,11 @@ export class DataCleanupService {
       !settings.automaticLogs &&
       !this.repository.pruneResults &&
       !this.repository.pruneDetails
-    )
+    ) {
       return;
+    }
     this.assertIdle();
-    this.busy = true;
-    try {
+    await this.runBusy(async () => {
       if (settings.historyRetentionDays !== null || settings.historyMaxCount != null) {
         const scope = {
           ...(settings.historyRetentionDays !== null
@@ -201,35 +224,29 @@ export class DataCleanupService {
             : {}),
           ...(settings.historyMaxCount != null ? { keepLatestRuns: settings.historyMaxCount } : {}),
         };
-        let removed: number;
-        do {
-          removed = await this.repository.removeBatch(scope, 100);
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        } while (removed === 100);
-        if (this.repository.purgeExpiredFeatureOperations) {
-          await this.repository.purgeExpiredFeatureOperations(scope);
-        }
+        await this.drainBatches(
+          () => this.repository.removeBatch(scope, 100),
+          (n) => n === 100,
+        );
+        await this.repository.purgeExpiredFeatureOperations?.(scope);
       }
       await this.retainResultsAndDetails(settings);
       if (settings.automaticLogs) {
         const files = await this.logs.preview(Date.now() - settings.logRetentionDays * 86400000);
         if (files.length) await this.logs.remove(files);
       }
-    } finally {
-      this.busy = false;
-    }
+    });
   }
+
   async compact() {
     this.assertIdle();
     this.assertAvailable();
-    this.busy = true;
-    try {
+    return this.runBusy(async () => {
       await this.assertStopped();
       return await this.repository.compact();
-    } finally {
-      this.busy = false;
-    }
+    });
   }
+
   async resetStatus() {
     try {
       this.assertIdle();
@@ -249,26 +266,26 @@ export class DataCleanupService {
       };
     }
   }
+
   async resetAll(input: unknown) {
     ResetWorkspace.parse(input);
     this.assertIdle();
     this.assertAvailable();
-    if (!this.reset) throw new ProductError('RESET_UNAVAILABLE', '请使用桌面软件入口', 409);
-    this.busy = true;
+    const resetter = this.reset;
+    if (!resetter) throw new ProductError('RESET_UNAVAILABLE', '请使用桌面软件入口', 409);
     this.resetting = true;
-    try {
-      await this.assertStopped();
-      await this.repository.assertResettable();
-      await this.reset.prepare();
-      this.resetting = true;
-      // Parent closes without resaving deliberately discarded drafts, then drains its controller.
-      setTimeout(() => this.reset?.restart(), 250);
-      return { requested: true };
-    } catch (error) {
-      this.resetting = false;
-      throw error;
-    } finally {
-      this.busy = false;
-    }
+    return this.runBusy(async () => {
+      try {
+        await this.assertStopped();
+        await this.repository.assertResettable();
+        await resetter.prepare();
+        this.resetting = true;
+        setTimeout(() => resetter.restart(), 250).unref?.();
+        return { requested: true };
+      } catch (error) {
+        this.resetting = false;
+        throw error;
+      }
+    });
   }
 }

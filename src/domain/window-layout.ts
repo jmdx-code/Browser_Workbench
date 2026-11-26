@@ -1,231 +1,331 @@
-import type { Rect, LayoutScreen, LayoutSettings, TaskWindow } from '../shared/window-layout.js';
-
-type PositionedWindow = { id: string; rect: Rect; contentInsets?: TaskWindow['contentInsets'] };
-
-// Large windows may shrink; ordinary windows retain their current size.
+import type {
+  Rect,
+  LayoutScreen,
+  LayoutSettings,
+  TaskWindow,
+  TileDisplayConfig,
+} from '../shared/window-layout.js';
+const clamp = (min: number, max: number, v: number) => Math.max(min, Math.min(max, v));
+const sortByDistance = (rect: Rect, list: Rect[]) =>
+  [...new Map(list.map((r) => [`${r.x}:${r.y}`, r])).values()].sort(
+    (a, b) =>
+      (a.x - rect.x) ** 2 + (a.y - rect.y) ** 2 - ((b.x - rect.x) ** 2 + (b.y - rect.y) ** 2),
+  );
+const clampRect = (
+  r: { width: number; height: number },
+  x: number,
+  y: number,
+  a: Rect,
+  m = 12,
+) => ({
+  width: r.width,
+  height: r.height,
+  x: clamp(a.x + m, a.x + a.width - m - r.width, x),
+  y: clamp(a.y + m, a.y + a.height - m - r.height, y),
+});
 export function fitTaskWindow(rect: Rect, display: LayoutScreen): Rect {
-  const a = display.workArea;
-  const maxWidth = a.width - 24,
-    maxHeight = a.height - 24;
-  if (maxWidth < 100 || maxHeight < 100) throw Error('WINDOW_LAYOUT_CAPACITY_EXCEEDED');
+  const a = display.workArea,
+    maxW = a.width - 24,
+    maxH = a.height - 24;
+  if (maxW < 100 || maxH < 100) throw Error('WINDOW_LAYOUT_CAPACITY_EXCEEDED');
   const large = rect.width * rect.height > (a.width * a.height) / 2;
-  const width = Math.min(
-    rect.width,
-    maxWidth,
-    large ? Math.max(640, Math.floor(a.width * 0.6)) : maxWidth,
+  return clampRect(
+    {
+      width: Math.min(rect.width, maxW, large ? Math.max(640, Math.floor(a.width * 0.6)) : maxW),
+      height: Math.min(rect.height, maxH, large ? Math.max(480, Math.floor(a.height * 0.8)) : maxH),
+    },
+    rect.x,
+    rect.y,
+    a,
   );
-  const height = Math.min(
-    rect.height,
-    maxHeight,
-    large ? Math.max(480, Math.floor(a.height * 0.8)) : maxHeight,
-  );
-  return {
-    width,
-    height,
-    x: Math.max(a.x + 12, Math.min(rect.x, a.x + a.width - 12 - width)),
-    y: Math.max(a.y + 12, Math.min(rect.y, a.y + a.height - 12 - height)),
-  };
 }
-
-// Try nearby peer corners, then screen corners. Real visibility decides success;
-// stale peer geometry must never prevent the current task from starting or moving.
 export function taskWindowPositions(
   rect: Rect,
   peers: readonly { rect: Rect; contentInsets?: TaskWindow['contentInsets'] }[],
   display: LayoutScreen,
   step: number,
 ): Rect[] {
-  const a = display.workArea;
-  const stride = contentLayoutStep(peers, step);
-  const candidates = [
-    ...overlappingWindowPositions(rect, peers, display, stride),
+  const a = display.workArea,
+    stride =
+      step +
+      Math.max(
+        0,
+        ...peers.map((w) => Math.max(w.contentInsets?.left ?? 0, w.contentInsets?.bottom ?? 0)),
+      ),
+    overlaps: Rect[] = [];
+  for (const p of peers)
+    for (const x of [p.rect.x, p.rect.x + p.rect.width - rect.width])
+      for (const y of [p.rect.y, p.rect.y + p.rect.height - rect.height])
+        for (const dx of [-stride, stride])
+          for (const dy of [-stride, stride]) {
+            const c = { ...rect, x: x + dx, y: y + dy };
+            if (
+              c.x >= a.x + 12 &&
+              c.y >= a.y + 12 &&
+              c.x + c.width <= a.x + a.width - 12 &&
+              c.y + c.height <= a.y + a.height - 12
+            )
+              overlaps.push(c);
+          }
+  return sortByDistance(rect, [
+    ...overlaps,
     ...[a.x + 12, a.x + a.width - 12 - rect.width].flatMap((x) =>
       [a.y + 12, a.y + a.height - 12 - rect.height].map((y) => ({ ...rect, x, y })),
     ),
-  ];
-  return [...new Map(candidates.map((r) => [`${r.x}:${r.y}`, r])).values()].sort(
-    (a, b) =>
-      (a.x - rect.x) ** 2 + (a.y - rect.y) ** 2 - ((b.x - rect.x) ** 2 + (b.y - rect.y) ** 2),
-  );
+  ]);
 }
-
 export function reservedLayoutDisplay(
   display: LayoutScreen,
   settings: LayoutSettings,
 ): LayoutScreen {
-  const screen = display.workArea;
-  const saved = settings.reservedArea ?? screen;
-  const x = Math.max(saved.x, screen.x),
-    y = Math.max(saved.y, screen.y);
-  const clipped = {
-    x,
-    y,
-    width: Math.min(saved.x + saved.width, screen.x + screen.width) - x,
-    height: Math.min(saved.y + saved.height, screen.y + screen.height) - y,
-  };
-  // fitTaskWindow needs a 100 DIP minimum window plus 12 DIP on each side.
-  const area = clipped.width >= 124 && clipped.height >= 124 ? clipped : screen;
-  return { ...display, workArea: { ...area } };
+  const s = display.workArea,
+    saved = settings.reservedArea ?? s,
+    x = Math.max(saved.x, s.x),
+    y = Math.max(saved.y, s.y),
+    w = Math.min(saved.x + saved.width, s.x + s.width) - x,
+    h = Math.min(saved.y + saved.height, s.y + s.height) - y;
+  return { ...display, workArea: w >= 124 && h >= 124 ? { x, y, width: w, height: h } : { ...s } };
 }
-
 export function contentWindowRect(window: Pick<TaskWindow, 'rect' | 'contentInsets'>): Rect {
-  const { rect, contentInsets: inset } = window;
-  if (!inset) return rect; // Geometry-only legacy callers; production requires measured insets.
-  const result = {
-    x: rect.x + inset.left,
-    y: rect.y + inset.top,
-    width: rect.width - inset.left - inset.right,
-    height: rect.height - inset.top - inset.bottom,
+  const { rect, contentInsets: i } = window;
+  if (!i) return rect;
+  const r = {
+    x: rect.x + i.left,
+    y: rect.y + i.top,
+    width: rect.width - i.left - i.right,
+    height: rect.height - i.top - i.bottom,
   };
-  if (result.width < 2 || result.height < 2) throw Error('WINDOW_LAYOUT_CONTENT_BOUNDS_REQUIRED');
-  return result;
+  if (r.width < 2 || r.height < 2) throw Error('WINDOW_LAYOUT_CONTENT_BOUNDS_REQUIRED');
+  return r;
 }
-
-export function contentLayoutStep(
-  windows: readonly Pick<PositionedWindow, 'contentInsets'>[],
-  step: number,
-) {
-  return (
-    step +
-    Math.max(
-      0,
-      ...windows.map((w) => Math.max(w.contentInsets?.left ?? 0, w.contentInsets?.bottom ?? 0)),
-    )
-  );
-}
-
-// Occupied rectangles are overlap anchors, not excluded floor space. Align
-// corresponding corners and offset in each direction; real page visibility
-// remains the independent check after moving.
-export function overlappingWindowPositions(
-  rect: Rect,
-  peers: readonly { rect: Rect }[],
-  display: LayoutScreen,
-  stride: number,
-): Rect[] {
-  const area = display.workArea;
-  const points: Rect[] = [];
-  for (const peer of peers) {
-    for (const x of [peer.rect.x, peer.rect.x + peer.rect.width - rect.width])
-      for (const y of [peer.rect.y, peer.rect.y + peer.rect.height - rect.height])
-        for (const dx of [-stride, stride])
-          for (const dy of [-stride, stride]) {
-            const candidate = { ...rect, x: x + dx, y: y + dy };
-            if (
-              candidate.x >= area.x + 12 &&
-              candidate.y >= area.y + 12 &&
-              candidate.x + candidate.width <= area.x + area.width - 12 &&
-              candidate.y + candidate.height <= area.y + area.height - 12
-            )
-              points.push(candidate);
-          }
-  }
-  return [...new Map(points.map((p) => [`${p.x}:${p.y}`, p])).values()].sort(
-    (a, b) =>
-      (a.x - rect.x) ** 2 + (a.y - rect.y) ** 2 - ((b.x - rect.x) ** 2 + (b.y - rect.y) ** 2),
-  );
-}
-
 export function displayForRect(
   rect: Rect,
   displays: readonly LayoutScreen[],
 ): LayoutScreen | undefined {
   if (!displays.length) return undefined;
-  const cx = rect.x + rect.width / 2;
-  const cy = rect.y + rect.height / 2;
-  const containing = displays.find(
-    (d) =>
-      cx >= d.workArea.x &&
-      cx <= d.workArea.x + d.workArea.width &&
-      cy >= d.workArea.y &&
-      cy <= d.workArea.y + d.workArea.height,
+  const cx = rect.x + rect.width / 2,
+    cy = rect.y + rect.height / 2;
+  return (
+    displays.find(
+      ({ workArea: a }) => cx >= a.x && cx <= a.x + a.width && cy >= a.y && cy <= a.y + a.height,
+    ) ??
+    displays.reduce((best, d) => {
+      const dist = ({ workArea: a }: LayoutScreen) =>
+        Math.max(a.x - cx, 0, cx - (a.x + a.width)) ** 2 +
+        Math.max(a.y - cy, 0, cy - (a.y + a.height)) ** 2;
+      return dist(d) < dist(best) ? d : best;
+    })
   );
-  if (containing) return containing;
-  let best = displays[0];
-  let bestDist = Infinity;
-  for (const d of displays) {
-    const dx = Math.max(d.workArea.x - cx, 0, cx - (d.workArea.x + d.workArea.width));
-    const dy = Math.max(d.workArea.y - cy, 0, cy - (d.workArea.y + d.workArea.height));
-    const dist = dx * dx + dy * dy;
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = d;
-    }
-  }
-  return best;
 }
-
 export function normalizeTaskWindowSize(
   display: LayoutScreen,
   referenceRect?: Rect,
 ): { width: number; height: number } {
-  const a = display.workArea;
-  const margin = 24;
-  const hardMaxWidth = Math.max(100, a.width - margin);
-  const hardMaxHeight = Math.max(100, a.height - margin);
-  const minWidth = Math.min(hardMaxWidth, Math.max(760, Math.floor(a.width * 0.44)));
-  const maxWidth = Math.min(
-    hardMaxWidth,
-    Math.max(minWidth, Math.min(1140, Math.floor(a.width * 0.58))),
-  );
-  const minHeight = Math.min(hardMaxHeight, Math.max(520, Math.floor(a.height * 0.52)));
-  const maxHeight = Math.min(
-    hardMaxHeight,
-    Math.max(minHeight, Math.min(780, Math.floor(a.height * 0.66))),
-  );
-  const defaultWidth = Math.min(maxWidth, Math.max(minWidth, Math.floor(a.width * 0.5)));
-  const defaultHeight = Math.min(maxHeight, Math.max(minHeight, Math.floor(a.height * 0.6)));
-  if (!referenceRect) {
-    return { width: defaultWidth, height: defaultHeight };
-  }
-  const fitted = fitTaskWindow(referenceRect, display);
-  return {
-    width: Math.min(maxWidth, Math.max(minWidth, fitted.width)),
-    height: Math.min(maxHeight, Math.max(minHeight, fitted.height)),
-  };
+  const a = display.workArea,
+    hw = Math.max(100, a.width - 24),
+    hh = Math.max(100, a.height - 24),
+    minW = Math.min(hw, Math.max(760, Math.floor(a.width * 0.44))),
+    maxW = Math.min(hw, Math.max(minW, Math.min(1140, Math.floor(a.width * 0.58)))),
+    minH = Math.min(hh, Math.max(520, Math.floor(a.height * 0.52))),
+    maxH = Math.min(hh, Math.max(minH, Math.min(780, Math.floor(a.height * 0.66)))),
+    src = referenceRect
+      ? fitTaskWindow(referenceRect, display)
+      : { width: Math.floor(a.width * 0.5), height: Math.floor(a.height * 0.6) };
+  return { width: clamp(minW, maxW, src.width), height: clamp(minH, maxH, src.height) };
 }
-
-export function gridCascadeSlotRect(
+export const gridCascadeSlotRect = (
   slotIndex: number,
   size: { width: number; height: number },
   display: LayoutScreen,
   step: number,
-): Rect {
-  const a = display.workArea;
-  const margin = 12;
-  const width = Math.min(size.width, Math.max(100, a.width - margin * 2));
-  const height = Math.min(size.height, Math.max(100, a.height - margin * 2));
-  const availX = Math.max(0, a.width - margin * 2 - width);
-  const availY = Math.max(0, a.height - margin * 2 - height);
-  const stepX = Math.max(24, step * 3);
-  const stepY = Math.max(28, step * 4);
-  // 每一斜列从上到下最多排 rowsPerCol 个窗口（至少 2 个，最多 10 个），确保每个窗口垂直方向都错开 stepY
-  const rowsPerCol =
-    availY >= stepY ? Math.max(2, Math.min(10, Math.floor(availY / stepY) + 1)) : 1;
-  const index = Math.max(0, slotIndex);
-  const row = index % rowsPerCol;
-  const colGroup = Math.floor(index / rowsPerCol);
-  // 每一大列之间的水平跨度，使多列斜向阶梯在屏幕上均匀展开
-  const colStrideX = Math.max(stepX * 3, Math.min(220, Math.floor(availX / 3) || stepX * 3));
-  const maxColSpan = Math.max(1, availX - (rowsPerCol - 1) * stepX);
-  const groupOffsetX = availX > 0 ? (colGroup * colStrideX) % (maxColSpan + colStrideX) : 0;
-  const rawX = a.x + margin + groupOffsetX + row * stepX;
-  const rawY = a.y + margin + row * stepY;
-  const x = Math.max(a.x + margin, Math.min(a.x + a.width - margin - width, rawX));
-  const y = Math.max(a.y + margin, Math.min(a.y + a.height - margin - height, rawY));
-  return { x, y, width, height };
-}
-
-export function arrangeTaskWindowsInOrder(
-  ids: readonly string[],
+): Rect => cascadeSlotRect(slotIndex, display, { ...size, step, maxRows: 10, maxColStride: 220 });
+function cascadeSlotRect(
+  slotIndex: number,
   display: LayoutScreen,
-  step: number,
-  referenceRect?: Rect,
-): Map<string, Rect> {
-  const size = normalizeTaskWindowSize(display, referenceRect);
-  const result = new Map<string, Rect>();
-  ids.forEach((id, i) => {
-    result.set(id, gridCascadeSlotRect(i, size, display, step));
-  });
-  return result;
+  opts: {
+    width: number;
+    height: number;
+    stepX?: number;
+    stepY?: number;
+    startX?: number;
+    startY?: number;
+    step?: number;
+    maxRows: number;
+    maxColStride: number;
+  },
+): Rect {
+  const a = display.workArea,
+    m = 12,
+    width = Math.min(opts.width, Math.max(100, a.width - m * 2)),
+    height = Math.min(opts.height, Math.max(100, a.height - m * 2)),
+    fbStep = opts.step ?? 8,
+    stepX = Math.max(8, opts.stepX ?? Math.max(24, fbStep * 3)),
+    stepY = Math.max(8, opts.stepY ?? Math.max(28, fbStep * 4)),
+    startX = clamp(m, Math.max(m, a.width - width - m), opts.startX ?? m),
+    startY = clamp(m, Math.max(m, a.height - height - m), opts.startY ?? m),
+    availX = Math.max(0, a.width - m - width - startX),
+    availY = Math.max(0, a.height - m - height - startY),
+    rowsPerCol = availY >= stepY ? clamp(2, opts.maxRows, Math.floor(availY / stepY) + 1) : 1,
+    index = Math.max(0, slotIndex),
+    row = index % rowsPerCol,
+    colGroup = Math.floor(index / rowsPerCol),
+    colStrideX = Math.max(
+      stepX * 3,
+      Math.min(opts.maxColStride, Math.floor(availX / 3) || stepX * 3),
+    ),
+    maxColSpan = Math.max(1, availX - (rowsPerCol - 1) * stepX),
+    groupOffsetX = availX > 0 ? (colGroup * colStrideX) % (maxColSpan + colStrideX) : 0;
+  return clampRect(
+    { width, height },
+    a.x + startX + groupOffsetX + row * stepX,
+    a.y + startY + row * stepY,
+    a,
+    m,
+  );
+}
+const TILE_PRESETS: [number, number, number][] = [
+  [1, 1, 1],
+  [2, 1, 2],
+  [4, 2, 2],
+  [6, 2, 3],
+  [9, 3, 3],
+  [12, 3, 4],
+  [16, 4, 4],
+];
+export function autoTileGrid(count: number): { rows: number; cols: number } {
+  const n = Math.max(1, Math.floor(count)),
+    hit = TILE_PRESETS.find(([cap]) => n <= cap);
+  if (hit) return { rows: hit[1], cols: hit[2] };
+  const cols = Math.min(8, Math.ceil(Math.sqrt(n)));
+  return { rows: Math.min(8, Math.ceil(n / cols)), cols };
+}
+export function computeDisplayTileSlots(
+  display: LayoutScreen,
+  rows: number,
+  cols: number,
+  gap = 8,
+): Rect[] {
+  const sr = clamp(1, 8, Math.floor(rows)),
+    sc = clamp(1, 8, Math.floor(cols)),
+    sg = clamp(0, 48, Math.floor(gap)),
+    a = display.workArea,
+    cw = Math.max(100, Math.floor((a.width - sg * (sc + 1)) / sc)),
+    ch = Math.max(100, Math.floor((a.height - sg * (sr + 1)) / sr)),
+    slots: Rect[] = [];
+  for (let r = 0; r < sr; r++)
+    for (let c = 0; c < sc; c++) {
+      const rx = a.x + sg + c * (cw + sg),
+        ry = a.y + sg + r * (ch + sg);
+      slots.push({
+        x: Math.min(rx, a.x + a.width - 100),
+        y: Math.min(ry, a.y + a.height - 100),
+        width: Math.min(cw, Math.max(100, a.x + a.width - sg - rx)),
+        height: Math.min(ch, Math.max(100, a.y + a.height - sg - ry)),
+      });
+    }
+  return slots;
+}
+interface DisplayTilePlanEntry {
+  display: LayoutScreen;
+  config: TileDisplayConfig;
+  rows: number;
+  cols: number;
+  startIdx: number;
+  slots: Rect[];
+  slotWindowIndices: number[][];
+}
+export function computeMultiDisplayTilePlan(
+  count: number,
+  displays: readonly LayoutScreen[],
+  tileConfigs?: readonly TileDisplayConfig[],
+  gap = 8,
+  overflow: 'wrap' | 'keep' = 'wrap',
+): { entries: DisplayTilePlanEntry[]; rects: Array<Rect | null> } {
+  if (count <= 0 || !displays.length)
+    return { entries: [], rects: Array.from({ length: Math.max(0, count) }, () => null) };
+  const byId = new Map(displays.map((d) => [d.id, d])),
+    active = (tileConfigs ?? []).flatMap((c) => {
+      const d = byId.get(c.displayId);
+      return c.enabled && d ? [{ display: d, config: c }] : [];
+    });
+  if (!active.length) {
+    const primary = displays.find((d) => d.primary) ?? displays[0];
+    if (primary)
+      active.push({
+        display: primary,
+        config: { displayId: primary.id, enabled: true, rows: 0, cols: 0, startSlot: 1 },
+      });
+  }
+  const entries: DisplayTilePlanEntry[] = [],
+    pool: Array<{ rect: Rect; display: LayoutScreen; entryIndex: number; slotIndex: number }> = [];
+  let rem = count;
+  for (const { display, config } of active) {
+    const auto = autoTileGrid(Math.max(1, rem)),
+      rows = config.rows > 0 ? config.rows : auto.rows,
+      cols = config.cols > 0 ? config.cols : auto.cols,
+      slots = computeDisplayTileSlots(display, rows, cols, gap),
+      startIdx = clamp(0, Math.max(0, slots.length - 1), config.startSlot - 1),
+      entryIndex = entries.length;
+    entries.push({
+      display,
+      config,
+      rows,
+      cols,
+      startIdx,
+      slots,
+      slotWindowIndices: Array.from({ length: slots.length }, () => []),
+    });
+    for (let s = startIdx; s < slots.length; s++) {
+      const rect = slots[s];
+      if (rect) pool.push({ rect, display, entryIndex, slotIndex: s });
+    }
+    rem = Math.max(0, rem - Math.max(0, slots.length - startIdx));
+  }
+  if (!pool.length) return { entries, rects: Array.from({ length: count }, () => null) };
+  return {
+    entries,
+    rects: Array.from({ length: count }, (_, i) => {
+      const slot = i >= pool.length && overflow === 'keep' ? undefined : pool[i % pool.length];
+      if (!slot) return null;
+      entries[slot.entryIndex]?.slotWindowIndices[slot.slotIndex]?.push(i);
+      const shift = i < pool.length ? 0 : Math.floor(i / pool.length) * 16;
+      return shift
+        ? clampRect(slot.rect, slot.rect.x + shift, slot.rect.y + shift, slot.display.workArea, 0)
+        : { ...slot.rect };
+    }),
+  };
+}
+export const computeMultiDisplayTileRects = (
+  count: number,
+  displays: readonly LayoutScreen[],
+  tileConfigs?: readonly TileDisplayConfig[],
+  gap = 8,
+  overflow: 'wrap' | 'keep' = 'wrap',
+): Array<Rect | null> =>
+  computeMultiDisplayTilePlan(count, displays, tileConfigs, gap, overflow).rects;
+export function computeCascadeRects(
+  count: number,
+  display: LayoutScreen,
+  opts?: {
+    width?: number;
+    height?: number;
+    stepX?: number;
+    stepY?: number;
+    startX?: number;
+    startY?: number;
+    step?: number;
+    referenceRect?: Rect;
+  },
+): Rect[] {
+  if (count <= 0) return [];
+  const def = normalizeTaskWindowSize(display, opts?.referenceRect);
+  return Array.from({ length: count }, (_, i) =>
+    cascadeSlotRect(i, display, {
+      ...opts,
+      width: opts?.width ?? def.width,
+      height: opts?.height ?? def.height,
+      maxRows: 12,
+      maxColStride: 240,
+    }),
+  );
 }

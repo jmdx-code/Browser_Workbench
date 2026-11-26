@@ -1,16 +1,25 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { ProductError } from '../domain/workspace.js';
-import { TASK_CAPACITY_VERSION } from '../shared/task-capacity.js';
-
+import { TASK_CAPACITY_VERSION } from '../shared/task-policies.js';
+export interface RouteBase {
+  req: IncomingMessage;
+  res: ServerResponse;
+  route: string;
+  input?: unknown;
+  json: (res: ServerResponse, status: number, body: unknown) => void;
+}
+export function needSvc<T>(v: T | undefined, code: string, msg: string): T {
+  if (!v) throw new ProductError(code, msg, 409);
+  return v;
+}
+export const TASK_CONTRACT_HEADER = 'x-workbench-task-contract';
+const upgrade = (msg: string): never => {
+  throw new ProductError('TASK_CONTRACT_UPGRADE_REQUIRED', msg, 409);
+};
 export function assertTaskCapacity(header: unknown, value: { maxConcurrentProfiles: number }) {
   if (value.maxConcurrentProfiles > 50 && header !== TASK_CAPACITY_VERSION)
-    throw new ProductError(
-      'TASK_CONTRACT_UPGRADE_REQUIRED',
-      '超过50个浏览器的并发设置需要新版界面，请刷新软件页面',
-      409,
-    );
+    upgrade('超过50个浏览器的并发设置需要新版界面，请刷新软件页面');
 }
-
-export const TASK_CONTRACT_HEADER = 'x-workbench-task-contract';
 export function assertTaskContract(
   header: string | string[] | undefined,
   steps: readonly {
@@ -27,67 +36,33 @@ export function assertTaskContract(
     (typeof header !== 'string' || !['1', '2', '3', '4', '5'].includes(header))
   )
     throw new ProductError('TASK_CONTRACT_UNSUPPORTED', '任务契约版本不兼容，请刷新软件页面', 409);
+  const v = header ?? '';
+  const reqPost = (fn: (s: { type: string; audience?: string; aiLabel?: string }) => boolean) =>
+    steps.some((s) => s.spec?.type === 'post' && fn(s.spec)) ||
+    plans.some((p) => p.snapshot.steps.some((s) => s.type === 'post' && fn(s)));
+  if (!['4', '5'].includes(v) && reqPost((s) => s.aiLabel !== undefined))
+    upgrade('AI 声明选项需要新版界面，请刷新软件页面');
+  if (!['3', '4', '5'].includes(v) && reqPost((s) => s.audience === 'friends'))
+    upgrade('快拍好友范围需要新版界面，请刷新软件页面');
   if (
-    header !== '4' &&
-    header !== '5' &&
-    (steps.some((step) => step.spec?.type === 'post' && step.spec.aiLabel !== undefined) ||
-      plans.some((plan) =>
-        plan.snapshot.steps.some((step) => step.type === 'post' && step.aiLabel !== undefined),
-      ))
-  )
-    throw new ProductError(
-      'TASK_CONTRACT_UPGRADE_REQUIRED',
-      'AI 声明选项需要新版界面，请刷新软件页面',
-      409,
-    );
-  if (
-    header !== '3' &&
-    header !== '4' &&
-    header !== '5' &&
-    (steps.some((step) => step.spec?.type === 'post' && step.spec.audience === 'friends') ||
-      plans.some((plan) =>
-        plan.snapshot.steps.some((step) => step.type === 'post' && step.audience === 'friends'),
-      ))
-  )
-    throw new ProductError(
-      'TASK_CONTRACT_UPGRADE_REQUIRED',
-      '快拍好友范围需要新版界面，请刷新软件页面',
-      409,
-    );
-  if (
-    header !== '2' &&
-    header !== '3' &&
-    header !== '4' &&
-    header !== '5' &&
+    !['2', '3', '4', '5'].includes(v) &&
     (steps.some(
-      (step) => step.status === 'FAILED' || step.status === 'SKIPPED' || step.outcome !== undefined,
+      (s) => s.status === 'FAILED' || s.status === 'SKIPPED' || s.outcome !== undefined,
     ) ||
-      plans.some((plan) =>
-        plan.snapshot.steps.some((step) => step.type === 'post' && step.audience !== undefined),
-      ))
+      reqPost((s) => s.audience !== undefined))
   )
-    throw new ProductError(
-      'TASK_CONTRACT_UPGRADE_REQUIRED',
-      '当前任务含新版步骤结果，请刷新软件页面',
-      409,
-    );
+    upgrade('当前任务含新版步骤结果，请刷新软件页面');
   if (
-    header !== '5' &&
-    steps.some((step) => {
-      const outcome = step.outcome;
-      return (
-        outcome !== null &&
-        typeof outcome === 'object' &&
-        'kind' in outcome &&
-        outcome.kind === 'SKIPPED' &&
-        'reason' in outcome &&
-        outcome.reason === 'MARKETPLACE_UNAVAILABLE'
-      );
-    })
+    v !== '5' &&
+    steps.some(
+      (s) =>
+        s.outcome !== null &&
+        typeof s.outcome === 'object' &&
+        'kind' in s.outcome &&
+        s.outcome.kind === 'SKIPPED' &&
+        'reason' in s.outcome &&
+        s.outcome.reason === 'MARKETPLACE_UNAVAILABLE',
+    )
   )
-    throw new ProductError(
-      'TASK_CONTRACT_UPGRADE_REQUIRED',
-      '商城正常跳过结果需要新版界面，请刷新软件页面',
-      409,
-    );
+    upgrade('商城正常跳过结果需要新版界面，请刷新软件页面');
 }

@@ -7,7 +7,7 @@ import {
   FACEBOOK_NO_BACKGROUND,
   nativeSolidBackgrounds,
   nativeBackgroundCSS,
-} from '../src/shared/facebook-background.js';
+} from '../src/shared/facebook-post-options.js';
 import { projectFacebookBackground } from '../src/infrastructure/facebook-background-reader.js';
 
 class FixtureNode {

@@ -1,47 +1,48 @@
 import { z } from 'zod';
-import { Id } from './contracts.js';
-
+import { Id, NonNegInt, Sha256Hex, sReq, strictObj } from './contracts.js';
 // Transport identity, supplied by the authenticated executor, never by the UI.
-export const ExecutionContext = z
-  .object({
-    profileId: Id,
-    accountId: z.string().min(1).max(200),
-    connectionEpoch: z.uuid(),
-    leaseId: z.uuid(),
-    generation: z.number().int().nonnegative(),
-  })
-  .strict();
+export const ExecutionContext = strictObj({
+  profileId: Id,
+  accountId: sReq(200),
+  connectionEpoch: Id,
+  leaseId: Id,
+  generation: NonNegInt,
+});
 export const DispatchBinding = ExecutionContext.extend({
   operationId: Id,
   jobId: Id,
   stepId: Id,
-  actionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  actionDigest: Sha256Hex,
 }).strict();
-export const BoundReceipt = z.object({ binding: DispatchBinding, evidence: z.json() }).strict();
+export const BoundReceipt = strictObj({ binding: DispatchBinding, evidence: z.json() });
+const SessionStopBinding = ExecutionContext.extend({ requestId: Id }).strict();
+const SessionStopReceipt = SessionStopBinding.extend({ state: z.literal('stopped') }).strict();
+export type StopReceipt = z.infer<typeof SessionStopReceipt>;
 export type ExecutionSession = z.infer<typeof ExecutionContext>;
 export type Binding = z.infer<typeof DispatchBinding>;
-export type ExecutionReceipt = z.infer<typeof BoundReceipt>;
-
-export function sameExecution(
+export const sameExecution = (
   a: ExecutionSession | null | undefined,
   b: ExecutionSession | null | undefined,
-): boolean {
-  if (!a || !b) return false;
-  return (
+): boolean =>
+  Boolean(
+    a &&
+    b &&
     a.profileId === b.profileId &&
     a.accountId === b.accountId &&
     a.connectionEpoch === b.connectionEpoch &&
     a.leaseId === b.leaseId &&
-    a.generation === b.generation
+    a.generation === b.generation,
   );
-}
-export function sameBinding(a: Binding | null | undefined, b: Binding | null | undefined): boolean {
-  if (!a || !b) return false;
-  return (
+export const sameBinding = (
+  a: Binding | null | undefined,
+  b: Binding | null | undefined,
+): boolean =>
+  Boolean(
+    a &&
+    b &&
     sameExecution(a, b) &&
     a.operationId === b.operationId &&
     a.jobId === b.jobId &&
     a.stepId === b.stepId &&
-    a.actionDigest === b.actionDigest
+    a.actionDigest === b.actionDigest,
   );
-}

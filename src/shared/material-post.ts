@@ -1,10 +1,8 @@
 import { z } from 'zod';
-import { Action } from './browser-actions.js';
-import { BoundReceipt } from './task-execution.js';
+import { Id, Sha256Hex, addIssue, intRange, sReq, strictObj } from './contracts.js';
 import { OwnedTabProof } from './kernel-state.js';
-import { DirectoryMaterialPostIntent, ResourceMaterialPostIntent } from './material-index.js';
-
-export const PostPurpose = z.enum([
+import { BoundReceipt } from './task-execution.js';
+const PostPurpose = z.enum([
   'PREPARE_HOME',
   'PREPARE_STORY',
   'OPEN_COMPOSER',
@@ -25,139 +23,94 @@ export const PostPurpose = z.enum([
   'ADVANCE_COMPOSER',
   'SUBMIT',
 ]);
-export const PreparePostOperation = z
-  .object({ attemptId: z.uuid(), operationId: z.uuid(), purpose: PostPurpose, action: Action })
-  .strict();
-export const PostOperation = PreparePostOperation.extend({
-  sequence: z.number().int().positive(),
-}).strict();
-// Produced by a trusted independent business observer, never by transport ACK or public HTTP.
-export const PostEvidence = z
-  .object({
-    kind: z.literal('material-post-verification'),
-    independent: z.literal(true),
-    attemptId: z.uuid(),
-    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-    purpose: PostPurpose,
-    proof: OwnedTabProof,
-    observedAccountId: z.string().min(1).max(200),
-    observationId: z.uuid(),
-    checkedAt: z.string().datetime(),
-    outcome: z.enum(['APPLIED', 'NOT_APPLIED', 'PUBLISHED', 'NOT_PUBLISHED']),
-    basis: z.enum([
-      'page-preparation-observed',
-      'composer-effect-observed',
-      'media-upload-observed',
-      'verified-action-not-applied',
-      'own-post-observed',
-      'submission-confirmed-not-published',
-    ]),
-    postId: z.string().min(1).max(200).nullable(),
-    media: z
-      .object({
-        ready: z.literal(true),
-        format: z.enum(['single-image', 'multi-image', 'video']),
-        count: z.number().int().min(1).max(20),
-      })
-      .strict()
-      .optional(),
-  })
-  .strict()
-  .superRefine((evidence, ctx) => {
-    if (
-      (evidence.purpose === 'SUBMIT') !==
-        ['PUBLISHED', 'NOT_PUBLISHED'].includes(evidence.outcome) ||
-      (evidence.outcome === 'PUBLISHED') !== (evidence.postId !== null)
-    )
-      ctx.addIssue({ code: 'custom', message: 'POST_EVIDENCE_PHASE_INVALID' });
-    const basis = {
-      APPLIED:
-        evidence.purpose === 'UPLOAD_MEDIA'
-          ? 'media-upload-observed'
-          : ['PREPARE_HOME', 'PREPARE_STORY'].includes(evidence.purpose)
-            ? 'page-preparation-observed'
-            : 'composer-effect-observed',
-      NOT_APPLIED: 'verified-action-not-applied',
-      PUBLISHED: 'own-post-observed',
-      NOT_PUBLISHED: 'submission-confirmed-not-published',
-    };
-    if (evidence.basis !== basis[evidence.outcome])
-      ctx.addIssue({ code: 'custom', message: 'POST_EVIDENCE_BASIS_INVALID' });
-    if (
-      (evidence.purpose === 'UPLOAD_MEDIA' && evidence.outcome === 'APPLIED') !==
-      (evidence.media !== undefined)
-    )
-      ctx.addIssue({ code: 'custom', message: 'POST_MEDIA_OBSERVATION_REQUIRED' });
-  });
-export const PostReceipt = BoundReceipt.extend({ evidence: PostEvidence }).strict();
-// This verdict is for the whole attempt, not an operation purpose. Define its
-// actual shared fields explicitly; operation-only cross-field checks do not
-// apply here and current Zod correctly rejects omitting refined fields.
-export const NegativeAttemptEvidence = z
-  .object({
-    kind: PostEvidence.shape.kind,
-    independent: PostEvidence.shape.independent,
-    attemptId: PostEvidence.shape.attemptId,
-    fingerprint: PostEvidence.shape.fingerprint,
-    proof: PostEvidence.shape.proof,
-    observedAccountId: PostEvidence.shape.observedAccountId,
-    observationId: PostEvidence.shape.observationId,
-    checkedAt: PostEvidence.shape.checkedAt,
+const PostEvidenceBase = strictObj({
+  kind: z.literal('material-post-verification'),
+  independent: z.literal(true),
+  attemptId: Id,
+  fingerprint: Sha256Hex,
+  purpose: PostPurpose,
+  proof: OwnedTabProof,
+  observedAccountId: sReq(200),
+  observationId: Id,
+  checkedAt: z.string().datetime(),
+  outcome: z.enum(['APPLIED', 'NOT_APPLIED', 'PUBLISHED', 'NOT_PUBLISHED']),
+  basis: z.enum([
+    'page-preparation-observed',
+    'composer-effect-observed',
+    'media-upload-observed',
+    'verified-action-not-applied',
+    'own-post-observed',
+    'submission-confirmed-not-published',
+  ]),
+  postId: sReq(200).nullable(),
+  media: strictObj({
+    ready: z.literal(true),
+    format: z.enum(['single-image', 'multi-image', 'video']),
+    count: intRange(1, 20),
+  }).optional(),
+});
+const PostEvidence = PostEvidenceBase.superRefine((e, ctx) => {
+  if (
+    (e.purpose === 'SUBMIT') !== ['PUBLISHED', 'NOT_PUBLISHED'].includes(e.outcome) ||
+    (e.outcome === 'PUBLISHED') !== (e.postId !== null)
+  )
+    addIssue(ctx, 'POST_EVIDENCE_PHASE_INVALID');
+  const expectedBasis = {
+    APPLIED:
+      e.purpose === 'UPLOAD_MEDIA'
+        ? 'media-upload-observed'
+        : ['PREPARE_HOME', 'PREPARE_STORY'].includes(e.purpose)
+          ? 'page-preparation-observed'
+          : 'composer-effect-observed',
+    NOT_APPLIED: 'verified-action-not-applied',
+    PUBLISHED: 'own-post-observed',
+    NOT_PUBLISHED: 'submission-confirmed-not-published',
+  };
+  if (e.basis !== expectedBasis[e.outcome]) addIssue(ctx, 'POST_EVIDENCE_BASIS_INVALID');
+  if ((e.purpose === 'UPLOAD_MEDIA' && e.outcome === 'APPLIED') !== (e.media !== undefined))
+    addIssue(ctx, 'POST_MEDIA_OBSERVATION_REQUIRED');
+});
+const PostReceipt = BoundReceipt.extend({ evidence: PostEvidence }).strict();
+const NegativeAttemptEvidence = PostEvidenceBase.pick({
+  kind: true,
+  independent: true,
+  attemptId: true,
+  fingerprint: true,
+  proof: true,
+  observedAccountId: true,
+  observationId: true,
+  checkedAt: true,
+})
+  .extend({
     outcome: z.literal('NOT_PUBLISHED'),
     basis: z.literal('independently-verified-not-published'),
   })
   .strict();
+const idList = z.array(Id).max(200);
 export const AttemptVerdict = z.discriminatedUnion('basis', [
-  z
-    .object({
-      attemptId: z.uuid(),
-      outcome: z.literal('NOT_PUBLISHED'),
-      basis: z.literal('CURRENT_STOP_NO_SUBMIT'),
-      endingId: z.uuid(),
-      operationIds: z.array(z.uuid()).max(200),
-    })
-    .strict(),
-  z
-    .object({
-      attemptId: z.uuid(),
-      outcome: z.enum(['PUBLISHED', 'NOT_PUBLISHED']),
-      basis: z.literal('SUBMIT_OPERATION'),
-      receipt: PostReceipt,
-    })
-    .strict(),
-  z
-    .object({
-      attemptId: z.uuid(),
-      outcome: z.literal('NOT_PUBLISHED'),
-      basis: z.literal('LOCAL_NEVER_DISPATCHED'),
-      operationIds: z.array(z.uuid()).max(200),
-    })
-    .strict(),
-  z
-    .object({
-      attemptId: z.uuid(),
-      outcome: z.literal('NOT_PUBLISHED'),
-      basis: z.literal('INDEPENDENT_ATTEMPT'),
-      evidence: NegativeAttemptEvidence,
-    })
-    .strict(),
+  strictObj({
+    attemptId: Id,
+    outcome: z.literal('NOT_PUBLISHED'),
+    basis: z.literal('CURRENT_STOP_NO_SUBMIT'),
+    endingId: Id,
+    operationIds: idList,
+  }),
+  strictObj({
+    attemptId: Id,
+    outcome: z.enum(['PUBLISHED', 'NOT_PUBLISHED']),
+    basis: z.literal('SUBMIT_OPERATION'),
+    receipt: PostReceipt,
+  }),
+  strictObj({
+    attemptId: Id,
+    outcome: z.literal('NOT_PUBLISHED'),
+    basis: z.literal('LOCAL_NEVER_DISPATCHED'),
+    operationIds: idList,
+  }),
+  strictObj({
+    attemptId: Id,
+    outcome: z.literal('NOT_PUBLISHED'),
+    basis: z.literal('INDEPENDENT_ATTEMPT'),
+    evidence: NegativeAttemptEvidence,
+  }),
 ]);
-const DirectoryArchiveRequest = z
-  .object({
-    attemptId: z.uuid(),
-    intent: DirectoryMaterialPostIntent,
-    postId: z.string().min(1).max(200),
-    archiveDirectory: z.string().min(1).max(2048),
-  })
-  .strict();
-export const ResourceArchiveRequest = DirectoryArchiveRequest.extend({
-  intent: ResourceMaterialPostIntent,
-  archiveDirectory: z.null(),
-}).strict();
-export const ArchiveRequest = z.union([DirectoryArchiveRequest, ResourceArchiveRequest]);
-export type PreparePost = z.infer<typeof PreparePostOperation>;
-export type PostLink = z.infer<typeof PostOperation>;
-export type VerifiedPostReceipt = z.infer<typeof PostReceipt>;
-export type AttemptResult = z.infer<typeof AttemptVerdict>;
-export type NegativePostEvidence = z.infer<typeof NegativeAttemptEvidence>;
-export type PendingArchive = z.infer<typeof ArchiveRequest>;

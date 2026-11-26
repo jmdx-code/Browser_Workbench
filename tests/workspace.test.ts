@@ -7,17 +7,11 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { WorkspaceService } from '../src/application/workspace-service.js';
-import {
-  CombinationSchema,
-  CombinationDraftSchema,
-  StopResultsSchema,
-  type Combination,
-  type Profile,
-} from '../src/shared/contracts.js';
+import { CombinationSchema, type Combination, type Profile } from '../src/shared/contracts.js';
 import { toggleSet, selectionState } from '../src/renderer/selection.js';
-import { dropMaterialUsageSchema, dropStoryPrivacySchema } from './fixtures/workspace-schema.js';
+import { latestMigrationBackupMarker } from './fixtures/workspace-schema.js';
 
-test('schema25 upgrades the preparation contract with backup while retaining original saved versions and paused work', async () => {
+test('v61->v62 upgrade backs up and preserves combinations, preferences, and execution contracts', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-preparation-upgrade-'));
   const file = path.join(directory, 'workspace.sqlite');
   try {
@@ -25,10 +19,7 @@ test('schema25 upgrades the preparation contract with backup while retaining ori
     const saved = initial.createCombination(combination());
     initial.close();
     const previous = new DatabaseSync(file);
-    previous.exec(
-      dropStoryPrivacySchema +
-        "DROP INDEX one_original_post_background; DROP TABLE workspace_preferences; DELETE FROM workspace_execution_contracts WHERE name IN ('post-native-background','post-home-preparation','browse-wheel-visual-anchor'); PRAGMA user_version=25",
-    );
+    previous.exec('PRAGMA user_version=61');
     previous.close();
     const migrated = await WorkspaceStore.open(file);
     try {
@@ -54,9 +45,7 @@ test('schema25 upgrades the preparation contract with backup while retaining ori
       check.close();
     }
     assert.ok(
-      (await readdir(directory)).some((name) =>
-        name.includes('.before-v' + workspaceSchemaVersion + '-'),
-      ),
+      (await readdir(directory)).some((name) => name.includes(latestMigrationBackupMarker)),
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -97,7 +86,7 @@ async function withStore(run: (store: WorkspaceStore, file: string) => Promise<v
   }
 }
 
-test('Marketplace task compatibility gate upgrades18 with backup, retaining original combinations and scheduler settings', async () => {
+test('Marketplace task compatibility gate upgrades v60 with backup, retaining original combinations and scheduler settings', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-marketplace-migration-'));
   const file = path.join(dir, 'workspace.sqlite');
   try {
@@ -106,10 +95,7 @@ test('Marketplace task compatibility gate upgrades18 with backup, retaining orig
     original.tasks.setSettings({ maxConcurrentProfiles: 4 });
     original.close();
     const old = new DatabaseSync(file);
-    old.exec(
-      dropMaterialUsageSchema +
-        "DELETE FROM workspace_execution_contracts WHERE name IN ('marketplace-task','task-page-lifecycle'); PRAGMA user_version=18",
-    );
+    old.exec('PRAGMA user_version=60');
     old.close();
     const migrated = await WorkspaceStore.open(file);
     try {
@@ -156,7 +142,7 @@ test('Marketplace task compatibility gate upgrades18 with backup, retaining orig
       migrated.close();
     }
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 });
   }
 });
 test('four-step contract preserves repeated feed steps and rejects duplicate step identity', () => {
@@ -167,7 +153,6 @@ test('four-step contract preserves repeated feed steps and rejects duplicate ste
   assert.ok(first && last);
   last.id = first.id;
   assert.equal(CombinationSchema.safeParse(value).success, false);
-  assert.equal(CombinationDraftSchema.safeParse(value).success, false);
 });
 test('finite round validation and account repeat protection cannot silently weaken', () => {
   const value = combination();
@@ -183,18 +168,18 @@ test('finite round validation and account repeat protection cannot silently weak
     false,
   );
 });
-test('saved versions stay immutable while a draft is edited, published, and discarded', async () => {
+test('saved versions stay immutable while a combination is updated with conflict checks', async () => {
   await withStore(async (store, file) => {
     const original = await store.createCombination(combination());
     const edited = { ...combination(), name: '活跃2' };
-    const draft = await store.writeDraft(original.id, 0, edited);
-    assert.equal(draft.saved?.name, '活跃1');
-    assert.equal(draft.draft?.name, '活跃2');
-    await assert.rejects(async () => await store.writeDraft(original.id, 0, edited), /其他窗口/);
-    const published = await store.publish(original.id, draft.revision);
-    assert.equal(published.version, 2);
-    assert.equal(published.saved?.name, '活跃2');
-    assert.equal(published.draft, null);
+    const saved = await store.saveCombination(original.id, 0, edited);
+    assert.equal(saved.version, 2);
+    assert.equal(saved.saved?.name, '活跃2');
+    assert.equal(saved.draft, null);
+    await assert.rejects(
+      async () => await store.saveCombination(original.id, 0, edited),
+      /其他窗口/,
+    );
     const db = new DatabaseSync(file);
     try {
       const row = db.prepare('SELECT body FROM combination_versions WHERE version=1').get();
@@ -206,16 +191,9 @@ test('saved versions stay immutable while a draft is edited, published, and disc
     } finally {
       db.close();
     }
-    const next = await store.writeDraft(original.id, published.revision, {
-      ...edited,
-      name: '草稿3',
-    });
-    const discarded = await store.discardDraft(original.id, next.revision);
-    assert.equal(discarded.saved?.name, '活跃2');
-    assert.equal(discarded.draft, null);
   });
 });
-test('groups, bulk transfers, aliases and unsaved drafts persist after database reopen', async () => {
+test('groups, bulk transfers, aliases and combinations persist after database reopen', async () => {
   await withStore(async (store, file) => {
     const group = await store.createGroup('主力', 'green');
     await assert.rejects(async () => await store.createGroup('主力', 'blue'), /已存在/);
@@ -223,13 +201,14 @@ test('groups, bulk transfers, aliases and unsaved drafts persist after database 
     await store.moveProfiles(ids, group.id);
     await store.renameProfile(ids[0] ?? '', 'Chrome 004');
     const saved = await store.createCombination(combination());
-    await store.writeDraft(saved.id, saved.revision, { ...combination(), name: '待保存草稿' });
+    await store.saveCombination(saved.id, saved.revision, { ...combination(), name: '更新后组合' });
     const reopened = await WorkspaceStore.open(file);
     try {
       assert.equal(reopened.groups()[0]?.name, '主力');
       assert.equal(reopened.profileMetadata().size, 29);
       assert.equal(reopened.profileMetadata().get(ids[0] ?? '')?.alias, 'Chrome 004');
-      assert.equal(reopened.combinations()[0]?.draft?.name, '待保存草稿');
+      assert.equal(reopened.combinations()[0]?.saved?.name, '更新后组合');
+      assert.equal(reopened.combinations()[0]?.draft, null);
       assert.equal(reopened.combinations()[0]?.saved?.steps.length, 4);
       assert.equal(reopened.combinations()[0]?.saved?.steps[3]?.type, 'feed');
     } finally {
@@ -296,7 +275,7 @@ test('future schema is rejected without changing its version or data', async () 
     await rm(dir, { recursive: true, force: true });
   }
 });
-test('service rejects unknown profiles before moving and isolates partial stop failures', async () => {
+test('service rejects unknown profiles before renaming', async () => {
   await withStore(async (store) => {
     const ids = [randomUUID(), randomUUID()];
     const profiles: Profile[] = ids.map((id) => ({
@@ -312,28 +291,16 @@ test('service rejects unknown profiles before moving and isolates partial stop f
       capabilities: [],
       account: { state: 'unknown', id: null, name: null, avatar: null },
     }));
-    const stopped: string[] = [];
     const service = new WorkspaceService(store, {
       profiles: () => profiles,
       records: () => [],
-      stop: (id) => {
-        if (id === ids[1]) throw Error('OFFLINE');
-        stopped.push(id);
-      },
+      stop: () => {},
     });
     await assert.rejects(
-      async () => await service.moveProfiles([ids[0] ?? '', randomUUID()], null),
+      async () => await service.renameProfile(randomUUID(), '不存在资料'),
       /不存在/,
     );
     assert.equal((await store.profileMetadata()).size, 0);
-    const results = await service.stopProfiles(ids);
-    assert.equal(StopResultsSchema.parse({ results }).results.length, 2);
-    assert.deepEqual(
-      results.map((row) => row.requested),
-      [true, false],
-    );
-    assert.equal(stopped.length, 1);
-    assert.throws(() => service.startCombination(), /尚未实现/);
     assert.equal((await service.snapshot()).support.comboExecution, false);
   });
 });
@@ -346,24 +313,15 @@ test('cross-group selection is preserved when filtering and toggling a partial g
   assert.deepEqual([...toggleSet(next, ['A', 'B'], false)], ['C']);
   assert.deepEqual([...selected], ['A', 'C']);
 });
-test('incomplete new drafts persist, but publishing validates and keeps the draft on failure', async () => {
+test('invalid combinations are rejected before saving', async () => {
   await withStore(async (store) => {
     const value = combination();
     const post = value.steps[2];
     assert.ok(post && post.type === 'post');
     post.resourceDirectory = '';
-    const draft = await store.createDraft(value);
-    assert.equal(draft.version, 0);
-    assert.equal(draft.saved, null);
-    await assert.rejects(
-      async () => await store.discardDraft(draft.id, draft.revision),
-      /草稿已保留/,
-    );
-    await assert.rejects(async () => await store.publish(draft.id, draft.revision));
-    assert.equal((await store.combinations())[0]?.draft?.steps.length, 4);
-    assert.equal((await store.combinations())[0]?.version, 0);
+    await assert.rejects(async () => await store.createCombination(value));
+    assert.equal((await store.combinations()).length, 0);
     post.resourceDirectory = 'D:\\素材';
-    const ready = await store.writeDraft(draft.id, draft.revision, value);
-    assert.equal((await store.publish(draft.id, ready.revision)).version, 1);
+    assert.equal((await store.createCombination(value)).version, 1);
   });
 });

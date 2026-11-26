@@ -15,8 +15,7 @@ import {
   projectFacebookBrowsePage,
   projectFacebookFeedInputFence,
 } from './facebook-browse-reader.js';
-import { EXTENSION_VERSION } from '../shared/extension-version.js';
-
+import { detectAbnormalFacebookDom } from './shared-dom-eval-runtime.js';
 const Fence = z
   .object({
     url: z.union([
@@ -34,18 +33,7 @@ const AbnormalReason = z.enum([
   'FACEBOOK_ACCOUNT_RESTRICTED',
   'FACEBOOK_ACCOUNT_LOGGED_OUT',
 ]);
-const detectAbnormalDom = `(() => {
-  const loginForm = Boolean(
-    document.querySelector('input[name="email"]') &&
-    document.querySelector('input[name="pass"], input[type="password"]'),
-  );
-  if (loginForm) return 'FACEBOOK_ACCOUNT_LOGGED_OUT';
-  const bodyText = (document.body?.innerText || '').slice(0, 4000);
-  if (/account has been disabled|your account is disabled|we suspended your account|账号已被停用|账户已被停用|已停用你的账户/i.test(bodyText)) {
-    return 'FACEBOOK_ACCOUNT_RESTRICTED';
-  }
-  return null;
-})()`;
+const detectAbnormalDom = `(${detectAbnormalFacebookDom.toString()})()`;
 function assertNotAbnormalIdentity(raw: unknown) {
   if (!raw || typeof raw !== 'object') return;
   if ('url' in raw && typeof raw.url === 'string') {
@@ -60,7 +48,7 @@ function assertNotAbnormalIdentity(raw: unknown) {
 /* One synchronous browser evaluation ties the fresh actor to its document. The
  * JS turn cannot navigate between those reads; avoid three independent RPC waits
  * on every browse sample while retaining the current owner guards at both ends. */
-const fnCacheTag = 'v0_1_171_' + EXTENSION_VERSION.replace(/\W+/g, '_');
+const fnCacheTag = 'v0_3_92_r2';
 const expression = `(() => {
   const timeOrigin = performance.timeOrigin;
   const projectIdentity = (globalThis.__wbProjectDocIdentity_${fnCacheTag} ??= ${projectFacebookDocumentIdentity.toString()});
@@ -79,7 +67,6 @@ export async function readCurrentFacebookBrowseIdentity(page: Page, guard: () =>
   const { actor: selected, ...document } = actor;
   return { actor: selected, document };
 }
-
 const sampleExpression = `(() => {
   const projectIdentity = (globalThis.__wbProjectDocIdentity_${fnCacheTag} ??= ${projectFacebookDocumentIdentity.toString()});
   const projectPage = (globalThis.__wbProjectBrowsePage_${fnCacheTag} ??= ${projectFacebookBrowsePage.toString()});

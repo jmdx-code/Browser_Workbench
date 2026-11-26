@@ -1,11 +1,11 @@
 import type { SynchronousRepository } from '../domain/persistence.js';
 import { z } from 'zod';
 import type { DatabaseSync } from 'node:sqlite';
-import { TaskResourceBinding, TaskResourceSnapshot } from '../shared/task-resources.js';
+import { TaskResourceBinding, TaskResourceSnapshot } from '../shared/task-policies.js';
 import type { Assignment, Plan } from '../shared/task-contracts.js';
 import type { Combination } from '../shared/contracts.js';
-import type { TaskResourceRepository as CompatibleTaskResourceRepository } from '../domain/task-resources.js';
-import { needsResourceTable } from '../domain/task-resources.js';
+import type { TaskResourceRepository as CompatibleTaskResourceRepository } from '../domain/resource-material-rules.js';
+import { needsResourceTable } from '../domain/resource-material-rules.js';
 import { hasResource } from '../domain/resource-table.js';
 import { ProductError } from '../domain/workspace.js';
 import { SqliteResourceTableRepository } from './resource-table-store.js';
@@ -30,10 +30,9 @@ export class SqliteTaskResourceRepository implements TaskResourceRepository {
       throw new ProductError('RESOURCE_TABLE_EMPTY', '资源表没有可分配的内容', 409);
     return table.revision;
   }
-  // Called only from the original assignment transaction after plan creation.
   insert(plan: Plan, resourceRevision: number) {
     if (!this.db.isTransaction) throw Error('TASK_RESOURCE_ASSIGNMENT_TRANSACTION_REQUIRED');
-    const binding = TaskResourceBinding.parse({
+    const b = TaskResourceBinding.parse({
       jobId: plan.id,
       combinationId: plan.combinationId,
       resourceRevision,
@@ -41,7 +40,7 @@ export class SqliteTaskResourceRepository implements TaskResourceRepository {
     });
     this.db
       .prepare('INSERT INTO task_resource_bindings VALUES(?,?,?,?)')
-      .run(binding.jobId, binding.combinationId, binding.resourceRevision, binding.createdAt);
+      .run(b.jobId, b.combinationId, b.resourceRevision, b.createdAt);
   }
   binding(jobId: string) {
     z.uuid().parse(jobId);

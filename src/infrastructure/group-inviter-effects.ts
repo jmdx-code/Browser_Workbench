@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Awaitable } from '../domain/persistence.js';
 import { readFacebookAcrossNavigation } from './facebook-navigation-read.js';
 import type { Page } from 'playwright-core';
-
+import { serializeDomEval, type createDomEvalRuntime } from './shared-dom-eval-runtime.js';
 export const inviteDialogSelector = '[role="dialog"]';
 export interface InvitationRecipient {
   id: string | null;
@@ -42,99 +42,22 @@ export interface GroupInvitationState {
   inviteButtonIndex?: number;
   relay?: { available: boolean; edgeCount: number; groupId: string | null };
 }
-
-// Synchronous read projection; controlled DOM markers identify the observed controls. Relay is read-only.
-export function projectGroupInvitationState(selector = inviteDialogSelector): GroupInvitationState {
-  document
-    .querySelectorAll(
-      '[data-wb-recipient-id],[data-wb-group-send-btn],[data-wb-group-close-btn],[data-wb-group-invite-menuitem],[data-wb-intervention-dismiss-btn]',
-    )
-    .forEach((el) => {
-      for (const attribute of [
-        'data-wb-recipient-id',
-        'data-wb-group-send-btn',
-        'data-wb-group-close-btn',
-        'data-wb-group-invite-menuitem',
-        'data-wb-intervention-dismiss-btn',
-      ])
-        el.removeAttribute(attribute);
-    });
-  type RecordValue = Record<string, unknown>;
-  const record = (v: unknown): v is RecordValue => !!v && typeof v === 'object';
-  const uid = (v: unknown): v is string => typeof v === 'string' && /^\d{5,25}$/.test(v);
-  const visible = (el: Element) => {
-    const r = el.getBoundingClientRect(),
-      s = getComputedStyle(el);
-    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-  };
+function projectGroupInvitationEntry(
+  createRt: typeof createDomEvalRuntime,
+  selector = '[role="dialog"]',
+): GroupInvitationState {
+  const { record, uid, visible, chain, clearDataAttrs } = createRt();
+  clearDataAttrs([
+    'data-wb-recipient-id',
+    'data-wb-group-send-btn',
+    'data-wb-group-close-btn',
+    'data-wb-group-invite-menuitem',
+    'data-wb-intervention-dismiss-btn',
+    'data-wb-group-invite-btn',
+    'data-wb-group-join-btn',
+  ]);
   const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
-    __wbReactRootNodesV1?: WeakMap<Element, RecordValue>;
     __wbInvitationScriptUserV1?: { timeOrigin: number; id: string | null };
-  };
-  const rootFibers = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, RecordValue>());
-  let rootScanned = false;
-  const currentRootFiber = (node: RecordValue | undefined): RecordValue | undefined => {
-    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
-      let root: unknown = candidate;
-      for (let depth = 0; record(root) && depth < 256; depth++) {
-        if (!root.return) {
-          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
-          break;
-        }
-        root = root.return;
-      }
-    }
-    return undefined;
-  };
-  const rootFiber = (el: Element) => {
-    // Some current React builds expose only __reactContainer$, not per-node Fiber keys.
-    const cached = currentRootFiber(rootFibers.get(el));
-    if (cached) {
-      rootFibers.set(el, cached);
-      return cached;
-    }
-    if (!rootScanned) {
-      rootScanned = true;
-      const seen = new Set<unknown>(),
-        stack: unknown[] = [];
-      for (const host of Array.from(document.querySelectorAll('*')))
-        for (const key of Object.keys(host).filter((k) => k.startsWith('__reactContainer$'))) {
-          const root = Reflect.get(host, key);
-          stack.push(
-            record(root) && record(root.stateNode) ? (root.stateNode.current ?? root) : root,
-          );
-        }
-      while (stack.length && seen.size < 100000) {
-        const f = stack.pop();
-        if (!record(f) || seen.has(f)) continue;
-        seen.add(f);
-        if (f.stateNode instanceof Element) rootFibers.set(f.stateNode, f);
-        if (f.child) stack.push(f.child);
-        if (f.sibling) stack.push(f.sibling);
-      }
-    }
-    return rootFibers.get(el);
-  };
-  const chain = (el: Element, limit = 48) => {
-    const key = Object.keys(el).find(
-      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
-    );
-    let node: unknown = key ? Reflect.get(el, key) : rootFiber(el);
-    const result: { name: string; props: RecordValue }[] = [];
-    for (let n = 0; n < limit && record(node); n++, node = node.return) {
-      const type = node.elementType ?? node.type;
-      const name =
-        typeof type === 'function'
-          ? String(Reflect.get(type, 'displayName') ?? type.name)
-          : record(type)
-            ? String(type.displayName ?? '')
-            : typeof type === 'string'
-              ? type
-              : '';
-      const props = node.memoizedProps ?? node.pendingProps;
-      result.push({ name, props: record(props) ? props : {} });
-    }
-    return result;
   };
   const reference = (el: Element) => {
     for (const f of chain(el)) {
@@ -149,10 +72,10 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     return null;
   };
   const readRecipient = (el: Element): InvitationRecipient => {
-    let id: string | null = null,
-      name: string | undefined,
-      invited = false,
-      member = false;
+    let id: string | null = null;
+    let name: string | undefined;
+    let invited = false;
+    let member = false;
     for (const f of chain(el, 28)) {
       const user = f.props['user$key'];
       const candidate = record(user) ? (user.id ?? user.__id) : null;
@@ -213,8 +136,8 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
   const relay = { available: false, edgeCount: 0, groupId };
   if (dialog && groupId) {
     try {
-      const ref = reference(dialog),
-        env = ref?.environment;
+      const ref = reference(dialog);
+      const env = ref?.environment;
       const vars = ref?.variables;
       if (
         record(vars) &&
@@ -229,21 +152,19 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
             : null;
         if (record(source) && typeof source.get === 'function') {
           relay.available = true;
-          const get = (id: string): RecordValue | null => {
-            const r = Reflect.apply(source.get as Function, source, [id]);
+          const get = (id: string): Record<string, unknown> | null => {
+            const r = Reflect.apply(source.get as (...args: unknown[]) => unknown, source, [id]);
             return record(r) ? r : null;
           };
-          const group = get(groupId),
-            queue: string[] = [],
-            visited = new Set<string>();
+          const group = get(groupId);
+          const queue: string[] = [];
+          const visited = new Set<string>();
           const links = (value: unknown) => {
-            if (record(value)) {
-              if (typeof value.__ref === 'string') queue.push(value.__ref);
-              if (Array.isArray(value.__refs))
-                for (const id of value.__refs) if (typeof id === 'string') queue.push(id);
-            }
+            if (!record(value)) return;
+            if (typeof value.__ref === 'string') queue.push(value.__ref);
+            if (Array.isArray(value.__refs))
+              for (const id of value.__refs) if (typeof id === 'string') queue.push(id);
           };
-          // Follow this group's invite connections, never edges belonging to another group.
           if (group)
             for (const [key, value] of Object.entries(group))
               if (/invite_member_search|suggested_members/.test(key)) links(value);
@@ -253,8 +174,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
             if (visited.has(id)) continue;
             visited.add(id);
             const edge = get(id);
-            if (!edge) continue;
-            if (edge.__typename === 'User') continue;
+            if (!edge || edge.__typename === 'User') continue;
             if (
               edge.__typename === 'GroupInviteMemberSearchEdge' ||
               edge.__typename === 'GroupSuggestedMembersEdge'
@@ -282,48 +202,31 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
             }
         }
       }
-    } catch {
-      /* DOM evidence remains usable when the local store is unavailable. */
-    }
+    } catch {}
   }
   const buttons = Array.from(dialog?.querySelectorAll('[role="button"],button') ?? []);
-  const semantic = (el: Element) => chain(el, 12).find((f) => f.name.includes('FDSButton.react'));
-  const primary = buttons
-    .map((el, index) => ({ el, index, props: semantic(el)?.props }))
+  const indexedButtons = buttons.map((el, index) => ({ el, index, frames: chain(el, 12) }));
+  const primary = indexedButtons
+    .map((b) => ({ ...b, props: b.frames.find((f) => f.name.includes('FDSButton.react'))?.props }))
     .filter((b) => b.props?.type === 'primary');
   const close =
-    buttons
-      .map((el, index) => ({ el, index, frames: chain(el, 12) }))
-      .find((b) => b.frames.some((f) => f.name.includes('FDSCircleButton'))) ??
-    buttons
-      .map((el, index) => ({ el, index, frames: chain(el, 12) }))
-      .find((b) =>
-        b.frames.some((f) => f.name.includes('FDSButton.react') && f.props.type === 'secondary'),
-      );
+    indexedButtons.find((b) => b.frames.some((f) => f.name.includes('FDSCircleButton'))) ??
+    indexedButtons.find((b) =>
+      b.frames.some((f) => f.name.includes('FDSButton.react') && f.props.type === 'secondary'),
+    );
+  const isInterventionFrame = (f: { name: string; props: Record<string, unknown> }) =>
+    /GroupsCometFeatureInterventionDialog|SentryBlockDialog|CometErrorDialog/.test(f.name) ||
+    f.props.testid === 'feature-intervention-ok-button' ||
+    (record(f.props.footer) &&
+      record(f.props.footer.props) &&
+      record(f.props.footer.props.primary) &&
+      f.props.footer.props.primary.testid === 'feature-intervention-ok-button');
   const interventionDialogs = dialogs.filter(
     (d) =>
       visible(d) &&
-      (chain(d).some(
-        (f) =>
-          /GroupsCometFeatureInterventionDialog|SentryBlockDialog|CometErrorDialog/.test(f.name) ||
-          f.props.testid === 'feature-intervention-ok-button' ||
-          (record(f.props.footer) &&
-            record(f.props.footer.props) &&
-            record(f.props.footer.props.primary) &&
-            f.props.footer.props.primary.testid === 'feature-intervention-ok-button'),
-      ) ||
+      (chain(d).some(isInterventionFrame) ||
         Array.from(d.querySelectorAll('button,[role="button"],h1,h2,[role="heading"]')).some((el) =>
-          chain(el, 32).some(
-            (f) =>
-              /GroupsCometFeatureInterventionDialog|SentryBlockDialog|CometErrorDialog/.test(
-                f.name,
-              ) ||
-              f.props.testid === 'feature-intervention-ok-button' ||
-              (record(f.props.footer) &&
-                record(f.props.footer.props) &&
-                record(f.props.footer.props.primary) &&
-                f.props.footer.props.primary.testid === 'feature-intervention-ok-button'),
-          ),
+          chain(el, 32).some(isInterventionFrame),
         )),
   );
   const verificationRequired = interventionDialogs.length > 0;
@@ -344,26 +247,24 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     dismissBtn?.setAttribute?.('data-wb-intervention-dismiss-btn', '1');
   }
   const pageButtons = Array.from(document.querySelectorAll('[role="button"],button'));
-  document.querySelectorAll('[data-wb-group-invite-btn],[data-wb-group-join-btn]').forEach((el) => {
-    el.removeAttribute('data-wb-group-invite-btn');
-    el.removeAttribute('data-wb-group-join-btn');
-  });
+  const notInShell = (el: Element) =>
+    !el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav');
   const inviteCandidates = pageButtons.filter(
     (el) =>
       visible(el) &&
-      !el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav') &&
+      notInShell(el) &&
       chain(el, 24).some((f) => f.name.includes('GroupsCometHeaderInviteMemberAddButton')),
   );
   const inviteBtn =
     inviteCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? inviteCandidates[0];
   const invite = inviteBtn ? pageButtons.indexOf(inviteBtn) : -1;
-  if (inviteBtn) inviteBtn.setAttribute('data-wb-group-invite-btn', '1');
+  inviteBtn?.setAttribute('data-wb-group-invite-btn', '1');
   const joinCandidates = pageButtons.filter((el) => {
     if (
       !visible(el) ||
       el.getAttribute('aria-disabled') === 'true' ||
       el.hasAttribute?.('disabled') ||
-      el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav')
+      !notInShell(el)
     )
       return false;
     return chain(el, 48).some((f) => {
@@ -374,16 +275,15 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
       const actionObj = record(f.props.action) ? f.props.action : null;
       const actionRef = typeof actionObj?.__id === 'string' ? actionObj.__id : '';
       const actionGroup = /^client:(\d+):join_action\(/.exec(actionRef)?.[1];
-      if (matchedId || actionGroup) {
-        return matchedId === groupId || actionGroup === groupId;
-      }
-      return true;
+      return matchedId || actionGroup ? matchedId === groupId || actionGroup === groupId : true;
     });
   });
   const joinBtn =
     joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
-  if (joinBtn) joinBtn.setAttribute('data-wb-group-join-btn', '1');
-  const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
+  joinBtn?.setAttribute('data-wb-group-join-btn', '1');
+  const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter((m) =>
+    visible(m),
+  );
   const menuItems = menus.map((el, index) => ({
     index,
     preferred:
@@ -418,14 +318,13 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     if (cached?.timeOrigin === timeOrigin && cached.id) scriptUserId = cached.id;
     else {
       for (const script of Array.from(document.scripts)) {
-        const text = script.textContent ?? '';
-        const match = /"ACTOR_ID":"(\d{5,25})"/.exec(text) ?? /"USER_ID":"(\d{5,25})"/.exec(text);
+        const txt = script.textContent ?? '';
+        const match = /"ACTOR_ID":"(\d{5,25})"/.exec(txt) ?? /"USER_ID":"(\d{5,25})"/.exec(txt);
         if (match?.[1]) {
           scriptUserId = match[1];
           break;
         }
       }
-      // A miss may be a still-loading document; retry it next time.
       cacheHost.__wbInvitationScriptUserV1 = { timeOrigin, id: scriptUserId };
     }
   }
@@ -439,7 +338,7 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     dialogLabel: dialog?.getAttribute('aria-label') ?? undefined,
     menu: menus.length > 0,
     menuItems,
-    dialogCount: dialogs.filter(visible).length,
+    dialogCount: dialogs.filter((d) => visible(d)).length,
     joined: invite >= 0,
     items,
     recipients: [...recipients.values()],
@@ -460,6 +359,10 @@ export function projectGroupInvitationState(selector = inviteDialogSelector): Gr
     relay,
   };
 }
+// Synchronous read projection; controlled DOM markers identify the observed controls. Relay is read-only.
+export const projectGroupInvitationState = serializeDomEval<
+  (selector?: string) => GroupInvitationState
+>('projectGroupInvitationState', projectGroupInvitationEntry);
 export async function readGroupInvitationState(
   page: Page,
   guard: () => Awaitable<void> = () => {},
@@ -469,7 +372,6 @@ export async function readGroupInvitationState(
     guard,
   );
 }
-
 export async function dismissFeatureInterventionDialogIfPresent(
   page: Page,
   guard: () => Awaitable<void> = () => {},
@@ -497,9 +399,7 @@ export async function dismissFeatureInterventionDialogIfPresent(
         return false;
       })
       .catch(() => false);
-    if (!clicked) {
-      await page.keyboard?.press?.('Escape')?.catch(() => {});
-    }
+    if (!clicked) await page.keyboard?.press?.('Escape')?.catch(() => {});
     await new Promise((r) => setTimeout(r, 350));
     await guard();
     state = await readGroupInvitationState(page, guard);
@@ -507,7 +407,6 @@ export async function dismissFeatureInterventionDialogIfPresent(
   }
   return !state.verificationRequired;
 }
-
 const InvitationProof = z
   .object({
     friendIds: z.array(z.string()).min(1),
@@ -521,7 +420,6 @@ const InvitationProof = z
       .strict(),
   })
   .strict();
-
 export function groupInvitationEffect(
   label: string,
   state: Awaited<ReturnType<typeof readGroupInvitationState>>,
@@ -544,9 +442,8 @@ export function groupInvitationEffect(
     Boolean(value) &&
     typeof value === 'object' &&
     (value as { unjoinableIntervention?: boolean }).unjoinableIntervention === true
-  ) {
+  )
     return true;
-  }
   const atGroup = url.pathname.split('/')[1] === 'groups' && url.pathname.split('/')[2] === groupId;
   if (!atGroup) return false;
   if (label === 'enter-group') return true;

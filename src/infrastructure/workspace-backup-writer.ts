@@ -4,10 +4,9 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, stat, writeFile, realpath } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import type { WorkspaceBackupWriter } from '../domain/workspace-backup.js';
+import type { WorkspaceBackupWriter } from '../domain/system-ports.js';
 import { WorkspaceBackupResult, WorkspaceBackupManifest } from '../shared/workspace-backup.js';
 import { defaultBackupDirectory } from './paths.js';
-
 // Reuses each original SQLite backup operation. Does not copy live WAL files or source media.
 export class FilesystemWorkspaceBackupWriter implements WorkspaceBackupWriter {
   constructor(

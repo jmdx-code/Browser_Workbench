@@ -1,10 +1,10 @@
-# Development guidelines
+# Development Guidelines
 
-- Use Node.js 24.19+ and the existing Electron / Vite / TypeScript stack.
-- Read README.md, docs/PUBLIC_ARCHITECTURE.md and docs/SOFTWARE_UPDATES.md before changing the project.
-- Preserve layer boundaries and existing persistence migrations. Add new migrations instead of editing applied migrations.
-- Keep changes within the requested scope. Prefer straightforward implementations and reuse existing task/control flows.
-- Never treat an input acknowledgement as a confirmed business result. Preserve pending/unknown results and stop authority correctly.
-- Do not commit account data, credentials, databases, source media or development audit records.
-- Run focused regressions for changed behavior; run npm run check before a release.
-- Local checkouts may contain .local/AGENTS.private.md and private operational notes under docs/. If present, read them before local development. They retain local user constraints and are intentionally excluded from the public repository.
+- Use Node.js 24.19+ and the Electron 44 / Vite 8 / React 19 / TypeScript 5.9 stack.
+- Read `README.md`, `docs/PUBLIC_ARCHITECTURE.md`, `docs/ARCHITECTURE.md`, and `docs/SOFTWARE_UPDATES.md` before changing architecture.
+- Enforce `scripts/check-boundaries.mjs` across all 8 `src/` layers (`shared`, `domain`, `application`, `infrastructure`, `http`, `renderer`, `bridge`, `desktop`) with zero `any`, zero non-null `!`, and zero `@ts-ignore`/`@ts-nocheck`.
+- Keep all source modules cohesive and focused (`< 800` lines per file); split readers, actuators, orchestrators, and route/gateway concerns cleanly without altering verified DOM/GraphQL/ADB/SQL invariants.
+- Preserve SQLite persistence migrations cleanly (append new migrations instead of mutating already-shipped versions).
+- Never treat an input acknowledgement as a confirmed business result; preserve `UNKNOWN` / `pending_approval` evidence and stop authority.
+- Do not commit account data, credentials, SQLite databases, media fixtures, or audit outputs.
+- Verify changes with `npm run format && npm run check`, stress checks when concurrency/transport changes, and live desktop acceptance before finalizing.

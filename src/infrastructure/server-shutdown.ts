@@ -8,7 +8,6 @@ export interface BoundedShutdownDeps {
   serviceStopBudgetMs?: number;
   logFlushBudgetMs?: number;
 }
-
 async function runWithBudget(work: () => Promise<void>, budgetMs: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -22,7 +21,6 @@ async function runWithBudget(work: () => Promise<void>, budgetMs: number): Promi
     if (timer) clearTimeout(timer);
   }
 }
-
 /**
  * Coordinates graceful server shutdown with an explicit budget for stopping
  * background services so `closeBridge()` and `closePersistence()` (WAL checkpoint)

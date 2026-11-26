@@ -1,6 +1,5 @@
 import type { Awaitable } from '../domain/persistence.js';
 import { spawn } from 'node:child_process';
-
 // One bounded local media operation, never a browser controller. No shell or network input.
 export async function runMediaProcess(
   executable: string,

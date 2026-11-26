@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { projectFacebookDocumentIdentity } from '../shared/facebook-document-identity.js';
 import { projectFacebookStoryPage } from './facebook-story-page-reader.js';
-
 const DocumentFence = z
   .object({
     url: z.enum([
@@ -22,7 +21,6 @@ const Creator = z
     actor: FacebookNativeActor.nullable(),
   })
   .strict();
-
 // Selected native actor and the completed StoriesCreate creator stream must agree.
 // A display name, ordinary post preload or an unfinished stream is not a substitute.
 export async function readCurrentFacebookStoryIdentity(page: Page, guard: () => Awaitable<void>) {

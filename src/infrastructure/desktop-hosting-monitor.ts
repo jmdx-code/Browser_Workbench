@@ -1,6 +1,5 @@
 import type { FeatureExecutionRegistry } from '../application/feature-execution-registry.js';
 import type { GoogleSheetsService } from '../application/google-sheets-service.js';
-
 export interface DesktopHostingMonitorDeps {
   isShuttingDown: () => boolean;
   getFeatureExecution: () => FeatureExecutionRegistry | undefined;
@@ -16,7 +15,6 @@ export interface DesktopHostingMonitorDeps {
     summary: string;
   }) => void;
 }
-
 /**
  * Periodically computes active task & auto-monitor hosting state and notifies Electron main
  * for unified powerSaveBlocker management, tray tooltip updates, and close-window guards.

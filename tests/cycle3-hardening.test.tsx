@@ -211,20 +211,21 @@ describe('Cycle 3 renderer hardening regressions', () => {
     });
   });
 
-  it('keeps startup topbar concurrency and auth panel styles out of lazy-only CSS chunks', () => {
-    const designCss = readFileSync(join(process.cwd(), 'src/renderer/design-system.css'), 'utf8');
+  it('keeps startup topbar concurrency and auth panel styles inside the single Tailwind v4 stylesheet', () => {
+    const tailwindCss = readFileSync(join(process.cwd(), 'src/renderer/ui/tailwind.css'), 'utf8');
     const authPanelTsx = readFileSync(
       join(process.cwd(), 'src/renderer/modules/sheets/google-sheets-auth-panel.tsx'),
       'utf8',
     );
-    const authPanelCss = readFileSync(
-      join(process.cwd(), 'src/renderer/modules/sheets/google-sheets-auth-panel.css'),
+    const topbarTsx = readFileSync(
+      join(process.cwd(), 'src/renderer/workbench-topbar.tsx'),
       'utf8',
     );
-    expect(designCss).toContain('.topbar-concurrency-popover');
-    expect(designCss).toContain('.workspace:has(.gs-page)');
-    expect(authPanelTsx).toContain("import './google-sheets-auth-panel.css'");
-    expect(authPanelCss).toContain('.gs-auth-panel');
-    expect(authPanelCss).toContain(".gs-file-btn input[type='file']");
+    const mainTsx = readFileSync(join(process.cwd(), 'src/renderer/main.tsx'), 'utf8');
+    expect(tailwindCss).toContain("@import 'tailwindcss';");
+    expect(mainTsx).toContain("import './ui/tailwind.css';");
+    expect(topbarTsx).toContain('topbar-concurrency-popover');
+    expect(authPanelTsx).not.toContain('.css');
+    expect(authPanelTsx).toContain('type="file"');
   });
 });

@@ -5,7 +5,7 @@ import { constants, createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, copyFile, rename, rm, stat } from 'node:fs/promises';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { z } from 'zod';
-import type { WorkspaceRestorePort } from '../domain/workspace-backup.js';
+import type { WorkspaceRestorePort } from '../domain/system-ports.js';
 import {
   WorkspaceBackupManifest,
   WorkspaceRestoreInspection,
@@ -27,20 +27,21 @@ const PendingRestore = z
 type Pending = z.infer<typeof PendingRestore>;
 const pendingFile = (dataDir: string) => path.join(dataDir, 'pending-restore.json');
 const stageDirectory = (dataDir: string, id: string) => path.join(dataDir, 'data-restores', id);
+
 async function savePending(dataDir: string, value: Pending) {
-  const temp = pendingFile(dataDir) + '.' + randomUUID() + '.tmp';
-  await writeFile(temp, JSON.stringify(PendingRestore.parse(value), null, 2), {
+  const tmp = pendingFile(dataDir) + '.' + randomUUID() + '.tmp';
+  await writeFile(tmp, JSON.stringify(PendingRestore.parse(value), null, 2), {
     flag: 'wx',
     flush: true,
   });
-  await rename(temp, pendingFile(dataDir));
+  await rename(tmp, pendingFile(dataDir));
 }
 async function readPending(dataDir: string) {
   try {
     return PendingRestore.parse(JSON.parse(await readFile(pendingFile(dataDir), 'utf8')));
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
-    throw error;
+  } catch (e) {
+    if (e instanceof Error && 'code' in e && e.code === 'ENOENT') return null;
+    throw e;
   }
 }
 async function fingerprint(file: string) {
@@ -58,42 +59,39 @@ async function inspect(directory: string) {
   const manifest = WorkspaceBackupManifest.parse(
     JSON.parse(await readFile(path.join(directory, 'backup.json'), 'utf8')),
   );
-  for (const record of manifest.files) {
-    const file = path.join(directory, record.name),
+  for (const rec of manifest.files) {
+    const file = path.join(directory, rec.name),
       actual = await fingerprint(file);
-    if (actual.bytes !== record.bytes || actual.sha256 !== record.sha256)
-      throw Error('备份文件已改变或损坏：' + record.name);
+    if (actual.bytes !== rec.bytes || actual.sha256 !== rec.sha256)
+      throw Error('备份文件已改变或损坏：' + rec.name);
     const db = new DatabaseSync(file, { readOnly: true });
     try {
       db.exec('PRAGMA busy_timeout = 5000');
-      const version = db.prepare('PRAGMA user_version').get()?.user_version;
-      const maximum =
-        record.name === 'workspace.sqlite' ? workspaceSchemaVersion : bridgeSchemaVersion;
-      if (typeof version !== 'number' || version < 1 || version > maximum)
+      const v = db.prepare('PRAGMA user_version').get()?.user_version,
+        max = rec.name === 'workspace.sqlite' ? workspaceSchemaVersion : bridgeSchemaVersion;
+      if (typeof v !== 'number' || v < 1 || v > max)
         throw Error('备份版本不兼容，请使用同版或更新的软件');
       if (
         db.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok' ||
         db.prepare('PRAGMA foreign_key_check').all().length
       )
         throw Error('备份数据库检查未通过');
-      // Check that these are the application's databases, without running a migration or recovery.
-      if (record.name === 'workspace.sqlite') {
-        for (const table of ['groups', 'combinations', 'profile_metadata', 'task_plans'])
-          db.prepare('SELECT count(*) FROM ' + table).get();
-      } else
-        for (const table of ['profiles', 'operations', 'tasks'])
-          db.prepare('SELECT count(*) FROM ' + table).get();
+      const reqTables =
+        rec.name === 'workspace.sqlite'
+          ? ['groups', 'combinations', 'profile_metadata', 'task_plans']
+          : ['profiles', 'operations', 'tasks'];
+      for (const t of reqTables) db.prepare('SELECT count(*) FROM ' + t).get();
     } finally {
       db.close();
     }
   }
-  const workspace = new DatabaseSync(path.join(directory, 'workspace.sqlite'), { readOnly: true });
-  const journal = new DatabaseSync(path.join(directory, 'journal.sqlite'), { readOnly: true });
+  const ws = new DatabaseSync(path.join(directory, 'workspace.sqlite'), { readOnly: true }),
+    jn = new DatabaseSync(path.join(directory, 'journal.sqlite'), { readOnly: true });
   try {
-    workspace.exec('PRAGMA busy_timeout = 5000');
-    journal.exec('PRAGMA busy_timeout = 5000');
-    const count = (db: DatabaseSync, table: string) =>
-      Number(db.prepare('SELECT count(*) AS total FROM ' + table).get()?.total);
+    ws.exec('PRAGMA busy_timeout = 5000');
+    jn.exec('PRAGMA busy_timeout = 5000');
+    const cnt = (db: DatabaseSync, t: string) =>
+      Number(db.prepare('SELECT count(*) AS total FROM ' + t).get()?.total);
     return {
       manifest,
       inspection: WorkspaceRestoreInspection.parse({
@@ -101,38 +99,36 @@ async function inspect(directory: string) {
         id: manifest.id,
         createdAt: manifest.createdAt,
         softwareVersion: manifest.softwareVersion,
-        groups: count(workspace, 'groups'),
-        combinations: count(workspace, 'combinations'),
-        profiles: count(journal, 'profiles'),
-        tasks: count(workspace, 'task_plans'),
+        groups: cnt(ws, 'groups'),
+        combinations: cnt(ws, 'combinations'),
+        profiles: cnt(jn, 'profiles'),
+        tasks: cnt(ws, 'task_plans'),
       }),
     };
   } finally {
-    workspace.close();
-    journal.close();
+    ws.close();
+    jn.close();
   }
 }
 
-// This is a software-data transaction, not a browser task or another execution journal.
-// It is staged while running and applied only before opening either DB, after owning the port.
 export class FilesystemWorkspaceRestore implements WorkspaceRestorePort {
   constructor(private readonly dataDir: string) {}
   async inspect(directory: string) {
     return (await inspect(directory)).inspection;
   }
   async status(): Promise<RestoreStatus> {
-    const pending = await readPending(this.dataDir);
+    const p = await readPending(this.dataDir);
     return {
       available: true,
-      state: pending?.state === 'APPLYING' ? 'READY' : (pending?.state ?? 'NONE'),
-      reason: pending?.reason ?? '',
-      safetyDirectory: pending?.safetyDirectory ?? '',
+      state: p?.state === 'APPLYING' ? 'READY' : (p?.state ?? 'NONE'),
+      reason: p?.reason ?? '',
+      safetyDirectory: p?.safetyDirectory ?? '',
     };
   }
   async prepare(directory: string, guard: () => Awaitable<void>) {
     await guard();
-    const previous = await readPending(this.dataDir);
-    if (previous && ['READY', 'APPLYING'].includes(previous.state))
+    const prev = await readPending(this.dataDir);
+    if (prev && ['READY', 'APPLYING'].includes(prev.state))
       throw Error('已有待恢复的数据，请先重启完成恢复');
     const original = await inspect(directory);
     await guard();
@@ -189,8 +185,6 @@ async function replacePair(
     await rm(temp, { force: true, maxRetries: 4, retryDelay: 100 });
     await rm(oldBackup, { force: true, maxRetries: 4, retryDelay: 100 });
     await copyFile(path.join(source, name), temp, constants.COPYFILE_EXCL);
-    // Move existing live DB aside FIRST with Windows EBUSY retry before removing -wal/-shm,
-    // so a locked live DB never loses its WAL if rename cannot acquire the file.
     let movedOld = false;
     try {
       await renameWithWindowsRetry(target, oldBackup);
@@ -204,18 +198,16 @@ async function replacePair(
     try {
       await renameWithWindowsRetry(temp, target);
     } catch (error) {
-      if (movedOld) {
-        await renameWithWindowsRetry(oldBackup, target).catch(() => {});
-      }
+      if (movedOld) await renameWithWindowsRetry(oldBackup, target).catch(() => {});
       await rm(temp, { force: true }).catch(() => {});
       throw error;
     }
-    for (const file of [target + '-wal', target + '-shm', oldBackup]) {
+    for (const file of [target + '-wal', target + '-shm', oldBackup])
       await rm(file, { force: true, maxRetries: 6, retryDelay: 150 });
-    }
     await checkpoint(name);
   }
 }
+
 export async function applyPendingWorkspaceRestore(
   dataDir: string,
   softwareVersion: string,
@@ -247,8 +239,8 @@ export async function applyPendingWorkspaceRestore(
         }
       };
       const safety = await new FilesystemWorkspaceBackupWriter(
-        (file) => snapshot('workspace.sqlite', file),
-        (file) => snapshot('journal.sqlite', file),
+        (f) => snapshot('workspace.sqlite', f),
+        (f) => snapshot('journal.sqlite', f),
         softwareVersion,
       ).write(safetyRoot, () => {});
       pending = { ...pending, state: 'APPLYING', safetyDirectory: safety.directory, reason: '' };

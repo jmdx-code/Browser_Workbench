@@ -9,15 +9,17 @@ import {
   resourceEffectiveRow,
 } from '../domain/resource-materials.js';
 import { ResourceMaterialSnapshot, type ResourceMaterial } from '../shared/resource-materials.js';
-import { normalizeMaterialText } from '../domain/materials.js';
+import { normalizeMaterialText } from '../domain/resource-material-rules.js';
 import type { ResourceRowValue } from '../shared/resource-table.js';
-import type { PostIntent } from '../shared/material-index.js';
-import type { SourceObservation } from '../application/material-source-check.js';
+import { MaterialPostIntent, type PostIntent } from '../shared/material-index.js';
+import type {
+  MaterialSourceVerifier,
+  SourceObservation,
+} from '../application/workspace-media-maintenance.js';
 import type { MaterialFileSnapshot } from '../shared/materials.js';
 import { mediaReference } from '../domain/resource-table.js';
 import type { PublicDriveDownloader } from './public-drive-download.js';
-
-export class FilesystemResourceMaterialVerifier {
+export class FilesystemResourceMaterialVerifier implements MaterialSourceVerifier {
   constructor(
     private readonly reader = new FilesystemResourceSourceReader(),
     private readonly policy = {
@@ -120,13 +122,19 @@ export class FilesystemResourceMaterialVerifier {
       ...(downloaded.length ? { downloads: downloaded } : {}),
     });
   }
+  async copyVerified(
+    input: PostIntent,
+    assertCurrent: () => Awaitable<void>,
+    copyMedia: (file: PostIntent['snapshot']['files'][number], chunk: Uint8Array) => Promise<void>,
+  ): Promise<SourceObservation> {
+    return this.verify(input, assertCurrent, copyMedia);
+  }
   async verify(
-    intent: PostIntent,
+    input: PostIntent,
     assertCurrent: () => Awaitable<void>,
     copyMedia?: (file: PostIntent['snapshot']['files'][number], chunk: Uint8Array) => Promise<void>,
   ): Promise<SourceObservation> {
-    if (!('resource' in intent) || intent.directory !== null)
-      throw Error('RESOURCE_MATERIAL_INTENT_REQUIRED');
+    const intent = MaterialPostIntent.parse(input);
     const payload = validateResourceMaterial(intent.snapshot, intent.resource);
     if (
       intent.fingerprint !== intent.snapshot.fingerprint ||

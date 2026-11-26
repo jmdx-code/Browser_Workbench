@@ -1,19 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { BumperState } from '../../../shared/group-bumper.js';
-import type { BluestacksState } from '../../../shared/bluestacks.js';
 import type { AutoSchedulerState } from '../../../shared/auto-scheduler.js';
+import type { BluestacksState } from '../../../shared/bluestacks.js';
 import type { GoogleSheetsOverview } from '../../../shared/google-sheets.js';
+import type { BumperState } from '../../../shared/group-bumper.js';
 import type { GroupInviterState } from '../../../shared/group-inviter.js';
 import type { PosterState } from '../../../shared/group-poster.js';
 import { api } from '../../api.js';
 
-export function playInviterCompletionChime(): void {
+function playInviterCompletionChime(): void {
   try {
     if (typeof window === 'undefined' || typeof window.AudioContext !== 'function') return;
-    const ctx = new window.AudioContext();
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
+    const ctx = new window.AudioContext(),
+      now = ctx.currentTime,
+      osc = ctx.createOscillator(),
+      gain = ctx.createGain();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(587.33, now);
     osc.frequency.setValueAtTime(880, now + 0.12);
@@ -23,403 +23,233 @@ export function playInviterCompletionChime(): void {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.36);
-    osc.onended = () => {
-      void ctx.close().catch(() => {});
-    };
-  } catch {
-    // Ignore audio context restrictions in headless or muted environments
-  }
+    osc.onended = () => void ctx.close().catch(() => {});
+  } catch {}
 }
 
-export function useFeatureModulesPolling(viewKind: string) {
-  const [groupBumper, setGroupBumper] = useState<BumperState | null>(null);
-  const [groupInviter, setGroupInviter] = useState<GroupInviterState | null>(null);
-  const [groupInviterLoaded, setGroupInviterLoaded] = useState(false);
-  const [groupPoster, setGroupPoster] = useState<PosterState | null>(null);
-  const [bluestacks, setBluestacks] = useState<BluestacksState | null>(null);
-  const [autoScheduler, setAutoScheduler] = useState<AutoSchedulerState | null>(null);
-  const [googleSheets, setGoogleSheets] = useState<GoogleSheetsOverview | null>(null);
-  const [windowVisible, setWindowVisible] = useState<boolean>(() =>
-    typeof document !== 'undefined' ? !document.hidden : true,
-  );
-  const prevInviterRunningRef = useRef<boolean>(false);
-  const prevBluestacksRunningRef = useRef<boolean>(false);
-  const prevBluestacksPageRunningRef = useRef<boolean>(false);
-
+function useChimeOnComplete(running: boolean, enabled: boolean) {
+  const prev = useRef(false);
   useEffect(() => {
-    const runningNow = Boolean(groupInviter?.running);
-    if (
-      prevInviterRunningRef.current &&
-      !runningNow &&
-      groupInviter !== null &&
-      groupInviter.playSoundOnComplete !== false
-    ) {
-      playInviterCompletionChime();
-    }
-    prevInviterRunningRef.current = runningNow;
-  }, [groupInviter]);
+    if (prev.current && !running && enabled) playInviterCompletionChime();
+    prev.current = running;
+  }, [running, enabled]);
+}
 
+function usePollInterval(fetchNow: boolean, poll: boolean, ms: number, refresh: () => void) {
   useEffect(() => {
-    const runningNow = Boolean(bluestacks?.running);
-    if (
-      prevBluestacksRunningRef.current &&
-      !runningNow &&
-      bluestacks?.bumperSettings?.enableSound
-    ) {
-      playInviterCompletionChime();
-    }
-    prevBluestacksRunningRef.current = runningNow;
-  }, [bluestacks]);
+    if (fetchNow) refresh();
+    if (!poll) return;
+    const t = setInterval(refresh, ms);
+    return () => clearInterval(t);
+  }, [fetchNow, poll, ms, refresh]);
+}
 
-  useEffect(() => {
-    const runningNow = Boolean(bluestacks?.pageBumperRunning);
-    if (
-      prevBluestacksPageRunningRef.current &&
-      !runningNow &&
-      bluestacks?.pageBumperSettings?.enableSound
-    ) {
-      playInviterCompletionChime();
-    }
-    prevBluestacksPageRunningRef.current = runningNow;
-  }, [bluestacks]);
-
-  useEffect(() => {
-    if (typeof document === 'undefined') return;
-    const onVisibility = () => setWindowVisible(!document.hidden);
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, []);
-
-  const mountedRef = useRef(true);
-  const controllersRef = useRef<{
-    bumper: AbortController | null;
-    inviter: AbortController | null;
-    poster: AbortController | null;
-    bluestacks: AbortController | null;
-    autoScheduler: AbortController | null;
-    googleSheets: AbortController | null;
-  }>({
-    bumper: null,
-    inviter: null,
-    poster: null,
-    bluestacks: null,
-    autoScheduler: null,
-    googleSheets: null,
-  });
-  const epochsRef = useRef({
-    bumper: 0,
-    inviter: 0,
-    poster: 0,
-    bluestacks: 0,
-    autoScheduler: 0,
-    googleSheets: 0,
-  });
-  const lastSigRef = useRef<Record<keyof typeof epochsRef.current, string | null>>({
-    bumper: null,
-    inviter: null,
-    poster: null,
-    bluestacks: null,
-    autoScheduler: null,
-    googleSheets: null,
-  });
+function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?: () => void) {
+  const [state, setState] = useState<T | null>(null);
+  const ctrlRef = useRef<AbortController | null>(null),
+    epochRef = useRef(0),
+    sigRef = useRef<string | null>(null),
+    mountedRef = useRef(true),
+    finallyRef = useRef(onFinally);
+  finallyRef.current = onFinally;
 
   useEffect(() => {
     mountedRef.current = true;
-    const ctrls = controllersRef.current;
     return () => {
       mountedRef.current = false;
-      for (const key of Object.keys(ctrls) as Array<keyof typeof ctrls>) {
-        ctrls[key]?.abort();
-        ctrls[key] = null;
-      }
+      ctrlRef.current?.abort();
+      ctrlRef.current = null;
     };
   }, []);
 
-  const commitAuthoritative = useCallback(
-    <K extends keyof typeof epochsRef.current, T>(key: K, setter: (next: T) => void, next: T) => {
-      epochsRef.current[key] += 1;
-      controllersRef.current[key]?.abort();
-      controllersRef.current[key] = null;
-      lastSigRef.current[key] = JSON.stringify(next);
-      setter(next);
+  const commit = useCallback((next: T | null) => {
+    epochRef.current += 1;
+    ctrlRef.current?.abort();
+    ctrlRef.current = null;
+    sigRef.current = JSON.stringify(next);
+    setState(next);
+  }, []);
+
+  const refresh = useCallback(
+    (force = false): Promise<void> => {
+      if (!force && ctrlRef.current) return Promise.resolve();
+      if (force && ctrlRef.current) {
+        ctrlRef.current.abort();
+        ctrlRef.current = null;
+      }
+      const ctrl = new AbortController();
+      ctrlRef.current = ctrl;
+      const epoch = force ? ++epochRef.current : epochRef.current;
+      return fetcher(ctrl.signal)
+        .then((next) => {
+          if (!mountedRef.current || ctrl.signal.aborted || epochRef.current !== epoch) return;
+          const sig = JSON.stringify(next);
+          if (force || sig !== sigRef.current) {
+            sigRef.current = sig;
+            setState(next);
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (ctrlRef.current === ctrl) ctrlRef.current = null;
+          if (mountedRef.current) finallyRef.current?.();
+        });
     },
-    [],
+    [fetcher],
   );
 
-  const setGroupBumperAuth = useCallback(
-    (next: BumperState | null) => commitAuthoritative('bumper', setGroupBumper, next),
-    [commitAuthoritative],
+  const trigger = useCallback(() => void refresh(false), [refresh]);
+  return [state, commit, trigger, refresh] as const;
+}
+
+export function useFeatureModulesPolling(viewKind: string, sseConnected = false) {
+  const [groupInviterLoaded, setGroupInviterLoaded] = useState(false),
+    [serverActiveModules, setServerActiveModules] = useState<readonly string[]>([]),
+    [windowVisible, setWindowVisible] = useState(() =>
+      typeof document !== 'undefined' ? !document.hidden : true,
+    );
+
+  const [groupBumper, setGroupBumper, refreshBumper] = usePolledModule<BumperState>(
+    api.bumperState,
   );
-  const setGroupInviterAuth = useCallback(
-    (next: GroupInviterState | null) => commitAuthoritative('inviter', setGroupInviter, next),
-    [commitAuthoritative],
+  const [groupInviter, setGroupInviter, refreshInviterSync, fetchInviter] =
+    usePolledModule<GroupInviterState>(api.groupInviterState, () => setGroupInviterLoaded(true));
+  const [groupPoster, setGroupPoster, refreshPoster] = usePolledModule<PosterState>(
+    api.posterState,
   );
-  const setGroupPosterAuth = useCallback(
-    (next: PosterState | null) => commitAuthoritative('poster', setGroupPoster, next),
-    [commitAuthoritative],
+  const bsFetcher = useCallback((s: AbortSignal) => api.bluestacksState(false, s), []);
+  const [bluestacks, setBluestacks, refreshBsIdle, fetchBs] =
+    usePolledModule<BluestacksState>(bsFetcher);
+  const [autoScheduler, setAutoScheduler, refreshAutoScheduler] =
+    usePolledModule<AutoSchedulerState>(api.autoSchedulerState);
+  const [googleSheets, setGoogleSheets, refreshGoogleSheets] =
+    usePolledModule<GoogleSheetsOverview>(api.googleSheetsOverview);
+
+  const refreshGroupInviter = useCallback(() => fetchInviter(false), [fetchInviter]);
+  const refreshBluestacks = useCallback(
+    (force = false) =>
+      void (force
+        ? api
+            .bluestacksState(true, new AbortController().signal)
+            .then(setBluestacks)
+            .catch(() => {})
+        : fetchBs(false)),
+    [setBluestacks, fetchBs],
   );
-  const setBluestacksAuth = useCallback(
-    (next: BluestacksState | null) => commitAuthoritative('bluestacks', setBluestacks, next),
-    [commitAuthoritative],
+
+  useChimeOnComplete(
+    Boolean(groupInviter?.running),
+    groupInviter !== null && groupInviter.playSoundOnComplete !== false,
   );
-  const setAutoSchedulerAuth = useCallback(
-    (next: AutoSchedulerState | null) =>
-      commitAuthoritative('autoScheduler', setAutoScheduler, next),
-    [commitAuthoritative],
+  useChimeOnComplete(
+    Boolean(bluestacks?.running),
+    Boolean(bluestacks?.bumperSettings?.enableSound),
   );
-  const setGoogleSheetsAuth = useCallback(
-    (next: GoogleSheetsOverview | null) =>
-      commitAuthoritative('googleSheets', setGoogleSheets, next),
-    [commitAuthoritative],
+  useChimeOnComplete(
+    Boolean(bluestacks?.pageBumperRunning),
+    Boolean(bluestacks?.pageBumperSettings?.enableSound),
   );
 
-  const refreshBumper = useCallback(() => {
-    if (controllersRef.current.bumper) return;
-    const ctrl = new AbortController();
-    controllersRef.current.bumper = ctrl;
-    const epoch = epochsRef.current.bumper;
-    void api
-      .bumperState(ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.bumper !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (sig !== lastSigRef.current.bumper) {
-          lastSigRef.current.bumper = sig;
-          setGroupBumper(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.bumper === ctrl) controllersRef.current.bumper = null;
-      });
-  }, []);
-
-  const refreshGroupInviter = useCallback(async () => {
-    if (controllersRef.current.inviter) return;
-    const ctrl = new AbortController();
-    controllersRef.current.inviter = ctrl;
-    const epoch = epochsRef.current.inviter;
-    await api
-      .groupInviterState(ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.inviter !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (sig !== lastSigRef.current.inviter) {
-          lastSigRef.current.inviter = sig;
-          setGroupInviter(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.inviter === ctrl) controllersRef.current.inviter = null;
-        if (mountedRef.current) setGroupInviterLoaded(true);
-      });
-  }, []);
-
-  const refreshPoster = useCallback(() => {
-    if (controllersRef.current.poster) return;
-    const ctrl = new AbortController();
-    controllersRef.current.poster = ctrl;
-    const epoch = epochsRef.current.poster;
-    void api
-      .posterState(ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.poster !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (sig !== lastSigRef.current.poster) {
-          lastSigRef.current.poster = sig;
-          setGroupPoster(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.poster === ctrl) controllersRef.current.poster = null;
-      });
-  }, []);
-
-  const refreshBluestacks = useCallback((force = false) => {
-    if (!force && controllersRef.current.bluestacks) return;
-    if (force && controllersRef.current.bluestacks) {
-      controllersRef.current.bluestacks.abort();
-      controllersRef.current.bluestacks = null;
-    }
-    const ctrl = new AbortController();
-    controllersRef.current.bluestacks = ctrl;
-    const epoch = ++epochsRef.current.bluestacks;
-    void api
-      .bluestacksState(force, ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.bluestacks !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (force || sig !== lastSigRef.current.bluestacks) {
-          lastSigRef.current.bluestacks = sig;
-          setBluestacks(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.bluestacks === ctrl) controllersRef.current.bluestacks = null;
-      });
-  }, []);
-
-  const refreshAutoScheduler = useCallback(() => {
-    if (controllersRef.current.autoScheduler) return;
-    const ctrl = new AbortController();
-    controllersRef.current.autoScheduler = ctrl;
-    const epoch = epochsRef.current.autoScheduler;
-    void api
-      .autoSchedulerState(ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.autoScheduler !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (sig !== lastSigRef.current.autoScheduler) {
-          lastSigRef.current.autoScheduler = sig;
-          setAutoScheduler(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.autoScheduler === ctrl)
-          controllersRef.current.autoScheduler = null;
-      });
-  }, []);
-
-  const refreshGoogleSheets = useCallback(() => {
-    if (controllersRef.current.googleSheets) return;
-    const ctrl = new AbortController();
-    controllersRef.current.googleSheets = ctrl;
-    const epoch = epochsRef.current.googleSheets;
-    void api
-      .googleSheetsOverview(ctrl.signal)
-      .then((next) => {
-        if (!mountedRef.current || ctrl.signal.aborted || epochsRef.current.googleSheets !== epoch)
-          return;
-        const sig = JSON.stringify(next);
-        if (sig !== lastSigRef.current.googleSheets) {
-          lastSigRef.current.googleSheets = sig;
-          setGoogleSheets(next);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (controllersRef.current.googleSheets === ctrl)
-          controllersRef.current.googleSheets = null;
-      });
-  }, []);
-
-  // Initial bootstrap load once on mount
   useEffect(() => {
-    refreshBumper();
+    if (typeof document === 'undefined') return;
+    const onVis = () => setWindowVisible(!document.hidden);
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+
+  useEffect(() => {
+    for (const fn of [
+      refreshBumper,
+      refreshPoster,
+      refreshBsIdle,
+      refreshAutoScheduler,
+      refreshGoogleSheets,
+    ])
+      fn();
     void refreshGroupInviter();
-    refreshPoster();
-    refreshBluestacks(false);
-    refreshAutoScheduler();
-    refreshGoogleSheets();
   }, [
     refreshBumper,
     refreshGroupInviter,
     refreshPoster,
-    refreshBluestacks,
+    refreshBsIdle,
     refreshAutoScheduler,
     refreshGoogleSheets,
   ]);
 
-  const isBluestacksView = viewKind.startsWith('bluestacks-');
+  const prevActiveSigRef = useRef(''),
+    mountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    [],
+  );
+  const pollSummary = useCallback((signal?: AbortSignal) => {
+    if (typeof api.runtimeSummary !== 'function') return Promise.resolve();
+    return api
+      .runtimeSummary(signal)
+      .then((res) => {
+        if (!mountedRef.current || signal?.aborted) return;
+        const sorted = [...res.activeModules].sort(),
+          sig = sorted.join(',');
+        if (sig !== prevActiveSigRef.current) {
+          prevActiveSigRef.current = sig;
+          setServerActiveModules(sorted);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
-  // Bumper polling: 2s when active view or running/refreshing (throttled when hidden); paused when idle & not viewing
+  useEffect(() => {
+    if (typeof api.runtimeSummary !== 'function') return;
+    let inFlight: AbortController | null = null;
+    const run = () => {
+      if (inFlight) return;
+      const ctrl = new AbortController();
+      inFlight = ctrl;
+      void pollSummary(ctrl.signal).finally(() => {
+        if (inFlight === ctrl) inFlight = null;
+      });
+    };
+    run();
+    const timer = setInterval(
+      run,
+      sseConnected ? (windowVisible ? 25_000 : 35_000) : windowVisible ? 3500 : 10_000,
+    );
+    return () => {
+      inFlight?.abort();
+      clearInterval(timer);
+    };
+  }, [windowVisible, sseConnected, pollSummary]);
+
+  const hasMod = (id: string) => serverActiveModules.includes(id);
+  const sBumper = hasMod('group-bumper') || hasMod('page-bumper'),
+    sInviter = hasMod('group-inviter'),
+    sPoster = hasMod('group-poster'),
+    sBs = serverActiveModules.some((id) => id.startsWith('bluestacks-')),
+    sSched = hasMod('auto-scheduler'),
+    sSheets = hasMod('google-sheets');
+  const isBsView = viewKind.startsWith('bluestacks-'),
+    isSheetsView = viewKind.startsWith('sheets-') || viewKind === 'records',
+    isSchedView = viewKind === 'auto-scheduler',
+    fastMs = (fast: boolean, activeMs = 2000, idleMs = 6000) =>
+      sseConnected ? 15_000 : windowVisible ? (fast ? activeMs : idleMs) : 10_000;
+
   const bumperBusy = Boolean(
     groupBumper?.running ||
     groupBumper?.pageBumperRunning ||
     groupBumper?.groupAvatarRefreshing ||
-    groupBumper?.pageAvatarRefreshing,
+    groupBumper?.pageAvatarRefreshing ||
+    sBumper,
   );
-  const bumperActive =
-    viewKind === 'group-bumper' ||
-    viewKind === 'page-bumper' ||
-    isBluestacksView ||
-    viewKind === 'records' ||
-    bumperBusy;
-
-  useEffect(() => {
-    if (
-      viewKind === 'group-bumper' ||
-      viewKind === 'page-bumper' ||
-      isBluestacksView ||
-      viewKind === 'auto-scheduler' ||
-      viewKind === 'records'
-    ) {
-      refreshBumper();
-    }
-    if (!bumperActive) return;
-    const intervalMs = windowVisible
-      ? viewKind === 'group-bumper' || viewKind === 'page-bumper' || isBluestacksView || bumperBusy
-        ? 2000
-        : 6000
-      : 10000;
-    const timer = setInterval(refreshBumper, intervalMs);
-    return () => clearInterval(timer);
-  }, [viewKind, isBluestacksView, bumperActive, windowVisible, bumperBusy, refreshBumper]);
-
-  // Inviter polling
-  const inviterBusy = Boolean(groupInviter?.running || groupInviter?.groupAvatarRefreshing);
-  const inviterActive =
-    viewKind === 'group-inviter' ||
-    viewKind === 'bluestacks-group-inviter' ||
-    viewKind === 'records' ||
-    inviterBusy;
-
-  useEffect(() => {
-    if (
-      viewKind === 'group-inviter' ||
-      viewKind === 'bluestacks-group-inviter' ||
-      viewKind === 'records'
-    ) {
-      void refreshGroupInviter();
-    }
-    if (!inviterActive) return;
-    const intervalMs = windowVisible
-      ? viewKind === 'group-inviter' || viewKind === 'bluestacks-group-inviter' || inviterBusy
-        ? 2000
-        : 6000
-      : 10000;
-    const timer = setInterval(() => void refreshGroupInviter(), intervalMs);
-    return () => clearInterval(timer);
-  }, [viewKind, inviterActive, windowVisible, inviterBusy, refreshGroupInviter]);
-
-  // Poster polling
-  const posterBusy = Boolean(groupPoster?.running || groupPoster?.groupAvatarRefreshing);
-  const posterActive =
-    viewKind === 'group-poster' ||
-    viewKind === 'bluestacks-group-poster' ||
-    viewKind === 'records' ||
-    posterBusy;
-
-  useEffect(() => {
-    if (
-      viewKind === 'group-poster' ||
-      viewKind === 'bluestacks-group-poster' ||
-      viewKind === 'auto-scheduler' ||
-      viewKind === 'records'
-    ) {
-      refreshPoster();
-    }
-    if (!posterActive) return;
-    const intervalMs = windowVisible
-      ? viewKind === 'group-poster' || viewKind === 'bluestacks-group-poster' || posterBusy
-        ? 2000
-        : 6000
-      : 10000;
-    const timer = setInterval(refreshPoster, intervalMs);
-    return () => clearInterval(timer);
-  }, [viewKind, posterActive, windowVisible, posterBusy, refreshPoster]);
-
-  // BlueStacks polling
-  const bluestacksBusy = Boolean(
+  const bumperView = viewKind === 'group-bumper' || viewKind === 'page-bumper' || isBsView;
+  const inviterBusy = Boolean(
+    groupInviter?.running || groupInviter?.groupAvatarRefreshing || sInviter,
+  );
+  const inviterView = viewKind === 'group-inviter' || viewKind === 'bluestacks-group-inviter';
+  const posterBusy = Boolean(groupPoster?.running || groupPoster?.groupAvatarRefreshing || sPoster);
+  const posterView = viewKind === 'group-poster' || viewKind === 'bluestacks-group-poster';
+  const bsBusy = Boolean(
     bluestacks?.running ||
     bluestacks?.pageBumperRunning ||
     bluestacks?.activeRunning ||
@@ -427,70 +257,25 @@ export function useFeatureModulesPolling(viewKind: string) {
     bluestacks?.inviterRunning ||
     bluestacks?.batchLogin?.running ||
     bluestacks?.healthCheck?.running ||
-    (bluestacks?.launchingIds.length ?? 0) > 0 ||
-    (bluestacks?.closingIds.length ?? 0) > 0 ||
-    (bluestacks?.inspectingIds.length ?? 0) > 0 ||
-    (bluestacks?.installingIds?.length ?? 0) > 0 ||
-    (bluestacks?.loggingInIds?.length ?? 0) > 0 ||
-    (bluestacks?.switchingIds?.length ?? 0) > 0,
+    [
+      bluestacks?.launchingIds,
+      bluestacks?.closingIds,
+      bluestacks?.inspectingIds,
+      bluestacks?.installingIds,
+      bluestacks?.loggingInIds,
+      bluestacks?.switchingIds,
+    ].some((a) => (a?.length ?? 0) > 0) ||
+    sBs,
   );
-  const bluestacksActive = isBluestacksView || viewKind === 'records' || bluestacksBusy;
-
-  useEffect(() => {
-    if (isBluestacksView || viewKind === 'records') {
-      refreshBluestacks(false);
-    }
-    if (!bluestacksActive) return;
-    const intervalMs = windowVisible ? (isBluestacksView || bluestacksBusy ? 1800 : 6000) : 10000;
-    const timer = setInterval(() => refreshBluestacks(false), intervalMs);
-    return () => clearInterval(timer);
-  }, [
-    viewKind,
-    isBluestacksView,
-    bluestacksActive,
-    windowVisible,
-    bluestacksBusy,
-    refreshBluestacks,
-  ]);
-
-  // Auto-scheduler polling (use primitive boolean dep so schedule array identity never triggers infinite loop!)
-  const schedulerBusy = Boolean(autoScheduler?.running);
-  const schedulerHasEnabled = Boolean(autoScheduler?.schedules.some((s) => s.enabled));
-  useEffect(() => {
-    if (viewKind === 'auto-scheduler') {
-      refreshAutoScheduler();
-      refreshBumper();
-      refreshPoster();
-      refreshBluestacks(false);
-    }
-    const hasEnabled = schedulerHasEnabled || schedulerBusy;
-    if (viewKind !== 'auto-scheduler' && !hasEnabled) return;
-    const intervalMs = windowVisible
-      ? viewKind === 'auto-scheduler' || schedulerBusy
-        ? 2500
-        : 12000
-      : 15000;
-    const timer = setInterval(refreshAutoScheduler, intervalMs);
-    return () => clearInterval(timer);
-  }, [
-    viewKind,
-    windowVisible,
-    schedulerBusy,
-    schedulerHasEnabled,
-    refreshAutoScheduler,
-    refreshBumper,
-    refreshPoster,
-    refreshBluestacks,
-  ]);
-
-  // Google Sheets polling
-  const isSheetsView = viewKind.startsWith('sheets-');
+  const schedBusy = Boolean(autoScheduler?.running || sSched),
+    schedEnabled = Boolean(autoScheduler?.schedules.some((s) => s.enabled));
   const sheetsBusy = Boolean(
     (googleSheets?.runningScheduleCount ?? 0) > 0 ||
     (googleSheets?.runningRecordsCount ?? 0) > 0 ||
-    (googleSheets?.activeProfiles?.length ?? 0) > 0,
+    (googleSheets?.activeProfiles?.length ?? 0) > 0 ||
+    sSheets,
   );
-  const sheetsHasEnabled = Boolean(
+  const sheetsEnabled = Boolean(
     googleSheets?.links.some(
       (l) =>
         l.enabled &&
@@ -498,35 +283,67 @@ export function useFeatureModulesPolling(viewKind: string) {
           (l.kind === 'post_records' && l.recordsConfig?.enabled)),
     ),
   );
-  useEffect(() => {
-    if (isSheetsView) {
-      refreshGoogleSheets();
-    }
-    if (!isSheetsView && !sheetsBusy && !sheetsHasEnabled) return;
-    const intervalMs = windowVisible ? (isSheetsView || sheetsBusy ? 3000 : 12000) : 15000;
-    const timer = setInterval(refreshGoogleSheets, intervalMs);
-    return () => clearInterval(timer);
-  }, [isSheetsView, windowVisible, sheetsBusy, sheetsHasEnabled, refreshGoogleSheets]);
+
+  for (const [fetchNow, poll, ms, fn] of [
+    [
+      bumperView || isSchedView || viewKind === 'records' || sBumper,
+      bumperView || viewKind === 'records' || bumperBusy,
+      fastMs(bumperView || bumperBusy),
+      refreshBumper,
+    ],
+    [
+      inviterView || viewKind === 'records' || sInviter,
+      inviterView || viewKind === 'records' || inviterBusy,
+      fastMs(inviterView || inviterBusy),
+      refreshInviterSync,
+    ],
+    [
+      posterView || isSchedView || viewKind === 'records' || sPoster,
+      posterView || viewKind === 'records' || posterBusy,
+      fastMs(posterView || posterBusy),
+      refreshPoster,
+    ],
+    [
+      isBsView || isSchedView || viewKind === 'records' || sBs,
+      isBsView || viewKind === 'records' || bsBusy,
+      fastMs(isBsView || bsBusy, 1800),
+      refreshBsIdle,
+    ],
+    [
+      isSchedView || sSched,
+      isSchedView || schedEnabled || schedBusy,
+      sseConnected ? 20_000 : windowVisible ? (isSchedView || schedBusy ? 2500 : 12_000) : 15_000,
+      refreshAutoScheduler,
+    ],
+    [
+      isSheetsView || sSheets,
+      isSheetsView || sheetsBusy || sheetsEnabled,
+      sseConnected ? 20_000 : windowVisible ? (isSheetsView || sheetsBusy ? 3000 : 12_000) : 15_000,
+      refreshGoogleSheets,
+    ],
+  ] as const)
+    usePollInterval(fetchNow, poll, ms, fn);
 
   return {
     groupBumper,
-    setGroupBumper: setGroupBumperAuth,
+    setGroupBumper,
     refreshBumper,
     groupInviter,
-    setGroupInviter: setGroupInviterAuth,
+    setGroupInviter,
     groupInviterLoaded,
     refreshGroupInviter,
     groupPoster,
-    setGroupPoster: setGroupPosterAuth,
+    setGroupPoster,
     refreshPoster,
     bluestacks,
-    setBluestacks: setBluestacksAuth,
+    setBluestacks,
     refreshBluestacks,
     autoScheduler,
-    setAutoScheduler: setAutoSchedulerAuth,
+    setAutoScheduler,
     refreshAutoScheduler,
     googleSheets,
-    setGoogleSheets: setGoogleSheetsAuth,
+    setGoogleSheets,
     refreshGoogleSheets,
+    refreshRuntimeSummaryNow: useCallback(() => void pollSummary(), [pollSummary]),
   };
 }

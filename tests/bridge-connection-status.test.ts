@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   bridgeConnectionDescription,
   bridgeTransportDescription,
-} from '../src/shared/bridge-connection-status.js';
+} from '../src/shared/bridge-connection-health.js';
 test('transport readiness does not claim task pause or remain ready after disconnect', () => {
   assert.equal(bridgeTransportDescription(true, 'ready', ''), '软件已连接 · 通道就绪');
   assert.equal(bridgeTransportDescription(false, 'ready', ''), '尚未连接本机软件');

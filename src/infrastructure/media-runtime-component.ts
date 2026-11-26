@@ -5,7 +5,6 @@ import { createReadStream } from 'node:fs';
 import { readFile, mkdir, stat, open, copyFile, rename, rm, writeFile } from 'node:fs/promises';
 import { extractPinnedMediaArchive } from './pinned-media-archive.js';
 import { ProductError } from '../domain/workspace.js';
-
 const root = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 type Descriptor = {
   platform: string;

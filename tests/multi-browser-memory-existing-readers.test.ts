@@ -28,7 +28,6 @@ vi.mock('node:test', () => ({
     }),
 }));
 await import('../tests/facebook-document-identity.test.js');
-await import('../tests/facebook-browse.test.js');
 await import('../tests/facebook-browse-identity.test.js');
 await import('../tests/facebook-background.test.js');
 await import('../tests/facebook-audience.test.js');

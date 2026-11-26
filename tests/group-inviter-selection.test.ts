@@ -17,7 +17,6 @@ function harness(repo: Pick<GroupInviterRepository, 'getInvitedFriendIdsForGroup
     repo as GroupInviterRepository,
     () => undefined,
     () => undefined,
-    () => null,
   );
   return {
     select: (group: string, id: string, owned: Set<string>, click: () => Promise<boolean>) =>
@@ -148,7 +147,6 @@ for (const failure of ['cancel-after-selection', 'reserve-error'])
       repo,
       () => kernel,
       () => ({ peers: new Map([[profileId, peer]]) }) as unknown as Core,
-      () => null,
     );
     Reflect.set(
       adapter,

@@ -1,16 +1,14 @@
 import type { Awaitable } from '../domain/persistence.js';
 import { missingFacebookDefaultContext } from './facebook-task-document-ready.js';
-
 export function facebookNavigationContextPending(error: unknown): boolean {
   return (
     missingFacebookDefaultContext(error) ||
     (error instanceof Error &&
-      /^page\.evaluate: Execution context was destroyed, most likely because of a navigation\.?$/.test(
+      /(?:Execution context was destroyed|Cannot find context with specified id)/i.test(
         error.message,
       ))
   );
 }
-
 // A read racing a document replacement may be repeated; the original input never is.
 export async function readFacebookAcrossNavigation<T>(
   read: () => Promise<T>,

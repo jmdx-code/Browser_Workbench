@@ -8,10 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
-import {
-  dropResourceTableSchema,
-  latestMigrationBackupMarker,
-} from './fixtures/workspace-schema.js';
+import { latestMigrationBackupMarker } from './fixtures/workspace-schema.js';
 import { WorkspaceService } from '../src/application/workspace-service.js';
 import { ResourceTableService } from '../src/application/resource-table-service.js';
 import { FilesystemResourceSourceReader } from '../src/infrastructure/resource-source-reader.js';
@@ -67,7 +64,7 @@ async function fixture(run: (store: WorkspaceStore, file: string) => Promise<voi
     store.close();
     assert.equal(path.dirname(directory), tmpdir());
     assert.ok(path.basename(directory).startsWith('wb-resource-table-'));
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 });
   }
 }
 test('Sheets TSV preserves multiline, escaped quotes, tabs, formulas and literal HTML; malformed and oversized clipboard rejected', () => {
@@ -211,7 +208,7 @@ test('resource references cannot spoof verified format or become arbitrary URL r
 test('resource table versions persist, conflict is atomic across handles, copies isolated, old configurations untouched and history immutable', async () =>
   fixture(async (store, file) => {
     const row = await store.createCombination(combination());
-    const other = await store.createDraft({ ...combination(), name: '另一组合' });
+    const other = await store.createCombination({ ...combination(), name: '另一组合' });
     const rows = pasteResourceCells([], 0, 0, '文案一\n文案二', randomUUID);
     rows.push(emptyResourceRow(randomUUID()));
     assert.equal((await store.resourceTables.read(row.id)).revision, 0);
@@ -238,12 +235,6 @@ test('resource table versions persist, conflict is atomic across handles, copies
       );
       assert.equal((await store.resourceTables.read(row.id)).rows[0]?.text, '窗口二');
       assert.equal((await store.resourceTables.read(other.id)).revision, 0);
-      const copy = await store.copyCombination(row.id);
-      const copied = await store.resourceTables.read(copy.id);
-      assert.equal(copied.rows[0]?.text, '窗口二');
-      assert.notEqual(copied.rows[0]?.id, rows[0]?.id);
-      await store.resourceTables.save(copy.id, 1, []);
-      assert.equal((await store.resourceTables.read(row.id)).rows.length, 1);
       assert.equal((await store.combinations()).find((value) => value.id === row.id)?.revision, 0);
       assert.equal((await store.combinations()).find((value) => value.id === row.id)?.version, 1);
     } finally {
@@ -269,12 +260,6 @@ test('resource table versions persist, conflict is atomic across handles, copies
         ).length,
         3,
       );
-      const before = (await store.combinations()).length;
-      db.exec(
-        "CREATE TRIGGER fail_resource_copy BEFORE INSERT ON resource_table_versions BEGIN SELECT RAISE(ABORT,'INJECTED_WRITE_FAILURE'); END",
-      );
-      await assert.rejects(async () => await store.copyCombination(row.id), /INJECTED/);
-      assert.equal((await store.combinations()).length, before);
     } finally {
       db.close();
     }
@@ -292,17 +277,16 @@ test('authenticated HTTP saves 200 long captions beyond old JSON budget without 
       dataDir: path.dirname(dirFile),
       port,
       extensionIds: ['a'.repeat(32)],
-      appRoutes: ({ core, store, tasks }) =>
+      appRoutes: ({ core, store }) =>
         workspaceApi(
-          new WorkspaceService(repo, new BridgeProfileSource(core, store, tasks)),
-          undefined,
+          new WorkspaceService(repo, new BridgeProfileSource(core, store)),
           undefined,
           undefined,
           new ResourceTableService(repo.resourceTables, new FilesystemResourceSourceReader()),
         ),
     });
     try {
-      const combo = await repo.createDraft(combination());
+      const combo = await repo.createCombination(combination());
       const rows = pasteResourceCells(
         [],
         0,
@@ -448,8 +432,6 @@ test('authenticated HTTP saves 200 long captions beyond old JSON budget without 
         400,
       );
       assert.equal((await repo.resourceTables.read(combo.id)).revision, 2);
-      const copied = await post('/combinations/copy', { id: combo.id });
-      assert.equal(copied.status, 201);
       assert.equal(
         (
           await fetch(server.origin + '/api/workspace/resource-tables/summaries', {
@@ -462,7 +444,7 @@ test('authenticated HTTP saves 200 long captions beyond old JSON budget without 
       await server.close();
     }
   }));
-test('schema12 migration backs up before adding resource tables and preserves every original SQL definition and configuration', async () =>
+test('v61->v62 upgrade backs up and preserves resource tables, combinations, metadata, and groups', async () =>
   fixture(async (store, file) => {
     const combo = await store.createCombination({
       ...combination(),
@@ -481,10 +463,7 @@ test('schema12 migration backs up before adding resource tables and preserves ev
     await store.createGroup('旧分组', 'green');
     await store.renameProfile(randomUUID(), '旧资料');
     const db = new DatabaseSync(file);
-    db.exec(dropResourceTableSchema + 'PRAGMA user_version=12');
-    const before = db
-      .prepare('SELECT name,type,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name')
-      .all();
+    db.exec('PRAGMA user_version=61');
     const configs = await store.combinations();
     const metadata = await store.profileMetadata();
     const groups = await store.groups();
@@ -498,10 +477,15 @@ test('schema12 migration backs up before adding resource tables and preserves ev
       assert.equal(upgraded.resourceTables.summaries().length, 0);
       const after = new DatabaseSync(file, { readOnly: true });
       try {
-        for (const definition of before) assertSchemaDefinitionPreserved(after, definition);
         assert.equal(
           after.prepare('PRAGMA user_version').get()?.user_version,
           workspaceSchemaVersion,
+        );
+        assert.equal(
+          after
+            .prepare("SELECT count(*) n FROM sqlite_master WHERE name='resource_table_heads'")
+            .get()?.n,
+          1,
         );
       } finally {
         after.close();
@@ -514,13 +498,7 @@ test('schema12 migration backs up before adding resource tables and preserves ev
         readOnly: true,
       });
       try {
-        assert.equal(backup.prepare('PRAGMA user_version').get()?.user_version, 12);
-        assert.equal(
-          backup
-            .prepare("SELECT count(*) n FROM sqlite_master WHERE name='resource_table_heads'")
-            .get()?.n,
-          0,
-        );
+        assert.equal(backup.prepare('PRAGMA user_version').get()?.user_version, 61);
       } finally {
         backup.close();
       }
@@ -528,7 +506,6 @@ test('schema12 migration backs up before adding resource tables and preserves ev
       upgraded.close();
     }
   }));
-import { assertSchemaDefinitionPreserved } from './fixtures/workspace-schema.js';
 
 test('five-column Sheets overwrite, single-cell rectangle fill and quoted TSV roundtrip', () => {
   let rows = pasteResourceCells(
@@ -600,7 +577,7 @@ test('resource option aliases accept natural Sheets values and reject unknown se
 
 test('optional row AI survives saved versions without rewriting an older row lacking the field', async () => {
   await fixture(async (store) => {
-    const combo = await store.createDraft(combination()),
+    const combo = await store.createCombination(combination()),
       old = { ...emptyResourceRow(randomUUID()), text: 'old row' };
     await store.resourceTables.save(combo.id, 0, [old]);
     await store.resourceTables.save(combo.id, 1, [{ ...old, aiLabel: 'on' }]);

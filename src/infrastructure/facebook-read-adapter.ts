@@ -12,7 +12,6 @@ import {
   facebookUILabelSelector,
   facebookComposerPostLabels,
 } from '../shared/facebook-ui.js';
-
 const loginForm = 'form:has(input[name="email"]):has(input[type="password"])';
 const reviewActionsScope =
   ':is([role="dialog"]' +
@@ -20,7 +19,6 @@ const reviewActionsScope =
   ',' +
   FACEBOOK_REEL_SCOPE +
   ')';
-
 // Page selectors are software-owned. Projection primitives remain generic in the extension.
 export const facebookIdentityProjection = PageReadRequest.parse({
   queries: [
@@ -70,7 +68,6 @@ export const facebookIdentityProjection = PageReadRequest.parse({
     },
   ],
 });
-
 // Exact supported labels; no broad banner images, menu clicks, globals or profile adoption.
 const ownProfileControl =
   '[role="banner"] [role="button"]' + facebookUILabelSelector(FACEBOOK_PROFILE_CONTROL_LABELS);
@@ -116,7 +113,6 @@ export const facebookDisplayInspectionProjection = PageReadRequest.parse({
     },
   ],
 });
-
 // Same declarative protocol as 0.3.7. Semantic structure has no locale, coordinates or classes.
 // These are diagnostic observations; a composer-shaped dialog alone is not a post authority.
 export const facebookComposerProjection = PageReadRequest.parse({
@@ -232,26 +228,5 @@ export const facebookComposerProjection = PageReadRequest.parse({
       text: key === 'composerReviewHeadings',
       attributes: ['aria-label'] as const,
     })),
-  ],
-});
-
-export const facebookSelfProfileProjection = PageReadRequest.parse({
-  queries: [
-    ...facebookIdentityProjection.queries,
-    {
-      key: 'profileHeading',
-      selector: 'h1',
-      limit: 3,
-      text: true,
-      attributes: [],
-    },
-    {
-      key: 'accountControlImages',
-      selector:
-        '[role="banner"] [role="button"][aria-label] image, [role="banner"] [role="button"][aria-label] img',
-      limit: 8,
-      text: false,
-      attributes: ['href', 'src', 'alt'],
-    },
   ],
 });

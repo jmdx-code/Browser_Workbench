@@ -6,10 +6,8 @@ import {
   type BrowserBrand,
   type ProfileLaunchBinding,
 } from '../shared/profile-lifecycle.js';
-
 const MAX_PASS_BYTES = 64 * 1024 * 1024;
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
-
 type FolderEntry = {
   key: string;
   root: string;
@@ -18,19 +16,16 @@ type FolderEntry = {
   browserKind: BrowserBrand;
   executablePath: string | null;
 };
-
 type ScanState = {
   matchedByFolder: Map<string, FolderEntry>;
   remainingFolders: Set<string>;
   candidateFolders: Set<string>;
 };
-
 export function inferBrowserBrandFromRoot(root: string): BrowserBrand {
   if (/brave/i.test(root)) return 'brave';
   if (/edge/i.test(root)) return 'edge';
   return 'chrome';
 }
-
 export function defaultExecutableCandidates(browserKind: BrowserBrand): readonly string[] {
   const pf = process.env.PROGRAMFILES ?? 'C:\\Program Files';
   const pfx86 = process.env['PROGRAMFILES(X86)'] ?? 'C:\\Program Files (x86)';
@@ -57,9 +52,36 @@ export function defaultExecutableCandidates(browserKind: BrowserBrand): readonly
     ...(local ? [path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe')] : []),
   ];
 }
-
 // Display & launch metadata strictly for extension-registered profiles ONLY.
 // Uninstalled browser profiles are NEVER stored, returned, or exposed.
+async function scanExtensionLdbFiles(
+  profilePath: string,
+  extensionIds: readonly string[],
+  onFile: (location: string, size: number) => Promise<'stop' | 'continue'>,
+): Promise<{ stopped: boolean; readFailed: boolean }> {
+  let readFailed = false;
+  for (const extensionId of extensionIds) {
+    if (!/^[a-p]{32}$/.test(extensionId)) continue;
+    const directory = path.join(profilePath, 'Local Extension Settings', extensionId);
+    let files: string[];
+    try {
+      files = await readdir(directory);
+    } catch {
+      continue;
+    }
+    for (const file of files.filter((value) => /\.(log|ldb)$/.test(value))) {
+      const location = path.join(directory, file);
+      try {
+        const size = (await stat(location)).size;
+        if (size <= 0 || size > MAX_FILE_BYTES) continue;
+        if ((await onFile(location, size)) === 'stop') return { stopped: true, readFailed };
+      } catch {
+        readFailed = true;
+      }
+    }
+  }
+  return { stopped: false, readFailed };
+}
 export class LocalBrowserLabels {
   private readonly labels = new Map<string, string>();
   private readonly bindings = new Map<string, ProfileLaunchBinding>();
@@ -71,7 +93,6 @@ export class LocalBrowserLabels {
   // Retain file-level progress too: a single profile may itself exceed the pass budget.
   private partial:
     { key: string; files: Set<string>; found: Set<string>; ids: Set<string> } | undefined;
-
   constructor(
     private readonly extensionIds: readonly string[],
     private readonly roots = process.env.LOCALAPPDATA
@@ -84,19 +105,15 @@ export class LocalBrowserLabels {
     private readonly now = Date.now,
     private readonly executableCandidates?: Partial<Record<BrowserBrand, readonly string[]>>,
   ) {}
-
   name(id: string): string | undefined {
     return this.labels.get(id);
   }
-
   binding(id: string): ProfileLaunchBinding | undefined {
     return this.bindings.get(id);
   }
-
   allBindings(): ProfileLaunchBinding[] {
     return [...this.bindings.values()];
   }
-
   hydrateBindings(
     saved: readonly ProfileLaunchBinding[],
     registeredIds: ReadonlySet<string>,
@@ -124,20 +141,15 @@ export class LocalBrowserLabels {
       owners.add(item.profileId);
     }
   }
-
   forget(ids: readonly string[]): void {
     for (const id of ids) {
       this.labels.delete(id);
       this.bindings.delete(id);
       this.inProgress.delete(id);
       this.lastAttemptAt.delete(id);
-      for (const [folderKey, owners] of this.folderOwners) {
-        owners.delete(id);
-        if (owners.size === 0) this.folderOwners.delete(folderKey);
-      }
+      this.removeFolderOwnership(id);
     }
   }
-
   private resolveExecutablePath(browserKind: BrowserBrand): string | null {
     const candidates =
       this.executableCandidates?.[browserKind] ?? defaultExecutableCandidates(browserKind);
@@ -146,14 +158,12 @@ export class LocalBrowserLabels {
     }
     return null;
   }
-
   private removeFolderOwnership(id: string): void {
     for (const [folderKey, owners] of this.folderOwners) {
       owners.delete(id);
       if (owners.size === 0) this.folderOwners.delete(folderKey);
     }
   }
-
   async refreshNow(
     ids: readonly string[],
     onBindingsUpdated?: (bindings: readonly ProfileLaunchBinding[]) => Promise<void> | void,
@@ -177,72 +187,48 @@ export class LocalBrowserLabels {
       if (latest.length > 0) await onBindingsUpdated(latest);
     }
   }
-
   async verifyBindingOnDisk(
     binding: ProfileLaunchBinding,
   ): Promise<
     | { ok: true; updatedBinding: ProfileLaunchBinding }
     | { ok: false; errorCode: string; reason: string }
   > {
+    const fail = (errorCode: string, reason: string) => ({
+      ok: false as const,
+      errorCode,
+      reason,
+    });
     let executablePath = binding.executablePath;
     if (!existsSync(executablePath)) {
       const fallbackExe = this.resolveExecutablePath(binding.browserKind);
-      if (!fallbackExe) {
-        return {
-          ok: false,
-          errorCode: 'BROWSER_EXECUTABLE_NOT_FOUND',
-          reason: `未找到浏览器可执行程序：${binding.executablePath}`,
-        };
-      }
+      if (!fallbackExe)
+        return fail(
+          'BROWSER_EXECUTABLE_NOT_FOUND',
+          `未找到浏览器可执行程序：${binding.executablePath}`,
+        );
       executablePath = fallbackExe;
     }
-
     const profilePath = path.join(binding.userDataDir, binding.profileDirectory);
     try {
-      const profileStat = await stat(profilePath);
-      if (!profileStat.isDirectory()) {
-        return {
-          ok: false,
-          errorCode: 'PROFILE_DIRECTORY_NOT_FOUND',
-          reason: `浏览器资料目录不存在：${profilePath}`,
-        };
-      }
+      if (!(await stat(profilePath)).isDirectory())
+        return fail('PROFILE_DIRECTORY_NOT_FOUND', `浏览器资料目录不存在：${profilePath}`);
     } catch {
-      return {
-        ok: false,
-        errorCode: 'PROFILE_DIRECTORY_NOT_FOUND',
-        reason: `浏览器资料目录不存在：${profilePath}`,
-      };
+      return fail('PROFILE_DIRECTORY_NOT_FOUND', `浏览器资料目录不存在：${profilePath}`);
     }
-
     const needle = Buffer.from(binding.profileId);
     let verifiedExtensionStorage = false;
-    for (const extensionId of this.extensionIds) {
-      if (!/^[a-p]{32}$/.test(extensionId)) continue;
-      const extStorageDir = path.join(profilePath, 'Local Extension Settings', extensionId);
-      let files: string[];
+    await scanExtensionLdbFiles(profilePath, this.extensionIds, async (location) => {
       try {
-        files = await readdir(extStorageDir);
-      } catch {
-        continue;
-      }
-      for (const file of files.filter((value) => /\.(log|ldb)$/.test(value))) {
-        const location = path.join(extStorageDir, file);
-        try {
-          const size = (await stat(location)).size;
-          if (size <= 0 || size > MAX_FILE_BYTES) continue;
-          const bytes = await readFile(location);
-          if (bytes.includes(needle)) {
-            verifiedExtensionStorage = true;
-            break;
-          }
-        } catch {
-          // Ignore transient file read errors while checking other files
+        const bytes = await readFile(location);
+        if (bytes.includes(needle)) {
+          verifiedExtensionStorage = true;
+          return 'stop';
         }
+      } catch {
+        // Ignore transient file read errors while checking other files
       }
-      if (verifiedExtensionStorage) break;
-    }
-
+      return 'continue';
+    });
     if (!verifiedExtensionStorage) {
       this.bindings.delete(binding.profileId);
       this.removeFolderOwnership(binding.profileId);
@@ -252,7 +238,6 @@ export class LocalBrowserLabels {
         reason: '该浏览器资料目录中未检测到已配对的工作台插件记录，已拒绝启动以防误开其他资料',
       };
     }
-
     const updatedBinding: ProfileLaunchBinding = {
       ...binding,
       executablePath,
@@ -266,7 +251,6 @@ export class LocalBrowserLabels {
     this.bindings.set(binding.profileId, updatedBinding);
     return { ok: true, updatedBinding };
   }
-
   async refresh(
     ids: readonly string[],
     options?: { forceMissingBindings?: boolean | undefined },
@@ -356,88 +340,52 @@ export class LocalBrowserLabels {
                 ids: new Set(activeIds),
               };
         let complete = true;
-        let readFailed = false;
-        for (const extensionId of this.extensionIds) {
-          if (!/^[a-p]{32}$/.test(extensionId)) continue;
-          const directory = path.join(
-            entry.root,
-            entry.folder,
-            'Local Extension Settings',
-            extensionId,
-          );
-          let files: string[];
-          try {
-            files = await readdir(directory);
-          } catch {
-            continue;
-          }
-          for (const file of files.filter((value) => /\.(log|ldb)$/.test(value))) {
-            const location = path.join(directory, file);
-            if (progress.files.has(location)) continue;
-            try {
-              const size = (await stat(location)).size;
-              if (size > MAX_FILE_BYTES) continue;
-              if (bytesRead + size > MAX_PASS_BYTES) {
-                exhausted = true;
-                complete = false;
-                break;
-              }
-              const handle = await open(location, 'r');
-              let bytes: Buffer;
-              try {
-                const buffer = Buffer.alloc(size);
-                let count = 0;
-                while (count < size) {
-                  const result = await handle.read(buffer, count, size - count, count);
-                  if (!result.bytesRead) break;
-                  count += result.bytesRead;
-                }
-                bytes = buffer.subarray(0, count);
-              } finally {
-                await handle.close();
-              }
-              bytesRead += bytes.length;
-              for (const id of activeIds)
-                if (bytes.includes(Buffer.from(id))) progress.found.add(id);
-              progress.files.add(location);
-            } catch {
-              readFailed = true; /* Locked/rotated file: advance past this folder so other profiles aren't head-of-line blocked. */
+        const scanRes = await scanExtensionLdbFiles(
+          path.join(entry.root, entry.folder),
+          this.extensionIds,
+          async (location, size) => {
+            if (progress.files.has(location)) return 'continue';
+            if (bytesRead + size > MAX_PASS_BYTES) {
+              exhausted = true;
+              complete = false;
+              return 'stop';
             }
-          }
-          if (exhausted) break;
-        }
-        if (exhausted) {
+            const handle = await open(location, 'r');
+            let bytes: Buffer;
+            try {
+              const buffer = Buffer.alloc(size);
+              let count = 0;
+              while (count < size) {
+                const result = await handle.read(buffer, count, size - count, count);
+                if (!result.bytesRead) break;
+                count += result.bytesRead;
+              }
+              bytes = buffer.subarray(0, count);
+            } finally {
+              await handle.close();
+            }
+            bytesRead += bytes.length;
+            for (const id of activeIds) if (bytes.includes(Buffer.from(id))) progress.found.add(id);
+            progress.files.add(location);
+            return 'continue';
+          },
+        );
+        if (exhausted || !complete) {
           this.partial = progress;
           this.nextCursor = index;
           break;
         }
-        if (readFailed) {
-          // Record any IDs already discovered from readable files in this folder,
-          // then advance cursor to avoid head-of-line livelock on a permanently locked file.
-          for (const id of activeIds) {
-            const state = this.inProgress.get(id);
-            if (!state || !state.remainingFolders.has(entry.key)) continue;
-            if (progress.found.has(id)) state.matchedByFolder.set(entry.key, entry);
-            state.remainingFolders.delete(entry.key);
-          }
-          this.partial = undefined;
-          this.nextCursor = (index + 1) % entries.length;
-          continue;
-        }
-        if (!complete) {
-          this.partial = progress;
-          this.nextCursor = index;
-          break;
-        }
+        // Record any IDs discovered from readable files in this folder and advance cursor
+        // (even on readFailed) to avoid head-of-line livelock on a permanently locked file.
         for (const id of activeIds) {
           const state = this.inProgress.get(id);
-          if (!state) continue;
-          if (!state.remainingFolders.has(entry.key)) continue;
+          if (!state || !state.remainingFolders.has(entry.key)) continue;
           if (progress.found.has(id)) state.matchedByFolder.set(entry.key, entry);
           state.remainingFolders.delete(entry.key);
         }
         this.partial = undefined;
         this.nextCursor = (index + 1) % entries.length;
+        void scanRes.readFailed;
       }
       for (const id of activeIds) {
         const state = this.inProgress.get(id);

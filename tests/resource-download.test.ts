@@ -17,7 +17,7 @@ import { startBridgeServer } from '../src/bridge/server.js';
 import { WorkspaceService } from '../src/application/workspace-service.js';
 import { BridgeProfileSource } from '../src/infrastructure/browser-source.js';
 import { workspaceApi } from '../src/http/workspace-api.js';
-import type { ResourceDriveDownloader } from '../src/domain/resource-download.js';
+import type { ResourceDriveDownloader } from '../src/domain/resource-material-rules.js';
 
 const png = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
@@ -30,10 +30,21 @@ const makeRows = (count: number) =>
     media: [mediaReference('https://drive.google.com/file/d/generated-' + index + '/view')],
   }));
 const draft = async (store: WorkspaceStore) =>
-  await store.createDraft({
+  await store.createCombination({
     name: '网盘资源',
     note: '',
-    steps: [],
+    steps: [
+      {
+        id: randomUUID(),
+        type: 'post',
+        resourceMode: 'table',
+        resourceDirectory: '',
+        count: 1,
+        allowRepeat: false,
+        forbidSameAccountRepeat: true,
+        archivePublished: false,
+      },
+    ],
     randomOrder: false,
     loop: { mode: 'finite', rounds: 1 },
   });
@@ -308,10 +319,9 @@ test('authenticated real HTTP streams the download report and saved local media 
     dataDir: path.join(directory, 'bridge'),
     port: address.port,
     extensionIds: ['a'.repeat(32)],
-    appRoutes: ({ core, store: bridge, tasks }) =>
+    appRoutes: ({ core, store: bridge }) =>
       workspaceApi(
-        new WorkspaceService(store, new BridgeProfileSource(core, bridge, tasks)),
-        undefined,
+        new WorkspaceService(store, new BridgeProfileSource(core, bridge)),
         undefined,
         undefined,
         resources,

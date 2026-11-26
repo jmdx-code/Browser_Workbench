@@ -5,7 +5,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { api } from '../src/renderer/api.js';
 import { UnifiedTargetPicker } from '../src/renderer/modules/shared/unified-target-picker.js';
 import { BluestacksInviterPage } from '../src/renderer/modules/bluestacks-inviter-page.js';
-import { BluestacksPosterPage } from '../src/renderer/modules/bluestacks-poster-page.js';
+import { GroupPosterPage } from '../src/renderer/group-poster-page.js';
+import { PosterSettings } from '../src/shared/group-poster.js';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -138,44 +139,58 @@ describe('Unified Group & Page Picker + BlueStacks Inviter/Poster parity', () =>
     expect(host.textContent).toContain('按 ID 选中');
   });
 
-  it('BluestacksPosterPage uses unified FinderTargetList with real avatars and renders material thumbnails', async () => {
+  it('Unified GroupPosterPage in bluestacks carrier renders material thumbnails and 目标小组库 FinderTargetList', async () => {
     await act(async () => {
       root.render(
-        <BluestacksPosterPage
-          bluestacksState={null}
-          onBluestacksState={() => {}}
+        <GroupPosterPage
+          carrier="bluestacks"
+          state={{
+            groups: [
+              {
+                id: '3017439278594998',
+                name: 'Grace Group',
+                avatarUrl: 'data:image/webp;base64,UklGRhIAAABXRUJQVlA4',
+                folderId: 'folder-1',
+                sortOrder: 0,
+                totalBumpedCount: 1,
+                createdAt: 0,
+                updatedAt: 0,
+              },
+            ],
+            materials: [
+              {
+                id: 'mat-1',
+                caption: '带图素材测试',
+                mediaSource: 'https://example.com/a.jpg',
+                mediaKind: 'image',
+                background: 'plain',
+                aiLabel: 'default',
+                localFilePath: 'C:/tmp/a.jpg',
+                hasThumbnail: true,
+                cacheStatus: 'ready',
+                cacheError: null,
+                selected: true,
+                sortOrder: 0,
+                usedCount: 0,
+                createdAt: 1,
+                updatedAt: 2,
+              },
+            ],
+            settings: PosterSettings.parse({}),
+            running: false,
+            statusText: '',
+            total: 0,
+            dailyStats: [],
+            profileCounts: {},
+            pendingReviewOperations: [],
+            tasks: [],
+            postedGroupIdsByMaterial: {},
+            activeGroupsByMaterial: {},
+          }}
           selected={new Set()}
-          materials={[
-            {
-              id: 'mat-1',
-              caption: '带图素材测试',
-              mediaSource: 'https://example.com/a.jpg',
-              mediaKind: 'image',
-              background: 'plain',
-              aiLabel: 'default',
-              localFilePath: 'C:/tmp/a.jpg',
-              hasThumbnail: true,
-              cacheStatus: 'ready',
-              cacheError: null,
-              selected: true,
-              sortOrder: 0,
-              usedCount: 0,
-              createdAt: 1,
-              updatedAt: 2,
-            },
-          ]}
-          groups={[
-            {
-              id: '3017439278594998',
-              name: 'Grace Group',
-              avatarUrl: 'data:image/webp;base64,UklGRhIAAABXRUJQVlA4',
-              folderId: 'folder-1',
-              sortOrder: 0,
-              totalBumpedCount: 1,
-              createdAt: 0,
-              updatedAt: 0,
-            },
-          ]}
+          bluestacksState={null}
+          selectedBluestacks={new Set()}
+          onState={() => {}}
           onMessage={() => {}}
         />,
       );
@@ -184,9 +199,21 @@ describe('Unified Group & Page Picker + BlueStacks Inviter/Poster parity', () =>
       await Promise.resolve();
     });
 
-    expect(host.querySelector('.finder-target-list')).toBeTruthy();
-    expect(host.querySelectorAll('.finder-name img').length).toBe(1);
     const matImg = host.querySelector('img[src*="/api/workspace/group-poster/materials/media"]');
     expect(matImg).toBeTruthy();
+
+    // Switch to 目标小组库 tab
+    const groupsTab = [...host.querySelectorAll('button')].find((b) =>
+      b.textContent?.includes('目标小组库'),
+    );
+    expect(groupsTab).toBeTruthy();
+    await act(async () => {
+      groupsTab?.click();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(host.querySelector('.finder-target-list')).toBeTruthy();
+    expect(host.querySelectorAll('.finder-name img').length).toBe(1);
   });
 });

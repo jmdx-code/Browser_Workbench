@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import { CurrentStopReceipt } from './task-ending.js';
-
+import { CurrentStopReceipt, Id, NonNegInt, addIssue, sReq, strictObj } from './contracts.js';
 // Parsing describes evidence, never grants continuation. Business result describes the
 // failed attempt, not previously confirmed publications counted in this step's progress.
 export const StepSubmissionPhase = z.enum([
@@ -10,77 +9,66 @@ export const StepSubmissionPhase = z.enum([
   'RESULT_CONFIRMED',
   'UNKNOWN',
 ]);
-export const TaskStepFailure = z
-  .object({
-    version: z.literal(1),
-    kind: z.literal('FAILED'),
-    reason: z.string().min(1).max(200),
-    endedAt: z.number().int().nonnegative(),
-    endingId: z.uuid(),
-    currentStop: CurrentStopReceipt,
-    submissionPhase: StepSubmissionPhase,
-    businessResult: z.enum(['NOT_APPLICABLE', 'PUBLISHED', 'NOT_PUBLISHED', 'UNKNOWN']),
-  })
-  .strict()
-  .superRefine((value, issue) => {
-    if (value.currentStop.requestId !== value.endingId)
-      issue.addIssue({ code: 'custom', message: 'STEP_ENDING_STOP_MISMATCH' });
-    const allowed = {
-      NOT_APPLICABLE: ['NOT_APPLICABLE'],
-      BEFORE_SUBMIT: ['NOT_PUBLISHED'],
-      SUBMIT_DISPATCHED: ['UNKNOWN'],
-      RESULT_CONFIRMED: ['PUBLISHED', 'NOT_PUBLISHED'],
-      UNKNOWN: ['UNKNOWN'],
-    };
-    if (!allowed[value.submissionPhase].includes(value.businessResult))
-      issue.addIssue({ code: 'custom', message: 'STEP_SUBMISSION_RESULT_MISMATCH' });
-  });
-export const TaskStepSkip = z
-  .object({
-    version: z.literal(1),
-    kind: z.literal('SKIPPED'),
-    reason: z.enum([
-      'DEPENDENCY_FAILED',
-      'RESOURCE_EXHAUSTED',
-      'FEATURE_UNAVAILABLE',
-      'MARKETPLACE_UNAVAILABLE',
-    ]),
-    endedAt: z.number().int().nonnegative(),
-    dependencyStepId: z.uuid().optional(),
-    endingId: z.uuid().optional(),
-    currentStop: CurrentStopReceipt.optional(),
-  })
-  .strict()
-  .superRefine((value, issue) => {
-    if ((value.reason === 'DEPENDENCY_FAILED') !== (value.dependencyStepId !== undefined))
-      issue.addIssue({ code: 'custom', message: 'STEP_SKIP_DEPENDENCY_MISMATCH' });
-    if (value.reason === 'MARKETPLACE_UNAVAILABLE') {
-      if (!value.endingId || !value.currentStop || value.currentStop.requestId !== value.endingId)
-        issue.addIssue({ code: 'custom', message: 'MARKETPLACE_SKIP_STOP_REQUIRED' });
-    } else if (value.endingId || value.currentStop)
-      issue.addIssue({ code: 'custom', message: 'STEP_SKIP_UNEXPECTED_STOP' });
-  });
+const allowedResults: Record<z.infer<typeof StepSubmissionPhase>, readonly string[]> = {
+  NOT_APPLICABLE: ['NOT_APPLICABLE'],
+  BEFORE_SUBMIT: ['NOT_PUBLISHED'],
+  SUBMIT_DISPATCHED: ['UNKNOWN'],
+  RESULT_CONFIRMED: ['PUBLISHED', 'NOT_PUBLISHED'],
+  UNKNOWN: ['UNKNOWN'],
+};
+const stopFields = {
+  endedAt: NonNegInt,
+  endingId: Id.optional(),
+  currentStop: CurrentStopReceipt.optional(),
+};
+export const TaskStepFailure = strictObj({
+  version: z.literal(1),
+  kind: z.literal('FAILED'),
+  reason: sReq(200),
+  ...stopFields,
+  submissionPhase: StepSubmissionPhase,
+  businessResult: z.enum(['NOT_APPLICABLE', 'PUBLISHED', 'NOT_PUBLISHED', 'UNKNOWN']),
+}).superRefine((v, ctx) => {
+  if (
+    (v.endingId !== undefined) !== (v.currentStop !== undefined) ||
+    (v.endingId && v.currentStop && v.currentStop.requestId !== v.endingId)
+  )
+    addIssue(ctx, 'STEP_ENDING_STOP_MISMATCH');
+  if (!allowedResults[v.submissionPhase].includes(v.businessResult))
+    addIssue(ctx, 'STEP_SUBMISSION_RESULT_MISMATCH');
+});
+export const TaskStepSkip = strictObj({
+  version: z.literal(1),
+  kind: z.literal('SKIPPED'),
+  reason: z.enum([
+    'DEPENDENCY_FAILED',
+    'RESOURCE_EXHAUSTED',
+    'FEATURE_UNAVAILABLE',
+    'MARKETPLACE_UNAVAILABLE',
+  ]),
+  dependencyStepId: Id.optional(),
+  ...stopFields,
+}).superRefine((v, ctx) => {
+  if ((v.reason === 'DEPENDENCY_FAILED') !== (v.dependencyStepId !== undefined))
+    addIssue(ctx, 'STEP_SKIP_DEPENDENCY_MISMATCH');
+  if (v.reason === 'MARKETPLACE_UNAVAILABLE') {
+    if (v.endingId && v.currentStop && v.currentStop.requestId !== v.endingId)
+      addIssue(ctx, 'STEP_ENDING_STOP_MISMATCH');
+  } else if (v.endingId || v.currentStop) addIssue(ctx, 'STEP_SKIP_UNEXPECTED_STOP');
+});
 export const TaskStepOutcome = z.union([TaskStepFailure, TaskStepSkip]);
-
 export type StepOutcome = z.infer<typeof TaskStepOutcome>;
-
-export function isMarketplaceUnavailableSkip(
+export const isMarketplaceUnavailableSkip = (
   type: string,
   status: string,
   outcome?: Pick<StepOutcome, 'kind' | 'reason'>,
-): boolean {
-  return (
-    type === 'marketplace' &&
-    status === 'SKIPPED' &&
-    outcome?.kind === 'SKIPPED' &&
-    outcome.reason === 'MARKETPLACE_UNAVAILABLE'
-  );
-}
-
-export function isSuccessfulTaskStep(
+): boolean =>
+  type === 'marketplace' &&
+  status === 'SKIPPED' &&
+  outcome?.kind === 'SKIPPED' &&
+  outcome.reason === 'MARKETPLACE_UNAVAILABLE';
+export const isSuccessfulTaskStep = (
   type: string,
   status: string,
   outcome?: Pick<StepOutcome, 'kind' | 'reason'>,
-): boolean {
-  return status === 'COMPLETED' || isMarketplaceUnavailableSkip(type, status, outcome);
-}
+): boolean => status === 'COMPLETED' || isMarketplaceUnavailableSkip(type, status, outcome);

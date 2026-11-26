@@ -6,7 +6,6 @@ import { performance } from 'node:perf_hooks';
 import { mediaReference } from '../domain/resource-table.js';
 import { headerMatches, proofOf } from './material-file-utils.js';
 import type { DownloadedResourceMedia } from '../shared/resource-materials.js';
-
 export interface DriveDownloadPolicy {
   maxBytes: number;
   reserveBytes: number;

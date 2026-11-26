@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { ZodError } from 'zod';
-import type { ArchiveManagementService } from '../application/archive-management.js';
+import { ZodError, z } from 'zod';
 import type { DataCleanupService } from '../application/data-cleanup.js';
 import {
   ensureFeatureExecutionRegistry,
@@ -12,100 +11,93 @@ import type { GroupPosterService } from '../application/group-poster-service.js'
 import type { BluestacksService } from '../application/bluestacks-service.js';
 import type { AutoSchedulerService } from '../application/auto-scheduler-service.js';
 import type { GoogleSheetsService } from '../application/google-sheets-service.js';
-import type { MaterialCacheManagement } from '../application/material-cache-management.js';
-import type { MaterialPreflightService } from '../application/material-preflight.js';
-import type { MaterialUsageService } from '../application/material-usage-service.js';
-import type { MediaComponentPort } from '../application/media-component.js';
-import type { NativeReviewService } from '../application/native-review.js';
+import type {
+  MaterialCacheManagement,
+  MaterialUsageService,
+  MediaComponentPort,
+  WorkspaceMaintenance,
+} from '../application/workspace-media-maintenance.js';
 import type { ProfileInspectionService } from '../application/profile-inspection.js';
 import type { ResourceTableService } from '../application/resource-table-service.js';
 import type { SoftwareUpdateService } from '../application/software-update-service.js';
 import type { TaskService } from '../application/task-service.js';
 import { TaskTestService } from '../application/task-test-service.js';
 import type { WorkspaceBackupService } from '../application/workspace-backup-service.js';
-import type { WorkspaceMaintenance } from '../application/workspace-maintenance.js';
 import type { WorkspaceService } from '../application/workspace-service.js';
+import type { WorkspaceEventHub } from '../application/workspace-event-hub.js';
 import type { Awaitable } from '../domain/persistence.js';
 import { ProductError } from '../domain/workspace.js';
 import type { BrowserWindowPort } from '../shared/browser-window.js';
 import {
-  ChangeCombination,
   CreateCombination,
-  CreateCombinationDraft,
+  CreateGroup,
   DeleteCombination,
-  ExistingCombination,
-  StartCombination,
+  DeleteGroup,
+  Id,
+  RenameGroup,
+  RenameProfile,
+  SaveCombination,
   WorkspaceSchema,
+  obj,
+  strictObj,
 } from '../shared/contracts.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
-import type { WindowLayoutPort } from '../shared/window-layout.js';
+import {
+  PostBumpRecordQuerySchema,
+  PostBumpRecordQueryType,
+  type PostBumpRecordsPort,
+} from '../shared/post-bump-records.js';
+import { RESOURCE_SUMMARY_HEADER } from '../shared/resource-table.js';
+import { ExtensionReloadRequest } from '../shared/software-update.js';
+import { windowLayoutMessage, type WindowLayoutPort } from '../shared/window-layout.js';
+import { inferEventTopicsForRoute } from '../shared/workspace-events.js';
 import { handleFeatureModuleRoutes } from './routes/feature-module-routes.js';
-import { handleMaterialResourceRoutes } from './routes/material-resource-routes.js';
-import { handleSystemMaintenanceRoutes } from './routes/system-maintenance-routes.js';
 import { handleTaskRoutes } from './routes/task-routes.js';
-
-function json(res: ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, {
-    'content-type': 'application/json;charset=utf-8',
-    'cache-control': 'no-store',
-  });
-  res.end(JSON.stringify(body));
-}
-
+import { needSvc } from './task-contract-version.js';
+const DEFAULT_AVATAR_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><circle cx="24" cy="24" r="24" fill="#e3e7ed"/><circle cx="24" cy="18" r="8" fill="#929aa6"/><path d="M9 43a15 15 0 0 1 30 0" fill="#929aa6"/></svg>';
+const json = (res: ServerResponse, status: number, body: unknown) => {
+    res.writeHead(status, {
+      'content-type': 'application/json;charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify(body));
+  },
+  needUi = (msg: string): never => {
+    throw new ProductError('WORKBENCH_CLIENT_UPDATE_REQUIRED', msg, 409);
+  };
 function assertStoryWorkspaceClient(
   header: string | string[] | undefined,
   values: readonly (
     { steps: readonly { type: string; audience?: string; aiLabel?: string }[] } | null | undefined
   )[],
 ) {
-  if (
-    header !== '6' &&
-    values.some((value) =>
-      value?.steps.some((step) => step.type === 'post' && step.aiLabel !== undefined),
-    )
-  )
-    throw new ProductError(
-      'WORKBENCH_CLIENT_UPDATE_REQUIRED',
-      'AI 声明选项需要新版界面，请刷新工作台；当前编辑请先保留',
-      409,
-    );
-  if (
-    header !== '5' &&
-    header !== '6' &&
-    values.some((value) =>
-      value?.steps.some((step) => step.type === 'post' && step.audience === 'friends'),
-    )
-  )
-    throw new ProductError(
-      'WORKBENCH_CLIENT_UPDATE_REQUIRED',
-      '快拍好友范围需要新版界面，请刷新工作台；当前编辑请先保留',
-      409,
-    );
+  const hasPost = (pred: (s: { type: string; audience?: string; aiLabel?: string }) => boolean) =>
+    values.some((v) => v?.steps.some((s) => s.type === 'post' && pred(s)));
+  if (header !== '6' && hasPost((s) => s.aiLabel !== undefined))
+    needUi('AI 声明选项需要新版界面，请刷新工作台；当前编辑请先保留');
+  if (header !== '5' && header !== '6' && hasPost((s) => s.audience === 'friends'))
+    needUi('快拍好友范围需要新版界面，请刷新工作台；当前编辑请先保留');
 }
-
-export interface DiagnosticCaptureInput {
+interface DiagnosticCaptureInput {
   note?: string;
   uiContext?: string;
   targetDir?: string;
   reveal?: boolean;
 }
-export interface DiagnosticCaptureOutput {
+interface DiagnosticCaptureOutput {
   filePath: string;
   fileName: string;
   sizeBytes: number;
   entryId: number;
   at: string;
 }
-
 export function workspaceApi(
   service: WorkspaceService,
   tasks?: TaskService,
-  materials?: MaterialPreflightService,
   inspection?: ProfileInspectionService,
   resources?: ResourceTableService,
-  archives?: ArchiveManagementService,
-  nativeReview?: NativeReviewService,
   materialUsage?: MaterialUsageService,
   backups?: WorkspaceBackupService,
   softwareControl?: { restart: () => void },
@@ -130,249 +122,517 @@ export function workspaceApi(
   profileLifecycle?: ProfileLifecyclePort,
   autoScheduler?: AutoSchedulerService,
   googleSheets?: GoogleSheetsService,
+  postBumpRecords?: PostBumpRecordsPort,
+  eventHub?: WorkspaceEventHub,
 ) {
-  const resolvedFeatureExecution = ensureFeatureExecutionRegistry(featureExecution, {
+  const fe = ensureFeatureExecutionRegistry(featureExecution, {
     tasks,
     groupInviter,
     groupBumper,
     groupPoster,
     bluestacks,
   });
-  groupBumper?.setFeatureExecutionRegistry?.(resolvedFeatureExecution);
-  groupInviter?.setFeatureExecutionRegistry?.(resolvedFeatureExecution);
+  groupBumper?.setFeatureExecutionRegistry?.(fe);
+  groupInviter?.setFeatureExecutionRegistry?.(fe);
   if (profileLifecycle) {
     groupBumper?.setProfileLifecycle?.(profileLifecycle);
     groupInviter?.setProfileLifecycle?.(profileLifecycle);
     groupPoster?.setProfileLifecycle?.(profileLifecycle);
   }
   const taskTests = tasks
-    ? new TaskTestService(service, tasks, (profileId) =>
-        resolvedFeatureExecution.isProfileBusy(profileId, 'active-accounts'),
-      )
+    ? new TaskTestService(service, tasks, (id) => fe.isProfileBusy(id, 'active-accounts'))
     : undefined;
-  if (taskTests && profileLifecycle) {
-    taskTests.setProfileLifecycle(profileLifecycle);
-  }
+  if (taskTests && profileLifecycle) taskTests.setProfileLifecycle(profileLifecycle);
+  const skipPostDiag = new Set([
+      '/api/workspace/diagnostics/snapshot',
+      '/api/workspace/tasks/records',
+      '/api/workspace/tasks/history',
+      '/api/workspace/resource-tables/read',
+    ]),
+    sseHeaders = {
+      'content-type': 'text/event-stream;charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    };
   return async (req: IncomingMessage, res: ServerResponse, route: string, input?: unknown) => {
     if (!route.startsWith('/api/workspace')) return false;
+    const endRes = () => !res.writableEnded && res.end();
+    if (req.method === 'GET' && route === '/api/workspace/events') {
+      res.writeHead(200, sseHeaders);
+      res.flushHeaders?.();
+      if (!eventHub) {
+        res.write('event: ready\nid: 0\ndata: {"topics":["workspace"],"version":0,"at":0}\n\n');
+        req.on('close', endRes);
+      } else {
+        eventHub.attach({
+          get closed() {
+            return res.destroyed || res.writableEnded;
+          },
+          write: (c) => res.write(c),
+          end: endRes,
+          onClose: (cb) => req.on('close', cb),
+        });
+      }
+      return true;
+    }
     const reqStartAt = Date.now();
     try {
+      const routeCtx = {
+        req,
+        res,
+        route,
+        input,
+        json,
+        service,
+        tasks,
+        taskTests,
+        inspection,
+        browserWindows,
+        cleanup,
+        groupInviter,
+        groupBumper,
+        groupPoster,
+        bluestacks,
+        autoScheduler,
+        googleSheets,
+        profileLifecycle,
+        featureExecution: fe,
+        isProfileOnline,
+      };
+      if (await handleFeatureModuleRoutes(routeCtx)) return true;
+      const ok = (body: unknown, status = 200) => (json(res, status, body), true),
+        sendRaw = (status: number, headers: Record<string, string>, body?: string | Buffer) => (
+          res.writeHead(status, headers),
+          res.end(body),
+          true
+        ),
+        dispatchMap = async (
+          map: Record<string, (() => Promise<unknown>) | undefined>,
+          key = route,
+        ) => {
+          const fn = map[key];
+          if (!fn) return false;
+          const out = await fn();
+          return res.writableEnded ? true : ok(out);
+        };
       if (
-        await handleFeatureModuleRoutes({
-          req,
-          res,
-          route,
-          input,
-          json,
-          service,
-          tasks,
-          inspection,
-          nativeReview,
-          browserWindows,
-          cleanup,
-          groupInviter,
-          groupBumper,
-          groupPoster,
-          bluestacks,
-          autoScheduler,
-          googleSheets,
-          featureExecution: resolvedFeatureExecution,
-        })
+        route === '/api/workspace/window-layout' &&
+        (req.method === 'GET' || req.method === 'POST')
       ) {
-        return true;
+        const layout = needSvc(windowLayout, 'WINDOW_LAYOUT_UNAVAILABLE', '窗口布局服务未加载');
+        if (req.method === 'POST') cleanup?.assertNotResetting();
+        try {
+          return ok(req.method === 'GET' ? await layout.snapshot() : await layout.command(input));
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('WINDOW_LAYOUT_'))
+            throw new ProductError(error.message, windowLayoutMessage(error.message), 409);
+          throw error;
+        }
       }
-
+      if (mediaComponent && route === '/api/workspace/media-component') {
+        if (req.method === 'POST') {
+          cleanup?.assertNotResetting();
+          const { action } = obj({ action: z.enum(['install', 'cancel']) }).parse(input);
+          if (action === 'cancel') mediaComponent.cancel();
+          else {
+            backups?.assertIdle();
+            await mediaComponent.start();
+          }
+        }
+        return ok(await mediaComponent.status());
+      }
+      if (req.method === 'GET') {
+        const sp = new URL(req.url ?? '/', 'http://localhost').searchParams,
+          intOpt = (k: string) => {
+            const n = Number(sp.get(k) || NaN);
+            return Number.isSafeInteger(n) ? n : undefined;
+          };
+        if (route === '/api/workspace/post-bump-records') {
+          if (!postBumpRecords) return ok({ records: [], total: 0, hasMore: false });
+          return ok(
+            await postBumpRecords.list(
+              PostBumpRecordQuerySchema.parse({
+                recordType: sp.get('recordType') ?? 'all',
+                carrier: sp.get('carrier') ?? 'all',
+                status: sp.get('status') ?? 'all',
+                search: sp.get('search') ?? '',
+                from: intOpt('from'),
+                to: intOpt('to'),
+                limit: intOpt('limit') ?? 200,
+                offset: intOpt('offset') ?? 0,
+              }),
+            ),
+          );
+        }
+        if (cleanup && route === '/api/workspace/record-avatar') {
+          const image = await cleanup.recordAvatar(
+              z.enum(['account', 'page', 'group']).parse(sp.get('kind')),
+              z.string().min(1).max(200).parse(sp.get('id')),
+            ),
+            inline =
+              image && /^data:(image\/(?:jpeg|webp|png|gif));base64,([A-Za-z0-9+/=]+)$/.exec(image);
+          return inline
+            ? sendRaw(
+                200,
+                {
+                  'content-type': inline[1] ?? 'image/jpeg',
+                  'cache-control': 'private,max-age=300',
+                  'x-content-type-options': 'nosniff',
+                },
+                Buffer.from(inline[2] ?? '', 'base64'),
+              )
+            : image?.startsWith('https://')
+              ? sendRaw(302, { location: image, 'cache-control': 'private,max-age=60' })
+              : sendRaw(
+                  200,
+                  { 'content-type': 'image/svg+xml', 'cache-control': 'private,max-age=60' },
+                  DEFAULT_AVATAR_SVG,
+                );
+        }
+        const getMap: Record<string, (() => Promise<unknown>) | undefined> = {
+          '/api/workspace/update/status': () =>
+            needSvc(softwareUpdate, 'UPDATER_UNAVAILABLE', '当前服务未启用更新器').status(),
+          ...(cleanup
+            ? {
+                '/api/workspace/data-cleanup/progress': () => Promise.resolve(cleanup.progress()),
+                '/api/workspace/data-cleanup/settings': () => cleanup.settings(),
+                '/api/workspace/data-cleanup/reset-status': () => cleanup.resetStatus(),
+              }
+            : {}),
+          ...(maintenance
+            ? {
+                '/api/workspace/maintenance': () => maintenance.snapshot(),
+                '/api/workspace/maintenance/logs': () => maintenance.export(),
+              }
+            : {}),
+          '/api/workspace/preferences': () => service.preferences(),
+          '/api/workspace/backups/status': async () =>
+            (await backups?.status()) ?? {
+              available: false,
+              busy: false,
+              canCreate: false,
+              reason: '数据备份服务尚未加载',
+            },
+          '/api/workspace/backups/restore-status': async () =>
+            (await backups?.restoreStatus()) ?? {
+              available: false,
+              state: 'NONE',
+              reason: '恢复服务未加载',
+              safetyDirectory: '',
+            },
+          '/api/workspace/materials/cache': cacheManagement
+            ? () => cacheManagement.snapshot()
+            : undefined,
+          '/api/workspace/materials/usage': materialUsage
+            ? () => materialUsage.snapshot()
+            : undefined,
+        };
+        if (await dispatchMap(getMap)) return true;
+      }
+      if (req.method === 'POST') {
+        cleanup?.assertNotResetting();
+        if (
+          cleanup &&
+          route.startsWith('/api/workspace/data-cleanup/') &&
+          (await dispatchMap(
+            {
+              preview: () => cleanup.preview(input),
+              execute: () => cleanup.execute(input),
+              settings: () => cleanup.saveSettings(input),
+              compact: () => cleanup.compact(),
+              reset: () => cleanup.resetAll(input),
+            },
+            route.slice('/api/workspace/data-cleanup/'.length),
+          ))
+        )
+          return true;
+        if (
+          route.startsWith('/api/workspace/update/') ||
+          route.startsWith('/api/workspace/extensions/') ||
+          route.startsWith('/api/workspace/ai-workspace/')
+        ) {
+          const updater = needSvc(softwareUpdate, 'UPDATER_UNAVAILABLE', '当前服务未启用更新器');
+          if (
+            await dispatchMap({
+              '/api/workspace/update/status': () => updater.status(),
+              '/api/workspace/update/check': () => updater.check(),
+              '/api/workspace/update/config': () => updater.configure(input),
+              '/api/workspace/update/apply': () => updater.apply(),
+              '/api/workspace/extensions/reload': () =>
+                updater.reload(ExtensionReloadRequest.parse(input ?? {}).profileIds),
+              '/api/workspace/ai-workspace/open-dir': () => updater.openAiWorkspace(),
+              '/api/workspace/extensions/open-dir': () => updater.openDirectory(),
+            })
+          )
+            return true;
+        }
+        const sOpt = z.string().max(1024).optional(),
+          sNote = z.string().max(1000).optional(),
+          save = async (run: unknown) => (await Promise.resolve(run), { saved: true }),
+          needBackup = () => needSvc(backups, 'BACKUP_UNAVAILABLE', '请更新软件以使用数据备份'),
+          needRestore = () => needSvc(backups, 'RESTORE_UNAVAILABLE', '恢复服务未加载');
+        if (
+          await dispatchMap({
+            '/api/workspace/post-bump-records/delete': async () => {
+              if (!postBumpRecords) return { deleted: 0 };
+              const b = strictObj({
+                ids: z.array(z.string().min(1)).max(1000).optional(),
+                clearAll: z.boolean().optional(),
+                recordType: PostBumpRecordQueryType.optional(),
+              }).parse(input ?? {});
+              return b.clearAll
+                ? postBumpRecords.clear(b.recordType)
+                : postBumpRecords.deleteByIds(b.ids ?? []);
+            },
+            '/api/workspace/diagnostics/snapshot': captureDiagnostics
+              ? async () => ({
+                  recorded: true,
+                  ...(await captureDiagnostics(
+                    strictObj({
+                      note: sNote,
+                      uiContext: sNote,
+                      targetDir: sOpt,
+                      reveal: z.boolean().optional(),
+                    }).parse(input ?? {}),
+                  )),
+                })
+              : undefined,
+            '/api/workspace/diagnostics/reveal': revealDiagnostics
+              ? async () => {
+                  const p = strictObj({ fileName: sOpt, targetDir: sOpt }).parse(input ?? {});
+                  return { revealed: true, ...(await revealDiagnostics(p.fileName, p.targetDir)) };
+                }
+              : undefined,
+            '/api/workspace/maintenance/settings': maintenance
+              ? async () => maintenance.update(input)
+              : undefined,
+            '/api/workspace/preferences': () => service.updatePreferences(input),
+            '/api/workspace/profiles/reorder': async () => {
+              const v = strictObj({
+                groupId: Id.nullable(),
+                orderedProfileIds: z.array(Id).max(10000),
+              }).parse(input);
+              await service.requireProfiles(v.orderedProfileIds);
+              return save(service.repository.reorderProfiles?.(v.orderedProfileIds, v.groupId));
+            },
+            '/api/workspace/groups/reorder': () =>
+              save(
+                service.repository.reorderGroups?.(
+                  strictObj({ orderedGroupIds: z.array(Id).max(500) }).parse(input).orderedGroupIds,
+                ),
+              ),
+            '/api/workspace/groups/create': async () => {
+              const v = CreateGroup.parse(input);
+              return ok(await service.repository.createGroup(v.name, v.color), 201);
+            },
+            '/api/workspace/groups/rename': () => {
+              const v = RenameGroup.parse(input);
+              return save(service.repository.renameGroup(v.groupId, v.name));
+            },
+            '/api/workspace/groups/delete': async () => ({
+              deleted: true,
+              movedProfiles: await service.repository.deleteGroup(DeleteGroup.parse(input).groupId),
+            }),
+            '/api/workspace/profiles/rename': () => {
+              const v = RenameProfile.parse(input);
+              return save(service.renameProfile(v.profileId, v.alias));
+            },
+            '/api/workspace/software/restart': async () => {
+              const ctrl = needSvc(
+                  softwareControl,
+                  'SOFTWARE_RESTART_UNAVAILABLE',
+                  '当前不是桌面软件，请使用正常软件入口',
+                ),
+                activeLabels = (await fe.activeModuleLabels()) ?? [];
+              if (activeLabels.length > 0 || (await tasks?.hasActiveExecution()))
+                throw new ProductError(
+                  'TASKS_ACTIVE',
+                  activeLabels.length > 0
+                    ? `请先停止或暂停正在运行的任务（${activeLabels.join('、')}），再重启软件`
+                    : '请先停止或暂停任务，再重启软件',
+                  409,
+                );
+              backups?.assertNotBusy();
+              ok({ requested: true });
+              ctrl.restart();
+            },
+            '/api/workspace/backups/create': () => needBackup().create(input),
+            '/api/workspace/backups/inspect-restore': () => needRestore().inspectRestore(input),
+            '/api/workspace/backups/prepare-restore': () => needRestore().prepareRestore(input),
+          })
+        )
+          return true;
+      }
+      if (await handleTaskRoutes(routeCtx)) return true;
       if (
-        await handleSystemMaintenanceRoutes({
-          req,
-          res,
-          route,
-          input,
-          json,
-          service,
-          tasks,
-          backups,
-          softwareControl,
-          maintenance,
-          featureExecution: resolvedFeatureExecution,
-          captureDiagnostics,
-          revealDiagnostics,
-          cleanup,
-          windowLayout,
-          mediaComponent,
-          softwareUpdate,
-        })
+        route === '/api/workspace/resource-tables/summaries' &&
+        req.method === 'GET' &&
+        resources
       ) {
-        return true;
+        const c = req.headers[RESOURCE_SUMMARY_HEADER];
+        if (c !== undefined && c !== '2')
+          throw new ProductError('RESOURCE_SUMMARY_VERSION_UNSUPPORTED', '请更新资源列表界面', 409);
+        return ok(c === '2' ? await resources.usageSummaries() : await resources.summaries());
       }
-
-      if (req.method === 'POST') cleanup?.assertNotResetting();
-
       if (
-        await handleMaterialResourceRoutes({
-          req,
-          res,
-          route,
-          input,
-          json,
-          service,
-          materials,
-          resources,
-          archives,
-          materialUsage,
-          cacheManagement,
-          cleanup,
-        })
+        req.method === 'POST' &&
+        (route.startsWith('/api/workspace/materials/') ||
+          route.startsWith('/api/workspace/resource-tables/'))
       ) {
-        return true;
+        const needRes = () => needSvc(resources, 'RESOURCES_UNAVAILABLE', '资源表服务未启用'),
+          connected = (errCode: string) => () => {
+            if (req.aborted || res.destroyed) throw Error(errCode);
+          };
+        if (
+          await dispatchMap({
+            '/api/workspace/materials/cache/clean': () =>
+              needSvc(cacheManagement, 'CACHE_CLEANUP_UNAVAILABLE', '缓存管理服务未加载').clean(
+                input,
+              ),
+            '/api/workspace/materials/usage/clear': () =>
+              needSvc(
+                materialUsage,
+                'MATERIAL_USAGE_UNAVAILABLE',
+                '素材使用记录服务未启用，请更新软件',
+              ).clear(input),
+            '/api/workspace/resource-tables/read': () => needRes().read(input),
+            '/api/workspace/resource-tables/save': () => needRes().save(input),
+          })
+        )
+          return true;
+        if (route === '/api/workspace/resource-tables/media') {
+          const checkAlive = connected('RESOURCE_PREVIEW_CLIENT_CLOSED');
+          await needRes().previewMedia(input, checkAlive, async ({ bytes, contentType }) => {
+            checkAlive();
+            res.setTimeout(30_000, () => res.destroy());
+            res.writeHead(200, {
+              'content-type': contentType,
+              'content-length': bytes.byteLength,
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+            });
+            await new Promise<void>((resolve, reject) => {
+              const closed = () => reject(Error('RESOURCE_PREVIEW_CLIENT_CLOSED'));
+              res.once('close', closed);
+              res.end(bytes, () => (res.removeListener('close', closed), resolve()));
+            });
+          });
+          return true;
+        }
+        if (
+          route === '/api/workspace/resource-tables/download' ||
+          route === '/api/workspace/resource-tables/check'
+        ) {
+          const svc = needRes(),
+            downloading = route.endsWith('/download'),
+            checkAlive = connected('RESOURCE_CHECK_CLIENT_CLOSED'),
+            isStream = req.headers.accept === 'application/x-ndjson';
+          if (downloading && !isStream)
+            throw new ProductError('RESOURCE_DOWNLOAD_STREAM_REQUIRED', '请更新资源下载界面', 409);
+          if (!isStream) return ok(await svc.checkSources(input, checkAlive));
+          const frame = async (value: unknown) => {
+            checkAlive();
+            if (!res.headersSent)
+              res.writeHead(200, {
+                'content-type': 'application/x-ndjson',
+                'cache-control': 'no-store',
+                'x-content-type-options': 'nosniff',
+              });
+            await new Promise<void>((resolve, reject) =>
+              res.write(JSON.stringify(value) + '\n', (e) => (e ? reject(e) : resolve())),
+            );
+            checkAlive();
+          };
+          try {
+            const onProgress = (p: unknown) => frame({ kind: 'progress', ...(p as object) }),
+              report = downloading
+                ? await svc.downloadSources(input, checkAlive, onProgress)
+                : await svc.checkSources(input, checkAlive, onProgress);
+            await frame({ kind: 'completed', report });
+          } catch (error) {
+            if (!res.headersSent) throw error;
+            if (!res.destroyed)
+              await frame({
+                kind: 'failed',
+                code:
+                  error instanceof ProductError
+                    ? error.code
+                    : downloading
+                      ? 'RESOURCE_DOWNLOAD_INTERRUPTED'
+                      : 'RESOURCE_CHECK_FAILED',
+                error: error instanceof ProductError ? error.message : '检查未完成；已保存资源保持',
+              });
+          }
+          if (!res.destroyed) res.end();
+          return true;
+        }
       }
-
-      if (
-        await handleTaskRoutes({
-          req,
-          res,
-          route,
-          input,
-          json,
-          service,
-          tasks,
-          taskTests,
-          featureExecution: resolvedFeatureExecution,
-          isProfileOnline,
-          profileLifecycle,
-        })
-      ) {
-        return true;
-      }
-
+      const contractHeader = req.headers['x-workbench-workspace-contract'],
+        contract = String(contractHeader);
       if (req.method === 'GET' && route === '/api/workspace') {
         const snapshot = WorkspaceSchema.parse(await service.snapshot());
         assertStoryWorkspaceClient(
-          req.headers['x-workbench-workspace-contract'],
-          snapshot.combinations.flatMap((row) => [row.saved, row.draft]),
+          contractHeader,
+          snapshot.combinations.map((r) => r.saved),
         );
+        const hasStep = (
+          pred: (s: { type: string; audience?: unknown; resourceMode?: unknown }) => boolean,
+        ) => snapshot.combinations.some((r) => r.saved?.steps.some(pred));
         if (
-          !['4', '5', '6'].includes(String(req.headers['x-workbench-workspace-contract'])) &&
-          snapshot.combinations.some((row) =>
-            [row.saved, row.draft].some((value) =>
-              value?.steps.some((step) => step.type === 'post' && step.audience !== undefined),
-            ),
-          )
+          !['4', '5', '6'].includes(contract) &&
+          hasStep((s) => s.type === 'post' && s.audience !== undefined)
         )
-          throw new ProductError(
-            'WORKBENCH_CLIENT_UPDATE_REQUIRED',
-            '帖子分享范围需要新版界面，请刷新工作台；当前编辑请先保留',
-            409,
-          );
+          needUi('帖子分享范围需要新版界面，请刷新工作台；当前编辑请先保留');
         if (
-          !['2', '3', '4', '5', '6'].includes(
-            String(req.headers['x-workbench-workspace-contract']),
-          ) &&
-          snapshot.combinations.some((row) =>
-            [row.saved, row.draft].some((value) =>
-              value?.steps.some((step) => step.type === 'post' && step.resourceMode !== undefined),
-            ),
-          )
+          !['2', '3', '4', '5', '6'].includes(contract) &&
+          hasStep((s) => s.type === 'post' && s.resourceMode !== undefined)
         )
-          throw new ProductError(
-            'WORKBENCH_CLIENT_UPDATE_REQUIRED',
-            '资源表需要新版界面，请重新打开工作台；当前编辑请先保留',
-            409,
-          );
-        json(
-          res,
-          200,
-          ['3', '4', '5', '6'].includes(String(req.headers['x-workbench-workspace-contract']))
+          needUi('资源表需要新版界面，请重新打开工作台；当前编辑请先保留');
+        return ok(
+          ['3', '4', '5', '6'].includes(contract)
             ? snapshot
-            : {
-                ...snapshot,
-                profiles: snapshot.profiles.map(({ browserName: _name, ...profile }) => profile),
-              },
+            : { ...snapshot, profiles: snapshot.profiles.map(({ browserName: _n, ...p }) => p) },
         );
-        return true;
       }
-      if (req.method !== 'POST') {
-        json(res, 405, { code: 'METHOD_NOT_ALLOWED', error: '不支持的请求方式' });
-        return true;
-      }
+      if (req.method !== 'POST')
+        return ok({ code: 'METHOD_NOT_ALLOWED', error: '不支持的请求方式' }, 405);
       const repo = service.repository;
-      const assertExistingStoryClient = async (id: string) => {
-        const row = (await repo.combinations()).find((item) => item.id === id);
-        assertStoryWorkspaceClient(req.headers['x-workbench-workspace-contract'], [
-          row?.saved,
-          row?.draft,
-        ]);
-      };
-      switch (route) {
-        case '/api/workspace/combinations/create': {
-          const value = CreateCombination.parse(input);
-          assertStoryWorkspaceClient(req.headers['x-workbench-workspace-contract'], [value.value]);
-          json(res, 201, await repo.createCombination(value.value));
-          break;
-        }
-        case '/api/workspace/combinations/copy': {
-          const value = ExistingCombination.pick({ id: true }).strict().parse(input);
-          await assertExistingStoryClient(value.id);
-          json(res, 201, await repo.copyCombination(value.id));
-          break;
-        }
-        case '/api/workspace/combinations/delete': {
-          const value = DeleteCombination.parse(input);
-          const activePlan = (await tasks?.livePlans())?.find(
-            (plan) =>
-              plan.combinationId === value.id &&
-              !['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state),
-          );
-          if (activePlan)
-            throw new ProductError(
-              'COMBINATION_TASK_ACTIVE',
-              '该任务组合正在运行或排队中，请先停止相关任务后再删除',
-              409,
-            );
-          const result = await service.deleteCombination(value.id);
-          json(res, 200, { deleted: true, ...result });
-          break;
-        }
-        case '/api/workspace/combinations/create-draft': {
-          const value = CreateCombinationDraft.parse(input);
-          assertStoryWorkspaceClient(req.headers['x-workbench-workspace-contract'], [value.value]);
-          json(res, 201, await repo.createDraft(value.value));
-          break;
-        }
-        case '/api/workspace/combinations/draft': {
-          const value = ChangeCombination.parse(input);
-          await assertExistingStoryClient(value.id);
-          assertStoryWorkspaceClient(req.headers['x-workbench-workspace-contract'], [value.value]);
-          json(res, 200, await repo.writeDraft(value.id, value.expectedRevision, value.value));
-          break;
-        }
-        case '/api/workspace/combinations/publish': {
-          const value = ExistingCombination.parse(input);
-          await assertExistingStoryClient(value.id);
-          json(res, 200, await repo.publish(value.id, value.expectedRevision));
-          break;
-        }
-        case '/api/workspace/combinations/discard': {
-          const value = ExistingCombination.parse(input);
-          await assertExistingStoryClient(value.id);
-          json(res, 200, await repo.discardDraft(value.id, value.expectedRevision));
-          break;
-        }
-        case '/api/workspace/combinations/start': {
-          StartCombination.parse(input);
-          service.startCombination();
-          break;
-        }
-        default:
-          json(res, 404, { code: 'NOT_FOUND', error: '接口不存在' });
+      if (route === '/api/workspace/combinations/create') {
+        const value = CreateCombination.parse(input);
+        assertStoryWorkspaceClient(contractHeader, [value.value]);
+        return ok(await repo.createCombination(value.value), 201);
       }
+      if (route === '/api/workspace/combinations/save') {
+        const value = SaveCombination.parse(input),
+          existing = (await repo.combinations()).find((item) => item.id === value.id);
+        assertStoryWorkspaceClient(contractHeader, [existing?.saved, value.value]);
+        if (!repo.saveCombination)
+          throw new ProductError('SAVE_COMBINATION_UNSUPPORTED', '当前存储不支持直接保存组合', 501);
+        return ok(await repo.saveCombination(value.id, value.expectedRevision, value.value));
+      }
+      if (route === '/api/workspace/combinations/delete') {
+        const value = DeleteCombination.parse(input);
+        if (
+          (await tasks?.livePlans())?.some(
+            (p) =>
+              p.combinationId === value.id && !['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state),
+          )
+        )
+          throw new ProductError(
+            'COMBINATION_TASK_ACTIVE',
+            '该任务组合正在运行或排队中，请先停止相关任务后再删除',
+            409,
+          );
+        return ok({ deleted: true, ...(await service.deleteCombination(value.id)) });
+      }
+      json(res, 404, { code: 'NOT_FOUND', error: '接口不存在' });
     } catch (error) {
-      const durationMs = Date.now() - reqStartAt;
       devDiag.record({
         level: 'ERROR',
         category: 'HTTP_API',
         event: 'HTTP_REQUEST_ERROR',
-        durationMs,
+        durationMs: Date.now() - reqStartAt,
         reason:
           error instanceof ProductError
             ? `${error.code}:${error.message}`
@@ -388,23 +648,18 @@ export function workspaceApi(
         json(res, 400, {
           code: 'VALIDATION_FAILED',
           error: '参数不符合规则',
-          issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+          issues: error.issues.map((i) => ({ path: i.path, message: i.message })),
         });
       else {
         console.error('Workspace request failed', error);
         json(res, 500, { code: 'INTERNAL_ERROR', error: '保存失败，请查看本机日志' });
       }
     } finally {
-      if (
-        req.method === 'POST' &&
-        route !== '/api/workspace/diagnostics/snapshot' &&
-        ![
-          '/api/workspace/tasks/records',
-          '/api/workspace/tasks/history',
-          '/api/workspace/resource-tables/read',
-          '/api/workspace/archives/list',
-        ].includes(route)
-      ) {
+      if (req.method === 'POST' && res.statusCode > 0 && res.statusCode < 400 && eventHub) {
+        const topics = inferEventTopicsForRoute(route);
+        if (topics.length > 0) eventHub.emit(topics, route);
+      }
+      if (req.method === 'POST' && !skipPostDiag.has(route)) {
         const durationMs = Date.now() - reqStartAt;
         devDiag.record({
           level: durationMs >= 2000 ? 'SLOW' : 'INFO',

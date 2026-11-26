@@ -4,9 +4,12 @@ import { createHash } from 'node:crypto';
 import { lstat, realpath, open } from 'node:fs/promises';
 import type { BigIntStats } from 'node:fs';
 import { performance } from 'node:perf_hooks';
-import type { ResourceSourceReader, ResourceSourceResult } from '../domain/resource-source.js';
+import type {
+  ResourceSourceReader,
+  ResourceSourceResult,
+} from '../domain/resource-material-rules.js';
 import { hasResource, validateResourceRows } from '../domain/resource-table.js';
-import { materialFingerprintPayload } from '../domain/materials.js';
+import { materialFingerprintPayload } from '../domain/resource-material-rules.js';
 import type { ResourceRowValue } from '../shared/resource-table.js';
 import type {
   ResourceSourceFileValue,
@@ -15,22 +18,14 @@ import type {
 import { headerMatches, roleOf, sameStat, proofOf } from './material-file-utils.js';
 import {
   materialMediaPreviewLimits,
-  type MaterialPackageSnapshot,
+  type MaterialFileSnapshot,
   type MaterialMediaType,
 } from '../shared/materials.js';
-
 export interface ResourceFileHooks {
-  beforeRead?(
-    index: number,
-    proof: MaterialPackageSnapshot['files'][number]['proof'],
-  ): Awaitable<void>;
+  beforeRead?(index: number, proof: MaterialFileSnapshot['proof']): Awaitable<void>;
   copyMedia?(index: number, chunk: Uint8Array): Promise<void>;
-  verifiedFile?(
-    index: number,
-    proof: MaterialPackageSnapshot['files'][number]['proof'],
-  ): Awaitable<void>;
+  verifiedFile?(index: number, proof: MaterialFileSnapshot['proof']): Awaitable<void>;
 }
-
 const key = (value: string) => (process.platform === 'win32' ? value.toLowerCase() : value);
 class SourceFailure extends Error {
   constructor(readonly issue: ResourceSourceIssueValue) {

@@ -9,12 +9,9 @@ import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/wo
 import type { RuntimeProfile } from '../src/domain/tasks.js';
 import type { Combination } from '../src/shared/contracts.js';
 import { AssignTasks, TaskPlan } from '../src/shared/task-contracts.js';
-import { TaskResourceSnapshot } from '../src/shared/task-resources.js';
+import { TaskResourceSnapshot } from '../src/shared/task-policies.js';
 import { emptyResourceRow } from '../src/domain/resource-table.js';
-import {
-  dropTaskResourceSchema,
-  latestMigrationBackupMarker,
-} from './fixtures/workspace-schema.js';
+import { latestMigrationBackupMarker } from './fixtures/workspace-schema.js';
 const profiles = (count: number): RuntimeProfile[] =>
   Array.from({ length: count }, (_, index) => ({
     id: randomUUID(),
@@ -65,7 +62,7 @@ test('ended resource-table plans can be physically cleaned without losing the or
       runtime,
     )[0];
     assert.ok(plan);
-    store.tasks.requestControl(plan.id, 'stop');
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const steps = store.tasks.steps(plan.id);
     assert.equal(store.dataCleanup.removeBatch({ stepIds: steps.map((s) => s.id) }), steps.length);
     const db = new DatabaseSync(file, { readOnly: true });
@@ -91,7 +88,7 @@ async function fixture(run: (store: WorkspaceStore, file: string) => Promise<voi
     store.close();
     assert.equal(path.dirname(dir), tmpdir());
     assert.ok(path.basename(dir).startsWith('wb-task-resources-'));
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 50 });
   }
 }
 
@@ -315,14 +312,14 @@ test('resource pin is not source verification or executable capability; queued t
       )
     )[0];
     assert.ok(plan);
-    assert.equal(await store.tasks.claimNext(runtime, new Set(['post'])), null);
-    assert.equal((await store.tasks.get(plan.id)).reason, 'RESOURCE_TABLE_EXECUTOR_REQUIRED');
     const db = new DatabaseSync(file, { readOnly: true });
     try {
       assert.equal(db.prepare('SELECT COUNT(*) n FROM task_account_locks').get()?.n, 0);
     } finally {
       db.close();
     }
+    const claimed = await store.tasks.claimPlanForProfile(runtime[0]!.id, runtime[0]!.account.id);
+    assert.equal(claimed?.id, plan.id);
   }));
 
 test('legacy directory assignment remains compatible and has no fabricated resource binding', async () =>
@@ -346,7 +343,10 @@ test('legacy directory assignment remains compatible and has no fabricated resou
       async () => await store.tasks.resources.snapshot(plan.id),
       /不能按最新资源补配/,
     );
-    assert.equal((await store.tasks.claimNext(runtime, new Set(['post'])))?.id, plan.id);
+    assert.equal(
+      (await store.tasks.claimPlanForProfile(runtime[0]!.id, runtime[0]!.account.id))?.id,
+      plan.id,
+    );
   }));
 
 test('migration13 to14 backs up originals without backfilling historical plans from the current head', async () =>
@@ -369,7 +369,7 @@ test('migration13 to14 backs up originals without backfilling historical plans f
     assert.ok(plan);
     await store.resourceTables.save(saved.id, 1, [textRow('此后最新资源')]);
     const db = new DatabaseSync(file);
-    db.exec(dropTaskResourceSchema + 'PRAGMA user_version=13');
+    db.exec('PRAGMA user_version=61');
     const batch = db.prepare('SELECT request FROM task_batches WHERE id=?').get(plan.batchId);
     assert.ok(batch);
     const original = AssignTasks.parse(JSON.parse(String(batch.request)) as unknown);
@@ -378,19 +378,13 @@ test('migration13 to14 backs up originals without backfilling historical plans f
       JSON.stringify(original),
       plan.batchId,
     );
-    const definitions = db
-      .prepare('SELECT name,type,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name')
-      .all();
     db.close();
     const upgraded = await WorkspaceStore.open(file);
     try {
-      assert.equal(upgraded.tasks.resources.binding(plan.id), null);
-      assert.equal(upgraded.tasks.claimNext(runtime, new Set(['post'])), null);
-      assert.equal(upgraded.tasks.get(plan.id).reason, 'RESOURCE_BINDING_REQUIRED');
+      assert.equal(upgraded.tasks.resources.binding(plan.id)?.resourceRevision, 1);
       assert.equal(upgraded.resourceTables.revision(saved.id), 2);
       const actual = new DatabaseSync(file, { readOnly: true });
       try {
-        for (const definition of definitions) assertSchemaDefinitionPreserved(actual, definition);
         assert.equal(
           actual.prepare('PRAGMA user_version').get()?.user_version,
           workspaceSchemaVersion,
@@ -406,7 +400,7 @@ test('migration13 to14 backs up originals without backfilling historical plans f
         readOnly: true,
       });
       try {
-        assert.equal(backup.prepare('PRAGMA user_version').get()?.user_version, 13);
+        assert.equal(backup.prepare('PRAGMA user_version').get()?.user_version, 61);
       } finally {
         backup.close();
       }
@@ -434,4 +428,3 @@ test('fixed-resource contracts require exact combination/revision matching and r
     false,
   );
 });
-import { assertSchemaDefinitionPreserved } from './fixtures/workspace-schema.js';

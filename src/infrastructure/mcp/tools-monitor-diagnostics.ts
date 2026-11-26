@@ -1,867 +1,451 @@
 import { open as openFile } from 'node:fs/promises';
-import { devDiag } from '../../shared/dev-diagnostics.js';
-import {
-  buildEnrichedProfiles,
-  errorResult,
-  formatLocalDateTime,
-  okResult,
-  resolveDataDirIntegrity,
-  resolveProfileIdentifierFromList,
-  resolveProfileIds,
-  type McpToolDefinition,
-  type WorkbenchMcpDependencies,
-} from './mcp-context.js';
+import { devDiag, type DevDiagLevel } from '../../shared/dev-diagnostics.js';
+import * as M from './mcp-context.js';
 
-async function readTailJsonlLines(
-  filePath: string,
-  maxBytes = 262_144,
-): Promise<Array<Record<string, unknown>>> {
-  let handle: Awaited<ReturnType<typeof openFile>> | null = null;
+const MODULES =
+  'active-accounts group-poster group-bumper page-bumper group-inviter bluestacks-bumper bluestacks-page-bumper auto-scheduler google-sheets';
+const MOD_MAP: Record<string, string> = {
+  tasks: 'active-accounts',
+  poster: 'group-poster',
+  bumper: 'group-bumper',
+  inviter: 'group-inviter',
+  bluestacks: 'bluestacks-bumper',
+  'bluestacks-group-bumper': 'bluestacks-bumper',
+  scheduler: 'auto-scheduler',
+  sheets: 'google-sheets',
+};
+const DONE_PLAN = new Set(['STOPPED', 'COMPLETED', 'FAILED']);
+const DONE_POST = new Set(['completed', 'partial', 'failed', 'cancelled']);
+
+async function readTailJsonlLines(filePath: string, maxBytes = 262_144) {
+  const h = await openFile(filePath, 'r').catch(() => null);
+  if (!h) return [];
   try {
-    handle = await openFile(filePath, 'r');
-    const st = await handle.stat();
-    if (st.size <= 0) return [];
-    const readLen = Math.min(st.size, maxBytes);
-    const startOffset = Math.max(0, st.size - readLen);
-    const buf = Buffer.alloc(readLen);
-    const { bytesRead } = await handle.read(buf, 0, readLen, startOffset);
-    const text = buf.subarray(0, bytesRead).toString('utf8');
-    const rawLines = text.split(/\r?\n/);
-    // Drop potentially partial first line when reading from middle of file
-    const completeLines = startOffset > 0 ? rawLines.slice(1) : rawLines;
-    const parsed: Array<Record<string, unknown>> = [];
-    for (const line of completeLines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+    const size = (await h.stat()).size;
+    const len = Math.min(size, maxBytes);
+    if (len <= 0) return [];
+    const off = Math.max(0, size - len);
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await h.read(buf, 0, len, off);
+    const lines = buf.subarray(0, bytesRead).toString('utf8').split(/\r?\n/);
+    const out: Array<Record<string, unknown>> = [];
+    for (const raw of off > 0 ? lines.slice(1) : lines) {
+      if (!raw.trim()) continue;
       try {
-        const obj = JSON.parse(trimmed) as unknown;
-        if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
-          parsed.push(obj as Record<string, unknown>);
-        }
+        const o = JSON.parse(raw.trim()) as unknown;
+        if (typeof o === 'object' && o !== null && !Array.isArray(o))
+          out.push(o as Record<string, unknown>);
       } catch {}
     }
-    return parsed;
+    return out;
   } catch {
     return [];
   } finally {
-    await handle?.close().catch(() => {});
+    await h.close().catch(() => {});
   }
 }
 
-export function createMonitorAndDiagnosticTools(
-  deps: WorkbenchMcpDependencies,
-): McpToolDefinition[] {
-  const wbWaitForTask: McpToolDefinition = {
-    name: 'wb_wait_for_task',
-    description:
-      '阻塞等待并持续监控指定业务模块的任务真实进展（最长单次等待 90 秒，无需高频空转轮询）。返回真实落盘回执（如发帖 postId / postUrl、顶贴记录、邀请记录）、每个浏览器的实时步骤状态、受限账号预警、待核对未决操作（PENDING_REVIEW）以及期间新增的诊断异常，遇到账号受限或待核对异常时可提前唤醒以便 Agent 立即处置。',
-    annotations: { readOnlyHint: true },
-    inputSchema: {
-      type: 'object',
-      properties: {
-        module: {
-          type: 'string',
-          enum: [
-            'active-accounts',
-            'group-poster',
-            'group-bumper',
-            'page-bumper',
-            'group-inviter',
-            'bluestacks-bumper',
-            'bluestacks-page-bumper',
-            'auto-scheduler',
-            'google-sheets',
-          ],
-          description: '要监控的业务模块',
-        },
-        taskIds: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '可选传入要精确跟踪的任务 ID 或计划 planId 数组',
-        },
-        taskId: {
-          type: 'string',
-          description: '可选传入单个要跟踪的任务 ID 或计划 planId（等价于 taskIds: [taskId]）',
-        },
-        profileIds: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'active-accounts 模块可选按指定浏览器标识列表过滤跟踪计划',
-        },
-        waitSeconds: {
-          type: 'number',
-          minimum: 1,
-          maximum: 90,
-          description: '本次最多等待的秒数（默认 25 秒，最大 90 秒）',
-        },
-        wakeOnAnomaly: {
-          type: 'boolean',
-          description: '检测到新增账号受限或待核对未决操作时是否提前唤醒返回（默认 true）',
-        },
+async function readSimpleStatus(
+  deps: M.WorkbenchMcpDependencies,
+  mod: string,
+  since: (ms: number) => boolean,
+): Promise<{ running: boolean; payload: object }> {
+  if (mod === 'auto-scheduler') {
+    const svc = deps.getAutoSchedulerService?.();
+    M.req(svc, 'AUTO_SCHEDULER_UNAVAILABLE', '定时排班服务尚未初始化', 503);
+    const st = await svc.state();
+    return {
+      running: st.running,
+      payload: {
+        running: st.running,
+        activeRuns: st.activeRuns,
+        recentRuns: st.recentRuns.slice(0, 5),
       },
-      required: ['module'],
-      additionalProperties: false,
+    };
+  }
+  if (mod === 'google-sheets') {
+    const svc = deps.getGoogleSheetsService?.();
+    M.req(svc, 'GOOGLE_SHEETS_UNAVAILABLE', 'Google 云表协同服务尚未初始化', 503);
+    const ov = await svc.overview();
+    return {
+      running: svc.hasActiveExecution(),
+      payload: {
+        ...M.pick(ov, 'runningScheduleCount runningRecordsCount'),
+        recentLogs: ov.logs.slice(0, 15),
+      },
+    };
+  }
+  if (mod === 'group-inviter') {
+    const [st, logs] = await Promise.all([
+      deps.groupInviterService.state(),
+      deps.groupInviterService.logs('', undefined, 80),
+    ]);
+    const entries = logs.filter((l) => since(l.invitedAt));
+    return {
+      running: st.running,
+      payload: {
+        ...M.pick(st, 'running statusText profileCounts runId?'),
+        newVerifiedInvitesCount: entries.length,
+        newVerifiedInvites: entries,
+      },
+    };
+  }
+  const isPage = mod === 'bluestacks-page-bumper';
+  const bumper = deps.getGroupBumperService();
+  const [st, logs] = await Promise.all([
+    deps.bluestacksService.state(false),
+    bumper
+      ? bumper.logs('', undefined, undefined, 80, isPage ? 'page' : 'group')
+      : Promise.resolve([]),
+  ]);
+  const instIds = new Set(st.instances.map((i) => i.id));
+  const entries = logs.filter((l) => instIds.has(l.profileId) && since(l.bumpedAt));
+  const scope = M.pickBumperScope(st, isPage);
+  return {
+    running: scope.running,
+    payload: {
+      ...M.pick(scope, 'running statusText profileCounts'),
+      newVerifiedBumpsCount: entries.length,
+      newVerifiedBumps: entries,
     },
-    handler: async (args) => {
-      const rawModule = String(args.module ?? 'group-poster').trim();
-      const moduleAliasMap: Record<string, string> = {
-        tasks: 'active-accounts',
-        'active-accounts': 'active-accounts',
-        poster: 'group-poster',
-        'group-poster': 'group-poster',
-        bumper: 'group-bumper',
-        'group-bumper': 'group-bumper',
-        'page-bumper': 'page-bumper',
-        inviter: 'group-inviter',
-        'group-inviter': 'group-inviter',
-        bluestacks: 'bluestacks-bumper',
-        'bluestacks-bumper': 'bluestacks-bumper',
-        'bluestacks-group-bumper': 'bluestacks-bumper',
-        'bluestacks-page-bumper': 'bluestacks-page-bumper',
-        scheduler: 'auto-scheduler',
-        'auto-scheduler': 'auto-scheduler',
-        sheets: 'google-sheets',
-        'google-sheets': 'google-sheets',
-      };
-      const moduleName = moduleAliasMap[rawModule];
-      if (!moduleName) {
-        return errorResult(
-          'INVALID_MODULE',
-          `不支持的监控模块 "${rawModule}"，可选值：active-accounts、group-poster、group-bumper、page-bumper、group-inviter、bluestacks-bumper、bluestacks-page-bumper、auto-scheduler、google-sheets`,
-        );
-      }
-      const waitMs = Math.max(1, Math.min(90, Number(args.waitSeconds ?? 25))) * 1000;
-      const wakeOnAnomaly = args.wakeOnAnomaly !== false;
-      const singleTaskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
-      const taskIds = [
-        ...(Array.isArray(args.taskIds)
-          ? args.taskIds.map((x) => String(x).trim()).filter(Boolean)
-          : []),
-        ...(singleTaskId ? [singleTaskId] : []),
-      ];
-      const startedAt = Date.now();
-      const deadline = startedAt + waitMs;
-      const baselineDiagSeq = devDiag.recent(1)[0]?.seq ?? 0;
+  };
+}
 
-      const collectNewDiagnostics = () =>
-        devDiag
-          .recent(200)
-          .filter(
-            (e) =>
-              e.seq > baselineDiagSeq &&
-              (e.level === 'WARN' || e.level === 'ERROR' || e.level === 'WAIT'),
-          )
-          .slice(-25)
-          .map((e) => ({
-            seq: e.seq,
-            localTime: e.localTime,
-            level: e.level,
-            category: e.category,
-            event: e.event,
-            profileId: e.profileId ?? null,
-            profileName: e.profileName ?? null,
-            reason: e.reason ?? null,
-            data: e.data ?? null,
-          }));
+async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
+  const rawMod = M.strArg(args.module) || 'group-poster';
+  const mod = MOD_MAP[rawMod] ?? (MODULES.split(' ').includes(rawMod) ? rawMod : '');
+  M.req(mod, 'INVALID_MODULE', `不支持的监控模块 "${rawMod}"`);
+  const waitMs = Math.max(1, Math.min(90, Number(args.waitSeconds ?? 25))) * 1000;
+  const wakeOnAnomaly = args.wakeOnAnomaly !== false;
+  const taskIds = M.collectRawIds(args, 'taskIds', 'taskId');
+  const startedAt = Date.now();
+  const baseSeq = devDiag.recent(1)[0]?.seq ?? 0;
+  const deadline = startedAt + waitMs;
+  const since = (ms: number) => ms >= startedAt - 2000;
+  const isFut = (ms: number | null) =>
+    ms !== null && ms > Date.now() + Math.max(2000, deadline - Date.now());
+  const pollWake = async (fn: (done: (w: string) => true) => Promise<boolean>) => {
+    let wake = 'timeout_still_running';
+    await M.pollUntil(deadline, 1000, () => fn((w) => ((wake = w), true)));
+    return wake;
+  };
+  const finish = (wakeReason: string, settled: boolean, extra: object) => {
+    const diag = M.recentDiagSlice(200, 25, { minSeq: baseSeq, levels: ['WARN', 'ERROR', 'WAIT'] });
+    return {
+      module: mod,
+      settled,
+      wakeReason,
+      elapsedMs: Date.now() - startedAt,
+      ...extra,
+      newDiagnostics: diag.map((e) =>
+        M.pick(e, 'seq localTime level category event profileId? profileName? reason? data?'),
+      ),
+    };
+  };
+  const checkBatch = (
+    hasIds: boolean,
+    empty: boolean,
+    doneAll: boolean,
+    futAll: boolean,
+    run: boolean,
+  ) => {
+    if (!hasIds) return !run ? 'completed' : null;
+    if (empty) return 'task_not_found';
+    return doneAll ? 'completed' : futAll ? 'scheduled_in_future' : null;
+  };
+  const pendIds = (st?: { pendingReviewOperations?: Array<{ id: string }> }) =>
+    new Set((st?.pendingReviewOperations ?? []).map((o) => o.id));
+  const hasNewPend = (st: { pendingReviewOperations?: Array<{ id: string }> }, seen: Set<string>) =>
+    wakeOnAnomaly && (st.pendingReviewOperations ?? []).some((o) => !seen.has(o.id));
 
-      if (moduleName === 'active-accounts') {
-        const taskService = deps.taskService;
-        if (!taskService) {
-          return errorResult('TASKS_UNAVAILABLE', '活跃账号任务执行服务未启用');
-        }
-        const rawFilterPids = Array.isArray(args.profileIds)
-          ? args.profileIds.map((x) => String(x).trim()).filter(Boolean)
-          : [];
-        const filterProfileSet =
-          rawFilterPids.length > 0 ? new Set(await resolveProfileIds(deps, rawFilterPids)) : null;
-        const filterPlanSet = taskIds.length > 0 ? new Set(taskIds) : null;
-
-        const initOverview = await taskService.overview();
-        const initialReviewIds = new Set(
-          initOverview.plans.filter((p) => p.state === 'REVIEW').map((p) => p.id),
-        );
-
-        let aaWake:
-          | 'completed'
-          | 'paused'
-          | 'scheduled_in_future'
-          | 'pending_review_detected'
-          | 'timeout_still_running' = 'timeout_still_running';
-
-        while (true) {
-          const ov = await taskService.overview();
-          const tracked = ov.plans.filter((p) => {
-            if (filterPlanSet && !filterPlanSet.has(p.id)) return false;
-            if (filterProfileSet && !filterProfileSet.has(p.profileId)) return false;
-            if (!filterPlanSet && !filterProfileSet) {
-              return !['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state);
-            }
-            return true;
-          });
-
-          if (tracked.length === 0) {
-            aaWake = 'completed';
-            break;
-          }
-          if (tracked.every((p) => ['STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))) {
-            aaWake = 'completed';
-            break;
-          }
-          if (
-            tracked.every((p) => ['PAUSED', 'STOPPED', 'COMPLETED', 'FAILED'].includes(p.state))
-          ) {
-            aaWake = 'paused';
-            break;
-          }
-          if (
-            tracked.every(
-              (p) =>
-                p.state === 'QUEUED' &&
-                p.timing?.mode === 'at' &&
-                p.timing.startAt > Date.now() + Math.max(2000, deadline - Date.now()),
-            )
-          ) {
-            aaWake = 'scheduled_in_future';
-            break;
-          }
-          if (
-            wakeOnAnomaly &&
-            ov.plans.some((p) => p.state === 'REVIEW' && !initialReviewIds.has(p.id))
-          ) {
-            aaWake = 'pending_review_detected';
-            break;
-          }
-          if (Date.now() >= deadline) break;
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-
-        const finalOv = await taskService.overview();
-        const monitoredPlans = finalOv.plans
-          .filter((p) => {
-            if (filterPlanSet && !filterPlanSet.has(p.id)) return false;
-            if (filterProfileSet && !filterProfileSet.has(p.profileId)) return false;
-            return true;
-          })
-          .slice(0, 30)
-          .map((p) => ({
-            id: p.id,
-            profileId: p.profileId,
-            combinationId: p.combinationId,
-            combinationName: p.snapshot.name,
-            state: p.state,
-            reason: p.reason,
-            round: p.round,
-            position: p.position,
-            updatedAtLocal: formatLocalDateTime(p.updatedAt),
-          }));
-        const stillRunning = monitoredPlans.some((p) =>
-          ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'].includes(p.state),
-        );
-
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled: !stillRunning,
-          wakeReason: aaWake,
-          elapsedMs: Date.now() - startedAt,
-          running: stillRunning,
-          monitoredPlansCount: monitoredPlans.length,
-          monitoredPlans,
-          reviewPlans: finalOv.plans
-            .filter((p) => p.state === 'REVIEW')
-            .map((p) => ({
-              id: p.id,
-              profileId: p.profileId,
-              combinationName: p.snapshot.name,
-              reason: p.reason,
-            })),
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      if (moduleName === 'group-poster') {
-        const initialState = await deps.groupPosterService.state();
-        const initialRestricted = new Set(
-          Object.entries(initialState.profileCounts)
-            .filter(([, stat]) => stat.restricted === true)
-            .map(([pid]) => pid),
-        );
-        const initialPendingIds = new Set(
-          (initialState.pendingReviewOperations ?? []).map((op) => op.id),
-        );
-
-        let wakeReason:
-          | 'completed'
-          | 'scheduled_in_future'
-          | 'account_restricted_detected'
-          | 'pending_review_detected'
-          | 'task_not_found'
-          | 'timeout_still_running' = 'timeout_still_running';
-
-        while (true) {
-          const st = await deps.groupPosterService.state();
-          const allTasks = st.tasks ?? [];
-          const tracked =
-            taskIds.length > 0
-              ? allTasks.filter((t) => taskIds.includes(t.id))
-              : allTasks.filter((t) => t.status === 'running' || t.status === 'scheduled');
-
-          if (taskIds.length > 0 && tracked.length === 0) {
-            wakeReason = 'task_not_found';
-            break;
-          }
-          if (taskIds.length > 0 && tracked.length > 0) {
-            const terminal = tracked.every((t) =>
-              ['completed', 'partial', 'failed', 'cancelled'].includes(t.status),
-            );
-            if (terminal) {
-              wakeReason = 'completed';
-              break;
-            }
-            const allScheduledFuture = tracked.every(
-              (t) =>
-                t.status === 'scheduled' &&
-                t.scheduledAt !== null &&
-                t.scheduledAt > Date.now() + Math.max(2000, deadline - Date.now()),
-            );
-            if (allScheduledFuture) {
-              wakeReason = 'scheduled_in_future';
-              break;
-            }
-          } else if (taskIds.length === 0 && !st.running) {
-            wakeReason = 'completed';
-            break;
-          }
-
-          if (wakeOnAnomaly) {
-            const newlyRestricted = Object.entries(st.profileCounts).some(
-              ([pid, stat]) => stat.restricted === true && !initialRestricted.has(pid),
-            );
-            if (newlyRestricted) {
-              wakeReason = 'account_restricted_detected';
-              break;
-            }
-            const newlyPending = (st.pendingReviewOperations ?? []).some(
-              (op) => !initialPendingIds.has(op.id),
-            );
-            if (newlyPending) {
-              wakeReason = 'pending_review_detected';
-              break;
-            }
-          }
-
-          if (Date.now() >= deadline) {
-            wakeReason = 'timeout_still_running';
-            break;
-          }
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-
-        const [finalState, recentLogs] = await Promise.all([
-          deps.groupPosterService.state(),
-          deps.groupPosterService.logs('', undefined, undefined, undefined),
-        ]);
-        const trackedTasks =
-          taskIds.length > 0
-            ? (finalState.tasks ?? []).filter((t) => taskIds.includes(t.id))
-            : (finalState.tasks ?? []).slice(0, 10);
-        const newVerifiedPosts = recentLogs
-          .filter((l) => l.postedAt >= startedAt - 2000)
-          .slice(0, 50)
-          .map((l) => ({
-            ...l,
-            postedAtLocal: formatLocalDateTime(l.postedAt),
-          }));
-
-        const settled =
-          taskIds.length > 0
-            ? trackedTasks.length > 0 &&
-              trackedTasks.every((t) =>
-                ['completed', 'partial', 'failed', 'cancelled'].includes(t.status),
-              )
-            : !finalState.running;
-
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled,
-          wakeReason,
-          elapsedMs: Date.now() - startedAt,
-          running: finalState.running,
-          statusText: finalState.statusText,
-          monitoredTasks: trackedTasks.map((t) => ({
-            ...t,
-            scheduledAtLocal: formatLocalDateTime(t.scheduledAt),
-            startedAtLocal: formatLocalDateTime(t.startedAt),
-            finishedAtLocal: formatLocalDateTime(t.finishedAt),
-            msUntilScheduled:
-              t.status === 'scheduled' && t.scheduledAt !== null
-                ? Math.max(0, t.scheduledAt - Date.now())
-                : null,
-          })),
-          newVerifiedPostsCount: newVerifiedPosts.length,
-          newVerifiedPosts,
-          activeGroupsByMaterial: finalState.activeGroupsByMaterial ?? {},
-          profileCounts: finalState.profileCounts,
-          pendingReviewOperations: finalState.pendingReviewOperations ?? [],
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      if (moduleName === 'group-bumper' || moduleName === 'page-bumper') {
-        const bumper = deps.getGroupBumperService();
-        if (!bumper) return errorResult('BUMPER_UNAVAILABLE', '顶贴服务未加载');
-        const isPage = moduleName === 'page-bumper';
-        const initial = await bumper.state();
-        const initialPending = new Set((initial.pendingReviewOperations ?? []).map((op) => op.id));
-        let wakeReason:
-          | 'completed'
-          | 'scheduled_in_future'
-          | 'pending_review_detected'
-          | 'task_not_found'
-          | 'timeout_still_running' = 'timeout_still_running';
-
-        while (true) {
-          const st = await bumper.state();
-          const running = isPage ? st.pageBumperRunning : st.running;
-          const allScheduled = (st.scheduledTasks ?? []).filter((t) => t.mode === moduleName);
-          const tracked =
-            taskIds.length > 0 ? allScheduled.filter((t) => taskIds.includes(t.id)) : [];
-
-          if (taskIds.length > 0 && tracked.length === 0) {
-            wakeReason = 'task_not_found';
-            break;
-          }
-          if (taskIds.length > 0 && tracked.length > 0) {
-            const terminal = tracked.every((t) =>
-              ['completed', 'failed', 'cancelled'].includes(t.status),
-            );
-            if (terminal) {
-              wakeReason = 'completed';
-              break;
-            }
-            const allFuture = tracked.every(
-              (t) =>
-                t.status === 'scheduled' &&
-                t.scheduledAt > Date.now() + Math.max(2000, deadline - Date.now()),
-            );
-            if (allFuture) {
-              wakeReason = 'scheduled_in_future';
-              break;
-            }
-          } else if (taskIds.length === 0 && !running) {
-            wakeReason = 'completed';
-            break;
-          }
-
-          if (
-            wakeOnAnomaly &&
-            (st.pendingReviewOperations ?? []).some((op) => !initialPending.has(op.id))
-          ) {
-            wakeReason = 'pending_review_detected';
-            break;
-          }
-          if (Date.now() >= deadline) break;
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-
-        const [finalSt, logs] = await Promise.all([
-          bumper.state(),
-          bumper.logs('', undefined, undefined, 50, isPage ? 'page' : 'group'),
-        ]);
-        const newBumps = logs.filter((l) => l.bumpedAt >= startedAt - 2000);
-        const running = isPage ? finalSt.pageBumperRunning : finalSt.running;
-        const modeTasks = (finalSt.scheduledTasks ?? []).filter((t) => t.mode === moduleName);
-        const monitoredTasks = (
-          taskIds.length > 0
-            ? modeTasks.filter((t) => taskIds.includes(t.id))
-            : modeTasks.slice(0, 10)
-        ).map((t) => ({
-          ...t,
-          scheduledAtLocal: formatLocalDateTime(t.scheduledAt),
-          startedAtLocal: formatLocalDateTime(t.startedAt),
-          finishedAtLocal: formatLocalDateTime(t.finishedAt),
-        }));
-        const settled =
-          taskIds.length > 0
-            ? monitoredTasks.length > 0 &&
-              monitoredTasks.every((t) => ['completed', 'failed', 'cancelled'].includes(t.status))
-            : !running;
-
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled,
-          wakeReason,
-          elapsedMs: Date.now() - startedAt,
-          running,
-          statusText: isPage ? finalSt.pageBumperStatusText : finalSt.statusText,
-          profileCounts: isPage ? finalSt.pageBumperProfileCounts : finalSt.profileCounts,
-          monitoredTasks,
-          newVerifiedBumpsCount: newBumps.length,
-          newVerifiedBumps: newBumps,
-          pendingReviewOperations: finalSt.pendingReviewOperations ?? [],
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      if (moduleName === 'auto-scheduler') {
-        const schedulerSvc = deps.getAutoSchedulerService?.();
-        if (!schedulerSvc) {
-          return errorResult('AUTO_SCHEDULER_UNAVAILABLE', '定时排班服务尚未初始化');
-        }
-        let wakeReason: 'completed' | 'timeout_still_running' = 'timeout_still_running';
-        while (true) {
-          const st = await schedulerSvc.state();
-          if (!st.running) {
-            wakeReason = 'completed';
-            break;
-          }
-          if (Date.now() >= deadline) break;
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-        const finalSt = await schedulerSvc.state();
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled: !finalSt.running,
-          wakeReason,
-          elapsedMs: Date.now() - startedAt,
-          running: finalSt.running,
-          activeRuns: finalSt.activeRuns,
-          recentRuns: finalSt.recentRuns.slice(0, 5),
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      if (moduleName === 'google-sheets') {
-        const sheetsSvc = deps.getGoogleSheetsService?.();
-        if (!sheetsSvc) {
-          return errorResult('GOOGLE_SHEETS_UNAVAILABLE', 'Google 云表协同服务尚未初始化');
-        }
-        let wakeReason: 'completed' | 'timeout_still_running' = 'timeout_still_running';
-        while (true) {
-          if (!sheetsSvc.hasActiveExecution()) {
-            wakeReason = 'completed';
-            break;
-          }
-          if (Date.now() >= deadline) break;
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-        const finalOv = await sheetsSvc.overview();
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled: !sheetsSvc.hasActiveExecution(),
-          wakeReason,
-          elapsedMs: Date.now() - startedAt,
-          runningScheduleCount: finalOv.runningScheduleCount,
-          runningRecordsCount: finalOv.runningRecordsCount,
-          recentLogs: finalOv.logs.slice(0, 15),
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      if (moduleName === 'group-inviter') {
-        let wakeReason: 'completed' | 'timeout_still_running' = 'timeout_still_running';
-        while (true) {
-          const st = await deps.groupInviterService.state();
-          if (!st.running) {
-            wakeReason = 'completed';
-            break;
-          }
-          if (Date.now() >= deadline) break;
-          await new Promise<void>((r) => setTimeout(r, 1000));
-        }
-        const [finalSt, logs] = await Promise.all([
-          deps.groupInviterService.state(),
-          deps.groupInviterService.logs('', undefined, 80),
-        ]);
-        const newInvites = logs.filter((l) => l.invitedAt >= startedAt - 2000);
-        return okResult({
-          ok: true,
-          module: moduleName,
-          settled: !finalSt.running,
-          wakeReason,
-          elapsedMs: Date.now() - startedAt,
-          running: finalSt.running,
-          runId: finalSt.runId ?? null,
-          statusText: finalSt.statusText,
-          profileCounts: finalSt.profileCounts,
-          newVerifiedInvitesCount: newInvites.length,
-          newVerifiedInvites: newInvites,
-          newDiagnostics: collectNewDiagnostics(),
-        });
-      }
-
-      // bluestacks-bumper | bluestacks-page-bumper
-      const isBsPage = moduleName === 'bluestacks-page-bumper';
-      let bsWake: 'completed' | 'timeout_still_running' = 'timeout_still_running';
-      while (true) {
-        const st = await deps.bluestacksService.state(false);
-        const running = isBsPage ? st.pageBumperRunning : st.running;
-        if (!running) {
-          bsWake = 'completed';
-          break;
-        }
-        if (Date.now() >= deadline) break;
-        await new Promise<void>((r) => setTimeout(r, 1000));
-      }
-      const bumperSvc = deps.getGroupBumperService();
-      const [finalBs, bsLogs] = await Promise.all([
-        deps.bluestacksService.state(false),
-        bumperSvc
-          ? bumperSvc.logs('', undefined, undefined, 80, isBsPage ? 'page' : 'group')
-          : Promise.resolve([]),
-      ]);
-      const bsInstIds = new Set(finalBs.instances.map((i) => i.id));
-      const newBsBumps = bsLogs.filter(
-        (l) => bsInstIds.has(l.profileId) && l.bumpedAt >= startedAt - 2000,
+  if (mod === 'active-accounts') {
+    const svc = deps.taskService;
+    M.req(svc, 'TASKS_UNAVAILABLE', '活跃账号任务执行服务未启用', 503);
+    const pids = await M.optPids(deps, args);
+    const [fPids, fPlans] = [
+      pids ? new Set(pids) : null,
+      taskIds.length > 0 ? new Set(taskIds) : null,
+    ];
+    const matchP = (p: { id: string; profileId: string }) =>
+      (!fPlans || fPlans.has(p.id)) && (!fPids || fPids.has(p.profileId));
+    const initFail = new Set(
+      (await svc.overview()).plans.filter((p) => p.state === 'FAILED').map((p) => p.id),
+    );
+    const wake = await pollWake(async (done) => {
+      const ov = await svc.overview();
+      const tracked = ov.plans.filter(
+        (p) => matchP(p) && (fPlans || fPids || !DONE_PLAN.has(p.state)),
       );
-      const finalRunning = isBsPage ? finalBs.pageBumperRunning : finalBs.running;
-      return okResult({
-        ok: true,
-        module: moduleName,
-        settled: !finalRunning,
-        wakeReason: bsWake,
-        elapsedMs: Date.now() - startedAt,
-        running: finalRunning,
-        statusText: isBsPage ? finalBs.pageBumperStatusText : finalBs.statusText,
-        profileCounts: isBsPage ? finalBs.pageBumperProfileCounts : finalBs.profileCounts,
-        newVerifiedBumpsCount: newBsBumps.length,
-        newVerifiedBumps: newBsBumps,
-        newDiagnostics: collectNewDiagnostics(),
-      });
-    },
-  };
+      if (tracked.every((p) => DONE_PLAN.has(p.state))) return done('completed');
+      if (
+        tracked.every(
+          (p) => p.state === 'QUEUED' && p.timing?.mode === 'at' && isFut(p.timing.startAt),
+        )
+      )
+        return done('scheduled_in_future');
+      return wakeOnAnomaly && ov.plans.some((p) => p.state === 'FAILED' && !initFail.has(p.id))
+        ? done('failure_detected')
+        : false;
+    });
+    const ov = await svc.overview();
+    const matched = ov.plans.filter(matchP).slice(0, 30);
+    const running = matched.some((p) => ['QUEUED', 'RUNNING'].includes(p.state));
+    return finish(wake, !running, {
+      running,
+      monitoredPlansCount: matched.length,
+      monitoredPlans: matched.map((p) => M.mapActivePlan(p)),
+      failedPlans: ov.plans
+        .filter((p) => p.state === 'FAILED')
+        .map((p) => M.mapActivePlan(p, 'id profileId reason')),
+    });
+  }
 
-  const wbDiagnose: McpToolDefinition = {
-    name: 'wb_diagnose',
-    description:
-      '深度故障排查与插件热重载工具：读取内存与磁盘 dev-diagnostics.jsonl 实时运行日志、核查桥接层未决命令（store.unresolved）与各模块待核对账本（PENDING_REVIEW）、一键热重载全部闲置 Chrome 扩展到最新版本（reload_extensions），或导出完整诊断快照压缩包（export_package）。当任何任务卡住、按钮未识别或插件版本落后时第一时间调用。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['inspect', 'tail_log_file', 'reload_extensions', 'export_package'],
-          description: '诊断动作（默认 inspect）',
-        },
-        profileId: {
-          type: 'string',
-          description: '按指定浏览器 profileId 过滤日志或热重载指定浏览器扩展',
-        },
-        profileIds: {
-          type: 'array',
-          items: { type: 'string' },
-          description:
-            'reload_extensions 时可选指定多个 profileId（省略则热重载全部在线闲置浏览器）',
-        },
-        levels: {
-          type: 'array',
-          items: {
-            type: 'string',
-            enum: ['INFO', 'WARN', 'ERROR', 'SLOW', 'WAIT', 'SNAPSHOT'],
-          },
-          description: '按日志级别过滤（例如 ["WARN", "ERROR", "WAIT"]）',
-        },
-        search: {
-          type: 'string',
-          description: '按事件名、错误原因或 URL 关键词过滤诊断日志',
-        },
-        limit: {
-          type: 'number',
-          minimum: 1,
-          maximum: 200,
-          description: '返回诊断日志条数上限（默认 60）',
-        },
-        note: {
-          type: 'string',
-          description: 'export_package 时写入诊断包的备注说明',
-        },
-      },
-      additionalProperties: false,
-    },
-    handler: async (args) => {
-      const action = typeof args.action === 'string' ? args.action : 'inspect';
+  if (mod === 'group-poster') {
+    const initSt = await deps.groupPosterService.state();
+    const initRestr = new Set(
+      Object.entries(initSt.profileCounts)
+        .filter(([, s]) => s.restricted)
+        .map(([k]) => k),
+    );
+    const initPend = pendIds(initSt);
+    const wake = await pollWake(async (done) => {
+      const st = await deps.groupPosterService.state();
+      const all = st.tasks ?? [];
+      const tracked = all.filter((t) =>
+        taskIds.length > 0
+          ? taskIds.includes(t.id)
+          : t.status === 'running' || t.status === 'scheduled',
+      );
+      const w = checkBatch(
+        taskIds.length > 0,
+        tracked.length === 0,
+        tracked.every((t) => DONE_POST.has(t.status)),
+        tracked.every((t) => t.status === 'scheduled' && isFut(t.scheduledAt)),
+        st.running,
+      );
+      if (w) return done(w);
+      if (
+        wakeOnAnomaly &&
+        Object.entries(st.profileCounts).some(([k, s]) => s.restricted && !initRestr.has(k))
+      )
+        return done('account_restricted_detected');
+      return hasNewPend(st, initPend) ? done('pending_review_detected') : false;
+    });
+    const [finalSt, logs] = await Promise.all([
+      deps.groupPosterService.state(),
+      deps.groupPosterService.logs('', undefined, undefined, undefined),
+    ]);
+    const allT = finalSt.tasks ?? [];
+    const tracked =
+      taskIds.length > 0 ? allT.filter((t) => taskIds.includes(t.id)) : allT.slice(0, 10);
+    const newPosts = M.mapAt(logs.filter((l) => since(l.postedAt)).slice(0, 50), 'postedAt');
+    const settled =
+      taskIds.length > 0
+        ? tracked.length > 0 && tracked.every((t) => DONE_POST.has(t.status))
+        : !finalSt.running;
+    return finish(wake, settled, {
+      ...M.pick(
+        finalSt,
+        'running statusText profileCounts activeGroupsByMaterial pendingReviewOperations#',
+      ),
+      monitoredTasks: tracked.map((t) => ({
+        ...t,
+        ...M.pick(t, 'scheduledAt@ startedAt@ finishedAt@'),
+        msUntilScheduled:
+          t.status === 'scheduled' && t.scheduledAt !== null
+            ? Math.max(0, t.scheduledAt - Date.now())
+            : null,
+      })),
+      newVerifiedPostsCount: newPosts.length,
+      newVerifiedPosts: newPosts,
+    });
+  }
 
-      if (action === 'reload_extensions') {
-        if (!deps.reloadExtensions) {
-          return errorResult('RELOAD_UNAVAILABLE', '当前环境不支持扩展热重载');
-        }
-        const rawIds = Array.isArray(args.profileIds)
-          ? args.profileIds.map((x) => String(x).trim()).filter(Boolean)
-          : typeof args.profileId === 'string' && args.profileId.trim()
-            ? [args.profileId.trim()]
-            : [];
-        const ids = rawIds.length > 0 ? await resolveProfileIds(deps, rawIds) : undefined;
-        const result = await deps.reloadExtensions(ids && ids.length > 0 ? ids : undefined);
-        // Wait briefly so Chrome reconnects with the newly loaded manifest capabilities
-        await new Promise<void>((r) => setTimeout(r, 1500));
-        const profiles = await buildEnrichedProfiles(deps);
-        return okResult({
-          ok: true,
-          reloadResult: result,
-          onlineProfilesAfterReload: profiles
-            .filter((p) => p.online)
-            .map((p) => ({
-              id: p.id,
-              alias: p.alias,
-              browserName: p.browserName,
-              displayName: p.displayName,
-              extensionVersion: p.extensionVersion,
-              supportsAgentBrowser: p.supportsAgentBrowser,
-              phase: p.phase,
-              synced: p.synced,
-            })),
-        });
-      }
+  if (mod === 'group-bumper' || mod === 'page-bumper') {
+    const bumper = deps.getGroupBumperService();
+    M.req(bumper, 'BUMPER_UNAVAILABLE', '顶贴服务未加载', 503);
+    const isPage = mod === 'page-bumper';
+    const initPend = pendIds(await bumper.state());
+    const wake = await pollWake(async (done) => {
+      const st = await bumper.state();
+      const ss = taskIds.length > 0 ? await deps.getAutoSchedulerService?.()?.state() : null;
+      const tracked = ss ? ss.schedules.filter((s) => taskIds.includes(s.id)) : [];
+      const activeRun = Boolean(ss?.activeRuns.some((r) => taskIds.includes(r.scheduleId)));
+      const finishedRun = Boolean(ss?.recentRuns.some((r) => taskIds.includes(r.scheduleId)));
+      const fut =
+        !activeRun &&
+        tracked.every((s) => s.enabled && s.trigger.mode === 'once' && isFut(s.trigger.onceAt));
+      const w = checkBatch(
+        Boolean(ss),
+        tracked.length === 0 && !activeRun && !finishedRun,
+        !activeRun && finishedRun,
+        fut,
+        M.pickBumperScope(st, isPage).running,
+      );
+      return w ? done(w) : hasNewPend(st, initPend) ? done('pending_review_detected') : false;
+    });
+    const [finalSt, logs] = await Promise.all([
+      bumper.state(),
+      bumper.logs('', undefined, undefined, 50, isPage ? 'page' : 'group'),
+    ]);
+    const newBumps = logs.filter((l) => since(l.bumpedAt));
+    const scope = M.pickBumperScope(finalSt, isPage);
+    return finish(wake, !scope.running && wake === 'completed', {
+      ...M.pick(scope, 'running statusText profileCounts'),
+      monitoredTasks: [],
+      newVerifiedBumpsCount: newBumps.length,
+      newVerifiedBumps: newBumps,
+      pendingReviewOperations: finalSt.pendingReviewOperations ?? [],
+    });
+  }
 
-      if (action === 'export_package') {
-        if (!deps.captureDiagnostics) {
-          return errorResult('CAPTURE_UNAVAILABLE', '诊断包导出服务未加载');
-        }
-        const note =
-          typeof args.note === 'string' && args.note.trim()
-            ? args.note.trim()
-            : 'AI Agent 自动采集诊断包';
-        const output = await deps.captureDiagnostics({
-          note,
-          uiContext: 'mcp-wb_diagnose',
-          reveal: false,
-        });
-        return okResult({
-          ok: true,
-          diagnosticPackage: output,
-        });
-      }
+  const wake = await pollWake(async (done) =>
+    !(await readSimpleStatus(deps, mod, since)).running ? done('completed') : false,
+  );
+  const fin = await readSimpleStatus(deps, mod, since);
+  return finish(wake, !fin.running, fin.payload);
+}
 
-      const rawProfileFilter = typeof args.profileId === 'string' ? args.profileId.trim() : '';
-      const levelSet =
-        Array.isArray(args.levels) && args.levels.length > 0
-          ? new Set(args.levels.map((x) => String(x)))
-          : null;
-      const q = typeof args.search === 'string' ? args.search.trim().toLowerCase() : '';
-      const limit = Math.max(1, Math.min(200, Math.floor(Number(args.limit ?? 60))));
-      const dataDirectory = resolveDataDirIntegrity(deps.dataDir);
-      const allKnownProfiles = await buildEnrichedProfiles(deps);
-      const profileFilter = (() => {
-        if (!rawProfileFilter) return '';
-        try {
-          return resolveProfileIdentifierFromList(allKnownProfiles, rawProfileFilter);
-        } catch {
-          return rawProfileFilter;
-        }
-      })();
-
-      if (action === 'tail_log_file') {
-        const diskEntries = await readTailJsonlLines(deps.devDiagFilePath);
-        const filtered = diskEntries.filter((e) => {
-          if (profileFilter && String(e.profileId ?? '') !== profileFilter) return false;
-          if (levelSet && !levelSet.has(String(e.level ?? ''))) return false;
-          if (q) {
-            const hay = JSON.stringify(e).toLowerCase();
-            if (!hay.includes(q)) return false;
-          }
-          return true;
-        });
-        return okResult({
-          ok: true,
-          dataDirectory,
-          logFilePath: deps.devDiagFilePath,
-          matchedInTail: filtered.length,
-          entries: filtered.slice(-limit),
-        });
-      }
-
-      // action === 'inspect'
-      const [posterState, bumperState, bluestacksState, taskOverview] = await Promise.all([
-        deps.groupPosterService.state(),
-        deps.getGroupBumperService()?.state(),
-        deps.bluestacksService.state(false),
-        deps.taskService ? deps.taskService.overview() : Promise.resolve(null),
-      ]);
-      const profiles = allKnownProfiles;
-
-      const bridgeUnresolvedByProfile: Record<string, unknown[]> = {};
-      for (const p of profiles) {
-        if (p.unresolvedCount > 0) {
-          bridgeUnresolvedByProfile[p.id] = await deps.store.unresolved(p.id);
-        }
-      }
-
-      const ringFiltered = devDiag
-        .recent(400)
-        .filter((e) => {
-          if (profileFilter && (e.profileId ?? '') !== profileFilter) return false;
-          if (levelSet && !levelSet.has(e.level)) return false;
-          if (q) {
-            const hay = [
-              e.event,
-              e.reason ?? '',
-              e.url ?? '',
-              e.profileName ?? '',
-              e.data ? JSON.stringify(e.data) : '',
-            ]
-              .join(' ')
-              .toLowerCase();
-            if (!hay.includes(q)) return false;
-          }
-          return true;
-        })
-        .slice(-limit);
-
-      const outdatedExtensions = profiles
-        .filter((p) => p.online && p.extensionVersion !== deps.extensionVersion)
-        .map((p) => ({
-          id: p.id,
-          alias: p.alias,
-          browserName: p.browserName,
-          displayName: p.displayName,
-          currentVersion: p.extensionVersion,
-          bundledVersion: deps.extensionVersion,
-        }));
-
-      return okResult({
-        ok: true,
-        softwareVersion: deps.softwareVersion,
-        bundledExtensionVersion: deps.extensionVersion,
-        dataDirectory,
-        logFilePath: deps.devDiagFilePath,
-        outdatedExtensions,
-        bridgeUnresolvedByProfile,
-        activeAccountsReviewPlans: taskOverview
-          ? taskOverview.plans
-              .filter((p) => p.state === 'REVIEW')
-              .map((p) => ({
-                id: p.id,
-                profileId: p.profileId,
-                combinationName: p.snapshot.name,
-                reason: p.reason,
-                updatedAtLocal: formatLocalDateTime(p.updatedAt),
-              }))
-          : [],
-        posterPendingReview: posterState.pendingReviewOperations ?? [],
-        bumperPendingReview: bumperState?.pendingReviewOperations ?? [],
-        bluestacks: {
-          adbReady: Boolean(bluestacksState.config?.adbReady),
-          playerReady: Boolean(bluestacksState.config?.playerReady),
-          running: bluestacksState.running,
-          pageBumperRunning: bluestacksState.pageBumperRunning,
-          onlineInstances: bluestacksState.instances.filter((i) => i.online).length,
-        },
-        profilesWithIssues: profiles.filter(
-          (p) =>
-            p.online &&
-            (!p.synced ||
-              p.unresolvedCount > 0 ||
-              ['restricted', 'verification', 'logged-out'].includes(p.account.state)),
+async function handleDiagnose(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
+  const action = M.strArg(args.action) || 'inspect';
+  if (action === 'reload_extensions') {
+    M.req(deps.reloadExtensions, 'RELOAD_UNAVAILABLE', '当前环境不支持扩展热重载', 503);
+    const rawIds = M.collectRawIds(args, 'profileIds', 'profileId');
+    const reloadResult = await deps.reloadExtensions(
+      rawIds.length > 0 ? await M.resolveProfileIds(deps, rawIds) : undefined,
+    );
+    await M.sleep(1500);
+    return {
+      reloadResult,
+      onlineProfilesAfterReload: (await M.buildEnrichedProfiles(deps))
+        .filter((p) => p.online)
+        .map((p) =>
+          M.pick(
+            p,
+            'id alias browserName displayName extensionVersion supportsAgentBrowser phase synced',
+          ),
         ),
-        recentDiagnosticsCount: ringFiltered.length,
-        recentDiagnostics: ringFiltered,
+    };
+  }
+  if (action === 'export_package') {
+    M.req(deps.captureDiagnostics, 'CAPTURE_UNAVAILABLE', '诊断包导出服务未加载', 503);
+    const note = M.strArg(args.note) || 'AI Agent 自动采集诊断包';
+    return {
+      diagnosticPackage: await deps.captureDiagnostics({
+        note,
+        uiContext: 'mcp-wb_diagnose',
+        reveal: false,
+      }),
+    };
+  }
+  const [rawFilter, q, limit] = [
+    M.strArg(args.profileId),
+    M.strArg(args.search).toLowerCase(),
+    M.clampInt(args.limit, 60, 1, 200),
+  ];
+  const [dataDirectory, profiles] = [
+    M.resolveDataDirIntegrity(deps.dataDir),
+    await M.buildEnrichedProfiles(deps),
+  ];
+  const levels =
+    Array.isArray(args.levels) && args.levels.length > 0
+      ? (args.levels.map(String) as DevDiagLevel[])
+      : undefined;
+  let profileFilter = rawFilter;
+  if (rawFilter)
+    try {
+      profileFilter = M.resolveProfileIdentifierFromList(profiles, rawFilter);
+    } catch {}
+  if (action === 'tail_log_file') {
+    const lvl = levels ? new Set<string>(levels) : null;
+    const entries = (await readTailJsonlLines(deps.devDiagFilePath)).filter(
+      (e) =>
+        (!profileFilter || String(e.profileId ?? '') === profileFilter) &&
+        (!lvl || lvl.has(String(e.level ?? ''))) &&
+        (!q || JSON.stringify(e).toLowerCase().includes(q)),
+    );
+    return {
+      dataDirectory,
+      logFilePath: deps.devDiagFilePath,
+      matchedInTail: entries.length,
+      entries: entries.slice(-limit),
+    };
+  }
+  const [posterSt, bumperSt, bsSt, taskOv] = await Promise.all([
+    deps.groupPosterService.state(),
+    deps.getGroupBumperService()?.state(),
+    deps.bluestacksService.state(false),
+    deps.taskService ? deps.taskService.overview() : Promise.resolve(null),
+  ]);
+  const bridgeUnresolvedByProfile: Record<string, unknown[]> = {};
+  const outdatedExtensions: Array<Record<string, unknown>> = [];
+  const profilesWithIssues: M.EnrichedProfileSummary[] = [];
+  for (const p of profiles) {
+    if (p.unresolvedCount > 0) bridgeUnresolvedByProfile[p.id] = await deps.store.unresolved(p.id);
+    if (!p.online) continue;
+    if (p.extensionVersion !== deps.extensionVersion)
+      outdatedExtensions.push({
+        ...M.pick(p, 'id alias browserName displayName'),
+        currentVersion: p.extensionVersion,
+        bundledVersion: deps.extensionVersion,
       });
+    if (
+      !p.synced ||
+      p.unresolvedCount > 0 ||
+      ['restricted', 'verification', 'logged-out'].includes(p.account.state)
+    )
+      profilesWithIssues.push(p);
+  }
+  const recentDiagnostics = M.recentDiagSlice(400, limit, {
+    levels,
+    profileFilter: profileFilter || undefined,
+    query: q || undefined,
+  });
+  return {
+    softwareVersion: deps.softwareVersion,
+    bundledExtensionVersion: deps.extensionVersion,
+    dataDirectory,
+    logFilePath: deps.devDiagFilePath,
+    outdatedExtensions,
+    bridgeUnresolvedByProfile,
+    activeAccountsFailedPlans: (taskOv?.plans ?? [])
+      .filter((p) => p.state === 'FAILED')
+      .map((p) => M.mapActivePlan(p, 'id profileId reason updatedAt@')),
+    posterPendingReview: posterSt.pendingReviewOperations ?? [],
+    bumperPendingReview: bumperSt?.pendingReviewOperations ?? [],
+    bluestacks: {
+      adbReady: Boolean(bsSt.config?.adbReady),
+      playerReady: Boolean(bsSt.config?.playerReady),
+      ...M.pick(bsSt, 'running pageBumperRunning'),
+      onlineInstances: bsSt.instances.filter((i) => i.online).length,
     },
+    profilesWithIssues,
+    recentDiagnosticsCount: recentDiagnostics.length,
+    recentDiagnostics,
   };
+}
 
-  return [wbWaitForTask, wbDiagnose];
+export function createMonitorAndDiagnosticTools(
+  deps: M.WorkbenchMcpDependencies,
+): M.McpToolDefinition[] {
+  return [
+    M.reg(
+      'wb_wait_for_task',
+      '阻塞监控指定业务模块任务进展。',
+      `@taskIds|@taskId|@profileIds|module:e(${MODULES}):业务模块|waitSeconds:n(1,90):最多等待秒数|wakeOnAnomaly:b:异常时提前唤醒`,
+      (args) => handleWaitForTask(deps, args),
+      { req: 'module', readOnly: true },
+    ),
+    M.reg(
+      'wb_diagnose',
+      '诊断日志、未决命令、扩展热重载与导出诊断包。',
+      M.sp(
+        '@profileId|@profileIds|@search|@limit|action:e(inspect tail_log_file reload_extensions export_package):诊断动作|note:s:诊断包备注',
+        {
+          levels: M.A(M.E('INFO WARN ERROR SLOW WAIT SNAPSHOT'), '日志级别过滤'),
+        },
+      ),
+      (args) => handleDiagnose(deps, args),
+    ),
+  ];
 }

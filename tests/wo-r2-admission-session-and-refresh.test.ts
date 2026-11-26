@@ -4,7 +4,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { admitProfilesForStart } from '../src/application/profile-start-admission.js';
 import {
@@ -24,7 +23,6 @@ import { PosterAccountRestrictedError } from '../src/infrastructure/group-poster
 import { TargetMetadataRefreshService } from '../src/infrastructure/target-metadata-refresh.js';
 import {
   BumperMetadataAccountError,
-  FacebookGroupSessionHelper,
   GroupBumperBrowserAdapter,
 } from '../src/infrastructure/group-bumper-runner.js';
 import {
@@ -35,7 +33,6 @@ import {
 import { mergeAccountCacheUpdate } from '../src/shared/account-state-policy.js';
 import { ProfileInspectionService } from '../src/application/profile-inspection.js';
 import { ProductError } from '../src/domain/workspace.js';
-import { unifiedTargetLibraryMigration } from '../src/infrastructure/target-library-store.js';
 import { bumperDigest } from '../src/infrastructure/group-bumper-recovery.js';
 
 async function withStore(run: (store: WorkspaceStore, dir: string) => Promise<void> | void) {
@@ -171,7 +168,7 @@ test('WO-R2.2: admitProfilesForStart partitions ready / busy / offline across al
   });
 });
 
-test('WO-R2.3: applyResolvedTargetMetadata updates group_poster_logs without deleting historical logs on canonicalId merge, and unifiedTargetLibraryMigration sanitizes invalid folder_id', async () => {
+test('WO-R2.3: applyResolvedTargetMetadata updates post_bump_records & poster logs without deleting historical logs on canonicalId merge', async () => {
   await withStore(async (store) => {
     const profileId = randomUUID();
     store.groupBumper.upsertTargets('groups', {
@@ -238,58 +235,6 @@ test('WO-R2.3: applyResolvedTargetMetadata updates group_poster_logs without del
     );
     assert.ok(posterLogs.some((l) => l.id === log2Id && l.groupId === '999888777666'));
   });
-
-  // Verify unifiedTargetLibraryMigration with dangling folder_id in legacy tables
-  const db = new DatabaseSync(':memory:');
-  try {
-    db.exec(`
-      PRAGMA foreign_keys = ON;
-      CREATE TABLE group_bumper_folders (
-        id TEXT PRIMARY KEY,
-        kind TEXT NOT NULL,
-        name TEXT NOT NULL,
-        sort_order INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE group_bumper_groups (
-        group_id TEXT PRIMARY KEY,
-        group_name TEXT NOT NULL,
-        avatar_url TEXT,
-        folder_id TEXT,
-        sort_order INTEGER NOT NULL,
-        total_bumped_count INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE group_inviter_groups (
-        group_id TEXT PRIMARY KEY,
-        group_name TEXT NOT NULL,
-        avatar_url TEXT,
-        folder_id TEXT,
-        sort_order INTEGER NOT NULL,
-        total_invited_count INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      INSERT INTO group_bumper_groups VALUES ('123456', 'G1', NULL, 'dangling-folder-1', 0, 2, 100, 100);
-      INSERT INTO group_inviter_groups VALUES ('789012', 'G2', NULL, 'dangling-folder-2', 1, 3, 100, 100);
-    `);
-    unifiedTargetLibraryMigration(db);
-    const fkCheck = db.prepare('PRAGMA foreign_key_check').all();
-    assert.deepEqual(fkCheck, []);
-    const rows = (
-      db
-        .prepare('SELECT group_id, folder_id FROM shared_facebook_groups ORDER BY sort_order ASC')
-        .all() as Array<{ group_id: string; folder_id: string | null }>
-    ).map((r) => ({ group_id: r.group_id, folder_id: r.folder_id }));
-    assert.deepEqual(rows, [
-      { group_id: '123456', folder_id: null },
-      { group_id: '789012', folder_id: null },
-    ]);
-  } finally {
-    db.close();
-  }
 });
 
 test('WO-R2.4: TargetMetadataRefreshService supports stopRefresh, keeps running=false during refresh, and GroupBumperBrowserAdapter fails over to next PAUSED candidate on account error', async () => {
@@ -311,11 +256,6 @@ test('WO-R2.4: TargetMetadataRefreshService supports stopRefresh, keeps running=
         });
         return { updated: 0, failed: 0, needsBrowser: 0 };
       },
-      resolveTargetMetadata: async () => ({
-        canonicalId: null,
-        name: null,
-        avatarUrl: null,
-      }),
     });
 
     const registry = new FeatureExecutionRegistry();
@@ -573,21 +513,8 @@ test('WO-R2.5: GlobalAccountAbnormalReporter, mergeAccountCacheUpdate avatar pro
   });
 });
 
-test('WO-R2.6: FacebookGroupSessionHelper.ensureJoinedGroup anchors pendingRegex to short button text and GroupInviter last uninvitable group skips instead of failing', async () => {
+test('WO-R2.6: GroupInviter last uninvitable group skips instead of failing', async () => {
   await withStore(async (store) => {
-    assert.equal(
-      FacebookGroupSessionHelper.extractCanonicalGroupIdFromUrl(
-        'https://www.facebook.com/groups/3017439278594998/?sorting_setting=CHRONOLOGICAL',
-      ),
-      '3017439278594998',
-    );
-    assert.equal(
-      FacebookGroupSessionHelper.extractCanonicalGroupIdFromUrl(
-        'https://www.facebook.com/groups/my_group_slug/',
-      ),
-      null,
-    );
-
     const profileId = randomUUID();
     await store.groupInviter.upsertGroups({
       items: [{ groupId: '3017439278594998', groupName: 'Pending Group' }],
@@ -596,7 +523,6 @@ test('WO-R2.6: FacebookGroupSessionHelper.ensureJoinedGroup anchors pendingRegex
       isAvailable: () => true,
       isProfileReady: () => true,
       isProfileBusy: () => false,
-      fetchGroupAvatar: async () => null,
       inviteForGroup: async () => {
         throw new ProductError(
           'GROUP_INVITER_GROUP_UNINVITABLE',

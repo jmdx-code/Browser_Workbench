@@ -3,7 +3,6 @@ import { existsSync } from 'node:fs';
 import { ProductError } from '../domain/workspace.js';
 import { BridgeError } from '../bridge/protocol.js';
 import type { RemoteBridgeStore, RemoteWorkspaceStore } from './persistence-port.js';
-
 type Reply = {
   kind: 'ready' | 'result' | 'error' | 'progress';
   id?: number;
@@ -21,7 +20,6 @@ type Reply = {
   };
 };
 type Pending = { path: string; resolve(value: unknown): void; reject(error: Error): void };
-
 // Commands name complete existing repository units, never individual SQL statements.
 // The worker replies only after the original transaction/commit promise returns.
 export class PersistenceClient {

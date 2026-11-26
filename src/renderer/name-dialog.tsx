@@ -1,4 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
+import { Btn, useShowModal } from './modules/shared/module-ui.js';
+import { UI_DIALOG_CARD, UI_INPUT } from './ui/primitives.js';
+
 export function NameDialog({
   title,
   initial,
@@ -15,9 +18,7 @@ export function NameDialog({
   const [name, setName] = useState(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  useEffect(() => {
-    dialog.current?.showModal();
-  }, []);
+  useShowModal(dialog);
   async function save() {
     if (!name.trim() || submittingRef.current || busy) return;
     submittingRef.current = true;
@@ -36,35 +37,37 @@ export function NameDialog({
   return (
     <dialog
       ref={dialog}
-      className="name-dialog"
+      className={UI_DIALOG_CARD}
       onCancel={(event) => {
         if (busy) event.preventDefault();
         else onClose();
       }}
     >
       <form
+        className="flex flex-col gap-3"
         onSubmit={(event) => {
           event.preventDefault();
           void save();
         }}
       >
-        <h3>{title}</h3>
+        <h3 className="m-0 text-base font-semibold text-slate-900">{title}</h3>
         <input
           autoFocus
           required
+          className={UI_INPUT + ' w-full'}
           maxLength={80}
           value={name}
           onChange={(event) => setName(event.target.value)}
           aria-label={title}
         />
-        {error && <p className="text-danger">{error}</p>}
-        <footer>
-          <button type="button" disabled={busy} onClick={onClose}>
+        {error && <p className="m-0 text-xs font-medium text-rose-600">{error}</p>}
+        <footer className="mt-1 flex justify-end gap-2">
+          <Btn sm={false} disabled={busy} onClick={onClose}>
             取消
-          </button>
-          <button className="primary" type="submit" disabled={busy || !name.trim()}>
+          </Btn>
+          <Btn v="primary" sm={false} type="submit" disabled={busy || !name.trim()}>
             {busy ? '保存中…' : '保存'}
-          </button>
+          </Btn>
         </footer>
       </form>
     </dialog>

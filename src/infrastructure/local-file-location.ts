@@ -1,7 +1,6 @@
 import path from 'node:path';
 import { lstat } from 'node:fs/promises';
 import { LocalFileLocationRequest, FileLocationResult } from '../shared/desktop.js';
-
 export async function revealLocalFile(input: unknown, showItem: (source: string) => void) {
   try {
     const { source } = LocalFileLocationRequest.parse(input);

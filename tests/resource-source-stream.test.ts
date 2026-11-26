@@ -31,10 +31,10 @@ const body = (frames: unknown[], cut = 7) => {
 test('original readonly source check streams monotonic progress, complete multibyte report and cancellation without saving another ledger', async () => {
   const store = await WorkspaceStore.open(':memory:');
   try {
-    const combo = store.createDraft({
+    const combo = store.createCombination({
       name: '进度检查',
       note: '',
-      steps: [],
+      steps: [{ id: randomUUID(), type: 'feed', durationMinutes: 1, maxLikes: 0, minLikeCount: 0 }],
       randomOrder: false,
       loop: { mode: 'finite', rounds: 1 },
     });
@@ -180,10 +180,9 @@ test('real HTTP delivers progress and selected media, and client cancellation re
     dataDir: path.join(directory, 'bridge'),
     port: address.port,
     extensionIds: ['a'.repeat(32)],
-    appRoutes: ({ core, store: bridge, tasks }) =>
+    appRoutes: ({ core, store: bridge }) =>
       workspaceApi(
-        new WorkspaceService(store, new BridgeProfileSource(core, bridge, tasks)),
-        undefined,
+        new WorkspaceService(store, new BridgeProfileSource(core, bridge)),
         undefined,
         undefined,
         service,
@@ -196,10 +195,10 @@ test('real HTTP delivers progress and selected media, and client cancellation re
       'base64',
     );
     await writeFile(source, png);
-    const combo = store.createDraft({
+    const combo = store.createCombination({
       name: 'HTTP进度',
       note: '',
-      steps: [],
+      steps: [{ id: randomUUID(), type: 'feed', durationMinutes: 1, maxLikes: 0, minLikeCount: 0 }],
       randomOrder: false,
       loop: { mode: 'finite', rounds: 1 },
     });

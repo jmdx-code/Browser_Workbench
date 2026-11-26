@@ -1,73 +1,43 @@
-import './style.css';
-import './design-system.css';
-import {
-  Component,
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react';
+import './ui/tailwind.css';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import type { QuickScheduleSeed } from '../shared/auto-scheduler.js';
 import { bluestacksDisplayTitle } from '../shared/bluestacks.js';
 import type { Profile, SavedCombination } from '../shared/contracts.js';
 import type { DesktopBridge } from '../shared/desktop.js';
+import type { PostBumpStatusValue } from '../shared/post-bump-records.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
-import type { TaskCommand } from '../shared/task-contracts.js';
-import { ActiveAccountsPage } from './active-accounts-page.js';
 import { api } from './api.js';
 import { useCardColors } from './card-colors.js';
-import type { EditorHandle } from './editor.js';
 import { FeatureNavRail } from './feature-nav-rail.js';
+import { IconPanelOpen } from './icons.js';
+import { buildLiveRunCards } from './modules/live-run-cards.js';
+import type { SheetsModuleId } from './modules/module-contracts.js';
+import type { PostBumpRecordTypeFilter } from './modules/post-bump-records-page.js';
 import { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
 import { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
+import type { ActivityRecordModuleFilter } from './modules/unified-activity-records.js';
 import type { ResourceEditorHandle } from './resource-table-editor.js';
-import { SidebarResizer } from './sidebar-resizer.js';
-import { Sidebar } from './sidebar.js';
 import { useSoftwareUpdate } from './software-update-panel.js';
 import { attentionPlans } from './task-alerts.js';
-import { useInspections } from './use-inspections.js';
 import { useTasks } from './use-tasks.js';
-import { useWorkspace } from './use-workspace.js';
+import {
+  useInspections,
+  useWorkbenchActions,
+  useWorkspace,
+  useWorkspaceEvents,
+} from './use-workbench-actions.js';
 import { WorkbenchOverlays } from './workbench-overlays.js';
 import { WorkbenchTopbar } from './workbench-topbar.js';
+import {
+  WorkbenchErrorBoundary,
+  WorkbenchSidebarPane,
+  WorkbenchViewRouter,
+  type LedgerFilterState,
+  type ShellCtx,
+  type View,
+} from './workbench-view-router.js';
 
-const AutoSchedulerPage = lazy(() =>
-  import('./auto-scheduler-page.js').then((m) => ({ default: m.AutoSchedulerPage })),
-);
-const Editor = lazy(() => import('./editor.js').then((m) => ({ default: m.Editor })));
-const GroupBumperPage = lazy(() =>
-  import('./group-bumper-page.js').then((m) => ({ default: m.GroupBumperPage })),
-);
-const GroupInviterPage = lazy(() =>
-  import('./group-inviter-page.js').then((m) => ({ default: m.GroupInviterPage })),
-);
-const GroupPosterPage = lazy(() =>
-  import('./group-poster-page.js').then((m) => ({ default: m.GroupPosterPage })),
-);
-const GoogleSheetsPage = lazy(() =>
-  import('./modules/sheets/google-sheets-page.js').then((m) => ({ default: m.GoogleSheetsPage })),
-);
-const BluestacksSidebar = lazy(() =>
-  import('./modules/bluestacks-sidebar.js').then((m) => ({ default: m.BluestacksSidebar })),
-);
-const BluestacksActivePage = lazy(() =>
-  import('./modules/bluestacks-active-page.js').then((m) => ({ default: m.BluestacksActivePage })),
-);
-const BluestacksPosterPage = lazy(() =>
-  import('./modules/bluestacks-poster-page.js').then((m) => ({ default: m.BluestacksPosterPage })),
-);
-const BluestacksInviterPage = lazy(() =>
-  import('./modules/bluestacks-inviter-page.js').then((m) => ({
-    default: m.BluestacksInviterPage,
-  })),
-);
-const TaskRecordsPage = lazy(() =>
-  import('./task-records.js').then((m) => ({ default: m.TaskRecordsPage })),
-);
 declare const __WORKBENCH_VERSION__: string;
 declare global {
   interface Window {
@@ -75,155 +45,194 @@ declare global {
   }
 }
 
-class WorkbenchErrorBoundary extends Component<
-  { children: ReactNode; resetKey?: string; label?: string },
-  { error: Error | null }
-> {
-  override state: { error: Error | null } = { error: null };
+const BS_TO_BROWSER: Record<string, View['kind']> = {
+  'bluestacks-active': 'home',
+  'bluestacks-group-poster': 'group-poster',
+  'bluestacks-group-bumper': 'group-bumper',
+  'bluestacks-page-bumper': 'page-bumper',
+  'bluestacks-group-inviter': 'group-inviter',
+};
+const BROWSER_TO_BS: Record<string, View['kind']> = {
+  home: 'bluestacks-active',
+  edit: 'bluestacks-active',
+  'group-poster': 'bluestacks-group-poster',
+  'group-bumper': 'bluestacks-group-bumper',
+  'page-bumper': 'bluestacks-page-bumper',
+  'group-inviter': 'bluestacks-group-inviter',
+};
 
-  static getDerivedStateFromError(error: Error) {
-    return { error };
-  }
+const pruneSelection = (
+  ids: readonly string[],
+  setSelected: (fn: (prev: Set<string>) => Set<string>) => void,
+) => {
+  const valid = new Set(ids);
+  setSelected((prev) => {
+    for (const id of prev)
+      if (!valid.has(id)) return new Set([...prev].filter((x) => valid.has(x)));
+    return prev;
+  });
+};
 
-  override componentDidUpdate(prevProps: { resetKey?: string }) {
-    if (prevProps.resetKey !== this.props.resetKey && this.state.error) {
-      this.setState({ error: null });
-    }
-  }
+function App() {
+  const [view, setView] = useState<View>({ kind: 'home' }),
+    [carrier, setCarrier] = useState<'browser' | 'bluestacks'>('browser'),
+    lastSheetsKindRef = useRef<SheetsModuleId>('sheets-schedule'),
+    isBluestacksView = view.kind.startsWith('bluestacks-');
 
-  override render() {
-    if (this.state.error) {
-      return (
-        <div className="empty" role="alert" style={{ padding: 24, gap: 10 }}>
-          <strong>{this.props.label || '页面加载出现异常'}</strong>
-          <p className="muted" style={{ maxWidth: 480, wordBreak: 'break-word' }}>
-            {this.state.error.message || '请尝试重新加载页面'}
-          </p>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              type="button"
-              className="btn btn-sm"
-              onClick={() => this.setState({ error: null })}
-            >
-              重试渲染
-            </button>
-            <button
-              type="button"
-              className="btn btn-sm btn-primary"
-              onClick={() => window.location.reload()}
-            >
-              重新加载页面
-            </button>
-          </div>
-        </div>
+  const sseRefreshRef = useRef<((topics: ReadonlySet<string>) => void) | null>(null);
+  const { connected: sseConnected } = useWorkspaceEvents((topics) =>
+    sseRefreshRef.current?.(topics),
+  );
+  const { workspace, error, refresh } = useWorkspace(sseConnected);
+  const inspections = useInspections(carrier !== 'bluestacks' && !isBluestacksView, sseConnected);
+  const tasks = useTasks(sseConnected),
+    cardColors = useCardColors(),
+    mods = useFeatureModulesPolling(view.kind, sseConnected);
+  const { groupBumper, groupInviter, groupPoster, bluestacks, autoScheduler, googleSheets } = mods;
+
+  const resourceGen = useRef(0),
+    [resourceSummaries, setResourceSummaries] = useState<ResourceUsageSummaryValue[] | null>(null);
+  const refreshResources = useCallback(async () => {
+    const gen = ++resourceGen.current;
+    await api.resourceSummaries().then(
+      (v) => gen === resourceGen.current && setResourceSummaries(v),
+      () => gen === resourceGen.current && setResourceSummaries(null),
+    );
+  }, []);
+
+  sseRefreshRef.current = (topics) => {
+    for (const [topic, fn] of [
+      [
+        'workspace',
+        () => {
+          void refresh(true);
+          if (view.kind === 'home' || view.kind === 'edit') void refreshResources();
+        },
+      ],
+      ['tasks', tasks.nudge],
+      ['inspections', () => void inspections.refresh(true)],
+      ['group-bumper', mods.refreshBumper],
+      ['group-poster', mods.refreshPoster],
+      ['group-inviter', () => void mods.refreshGroupInviter()],
+      ['bluestacks', () => mods.refreshBluestacks(false)],
+      ['auto-scheduler', mods.refreshAutoScheduler],
+      ['google-sheets', mods.refreshGoogleSheets],
+      ['runtime-summary', mods.refreshRuntimeSummaryNow],
+    ] as const)
+      if (topics.has(topic)) fn();
+  };
+
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (workspace) {
+      pruneSelection(
+        workspace.profiles.map((p) => p.id),
+        setSelected,
       );
     }
-    return this.props.children;
-  }
-}
-type View =
-  | { kind: 'home' }
-  | { kind: 'edit'; row: SavedCombination }
-  | { kind: 'auto-scheduler' }
-  | { kind: 'records' }
-  | { kind: 'group-inviter' }
-  | { kind: 'group-bumper' }
-  | { kind: 'page-bumper' }
-  | { kind: 'group-poster' }
-  | { kind: 'sheets-groups' }
-  | { kind: 'sheets-pages' }
-  | { kind: 'sheets-schedule' }
-  | { kind: 'sheets-records' }
-  | { kind: 'bluestacks-active' }
-  | { kind: 'bluestacks-group-poster' }
-  | { kind: 'bluestacks-group-bumper' }
-  | { kind: 'bluestacks-page-bumper' }
-  | { kind: 'bluestacks-group-inviter' };
-type DetailTarget = { profileId: string; planId: string; round?: number };
-function App() {
-  const { workspace, error, refresh } = useWorkspace();
-  const inspections = useInspections();
-  const tasks = useTasks();
-  const cardColors = useCardColors();
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  }, [workspace]);
   const [selectedBluestacks, setSelectedBluestacks] = useState<Set<string>>(new Set());
-  const [view, setView] = useState<View>({ kind: 'home' });
-  const [recordFilter, setRecordFilter] = useState<string | null>(null);
-  const [detail, setDetail] = useState<DetailTarget | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [diagModalOpen, setDiagModalOpen] = useState(false);
-  const updates = useSoftwareUpdate();
-  const [updateMenu, setUpdateMenu] = useState(false);
-  const [menuSection, setMenuSection] = useState<'update' | 'google-sheets' | 'logs' | undefined>(
-    undefined,
-  );
-  const [message, setMessage] = useState('');
-  const [busy, setBusy] = useState(false);
-  const mutating = useRef(false);
-  const [aliasing, setAliasing] = useState<Profile | null>(null);
-  const editor = useRef<EditorHandle>(null);
-  const resourceEditor = useRef<ResourceEditorHandle>(null);
-  const [resourceRow, setResourceRow] = useState<SavedCombination | null>(null);
-  const [resourceSummaries, setResourceSummaries] = useState<ResourceUsageSummaryValue[] | null>(
-    null,
-  );
-  const mods = useFeatureModulesPolling(view.kind);
-  const {
-    groupBumper,
-    setGroupBumper,
-    groupInviter,
-    setGroupInviter,
-    groupPoster,
-    setGroupPoster,
-    bluestacks,
-    setBluestacks,
-    autoScheduler,
-    setAutoScheduler,
-    googleSheets,
-    setGoogleSheets,
-    refreshGoogleSheets,
-  } = mods;
-  const resourceGeneration = useRef(0);
-  async function applyUpdate() {
-    if (resourceEditor.current && !(await resourceEditor.current.persist())) return;
-    if (editor.current && !(await editor.current.persist())) return;
-    await updates.apply();
-  }
-  const refreshResources = useCallback(async () => {
-    const generation = ++resourceGeneration.current;
-    await api
-      .resourceSummaries()
-      .then((v) => generation === resourceGeneration.current && setResourceSummaries(v))
-      .catch(() => generation === resourceGeneration.current && setResourceSummaries(null));
-  }, []);
+  useEffect(() => {
+    if (bluestacks) {
+      pruneSelection(
+        bluestacks.instances.map((i) => i.id),
+        setSelectedBluestacks,
+      );
+    }
+  }, [bluestacks]);
+
+  const [recordFilter, setRecordFilter] = useState<string | null>(null),
+    [ledger, setLedger] = useState<LedgerFilterState>({
+      type: 'all',
+      status: 'all',
+      subView: 'ledger',
+      activeModule: 'all',
+      nonce: 0,
+    }),
+    [detail, setDetail] = useState<{ profileId: string; planId: string; round?: number } | null>(
+      null,
+    ),
+    [menuOpen, setMenuOpen] = useState(false),
+    [diagModalOpen, setDiagModalOpen] = useState(false),
+    [liveQueueOpen, setLiveQueueOpen] = useState(false),
+    [deviceSidebarCollapsed, setDeviceSidebarCollapsed] = useState(() => {
+      try {
+        return window.localStorage.getItem('workbench.device-sidebar-collapsed.v1') === '1';
+      } catch {
+        return false;
+      }
+    }),
+    [quickScheduleSeed, setQuickScheduleSeed] = useState<QuickScheduleSeed | null>(null),
+    updates = useSoftwareUpdate(),
+    [updateMenu, setUpdateMenu] = useState(false),
+    [menuSection, setMenuSection] = useState<'update' | 'google-sheets' | 'logs' | undefined>(
+      undefined,
+    ),
+    [message, setMessage] = useState(''),
+    [busy, setBusy] = useState(false),
+    mutating = useRef(false),
+    [aliasing, setAliasing] = useState<Profile | null>(null),
+    resourceEditor = useRef<ResourceEditorHandle>(null),
+    [resourceRow, setResourceRow] = useState<SavedCombination | null>(null);
+  const applyUpdate = async () => {
+    if (!resourceEditor.current || (await resourceEditor.current.persist())) await updates.apply();
+  };
+
   useEffect(() => {
     if (view.kind !== 'home' && view.kind !== 'edit') return;
     void refreshResources();
-    const timer = setInterval(() => void refreshResources(), 5000);
+    const timer = setInterval(() => void refreshResources(), sseConnected ? 25_000 : 5000);
     return () => {
       clearInterval(timer);
-      resourceGeneration.current++;
+      resourceGen.current++;
     };
-  }, [refreshResources, view.kind]);
+  }, [refreshResources, view.kind, sseConnected]);
   useEffect(
     () =>
-      window.workbenchDesktop?.onBeforeClose(async () => {
-        if (resourceEditor.current && !(await resourceEditor.current.persist())) return false;
-        return editor.current ? editor.current.persist() : true;
-      }),
+      window.workbenchDesktop?.onBeforeClose(async () =>
+        resourceEditor.current ? resourceEditor.current.persist() : true,
+      ),
     [],
   );
   useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        'workbench.device-sidebar-collapsed.v1',
+        deviceSidebarCollapsed ? '1' : '0',
+      );
+    } catch {}
+  }, [deviceSidebarCollapsed]);
+  useEffect(() => {
     if (!message) return;
-    const timer = setTimeout(() => setMessage(''), 6000);
-    return () => clearTimeout(timer);
+    const t = setTimeout(() => setMessage(''), 6000);
+    return () => clearTimeout(t);
   }, [message]);
-  async function navigate(next: View) {
+
+  const navigate = useCallback(async (next: View) => {
     if (resourceEditor.current && !(await resourceEditor.current.persist())) return;
-    if (view.kind === 'edit' && editor.current && !(await editor.current.persist())) return;
     setResourceRow(null);
+    if (next.kind.startsWith('bluestacks-')) setCarrier('bluestacks');
+    else if (next.kind in BROWSER_TO_BS) setCarrier('browser');
+    if (next.kind.startsWith('sheets-')) lastSheetsKindRef.current = next.kind as SheetsModuleId;
     setView(next);
+  }, []);
+
+  async function handleSwitchCarrier(nextCarrier: 'browser' | 'bluestacks') {
+    if (
+      nextCarrier === carrier ||
+      (resourceEditor.current && !(await resourceEditor.current.persist()))
+    )
+      return;
+    setResourceRow(null);
+    setCarrier(nextCarrier);
+    setView((prev) => {
+      if (prev.kind === 'edit') return { ...prev, carrier: nextCarrier };
+      const mapped =
+        nextCarrier === 'bluestacks' ? BROWSER_TO_BS[prev.kind] : BS_TO_BROWSER[prev.kind];
+      return mapped ? ({ kind: mapped } as View) : prev;
+    });
   }
+
   const mutate = useCallback(
     async (work: () => Promise<unknown>) => {
       if (mutating.current) return;
@@ -242,91 +251,65 @@ function App() {
     },
     [refresh],
   );
-  function checkProfiles(ids: string[]) {
-    void mutate(async () => {
-      const rows = await inspections.request(ids);
-      const queued = rows.filter((row) => ['QUEUED', 'READING'].includes(row.state)).length;
-      if (queued > 0) {
-        setTimeout(() => {
-          void inspections.refresh(true);
-          void refresh(true);
-        }, 1800);
-        setTimeout(() => {
-          void inspections.refresh(true);
-          void refresh(true);
-        }, 4200);
-        return `已触发识别 ${queued} 个在线浏览器的 FB 账号与头像（自动读取已打开的 Facebook 页面）`;
-      }
-      return '暂无可识别的空闲在线浏览器（请确认浏览器已打开 Facebook 且未在执行任务）';
-    });
-  }
-  function commandPlans(command: TaskCommand['command'], plans: TaskCommand['plans']) {
-    void mutate(async () => {
-      const { results } = await tasks.command({ command, plans });
-      const accepted = results.filter((row) => row.accepted);
-      const failed = results.filter((row) => !row.accepted);
-      const labels = { pause: '暂停', resume: '继续', stop: '停止' };
-      const reasons = [...new Set(failed.map((row) => row.reason))];
-      return (
-        `${labels[command]}请求已处理 ${accepted.length} 份；${failed.length} 份未完成` +
-        (reasons.length ? `（${reasons.join('、')}）` : '') +
-        (command === 'resume' ? '。原任务按并发设置重新排队。' : '。实际状态见任务记录。')
-      );
-    });
-  }
-  const plans = tasks.runtime?.plans ?? [];
-  const attentionCount = workspace ? attentionPlans(plans, workspace.profiles).length : 0;
-  const onlineCount = workspace?.profiles.filter((row) => row.online).length ?? 0;
+
+  const plans = tasks.runtime?.plans ?? [],
+    attentionCount = workspace ? attentionPlans(plans, workspace.profiles).length : 0,
+    onlineCount = workspace?.profiles.filter((row) => row.online).length ?? 0;
   const restartDisabled =
-    plans.some((plan) => ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state)) ||
-    Boolean(
-      groupInviter?.running ||
-      groupBumper?.running ||
-      groupBumper?.pageBumperRunning ||
-      groupPoster?.running ||
-      bluestacks?.running ||
-      bluestacks?.pageBumperRunning ||
-      bluestacks?.activeRunning ||
-      bluestacks?.posterRunning ||
-      bluestacks?.inviterRunning ||
-      autoScheduler?.running ||
-      (googleSheets?.runningScheduleCount ?? 0) > 0 ||
-      (googleSheets?.runningRecordsCount ?? 0) > 0 ||
+    plans.some((p) => ['QUEUED', 'RUNNING'].includes(p.state)) ||
+    [
+      groupInviter?.running,
+      groupBumper?.running,
+      groupBumper?.pageBumperRunning,
+      groupPoster?.running,
+      bluestacks?.running,
+      bluestacks?.pageBumperRunning,
+      bluestacks?.activeRunning,
+      bluestacks?.posterRunning,
+      bluestacks?.inviterRunning,
+      autoScheduler?.running,
+      (googleSheets?.runningScheduleCount ?? 0) > 0,
+      (googleSheets?.runningRecordsCount ?? 0) > 0,
       (googleSheets?.activeProfiles?.length ?? 0) > 0,
-    );
+    ].some(Boolean);
+
   const mergedProfiles = useMemo<Profile[]>(() => {
-    const base = workspace?.profiles ?? [];
-    const bsList = bluestacks?.instances ?? [];
+    const base = workspace?.profiles ?? [],
+      bsList = bluestacks?.instances ?? [];
     if (!bsList.length) return base;
     const seen = new Set(base.map((p) => p.id));
-    const extras: Profile[] = bsList
-      .filter((inst) => !seen.has(inst.id))
-      .map((inst, idx) => ({
-        id: inst.id,
-        alias: `[蓝蝶] ${bluestacksDisplayTitle(inst)}`,
-        browserName: `[蓝蝶] ${bluestacksDisplayTitle(inst)}`,
-        groupId: null,
-        order: 10000 + idx,
-        online: inst.online,
-        phase: inst.online ? 'READY' : 'OFFLINE',
-        synced: inst.online,
-        unresolved: 0,
-        extensionVersion: null,
-        capabilities: [],
-        presentation: null,
-        account: {
-          state: inst.accountState === 'missing-app' ? 'unknown' : inst.accountState,
-          id: inst.accountId || null,
-          name: inst.accountName || null,
-          avatar: inst.avatarUrl,
-        },
-      }));
-    return [...base, ...extras];
+    return [
+      ...base,
+      ...bsList
+        .filter((i) => !seen.has(i.id))
+        .map((i, idx) => ({
+          id: i.id,
+          alias: `[蓝蝶] ${bluestacksDisplayTitle(i)}`,
+          browserName: `[蓝蝶] ${bluestacksDisplayTitle(i)}`,
+          groupId: null,
+          order: 10000 + idx,
+          online: i.online,
+          phase: i.online ? 'READY' : 'OFFLINE',
+          synced: i.online,
+          unresolved: 0,
+          extensionVersion: null,
+          capabilities: [],
+          presentation: null,
+          account: {
+            state: i.accountState === 'missing-app' ? 'unknown' : i.accountState,
+            id: i.accountId || null,
+            name: i.accountName || null,
+            avatar: i.avatarUrl,
+          },
+        })),
+    ];
   }, [workspace?.profiles, bluestacks?.instances]);
+
   const projection = useMemo(
     () =>
       buildWorkbenchProjection({
         viewKind: view.kind,
+        carrier,
         profiles: workspace?.profiles,
         selected,
         tasks: tasks.runtime,
@@ -341,6 +324,7 @@ function App() {
       }),
     [
       view.kind,
+      carrier,
       workspace?.profiles,
       selected,
       tasks.runtime,
@@ -354,559 +338,297 @@ function App() {
       message,
     ],
   );
-  const stopModuleProfilesInternal = useCallback(
-    async (ids: string[]) => {
-      const uniqueIds = [...new Set(ids)];
-      const jobs: Array<{ label: string; run: () => Promise<void> }> = [];
-      const sIds = uniqueIds.filter((id) => projection.schedulerRunningIds.includes(id));
-      if (sIds.length) {
-        jobs.push({
-          label: '定时排班',
-          run: async () => {
-            setAutoScheduler(
-              await api.autoSchedulerAction('stop', {
-                targetIds: sIds,
-                keepWindowsOpen: true,
-              }),
-            );
-          },
-        });
-      }
-      const bIds = uniqueIds.filter((id) => projection.bumperRunningIds.includes(id));
-      if (bIds.length) {
-        jobs.push({
-          label: '顶贴',
-          run: async () => {
-            setGroupBumper(await api.bumperAction('stop', { profileIds: bIds }));
-          },
-        });
-      }
-      const pIds = uniqueIds.filter((id) => projection.posterRunningIds.includes(id));
-      if (pIds.length) {
-        jobs.push({
-          label: '小组发帖',
-          run: async () => {
-            setGroupPoster(await api.posterAction('stop', { profileIds: pIds }));
-          },
-        });
-      }
-      const inviteIds = uniqueIds.filter((id) => projection.inviterRunningIds.includes(id));
-      if (inviteIds.length) {
-        jobs.push({
-          label: '小组邀请人',
-          run: async () => {
-            setGroupInviter(await api.stopGroupInviterProfiles({ profileIds: inviteIds }));
-          },
-        });
-      }
-      const sheetIds = uniqueIds.filter((id) => projection.sheetsRunningIds.includes(id));
-      if (sheetIds.length) {
-        jobs.push({
-          label: '云表任务',
-          run: async () => {
-            setGoogleSheets(await api.googleSheetsStopProfiles(sheetIds));
-          },
-        });
-      }
-      const settled = await Promise.allSettled(jobs.map((j) => j.run()));
-      const failures: string[] = [];
-      settled.forEach((res, idx) => {
-        if (res.status === 'rejected') {
-          const msg = res.reason instanceof Error ? res.reason.message : '失败';
-          failures.push(`${jobs[idx]?.label ?? '模块'}：${msg}`);
-        }
-      });
-      return { uniqueCount: uniqueIds.length, failures };
-    },
+  const liveRunCards = useMemo(
+    () =>
+      buildLiveRunCards({
+        profiles: workspace?.profiles ?? [],
+        runtime: tasks.runtime,
+        combinations: workspace?.combinations ?? [],
+        autoScheduler,
+        groupBumper,
+        groupPoster,
+        groupInviter,
+        googleSheets,
+        bluestacks,
+      }),
     [
-      projection.schedulerRunningIds,
-      projection.bumperRunningIds,
-      projection.posterRunningIds,
-      projection.inviterRunningIds,
-      projection.sheetsRunningIds,
-      setAutoScheduler,
-      setGroupBumper,
-      setGroupPoster,
-      setGroupInviter,
-      setGoogleSheets,
+      workspace?.profiles,
+      workspace?.combinations,
+      tasks.runtime,
+      autoScheduler,
+      groupBumper,
+      groupPoster,
+      groupInviter,
+      googleSheets,
+      bluestacks,
     ],
   );
-  const stopProfilesUnified = useCallback(
-    (planTargets: TaskCommand['plans'], moduleProfileIds: string[]) => {
-      void mutate(async () => {
-        const parts: string[] = [];
-        const failures: string[] = [];
-        const ops: Array<Promise<void>> = [];
-        if (planTargets.length) {
-          ops.push(
-            tasks
-              .command({ command: 'stop', plans: planTargets })
-              .then(({ results }) => {
-                const accepted = results.filter((row) => row.accepted);
-                const failed = results.filter((row) => !row.accepted);
-                const reasons = [...new Set(failed.map((row) => row.reason))];
-                parts.push(
-                  `活跃任务已处理 ${accepted.length} 份` +
-                    (failed.length ? `（${failed.length} 份未完成：${reasons.join('、')}）` : ''),
-                );
-              })
-              .catch((err) => {
-                failures.push(`活跃任务：${err instanceof Error ? err.message : '失败'}`);
-              }),
-          );
-        }
-        if (moduleProfileIds.length) {
-          ops.push(
-            stopModuleProfilesInternal(moduleProfileIds).then((res) => {
-              if (res.uniqueCount > 0) parts.push(`模块任务 ${res.uniqueCount} 个浏览器`);
-              failures.push(...res.failures);
-            }),
-          );
-        }
-        await Promise.all(ops);
-        const summary = parts.length ? `已发送停止指令（${parts.join('；')}）` : '无需要停止的任务';
-        return failures.length ? `${summary}；部分失败：${failures.join('；')}` : summary;
-      });
-    },
-    [mutate, tasks, stopModuleProfilesInternal],
-  );
-  const handlePosterState = useCallback(
-    (next: Parameters<typeof setGroupPoster>[0]) => {
-      setGroupPoster(next);
-      void mods.refreshGroupInviter();
-    },
-    [setGroupPoster, mods.refreshGroupInviter],
-  );
+  const actions = useWorkbenchActions({
+    mutate,
+    refresh,
+    tasks,
+    inspections,
+    projection,
+    mods,
+    setMessage,
+    liveRunCards,
+  });
   const forceRefreshWorkspace = useCallback(() => refresh(true), [refresh]);
+  const openQuickSchedule = useCallback(
+    (seed: QuickScheduleSeed) => {
+      if (!groupBumper) mods.refreshBumper();
+      if (!groupPoster) mods.refreshPoster();
+      if (!groupInviter) void mods.refreshGroupInviter();
+      if (!bluestacks) mods.refreshBluestacks(false);
+      setQuickScheduleSeed(seed);
+    },
+    [groupBumper, groupPoster, groupInviter, bluestacks, mods],
+  );
+  const openLedgerRecords = useCallback(
+    (opts: {
+      type?: PostBumpRecordTypeFilter;
+      status?: 'all' | PostBumpStatusValue;
+      subView?: 'ledger' | 'active';
+      activeModule?: ActivityRecordModuleFilter;
+    }) => {
+      setLedger((prev) => ({
+        type: opts.type ?? 'all',
+        status: opts.status ?? 'all',
+        subView: opts.subView ?? 'ledger',
+        activeModule: opts.activeModule ?? 'all',
+        nonce: prev.nonce + 1,
+      }));
+      void navigate({ kind: 'records' });
+    },
+    [navigate],
+  );
+
+  const shell: ShellCtx | null = workspace
+    ? {
+        workspace,
+        mergedProfiles,
+        inspections,
+        tasks,
+        mods,
+        busy,
+        selected,
+        setSelected,
+        selectedBluestacks,
+        setSelectedBluestacks,
+        projection,
+        actions,
+        mutate,
+        forceRefreshWorkspace,
+        setMessage,
+      }
+    : null;
+  const isSheetView = view.kind.startsWith('sheets-');
+  const isSplitCanvasView =
+    view.kind === 'group-bumper' ||
+    view.kind === 'page-bumper' ||
+    view.kind === 'group-inviter' ||
+    view.kind === 'bluestacks-group-bumper' ||
+    view.kind === 'bluestacks-page-bumper' ||
+    view.kind === 'bluestacks-group-inviter';
+  const workspaceLayoutCls = isSheetView
+    ? 'flex h-full min-h-0 flex-col overflow-hidden p-0'
+    : isSplitCanvasView
+      ? 'flex h-full min-h-0 flex-col overflow-hidden px-[18px] pt-3 pb-3.5 max-[1080px]:px-3.5'
+      : 'overflow-y-auto px-6 pt-3 pb-8 max-[1080px]:px-3.5 max-[850px]:pb-6';
+  const showDeviceSidebar = !deviceSidebarCollapsed;
+  const bsOnlineCount = (bluestacks?.instances ?? []).filter((i) => i.online).length;
+  const bsTotalCount = bluestacks?.instances.length ?? 0;
+  const totalProfilesCount = workspace?.profiles.length ?? 0;
+  const closeMenu = () => {
+    setMenuOpen(false);
+    setUpdateMenu(false);
+    setMenuSection(undefined);
+  };
+
   return (
-    <div className="app">
+    <div className="app flex h-screen min-h-[480px] w-full flex-col overflow-x-hidden bg-[var(--bg)]">
       <WorkbenchTopbar
         version={__WORKBENCH_VERSION__}
         breadcrumbText={projection.breadcrumbText}
         busy={busy}
         error={error}
+        carrier={carrier}
         onlineCount={onlineCount}
         totalProfilesCount={workspace?.profiles.length ?? 0}
+        bluestacksOnlineCount={(bluestacks?.instances ?? []).filter((i) => i.online).length}
+        bluestacksTotalCount={bluestacks?.instances.length ?? 0}
+        onSwitchCarrier={(next) => void handleSwitchCarrier(next)}
+        runningCount={liveRunCards.length}
+        onOpenWindowLayout={() => void navigate({ kind: 'window-layout' })}
+        onOpenLiveRuns={() => setLiveQueueOpen(true)}
         updateStatus={updates.status}
         updateError={updates.error}
         schedulerSettings={autoScheduler?.settings ?? null}
-        onSaveGlobalConcurrency={async (patch) => {
-          try {
-            let base = autoScheduler?.settings;
-            if (!base) {
-              const latest = await api.autoSchedulerState().catch(() => null);
-              if (latest) {
-                setAutoScheduler(latest);
-                base = latest.settings;
-              }
-            }
-            if (!base) {
-              setMessage('全局并发设置尚未加载完成，请稍后再试');
-              return false;
-            }
-            const next = await api.autoSchedulerAction('settings', { ...base, ...patch });
-            setAutoScheduler(next);
-            tasks.refresh();
-            mods.refreshBumper();
-            mods.refreshPoster();
-            void mods.refreshGroupInviter();
-            mods.refreshBluestacks(false);
-            setMessage(
-              `已更新全局并发：浏览器 ${next.settings.browserConcurrency} 窗 · 蓝蝶 ${next.settings.bluestacksConcurrency} 窗`,
-            );
-            return true;
-          } catch (err) {
-            setMessage(err instanceof Error ? err.message : '保存全局并发失败');
-            return false;
-          }
-        }}
-        onOpenDiagnosticModal={() => setDiagModalOpen(true)}
-        onOpenMenu={() => setMenuOpen(true)}
+        onSaveGlobalConcurrency={actions.handleSaveGlobalConcurrency}
+        onOpenMenu={() => workspace && setMenuOpen(true)}
         onOpenUpdateMenu={() => {
+          if (!workspace) return;
           setUpdateMenu(true);
           setMenuOpen(true);
         }}
         onApplyUpdate={applyUpdate}
-        onNotify={setMessage}
       />
-      {!workspace ? (
-        <main className="loading">
-          <h2>{error ? '控制服务连接失败' : '正在连接本机控制服务…'}</h2>
-          <p>{error}</p>
-          <button className="btn btn-primary" onClick={() => void refresh(true)}>
+      {!shell ? (
+        <main className="mx-auto my-20 grid justify-items-center gap-3 px-4 text-center">
+          <h2 className="text-base font-semibold text-slate-900">
+            {error ? '控制服务连接失败' : '正在连接本机控制服务…'}
+          </h2>
+          {error && <p className="max-w-md text-xs text-[var(--text-3)]">{error}</p>}
+          <button
+            type="button"
+            className="btn btn-primary inline-flex h-8 items-center justify-center rounded-md border border-[var(--brand)] bg-[var(--brand)] px-4 text-[13px] font-semibold text-white hover:bg-[var(--brand-hover)]"
+            onClick={() => void refresh(true)}
+          >
             重新连接
           </button>
         </main>
       ) : (
-        <div className="app-body">
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden max-[600px]:flex-col">
           <FeatureNavRail
             activeModule={projection.activeModule}
+            carrier={carrier}
             items={projection.navItems}
             onSelectModule={(mod) =>
-              void navigate({ kind: mod === 'active-accounts' ? 'home' : mod })
+              void navigate(
+                mod === 'active-accounts'
+                  ? { kind: 'home' }
+                  : mod.startsWith('sheets-')
+                    ? { kind: lastSheetsKindRef.current }
+                    : { kind: mod },
+              )
             }
           />
-          {view.kind === 'bluestacks-active' ||
-          view.kind === 'bluestacks-group-poster' ||
-          view.kind === 'bluestacks-group-bumper' ||
-          view.kind === 'bluestacks-page-bumper' ||
-          view.kind === 'bluestacks-group-inviter' ? (
-            <Suspense fallback={<aside className="sidebar" aria-busy="true" />}>
-              <BluestacksSidebar
-                mode={view.kind}
-                state={bluestacks}
-                onChange={setBluestacks}
-                selected={selectedBluestacks}
-                onSelect={setSelectedBluestacks}
-                onError={setMessage}
-              />
-            </Suspense>
-          ) : (
-            <Sidebar
-              tasks={tasks.runtime}
-              onTaskCommand={commandPlans}
-              workspace={workspace}
-              selected={selected}
-              onSelect={setSelected}
-              nameAction={view.kind === 'records' ? 'filter' : 'select'}
-              filteredId={view.kind === 'records' ? recordFilter : null}
-              onInspect={(id) => setRecordFilter((current) => (current === id ? null : id))}
-              mutate={mutate}
-              inspections={inspections.rows}
-              inspectionAvailable={inspections.available}
-              inspectionError={inspections.error}
-              busy={busy}
-              onCheck={checkProfiles}
+          {showDeviceSidebar ? (
+            <WorkbenchSidebarPane
+              shell={shell}
+              carrier={carrier}
+              viewKind={view.kind}
               onRename={setAliasing}
-              onShow={(id) =>
-                void mutate(() => api.showBrowser(id).then(() => '已显示对应浏览器页面'))
-              }
-              activities={projection.projectedActivities}
-              selectionControls={projection.projectedControls}
-              bumperCounts={
-                view.kind === 'group-bumper'
-                  ? groupBumper?.profileCounts
-                  : view.kind === 'page-bumper'
-                    ? (groupBumper?.pageBumperProfileCounts ?? {})
-                    : undefined
-              }
-              bumperRunningIds={projection.bumperRunningIds}
-              groupInviterCounts={
-                view.kind === 'group-inviter' ? (groupInviter?.profileCounts ?? {}) : null
-              }
-              groupInviterRunningIds={projection.inviterRunningIds}
-              onStopModules={(ids) => stopProfilesUnified([], ids)}
-              onStopProfiles={stopProfilesUnified}
-              onRefreshWorkspace={forceRefreshWorkspace}
-              onNotify={setMessage}
+              onInspect={() => setLiveQueueOpen(true)}
+              onHideSidebar={() => setDeviceSidebarCollapsed(true)}
             />
+          ) : (
+            <div
+              className="flex w-9 shrink-0 flex-col items-center gap-2 border-r border-[var(--line)] bg-[var(--sidebar-bg)] pt-2 select-none"
+              aria-label="设备栏已折叠"
+            >
+              <button
+                type="button"
+                aria-label="展开设备栏"
+                title="展开左侧浏览器 / 蓝蝶设备栏"
+                className="inline-grid h-7 w-7 place-content-center rounded-md border border-[var(--line)] bg-white text-[var(--text-2)] shadow-2xs transition-colors hover:border-[var(--brand)] hover:bg-[var(--brand-soft)] hover:text-[var(--brand)]"
+                onClick={() => setDeviceSidebarCollapsed(false)}
+              >
+                <IconPanelOpen size={15} />
+              </button>
+              <button
+                type="button"
+                title="点击展开左侧设备栏"
+                className="flex flex-1 cursor-pointer flex-col items-center justify-start rounded-md border-0 bg-transparent px-1 py-2 text-[11px] font-medium text-[var(--text-3)] transition-colors hover:bg-[var(--surface-3)] hover:text-[var(--text)] [writing-mode:vertical-rl]"
+                onClick={() => setDeviceSidebarCollapsed(false)}
+              >
+                {carrier === 'bluestacks'
+                  ? `蓝蝶 ${bsOnlineCount}/${bsTotalCount}`
+                  : `浏览器 ${onlineCount}/${totalProfilesCount}`}
+              </button>
+            </div>
           )}
-          <SidebarResizer />
-          <main className={'workspace view-' + view.kind}>
+          <main
+            className={`workspace min-w-0 flex-1 bg-[var(--bg)] ${workspaceLayoutCls} view-${view.kind}`}
+          >
             {error && (
-              <div className="error-note" role="alert">
-                {error}
-                <button className="btn btn-sm" onClick={() => void refresh(true)}>
+              <div
+                className="mt-3 mb-2 flex items-center gap-2.5 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700"
+                role="alert"
+              >
+                <span className="flex-1">{error}</span>
+                <button
+                  type="button"
+                  className="btn btn-sm inline-flex h-7 items-center rounded-md border border-rose-200 bg-white px-2.5 text-xs font-medium text-rose-700 hover:bg-rose-100"
+                  onClick={() => void refresh(true)}
+                >
                   重新连接
                 </button>
               </div>
             )}
             {tasks.error && (
-              <p className="error-note" role="alert">
+              <p
+                className="mt-3 mb-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs text-rose-700"
+                role="alert"
+              >
                 {tasks.error}
               </p>
             )}
-            {view.kind === 'home' && (
-              <ActiveAccountsPage
-                workspace={workspace}
-                selected={selected}
-                tasks={tasks}
-                cardColors={cardColors}
-                busy={busy}
-                resourceSummaries={resourceSummaries}
-                selectionControls={projection.projectedControls}
-                onSetResourceSummaries={setResourceSummaries}
-                onOpenResources={setResourceRow}
-                onEditCombination={(row) => setView({ kind: 'edit', row })}
-                onRefreshWorkspace={forceRefreshWorkspace}
-                onRefreshResources={refreshResources}
-                onMutate={mutate}
-                onNotify={setMessage}
-              />
-            )}
-            <WorkbenchErrorBoundary resetKey={view.kind} label="当前功能页面加载异常">
-              <Suspense
-                fallback={
-                  <div className="empty" role="status">
-                    <strong>正在加载页面…</strong>
-                  </div>
-                }
-              >
-                {view.kind === 'auto-scheduler' && (
-                  <AutoSchedulerPage
-                    state={autoScheduler}
-                    onState={setAutoScheduler}
-                    profiles={workspace.profiles}
-                    profileGroups={workspace.groups}
-                    selectedProfileIds={selected}
-                    combinations={workspace.combinations}
-                    bumperState={groupBumper}
-                    posterState={groupPoster}
-                    bluestacksState={bluestacks}
-                    onMessage={setMessage}
-                  />
-                )}
-                {view.kind === 'records' && (
-                  <TaskRecordsPage
-                    runtime={tasks.runtime}
-                    profiles={mergedProfiles}
-                    inspections={inspections.rows}
-                    loaded={!!tasks.runtime}
-                    filterId={recordFilter}
-                    onClearFilter={() => setRecordFilter(null)}
-                    onOpen={(profileId, planId, round) => setDetail({ profileId, planId, round })}
-                    groupInviterState={groupInviter}
-                    groupBumperState={groupBumper}
-                    onGroupBumperState={setGroupBumper}
-                    groupPosterState={groupPoster}
-                    googleSheetsOverview={googleSheets}
-                    onOpenCleanupSettings={() => {
-                      setMenuSection('logs');
-                      setMenuOpen(true);
-                    }}
-                    onNotify={setMessage}
-                  />
-                )}
-                {view.kind === 'bluestacks-active' && (
-                  <BluestacksActivePage
-                    bluestacksState={bluestacks}
-                    onBluestacksState={setBluestacks}
-                    selected={selectedBluestacks}
-                    combinations={workspace.combinations}
-                    onMessage={setMessage}
-                  />
-                )}
-                {view.kind === 'bluestacks-group-poster' && (
-                  <BluestacksPosterPage
-                    bluestacksState={bluestacks}
-                    onBluestacksState={setBluestacks}
-                    selected={selectedBluestacks}
-                    materials={groupPoster?.materials ?? []}
-                    groups={groupPoster?.groups ?? groupBumper?.groups ?? []}
-                    groupAvatarRefreshing={
-                      groupPoster?.groupAvatarRefreshing || groupInviter?.groupAvatarRefreshing
-                    }
-                    onSyncSharedGroups={async () => {
-                      await Promise.allSettled([
-                        api.bumperState().then(setGroupBumper),
-                        api.posterState().then(setGroupPoster),
-                        api.groupInviterState().then(setGroupInviter),
-                      ]);
-                    }}
-                    onMessage={setMessage}
-                  />
-                )}
-                {view.kind === 'bluestacks-group-inviter' && (
-                  <BluestacksInviterPage
-                    bluestacksState={bluestacks}
-                    onBluestacksState={setBluestacks}
-                    selected={selectedBluestacks}
-                    groups={groupBumper?.groups ?? []}
-                    inviterState={groupInviter}
-                    onSyncSharedGroups={async () => {
-                      await Promise.allSettled([
-                        api.bumperState().then(setGroupBumper),
-                        api.posterState().then(setGroupPoster),
-                        api.groupInviterState().then(setGroupInviter),
-                      ]);
-                    }}
-                    onMessage={setMessage}
-                  />
-                )}
-                {(view.kind === 'group-bumper' ||
-                  view.kind === 'page-bumper' ||
-                  view.kind === 'bluestacks-group-bumper' ||
-                  view.kind === 'bluestacks-page-bumper') && (
-                  <GroupBumperPage
-                    key={view.kind}
-                    mode={view.kind}
-                    state={groupBumper}
-                    selected={
-                      view.kind === 'bluestacks-group-bumper' ||
-                      view.kind === 'bluestacks-page-bumper'
-                        ? selectedBluestacks
-                        : selected
-                    }
-                    profiles={mergedProfiles}
-                    bluestacksState={bluestacks}
-                    onBluestacksState={setBluestacks}
-                    onState={(next) => {
-                      setGroupBumper(next);
-                      void mods.refreshGroupInviter();
-                      mods.refreshPoster();
-                    }}
-                    onMessage={setMessage}
-                  />
-                )}
-                {view.kind === 'group-poster' && (
-                  <GroupPosterPage
-                    state={groupPoster}
-                    selected={selected}
-                    profiles={workspace.profiles}
-                    profileGroups={workspace.groups}
-                    onState={handlePosterState}
-                    onMessage={setMessage}
-                  />
-                )}
-                {(view.kind === 'sheets-groups' ||
-                  view.kind === 'sheets-pages' ||
-                  view.kind === 'sheets-schedule' ||
-                  view.kind === 'sheets-records') && (
-                  <GoogleSheetsPage
-                    key={view.kind}
-                    kind={
-                      view.kind === 'sheets-groups'
-                        ? 'group_library'
-                        : view.kind === 'sheets-pages'
-                          ? 'page_library'
-                          : view.kind === 'sheets-schedule'
-                            ? 'post_schedule'
-                            : 'post_records'
-                    }
-                    overview={googleSheets}
-                    onOverview={setGoogleSheets}
-                    profileGroups={workspace.groups}
-                    profiles={workspace.profiles}
-                    bluestacksState={bluestacks}
-                    onOpenAuthMenu={() => {
-                      setMenuSection('google-sheets');
-                      setMenuOpen(true);
-                    }}
-                    onAfterLibrarySync={() => {
-                      mods.refreshBumper();
-                      mods.refreshPoster();
-                      void mods.refreshGroupInviter();
-                    }}
-                    onNotify={setMessage}
-                  />
-                )}
-                {view.kind === 'group-inviter' && (
-                  <GroupInviterPage
-                    state={groupInviter}
-                    onRefresh={async () => setGroupInviter(await api.groupInviterState())}
-                    loaded={mods.groupInviterLoaded}
-                    selectedProfileIds={selected}
-                    busy={busy}
-                    onAddGroups={async (items) => {
-                      setGroupInviter(await api.addInviterGroups({ items }));
-                      void api.bumperState().then(setGroupBumper, () => {});
-                      void api.posterState().then(setGroupPoster, () => {});
-                      setMessage(`已保存 ${items.length} 个小组，正在后台获取小组头像`);
-                    }}
-                    onDeleteGroups={(groupIds) =>
-                      mutate(async () => {
-                        setGroupInviter(await api.deleteInviterGroups({ groupIds }));
-                        void api.bumperState().then(setGroupBumper, () => {});
-                        void api.posterState().then(setGroupPoster, () => {});
-                        return `已删除 ${groupIds.length} 个小组`;
-                      })
-                    }
-                    onSaveInvitesPerGroup={async (invitesPerGroup) =>
-                      setGroupInviter(await api.saveGroupInviterSettings({ invitesPerGroup }))
-                    }
-                    onStart={(groupIds, invitesPerGroup) =>
-                      mutate(async () => {
-                        const targetIds = (
-                          groupInviter?.running
-                            ? [...selected].filter((id) => !groupInviter.profileCounts[id]?.running)
-                            : [...selected]
-                        ).sort();
-                        const next = await api.startGroupInviter({
-                          profileIds: targetIds,
-                          groupIds,
-                          invitesPerGroup,
-                        });
-                        setGroupInviter(next);
-                        const skipped = targetIds.filter((id) =>
-                          next.profileCounts[id]?.status?.startsWith('跳过'),
-                        ).length;
-                        return `已启动小组邀请人：${Math.max(0, targetIds.length - skipped)} 个账号 × ${groupIds.length} 个小组${skipped > 0 ? `（已自动跳过 ${skipped} 个不可用或运行中账号）` : ''}`;
-                      })
-                    }
-                    onStop={() =>
-                      mutate(async () => {
-                        setGroupInviter(await api.stopGroupInviter());
-                        return '已发送停止小组邀请人指令';
-                      })
-                    }
-                    onMessage={setMessage}
-                  />
-                )}
-                {view.kind === 'edit' && (
-                  <Editor
-                    ref={editor}
-                    key={view.row.id}
-                    initial={view.row}
-                    selectedProfiles={workspace.profiles.filter((profile) =>
-                      selected.has(profile.id),
-                    )}
-                    onResources={() => setResourceRow(view.row)}
-                    resourceUsage={
-                      resourceSummaries?.find((item) => item.combinationId === view.row.id) ?? null
-                    }
-                    resourceUsageLoaded={resourceSummaries !== null}
-                    onSaved={forceRefreshWorkspace}
-                    onClose={() => void navigate({ kind: 'home' })}
-                    notify={setMessage}
-                  />
-                )}
-              </Suspense>
-            </WorkbenchErrorBoundary>
+            <WorkbenchViewRouter
+              shell={shell}
+              router={{
+                view,
+                setView,
+                carrier,
+                cardColors,
+                resourceSummaries,
+                setResourceSummaries,
+                onOpenResources: setResourceRow,
+                refreshResources,
+                openQuickSchedule,
+                onOpenLiveRuns: () => setLiveQueueOpen(true),
+                openLedgerRecords,
+                ledger,
+                recordFilter,
+                setRecordFilter,
+                onOpenDetail: (profileId, planId, round) => setDetail({ profileId, planId, round }),
+                onOpenMenuSection: (section) => {
+                  setMenuSection(section);
+                  setMenuOpen(true);
+                },
+                navigate,
+              }}
+            />
           </main>
         </div>
       )}
       <WorkbenchOverlays
-        workspace={workspace}
+        shell={shell}
         message={message}
-        onMessage={setMessage}
         detail={detail}
         onCloseDetail={() => setDetail(null)}
         plans={plans}
-        inspections={inspections}
-        busy={busy}
-        onCommand={commandPlans}
         onRename={setAliasing}
-        onCheck={checkProfiles}
         onOpenResource={setResourceRow}
         menuOpen={menuOpen}
         updateMenu={updateMenu}
         menuSection={menuSection}
-        onGoogleSheetsChanged={refreshGoogleSheets}
-        onCloseMenu={() => {
-          setMenuOpen(false);
-          setUpdateMenu(false);
-          setMenuSection(undefined);
-        }}
+        onCloseMenu={closeMenu}
         updates={updates}
         onApplyUpdate={applyUpdate}
-        selected={selected}
-        runtime={tasks.runtime}
         restartDisabled={restartDisabled}
-        onRefreshTasks={tasks.refresh}
-        mutate={mutate}
         resourceRow={resourceRow}
         resourceEditorRef={resourceEditor}
         onSavedResource={refreshResources}
         aliasing={aliasing}
         onCloseAliasing={() => setAliasing(null)}
-        onRefreshWorkspace={forceRefreshWorkspace}
         diagModalOpen={diagModalOpen}
-        diagUiContext={projection.diagUiContext}
+        onOpenDiagModal={() => setDiagModalOpen(true)}
         onCloseDiagModal={() => setDiagModalOpen(false)}
+        onOpenWindowLayout={() => {
+          closeMenu();
+          void navigate({ kind: 'window-layout' });
+        }}
+        quickScheduleSeed={quickScheduleSeed}
+        onCloseQuickSchedule={() => setQuickScheduleSeed(null)}
+        liveQueueOpen={liveQueueOpen}
+        onCloseLiveQueue={() => setLiveQueueOpen(false)}
+        liveRunCards={liveRunCards}
       />
     </div>
   );
 }
+
 const root = document.getElementById('root');
 if (!root) throw Error('ROOT_ELEMENT_MISSING');
 createRoot(root).render(

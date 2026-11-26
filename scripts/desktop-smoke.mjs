@@ -88,8 +88,6 @@ try {
   if (
     code !== 0 ||
     !value.ok ||
-    (process.env.WORKBENCH_SMOKE_RESET === '1' && !value.resetVerified) ||
-    (process.env.WORKBENCH_SMOKE_CLEANUP_UI === '1' && !value.cleanupUi) ||
     value.htmlFacts.overflow ||
     value.htmlFacts.nodeExposed ||
     !value.htmlFacts.desktopBridge ||

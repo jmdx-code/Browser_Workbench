@@ -1,38 +1,39 @@
-import type { PresentationRecoveryDecision } from '../src/shared/presentation-recovery.js';
-import {
-  KernelJsonObject,
-  KernelTargetInfo,
-  type KernelBackend,
-  type KernelTarget,
-} from '../src/shared/kernel-protocol.js';
-import {
-  assertKernelSessionCommand,
-  kernelAccessURL,
-  kernelRequiresOperation,
-  type KernelAccess,
-} from '../src/shared/kernel-policy.js';
-import {
-  PageReadRequest,
-  validateProjection,
-  type PageProjectionRequest,
-} from '../src/shared/page-read.js';
-import { pageProjectionExpression } from './page-projection.js';
-import { OwnedTabProof, type KernelState, type TabProof } from '../src/shared/kernel-state.js';
 import type { KernelJournal } from '../src/application/kernel-journal.js';
-import { kernelJournal } from './kernel-storage.js';
-import { readNativeFacebookIdentity } from './facebook-identity-reader.js';
-import type { Binding } from '../src/shared/task-execution.js';
-import { digestAction } from './journal.js';
-import { WorkspacePageGroup } from './workspace-page-group.js';
-import { TaskRendering } from './task-rendering.js';
 import { sameTabProof } from '../src/domain/task-tabs.js';
-
-export function isBenignDetachError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? '');
-  if (message.includes('DEBUGGER_DETACH_TIMEOUT')) return false;
-  return /Debugger is not attached|No tab with (?:given )?id/i.test(message);
-}
-
+import { kernelAccessURL, type KernelAccess } from '../src/shared/kernel-policy.js';
+import type {
+  KernelBackend,
+  KernelJsonObject,
+  KernelTarget,
+} from '../src/shared/kernel-protocol.js';
+import { OwnedTabProof, type TabProof } from '../src/shared/kernel-state.js';
+import type { PageProjectionRequest } from '../src/shared/page-read.js';
+import type { PresentationRecoveryDecision } from '../src/shared/presentation-recovery.js';
+import type { Binding } from '../src/shared/task-execution.js';
+import {
+  armTaskPresentationHelper,
+  attachDebuggerTarget,
+  detachDebuggerTarget,
+  handleClosingDialog,
+  isBenignDetachError,
+  maintainPresentationHelper,
+  revealOwnedPageHelper,
+  sendCdpCommand,
+  type KernelCdpContext,
+  type PresentationState,
+} from './kernel-cdp-client.js';
+import {
+  consolidateWorkspaceTabs,
+  inspectWorkspaceInventory,
+  isReadyTabRecord,
+  observeTabIdentity,
+  projectTabPage,
+  recoverOwnedTabToHome,
+} from './kernel-page-projection.js';
+import { kernelJournal } from './kernel-storage.js';
+import { TaskRendering } from './task-rendering.js';
+import { sleep, withBoundedWait, WorkspacePageGroup } from './workspace-page-group.js';
+export { isBenignDetachError };
 export interface KernelNativeBackend extends KernelBackend {
   owns(tabId: number): boolean;
   detached(tabId: number): void;
@@ -54,18 +55,88 @@ export interface KernelNativeBackend extends KernelBackend {
   setWindowExposure?(proof: TabProof, exposed: boolean): Promise<void>;
   adopt?(proof: TabProof): Promise<void>;
   revealOwnedPage?(proof: TabProof, focus?: boolean): Promise<{ tabId: number; focused: boolean }>;
-  consolidateWorkspace?(preferActiveTab?: boolean): Promise<{
-    proof: TabProof;
-    url: string;
-    closedTabIds: number[];
-    remainingTabCount: number;
-  }>;
+  consolidateWorkspace?(
+    preferActiveTab?: boolean,
+  ): Promise<{ proof: TabProof; url: string; closedTabIds: number[]; remainingTabCount: number }>;
+  recoverTabToHome?(
+    proof: TabProof,
+  ): Promise<{ proof: TabProof; url: string; targetChanged: boolean }>;
   tabRemoved?(tabId: number): void;
 }
 export class ChromeKernelBackend implements KernelNativeBackend {
   private exposedWindow?: TabProof;
-  private isExposed(proof: TabProof) {
-    return !!this.exposedWindow && sameTabProof(this.exposedWindow, proof);
+  private presentation?: PresentationState;
+  private recoverPresentation?: (
+    proof: TabProof,
+    positionOnly?: boolean,
+  ) => Promise<PresentationRecoveryDecision>;
+  private presentationObserver?: (proof: TabProof, state: KernelJsonObject) => void;
+  private presenting?: Promise<void>;
+  private readonly workspaceGroup = new WorkspacePageGroup();
+  private readonly owned = new Map<number, TabProof>();
+  private readonly attached = new Map<number, string>();
+  private readonly expectedDetaches = new Set<number>();
+  private readonly expectedRemovals = new Set<number>();
+  private readonly identityReadTabs = new Set<number>();
+  private readonly removingUntil = new Map<number, number>();
+  private readonly removalDialogs = new Set<number>();
+  private identityReadPending = false;
+  readonly rendering = new TaskRendering((t, m, p) => chrome.debugger.sendCommand(t, m, p), {
+    forgetTab: (tabId) => this.windows?.forgetTab?.(tabId),
+  });
+  constructor(
+    private readonly journal: KernelJournal = kernelJournal,
+    private readonly allowInput: () => boolean = () => false,
+    private readonly access: KernelAccess = 'fixture',
+    private readonly allowRead: () => boolean = () => false,
+    private readonly currentOperation: () => Binding | undefined = () => undefined,
+    private readonly presentationNow: () => number = performance.now.bind(performance),
+    private readonly windows?: { forgetTab?(tabId: number): void },
+  ) {}
+  private isExposed = (proof: TabProof) =>
+    !!this.exposedWindow && sameTabProof(this.exposedWindow, proof);
+  private clearTabPresentation = (tabId: number) => {
+    if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+  };
+  private cdpCtx(): KernelCdpContext {
+    return {
+      access: this.access,
+      journal: this.journal,
+      owned: this.owned,
+      attached: this.attached,
+      rendering: this.rendering,
+      expectedDetaches: this.expectedDetaches,
+      expectedRemovals: this.expectedRemovals,
+      allowRead: () => this.allowRead(),
+      currentOperation: () => this.currentOperation(),
+      clearTabPresentation: this.clearTabPresentation,
+      scope: (tabId: number) => this.scope(tabId),
+      workspaceGroup: this.workspaceGroup,
+      identityReadTabs: this.identityReadTabs,
+      isIdentityReadPending: () => this.identityReadPending,
+      setIdentityReadPending: (v) => (this.identityReadPending = v),
+      removingUntil: this.removingUntil,
+      removalDialogs: this.removalDialogs,
+      allowInput: () => this.allowInput(),
+      sameProfileForeground: () => this.sameProfileForeground(),
+      isExposed: this.isExposed,
+      ensurePresentation: (proof) => {
+        if (this.presentation?.proof !== proof) this.presentation = { proof, checkedAt: -Infinity };
+      },
+      clearExposedIfTab: (tabId) => {
+        if (this.exposedWindow?.tabId === tabId) this.exposedWindow = undefined;
+      },
+      presentationNow: () => this.presentationNow(),
+      reportPresentation: (proof, state) => {
+        try {
+          this.presentationObserver?.(proof, state);
+        } catch {}
+      },
+      getPresentation: () => this.presentation,
+      setPresentation: (v) => (this.presentation = v),
+      getPresenting: () => this.presenting,
+      setPresenting: (v) => (this.presenting = v),
+    };
   }
   async setWindowExposure(proof: TabProof, exposed: boolean) {
     this.exposedWindow = exposed ? proof : undefined;
@@ -87,12 +158,8 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         .catch(() => {});
     }
   }
-  readonly rendering = new TaskRendering(
-    (target, method, params) => chrome.debugger.sendCommand(target, method, params),
-    { forgetTab: (tabId) => this.windows?.forgetTab?.(tabId) },
-  );
-  consumeRendering(source: KernelTarget, method: string, value: unknown) {
-    return this.rendering.consume(
+  consumeRendering = (source: KernelTarget, method: string, value: unknown) =>
+    this.rendering.consume(
       source,
       method,
       value,
@@ -102,59 +169,26 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         this.owned.has(source.tabId) &&
         this.attached.has(source.tabId),
     );
-  }
   forgetRendering(tabId?: number): void {
     this.exposedWindow = undefined;
     if (tabId === undefined) {
       this.presentation = undefined;
       this.rendering.forgetAll();
     } else {
-      if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+      this.clearTabPresentation(tabId);
       this.rendering.forget(tabId);
     }
   }
   async releaseRendering(tabId?: number, timeoutMs = 2_500): Promise<boolean> {
     this.exposedWindow = undefined;
-    this.presentation = undefined; // Revoke recovery synchronously, including an in-flight check.
+    this.presentation = undefined;
     const stopped = await this.rendering.release(tabId, timeoutMs);
-    if (this.presenting) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const completed = await Promise.race([
-          this.presenting.then(() => true),
-          new Promise<false>((resolve) => {
-            timer = setTimeout(() => resolve(false), timeoutMs);
-          }),
-        ]);
-        if (!completed) return false;
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    }
-    return stopped;
+    return !this.presenting
+      ? stopped
+      : (await withBoundedWait(this.presenting, timeoutMs)).completed && stopped;
   }
-  private presentation?: {
-    proof: TabProof;
-    checkedAt: number;
-    inactiveSince?: number;
-    visibility?: string;
-    visibilityAt?: number;
-    probe?: Promise<void>;
-    diagnostic?: string;
-    reportedAt?: number;
-  };
-  private recoverPresentation?: (
-    proof: TabProof,
-    positionOnly?: boolean,
-  ) => Promise<PresentationRecoveryDecision>;
-  private presentationObserver?: (proof: TabProof, state: KernelJsonObject) => void;
   setPresentationObserver(observer: (proof: TabProof, state: KernelJsonObject) => void) {
     this.presentationObserver = observer;
-  }
-  private reportPresentation(proof: TabProof, state: KernelJsonObject) {
-    try {
-      this.presentationObserver?.(proof, state);
-    } catch {}
   }
   setPresentationRecoveryGate(
     gate: (proof: TabProof, positionOnly?: boolean) => Promise<PresentationRecoveryDecision>,
@@ -162,359 +196,55 @@ export class ChromeKernelBackend implements KernelNativeBackend {
     this.recoverPresentation = gate;
     void this.recoverPresentation;
   }
-  async armTaskPresentation(proof: TabProof) {
-    const owned = this.owned.get(proof.tabId);
-    if (!owned) throw Error('TASK_PRESENTATION_SCOPE_REJECTED');
-    const guard = () => {
-      if (
-        this.access !== 'facebook-task' ||
-        !this.allowRead() ||
-        !this.journal.writable ||
-        !owned ||
-        this.owned.get(proof.tabId) !== owned ||
-        !sameTabProof(owned, proof) ||
-        this.attached.get(proof.tabId) !== proof.targetId
-      )
-        throw Error('TASK_PRESENTATION_SCOPE_REJECTED');
-    };
-    guard();
-    await this.scope(proof.tabId);
-    guard();
-    if (
-      typeof chrome !== 'undefined' &&
-      typeof chrome.tabs?.get === 'function' &&
-      typeof chrome.windows?.get === 'function'
-    ) {
-      const tab = await chrome.tabs.get(proof.tabId).catch(() => null);
-      guard();
-      if (tab && tab.windowId !== undefined) {
-        const win = await chrome.windows.get(tab.windowId).catch(() => null);
-        guard();
-        if (win?.state === 'minimized') {
-          await chrome.windows
-            .update(tab.windowId, { state: 'normal', focused: false })
-            .catch(() => {});
-          guard();
-        }
-        if (tab.active === false) {
-          await chrome.tabs.update(proof.tabId, { active: true }).catch(() => {});
-          guard();
-        }
-      }
-    }
-    await this.rendering.ensure(proof.tabId, owned.targetId, guard).catch(() => {});
-    guard();
-    this.presentation = { proof: owned, checkedAt: -Infinity };
-    this.reportPresentation(owned, { phase: 'ARMED' });
-  }
-  private presenting?: Promise<void>;
-  maintainPresentation() {
-    const presentation = this.presentation;
-    if (this.access !== 'facebook-task' || !presentation || this.presenting) return;
-    const at = this.presentationNow();
-    if (at - presentation.checkedAt < 8_000) return;
-    presentation.checkedAt = at;
-    const { proof } = presentation;
-    const tabId = proof.tabId;
-    const pending = (async () => {
-      const guard = () => {
-        if (
-          this.presentation !== presentation ||
-          this.owned.get(tabId) !== proof ||
-          this.attached.get(tabId) !== proof.targetId ||
-          !this.allowRead() ||
-          !this.journal.writable
-        )
-          throw Error('KERNEL_PRESENTATION_REVOKED');
-      };
-      guard();
-      const tab = await chrome.tabs.get(tabId);
-      guard();
-      let observedUrl = tab.url ?? '';
-      if (!observedUrl && typeof chrome.debugger?.getTargets === 'function') {
-        observedUrl =
-          (await chrome.debugger.getTargets().catch(() => [])).find((row) => row.tabId === tabId)
-            ?.url ?? '';
-        guard();
-      }
-      if (observedUrl === '' || observedUrl === 'about:blank') return;
-      if (!kernelAccessURL(observedUrl, 'facebook-task'))
-        throw Error('KERNEL_PRESENTATION_URL_CHANGED');
-      const window = await chrome.windows.get(tab.windowId);
-      guard();
-      if (window.state === 'minimized') {
-        await chrome.windows.update(tab.windowId, { state: 'normal', focused: false });
-        guard();
-      }
-      if (!tab.active) {
-        await chrome.tabs.update(tabId, { active: true });
-        guard();
-      }
-      // Renderer/CDP can itself be suspended by occlusion. Its probe must never
-      // block browser-process window recovery or the next watchdog tick.
-      if (!presentation.probe) {
-        const probe = (async () => {
-          await this.rendering.ensure(tabId, proof.targetId, guard);
-          guard();
-          const value = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-            expression: 'document.visibilityState',
-            returnByValue: true,
-          });
-          guard();
-          const result = KernelJsonObject.parse(value ?? {});
-          const resultValue = result.result;
-          const visibility =
-            resultValue && typeof resultValue === 'object' && !Array.isArray(resultValue)
-              ? (resultValue as Record<string, unknown>).value
-              : undefined;
-          if (visibility !== 'hidden' && visibility !== 'visible')
-            throw Error('TASK_PRESENTATION_VISIBILITY_UNAVAILABLE');
-          presentation.visibility = visibility;
-          presentation.visibilityAt = Date.now();
-          if (visibility === 'hidden') {
-            await this.rendering.refresh(tabId, proof.targetId, guard);
-            guard();
-          }
-        })();
-        presentation.probe = probe;
-        void probe
-          .catch((error: unknown) => {
-            if (this.presentation === presentation && this.allowRead())
-              this.reportPresentation(proof, {
-                phase: 'PROBE_ERROR',
-                reason: String(error).slice(0, 200),
-              });
-          })
-          .finally(() => {
-            if (presentation.probe === probe) presentation.probe = undefined;
-          });
-      }
-      if (window.focused === false) presentation.inactiveSince ??= at;
-      else presentation.inactiveSince = undefined;
-      const state = {
-        phase: 'CHECK',
-        windowFocused: window.focused ?? null,
-        visibility: presentation.visibility ?? null,
-        ...(presentation.visibilityAt !== undefined
-          ? { visibilityAt: presentation.visibilityAt }
-          : {}),
-        probePending: !!presentation.probe,
-      };
-      const diagnostic = JSON.stringify(state);
-      if (presentation.diagnostic !== diagnostic) {
-        presentation.diagnostic = diagnostic;
-        presentation.reportedAt = at;
-        this.reportPresentation(proof, state);
-      }
-      const hidden =
-        presentation.visibility === 'hidden' &&
-        presentation.visibilityAt !== undefined &&
-        Date.now() - presentation.visibilityAt <= 5000;
-      if (hidden) {
-        await this.rendering.refresh(tabId, proof.targetId, guard).catch(() => {});
-        guard();
-      }
-      return;
-    })();
-    this.presenting = pending;
-    void pending
-      .catch((error: unknown) => {
-        if (this.presentation === presentation && this.allowRead())
-          this.reportPresentation(proof, {
-            phase: 'MONITOR_ERROR',
-            reason: String(error).slice(0, 200),
-          });
-      })
-      .finally(() => {
-        if (this.presenting === pending) this.presenting = undefined;
-      });
-  }
-  private readonly workspaceGroup = new WorkspacePageGroup();
-  private readonly owned = new Map<number, TabProof>();
-  private readonly attached = new Map<number, string>();
-  private readonly expectedDetaches = new Set<number>();
-  private readonly expectedRemovals = new Set<number>();
-  private readonly identityReadTabs = new Set<number>();
-  private readonly removingUntil = new Map<number, number>();
-  private readonly removalDialogs = new Set<number>();
-  private identityReadPending = false;
   private async sameProfileForeground(): Promise<boolean> {
     if (!this.allowRead() || typeof chrome.windows.getAll !== 'function') return false;
-    const startedAt = Date.now();
-    const windows = await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] });
-    return (
-      this.allowRead() && Date.now() - startedAt <= 1500 && windows.some((window) => window.focused)
-    );
+    const startedAt = Date.now(),
+      windows = await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] });
+    return this.allowRead() && Date.now() - startedAt <= 1500 && windows.some((w) => w.focused);
   }
-  constructor(
-    private readonly journal: KernelJournal = kernelJournal,
-    private readonly allowInput: () => boolean = () => false,
-    private readonly access: KernelAccess = 'fixture',
-    private readonly allowRead: () => boolean = () => false,
-    private readonly currentOperation: () => Binding | undefined = () => undefined,
-    private readonly presentationNow: () => number = performance.now.bind(performance),
-    private readonly windows?: { forgetTab?(tabId: number): void },
-  ) {}
-  async inventory(): Promise<unknown> {
-    let currentRev = this.journal.currentRevision;
-    const before = await this.journal.snapshot();
-    currentRev = this.journal.currentRevision;
-    let mutated = false;
-    if (
-      this.allowRead() &&
-      !before.operations.some((row) => row.state !== 'RECONCILED' && !row.disposition)
-    ) {
-      const withdrawn = before.tabs.filter(
-        (row) =>
-          row.state === 'LOST' &&
-          ['TASK_ENDED_OWNERSHIP_WITHDRAWN', 'BROWSER_SESSION_CHANGED'].includes(row.reason),
-      );
-      if (withdrawn.length && chrome.storage?.local) {
-        const main = await this.workspaceGroup.read(() => {
-          if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-        });
-        const original = withdrawn.find(
-          (row) => main && row.proof && sameTabProof(main.proof, row.proof),
-        );
-        if (main && original?.proof) {
-          const target = (await chrome.debugger.getTargets()).find(
-            (row) => row.tabId === original.proof?.tabId && row.id === original.proof?.targetId,
-          );
-          if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-          if (target?.type === 'page' && kernelAccessURL(target.url, 'facebook-task')) {
-            if (
-              original.reason === 'TASK_ENDED_OWNERSHIP_WITHDRAWN' &&
-              original.proof.browserSessionEpoch === before.browserSessionEpoch
-            ) {
-              await this.journal.restoreWithdrawnTab(original.proof);
-              mutated = true;
-            } else if (
-              original.reason === 'BROWSER_SESSION_CHANGED' &&
-              original.proof.profileId === before.profileId
-            ) {
-              const known = before.tabs.find(
-                (row) =>
-                  row.state === 'READY' &&
-                  row.proof?.tabId === original.proof?.tabId &&
-                  row.proof?.targetId === original.proof?.targetId,
-              )?.proof;
-              const proof =
-                known ??
-                OwnedTabProof.parse({
-                  ...original.proof,
-                  ownershipId: crypto.randomUUID(),
-                  browserSessionEpoch: before.browserSessionEpoch,
-                });
-              if (!known) {
-                await this.journal.reobserveMain(original.proof, proof, target.url);
-                mutated = true;
-              }
-              await this.workspaceGroup.rebind(original.proof, proof, () => {
-                if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-              });
-            }
-          }
-        }
-      }
-    }
-    const observed =
-      mutated || !this.journal.writable || this.journal.currentRevision !== currentRev
-        ? await this.journal.snapshot()
-        : before;
-    currentRev = this.journal.currentRevision;
-    const retained = observed.tabs.filter(
-      (row) =>
-        row.state === 'READY' &&
-        row.proof &&
-        row.proof.browserSessionEpoch === observed.browserSessionEpoch &&
-        !this.owned.has(row.proof.tabId),
-    );
-    if (!retained.length) return this.workspaceSnapshot(observed, currentRev);
-    if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    // Worker reload can miss onRemoved. Observe retained pages without adopting, attaching
-    // or closing them. Absence in both tab and target inventories confirms page lifecycle
-    // only; it never settles UNKNOWN input, confirms an old STOP or releases an account.
-    const [tabs, targets] = await Promise.all([
-      chrome.tabs.query({}),
-      chrome.debugger.getTargets(),
-    ]);
-    if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    const absent = retained.filter(
-      (row) =>
-        row.proof &&
-        !tabs.some((tab) => tab.id === row.proof?.tabId) &&
-        !targets.some(
-          (target) => target.tabId === row.proof?.tabId || target.id === row.proof?.targetId,
-        ),
-    );
-    if (!absent.length) return this.workspaceSnapshot(observed, currentRev);
-    const confirmedTabs = await chrome.tabs.query({});
-    if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    for (const row of absent) {
-      if (!confirmedTabs.some((tab) => tab.id === row.proof?.tabId))
-        await this.journal.tabState(row.ownershipId, 'CLOSED', 'RETAINED_TARGET_ABSENT');
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    }
-    return this.workspaceSnapshot(observed, currentRev);
+  armTaskPresentation(proof: TabProof) {
+    return armTaskPresentationHelper(this.cdpCtx(), proof);
   }
-  private async workspaceSnapshot(cachedState?: KernelState, cachedRevision?: number) {
-    // A cached snapshot is reusable only while the journal is still healthy and unchanged.
-    // Otherwise snapshot() re-reads, and rejects with KERNEL_JOURNAL_NOT_READY after a failure.
-    const stale = (revision: number) =>
-      !this.journal.writable || this.journal.currentRevision !== revision;
-    let state =
-      cachedState !== undefined && cachedRevision !== undefined && !stale(cachedRevision)
-        ? cachedState
-        : await this.journal.snapshot();
-    let stateRev = this.journal.currentRevision;
-    if (!chrome.storage?.local) {
-      if (stale(stateRev)) state = await this.journal.snapshot();
-      return state;
-    }
-    const main = await this.workspaceGroup.read(() => {
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    });
-    if (stale(stateRev)) {
-      state = await this.journal.snapshot();
-      stateRev = this.journal.currentRevision;
-    }
-    if (
-      !main ||
-      !state.tabs.some(
-        (row) => row.state === 'READY' && row.proof && sameTabProof(row.proof, main.proof),
-      )
-    )
-      return state;
-    const target = (await chrome.debugger.getTargets()).find(
-      (row) => row.tabId === main.proof.tabId && row.id === main.proof.targetId,
-    );
-    if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    if (stale(stateRev)) {
-      state = await this.journal.snapshot();
-      stateRev = this.journal.currentRevision;
-      if (
-        !state.tabs.some(
-          (row) => row.state === 'READY' && row.proof && sameTabProof(row.proof, main.proof),
-        )
-      )
-        return state;
-    }
-    return target?.type === 'page' && kernelAccessURL(target.url, 'facebook-task')
-      ? { ...state, workspaceMain: main.proof }
-      : state;
+  maintainPresentation() {
+    return maintainPresentationHelper(this.cdpCtx());
+  }
+  inventory(): Promise<unknown> {
+    return inspectWorkspaceInventory(this.cdpCtx());
+  }
+  revealOwnedPage(proof: TabProof, focus = true) {
+    return revealOwnedPageHelper(this.cdpCtx(), proof, focus);
+  }
+  consolidateWorkspace(preferActiveTab = true) {
+    return consolidateWorkspaceTabs(this.cdpCtx(), preferActiveTab);
+  }
+  recoverTabToHome(input: TabProof) {
+    return recoverOwnedTabToHome(this.cdpCtx(), input);
+  }
+  attach(tabId: number) {
+    return attachDebuggerTarget(this.cdpCtx(), tabId);
+  }
+  detach(tabId: number, timeoutMs = 3_000) {
+    return detachDebuggerTarget(this.cdpCtx(), tabId, timeoutMs);
+  }
+  closingDialog(source: KernelTarget, method: string, value: unknown) {
+    return handleClosingDialog(this.cdpCtx(), source, method, value);
+  }
+  send(target: KernelTarget, method: string, params: KernelJsonObject) {
+    return sendCdpCommand(this.cdpCtx(), target, method, params);
+  }
+  project(tabId: number, input: PageProjectionRequest) {
+    return projectTabPage(this.cdpCtx(), tabId, input);
+  }
+  observeIdentity(tabId: number, assertCurrent: () => void) {
+    return observeTabIdentity(this.cdpCtx(), tabId, assertCurrent);
   }
   async adopt(input: TabProof): Promise<void> {
-    const proof = OwnedTabProof.parse(input);
-    const state = await this.journal.snapshot();
-    const record = state.tabs.find((row) => row.ownershipId === proof.ownershipId);
-    if (
-      record?.state !== 'READY' ||
-      !record.proof ||
-      !sameTabProof(record.proof, proof) ||
-      proof.browserSessionEpoch !== state.browserSessionEpoch
-    )
+    const proof = OwnedTabProof.parse(input),
+      state = await this.journal.snapshot(),
+      record = state.tabs.find((r) => r.ownershipId === proof.ownershipId);
+    if (!isReadyTabRecord(record, proof, state.browserSessionEpoch))
       throw Error('KERNEL_TAB_ADOPTION_REJECTED');
-    const target = (await chrome.debugger.getTargets()).find((row) => row.tabId === proof.tabId);
+    const target = (await chrome.debugger.getTargets()).find((r) => r.tabId === proof.tabId);
     if (!target || target.type !== 'page' || target.id !== proof.targetId)
       throw Error('KERNEL_TAB_IDENTITY_CHANGED');
     if (!kernelAccessURL(target.url, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
@@ -526,9 +256,6 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   }
   async scope(tabId: number): Promise<void> {
     const target = await this.ownedTarget(tabId);
-    // A new native target may temporarily report its initial blank document
-    // during navigation. It still grants no command scope. Only the software's
-    // fixed initial-document reader may wait on this explicit pending result.
     if (
       (this.access === 'facebook-task' || this.access === 'facebook-readonly') &&
       ['about:blank', ''].includes(target.url)
@@ -538,294 +265,24 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       this.access === 'agent-browser' && target.url === '' ? 'about:blank' : target.url;
     if (!kernelAccessURL(urlToCheck, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
   }
-  async revealOwnedPage(
-    proof: TabProof,
-    focus = true,
-  ): Promise<{ tabId: number; focused: boolean }> {
-    proof = OwnedTabProof.parse(proof);
-    const check = () => {
-      const owned = this.owned.get(proof.tabId);
-      if (!this.allowRead() || !owned || !sameTabProof(owned, proof))
-        throw Error('WORKSPACE_REVEAL_REVOKED');
-    };
-    check();
-    await this.scope(proof.tabId);
-    check();
-    const tab = await chrome.tabs.get(proof.tabId);
-    check();
-    const window = await chrome.windows.get(tab.windowId);
-    check();
-    if (window.state === 'minimized') {
-      await chrome.windows.update(
-        tab.windowId,
-        focus ? { state: 'normal' } : { state: 'normal', focused: false },
-      );
-      check();
-    }
-    await chrome.tabs.update(proof.tabId, { active: true });
-    check();
-    if (!focus) {
-      if (this.attached.get(proof.tabId) === proof.targetId) {
-        await this.rendering.ensure(proof.tabId, proof.targetId, check).catch(() => {});
-        check();
-      }
-      const deadline = Date.now() + 1000;
-      let observedFocused = false;
-      while (true) {
-        const current = await chrome.tabs.get(proof.tabId);
-        check();
-        const observed = await chrome.windows.get(tab.windowId);
-        check();
-        observedFocused = Boolean(observed.focused);
-        if (current.windowId === tab.windowId && current.active) break;
-        if (Date.now() >= deadline) throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-        check();
-      }
-      await this.scope(proof.tabId);
-      check();
-      return { tabId: proof.tabId, focused: observedFocused };
-    }
-    // Explicit display command, not the automatic business foreground policy.
-    await chrome.windows.update(tab.windowId, { focused: true });
-    check();
-    const deadline = Date.now() + 1000;
-    while (true) {
-      const current = await chrome.tabs.get(proof.tabId);
-      check();
-      const observed = await chrome.windows.get(tab.windowId);
-      check();
-      if (current.windowId !== tab.windowId || !current.active)
-        throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
-      if (observed.focused) break;
-      if (Date.now() >= deadline) throw Error('WORKSPACE_REVEAL_UNCONFIRMED');
-      // Native focus acknowledgement can precede the OS focus event. Only read;
-      // another window choice or stop never causes a second focus request.
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      check();
-    }
-    await this.scope(proof.tabId);
-    check();
-    return { tabId: proof.tabId, focused: true };
-  }
-  async consolidateWorkspace(preferActiveTab = true): Promise<{
-    proof: TabProof;
-    url: string;
-    closedTabIds: number[];
-    remainingTabCount: number;
-  }> {
-    const check = () => {
-      if (this.access !== 'facebook-task' || !this.allowRead())
-        throw Error('WORKSPACE_CLEANUP_REVOKED');
-    };
-    check();
-    const state = await this.journal.snapshot();
-    check();
-    if (this.currentOperation()) throw Error('WORKSPACE_CLEANUP_OPERATION_ACTIVE');
-    for (const row of state.operations.filter(
-      (row) => row.state !== 'RECONCILED' && !row.disposition,
-    )) {
-      check();
-      if (row.state === 'DISPATCHING')
-        await this.journal.finish(row.binding, 'UNKNOWN', 'IDLE_WORKSPACE_CLEANUP');
-      await this.journal.endUnknown(row.binding, {
-        id: crypto.randomUUID(),
-        outcome: 'ENDED_UNKNOWN',
-        evidenceDigest: Array.from(
-          new Uint8Array(
-            await crypto.subtle.digest(
-              'SHA-256',
-              new TextEncoder().encode(
-                JSON.stringify({ reason: 'Idle workspace cleanup', binding: row.binding }),
-              ),
-            ),
-          ),
-          (x) => x.toString(16).padStart(2, '0'),
-        ).join(''),
-      });
-    }
-    const [windows, allTabs, initialTargets] = await Promise.all([
-      typeof chrome.windows?.getAll === 'function'
-        ? chrome.windows.getAll({ populate: true, windowTypes: ['normal'] })
-        : Promise.resolve([]),
-      chrome.tabs.query({}),
-      chrome.debugger.getTargets(),
-    ]);
-    check();
-    const isFbPage = (tabId: number | undefined, targets = initialTargets) => {
-      if (tabId === undefined) return undefined;
-      const target = targets.find((row) => row.tabId === tabId && row.type === 'page');
-      return target && kernelAccessURL(target.url, 'facebook-task') ? target : undefined;
-    };
-    const activeWindow = windows.find((w) => w.focused) ?? windows[0];
-    const activeTab =
-      activeWindow?.tabs?.find((t) => t.active && t.id !== undefined) ??
-      allTabs.find((t) => t.active && t.id !== undefined) ??
-      allTabs.find((t) => t.id !== undefined);
-    const registeredMain = chrome.storage?.local ? await this.workspaceGroup.read(check) : null;
-    check();
-    let chosenTabId: number | undefined;
-    let chosenTarget =
-      preferActiveTab && activeTab?.id !== undefined ? isFbPage(activeTab.id) : undefined;
-    if (chosenTarget && activeTab?.id !== undefined) {
-      chosenTabId = activeTab.id;
-    } else if (registeredMain && isFbPage(registeredMain.proof.tabId)) {
-      chosenTabId = registeredMain.proof.tabId;
-      chosenTarget = isFbPage(registeredMain.proof.tabId);
-    } else if (activeTab?.id !== undefined && isFbPage(activeTab.id)) {
-      chosenTabId = activeTab.id;
-      chosenTarget = isFbPage(activeTab.id);
-    } else {
-      const anyFb = allTabs.find((t) => isFbPage(t.id));
-      if (anyFb?.id !== undefined) {
-        chosenTabId = anyFb.id;
-        chosenTarget = isFbPage(anyFb.id);
-      }
-    }
-    if (chosenTabId === undefined || !chosenTarget) {
-      if (activeTab?.id !== undefined) {
-        chosenTabId = activeTab.id;
-        await chrome.tabs.update(chosenTabId, { url: 'https://www.facebook.com/', active: true });
-      } else {
-        const created = await chrome.tabs.create({
-          url: 'https://www.facebook.com/',
-          active: true,
-        });
-        if (created.id === undefined) throw Error('WORKSPACE_CLEANUP_CREATE_FAILED');
-        chosenTabId = created.id;
-      }
-      check();
-      for (let attempt = 0; attempt < 50 && !chosenTarget; attempt++) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 100));
-        check();
-        const targets = await chrome.debugger.getTargets();
-        chosenTarget = isFbPage(chosenTabId, targets);
-      }
-      if (!chosenTarget) throw Error('WORKSPACE_CLEANUP_TARGET_UNCONFIRMED');
-    }
-    const candidateProof = OwnedTabProof.parse({
-      ownershipId: crypto.randomUUID(),
-      profileId: state.profileId,
-      browserSessionEpoch: state.browserSessionEpoch,
-      tabId: chosenTabId,
-      targetId: chosenTarget.id,
-    });
-    const boundProof = await this.journal.bindWorkspaceMainTab(candidateProof, chosenTarget.url);
-    check();
-    this.owned.set(chosenTabId, boundProof);
-    if (chrome.storage?.local) {
-      await this.workspaceGroup.forceBindMain(boundProof, check);
-      check();
-    }
-    const currentTabs = await chrome.tabs.query({});
-    check();
-    const closedTabIds: number[] = [];
-    for (const tab of currentTabs) {
-      if (tab.id === undefined || tab.id === chosenTabId) continue;
-      const otherId = tab.id;
-      this.expectedDetaches.add(otherId);
-      this.expectedRemovals.add(otherId);
-      try {
-        if (this.attached.has(otherId)) {
-          await chrome.debugger.detach({ tabId: otherId }).catch(() => {});
-        }
-        await chrome.tabs.remove(otherId);
-        closedTabIds.push(otherId);
-      } catch {
-      } finally {
-        this.identityReadTabs.delete(otherId);
-        this.owned.delete(otherId);
-        this.attached.delete(otherId);
-        this.expectedRemovals.delete(otherId);
-      }
-    }
-    check();
-    await chrome.tabs.update(chosenTabId, { active: true });
-    check();
-    const remainingTabs = await chrome.tabs.query({});
-    check();
-    return {
-      proof: boundProof,
-      url: chosenTarget.url,
-      closedTabIds,
-      remainingTabCount: remainingTabs.length,
-    };
-  }
   async scopeForClose(tabId: number): Promise<void> {
     await this.ownedTarget(tabId);
     if (this.access !== 'fixture' && !this.allowRead())
       throw Error('KERNEL_READONLY_LEASE_REJECTED');
   }
+  private async markTabLost(tabId: number, proof: TabProof): Promise<void> {
+    this.owned.delete(tabId);
+    await this.journal.tabState(proof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
+  }
   private async ownedTarget(tabId: number) {
-    if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
     const proof = this.owned.get(tabId);
-    const target = (await chrome.debugger.getTargets()).find((row) => row.tabId === tabId);
-    if (!proof || !target || target.type !== 'page' || target.id !== proof.targetId) {
-      this.owned.delete(tabId);
-      if (proof) await this.journal.tabState(proof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
+    if (!proof) throw Error('KERNEL_TAB_NOT_OWNED');
+    const target = (await chrome.debugger.getTargets()).find((r) => r.tabId === tabId);
+    if (!target || target.type !== 'page' || target.id !== proof.targetId) {
+      await this.markTabLost(tabId, proof);
       throw Error('KERNEL_TAB_IDENTITY_CHANGED');
     }
     return target;
-  }
-  async attach(tabId: number) {
-    if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
-    await this.scope(tabId);
-    if (!this.attached.has(tabId)) {
-      this.expectedDetaches.delete(tabId);
-      try {
-        await chrome.debugger.attach({ tabId }, '1.3');
-      } catch (error) {
-        if (error instanceof Error && /Another debugger is already attached/i.test(error.message)) {
-          this.expectedDetaches.add(tabId);
-          await chrome.debugger.detach({ tabId }).catch(() => {});
-          this.expectedDetaches.delete(tabId);
-          await chrome.debugger.attach({ tabId }, '1.3');
-        } else {
-          throw error;
-        }
-      }
-      this.attached.set(tabId, '');
-    }
-    const result = KernelJsonObject.parse(
-      await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'),
-    );
-    const info = KernelTargetInfo.parse(result.targetInfo);
-    const attachedUrl =
-      this.access === 'agent-browser' && info.url === '' ? 'about:blank' : info.url;
-    if (
-      !kernelAccessURL(attachedUrl, this.access) ||
-      info.type !== 'page' ||
-      info.targetId !== this.owned.get(tabId)?.targetId
-    )
-      throw Error('KERNEL_SCOPE_CHANGED');
-    this.attached.set(tabId, info.targetId);
-    return info;
-  }
-  async detach(tabId: number, timeoutMs = 3_000): Promise<void> {
-    if (this.exposedWindow?.tabId === tabId) this.exposedWindow = undefined;
-    if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
-    this.rendering.forget(tabId);
-    if (!this.attached.has(tabId)) return;
-    if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
-    this.expectedDetaches.add(tabId);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        chrome.debugger.detach({ tabId }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error('DEBUGGER_DETACH_TIMEOUT')), timeoutMs);
-        }),
-      ]);
-      this.attached.delete(tabId);
-    } catch (error) {
-      if (isBenignDetachError(error)) {
-        this.attached.delete(tabId);
-        return;
-      }
-      throw error;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
   }
   async create(
     url: string,
@@ -834,29 +291,27 @@ export class ChromeKernelBackend implements KernelNativeBackend {
   ): Promise<{ tabId: number }> {
     if (!kernelAccessURL(url, this.access)) throw Error('KERNEL_URL_REJECTED');
     await this.journal.prepareTab(ownershipId, url);
-    let createdTabId: number | undefined;
-    let createAttempted = false;
-    try {
+    let createdTabId: number | undefined,
+      createAttempted = false;
+    const assertTaskRead = () => {
       if (this.access !== 'fixture' && !this.allowRead()) throw Error('KERNEL_READ_FENCED');
+    };
+    try {
+      assertTaskRead();
       if (this.access === 'facebook-task')
         foreground = foreground && (await this.sameProfileForeground());
-      if (this.access !== 'fixture' && !this.allowRead()) throw Error('KERNEL_READ_FENCED');
+      assertTaskRead();
       let targetWindowId: number | undefined;
       if (this.access === 'facebook-task' && chrome.storage?.local) {
-        const main = await this.workspaceGroup
-          .read(() => {
-            if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-          })
-          .catch(() => null);
-        if (main?.windowId !== undefined) {
-          if (typeof chrome.windows?.get === 'function') {
-            const win = await chrome.windows.get(main.windowId).catch(() => null);
-            if (win?.id === main.windowId) targetWindowId = main.windowId;
-          } else {
-            targetWindowId = main.windowId;
-          }
-        }
-        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+        const main = await this.workspaceGroup.read(assertTaskRead).catch(() => null);
+        if (main?.windowId !== undefined)
+          targetWindowId =
+            typeof chrome.windows?.get === 'function'
+              ? (await chrome.windows.get(main.windowId).catch(() => null))?.id === main.windowId
+                ? main.windowId
+                : undefined
+              : main.windowId;
+        assertTaskRead();
       }
       createAttempted = true;
       const tab = await chrome.tabs.create(
@@ -866,27 +321,23 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       );
       if (tab.id === undefined) throw Error('KERNEL_CREATE_FAILED');
       createdTabId = tab.id;
-      if (foreground && this.access === 'facebook-task') {
-        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-        if (await this.sameProfileForeground()) {
-          if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-          await chrome.windows.update(tab.windowId, { focused: true });
+      if (foreground && (this.access === 'facebook-task' || this.access === 'agent-browser')) {
+        assertTaskRead();
+        if (this.access === 'agent-browser' || (await this.sameProfileForeground())) {
+          assertTaskRead();
+          await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
         }
-        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      } else if (foreground && this.access === 'agent-browser') {
-        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-        if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
+        assertTaskRead();
       }
-      let target = (await chrome.debugger.getTargets()).find((row) => row.tabId === tab.id);
+      let target = (await chrome.debugger.getTargets()).find((r) => r.tabId === tab.id);
       if (this.access !== 'fixture') {
         for (
           let attempt = 0;
           attempt < 50 && (!target || target.url === 'about:blank' || target.url === '');
           attempt++
         ) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 100));
-          target = (await chrome.debugger.getTargets()).find((row) => row.tabId === tab.id);
+          await sleep(100);
+          target = (await chrome.debugger.getTargets()).find((r) => r.tabId === tab.id);
         }
         const createdUrl =
           this.access === 'agent-browser' && target?.url === ''
@@ -896,28 +347,24 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           throw Error('KERNEL_SCOPE_CHANGED');
       }
       if (!target || target.type !== 'page') throw Error('KERNEL_TARGET_IDENTITY_MISSING');
-      const state = await this.journal.snapshot();
-      const proof = OwnedTabProof.parse({
-        ownershipId,
-        profileId: state.profileId,
-        browserSessionEpoch: state.browserSessionEpoch,
-        tabId: tab.id,
-        targetId: target.id,
-      });
+      const state = await this.journal.snapshot(),
+        proof = OwnedTabProof.parse({
+          ownershipId,
+          profileId: state.profileId,
+          browserSessionEpoch: state.browserSessionEpoch,
+          tabId: tab.id,
+          targetId: target.id,
+        });
       await this.journal.confirmTab(proof);
       this.owned.set(tab.id, proof);
       if (this.access === 'facebook-task')
-        await this.workspaceGroup.registerCreated(proof, () => {
-          if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-        });
+        await this.workspaceGroup.registerCreated(proof, assertTaskRead);
       if (this.access === 'facebook-readonly' && url === 'https://www.facebook.com/')
         this.identityReadTabs.add(tab.id);
       return { tabId: tab.id };
     } catch (error) {
-      let cleanedUp = false;
-      if (!createAttempted) {
-        cleanedUp = true;
-      } else if (createdTabId !== undefined) {
+      let cleanedUp = !createAttempted;
+      if (createAttempted && createdTabId !== undefined) {
         this.owned.delete(createdTabId);
         this.identityReadTabs.delete(createdTabId);
         this.expectedDetaches.add(createdTabId);
@@ -936,16 +383,13 @@ export class ChromeKernelBackend implements KernelNativeBackend {
           this.expectedRemovals.delete(createdTabId);
         }
       }
+      const reason = cleanedUp
+        ? createAttempted
+          ? 'CREATE_ABORTED_CLEANED'
+          : 'CREATE_ABORTED_BEFORE_OPEN'
+        : 'CREATE_RESULT_UNKNOWN';
       await this.journal
-        .tabState(
-          ownershipId,
-          cleanedUp ? 'CLOSED' : 'UNKNOWN',
-          cleanedUp
-            ? createAttempted
-              ? 'CREATE_ABORTED_CLEANED'
-              : 'CREATE_ABORTED_BEFORE_OPEN'
-            : 'CREATE_RESULT_UNKNOWN',
-        )
+        .tabState(ownershipId, cleanedUp ? 'CLOSED' : 'UNKNOWN', reason)
         .catch(() => {});
       throw error;
     }
@@ -960,12 +404,7 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       assertReadable();
     };
     const cleanupClosed = async (expectedProof: TabProof) => {
-      if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
-      this.rendering.forget(tabId);
-      this.identityReadTabs.delete(tabId);
-      this.owned.delete(tabId);
-      this.attached.delete(tabId);
-      this.expectedDetaches.delete(tabId);
+      this.forgetTab(tabId, true);
       await this.journal.tabState(expectedProof.ownershipId, 'CLOSED', 'CLOSED_BY_EXECUTOR');
     };
     const confirmDisappeared = async (
@@ -979,54 +418,34 @@ export class ChromeKernelBackend implements KernelNativeBackend {
         chrome.tabs.query({}),
       ]);
       assertRemovable();
-      const stillInTargets = freshTargets.some(
-        (row) => row.tabId === tabId || row.id === expectedProof.targetId,
-      );
-      const stillInTabs = freshTabs.some((tab) => tab.id === tabId);
-      if (!stillInTargets && !stillInTabs) {
-        await cleanupClosed(expectedProof);
-        return;
-      }
-      if (markLostOnPresent) {
-        this.owned.delete(tabId);
-        await this.journal.tabState(expectedProof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
-      }
+      if (
+        !freshTargets.some((r) => r.tabId === tabId || r.id === expectedProof.targetId) &&
+        !freshTabs.some((t) => t.id === tabId)
+      )
+        return cleanupClosed(expectedProof);
+      if (markLostOnPresent) await this.markTabLost(tabId, expectedProof);
       throw fallbackError instanceof Error ? fallbackError : Error(String(fallbackError));
     };
-
     assertReadable();
     const proof = this.owned.get(tabId);
     if (!proof) {
-      const snapshot = await this.journal.snapshot();
-      let latestClosedProof: TabProof | null = null;
-      for (let index = snapshot.tabs.length - 1; index >= 0; index--) {
-        const row = snapshot.tabs[index];
-        if (
-          row?.proof &&
-          row.proof.browserSessionEpoch === snapshot.browserSessionEpoch &&
-          row.proof.tabId === tabId
-        ) {
-          if (row.state === 'CLOSED') {
-            latestClosedProof = row.proof;
-          }
-          break;
-        }
-      }
-      if (!latestClosedProof) throw Error('KERNEL_TAB_NOT_OWNED');
-      return await confirmDisappeared(latestClosedProof, Error('KERNEL_TAB_NOT_OWNED'));
+      const snapshot = await this.journal.snapshot(),
+        latest = [...snapshot.tabs]
+          .reverse()
+          .find(
+            (r) =>
+              r.proof?.browserSessionEpoch === snapshot.browserSessionEpoch &&
+              r.proof.tabId === tabId,
+          );
+      if (latest?.state !== 'CLOSED' || !latest.proof) throw Error('KERNEL_TAB_NOT_OWNED');
+      return confirmDisappeared(latest.proof, Error('KERNEL_TAB_NOT_OWNED'));
     }
-
-    const targets = await chrome.debugger.getTargets();
-    const target = targets.find((row) => row.tabId === tabId);
-    if (!target) {
-      return await confirmDisappeared(proof, Error('KERNEL_TAB_IDENTITY_CHANGED'), true);
-    }
+    const target = (await chrome.debugger.getTargets()).find((r) => r.tabId === tabId);
+    if (!target) return confirmDisappeared(proof, Error('KERNEL_TAB_IDENTITY_CHANGED'), true);
     if (target.type !== 'page' || target.id !== proof.targetId) {
-      this.owned.delete(tabId);
-      await this.journal.tabState(proof.ownershipId, 'LOST', 'TARGET_IDENTITY_CHANGED');
+      await this.markTabLost(tabId, proof);
       throw Error('KERNEL_TAB_IDENTITY_CHANGED');
     }
-    // STOP can arrive while the native target lookup is awaiting. Recheck immediately before close.
     assertReadable();
     this.expectedDetaches.add(tabId);
     this.expectedRemovals.add(tabId);
@@ -1036,10 +455,8 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       try {
         await chrome.tabs.remove(tabId);
       } catch (error) {
-        if (error instanceof Error && /No tab with id/i.test(error.message)) {
-          await confirmDisappeared(proof, error);
-          return;
-        }
+        if (error instanceof Error && /No tab with id/i.test(error.message))
+          return confirmDisappeared(proof, error);
         throw error;
       }
       await cleanupClosed(proof);
@@ -1049,266 +466,24 @@ export class ChromeKernelBackend implements KernelNativeBackend {
       this.removalDialogs.delete(tabId);
     }
   }
-  async closingDialog(source: KernelTarget, method: string, value: unknown): Promise<void> {
-    // A lifecycle-only completion of an already requested, owned-page close. The SDK's
-    // general dialog method still requires an original operation. Never accept confirm,
-    // prompt, alert, child-frame or unsolicited dialogs, and never change page content.
-    if (
-      (this.access !== 'facebook-task' && this.access !== 'agent-browser') ||
-      method !== 'Page.javascriptDialogOpening' ||
-      source.sessionId
-    )
-      return;
-    const params = KernelJsonObject.parse(value ?? {});
-    const proof = this.owned.get(source.tabId),
-      until = this.removingUntil.get(source.tabId);
-    if (
-      params.type !== 'beforeunload' ||
-      !proof ||
-      !until ||
-      Date.now() > until ||
-      !this.expectedRemovals.has(source.tabId) ||
-      !this.attached.has(source.tabId) ||
-      this.removalDialogs.has(source.tabId) ||
-      typeof params.url !== 'string' ||
-      !kernelAccessURL(params.url, this.access) ||
-      !this.allowRead()
-    )
-      return;
-    this.removalDialogs.add(source.tabId);
-    await this.scope(source.tabId);
-    if (
-      this.owned.get(source.tabId) !== proof ||
-      this.removingUntil.get(source.tabId) !== until ||
-      Date.now() > until ||
-      !this.allowRead()
-    )
-      throw Error('OWNED_CLOSE_DIALOG_REVOKED');
-    await chrome.debugger.sendCommand({ tabId: source.tabId }, 'Page.handleJavaScriptDialog', {
-      accept: true,
-    });
-  }
-  async send(
-    target: KernelTarget,
-    method: string,
-    params: KernelJsonObject,
-  ): Promise<KernelJsonObject> {
-    // Scope and lease were checked by KernelExecutor immediately before this call.
-    // An extra await here would create a gap in which STOP could be followed by a new input.
-    if (!this.owned.has(target.tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
-    if (!this.attached.has(target.tabId)) throw Error('KERNEL_NOT_ATTACHED');
-    if (this.access === 'facebook-readonly')
-      assertKernelSessionCommand(method, params, new Set(), this.access);
-    if (
-      (this.access === 'facebook-task' || this.access === 'agent-browser') &&
-      method !== 'DOM.setFileInputFiles'
-    )
-      assertKernelSessionCommand(method, params, new Set(), this.access);
-    if (this.access === 'agent-browser' && method === 'Page.bringToFront') {
-      if (target.sessionId) throw Error('KERNEL_MAIN_TAB_REQUIRED');
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      const tab = await chrome.tabs.get(target.tabId);
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      if (tab.windowId !== undefined) {
-        const win = await chrome.windows.get(tab.windowId).catch(() => null);
-        if (win?.state === 'minimized') {
-          await chrome.windows
-            .update(tab.windowId, { state: 'normal', focused: true })
-            .catch(() => {});
-        } else {
-          await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-        }
-      }
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      await chrome.tabs.update(target.tabId, { active: true });
-      return {};
-    }
-    if (this.access === 'agent-browser' && method === 'Page.captureScreenshot') {
-      if (target.sessionId) throw Error('KERNEL_MAIN_TAB_REQUIRED');
-      if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-      const tab = await chrome.tabs.get(target.tabId);
-      if (!this.allowRead() || !this.owned.has(target.tabId) || !this.attached.has(target.tabId))
-        throw Error('KERNEL_READ_FENCED');
-      let restoreTabId: number | null = null;
-      if (!tab.active && tab.windowId !== undefined) {
-        const activeTabs = await chrome.tabs
-          .query({ windowId: tab.windowId, active: true })
-          .catch(() => []);
-        const prevId = activeTabs[0]?.id;
-        if (typeof prevId === 'number' && prevId !== target.tabId) {
-          restoreTabId = prevId;
-        }
-      }
-      try {
-        if (tab.windowId !== undefined) {
-          const win = await chrome.windows.get(tab.windowId).catch(() => null);
-          if (win?.state === 'minimized') {
-            await chrome.windows
-              .update(tab.windowId, { state: 'normal', focused: false })
-              .catch(() => {});
-          }
-        }
-        if (!tab.active) {
-          await chrome.tabs.update(target.tabId, { active: true });
-        }
-        await chrome.debugger
-          .sendCommand(target, 'Emulation.setFocusEmulationEnabled', { enabled: true })
-          .catch(() => {});
-        await chrome.debugger
-          .sendCommand(target, 'Page.setWebLifecycleState', { state: 'active' })
-          .catch(() => {});
-        if (!this.allowRead() || !this.owned.has(target.tabId) || !this.attached.has(target.tabId))
-          throw Error('KERNEL_READ_FENCED');
-        return KernelJsonObject.parse(
-          (await chrome.debugger.sendCommand(target, method, params)) ?? {},
-        );
-      } finally {
-        if (restoreTabId !== null) {
-          await chrome.tabs.update(restoreTabId, { active: true }).catch(() => {});
-        }
-      }
-    }
-    if (
-      kernelRequiresOperation(method, this.access) &&
-      (!this.journal.writable || !this.allowInput())
-    )
-      throw Error('KERNEL_OPERATION_REQUIRED');
-    if (
-      method === 'Target.getTargetInfo' &&
-      params.targetId !== undefined &&
-      params.targetId !== this.attached.get(target.tabId)
-    )
-      throw Error('KERNEL_TARGET_NOT_OWNED');
-    if (this.access === 'facebook-task' && method === 'Page.bringToFront') {
-      if (target.sessionId) throw Error('KERNEL_MAIN_TAB_REQUIRED');
-      const proof = this.owned.get(target.tabId);
-      const operation = this.currentOperation();
-      const guard = () => {
-        if (
-          !proof ||
-          this.owned.get(target.tabId) !== proof ||
-          !this.attached.has(target.tabId) ||
-          !this.journal.writable ||
-          !this.allowInput() ||
-          this.currentOperation() !== operation
-        )
-          throw Error('KERNEL_ACTIVATION_REVOKED');
-      };
-      guard();
-      const focusWindow =
-        operation !== undefined &&
-        operation.actionDigest ===
-          (await digestAction({ kind: 'activateTab', tabId: target.tabId }));
-      guard();
-      const tab = await chrome.tabs.get(target.tabId);
-      guard();
-      const window = await chrome.windows.get(tab.windowId);
-      guard();
-      const mayFocus = focusWindow && (await this.sameProfileForeground());
-      guard();
-      // Selecting a tab and restoring its containing window are different operations.
-      // CDP bringToFront alone can acknowledge a page in a minimized window as still hidden.
-      // Preserve normal/maximized geometry; restore only the original tab's minimized window.
-      if (window.state === 'minimized' && operation) {
-        await chrome.windows.update(tab.windowId, { state: 'normal', focused: false });
-        guard();
-      }
-      await chrome.tabs.update(target.tabId, { active: true });
-      guard();
-      if (operation) {
-        // Preparation only: the following actual Input still passes its original fresh
-        // target/identity guard. No new await is inserted immediately before an Input.
-        await this.rendering.ensure(target.tabId, proof!.targetId, guard);
-        guard();
-        if (this.presentation?.proof !== proof)
-          this.presentation = { proof: proof!, checkedAt: -Infinity };
-      }
-      // Only the original explicit activation grants window focus. Routine wheel/click
-      // preparation keeps the selected task tab without repeatedly taking OS focus.
-      if (mayFocus && !this.isExposed(proof!) && (await this.sameProfileForeground())) {
-        guard();
-        await chrome.windows.update(tab.windowId, { focused: true });
-        guard();
-      }
-      return {};
-    }
-    return KernelJsonObject.parse(
-      (await chrome.debugger.sendCommand(target, method, params)) ?? {},
-    );
-  }
-  async project(tabId: number, input: PageProjectionRequest) {
-    if (this.access !== 'facebook-readonly') throw Error('KERNEL_PROJECTION_UNAVAILABLE');
-    const request = PageReadRequest.parse(input);
-    await this.scope(tabId);
-    if (!this.allowRead() || !this.attached.has(tabId)) throw Error('KERNEL_READ_FENCED');
-    const reply = KernelJsonObject.parse(
-      await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-        expression: pageProjectionExpression(request),
-        returnByValue: true,
-      }),
-    );
-    if (!this.allowRead()) throw Error('KERNEL_READ_FENCED');
-    if (reply.exceptionDetails) throw Error('KERNEL_PROJECTION_FAILED');
-    const value = KernelJsonObject.parse(reply.result).value;
-    const result = validateProjection(request, value);
-    if (!kernelAccessURL(result.url, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
-    return result;
-  }
-  async observeIdentity(tabId: number, assertCurrent: () => void) {
-    if (
-      this.access !== 'facebook-readonly' ||
-      !this.identityReadTabs.has(tabId) ||
-      this.identityReadPending ||
-      !this.attached.has(tabId)
-    )
-      throw Error('KERNEL_IDENTITY_TAB_REJECTED');
-    this.identityReadPending = true;
-    // Single-use read on the new inspection page; retry creates no reload on a retained tab.
-    this.identityReadTabs.delete(tabId);
-    const guard = async () => {
-      assertCurrent();
-      if (!this.allowRead()) throw Error('KERNEL_IDENTITY_READ_REVOKED');
-      await this.scope(tabId);
-      assertCurrent();
-      if (!this.allowRead()) throw Error('KERNEL_IDENTITY_READ_REVOKED');
-      // tabs.Tab.url is absent without tabs/FB host permission. The existing debugger
-      // permission exposes the attached target instead; keep the same exact proof and route.
-      const target = KernelTargetInfo.parse(
-        KernelJsonObject.parse(await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'))
-          .targetInfo,
-      );
-      assertCurrent();
-      if (
-        !this.allowRead() ||
-        target.type !== 'page' ||
-        target.targetId !== this.owned.get(tabId)?.targetId ||
-        target.url !== 'https://www.facebook.com/'
-      )
-        throw Error('KERNEL_IDENTITY_HOME_REQUIRED');
-    };
-    try {
-      return await readNativeFacebookIdentity(tabId, guard);
-    } finally {
-      this.identityReadPending = false;
-    }
-  }
-  owns(tabId: number): boolean {
-    return this.owned.has(tabId);
-  }
-  detached(tabId: number): void {
-    if (this.presentation?.proof.tabId === tabId) this.presentation = undefined;
+  private forgetTab(tabId: number, full = false): void {
+    this.clearTabPresentation(tabId);
     this.rendering.forget(tabId);
     this.attached.delete(tabId);
+    if (full) {
+      this.identityReadTabs.delete(tabId);
+      this.owned.delete(tabId);
+      this.expectedDetaches.delete(tabId);
+    }
   }
-  expectedDetach(tabId: number): boolean {
-    return this.expectedDetaches.delete(tabId);
+  owns = (tabId: number) => this.owned.has(tabId);
+  detached(tabId: number): void {
+    this.forgetTab(tabId);
   }
-  isExpectedDetach(tabId: number): boolean {
-    return this.expectedDetaches.has(tabId) || this.expectedRemovals.has(tabId);
-  }
-  expectedRemoval(tabId: number): boolean {
-    return this.expectedRemovals.has(tabId);
-  }
+  expectedDetach = (tabId: number) => this.expectedDetaches.delete(tabId);
+  isExpectedDetach = (tabId: number) =>
+    this.expectedDetaches.has(tabId) || this.expectedRemovals.has(tabId);
+  expectedRemoval = (tabId: number) => this.expectedRemovals.has(tabId);
   tabRemoved(tabId: number): void {
     this.identityReadTabs.delete(tabId);
     const proof = this.owned.get(tabId);

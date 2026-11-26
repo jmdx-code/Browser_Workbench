@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ProfileHeartbeat } from '../src/application/profile-heartbeat.js';
+import { ProfileHeartbeat } from '../src/application/kernel-gates.js';
 
 test('slow window observation cannot hold transport PONG or create overlapping window queries', async () => {
   const messages: unknown[] = [];

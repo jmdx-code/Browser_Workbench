@@ -8,7 +8,7 @@ import type {
   TaskCommand,
 } from '../shared/task-contracts.js';
 
-export function useTasks() {
+export function useTasks(sseConnected = false) {
   const [capabilities, setCapabilities] = useState<z.infer<typeof TaskCapabilities> | null>(null);
   const [runtime, setRuntime] = useState<z.infer<typeof TaskRuntimeOverview> | null>(null);
   const [revision, setRevision] = useState(0);
@@ -19,6 +19,7 @@ export function useTasks() {
   const lastCapsSig = useRef<string | null>(null);
   const lastRuntimeSig = useRef<string | null>(null);
   const pendingStart = useRef<{ key: string; input: Assignment } | null>(null);
+  const loadRef = useRef<(() => Promise<void>) | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     let pending = false;
@@ -71,16 +72,18 @@ export function useTasks() {
         pending = false;
       }
     };
+    loadRef.current = load;
     void load();
-    const timer = setInterval(() => void load(), 2000);
+    const timer = setInterval(() => void load(), sseConnected ? 25_000 : 2000);
     const visible = () => void load();
     document.addEventListener('visibilitychange', visible);
     return () => {
       controller.abort();
+      if (loadRef.current === load) loadRef.current = null;
       clearInterval(timer);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, [revision]);
+  }, [revision, sseConnected]);
   const start = async (input: Omit<Assignment, 'requestId'>) => {
     const key = JSON.stringify(input);
     const attempt =
@@ -91,7 +94,6 @@ export function useTasks() {
             input: { ...input, requestId: crypto.randomUUID() },
           };
     pendingStart.current = attempt;
-    // Keep the original request ID on reply loss; retrying the button cannot create a second batch.
     const result = await api.startTasks(attempt.input);
     pendingStart.current = null;
     setRevision((value) => value + 1);
@@ -111,5 +113,8 @@ export function useTasks() {
     start,
     command,
     refresh: () => setRevision((value) => value + 1),
+    nudge: () => {
+      void loadRef.current?.();
+    },
   };
 }

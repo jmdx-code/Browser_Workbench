@@ -8,50 +8,60 @@ import type {
   SheetImageHostPort,
   SheetImageHostTestResult,
 } from '../application/google-sheets-ports.js';
-
 const DRIVE_FOLDER_NAME = 'BrowserWorkbench_Images';
-
-// Minimal 1x1 valid PNG bytes for image-host connectivity test
 const TEST_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-
-function parseDataUrl(dataUrl: string): { bytes: Buffer; mimeType: string; ext: string } | null {
+const MIME_TO_EXT: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+function parseDataUrl(dataUrl: string): Buffer | null {
   const m = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/i.exec(
     dataUrl.trim(),
   );
-  if (!m?.[1] || !m[2]) return null;
-  const mimeType = m[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : m[1].toLowerCase();
-  const ext =
-    mimeType === 'image/png'
-      ? 'png'
-      : mimeType === 'image/webp'
-        ? 'webp'
-        : mimeType === 'image/gif'
-          ? 'gif'
-          : 'jpg';
+  if (!m?.[2]) return null;
   const bytes = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
-  if (bytes.byteLength < 16) return null;
-  return { bytes, mimeType, ext };
+  return bytes.byteLength >= 16 ? bytes : null;
 }
-
+function detectImageMagic(buf: Buffer): { mimeType: string; ext: string } | null {
+  if (buf.byteLength < 12) return null;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+    return { mimeType: 'image/png', ext: 'png' };
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)
+    return { mimeType: 'image/jpeg', ext: 'jpg' };
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38)
+    return { mimeType: 'image/gif', ext: 'gif' };
+  if (
+    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buf.subarray(8, 12).toString('ascii') === 'WEBP'
+  )
+    return { mimeType: 'image/webp', ext: 'webp' };
+  return null;
+}
+const isPrivateHost = (h: string): boolean =>
+  h === 'localhost' ||
+  h === '127.0.0.1' ||
+  h === '::1' ||
+  h === '0.0.0.0' ||
+  h.endsWith('.local') ||
+  /^10\.|^192\.168\.|^169\.254\.|^172\.(?:1[6-9]|2\d|3[01])\./.test(h);
 export class SheetImageHostClient implements SheetImageHostPort {
   private driveFolderPromise: Promise<string> | null = null;
   private gyazoCursor = 0;
-
   constructor(
     private readonly repo: CompatibleRepository<GoogleSheetsRepositoryPort>,
     private readonly oauth: GoogleOAuthPort,
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
-
   async uploadDataUrlOrUrl(input: {
     source: string;
     filenameHint: string;
   }): Promise<{ remoteUrl: string; host: 'gyazo' | 'drive'; cached: boolean } | null> {
     const trimmed = input.source.trim();
     if (!trimmed) return null;
-
-    // Already a permanent hosted URL on Gyazo or Googleusercontent -> reuse directly
     if (/^https:\/\/(?:i\.gyazo\.com|lh3\.googleusercontent\.com)\//i.test(trimmed)) {
       return {
         remoteUrl: trimmed,
@@ -59,77 +69,23 @@ export class SheetImageHostClient implements SheetImageHostPort {
         cached: true,
       };
     }
-
-    let bytes: Buffer;
-    let mimeType = 'image/png';
-    let ext = 'png';
-
-    const detectImageMagic = (buf: Buffer): { mimeType: string; ext: string } | null => {
-      if (buf.byteLength < 12) return null;
-      if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
-        return { mimeType: 'image/png', ext: 'png' };
-      }
-      if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
-        return { mimeType: 'image/jpeg', ext: 'jpg' };
-      }
-      if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
-        return { mimeType: 'image/gif', ext: 'gif' };
-      }
-      if (
-        buf[0] === 0x52 &&
-        buf[1] === 0x49 &&
-        buf[2] === 0x46 &&
-        buf[3] === 0x46 &&
-        buf[8] === 0x57 &&
-        buf[9] === 0x45 &&
-        buf[10] === 0x42 &&
-        buf[11] === 0x50
-      ) {
-        return { mimeType: 'image/webp', ext: 'webp' };
-      }
-      return null;
-    };
-
-    const parsedData = parseDataUrl(trimmed);
-    if (parsedData) {
-      bytes = parsedData.bytes;
-      const magic = detectImageMagic(bytes);
-      if (!magic) return null;
-      mimeType = magic.mimeType;
-      ext = magic.ext;
-    } else if (/^https?:\/\//i.test(trimmed)) {
-      let parsedUrl: URL;
+    let bytes = parseDataUrl(trimmed);
+    if (!bytes) {
+      if (!/^https?:\/\//i.test(trimmed)) return null;
+      let host = '';
       try {
-        parsedUrl = new URL(trimmed);
+        host = new URL(trimmed).hostname.toLowerCase();
       } catch {
         return null;
       }
-      const host = parsedUrl.hostname.toLowerCase();
-      if (
-        host === 'localhost' ||
-        host === '127.0.0.1' ||
-        host === '::1' ||
-        host === '0.0.0.0' ||
-        host.endsWith('.local') ||
-        /^10\./.test(host) ||
-        /^192\.168\./.test(host) ||
-        /^169\.254\./.test(host) ||
-        /^172\.(?:1[6-9]|2\d|3[01])\./.test(host)
-      ) {
-        return null;
-      }
+      if (isPrivateHost(host)) return null;
       const resp = await this.fetchImpl(trimmed, { signal: AbortSignal.timeout(25_000) });
-      if (!resp.ok) {
-        await resp.body?.cancel().catch(() => {});
-        return null;
-      }
       const ct = resp.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() ?? '';
-      if (ct && !ct.startsWith('image/') && ct !== 'application/octet-stream') {
-        await resp.body?.cancel().catch(() => {});
-        return null;
-      }
-      const declaredLen = Number(resp.headers.get('content-length') ?? 0);
-      if (declaredLen > 8 * 1024 * 1024) {
+      if (
+        !resp.ok ||
+        (ct && !ct.startsWith('image/') && ct !== 'application/octet-stream') ||
+        Number(resp.headers.get('content-length') ?? 0) > 8 * 1024 * 1024
+      ) {
         await resp.body?.cancel().catch(() => {});
         return null;
       }
@@ -142,8 +98,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
             const { done, value } = await reader.read();
             if (done) break;
             const chunk = Buffer.from(value);
-            total += chunk.byteLength;
-            if (total > 8 * 1024 * 1024) {
+            if ((total += chunk.byteLength) > 8 * 1024 * 1024) {
               await reader.cancel().catch(() => {});
               return null;
             }
@@ -159,25 +114,20 @@ export class SheetImageHostClient implements SheetImageHostPort {
         bytes = Buffer.from(arr);
       }
       if (bytes.byteLength < 16) return null;
-      const magic = detectImageMagic(bytes);
-      if (!magic) return null;
-      mimeType = magic.mimeType;
-      ext = magic.ext;
-    } else {
-      return null;
     }
-
-    const uploaded = await this.uploadBytes(bytes, mimeType, `${input.filenameHint}.${ext}`);
-    return {
-      remoteUrl: uploaded.remoteUrl,
-      host: uploaded.host,
-      cached: uploaded.cached,
-    };
+    const magic = detectImageMagic(bytes);
+    if (!magic) return null;
+    const ext = MIME_TO_EXT[magic.mimeType] ?? magic.ext;
+    const uploaded = await this.uploadBytes(bytes, magic.mimeType, `${input.filenameHint}.${ext}`);
+    return { remoteUrl: uploaded.remoteUrl, host: uploaded.host, cached: uploaded.cached };
   }
-
   async testUpload(): Promise<SheetImageHostTestResult> {
-    const bytes = Buffer.from(TEST_PNG_BASE64, 'base64');
-    const res = await this.uploadBytes(bytes, 'image/png', `wb-test-${Date.now()}.png`, true);
+    const res = await this.uploadBytes(
+      Buffer.from(TEST_PNG_BASE64, 'base64'),
+      'image/png',
+      `wb-test-${Date.now()}.png`,
+      true,
+    );
     return {
       remoteUrl: res.remoteUrl,
       host: res.host,
@@ -186,21 +136,65 @@ export class SheetImageHostClient implements SheetImageHostPort {
       ...(res.fallbackFromGyazo ? { fallbackFromGyazo: true } : {}),
     };
   }
-
-  private computeContentHash(host: 'gyazo' | 'drive', bytes: Buffer): string {
-    return createHash('sha256').update(host).update(':').update(bytes).digest('hex');
-  }
-
+  private hashFor = (host: 'gyazo' | 'drive', bytes: Buffer) =>
+    createHash('sha256').update(host).update(':').update(bytes).digest('hex');
   private async canFallbackToDrive(): Promise<boolean> {
     if (typeof this.oauth.status !== 'function') return true;
     try {
-      const st = await this.oauth.status();
-      return Boolean(st.authorized);
+      return Boolean((await this.oauth.status()).authorized);
     } catch {
       return false;
     }
   }
-
+  private async saveCachedImage(
+    contentHash: string,
+    host: 'gyazo' | 'drive',
+    remoteUrl: string,
+    driveFileId: string | null,
+    mimeType: string,
+    byteSize: number,
+    bypassCache: boolean,
+  ) {
+    if (!bypassCache) {
+      await this.repo.saveImageCache({
+        contentHash,
+        host,
+        remoteUrl,
+        driveFileId,
+        mimeType,
+        byteSize,
+        createdAt: Date.now(),
+      });
+    }
+  }
+  private async cacheHit(contentHash: string, bypassCache: boolean) {
+    if (bypassCache) return null;
+    const hit = await this.repo.getImageCache(contentHash);
+    return hit?.remoteUrl ? hit : null;
+  }
+  private async saveAndReturnDrive(
+    bytes: Buffer,
+    mimeType: string,
+    filename: string,
+    bypassCache: boolean,
+    fallbackFromGyazo?: boolean,
+  ) {
+    const contentHash = this.hashFor('drive', bytes),
+      extra = fallbackFromGyazo ? { fallbackFromGyazo: true } : {},
+      hit = await this.cacheHit(contentHash, bypassCache);
+    if (hit) return { remoteUrl: hit.remoteUrl, host: 'drive' as const, cached: true, ...extra };
+    const uploaded = await this.uploadToGoogleDrive(bytes, mimeType, filename);
+    await this.saveCachedImage(
+      contentHash,
+      'drive',
+      uploaded.remoteUrl,
+      uploaded.fileId,
+      mimeType,
+      bytes.byteLength,
+      bypassCache,
+    );
+    return { remoteUrl: uploaded.remoteUrl, host: 'drive' as const, cached: false, ...extra };
+  }
   private async uploadBytes(
     bytes: Buffer,
     mimeType: string,
@@ -214,136 +208,74 @@ export class SheetImageHostClient implements SheetImageHostPort {
     tokenCount?: number;
     fallbackFromGyazo?: boolean;
   }> {
-    const config = await this.repo.getImageHostConfig();
-    const gyazoTokens = resolveEffectiveGyazoTokens(config);
-    const useGyazo =
+    const config = await this.repo.getImageHostConfig(),
+      gyazoTokens = resolveEffectiveGyazoTokens(config);
+    if (!(
       config.preferredHost === 'gyazo' ||
-      (config.preferredHost === 'auto' && gyazoTokens.length > 0);
-    const chosenHost: 'gyazo' | 'drive' = useGyazo ? 'gyazo' : 'drive';
-
-    const contentHash = this.computeContentHash(chosenHost, bytes);
-
-    if (!bypassCache) {
-      const hit = await this.repo.getImageCache(contentHash);
-      if (hit && hit.remoteUrl) {
-        return { remoteUrl: hit.remoteUrl, host: hit.host, cached: true };
-      }
-    }
-
-    if (chosenHost === 'gyazo') {
-      if (gyazoTokens.length === 0) {
-        throw new ProductError(
-          'GYAZO_TOKEN_MISSING',
-          '当前选择了 Gyazo 图床，但尚未填写 Gyazo Access Token（可改回「自动」以使用免配置的 Google 网盘兜底）',
-          400,
+      (config.preferredHost === 'auto' && gyazoTokens.length > 0)
+    ))
+      return this.saveAndReturnDrive(bytes, mimeType, filename, bypassCache);
+    const contentHash = this.hashFor('gyazo', bytes),
+      hit = await this.cacheHit(contentHash, bypassCache);
+    if (hit) return { remoteUrl: hit.remoteUrl, host: hit.host, cached: true };
+    if (gyazoTokens.length === 0)
+      throw new ProductError(
+        'GYAZO_TOKEN_MISSING',
+        '当前选择了 Gyazo 图床，但尚未填写 Gyazo Access Token（可改回「自动」以使用免配置的 Google 网盘兜底）',
+        400,
+      );
+    const startIdx = this.gyazoCursor % gyazoTokens.length;
+    const errors: string[] = [];
+    for (let offset = 0; offset < gyazoTokens.length; offset++) {
+      const idx = (startIdx + offset) % gyazoTokens.length;
+      const token = gyazoTokens[idx];
+      if (!token) continue;
+      try {
+        const remoteUrl = await this.uploadToGyazo(bytes, mimeType, filename, token);
+        this.gyazoCursor = (idx + 1) % gyazoTokens.length;
+        await this.saveCachedImage(
+          contentHash,
+          'gyazo',
+          remoteUrl,
+          null,
+          mimeType,
+          bytes.byteLength,
+          bypassCache,
+        );
+        return {
+          remoteUrl,
+          host: 'gyazo',
+          cached: false,
+          tokenIndex: idx,
+          tokenCount: gyazoTokens.length,
+        };
+      } catch (err) {
+        errors.push(
+          `#${idx + 1}(${maskGyazoToken(token) ?? '••••••'}): ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-
-      const startIdx = this.gyazoCursor % gyazoTokens.length;
-      const errors: string[] = [];
-
-      for (let offset = 0; offset < gyazoTokens.length; offset++) {
-        const idx = (startIdx + offset) % gyazoTokens.length;
-        const token = gyazoTokens[idx];
-        if (!token) continue;
-        try {
-          const remoteUrl = await this.uploadToGyazo(bytes, mimeType, filename, token);
-          this.gyazoCursor = (idx + 1) % gyazoTokens.length;
-          if (!bypassCache) {
-            await this.repo.saveImageCache({
-              contentHash,
-              host: 'gyazo',
-              remoteUrl,
-              driveFileId: null,
-              mimeType,
-              byteSize: bytes.byteLength,
-              createdAt: Date.now(),
-            });
-          }
-          return {
-            remoteUrl,
-            host: 'gyazo',
-            cached: false,
-            tokenIndex: idx,
-            tokenCount: gyazoTokens.length,
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const masked = maskGyazoToken(token) ?? '••••••';
-          errors.push(`#${idx + 1}(${masked}): ${msg}`);
-        }
-      }
-
-      // Advance cursor past failed round so next attempt rotates cleanly
-      this.gyazoCursor = (startIdx + 1) % gyazoTokens.length;
-
-      // In 'auto' mode, if all Gyazo tokens failed and Google OAuth is authorized, fall back to Google Drive
-      if (config.preferredHost === 'auto' && (await this.canFallbackToDrive())) {
-        try {
-          const driveHash = this.computeContentHash('drive', bytes);
-          if (!bypassCache) {
-            const driveHit = await this.repo.getImageCache(driveHash);
-            if (driveHit && driveHit.remoteUrl) {
-              return {
-                remoteUrl: driveHit.remoteUrl,
-                host: 'drive',
-                cached: true,
-                fallbackFromGyazo: true,
-              };
-            }
-          }
-          const uploaded = await this.uploadToGoogleDrive(bytes, mimeType, filename);
-          if (!bypassCache) {
-            await this.repo.saveImageCache({
-              contentHash: driveHash,
-              host: 'drive',
-              remoteUrl: uploaded.remoteUrl,
-              driveFileId: uploaded.fileId,
-              mimeType,
-              byteSize: bytes.byteLength,
-              createdAt: Date.now(),
-            });
-          }
-          return {
-            remoteUrl: uploaded.remoteUrl,
-            host: 'drive',
-            cached: false,
-            fallbackFromGyazo: true,
-          };
-        } catch (driveErr) {
-          const driveMsg = driveErr instanceof Error ? driveErr.message : String(driveErr);
-          throw new ProductError(
-            'GYAZO_UPLOAD_FAILED',
-            `全部 ${gyazoTokens.length} 个 Gyazo Token 上传失败，且自动切换 Google 网盘兜底也失败（${driveMsg}）；Gyazo 明细：${errors.join('；')}`,
-            502,
-          );
-        }
-      }
-
-      throw new ProductError(
-        'GYAZO_UPLOAD_FAILED',
-        gyazoTokens.length === 1
-          ? (errors[0]?.replace(/^#1\([^)]+\):\s*/, '') ?? 'Gyazo 上传失败')
-          : `全部 ${gyazoTokens.length} 个 Gyazo Token 均上传失败：${errors.join('；')}`,
-        502,
-      );
     }
-
-    const uploaded = await this.uploadToGoogleDrive(bytes, mimeType, filename);
-    if (!bypassCache) {
-      await this.repo.saveImageCache({
-        contentHash,
-        host: 'drive',
-        remoteUrl: uploaded.remoteUrl,
-        driveFileId: uploaded.fileId,
-        mimeType,
-        byteSize: bytes.byteLength,
-        createdAt: Date.now(),
-      });
+    this.gyazoCursor = (startIdx + 1) % gyazoTokens.length;
+    if (config.preferredHost === 'auto' && (await this.canFallbackToDrive())) {
+      try {
+        return await this.saveAndReturnDrive(bytes, mimeType, filename, bypassCache, true);
+      } catch (driveErr) {
+        const driveMsg = driveErr instanceof Error ? driveErr.message : String(driveErr);
+        throw new ProductError(
+          'GYAZO_UPLOAD_FAILED',
+          `全部 ${gyazoTokens.length} 个 Gyazo Token 上传失败，且自动切换 Google 网盘兜底也失败（${driveMsg}）；Gyazo 明细：${errors.join('；')}`,
+          502,
+        );
+      }
     }
-    return { remoteUrl: uploaded.remoteUrl, host: 'drive', cached: false };
+    throw new ProductError(
+      'GYAZO_UPLOAD_FAILED',
+      gyazoTokens.length === 1
+        ? (errors[0]?.replace(/^#1\([^)]+\):\s*/, '') ?? 'Gyazo 上传失败')
+        : `全部 ${gyazoTokens.length} 个 Gyazo Token 均上传失败：${errors.join('；')}`,
+      502,
+    );
   }
-
   private async uploadToGyazo(
     bytes: Buffer,
     mimeType: string,
@@ -353,7 +285,6 @@ export class SheetImageHostClient implements SheetImageHostPort {
     const form = new FormData();
     form.append('access_token', accessToken);
     form.append('imagedata', new Blob([new Uint8Array(bytes)], { type: mimeType }), filename);
-
     const resp = await this.fetchImpl('https://upload.gyazo.com/api/upload', {
       method: 'POST',
       body: form,
@@ -363,9 +294,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
     let json: Record<string, unknown> = {};
     try {
       json = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      json = {};
-    }
+    } catch {}
     if (!resp.ok || typeof json.url !== 'string' || !json.url.startsWith('http')) {
       const errMsg =
         (typeof json.message === 'string' && json.message) ||
@@ -375,23 +304,19 @@ export class SheetImageHostClient implements SheetImageHostPort {
     }
     return json.url;
   }
-
   private async ensureDriveFolderId(accessToken: string): Promise<string> {
     const config = await this.repo.getImageHostConfig();
     if (config.driveFolderId) return config.driveFolderId;
     if (this.driveFolderPromise) return this.driveFolderPromise;
-
     this.driveFolderPromise = (async () => {
       try {
         const q = encodeURIComponent(
           `name='${DRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
         );
+        const headers = { authorization: `Bearer ${accessToken}` };
         const searchResp = await this.fetchImpl(
           `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1`,
-          {
-            headers: { authorization: `Bearer ${accessToken}` },
-            signal: AbortSignal.timeout(25_000),
-          },
+          { headers, signal: AbortSignal.timeout(25_000) },
         );
         if (!searchResp.ok) {
           const searchErrText = await searchResp.text().catch(() => '');
@@ -401,20 +326,15 @@ export class SheetImageHostClient implements SheetImageHostPort {
             searchResp.status === 401 ? 401 : 502,
           );
         }
-        const searchJson = (await searchResp.json()) as {
-          files?: Array<{ id?: string }>;
-        };
-        const foundId = searchJson.files?.[0]?.id;
+        const foundId = ((await searchResp.json()) as { files?: Array<{ id?: string }> }).files?.[0]
+          ?.id;
         if (foundId) {
           await this.repo.saveImageHostConfig({ driveFolderId: foundId });
           return foundId;
         }
         const createResp = await this.fetchImpl('https://www.googleapis.com/drive/v3/files', {
           method: 'POST',
-          headers: {
-            authorization: `Bearer ${accessToken}`,
-            'content-type': 'application/json; charset=utf-8',
-          },
+          headers: { ...headers, 'content-type': 'application/json; charset=utf-8' },
           body: JSON.stringify({
             name: DRIVE_FOLDER_NAME,
             mimeType: 'application/vnd.google-apps.folder',
@@ -438,10 +358,8 @@ export class SheetImageHostClient implements SheetImageHostPort {
         this.driveFolderPromise = null;
       }
     })();
-
     return this.driveFolderPromise;
   }
-
   private async uploadToGoogleDrive(
     bytes: Buffer,
     mimeType: string,
@@ -450,6 +368,10 @@ export class SheetImageHostClient implements SheetImageHostPort {
     retriedAuth = false,
   ): Promise<{ fileId: string; remoteUrl: string }> {
     const accessToken = await this.oauth.getValidAccessToken();
+    const retryAuth = async () => {
+      await this.oauth.invalidateAccessToken?.(accessToken);
+      return this.uploadToGoogleDrive(bytes, mimeType, filename, retriedFolder, true);
+    };
     let folderId: string;
     try {
       folderId = await this.ensureDriveFolderId(accessToken);
@@ -459,25 +381,20 @@ export class SheetImageHostClient implements SheetImageHostPort {
         err instanceof ProductError &&
         err.status === 401 &&
         this.oauth.invalidateAccessToken
-      ) {
-        await this.oauth.invalidateAccessToken(accessToken);
-        return this.uploadToGoogleDrive(bytes, mimeType, filename, retriedFolder, true);
-      }
+      )
+        return retryAuth();
       throw err;
     }
     const boundary = `wb_img_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const metadata = JSON.stringify({
-      name: filename,
-      parents: [folderId],
-    });
-    const preamble = Buffer.from(
-      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n` +
-        `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`,
-      'utf8',
-    );
-    const epilogue = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-    const body = Buffer.concat([preamble, bytes, epilogue]);
-
+    const metadata = JSON.stringify({ name: filename, parents: [folderId] });
+    const body = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`,
+        'utf8',
+      ),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+    ]);
     const uploadResp = await this.fetchImpl(
       'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
       {
@@ -492,8 +409,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
     );
     if (uploadResp.status === 401 && !retriedAuth && this.oauth.invalidateAccessToken) {
       await uploadResp.body?.cancel().catch(() => {});
-      await this.oauth.invalidateAccessToken(accessToken);
-      return this.uploadToGoogleDrive(bytes, mimeType, filename, retriedFolder, true);
+      return retryAuth();
     }
     if ((uploadResp.status === 404 || uploadResp.status === 403) && !retriedFolder) {
       await uploadResp.body?.cancel().catch(() => {});
@@ -511,8 +427,6 @@ export class SheetImageHostClient implements SheetImageHostPort {
         502,
       );
     }
-
-    // Make image publicly readable so Google Sheets =IMAGE() and Workbench UI can display it
     const permResp = await this.fetchImpl(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(uploaded.id)}/permissions`,
       {
@@ -527,7 +441,6 @@ export class SheetImageHostClient implements SheetImageHostPort {
     );
     if (!permResp.ok) {
       const errText = await permResp.text().catch(() => '');
-      // Best-effort cleanup of orphan private file on permission failure
       await this.fetchImpl(
         `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(uploaded.id)}`,
         {
@@ -542,7 +455,6 @@ export class SheetImageHostClient implements SheetImageHostPort {
         502,
       );
     }
-
     return {
       fileId: uploaded.id,
       remoteUrl: `https://lh3.googleusercontent.com/d/${encodeURIComponent(uploaded.id)}=w400`,

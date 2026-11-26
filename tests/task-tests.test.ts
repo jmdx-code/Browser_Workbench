@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { settlementFixture } from './fixtures/settlement.js';
+import { workspaceFixture } from './fixtures/workspace-fixture.js';
 import { WorkspaceService } from '../src/application/workspace-service.js';
 import { TaskService, type TaskExecutionPort } from '../src/application/task-service.js';
 import { TaskTestService } from '../src/application/task-test-service.js';
@@ -9,7 +9,7 @@ import { ProfileSchema, type Profile } from '../src/shared/contracts.js';
 import { TaskTestRequest } from '../src/shared/task-tests.js';
 
 test('single-task testing keeps exact browser selection and original batch identity across reply loss, rejects offline profiles and does not start newly online ones on retry', async () =>
-  settlementFixture(async (store) => {
+  workspaceFixture(async (store) => {
     const profiles: Profile[] = [true, false].map((online) =>
       ProfileSchema.parse({
         id: randomUUID(),
@@ -76,14 +76,19 @@ test('single-task testing keeps exact browser selection and original batch ident
     );
     secondProfile.extensionVersion = '0.3.21';
     await assert.rejects(tests.start({ ...request, durationMinutes: 2 }), /不能改动参数/);
+    await assert.rejects(
+      tests.start({ ...request, profileIds: [firstProfile.id] }),
+      /不能改动参数/,
+    );
     const partial = await tests.start({ ...request, requestId: randomUUID() });
     assert.equal(partial.plans.length, 1);
     assert.equal(partial.plans[0]?.profileId, secondProfile.id);
     assert.equal(partial.rejected[0]?.profileId, firstProfile.id);
-    assert.equal((await store.combinations()).length, 2);
+    // Identical step spec reuses the existing quick-task combination row (zero DB leak).
+    assert.equal((await store.combinations()).length, 1);
   }));
 test('unloaded or unsupported modules and invalid settings cannot create a combination or a browser operation', async () =>
-  settlementFixture(async (store) => {
+  workspaceFixture(async (store) => {
     const profile = ProfileSchema.parse({
       id: randomUUID(),
       alias: '生成',

@@ -2,7 +2,6 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { FacebookPostEffects } from '../shared/facebook-post-observation.js';
-
 // Actual Chinese personal-profile Next stage. Only reads the original hidden editable and
 // the visible preview belonging to the same outer form; no input, navigation or page stores.
 export function projectFacebookReviewContent() {

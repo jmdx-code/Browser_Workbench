@@ -70,12 +70,12 @@ test('WO-R1.1: group_poster_operations accepts real UUID connectionEpoch without
   }
 });
 
-test('WO-R1.2: fresh, v47 and v51 databases upgrade to the current schema with TEXT connection_epoch, preserved rows, valid foreign keys and no constructor ALTER TABLE', async () => {
-  assert.ok(workspaceSchemaVersion >= 52);
+test('WO-R1.2: fresh, v60 and v61 databases upgrade to v62 with TEXT connection_epoch, preserved rows, valid foreign keys and no constructor ALTER TABLE', async () => {
+  assert.ok(workspaceSchemaVersion >= 62);
   const dir = mkdtempSync(path.join(tmpdir(), 'wb-wor1-mig-'));
   try {
-    // 1. v0 -> v52 fresh database
-    const freshPath = path.join(dir, 'fresh-v52.sqlite');
+    // 1. v0 -> v62 fresh database
+    const freshPath = path.join(dir, 'fresh-v62.sqlite');
     const freshStore = await WorkspaceStore.open(freshPath);
     freshStore.close();
 
@@ -94,105 +94,72 @@ test('WO-R1.2: fresh, v47 and v51 databases upgrade to the current schema with T
     assert.equal(freshCols.find((c) => c.name === 'connection_epoch')?.type, 'TEXT');
     rawFresh.close();
 
-    // 2. v47 -> v52 legacy upgrade path
-    const v47Path = path.join(dir, 'legacy-v47.sqlite');
-    const seedStore = await WorkspaceStore.open(v47Path);
+    // 2. v60 -> v62 upgrade path
+    const v60Path = path.join(dir, 'legacy-v60.sqlite');
+    const seedStore = await WorkspaceStore.open(v60Path);
     seedStore.close();
-    const rawV47 = new DatabaseSync(v47Path);
-    rawV47.exec(`
-      DROP TABLE IF EXISTS shared_facebook_groups;
-      DROP TABLE IF EXISTS shared_facebook_pages;
-      DROP TABLE IF EXISTS group_poster_operations;
-      PRAGMA user_version = 47;
-    `);
-    rawV47.close();
+    const rawV60 = new DatabaseSync(v60Path);
+    rawV60.exec(`PRAGMA user_version = 60;`);
+    rawV60.close();
 
-    const upgradedFrom47 = await WorkspaceStore.open(v47Path);
-    const epoch47 = randomUUID();
-    upgradedFrom47.groupPoster.prepareOperation({
+    const upgradedFrom60 = await WorkspaceStore.open(v60Path);
+    const epoch60 = randomUUID();
+    upgradedFrom60.groupPoster.prepareOperation({
       binding: {
         operationId: randomUUID(),
         profileId: P01,
         accountId: '10001',
-        connectionEpoch: epoch47,
+        connectionEpoch: epoch60,
         leaseId: randomUUID(),
         generation: 1,
         jobId: randomUUID(),
         stepId: randomUUID(),
-        actionDigest: 'dig-47',
+        actionDigest: 'dig-60',
       },
-      runId: 'run-47',
+      runId: 'run-60',
       actionKind: 'setup_open_group',
       groupId: '99887766',
-      groupName: 'From v47',
+      groupName: 'From v60',
     });
-    upgradedFrom47.close();
+    upgradedFrom60.close();
 
-    const rawAfter47 = new DatabaseSync(v47Path, { readOnly: true });
+    const rawAfter60 = new DatabaseSync(v60Path, { readOnly: true });
     assert.equal(
-      (rawAfter47.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      (rawAfter60.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
       workspaceSchemaVersion,
     );
-    assert.deepEqual(rawAfter47.prepare('PRAGMA foreign_key_check').all(), []);
-    rawAfter47.close();
+    assert.deepEqual(rawAfter60.prepare('PRAGMA foreign_key_check').all(), []);
+    rawAfter60.close();
 
-    // 3. v51 -> v52 upgrade path (where connection_epoch was INTEGER NOT NULL)
-    const v51Path = path.join(dir, 'legacy-v51.sqlite');
-    const prep51 = await WorkspaceStore.open(v51Path);
-    prep51.close();
+    // 3. v61 -> v62 upgrade path preserving operations rows & dropping legacy log tables
+    const v61Path = path.join(dir, 'legacy-v61.sqlite');
+    const prep61 = await WorkspaceStore.open(v61Path);
+    prep61.close();
 
-    const rawV51 = new DatabaseSync(v51Path);
-    rawV51.exec(`
-      DROP TABLE IF EXISTS group_poster_operations;
-      CREATE TABLE group_poster_operations (
-        operation_id TEXT PRIMARY KEY,
-        profile_id TEXT NOT NULL,
-        account_id TEXT NOT NULL,
-        connection_epoch INTEGER NOT NULL,
-        lease_id TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        job_id TEXT NOT NULL,
-        step_id TEXT NOT NULL,
-        action_digest TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        action_kind TEXT NOT NULL,
-        group_id TEXT NOT NULL DEFAULT '',
-        group_name TEXT NOT NULL DEFAULT '',
-        material_id TEXT,
-        post_id TEXT,
-        post_url TEXT,
-        log_id TEXT,
-        resolution_id TEXT,
-        resolution_outcome TEXT,
-        evidence_digest TEXT,
-        status TEXT NOT NULL DEFAULT 'PREPARED',
-        kernel_settled INTEGER NOT NULL DEFAULT 0,
-        review_reason TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
+    const rawV61 = new DatabaseSync(v61Path);
+    rawV61.exec(`
       INSERT INTO group_poster_operations (
         operation_id, profile_id, account_id, connection_epoch, lease_id, generation,
         job_id, step_id, action_digest, run_id, action_kind, group_id, group_name,
         material_id, status, kernel_settled, created_at, updated_at
       ) VALUES (
-        'op-legacy-int', '${P01}', '100051', 7, 'lease-51', 1,
-        'job-51', 'step-51', 'dig-51', 'run-51', 'submit_post', '515151', 'Legacy Group 51',
-        'mat-51', 'PENDING_REVIEW', 1, 1700000000000, 1700000000000
+        'op-legacy-v61', '${P01}', '100051', 'epoch-61', 'lease-61', 1,
+        'job-61', 'step-61', 'dig-61', 'run-61', 'submit_post', '515151', 'Legacy Group 61',
+        'mat-61', 'PENDING_REVIEW', 0, 1700000000000, 1700000000000
       );
-      PRAGMA user_version = 51;
+      PRAGMA user_version = 61;
     `);
-    rawV51.close();
+    rawV61.close();
 
-    const upgradedFrom51 = await WorkspaceStore.open(v51Path);
-    const preservedOps = upgradedFrom51.groupPoster.listOperationsByProfile(P01, true);
+    const upgradedFrom61 = await WorkspaceStore.open(v61Path);
+    const preservedOps = upgradedFrom61.groupPoster.listOperationsByProfile(P01, true);
     assert.equal(preservedOps.length, 1);
-    assert.equal(preservedOps[0]?.binding.operationId, 'op-legacy-int');
-    assert.equal(preservedOps[0]?.binding.connectionEpoch, '7');
+    assert.equal(preservedOps[0]?.binding.operationId, 'op-legacy-v61');
+    assert.equal(preservedOps[0]?.binding.connectionEpoch, 'epoch-61');
     assert.equal(preservedOps[0]?.status, 'PENDING_REVIEW');
 
     const newEpochUuid = randomUUID();
-    upgradedFrom51.groupPoster.prepareOperation({
+    upgradedFrom61.groupPoster.prepareOperation({
       binding: {
         operationId: 'op-new-uuid',
         profileId: P01,
@@ -202,23 +169,23 @@ test('WO-R1.2: fresh, v47 and v51 databases upgrade to the current schema with T
         generation: 2,
         jobId: randomUUID(),
         stepId: randomUUID(),
-        actionDigest: 'dig-52',
+        actionDigest: 'dig-62',
       },
-      runId: 'run-52',
+      runId: 'run-62',
       actionKind: 'submit_post',
       groupId: '515151',
-      groupName: 'Legacy Group 51',
-      materialId: 'mat-52',
+      groupName: 'Legacy Group 61',
+      materialId: 'mat-62',
     });
-    const allOps = upgradedFrom51.groupPoster.listOperationsByProfile(P01, true);
+    const allOps = upgradedFrom61.groupPoster.listOperationsByProfile(P01, true);
     assert.equal(
       allOps.find((o) => o.binding.operationId === 'op-new-uuid')?.binding.connectionEpoch,
       newEpochUuid,
     );
-    upgradedFrom51.close();
+    upgradedFrom61.close();
 
-    // 4. Verify Repository constructors execute ZERO ALTER TABLE on a v52 database
-    const checkDb = new DatabaseSync(v51Path);
+    // 4. Verify Repository constructors execute ZERO ALTER TABLE on a v62 database
+    const checkDb = new DatabaseSync(v61Path);
     const origExec = checkDb.exec.bind(checkDb);
     const alterCalls: string[] = [];
     checkDb.exec = (sql: string) => {
@@ -505,6 +472,10 @@ test('WO-R1.5: GroupPosterService preserves user-selected group order, does not 
     });
 
     const claimedOrder: Array<{ rawGroupRefId: string; materialId: string }> = [];
+    let releaseFirstTask: (() => void) | null = null;
+    const firstTaskGate = new Promise<void>((resolve) => {
+      releaseFirstTask = resolve;
+    });
     const runner: GroupPosterBrowserPort = {
       ready: () => true,
       busy: async () => false,
@@ -513,6 +484,7 @@ test('WO-R1.5: GroupPosterService preserves user-selected group order, does not 
         while (!callbacks.cancelled() && (await callbacks.canContinueAccount(profileId))) {
           const task = await callbacks.claimNextTask();
           if (!task) break;
+          if (claimedOrder.length === 0) await firstTaskGate;
           const originalGroupRef = task.group;
           claimedOrder.push({ rawGroupRefId: originalGroupRef.id, materialId: task.material.id });
           let effectiveId = originalGroupRef.id;
@@ -551,11 +523,19 @@ test('WO-R1.5: GroupPosterService preserves user-selected group order, does not 
 
     const service = new GroupPosterService(store.groupPoster, runner, preparer);
     // Pass groupIds in reverse order: ['slug-beta', 'slug-alpha']
-    await service.start({
-      profileIds: [P01],
+    await service.createTask({
+      materialId: 'mat-1',
       groupIds: ['slug-beta', 'slug-alpha'],
-      materialIds: ['mat-1', 'mat-2'],
+      accountMode: 'selected',
+      profileIds: [P01],
     });
+    await service.createTask({
+      materialId: 'mat-2',
+      groupIds: ['slug-beta', 'slug-alpha'],
+      accountMode: 'selected',
+      profileIds: [P01],
+    });
+    (releaseFirstTask as (() => void) | null)?.();
 
     while ((await service.state()).running) {
       await new Promise<void>((r) => setTimeout(r, 20));

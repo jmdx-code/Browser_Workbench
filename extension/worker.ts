@@ -1,35 +1,25 @@
 declare const __BUNDLED_EXTENSION_VERSION__: string | undefined;
-function reportedExtensionVersion(): string {
-  return typeof __BUNDLED_EXTENSION_VERSION__ === 'string' &&
-    __BUNDLED_EXTENSION_VERSION__.length > 0
+const reportedExtensionVersion = (): string =>
+  typeof __BUNDLED_EXTENSION_VERSION__ === 'string' && __BUNDLED_EXTENSION_VERSION__.length > 0
     ? __BUNDLED_EXTENSION_VERSION__
     : chrome.runtime.getManifest().version;
-}
-
+import { ProfileHeartbeat } from '../src/application/kernel-gates.js';
 import {
-  VERSION,
-  LEASE_MS,
-  ORIGIN,
   Action,
+  LEASE_MS,
+  VERSION,
   isWrite,
-  allowedTaskURL,
   type Command,
-  type Reply,
-  type Action as ActionType,
+  type WindowBounds,
 } from '../src/bridge/protocol.js';
-import { Journal, type Saved } from './journal.js';
-import { mediaPoint } from './media-point.js';
-import { ExtensionKernelChannel } from './kernel-channel.js';
-import { isBenignDetachError } from './kernel-backend.js';
-import { initializeKernelJournal } from './kernel-storage.js';
 import { bridgeHelloCapabilities } from '../src/shared/bridge-capabilities.js';
-import { projectPage } from '../src/shared/page-projection.js';
-import { projectFacebookDocumentIdentity } from '../src/shared/facebook-document-identity.js';
-import { BridgeCommandQueue } from '../src/application/bridge-command-queue.js';
-import { heartbeatLeaseDeadline } from '../src/shared/bridge-heartbeat.js';
-import { ProfileHeartbeat } from '../src/application/profile-heartbeat.js';
-import { ReconnectBackoff } from '../src/shared/reconnect-backoff.js';
+import { heartbeatLeaseDeadline } from '../src/shared/bridge-connection-health.js';
 import { Id } from '../src/shared/contracts.js';
+import { projectFacebookDocumentIdentity } from '../src/shared/facebook-document-identity.js';
+import { projectPage } from '../src/shared/page-projection.js';
+import { ReconnectBackoff } from '../src/shared/reconnect-backoff.js';
+import { ExtensionKernelChannel } from './kernel-channel.js';
+import { initializeKernelJournal } from './kernel-storage.js';
 import {
   cleanupExtraTabs,
   closeProfileWindows,
@@ -40,92 +30,7 @@ import {
   recordUserWindowFocus,
   revealBrowserWindow,
 } from './reveal-browser-window.js';
-const fallbackStorage = {
-  get: async () => ({}),
-  set: async () => {},
-  remove: async () => {},
-} as unknown as chrome.storage.LocalStorageArea;
-const journal = new Journal(
-  typeof chrome !== 'undefined' && chrome?.storage?.local ? chrome.storage.local : fallbackStorage,
-);
-let activeHeartbeat: ProfileHeartbeat | undefined;
-type Owned = {
-  tabId: number;
-  token: string;
-  sourceURL?: string;
-  documentEpoch: number;
-  routeEpoch: number;
-};
-let profileId = '',
-  secret = '',
-  socket: WebSocket | undefined,
-  epoch = '',
-  leaseUntil = 0,
-  paused = true,
-  stopping = false;
-let generation = 0,
-  connectionSerial = 0,
-  connecting = false;
-let freezeSerial = 0,
-  kernelStopUnconfirmed = false,
-  reloadingExtension = false,
-  closingBrowserWindows = false;
-const defaultFreezeTimeoutMs = 8_000,
-  welcomeFreezeTimeoutMs = 5_000,
-  disconnectFreezeTimeoutMs = 5_000,
-  reloadFreezeTimeoutMs = 1_500;
-const commands = new BridgeCommandQueue();
-let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-const reconnectBackoff = new ReconnectBackoff();
-let manualPauseReconnect = false;
-let connectionStage = 'disconnected',
-  connectionFailure = '';
-const owned = new Map<number, Owned>(),
-  attached = new Set<number>(),
-  frames = new Map<string, { tabId: number; sessionId: string }>();
-function createChannel(channelEpoch: string): ExtensionKernelChannel {
-  const instance: ExtensionKernelChannel = new ExtensionKernelChannel(
-    () => ({
-      profileId,
-      epoch: channelEpoch,
-      valid:
-        kernel === instance &&
-        epoch === channelEpoch &&
-        paused &&
-        !stopping &&
-        !kernelStopUnconfirmed &&
-        socket?.readyState === WebSocket.OPEN &&
-        Date.now() < leaseUntil,
-    }),
-    (message) => {
-      if (kernel === instance && epoch === channelEpoch) send(message);
-    },
-  );
-  return instance;
-}
-let kernel = createChannel(epoch);
-async function init() {
-  await journal.migrate();
-  const config = await chrome.storage.local.get(['profileId', 'secret']);
-  profileId = typeof config.profileId === 'string' ? config.profileId : crypto.randomUUID();
-  secret = typeof config.secret === 'string' ? config.secret : '';
-  await chrome.storage.local.set({ profileId });
-  await initializeKernelJournal(profileId);
-  const session = await chrome.storage.session.get('owned');
-  for (const row of (session.owned ?? []) as Owned[])
-    try {
-      const t = await chrome.tabs.get(row.tabId);
-      const currentURL =
-        t.url ??
-        (await chrome.debugger.getTargets()).find((target) => target.tabId === row.tabId)?.url ??
-        '';
-      if (
-        (row.sourceURL?.startsWith('https:') && allowedTaskURL(currentURL)) ||
-        new URL(currentURL).searchParams.get('bridgeTab') === row.token
-      )
-        owned.set(row.tabId, { ...row, documentEpoch: row.documentEpoch + 1 });
-    } catch {}
-}
+import { consolidateOpenWorkbenchGroups, withBoundedWait } from './workspace-page-group.js';
 export interface OutgoingMessageDiagnostic {
   observed: boolean;
   utf8Bytes: number;
@@ -142,20 +47,14 @@ export function inspectOutgoingExtensionMessage(
     return { observed: false, utf8Bytes: raw.length, type: 'UNKNOWN' };
   }
   const utf8Bytes = new TextEncoder().encode(raw).byteLength;
-  const record =
-    typeof msg === 'object' && msg !== null ? (msg as Record<string, unknown>) : undefined;
-  const ev =
-    typeof record?.event === 'object' && record.event !== null
-      ? (record.event as Record<string, unknown>)
-      : undefined;
-  const type = typeof record?.type === 'string' ? record.type : 'UNKNOWN';
-  const method =
-    typeof record?.method === 'string'
-      ? record.method
-      : typeof ev?.method === 'string'
-        ? ev.method
-        : undefined;
-  const entriesCount = Array.isArray(record?.entries) ? record.entries.length : undefined;
+  const obj = (v: unknown) =>
+      typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : undefined,
+    rec = obj(msg),
+    ev = obj(rec?.event),
+    str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+  const type = str(rec?.type) ?? 'UNKNOWN';
+  const method = str(rec?.method) ?? str(ev?.method);
+  const entriesCount = Array.isArray(rec?.entries) ? rec.entries.length : undefined;
   if (utf8Bytes > 1_048_576) {
     console.warn('[BrowserWorkbench][BridgeOutgoingLargeMessage]', {
       type,
@@ -167,7 +66,60 @@ export function inspectOutgoingExtensionMessage(
   }
   return { observed: false, utf8Bytes, type, method, entriesCount };
 }
-let ready = typeof chrome !== 'undefined' && chrome?.storage?.local ? init() : Promise.resolve();
+let activeHeartbeat: ProfileHeartbeat | undefined,
+  profileId = '',
+  secret = '',
+  socket: WebSocket | undefined,
+  epoch = '',
+  leaseUntil = 0,
+  paused = true,
+  stopping = false,
+  connectionSerial = 0,
+  connecting = false,
+  freezeSerial = 0,
+  reloadingExtension = false,
+  closingBrowserWindows = false,
+  reconnectTimer: ReturnType<typeof setTimeout> | undefined,
+  manualPauseReconnect = false,
+  connectionStage = 'disconnected',
+  connectionFailure = '';
+const defaultFreezeTimeoutMs = 8_000,
+  welcomeFreezeTimeoutMs = 5_000,
+  disconnectFreezeTimeoutMs = 5_000,
+  reloadFreezeTimeoutMs = 1_500,
+  reconnectBackoff = new ReconnectBackoff();
+function createChannel(channelEpoch: string): ExtensionKernelChannel {
+  const instance: ExtensionKernelChannel = new ExtensionKernelChannel(
+    () => ({
+      profileId,
+      epoch: channelEpoch,
+      valid:
+        kernel === instance &&
+        epoch === channelEpoch &&
+        paused &&
+        !stopping &&
+        socket?.readyState === WebSocket.OPEN &&
+        Date.now() < leaseUntil,
+    }),
+    (message) => {
+      if (kernel === instance && epoch === channelEpoch) send(message);
+    },
+  );
+  return instance;
+}
+let kernel = createChannel(epoch);
+async function init() {
+  const all = await chrome.storage.local.get(null);
+  profileId = typeof all.profileId === 'string' ? all.profileId : crypto.randomUUID();
+  secret = typeof all.secret === 'string' ? all.secret : '';
+  const junkKeys = Object.keys(all).filter((k) => k !== 'profileId' && k !== 'secret');
+  if (junkKeys.length > 0) await chrome.storage.local.remove(junkKeys).catch(() => {});
+  await chrome.storage.local.set({ profileId });
+  await chrome.storage.session?.remove('owned').catch(() => {});
+  await initializeKernelJournal(profileId);
+  void consolidateOpenWorkbenchGroups().catch(() => {});
+}
+const ready = typeof chrome !== 'undefined' && chrome?.storage?.local ? init() : Promise.resolve();
 const send = (msg: unknown) => {
   if (socket?.readyState === WebSocket.OPEN) {
     const raw = JSON.stringify(msg);
@@ -175,456 +127,25 @@ const send = (msg: unknown) => {
     socket.send(raw);
   }
 };
-async function saveOwned() {
-  await chrome.storage.session.set({ owned: [...owned.values()] });
-}
-function localURL(url: string) {
-  try {
-    const u = new URL(url);
-    return (
-      ['http://127.0.0.1:18767', 'http://localhost:18767'].includes(u.origin) &&
-      ['/fixture', '/frame'].includes(u.pathname)
-    );
-  } catch {
-    return false;
-  }
-}
-function guard(command: Command, startGeneration: number) {
-  if ((kernelStopUnconfirmed || kernel.isStopUnconfirmed()) && isWrite(command.action)) {
-    throw Error('KERNEL_STOP_UNCONFIRMED');
-  }
-  if (
-    stopping ||
-    (paused && isWrite(command.action)) ||
-    generation !== startGeneration ||
-    socket?.readyState !== WebSocket.OPEN ||
-    command.connectionEpoch !== epoch ||
-    Date.now() > leaseUntil ||
-    Date.now() > command.deadline
-  )
-    throw Error('LEASE_OR_STOP_REJECTED');
-}
-async function requireOwned(tabId: number) {
-  const o = owned.get(tabId);
-  if (!o) throw Error('TAB_NOT_OWNED');
-  const t = await chrome.tabs.get(tabId);
-  if (t.status === 'loading') throw Error('TAB_SCOPE_CHANGED');
-  const url =
-    t.url ??
-    (await chrome.debugger.getTargets()).find((target) => target.tabId === tabId)?.url ??
-    '';
-  if (
-    o.sourceURL?.startsWith('https:')
-      ? !allowedTaskURL(url)
-      : !localURL(url) || new URL(url).searchParams.get('bridgeTab') !== o.token
-  )
-    throw Error('TAB_SCOPE_CHANGED');
-  return o;
-}
-async function attach(o: Owned) {
-  if (attached.has(o.tabId)) return;
-  await chrome.debugger.attach({ tabId: o.tabId }, '1.3');
-  attached.add(o.tabId);
-  await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Page.enable');
-  await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Runtime.enable');
-  await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Target.setAutoAttach', {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: 'iframe', exclude: false }],
-  });
-}
-async function evaluate(tabId: number, expression: string) {
-  const result: any = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-    expression,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (result.exceptionDetails)
-    throw Error(
-      String(result.exceptionDetails.exception?.description ?? 'PAGE_EVALUATION_FAILED').split(
-        '\n',
-      )[0],
-    );
-  return result.result?.value;
-}
-// Generic locator and hit testing. Facebook-specific selectors/flows belong in the local controller.
-function inspectExpression(spec: unknown, mode: 'point' | 'focus') {
-  return `(()=>{const spec=${JSON.stringify(spec)};if(document.visibilityState!=='visible')throw Error('TARGET_HIDDEN');const root=spec.scope?document.querySelectorAll(spec.scope):[document];if(root.length!==1)throw Error('SCOPE_AMBIGUOUS');const nodes=Array.from(root[0].querySelectorAll(spec.css)).filter(e=>!spec.text||e.textContent.includes(spec.text));if(nodes.length!==1)throw Error('TARGET_AMBIGUOUS');const e=nodes[0];if(e.disabled||e.getAttribute('aria-disabled')==='true')throw Error('TARGET_DISABLED');e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});const r=e.getBoundingClientRect();const style=getComputedStyle(e);if(!r.width||!r.height||style.visibility!=='visible'||style.display==='none'||Number(style.opacity)===0)throw Error('TARGET_HIDDEN');const x=r.x+r.width/2,y=r.y+r.height/2;const hit=document.elementFromPoint(x,y);if(!hit||!e.contains(hit))throw Error('TARGET_OCCLUDED');${mode === 'focus' ? 'e.focus();if(document.activeElement!==e)throw Error("FOCUS_FAILED");' : ''}return{x,y,url:location.href,tag:e.tagName};})()`;
-}
-async function observe(o: Owned) {
-  const mediaOnly = o.sourceURL?.startsWith('https:');
-  const value = await evaluate(
-    o.tabId,
-    `JSON.stringify({url:location.href,title:document.title,visibility:document.visibilityState,focused:document.hasFocus(),buttons:Array.from(document.querySelectorAll('button,[role=button]')).filter(e=>${mediaOnly ? '["Play","播放","播放视频","Play video","Pause","暂停"].includes(e.getAttribute("aria-label"))' : 'true'}).slice(0,100).map(e=>({id:e.id,text:${mediaOnly ? 'undefined' : 'e.innerText?.slice(0,120)'},label:e.getAttribute('aria-label')?.slice(0,120),disabled:e.disabled||e.getAttribute('aria-disabled')==='true'})),state:document.querySelector('#business-state')?.textContent,events:document.querySelector('#events')?.textContent,media:document.querySelector('#media-log')?.textContent,video:Array.from(document.querySelectorAll('video')).slice(0,10).map((v,index)=>{const r=v.getBoundingClientRect();const s=getComputedStyle(v);return{index,source:v.currentSrc,time:v.currentTime,paused:v.paused,readyState:v.readyState,duration:Number.isFinite(v.duration)?v.duration:null,loop:v.loop,rate:v.playbackRate,ended:v.ended,visible:s.visibility==='visible'&&s.display!=='none'&&Number(s.opacity)>0&&r.width>0&&r.height>0&&r.right>0&&r.bottom>0&&r.left<innerWidth&&r.top<innerHeight,area:r.width*r.height}})})`,
-  );
-  const snapshot = JSON.parse(value);
-  for (const video of snapshot.video) video.nodeId = await mediaNodeId(o.tabId, video.index);
-  return {
-    ...snapshot,
-    tabId: o.tabId,
-    documentEpoch: o.documentEpoch,
-    routeEpoch: o.routeEpoch,
-  };
-}
-async function mediaNodeId(tabId: number, index: number) {
-  const result: any = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-    expression: `document.querySelectorAll('video')[${index}]`,
-    returnByValue: false,
-  });
-  const objectId = result.result?.objectId;
-  if (!objectId) throw Error('MEDIA_CHANGED');
-  try {
-    const described: any = await chrome.debugger.sendCommand({ tabId }, 'DOM.describeNode', {
-      objectId,
-    });
-    return described.node.backendNodeId as number;
-  } finally {
-    await chrome.debugger.sendCommand({ tabId }, 'Runtime.releaseObject', { objectId });
-  }
-}
-async function execute(
-  command: Command,
-  g: number,
-): Promise<{ status: Reply['status']; evidence: unknown }> {
-  const action: ActionType = Action.parse(command.action);
-  guard(command, g);
-  if (action.kind === 'uploadMedia') throw Error('SDK_BOUND_UPLOAD_REQUIRED');
-  if (action.kind === 'readFacebookDisplay') {
-    const tabs = await chrome.tabs.query({ url: 'https://www.facebook.com/*' });
-    guard(command, g);
-    const tab =
-      tabs
-        .filter((t) => t.url === 'https://www.facebook.com/')
-        .sort((a, b) => Number(b.active) - Number(a.active))[0] ??
-      tabs
-        .filter((t) => typeof t.url === 'string' && t.url.startsWith('https://www.facebook.com/'))
-        .sort((a, b) => Number(b.active) - Number(a.active))[0];
-    if (tab?.id === undefined) return { status: 'VERIFIED', evidence: { available: false } };
-    const scope = tab.url === 'https://www.facebook.com/' ? 'home' : 'browse';
-    const pages = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: 'MAIN',
-      func: projectPage,
-      args: [action.projection],
-    });
-    guard(command, g);
-    const actors = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: 'MAIN',
-      func: projectFacebookDocumentIdentity,
-      args: [scope],
-    });
-    guard(command, g);
-    const page = pages.find((r) => r.frameId === 0),
-      actor = actors.find((r) => r.frameId === 0);
-    if (!page?.documentId || page.documentId !== actor?.documentId)
-      throw Error('INSPECTION_DOCUMENT_CHANGED');
-    return {
-      status: 'VERIFIED',
-      evidence: { available: true, tabId: tab.id, page: page.result, identity: actor.result },
-    };
-  }
-  if (action.kind === 'createTab' || action.kind === 'createTaskTab') {
-    const token = crypto.randomUUID();
-    const taskURL = new URL(action.kind === 'createTab' ? ORIGIN + '/fixture' : action.url);
-    if (taskURL.origin === ORIGIN) taskURL.searchParams.set('bridgeTab', token);
-    const window = await chrome.windows.create({
-      url: taskURL.href,
-      type: 'normal',
-      focused: action.kind === 'createTaskTab',
-    });
-    const t = window?.tabs?.[0];
-    if (!t?.id) throw Error('TAB_CREATE_FAILED');
-    const o: Owned = {
-      tabId: t.id,
-      token,
-      sourceURL: taskURL.href,
-      documentEpoch: 0,
-      routeEpoch: 0,
-    };
-    owned.set(t.id, o);
-    await saveOwned();
-    return {
-      status: 'VERIFIED',
-      evidence: {
-        tabId: t.id,
-        url: taskURL.href,
-        note: '仅确认标签页创建，页面加载另行观察',
-      },
-    };
-  }
-  // Software SDK browse decisions use the existing kernel/CDP path, never this legacy fixture executor.
-  if (action.kind === 'readTabState') {
-    if (!owned.has(action.tabId)) throw Error('TAB_NOT_OWNED');
-    const tab = await chrome.tabs.get(action.tabId);
-    guard(command, g);
-    if (tab.status === 'loading')
-      return { status: 'VERIFIED', evidence: { tabId: tab.id, status: 'loading' } };
-    await requireOwned(action.tabId);
-    const window = await chrome.windows.get(tab.windowId);
-    guard(command, g);
-    return {
-      status: 'VERIFIED',
-      evidence: {
-        tabId: tab.id,
-        status: 'complete',
-        url: tab.url,
-        state: window.state,
-        focused: window.focused,
-        active: tab.active,
-      },
-    };
-  }
-  if (
-    action.kind === 'browseNavigate' ||
-    action.kind === 'browsePlay' ||
-    action.kind === 'browseScroll'
-  )
-    throw Error('BROWSE_REQUIRES_MANAGED_KERNEL');
-  const o = await requireOwned(action.tabId);
-  guard(command, g);
-  if (action.kind === 'closeTab') {
-    // An intentional task-tab close must not look like an unexpected debugger takeover.
-    // Remove ownership of the debugger before detach emits its asynchronous event.
-    if (attached.delete(o.tabId)) {
-      await chrome.debugger.detach({ tabId: o.tabId });
-    }
-    await chrome.tabs.remove(o.tabId);
-    owned.delete(o.tabId);
-    await saveOwned();
-    return { status: 'VERIFIED', evidence: { closedTab: o.tabId } };
-  }
-  if (action.kind === 'windowState' || action.kind === 'activateTab') {
-    const t = await chrome.tabs.get(o.tabId);
-    const w = await chrome.windows.get(t.windowId, { populate: true });
-    if (!w.tabs?.every((tab) => tab.id && owned.has(tab.id)))
-      throw Error('WINDOW_CONTAINS_USER_TAB');
-    guard(command, g);
-    if (action.kind === 'activateTab') {
-      await chrome.windows.update(t.windowId, { state: 'normal' });
-      guard(command, g);
-      await chrome.tabs.update(o.tabId, { active: true });
-      guard(command, g);
-      await chrome.windows.update(t.windowId, { focused: true });
-    } else await chrome.windows.update(t.windowId, { state: action.state });
-    const actual = await chrome.windows.get(t.windowId);
-    const activeTab = await chrome.tabs.get(o.tabId);
-    if (
-      action.kind === 'activateTab'
-        ? actual.state !== 'normal' || !actual.focused || !activeTab.active
-        : actual.state !== action.state
-    )
-      throw Error('WINDOW_STATE_UNVERIFIED');
-    return {
-      status: 'VERIFIED',
-      evidence: {
-        windowId: t.windowId,
-        state: actual.state,
-        focused: actual.focused,
-        active: activeTab.active,
-        note: '窗口状态回执不代表页面可见，仍需只读核验',
-      },
-    };
-  }
-  await attach(o);
-  guard(command, g);
-  if (action.kind === 'observe') return { status: 'VERIFIED', evidence: await observe(o) };
-  if (action.kind === 'frameProbe') {
-    const tree = await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Page.getFrameTree');
-    const children = [];
-    for (const [targetId, f] of frames)
-      if (f.tabId === o.tabId) {
-        const frame = await chrome.debugger.sendCommand(
-          { tabId: o.tabId, sessionId: f.sessionId },
-          'Page.getFrameTree',
-        );
-        children.push({ targetId, sessionId: f.sessionId, frame });
-      }
-    return { status: 'VERIFIED', evidence: { tree, children } };
-  }
-  if (action.documentEpoch !== o.documentEpoch || action.routeEpoch !== o.routeEpoch)
-    throw Error('STALE_OBSERVATION');
-  if (action.kind === 'mediaClick') {
-    if ((await mediaNodeId(o.tabId, action.mediaIndex)) !== action.mediaNodeId)
-      throw Error('MEDIA_CHANGED');
-    const expression = `(${mediaPoint.toString()})(${JSON.stringify(action)})`;
-    const point = await evaluate(o.tabId, expression);
-    guard(command, g);
-    const fresh = await evaluate(o.tabId, expression);
-    if ((await mediaNodeId(o.tabId, action.mediaIndex)) !== action.mediaNodeId)
-      throw Error('MEDIA_CHANGED');
-    if (o.documentEpoch !== action.documentEpoch || o.routeEpoch !== action.routeEpoch)
-      throw Error('STALE_OBSERVATION');
-    if (Math.abs(point.x - fresh.x) > 1 || Math.abs(point.y - fresh.y) > 1)
-      throw Error('TARGET_MOVED');
-    guard(command, g);
-    await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed',
-      ...fresh,
-      button: 'left',
-      clickCount: 1,
-    });
-    await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased',
-      ...fresh,
-      button: 'left',
-      clickCount: 1,
-    });
-    return {
-      status: 'ACKNOWLEDGED',
-      evidence: { inputDispatched: true, note: '需要观察实际播放状态' },
-    };
-  }
-  const point = await evaluate(
-    o.tabId,
-    inspectExpression(action.target, action.kind === 'typeText' ? 'focus' : 'point'),
-  );
-  guard(command, g);
-  const current = await requireOwned(o.tabId);
-  if (current.documentEpoch !== action.documentEpoch || current.routeEpoch !== action.routeEpoch)
-    throw Error('STALE_OBSERVATION');
-  if (action.kind === 'typeText')
-    await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Input.insertText', {
-      text: action.text,
-    });
-  else {
-    const fresh = await evaluate(o.tabId, inspectExpression(action.target, 'point'));
-    guard(command, g);
-    if (Math.abs(point.x - fresh.x) > 1 || Math.abs(point.y - fresh.y) > 1)
-      throw Error('TARGET_MOVED');
-    await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed',
-      x: fresh.x,
-      y: fresh.y,
-      button: 'left',
-      clickCount: 1,
-    });
-    try {
-      await chrome.debugger.sendCommand({ tabId: o.tabId }, 'Input.dispatchMouseEvent', {
-        type: 'mouseReleased',
-        x: fresh.x,
-        y: fresh.y,
-        button: 'left',
-        clickCount: 1,
-      });
-    } catch {
-      throw Error('INPUT_OUTCOME_UNKNOWN');
-    }
-  }
-  return {
-    status: 'ACKNOWLEDGED',
-    evidence: { inputDispatched: true, note: '业务结果必须再观察核验；不能将本状态标成任务成功' },
-  };
-}
-async function handle(command: Command, g: number) {
-  let dispatched = false;
-  let entry: Saved | undefined;
-  try {
-    if (command.version !== VERSION || !command.commandId || !command.operationId)
-      throw Error('PROTOCOL_REJECTED');
-    command.action = Action.parse(command.action);
-    guard(command, g);
-    const prepared = await journal.prepare(command);
-    entry = prepared.entry;
-    if (!prepared.fresh && entry) {
-      send({
-        type: 'RESULT',
-        commandId: command.commandId,
-        status: entry.status === 'DISPATCHING' ? 'UNKNOWN' : entry.status,
-        evidence: entry.evidence,
-        error: entry.error,
-      });
-      return;
-    }
-    guard(command, g);
-    dispatched = true;
-    const result = await execute(command, g);
-    if (entry) await journal.finish(entry, result);
-    send({ type: 'RESULT', commandId: command.commandId, ...result });
-  } catch (e) {
-    const error = e instanceof Error ? e.message : 'ERROR';
-    const preconditions = [
-      'STALE_OBSERVATION',
-      'TARGET_AMBIGUOUS',
-      'TARGET_DISABLED',
-      'TARGET_HIDDEN',
-      'TARGET_OCCLUDED',
-      'TARGET_MOVED',
-      'SCOPE_AMBIGUOUS',
-      'FOCUS_FAILED',
-      'TAB_NOT_OWNED',
-      'TAB_SCOPE_CHANGED',
-      'MEDIA_CHANGED',
-      'MEDIA_STATE_CHANGED',
-    ];
-    const status: Reply['status'] =
-      !isWrite(command.action) || !dispatched || preconditions.some((code) => error.includes(code))
-        ? 'FAILED'
-        : 'UNKNOWN';
-    // A rejected capacity check must not itself grow the journal.
-    if (entry) await journal.finish(entry, { status, error });
-    send({ type: 'RESULT', commandId: command.commandId, status, error });
-    if (status === 'UNKNOWN') {
-      void freeze('UNKNOWN').catch(() => {});
-      send({ type: 'LOCAL_STOP' });
-    }
-  }
-}
 let freezing: Promise<void> | undefined;
 async function bounded<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(Error('KERNEL_STOP_UNCONFIRMED')), ms);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await withBoundedWait(promise, ms);
+  if (!res.completed) throw Error('KERNEL_STOP_UNCONFIRMED');
+  return res.value;
 }
 function freeze(_reason: string, options: { timeoutMs?: number } = {}): Promise<void> {
-  // An existing cleanup has already revoked input. Each caller can bound its own wait.
   if (freezing) return bounded(freezing, options.timeoutMs ?? defaultFreezeTimeoutMs);
   const token = ++freezeSerial,
     serial = connectionSerial,
-    originalKernel = kernel;
-  const originalEpoch = epoch;
-  const grantedLeaseUntil = leaseUntil;
+    originalKernel = kernel,
+    grantedLeaseUntil = leaseUntil;
   paused = true;
-  generation++;
   leaseUntil = 0;
   stopping = true;
-  const tabsToDetach = [...attached];
-  frames.clear();
-  const current = () =>
-    token === freezeSerial &&
-    serial === connectionSerial &&
-    originalKernel === kernel &&
-    epoch === originalEpoch;
-  // Start detach before waiting for writes: renderer requests may require detach to settle.
-  const detached = Promise.all(
-    tabsToDetach.map(async (tabId) => {
-      try {
-        await bounded(chrome.debugger.detach({ tabId }), 3_000);
-      } catch (error) {
-        if (!isBenignDetachError(error)) throw error;
-      }
-      if (current()) attached.delete(tabId);
-    }),
-  );
-  const work = Promise.all([detached, originalKernel.freeze(), commands.drainWrites()]);
-  freezing = bounded(work, options.timeoutMs ?? defaultFreezeTimeoutMs)
+  freezing = bounded(originalKernel.freeze(), options.timeoutMs ?? defaultFreezeTimeoutMs)
     .then(() => {
-      if (!current()) throw Error('KERNEL_STOP_UNCONFIRMED');
-      kernelStopUnconfirmed = false;
-      leaseUntil = Math.max(leaseUntil, grantedLeaseUntil);
-    })
-    .catch(() => {
-      if (current()) kernelStopUnconfirmed = true;
-      throw Error('KERNEL_STOP_UNCONFIRMED');
+      if (token === freezeSerial && serial === connectionSerial && originalKernel === kernel)
+        leaseUntil = Math.max(leaseUntil, grantedLeaseUntil);
     })
     .finally(() => {
       if (token === freezeSerial) {
@@ -647,60 +168,223 @@ async function proof(challenge: string) {
     (x) => x.toString(16).padStart(2, '0'),
   ).join('');
 }
-async function connect() {
-  if (
-    manualPauseReconnect ||
-    connecting ||
-    socket?.readyState === WebSocket.OPEN ||
-    !reconnectBackoff.canAttempt(performance.now())
-  )
-    return;
+const isSocketActive = (): boolean =>
+  !!socket &&
+  (socket.readyState === WebSocket.OPEN ||
+    socket.readyState === (WebSocket.CONNECTING ?? 0) ||
+    socket.readyState === (WebSocket.CLOSING ?? 2));
+const clearReconnectTimer = () => {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
   }
+};
+async function handleStatelessCommand(command: Command): Promise<void> {
+  const sendRes = (extra: Record<string, unknown>) =>
+    send({ type: 'RESULT', commandId: command.commandId, ...extra });
+  try {
+    if (command.version !== VERSION || !command.commandId || !command.operationId)
+      throw Error('PROTOCOL_REJECTED');
+    const action = Action.parse(command.action);
+    if (
+      stopping ||
+      isWrite(action) ||
+      socket?.readyState !== WebSocket.OPEN ||
+      command.connectionEpoch !== epoch ||
+      Date.now() > leaseUntil ||
+      Date.now() > command.deadline
+    )
+      throw Error('LEASE_OR_STOP_REJECTED');
+    if (action.kind !== 'readFacebookDisplay')
+      throw Error('STATELESS_EXTENSION_COMMAND_UNSUPPORTED');
+    const tabs = await chrome.tabs.query({ url: 'https://www.facebook.com/*' }),
+      byActive = (a: chrome.tabs.Tab, b: chrome.tabs.Tab) => Number(b.active) - Number(a.active),
+      tab =
+        tabs.filter((t) => t.url === 'https://www.facebook.com/').sort(byActive)[0] ??
+        tabs
+          .filter((t) => typeof t.url === 'string' && t.url.startsWith('https://www.facebook.com/'))
+          .sort(byActive)[0];
+    if (tab?.id === undefined)
+      return sendRes({ status: 'VERIFIED', evidence: { available: false } });
+    const execMain = <A extends unknown[], R>(func: (...a: A) => R, args: A) =>
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id as number },
+        world: 'MAIN',
+        func,
+        args,
+      });
+    const [pages, actors] = await Promise.all([
+      execMain(projectPage, [action.projection]),
+      execMain(projectFacebookDocumentIdentity, [
+        tab.url === 'https://www.facebook.com/' ? 'home' : 'browse',
+      ]),
+    ]);
+    const page = pages.find((r) => r.frameId === 0),
+      actor = actors.find((r) => r.frameId === 0);
+    if (!page?.documentId || page.documentId !== actor?.documentId)
+      throw Error('INSPECTION_DOCUMENT_CHANGED');
+    sendRes({
+      status: 'VERIFIED',
+      evidence: { available: true, tabId: tab.id, page: page.result, identity: actor.result },
+    });
+  } catch (e) {
+    sendRes({ status: 'FAILED', error: e instanceof Error ? e.message : 'ERROR' });
+  }
+}
+function assertLifecycleReady(incoming: Record<string, unknown>, ws: WebSocket): boolean {
+  if (
+    connectionStage !== 'ready' ||
+    ws.readyState !== WebSocket.OPEN ||
+    incoming.connectionEpoch !== epoch ||
+    !Id.safeParse(incoming.requestId).success
+  ) {
+    ws.close(1008, 'PROTOCOL_REJECTED');
+    return false;
+  }
+  return true;
+}
+const closeBrowserSocket = (ws: WebSocket) => {
+  send({ type: 'PONG', connectionEpoch: epoch, windowCount: 0, profileWindowFocused: false });
+  ws.close(1000, 'BROWSER_WINDOW_CLOSED');
+};
+function handleLifecycleSocketMessage(
+  incoming: Record<string, unknown>,
+  serial: number,
+  ws: WebSocket,
+): boolean {
+  const runLifecycle = (
+    flag: 'reload' | 'close',
+    reason: string,
+    body: () => Promise<void>,
+    onErr?: (err: unknown) => void,
+  ) => {
+    const busy = flag === 'reload' ? reloadingExtension : closingBrowserWindows;
+    if (!assertLifecycleReady(incoming, ws) || busy) return true;
+    const setBusy = (v: boolean) =>
+      flag === 'reload' ? (reloadingExtension = v) : (closingBrowserWindows = v);
+    setBusy(true);
+    void (async () => {
+      try {
+        await freeze(reason, { timeoutMs: reloadFreezeTimeoutMs }).catch(() => {});
+        await body();
+      } catch (err) {
+        onErr?.(err);
+      } finally {
+        setBusy(false);
+      }
+    })();
+    return true;
+  };
+  if (incoming.type === 'RELOAD_EXTENSION')
+    return runLifecycle('reload', 'EXTENSION_RELOAD', async () => {
+      if (
+        serial !== connectionSerial ||
+        ws.readyState !== WebSocket.OPEN ||
+        epoch !== incoming.connectionEpoch
+      )
+        return;
+      send({
+        type: 'EXTENSION_RELOADING',
+        extensionVersion: reportedExtensionVersion(),
+        requestId: incoming.requestId,
+        connectionEpoch: epoch,
+      });
+      chrome.runtime.reload();
+    });
+  if (incoming.type === 'CLOSE_BROWSER_WINDOWS') {
+    const sendClosed = (ok: boolean, closedCount: number, remainingCount: number, error?: string) =>
+      serial === connectionSerial &&
+      ws.readyState === WebSocket.OPEN &&
+      (send({
+        type: 'BROWSER_WINDOWS_CLOSED',
+        requestId: incoming.requestId,
+        connectionEpoch: epoch,
+        ok,
+        closedCount,
+        remainingCount,
+        ...(error !== undefined ? { error } : {}),
+      }),
+      true);
+    return runLifecycle(
+      'close',
+      'BROWSER_CLOSE_REQUESTED',
+      async () => {
+        const { closedCount, remainingCount } = await closeProfileWindows();
+        if (remainingCount > 0)
+          return void sendClosed(false, closedCount, remainingCount, 'BROWSER_CLOSE_BLOCKED');
+        if (sendClosed(true, closedCount, 0)) closeBrowserSocket(ws);
+      },
+      (err) => sendClosed(false, 0, 1, err instanceof Error ? err.message : 'BROWSER_CLOSE_FAILED'),
+    );
+  }
+  return false;
+}
+function dispatchSocketWindowMessage(m: Record<string, unknown>): boolean {
+  const replyRpc = (type: string, run: () => Promise<Record<string, unknown>>) => {
+    void run().then(
+      (result) => send({ type, requestId: m.requestId, connectionEpoch: epoch, ...result }),
+      (error) =>
+        send({
+          type,
+          requestId: m.requestId,
+          connectionEpoch: epoch,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    );
+    return true;
+  };
+  const map: Record<string, [string, () => Promise<Record<string, unknown>>]> = {
+    REVEAL_BROWSER_WINDOW: ['BROWSER_WINDOW_REVEALED', () => revealBrowserWindow()],
+    CLEANUP_EXTRA_TABS: [
+      'EXTRA_TABS_CLEANED',
+      () => cleanupExtraTabs(Boolean(m.preferActiveTab), new Set()),
+    ],
+    INSPECT_BROWSER_WINDOW: ['BROWSER_WINDOW_INSPECTED', () => inspectBrowserWindow()],
+    POSITION_BROWSER_WINDOW: [
+      'BROWSER_WINDOW_POSITIONED',
+      async () => {
+        const result = await positionBrowserWindow(m.bounds as WindowBounds, Boolean(m.focus));
+        await kernel.exposePositionedWindow(result.tabId);
+        return result;
+      },
+    ],
+  };
+  const entry = typeof m.type === 'string' ? map[m.type] : undefined;
+  return entry ? replyRpc(entry[0], entry[1]) : false;
+}
+async function connect() {
+  const canTry = () =>
+    !manualPauseReconnect && !isSocketActive() && reconnectBackoff.canAttempt(performance.now());
+  if (connecting || !canTry()) return;
+  clearReconnectTimer();
   connecting = true;
   let openedSocket = false;
   try {
     await ready;
-    if (
-      manualPauseReconnect ||
-      socket?.readyState === WebSocket.OPEN ||
-      !reconnectBackoff.canAttempt(performance.now())
-    )
-      return;
+    if (!canTry()) return;
     try {
-      const windows = await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] });
-      if (windows.length === 0) return;
+      if ((await chrome.windows.getAll({ windowTypes: ['normal', 'popup'] })).length === 0) return;
     } catch {}
-    if (
-      manualPauseReconnect ||
-      socket?.readyState === WebSocket.OPEN ||
-      !reconnectBackoff.canAttempt(performance.now())
-    )
-      return;
+    if (!canTry()) return;
     openedSocket = true;
   } finally {
     if (!openedSocket) connecting = false;
   }
   connectionStage = 'connecting';
-  const serial = ++connectionSerial;
-  const ws = new WebSocket('ws://127.0.0.1:18767/bridge');
+  const serial = ++connectionSerial,
+    ws = new WebSocket('ws://127.0.0.1:18767/bridge');
   socket = ws;
   let inbox = Promise.resolve();
-  const heartbeat = new ProfileHeartbeat(
+  const heartbeat = (activeHeartbeat = new ProfileHeartbeat(
     () => serial === connectionSerial && ws.readyState === WebSocket.OPEN,
     () => epoch,
     send,
     () => chrome.windows.getAll({ windowTypes: ['normal', 'popup'] }),
     (focused) => {
-      if (focused && !isProgrammaticWindowMoveActive()) {
-        recordUserWindowFocus(Date.now());
-      }
+      if (focused && !isProgrammaticWindowMoveActive()) recordUserWindowFocus(Date.now());
       return getLastUserFocusedAt();
     },
-  );
-  activeHeartbeat = heartbeat;
+  ));
   ws.onmessage = (event) => {
     if (serial !== connectionSerial) return;
     let incoming: unknown;
@@ -710,10 +394,10 @@ async function connect() {
       ws.close(1008, 'PROTOCOL_REJECTED');
       return;
     }
-    const deadline = heartbeatLeaseDeadline(incoming, epoch, Date.now(), LEASE_MS);
-    if (deadline !== null) {
+    const fastDeadline = heartbeatLeaseDeadline(incoming, epoch, Date.now(), LEASE_MS);
+    if (fastDeadline !== null) {
       reconnectBackoff.healthy(performance.now());
-      leaseUntil = deadline;
+      leaseUntil = fastDeadline;
       heartbeat.pulse();
       return;
     }
@@ -721,124 +405,23 @@ async function connect() {
       incoming &&
       typeof incoming === 'object' &&
       'type' in incoming &&
-      incoming.type === 'RELOAD_EXTENSION'
-    ) {
-      const request = incoming as Record<string, unknown>;
-      if (
-        connectionStage !== 'ready' ||
-        ws.readyState !== WebSocket.OPEN ||
-        request.connectionEpoch !== epoch ||
-        !Id.safeParse(request.requestId).success
-      ) {
-        ws.close(1008, 'PROTOCOL_REJECTED');
-        return;
-      }
-      if (reloadingExtension) return;
-      reloadingExtension = true;
-      void (async () => {
-        let dispatched = false;
-        try {
-          await freeze('EXTENSION_RELOAD', { timeoutMs: reloadFreezeTimeoutMs }).catch(() => {});
-          if (
-            serial !== connectionSerial ||
-            ws.readyState !== WebSocket.OPEN ||
-            epoch !== request.connectionEpoch
-          )
-            return;
-          // This acknowledges a reload request, never a successful business stop.
-          send({
-            type: 'EXTENSION_RELOADING',
-            extensionVersion: reportedExtensionVersion(),
-            requestId: request.requestId,
-            connectionEpoch: epoch,
-          });
-          chrome.runtime.reload();
-          dispatched = true;
-        } finally {
-          if (!dispatched) reloadingExtension = false;
-        }
-      })().catch(() => {
-        reloadingExtension = false;
-      });
+      handleLifecycleSocketMessage(incoming as Record<string, unknown>, serial, ws)
+    )
       return;
-    }
-    if (
-      incoming &&
-      typeof incoming === 'object' &&
-      'type' in incoming &&
-      incoming.type === 'CLOSE_BROWSER_WINDOWS'
-    ) {
-      const request = incoming as Record<string, unknown>;
-      if (
-        connectionStage !== 'ready' ||
-        ws.readyState !== WebSocket.OPEN ||
-        request.connectionEpoch !== epoch ||
-        !Id.safeParse(request.requestId).success
-      ) {
-        ws.close(1008, 'PROTOCOL_REJECTED');
-        return;
-      }
-      if (closingBrowserWindows) return;
-      closingBrowserWindows = true;
-      void (async () => {
-        try {
-          await freeze('BROWSER_CLOSE_REQUESTED', { timeoutMs: reloadFreezeTimeoutMs }).catch(
-            () => {},
-          );
-          const { closedCount, remainingCount } = await closeProfileWindows();
-          if (serial !== connectionSerial || ws.readyState !== WebSocket.OPEN) return;
-          if (remainingCount > 0) {
-            send({
-              type: 'BROWSER_WINDOWS_CLOSED',
-              requestId: request.requestId,
-              connectionEpoch: epoch,
-              ok: false,
-              error: 'BROWSER_CLOSE_BLOCKED',
-              closedCount,
-              remainingCount,
-            });
-            return;
-          }
-          send({
-            type: 'BROWSER_WINDOWS_CLOSED',
-            requestId: request.requestId,
-            connectionEpoch: epoch,
-            ok: true,
-            closedCount,
-            remainingCount: 0,
-          });
-          send({
-            type: 'PONG',
-            connectionEpoch: epoch,
-            windowCount: 0,
-            profileWindowFocused: false,
-          });
-          ws.close(1000, 'BROWSER_WINDOW_CLOSED');
-        } catch (err) {
-          if (serial === connectionSerial && ws.readyState === WebSocket.OPEN) {
-            send({
-              type: 'BROWSER_WINDOWS_CLOSED',
-              requestId: request.requestId,
-              connectionEpoch: epoch,
-              ok: false,
-              error: err instanceof Error ? err.message : 'BROWSER_CLOSE_FAILED',
-              closedCount: 0,
-              remainingCount: 1,
-            });
-          }
-        } finally {
-          closingBrowserWindows = false;
-        }
-      })().catch(() => {
-        closingBrowserWindows = false;
-      });
-      return;
-    }
     inbox = inbox
       .then(async () => {
         try {
           if (serial !== connectionSerial) return;
-          const m = JSON.parse(event.data);
+          const m = incoming as Record<string, unknown> & {
+            type?: string;
+            version?: number;
+            capabilities?: unknown;
+            challenge?: string;
+            connectionEpoch?: string;
+            leaseMs?: number;
+            secret?: string;
+            requestId?: string;
+          };
           if (m.type === 'CHALLENGE') {
             connectionStage = 'authenticating';
             if (m.version !== VERSION) throw Error('VERSION_MISMATCH');
@@ -849,7 +432,9 @@ async function connect() {
                 extensionVersion: reportedExtensionVersion(),
                 capabilities: bridgeHelloCapabilities(m.capabilities),
                 profileId,
-                ...(secret ? { proof: await proof(m.challenge) } : {}),
+                ...(secret && typeof m.challenge === 'string'
+                  ? { proof: await proof(m.challenge) }
+                  : {}),
               }),
             );
           } else if (m.type === 'WELCOME') {
@@ -857,20 +442,15 @@ async function connect() {
             connecting = false;
             paused = true;
             const oldKernel = kernel;
-            await freeze('WELCOME_RESET', { timeoutMs: welcomeFreezeTimeoutMs }).catch(() => {
-              kernelStopUnconfirmed = true;
-            });
+            await freeze('WELCOME_RESET', { timeoutMs: welcomeFreezeTimeoutMs }).catch(() => {});
             if (serial !== connectionSerial || ws.readyState !== WebSocket.OPEN) return;
-            kernelStopUnconfirmed ||= oldKernel.isStopUnconfirmed();
             oldKernel.abandon();
-            // A timed-out cleanup may still settle later. Retire its global-finalizer token.
             ++freezeSerial;
             freezing = undefined;
             stopping = false;
-            epoch = m.connectionEpoch;
+            epoch = String(m.connectionEpoch ?? '');
             kernel = createChannel(epoch);
-            kernel.setStopUnconfirmed(kernelStopUnconfirmed);
-            leaseUntil = Date.now() + Math.min(m.leaseMs, LEASE_MS);
+            leaseUntil = Date.now() + Math.min(Number(m.leaseMs ?? 0), LEASE_MS);
             if (m.secret) {
               secret = m.secret;
               await chrome.storage.local.set({ secret });
@@ -883,136 +463,33 @@ async function connect() {
             manualPauseReconnect = true;
             connectionFailure = 'PROFILE_REMOVED';
             ws.close(1000, 'PROFILE_REMOVED');
-            return;
           } else if (m.connectionEpoch !== epoch) throw Error('EPOCH_REJECTED');
           else if (m.type === 'HEARTBEAT') {
             const deadline = heartbeatLeaseDeadline(m, epoch, Date.now(), LEASE_MS);
             if (deadline === null) throw Error('HEARTBEAT_REJECTED');
             leaseUntil = deadline;
             heartbeat.pulse();
-          } else if (m.type === 'REVEAL_BROWSER_WINDOW') {
-            const requestEpoch = epoch;
-            void revealBrowserWindow().then(
-              (result) =>
-                send({
-                  type: 'BROWSER_WINDOW_REVEALED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  ...result,
-                }),
-              (error) =>
-                send({
-                  type: 'BROWSER_WINDOW_REVEALED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  error: error instanceof Error ? error.message : String(error),
-                }),
-            );
-          } else if (m.type === 'CLEANUP_EXTRA_TABS') {
-            const requestEpoch = epoch;
-            void cleanupExtraTabs(Boolean(m.preferActiveTab), new Set(owned.keys())).then(
-              (result) =>
-                send({
-                  type: 'EXTRA_TABS_CLEANED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  ...result,
-                }),
-              (error) =>
-                send({
-                  type: 'EXTRA_TABS_CLEANED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  error: error instanceof Error ? error.message : String(error),
-                }),
-            );
-          } else if (m.type === 'INSPECT_BROWSER_WINDOW') {
-            const requestEpoch = epoch;
-            void inspectBrowserWindow().then(
-              (result) =>
-                send({
-                  type: 'BROWSER_WINDOW_INSPECTED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  ...result,
-                }),
-              (error) =>
-                send({
-                  type: 'BROWSER_WINDOW_INSPECTED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  error: error instanceof Error ? error.message : String(error),
-                }),
-            );
-          } else if (m.type === 'POSITION_BROWSER_WINDOW') {
-            const requestEpoch = epoch;
-            void positionBrowserWindow(m.bounds, Boolean(m.focus))
-              .then(async (result) => {
-                await kernel.exposePositionedWindow(result.tabId);
-                send({
-                  type: 'BROWSER_WINDOW_POSITIONED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  ...result,
-                });
-              })
-              .catch((error) =>
-                send({
-                  type: 'BROWSER_WINDOW_POSITIONED',
-                  requestId: m.requestId,
-                  connectionEpoch: requestEpoch,
-                  error: error instanceof Error ? error.message : String(error),
-                }),
-              );
-          } else if (m.type === 'KERNEL_REQUEST') {
-            // Do not await a long Runtime call here: STOP must remain processable.
-            kernel.receive(m);
-          } else if (m.type === 'PRESENTATION_RECOVERY_PERMIT') {
-            kernel.presentationRecoveryPermit(m);
-          } else if (m.type === 'SYNC') {
-            try {
-              await freeze('SYNC');
-            } catch {
-              kernelStopUnconfirmed = true;
-              if (serial === connectionSerial && m.connectionEpoch === epoch)
-                send({
-                  type: 'SYNC_UNCONFIRMED',
-                  requestId: m.requestId,
-                  connectionEpoch: epoch,
-                  error: 'KERNEL_STOP_UNCONFIRMED',
-                });
-              return;
-            }
-            if (kernelStopUnconfirmed) return;
-            const entries = await journal.snapshot();
+          } else if (dispatchSocketWindowMessage(m)) return;
+          else if (m.type === 'KERNEL_REQUEST') kernel.receive(m);
+          else if (m.type === 'PRESENTATION_RECOVERY_PERMIT') kernel.presentationRecoveryPermit(m);
+          else if (m.type === 'SYNC' || m.type === 'STOP') {
+            await freeze(m.type === 'SYNC' ? 'SYNC' : 'CORE_STOP').catch(() => {});
             if (serial !== connectionSerial || m.connectionEpoch !== epoch) return;
-            send({ type: 'SYNC_STATE', requestId: m.requestId, connectionEpoch: epoch, entries });
+            send(
+              m.type === 'SYNC'
+                ? {
+                    type: 'SYNC_STATE',
+                    requestId: m.requestId,
+                    connectionEpoch: epoch,
+                    entries: [],
+                  }
+                : { type: 'STOPPED', requestId: m.requestId, connectionEpoch: epoch },
+            );
           } else if (m.type === 'RESUME') {
-            if (kernelStopUnconfirmed || kernel.isStopUnconfirmed()) return;
-            if (stopping || Date.now() >= leaseUntil) throw Error('RESUME_NOT_READY');
             paused = false;
             send({ type: 'RESUMED', requestId: m.requestId, connectionEpoch: epoch });
-          } else if (m.type === 'STOP') {
-            try {
-              await freeze('CORE_STOP');
-            } catch {
-              kernelStopUnconfirmed = true;
-              if (serial === connectionSerial && m.connectionEpoch === epoch)
-                send({
-                  type: 'STOP_UNCONFIRMED',
-                  requestId: m.requestId,
-                  connectionEpoch: epoch,
-                  error: 'KERNEL_STOP_UNCONFIRMED',
-                });
-              return;
-            }
-            if (serial !== connectionSerial || m.connectionEpoch !== epoch) return;
-            send({ type: 'STOPPED', requestId: m.requestId, connectionEpoch: epoch });
           } else if (m.type === 'COMMAND') {
-            const receivedGeneration = generation;
-            void commands
-              .enqueue(isWrite(Action.parse(m.action)), () => handle(m, receivedGeneration))
-              .catch(() => {});
+            void handleStatelessCommand(m as unknown as Command);
           }
         } catch {
           connectionFailure = 'PROTOCOL_REJECTED';
@@ -1029,12 +506,10 @@ async function connect() {
       connectionFailure = event.reason;
     else if (!connectionFailure) connectionFailure = 'CONNECTION_CLOSED';
     void freeze('DISCONNECTED', { timeoutMs: disconnectFreezeTimeoutMs })
-      .catch(() => {
-        if (serial === connectionSerial) kernelStopUnconfirmed = true;
-      })
+      .catch(() => {})
       .finally(() => {
         if (serial !== connectionSerial) return;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
+        clearReconnectTimer();
         if (manualPauseReconnect) return;
         reconnectTimer = setTimeout(() => {
           void connect().catch(() => {});
@@ -1042,142 +517,65 @@ async function connect() {
       });
   };
   ws.onerror = () => {
+    if (serial !== connectionSerial) return;
     connectionFailure = 'NETWORK_UNAVAILABLE';
     ws.close();
   };
 }
+const wakeAndConnect = (clearManualPause = false, checkCooldown = false) => {
+  if (clearManualPause) manualPauseReconnect = false;
+  if (
+    manualPauseReconnect ||
+    connecting ||
+    isSocketActive() ||
+    (checkCooldown && !reconnectBackoff.canAttempt(performance.now()))
+  )
+    return;
+  reconnectBackoff.reset();
+  clearReconnectTimer();
+  void connect().catch(() => {});
+};
 if (typeof chrome !== 'undefined' && chrome?.debugger?.onEvent) {
-  chrome.debugger.onEvent.addListener((source, method, p: any) => {
+  chrome.debugger.onEvent.addListener((source, method, p?: object) => {
     if (source.tabId !== undefined)
       kernel.event({ tabId: source.tabId, sessionId: source.sessionId }, method, p);
-    const o = source.tabId ? owned.get(source.tabId) : undefined;
-    if (!o) return;
-    if (method === 'Page.frameNavigated' && !source.sessionId && !p.frame.parentId) {
-      o.documentEpoch++;
-      o.routeEpoch++;
-      void saveOwned();
-    }
-    if (method === 'Page.navigatedWithinDocument' && !source.sessionId) {
-      o.routeEpoch++;
-      void saveOwned();
-    }
-    if (method === 'Target.attachedToTarget' && p.targetInfo.type === 'iframe') {
-      frames.set(p.targetInfo.targetId, { tabId: o.tabId, sessionId: p.sessionId });
-      void chrome.debugger
-        .sendCommand({ tabId: o.tabId, sessionId: p.sessionId }, 'Target.setAutoAttach', {
-          autoAttach: true,
-          waitForDebuggerOnStart: false,
-          flatten: true,
-          filter: [{ type: 'iframe', exclude: false }],
-        })
-        .catch(() => {});
-    }
-    if (method === 'Target.detachedFromTarget')
-      for (const [id, f] of frames) if (f.sessionId === p.sessionId) frames.delete(id);
   });
-  chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId !== undefined) kernel.detached(source.tabId, reason);
-    if (source.tabId === undefined || !attached.has(source.tabId)) return;
-    if (!stopping) {
-      void freeze('DEBUGGER_DETACHED').catch(() => {});
-      send({ type: 'LOCAL_STOP' });
-    }
-  });
-  chrome.tabs.onRemoved.addListener((tabId) => {
-    kernel.removed(tabId);
-    owned.delete(tabId);
-    attached.delete(tabId);
-    void saveOwned();
-  });
-  chrome.windows.onCreated.addListener(() => {
-    manualPauseReconnect = false;
-    reconnectBackoff.reset();
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = undefined;
-    }
-    void connect().catch(() => {});
-  });
+  chrome.debugger.onDetach.addListener(
+    (s, r) => s.tabId !== undefined && kernel.detached(s.tabId, r),
+  );
+  chrome.tabs.onRemoved.addListener((tabId) => kernel.removed(tabId));
+  chrome.windows.onCreated.addListener(() => wakeAndConnect(true));
   chrome.windows.onRemoved.addListener(() => {
     void chrome.windows
       .getAll({ windowTypes: ['normal', 'popup'] })
       .then((windows) => {
-        if (windows.length === 0 && socket?.readyState === WebSocket.OPEN) {
-          send({
-            type: 'PONG',
-            connectionEpoch: epoch,
-            windowCount: 0,
-            profileWindowFocused: false,
-          });
-          socket.close(1000, 'BROWSER_WINDOW_CLOSED');
-        }
+        if (windows.length === 0 && socket?.readyState === WebSocket.OPEN)
+          closeBrowserSocket(socket);
       })
       .catch(() => {});
   });
 }
-function tryWakeReconnect() {
-  if (
-    manualPauseReconnect ||
-    connecting ||
-    socket?.readyState === WebSocket.OPEN ||
-    !reconnectBackoff.canAttempt(performance.now())
-  )
-    return;
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = undefined;
-  }
-  void connect().catch(() => {});
-}
-if (
-  typeof chrome !== 'undefined' &&
-  typeof chrome.windows?.onFocusChanged?.addListener === 'function'
-) {
-  chrome.windows.onFocusChanged.addListener((windowId) => {
-    if (
-      typeof windowId !== 'number' ||
-      windowId === chrome.windows.WINDOW_ID_NONE ||
-      windowId < 0 ||
-      isProgrammaticWindowMoveActive()
-    )
-      return;
-    tryWakeReconnect();
-    void chrome.windows
-      .get(windowId)
-      .then((win) => {
-        if (win?.focused && (!win.type || win.type === 'normal')) {
-          recordUserWindowFocus(Date.now());
-          activeHeartbeat?.pulse();
-        }
-      })
-      .catch(() => {});
-  });
-}
-if (
-  typeof chrome !== 'undefined' &&
-  typeof chrome.windows?.onBoundsChanged?.addListener === 'function'
-) {
-  chrome.windows.onBoundsChanged.addListener((win) => {
+const pulseIfNormalWin = (win: chrome.windows.Window | undefined) => {
     if (!isProgrammaticWindowMoveActive() && win?.focused && (!win.type || win.type === 'normal')) {
       recordUserWindowFocus(Date.now());
       activeHeartbeat?.pulse();
     }
-  });
-}
-if (typeof chrome !== 'undefined' && typeof chrome.tabs?.onActivated?.addListener === 'function') {
-  chrome.tabs.onActivated.addListener((activeInfo) => {
+  },
+  noteWindowIdFocus = (windowId: number) => {
     if (isProgrammaticWindowMoveActive()) return;
-    tryWakeReconnect();
+    wakeAndConnect(false, true);
     void chrome.windows
-      .get(activeInfo.windowId)
-      .then((win) => {
-        if (win?.focused && (!win.type || win.type === 'normal')) {
-          recordUserWindowFocus(Date.now());
-          activeHeartbeat?.pulse();
-        }
-      })
+      .get(windowId)
+      .then(pulseIfNormalWin)
       .catch(() => {});
+  };
+if (typeof chrome !== 'undefined') {
+  chrome.windows?.onFocusChanged?.addListener((id) => {
+    if (typeof id === 'number' && id !== chrome.windows.WINDOW_ID_NONE && id >= 0)
+      noteWindowIdFocus(id);
   });
+  chrome.windows?.onBoundsChanged?.addListener(pulseIfNormalWin);
+  chrome.tabs?.onActivated?.addListener((info) => noteWindowIdFocus(info.windowId));
 }
 if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -1202,25 +600,13 @@ if (typeof chrome !== 'undefined' && chrome?.runtime?.onMessage) {
           paired: Boolean(secret),
           paused,
           leaseRemainingMs: Math.max(0, leaseUntil - Date.now()),
-          ownedTabs: [...owned.keys()],
+          ownedTabs: [],
         });
     })().catch((e) => reply({ error: e.message }));
     return true;
   });
-  chrome.alarms.onAlarm.addListener(() => {
-    if (manualPauseReconnect || connecting || socket?.readyState === WebSocket.OPEN) return;
-    reconnectBackoff.reset();
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = undefined;
-    }
-    void connect().catch(() => {});
-  });
-  chrome.runtime.onStartup.addListener(() => {
-    manualPauseReconnect = false;
-    reconnectBackoff.reset();
-    void connect().catch(() => {});
-  });
+  chrome.alarms.onAlarm.addListener(() => wakeAndConnect());
+  chrome.runtime.onStartup.addListener(() => wakeAndConnect(true));
   void chrome.alarms.create('reconnect', { periodInMinutes: 0.5 });
   setInterval(() => {
     kernel.expire();

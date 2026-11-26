@@ -1,427 +1,105 @@
-import { invitationDigest, prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
-import { FacebookGroupSessionHelper } from './facebook-group-session.js';
-import { dismissUnexpectedFacebookOverlays } from './facebook-overlay-dismisser.js';
-import { devDiag } from '../shared/dev-diagnostics.js';
-import type { Awaitable } from '../domain/persistence.js';
-import { randomUUID, createHash } from 'node:crypto';
-import type { Core } from '../bridge/core.js';
-import type { KernelBridge } from './kernel-bridge.js';
+import { createHash, randomUUID } from 'node:crypto';
+import type { Locator, Page } from 'playwright-core';
+import type { GlobalAccountAbnormalReporter } from '../application/account-abnormal-reporter.js';
 import type {
   GroupInviterBrowserRunner,
   GroupInviterRepository,
   GroupInviterRunCallbacks,
 } from '../application/group-inviter-service.js';
-import type { InviterGroupRow } from '../shared/group-inviter.js';
+import type { Core } from '../bridge/core.js';
+import type { Awaitable } from '../domain/persistence.js';
 import { ProductError } from '../domain/workspace.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
+import { isLocalAvatar } from '../shared/group-bumper.js';
+import type { InviterGroupRow } from '../shared/group-inviter.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
+import {
+  FacebookGroupSessionHelper,
+  reportGlobalRouteAbnormalIfNeeded,
+} from './facebook-group-session.js';
+import { invitationDigest, prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
+import { fetchAndLocalizeAvatar } from './group-bumper-avatar.js';
 import {
   dismissFeatureInterventionDialogIfPresent,
   groupInvitationEffect,
-  readGroupInvitationState,
   inviteDialogSelector,
+  readGroupInvitationState,
 } from './group-inviter-effects.js';
-import { fetchAndLocalizeAvatar, resolveBumperTargetMetadata } from './group-bumper-avatar.js';
-import { isLocalAvatar } from '../shared/group-bumper.js';
-import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
 import {
-  inferAbnormalScopeFromUrl,
-  inferAbnormalStateFromCodeOrMessage,
-  type GlobalAccountAbnormalReporter,
-} from '../application/account-abnormal-reporter.js';
-import type { TargetMetadataRefreshService } from './target-metadata-refresh.js';
-import type { Page, Request, Response, Locator } from 'playwright-core';
-import type { Binding } from '../shared/task-execution.js';
-import type { GroupInvitationState, InvitationMenuItem } from './group-inviter-effects.js';
-
-type Connection = Awaited<ReturnType<KernelBridge['connectFacebook']>>;
-
-const randInt = (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1));
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-export async function clickInvitationControl(
-  button: Locator,
-  validateFallback: () => Promise<boolean>,
-) {
-  await button.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }));
-  await sleep(150);
-  try {
-    await button.click({ timeout: 4000 });
-  } catch (error) {
-    if (!(error instanceof Error) || !/timeout|intercept|outside.*viewport/i.test(error.message))
-      throw error;
-    if (!(await validateFallback())) return;
-    await button.evaluate((el) => {
-      if (
-        !(el instanceof HTMLElement) ||
-        !el.isConnected ||
-        el.getAttribute('aria-disabled') === 'true' ||
-        (el instanceof HTMLButtonElement && el.disabled)
-      )
-        throw Error('GROUP_INVITER_CONTROL_UNAVAILABLE');
-      HTMLElement.prototype.click.call(el);
-    });
-  }
-}
-
-export function mountedInvitationSelectionMatches(
-  state: GroupInvitationState,
-  selectedIds: readonly string[],
-) {
-  const selected = new Set(selectedIds);
-  return state.items.every((item) =>
-    item.checked
-      ? item.id !== null && selected.has(item.id)
-      : item.id === null || !selected.has(item.id),
+  ensureGroupReadyAndJoin,
+  runInviteBatchAndSubmit,
+} from './group-inviter-runner/inviter-flow.js';
+import {
+  clickInvitationControl,
+  collectInvitationConfirmations,
+  confirmedInvitationGraphQL,
+  finalizeInviterConnection,
+  invitationResultStatus,
+  inviterVerificationError,
+  mountedInvitationSelectionMatches,
+  observeInvitationGraphQL,
+  readGroupCoverAndTitle,
+  readInvitationDialogDebugInfo,
+  retryInviterStop,
+  settleInvitationConfirmation,
+  type InvitationSubmission,
+  type InviterConnection,
+  type InviterFlowCtx,
+  type InviterPendingStop,
+  type InviterScope,
+} from './group-inviter-runner/inviter-ops.js';
+import type { KernelBridge } from './kernel-bridge.js';
+export {
+  clickInvitationControl,
+  collectInvitationConfirmations,
+  confirmedInvitationGraphQL,
+  invitationResultStatus,
+  mountedInvitationSelectionMatches,
+  observeInvitationGraphQL,
+  settleInvitationConfirmation,
+  type InvitationSubmission,
+};
+const isGroupRouteUrl = (rawUrl: string, ...groupIds: string[]): boolean => {
+  const route = new URL(rawUrl),
+    seg = route.pathname.split('/');
+  return (
+    route.origin === 'https://www.facebook.com' &&
+    seg[1] === 'groups' &&
+    groupIds.includes(seg[2] ?? '')
   );
-}
-export interface InvitationSubmission {
-  submitted: true;
-  total: number;
-  confirmedIds: string[];
-  pending: number;
-  graphqlConfirmed?: number;
-  fallbackReopens?: number;
-  reloads?: number;
-}
-
-function invitationJSONChunks(body: string): unknown[] | null {
-  const text = body.trim().replace(/^for\s*\(;;\);\s*/, '');
-  try {
-    return [JSON.parse(text) as unknown];
-  } catch {
-    try {
-      return text
-        .split('\n')
-        .filter((line) => line.trim())
-        .map((line) => JSON.parse(line.trim().replace(/^for\s*\(;;\);\s*/, '')) as unknown);
-    } catch {
-      return null;
-    }
-  }
-}
-
-export function confirmedInvitationGraphQL(input: {
-  name: string;
-  variables: unknown;
-  status: number;
-  body: string;
-  accountId: string;
-  groupId: string;
-  selectedIds: readonly string[];
-}): string[] {
-  const record = (v: unknown): v is Record<string, unknown> =>
-    !!v && typeof v === 'object' && !Array.isArray(v);
-  if (
-    input.name !== 'useGroupAddMembersMutation' ||
-    input.status !== 200 ||
-    !record(input.variables) ||
-    !record(input.variables.input)
-  )
-    return [];
-  const variables = input.variables.input;
-  if (variables.actor_id !== input.accountId || variables.group_id !== input.groupId) return [];
-  const chunks = invitationJSONChunks(input.body);
-  if (!chunks?.length) return [];
-  const selected = new Set(input.selectedIds),
-    confirmed = new Set<string>();
-  let matched = false;
-  for (const root of chunks) {
-    if (!record(root)) return [];
-    if (root.errors != null && (!Array.isArray(root.errors) || root.errors.length > 0)) return [];
-    const payload = record(root.data) ? root.data.group_add_member : undefined;
-    if (payload === undefined) continue;
-    if (
-      !record(payload) ||
-      !record(payload.group) ||
-      payload.group.id !== input.groupId ||
-      payload.user_facing_alert !== null
-    )
-      return [];
-    matched = true;
-    for (const key of ['added_users', 'already_invited_users', 'requested_users']) {
-      const users = payload[key];
-      if (!Array.isArray(users)) continue;
-      for (const user of users)
-        if (
-          record(user) &&
-          typeof user.id === 'string' &&
-          /^\d{5,25}$/.test(user.id) &&
-          selected.has(user.id)
-        )
-          confirmed.add(user.id);
-    }
-  }
-  return matched ? [...confirmed] : [];
-}
-
-export async function settleInvitationConfirmation(input: {
-  selectedIds: readonly string[];
-  confirmed: Set<string>;
-  graphql: () => Promise<string[]>;
-  persist: (ids: string[]) => Promise<void>;
-  assertCurrent: () => Promise<void>;
-  fallback: () => Promise<void>;
-}) {
-  const selected = new Set(input.selectedIds);
-  const credit = async () => {
-    const ids = [...new Set(await input.graphql())].filter(
-      (id) => selected.has(id) && !input.confirmed.has(id),
-    );
-    await input.assertCurrent();
-    if (ids.length) {
-      await input.persist(ids);
-      for (const id of ids) input.confirmed.add(id);
-    }
-    return ids.length;
-  };
-  let credited = await credit();
-  if (input.confirmed.size < selected.size) {
-    await input.fallback();
-    // A response body may finish reading while the page fallback is running.
-    credited += await credit();
-  }
-  return credited;
-}
-export function invitationResultStatus(confirmed: number, pending: number) {
-  return pending > 0
-    ? confirmed > 0
-      ? `已确认 ${confirmed} 人 · ${pending} 人待核对`
-      : `邀请已提交 · ${pending} 人待核对`
-    : `已确认 ${confirmed} 人`;
-}
-
-export async function collectInvitationConfirmations(input: {
-  selectedIds: readonly string[];
-  accountId: string;
-  groupId: string;
-  read: () => Promise<GroupInvitationState>;
-  scroll: (state: GroupInvitationState) => Promise<boolean>;
-  persist: (ids: string[]) => Promise<void>;
-  confirmed?: Set<string>;
-  guard: () => void;
-  now?: () => number;
-  wait?: () => Promise<void>;
-  budgetMs?: number;
-  allowHidden?: boolean;
-}) {
-  const confirmed = input.confirmed ?? new Set<string>(),
-    selected = new Set(input.selectedIds),
-    now = input.now ?? Date.now,
-    wait = input.wait ?? (() => sleep(500)),
-    deadline = now() + (input.budgetMs ?? 20000);
-  let origin: number | undefined,
-    stagnant = 0;
-  do {
-    input.guard();
-    const state = await input.read();
-    if (state.verificationRequired)
-      throw new ProductError(
-        'GROUP_INVITER_VERIFICATION_REQUIRED',
-        '受限 · 需要手机验证或操作受限',
-        409,
-      );
-    const url = new URL(state.url);
-    origin ??= state.timeOrigin;
-    if (
-      !state.ready ||
-      (!state.visible && !input.allowHidden) ||
-      state.accountId !== input.accountId ||
-      state.timeOrigin !== origin ||
-      url.pathname.split('/')[2] !== input.groupId ||
-      url.origin !== 'https://www.facebook.com'
-    )
-      throw new ProductError(
-        'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
-        '邀请核对页面发生变化，结果仍待确认，未重发',
-        409,
-      );
-    const found = [...state.items, ...(state.recipients ?? [])]
-      .filter((r) => r.id && selected.has(r.id) && !confirmed.has(r.id) && (r.invited || r.member))
-      .map((r) => r.id)
-      .filter((id): id is string => id !== null);
-    const fresh = [...new Set(found)];
-    if (fresh.length) {
-      await input.persist(fresh);
-      for (const id of fresh) confirmed.add(id);
-      stagnant = 0;
-    }
-    if (confirmed.size === selected.size || now() >= deadline) break;
-    const moved = await input.scroll(state);
-    stagnant = moved || fresh.length ? 0 : stagnant + 1;
-    if (stagnant >= 2) break;
-    await wait();
-  } while (now() < deadline);
-  return confirmed;
-}
-
-async function scrollInvitationList(page: Page, state: GroupInvitationState) {
-  if (!state.dialog || state.dialogIndex === undefined) return false;
-  return page.evaluate((index) => {
-    const d = document.querySelectorAll('[role="dialog"]')[index];
-    if (!d) return false;
-    const allDivs = [d, ...Array.from(d.querySelectorAll('div'))];
-    const scrollable = allDivs.filter((el) => {
-      const s = getComputedStyle(el);
-      return (
-        (/auto|scroll/.test(s.overflowY) || el.scrollHeight > el.clientHeight + 4) &&
-        el.clientHeight > 0 &&
-        el.scrollHeight > el.clientHeight
-      );
-    });
-    const withItems = scrollable.filter((el) =>
-      Boolean(el.querySelector('[role="checkbox"],[role="listitem"],[role="row"]')),
-    );
-    const pool = withItems.length > 0 ? withItems : scrollable;
-    pool.sort((a, b) => {
-      const cbDiff =
-        b.querySelectorAll('[role="checkbox"]').length -
-        a.querySelectorAll('[role="checkbox"]').length;
-      if (cbDiff !== 0) return cbDiff;
-      return b.scrollHeight - b.clientHeight - (a.scrollHeight - a.clientHeight);
-    });
-    const scroller = pool[0];
-    if (!scroller) return false;
-    const before = scroller.scrollTop;
-    scroller.scrollTop += Math.max(100, scroller.clientHeight * 0.75);
-    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-    return scroller.scrollTop !== before;
-  }, state.dialogIndex);
-}
-
-export function observeInvitationGraphQL(
+};
+async function readVerifiedInviteState(
   page: Page,
-  profileId: string,
-  operationId: string,
-  groupId: string,
-  selectedIds: readonly string[],
-  accountId: string,
+  guard: () => void,
+  allowDismiss: boolean,
+  onDismissed?: () => void,
 ) {
-  const requests = new Map<Request, { name: string; variables: unknown; rawVariables: unknown }>(),
-    pending = new Set<Promise<void>>();
-  const confirmed = new Set<string>();
-  let mutationSettled = false,
-    confirmationWaited = false;
-  let submitting = true;
-  const describe = (value: unknown, depth = 0): unknown => {
-    if (value === null) return null;
-    if (Array.isArray(value))
-      return {
-        type: 'array',
-        length: value.length,
-        sample: value.length ? describe(value[0], depth + 1) : null,
-      };
-    if (typeof value === 'object' && value) {
-      if (depth >= 5) return { keys: Object.keys(value).slice(0, 40) };
-      return Object.fromEntries(
-        Object.entries(value)
-          .slice(0, 50)
-          .map(([k, v]) => [k, describe(v, depth + 1)]),
-      );
-    }
-    return typeof value === 'boolean' || typeof value === 'number' ? value : typeof value;
-  };
-  const request = (r: Request) => {
-    try {
-      if (!submitting || new URL(r.url()).pathname !== '/api/graphql/' || r.method() !== 'POST')
-        return;
-      const form = new URLSearchParams(r.postData() ?? '');
-      const name = form.get('fb_api_req_friendly_name') ?? '';
-      const variables = JSON.parse(form.get('variables') ?? '{}');
-      const json = JSON.stringify(variables);
-      requests.set(r, {
-        name,
-        rawVariables: variables,
-        variables: {
-          shape: describe(variables),
-          groupMatched: json.includes(groupId),
-          selectedIdMatches: selectedIds.filter((id) => json.includes(id)).length,
-        },
-      });
-    } catch {
-      /* Diagnostic observation cannot block native input. */
-    }
-  };
-  const response = (r: Response) => {
-    const original = requests.get(r.request());
-    if (!original) return;
-    const work = (async () => {
-      try {
-        const body = await r.text();
-        const ids = confirmedInvitationGraphQL({
-          name: original.name,
-          variables: original.rawVariables,
-          status: r.status(),
-          body,
-          accountId,
-          groupId,
-          selectedIds,
-        });
-        for (const id of ids) confirmed.add(id);
-        const chunks = (invitationJSONChunks(body) ?? []).map((chunk) => describe(chunk));
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_GRAPHQL_OBSERVATION',
-          profileId,
-          operationId,
-          data: {
-            name: original.name,
-            variables: original.variables,
-            httpStatus: r.status(),
-            responseBytes: Buffer.byteLength(body),
-            responseShape: chunks.slice(0, 8),
-            confirmedSelectedIds: ids.length,
-          },
-        });
-      } catch (e) {
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_GRAPHQL_OBSERVATION_FAILED',
-          profileId,
-          operationId,
-          reason: e instanceof Error ? e.message.slice(0, 160) : 'READ_FAILED',
-          data: { name: original.name },
-        });
-      } finally {
-        if (original.name === 'useGroupAddMembersMutation') mutationSettled = true;
-      }
-    })();
-    pending.add(work);
-    void work.finally(() => pending.delete(work));
-  };
-  page.on('request', request);
-  page.on('response', response);
-  return {
-    endSubmission: () => {
-      submitting = false;
-    },
-    hasSettled: () => mutationSettled,
-    confirmations: async () => {
-      if (!confirmationWaited) {
-        confirmationWaited = true;
-        const deadline = Date.now() + 6000;
-        while (!mutationSettled && Date.now() < deadline) await sleep(50);
-      }
-      return [...confirmed];
-    },
-    close: async () => {
-      page.off('request', request);
-      page.off('response', response);
-      await Promise.race([Promise.allSettled([...pending]), sleep(1500)]);
-    },
-  };
+  let state = await readGroupInvitationState(page, guard);
+  if (state.verificationRequired && allowDismiss) {
+    if (await dismissFeatureInterventionDialogIfPresent(page, guard)) onDismissed?.();
+    state = await readGroupInvitationState(page, guard);
+  }
+  if (state.verificationRequired) throw inviterVerificationError();
+  return state;
 }
-
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
   private readonly selectingByGroup = new Map<string, Set<string>>();
-
+  private readonly scopes = new WeakMap<InviterConnection, InviterScope>();
+  private readonly stopping = new Map<string, InviterPendingStop>();
+  constructor(
+    private readonly repo: GroupInviterRepository,
+    private readonly getKernel: () => KernelBridge | undefined,
+    private readonly getCore: () => Core | undefined,
+    private readonly checkProfileBusy?: (profileId: string) => Awaitable<boolean>,
+    private onAccountAbnormal?: GlobalAccountAbnormalReporter,
+  ) {}
   private releaseSelections(groupId: string, owned: Set<string>) {
     const selecting = this.selectingByGroup.get(groupId);
     for (const id of owned) selecting?.delete(id);
     owned.clear();
     if (selecting?.size === 0) this.selectingByGroup.delete(groupId);
   }
-
   private async selectRecipient(
     groupId: string,
     friendId: string,
@@ -435,8 +113,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     owned.add(friendId);
     let checked = false;
     try {
-      // Hold the memory claim across the fresh read: another account may have
-      // just committed PENDING and released its claim after our old snapshot.
+      // Hold memory claim across fresh DB read to prevent races across accounts.
       if (!(await this.repo.getInvitedFriendIdsForGroup(groupId)).has(friendId))
         checked = await click();
       return checked;
@@ -448,174 +125,26 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       }
     }
   }
-  private readonly scopes = new WeakMap<
-    Connection,
-    {
-      guard: () => void;
-      activate?: () => Promise<unknown>;
-      backgroundAllowed?: boolean;
-      page: Page;
-      groupId: string;
-      jobId: string;
-      stepId: string;
-      stopId: string;
-      pendingSubmission?: Binding;
-      pendingSetup: Map<string, Binding>;
-    }
-  >();
-  private readonly stopping = new Map<
-    string,
-    {
-      connection: Connection;
-      requestId: string;
-      peerEpoch: string;
-      boundAccountId: string;
-      pendingSetup: Binding[];
-      pendingSubmission?: Binding | undefined;
-    }
-  >();
   async retryStop(profileId: string) {
-    const pending = this.stopping.get(profileId);
-    if (!pending) throw Error('GROUP_INVITER_STOP_NOT_PENDING');
-    const kernel = this.getKernel();
-    const core = this.getCore();
-    const currentPeer = core?.peers.get(profileId);
-    if (!currentPeer || !currentPeer.online || !currentPeer.synced) {
-      await pending.connection.closeLocalAfterDisconnect().catch(() => {});
-      throw Error('GROUP_INVITER_STOP_AWAITING_RECONNECT');
-    }
-    if (kernel && currentPeer.epoch !== pending.peerEpoch) {
-      if (currentPeer.phase !== 'PAUSED') {
-        await core?.reconcileRecoveringPeerIfPossible?.(profileId).catch(() => false);
-      }
-      if (currentPeer.phase !== 'PAUSED') {
-        await pending.connection.closeLocalAfterDisconnect().catch(() => {});
-        throw Error('GROUP_INVITER_STOP_AWAITING_RECONNECT');
-      }
-      await pending.connection.closeLocalAfterDisconnect();
-      await kernel.withSummary(currentPeer, async (port) => {
-        const receipt = await port.stopCurrent(pending.requestId);
-        if (
-          receipt.requestId !== pending.requestId ||
-          receipt.connectionEpoch !== currentPeer.epoch ||
-          receipt.state !== 'stopped'
-        ) {
-          throw Error('GROUP_INVITER_STOP_UNCONFIRMED');
-        }
-        await pending.connection.confirmReconnectedStop(receipt);
-        const inventory = await port.inventory();
-        for (const binding of pending.pendingSetup) {
-          if (
-            !inventory.operations.some(
-              (op) => op.binding.operationId === binding.operationId && kernelOperationPending(op),
-            )
-          ) {
-            continue;
-          }
-          await port.notify(binding, {
-            id: randomUUID(),
-            outcome: 'ENDED_UNKNOWN',
-            evidenceDigest: invitationDigest(
-              'Non-submit setup ended',
-              pending.boundAccountId,
-              binding.operationId,
-            ),
-          });
-        }
-        if (
-          pending.pendingSubmission &&
-          inventory.operations.some(
-            (op) =>
-              op.binding.operationId === pending.pendingSubmission?.operationId &&
-              kernelOperationPending(op),
-          )
-        ) {
-          await port.notify(pending.pendingSubmission, {
-            id: randomUUID(),
-            outcome: 'ENDED_UNKNOWN',
-            evidenceDigest: createHash('sha256')
-              .update(
-                JSON.stringify({
-                  pending: pending.pendingSubmission,
-                  reason:
-                    'Invitation batch ended; unconfirmed recipients remain PENDING and will not be resent',
-                }),
-              )
-              .digest('hex'),
-          });
-        }
-      });
-    } else {
-      await pending.connection.retryClose(pending.requestId);
-    }
-    this.stopping.delete(profileId);
+    await retryInviterStop({
+      profileId,
+      stopping: this.stopping,
+      kernel: this.getKernel(),
+      core: this.getCore(),
+    });
   }
-  constructor(
-    private readonly repo: GroupInviterRepository,
-    private readonly getKernel: () => KernelBridge | undefined,
-    private readonly getCore: () => Core | undefined,
-    _getProfileAccountId?: (profileId: string) => Awaitable<string | null>,
-    private readonly checkProfileBusy?: (profileId: string) => Awaitable<boolean>,
-    private readonly targetMetadataRefresh?: TargetMetadataRefreshService,
-    private onAccountAbnormal?: GlobalAccountAbnormalReporter,
-  ) {}
-
-  setAccountAbnormalReporter(reporter: GlobalAccountAbnormalReporter) {
-    this.onAccountAbnormal = reporter;
-  }
-
   isAvailable(): boolean {
     return Boolean(this.getKernel() && this.getCore());
   }
-
   isProfileReady(profileId: string): boolean {
-    const core = this.getCore();
-    const peer = core?.peers.get(profileId);
+    const peer = this.getCore()?.peers.get(profileId);
     return Boolean(peer && peer.online && peer.synced);
   }
-
   async isProfileBusy(profileId: string): Promise<boolean> {
     return (await this.checkProfileBusy?.(profileId)) === true;
   }
-
-  async fetchGroupAvatar(
-    group: InviterGroupRow,
-    allowIdleBrowser: boolean,
-  ): Promise<string | null> {
-    const meta = await this.resolveGroupMetadata(group, allowIdleBrowser);
-    return meta.avatarUrl ?? null;
-  }
-
-  async resolveGroupMetadata(
-    group: InviterGroupRow,
-    allowIdleBrowser: boolean,
-  ): Promise<{
-    groupName?: string | null;
-    avatarUrl?: string | null;
-    canonicalId?: string | null;
-  }> {
-    if (this.targetMetadataRefresh) {
-      const resolved = await this.targetMetadataRefresh.resolveTargetMetadata(
-        'groups',
-        group.groupId,
-        allowIdleBrowser,
-      );
-      return {
-        canonicalId: resolved.canonicalId,
-        groupName: resolved.name,
-        avatarUrl: resolved.avatarUrl,
-      };
-    }
-    const httpMeta = await resolveBumperTargetMetadata('groups', group.groupId);
-    return {
-      canonicalId: httpMeta.canonicalId,
-      groupName: httpMeta.name,
-      avatarUrl: httpMeta.avatarUrl,
-    };
-  }
-
   private async execBoundOp<T>(
-    conn: Awaited<ReturnType<KernelBridge['connectFacebook']>>,
+    conn: InviterConnection,
     accountId: string,
     label: string,
     fn: (operationId: string) => Promise<T>,
@@ -637,20 +166,13 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     };
     let interventionDismissedInOp = false;
     const backgroundAllowed = scope.backgroundAllowed === true || conn.taskRendering === true;
+    const readVerifiedState = (allowDismiss: boolean) =>
+      readVerifiedInviteState(scope.page, scope.guard, allowDismiss, () => {
+        interventionDismissedInOp = true;
+      });
     const assertPage = async () => {
       scope.guard();
-      let state = await readGroupInvitationState(scope.page, scope.guard);
-      if (state.verificationRequired && label !== 'send-group-invites') {
-        const dismissed = await dismissFeatureInterventionDialogIfPresent(scope.page, scope.guard);
-        if (dismissed) interventionDismissedInOp = true;
-        state = await readGroupInvitationState(scope.page, scope.guard);
-      }
-      if (state.verificationRequired)
-        throw new ProductError(
-          'GROUP_INVITER_VERIFICATION_REQUIRED',
-          '受限 · 需要手机验证或操作受限',
-          409,
-        );
+      let state = await readVerifiedState(label !== 'send-group-invites');
       const deadline = Date.now() + 15000;
       let activated = false;
       while (!state.ready || (!state.visible && !(backgroundAllowed && activated))) {
@@ -668,21 +190,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             409,
           );
         await sleep(250);
-        state = await readGroupInvitationState(scope.page, scope.guard);
-        if (state.verificationRequired && label !== 'send-group-invites') {
-          const dismissed = await dismissFeatureInterventionDialogIfPresent(
-            scope.page,
-            scope.guard,
-          );
-          if (dismissed) interventionDismissedInOp = true;
-          state = await readGroupInvitationState(scope.page, scope.guard);
-        }
-        if (state.verificationRequired)
-          throw new ProductError(
-            'GROUP_INVITER_VERIFICATION_REQUIRED',
-            '受限 · 需要手机验证或操作受限',
-            409,
-          );
+        state = await readVerifiedState(label !== 'send-group-invites');
       }
       scope.guard();
       if (state.accountId !== accountId)
@@ -691,15 +199,12 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           '当前登录账号已变化，已停止本次邀请；请检查浏览器中的实际账号',
           409,
         );
-      if (label !== 'enter-group' && !(label === 'join-group' && interventionDismissedInOp)) {
-        const route = new URL(state.url);
-        if (
-          route.origin !== 'https://www.facebook.com' ||
-          route.pathname.split('/')[1] !== 'groups' ||
-          route.pathname.split('/')[2] !== scope.groupId
-        )
-          throw Error('GROUP_INVITER_CURRENT_GROUP_CHANGED');
-      }
+      if (
+        label !== 'enter-group' &&
+        !(label === 'join-group' && interventionDismissedInOp) &&
+        !isGroupRouteUrl(state.url, scope.groupId)
+      )
+        throw Error('GROUP_INVITER_CURRENT_GROUP_CHANGED');
     };
     const navigationError = (error: unknown): never => {
       if (label === 'enter-group')
@@ -729,9 +234,8 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             typeof val === 'object' &&
             'unjoinableIntervention' in val &&
             (val as { unjoinableIntervention?: boolean }).unjoinableIntervention === true
-          ) {
+          )
             interventionDismissedInOp = true;
-          }
           return val;
         } catch (error) {
           return navigationError(error);
@@ -771,35 +275,21 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     const deadline = Date.now() + (sending ? 20000 : label === 'enter-group' ? 30000 : 15000);
     do {
       scope.guard();
-      let state = await readGroupInvitationState(scope.page, scope.guard);
-      if (state.verificationRequired && !sending) {
-        await dismissFeatureInterventionDialogIfPresent(scope.page, scope.guard);
-        state = await readGroupInvitationState(scope.page, scope.guard);
-      }
-      if (state.verificationRequired)
-        throw new ProductError(
-          'GROUP_INVITER_VERIFICATION_REQUIRED',
-          '受限 · 需要手机验证或操作受限',
-          409,
-        );
+      const state = await readVerifiedState(!sending);
       if (sending) {
-        // Never combine observations across another account, group or document.
-        const route = new URL(state.url);
-        resultTimeOrigin ??= state.timeOrigin;
         if (
           (resultTimeOrigin !== undefined && state.timeOrigin !== resultTimeOrigin) ||
           !state.ready ||
           (!state.visible && !backgroundAllowed) ||
           state.accountId !== accountId ||
-          route.origin !== 'https://www.facebook.com' ||
-          route.pathname.split('/')[1] !== 'groups' ||
-          route.pathname.split('/')[2] !== scope.groupId
+          !isGroupRouteUrl(state.url, scope.groupId)
         )
           throw new ProductError(
             'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
             '邀请结果核对时账号、小组或可见状态发生变化，未自动重发',
             409,
           );
+        resultTimeOrigin ??= state.timeOrigin;
         for (const item of [...state.items, ...(state.recipients ?? [])])
           if (item.id && item.invited) confirmed.set(item.id, item);
       }
@@ -812,12 +302,9 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
             currentUrl.origin === 'https://www.facebook.com' &&
             currentUrl.pathname.split('/')[1] === 'groups' &&
             /^\d{5,25}$/.test(candidateId)
-          ) {
+          )
             scope.groupId = candidateId;
-          }
-        } catch {
-          // ignore malformed URL during transition
-        }
+        } catch {}
       }
       if (
         groupInvitationEffect(
@@ -849,33 +336,19 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     if (!observed && label === 'enter-group')
       throw Error('GROUP_INVITER_NAVIGATION_FAILED:小组页面未能在期限内完成加载');
     if (!observed) {
-      const dialogs = await scope.page.evaluate(() =>
-        Array.from(document.querySelectorAll('[role="dialog"]')).map((d) => ({
-          label: d.getAttribute('aria-label'),
-          headings: Array.from(d.querySelectorAll('h1,h2,[role="heading"]')).map((h) =>
-            h.textContent?.slice(0, 100),
-          ),
-          buttons: Array.from(d.querySelectorAll('[role="button"],button'))
-            .slice(0, 8)
-            .map((b) => b.getAttribute('aria-label') ?? b.textContent?.slice(0, 80)),
-          checkboxes: d.querySelectorAll('[role="checkbox"]').length,
-        })),
-      );
       devDiag.record({
         category: 'GROUP_INVITER',
         event: 'GROUP_INVITER_EFFECT_MISSING',
         profileId: binding.profileId,
         operationId: binding.operationId,
-        data: { label, dialogs },
+        data: { label, dialogs: await readInvitationDialogDebugInfo(scope.page) },
       });
       throw new ProductError(
         'GROUP_INVITER_EFFECT_UNCONFIRMED',
-        `${label === 'send-group-invites' ? '邀请结果' : '页面操作结果'}未确认，已停止；不会自动重复发送`,
+        `${sending ? '邀请结果' : '页面操作结果'}未确认，已停止；不会自动重复发送`,
         409,
       );
     }
-    // Durable confirmed recipients before acknowledging the native operation.
-    // A crash between these commits leaves the original native record pending.
     await persist?.(res.value, binding.operationId);
     await conn.reconcile(binding, {
       id: randomUUID(),
@@ -887,7 +360,6 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     scope.pendingSetup.delete(operationId);
     return res.value;
   }
-
   async inviteForGroup(
     profileId: string,
     group: InviterGroupRow,
@@ -904,7 +376,6 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       callbacks.isCancelled(profileId)
     )
       return;
-
     const epoch = peer.epoch;
     const guard = () => {
       if (callbacks.isCancelled(profileId)) throw Error('GROUP_INVITER_CANCELLED');
@@ -918,7 +389,6 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     };
     guard();
     await callbacks.setProfileStatus(profileId, `正在连接 · ${group.groupName.slice(0, 12)}`);
-
     let prepared: Awaited<ReturnType<typeof prepareFacebookWorkspace>>;
     try {
       prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
@@ -935,8 +405,6 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         '该浏览器有待核对操作，请先处理原记录；未改写原结果、未发送新邀请',
         409,
       );
-    const mainProof = prepared.proof;
-
     await callbacks.setProfileStatus(profileId, '打开首页 · 读取当前登录账号');
     await FacebookGroupSessionHelper.waitPeerPaused(peer, guard, 10_000);
     const identity =
@@ -945,7 +413,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         peer,
         guard,
         true,
-        mainProof ?? undefined,
+        prepared.proof ?? undefined,
         true,
         false,
         true,
@@ -955,15 +423,14 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     const proof = identity.proof;
     if (!proof) throw Error('GROUP_INVITER_TASK_TAB_REQUIRED');
     const conn = await kernel.connectFacebook(peer, boundAccountId, guard, proof);
-    const stopRequestId = randomUUID();
+    const stopRequestId = conn.stopRequestId ?? randomUUID();
     const selectedInMemory = new Set<string>();
     let effectiveGroupId = group.groupId;
-
     try {
       const page = conn.browser.contexts()[0]?.pages()[0];
       if (!page) throw Error('BROWSER_PAGE_MISSING');
       await kernel.observeExternalPageAccount?.(profileId, page, identity.actor)?.catch(() => {});
-      const scopeRef = {
+      const scopeRef: InviterScope = {
         guard,
         activate: async () => {
           guard();
@@ -979,24 +446,11 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         jobId: randomUUID(),
         stepId: randomUUID(),
         stopId: stopRequestId,
-        pendingSetup: new Map<string, Binding>(),
+        pendingSetup: new Map(),
       };
       this.scopes.set(conn, scopeRef);
-
-      const effectiveAccountId = boundAccountId;
-      const atGroup = () => {
-        const route = new URL(page.url());
-        return (
-          route.origin === 'https://www.facebook.com' &&
-          route.pathname.split('/')[1] === 'groups' &&
-          (route.pathname.split('/')[2] === effectiveGroupId ||
-            route.pathname.split('/')[2] === scopeRef.groupId)
-        );
-      };
-
+      const atGroup = () => isGroupRouteUrl(page.url(), effectiveGroupId, scopeRef.groupId);
       if (callbacks.isCancelled(profileId)) return;
-
-      // The saved group ID is already the destination; no name search is needed.
       if (!atGroup()) {
         await callbacks.setProfileStatus(profileId, `打开小组 · ${group.groupName.slice(0, 12)}`);
         await this.execBoundOp(conn, boundAccountId, 'enter-group', async () => {
@@ -1006,20 +460,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           });
         });
       }
-
-      // Step 2: Capture cover / avatar, title, and canonical group ID on 302 redirect
-      const pageMeta = await page
-        .evaluate(() => {
-          const img = document.querySelector(
-            'a[aria-label="Cover photo"] img, a[aria-label="封面照片"] img, [role="main"] img[data-imgperflogname="profileCoverPhoto"]',
-          );
-          const h1 = document.querySelector('main h1, [role="main"] h1')?.textContent?.trim();
-          return {
-            coverSrc: img?.getAttribute('src') || null,
-            groupTitle: h1 || null,
-          };
-        })
-        .catch(() => ({ coverSrc: null, groupTitle: null }));
+      const pageMeta = await readGroupCoverAndTitle(page);
       const coverSrc =
         typeof pageMeta === 'string'
           ? pageMeta
@@ -1040,59 +481,27 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
         groupName: groupTitle,
         avatarUrl: localizedCover,
         applyResolvedMetadata: async (rawId, resolved) => {
-          if (this.repo.applyResolvedGroupMetadata) {
+          if (this.repo.applyResolvedGroupMetadata)
             await this.repo.applyResolvedGroupMetadata(rawId, resolved);
-          } else if (this.repo.updateGroupMetadata && (resolved.avatarUrl || resolved.name)) {
-            await this.repo.updateGroupMetadata(rawId, {
-              avatarUrl: resolved.avatarUrl ?? null,
-              groupName: resolved.name ?? null,
-            });
-          } else if (resolved.avatarUrl) {
-            await this.repo.updateGroupAvatar(rawId, resolved.avatarUrl);
-          }
         },
       });
       effectiveGroupId = redirectResolution.effectiveGroupId;
       scopeRef.groupId = effectiveGroupId;
-
       if (callbacks.isCancelled(profileId)) return;
-
-      // Step 3: Check if already in group; if not, click Join group / 加入小组 and close any modal
-      const joinBtnLoc = page.locator('[data-wb-group-join-btn="1"]').first();
+      const readVerified = () => readVerifiedInviteState(page, guard, true);
       const inviteButton = async () => {
-        let state = await readGroupInvitationState(page, guard);
-        if (state.verificationRequired) {
-          await dismissFeatureInterventionDialogIfPresent(page, guard);
-          state = await readGroupInvitationState(page, guard);
-        }
-        if (state.verificationRequired)
-          throw new ProductError(
-            'GROUP_INVITER_VERIFICATION_REQUIRED',
-            '受限 · 需要手机验证或操作受限',
-            409,
-          );
+        const state = await readVerified();
         const marked = page.locator('[data-wb-group-invite-btn="1"]').first();
         if (await marked.count()) return marked;
         return state.inviteButtonIndex === undefined
           ? null
           : page.locator('[role="button"],button').nth(state.inviteButtonIndex);
       };
-
       const clickControl = async (button: Locator, validate?: () => Promise<boolean>) => {
         guard();
         await clickInvitationControl(button, async () => {
           guard();
-          let current = await readGroupInvitationState(page, guard);
-          if (current.verificationRequired) {
-            await dismissFeatureInterventionDialogIfPresent(page, guard);
-            current = await readGroupInvitationState(page, guard);
-          }
-          if (current.verificationRequired)
-            throw new ProductError(
-              'GROUP_INVITER_VERIFICATION_REQUIRED',
-              '受限 · 需要手机验证或操作受限',
-              409,
-            );
+          const current = await readVerified();
           if (!atGroup() || current.accountId !== boundAccountId)
             throw Error('GROUP_INVITER_CURRENT_GROUP_CHANGED');
           if (validate && !(await validate())) return false;
@@ -1100,766 +509,52 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           return true;
         });
       };
-
-      const dismissNonInvitePopupIfNeeded = async () => {
-        const popupCloseCoords = await page
-          .evaluate(() => {
-            const isVis = (el: Element | null) => {
-              if (!el) return false;
-              const r = el.getBoundingClientRect();
-              if (r.width <= 0 || r.height <= 0) return false;
-              const s = getComputedStyle(el);
-              return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) > 0;
-            };
-            const dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(
-              (d) =>
-                isVis(d) &&
-                !/notifications|通知|messenger|聊天/i.test(d.getAttribute('aria-label') || '') &&
-                !d.querySelector('[role="checkbox"]'),
-            );
-            for (const d of dialogs) {
-              const closeBtn = Array.from(
-                d.querySelectorAll(
-                  '[role="button"][aria-label="Close"], [role="button"][aria-label="关闭"], [role="button"][aria-label="關閉"], [data-testid="feature-intervention-ok-button"]',
-                ),
-              ).find(isVis);
-              const continueBtn = Array.from(d.querySelectorAll('[role="button"],button')).find(
-                (el) =>
-                  isVis(el) &&
-                  /^(?:继续|繼續|Continue|知道了|Got\s*it|确定|確定|OK)$/i.test(
-                    (el.getAttribute('aria-label') || el.textContent || '')
-                      .replace(/\s+/g, ' ')
-                      .trim(),
-                  ),
-              );
-              const targetBtn = closeBtn ?? continueBtn;
-              if (targetBtn) {
-                const r = targetBtn.getBoundingClientRect();
-                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-              }
-            }
-            return null;
-          })
-          .catch(() => null);
-
-        if (popupCloseCoords) {
-          await this.execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
-            await page.mouse.click(popupCloseCoords.x, popupCloseCoords.y);
-          });
-        }
+      const flowCtx: InviterFlowCtx = {
+        profileId,
+        group,
+        page,
+        conn,
+        boundAccountId,
+        guard,
+        atGroup,
+        inviteButton,
+        clickControl,
+        execBoundOp: this.execBoundOp.bind(this),
+        callbacks,
       };
-
-      // The URL can arrive before React mounts the group's actions.
-      const checkPendingOrQuestions = async () =>
-        page
-          .evaluate(() => {
-            const pendingRx =
-              /^(?:Cancel request|Requested|Membership pending|Pending|取消请求|取消申請|已请求|已申請|待审核|待審核|等待批准|တောင်းဆိုထားသည်|တောင်းဆိုမှုကို ပယ်ဖျက်ပါ|Đã yêu cầu|Hủy yêu cầu|Chờ phê duyệt)$/i;
-            const questionRx =
-              /Answer questions|Membership questions|回答问题|回答問題|入组问题|入群问题|社團問題|မေးခွန်းများဖြေဆိုရန်|Trả lời câu hỏi/i;
-            const buttons = Array.from(
-              document.querySelectorAll<HTMLElement>('[role="button"], button'),
-            );
-            const hasPending = buttons.some((b) => {
-              const r = b.getBoundingClientRect();
-              if (r.width <= 0 || r.height <= 0) return false;
-              const txt = (b.textContent ?? '').replace(/\s+/g, ' ').trim();
-              const aria = (b.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
-              return (
-                (txt.length > 0 && txt.length <= 40 && pendingRx.test(txt)) ||
-                (aria.length > 0 && aria.length <= 40 && pendingRx.test(aria))
-              );
-            });
-            const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]'));
-            const hasQuestions = dialogs.some((d) => {
-              const r = d.getBoundingClientRect();
-              return r.width > 120 && r.height > 100 && questionRx.test(d.textContent ?? '');
-            });
-            return hasPending || hasQuestions;
-          })
-          .catch(() => false);
-      const groupReadyDeadline = Date.now() + 15000;
-      while (!(await (await inviteButton())?.isVisible()) && !(await joinBtnLoc.isVisible())) {
-        guard();
-        if (!atGroup())
-          throw new ProductError('GROUP_INVITER_GROUP_CHANGED', '小组页面已跳转，未继续邀请', 409);
-        if (await checkPendingOrQuestions()) {
-          throw new ProductError(
-            'GROUP_INVITER_GROUP_UNINVITABLE',
-            `跳过：该群需管理员审核或回答入群问题 · ${group.groupName.slice(0, 10)}`,
-            409,
-          );
-        }
-        await dismissNonInvitePopupIfNeeded();
-        await dismissUnexpectedFacebookOverlays(page, { keepSelector: '[role="checkbox"]' });
-        if ((await (await inviteButton())?.isVisible()) || (await joinBtnLoc.isVisible())) break;
-        if (Date.now() >= groupReadyDeadline) {
-          const controls = await page.evaluate(() => ({
-            url: location.href,
-            ready: document.readyState,
-            visibility: document.visibilityState,
-            buttons: Array.from(document.querySelectorAll('[role="button"],button'))
-              .filter((el) => {
-                const r = el.getBoundingClientRect();
-                const style = getComputedStyle(el);
-                return (
-                  r.width > 0 &&
-                  r.height > 0 &&
-                  style.visibility !== 'hidden' &&
-                  style.display !== 'none'
-                );
-              })
-              .slice(0, 20)
-              .map((el) =>
-                (el.getAttribute('aria-label') ?? el.textContent ?? '').trim().slice(0, 80),
-              ),
-          }));
-          devDiag.record({
-            category: 'GROUP_INVITER',
-            event: 'GROUP_INVITER_GROUP_CONTROLS_MISSING',
-            profileId,
-            data: controls,
-          });
-          throw new ProductError(
-            'GROUP_INVITER_GROUP_NOT_READY',
-            '小组页面未出现加入或邀请入口，请检查加载状态和访问权限',
-            409,
-          );
-        }
-        await sleep(250);
-      }
-      guard();
-      if (!(await inviteButton()) && (await joinBtnLoc.count()) > 0) {
-        await callbacks.setProfileStatus(profileId, `加入小组 · ${group.groupName.slice(0, 12)}`);
-        const joinRes = await this.execBoundOp(conn, boundAccountId, 'join-group', async () => {
-          let joinInterventionDismissed = false;
-          try {
-            await clickControl(
-              joinBtnLoc,
-              async () => !(await inviteButton()) && (await joinBtnLoc.isVisible()),
-            );
-          } catch (clickErr) {
-            if (
-              clickErr instanceof Error &&
-              clickErr.message === 'GROUP_INVITER_CURRENT_GROUP_CHANGED'
-            ) {
-              return { unjoinableIntervention: true };
-            }
-            throw clickErr;
-          }
-          const joinClickAt = Date.now();
-          const deadline = joinClickAt + 4000;
-          do {
-            guard();
-            const state = await readGroupInvitationState(page, guard);
-            if (state.verificationRequired) {
-              await dismissFeatureInterventionDialogIfPresent(page, guard);
-              joinInterventionDismissed = true;
-              return { unjoinableIntervention: true };
-            }
-            if (!atGroup()) {
-              return { unjoinableIntervention: true };
-            }
-            if (
-              Boolean(await inviteButton()) ||
-              state.dialogCount > 0 ||
-              (Date.now() - joinClickAt >= 1500 && !(await joinBtnLoc.isVisible()))
-            )
-              break;
-            await sleep(250);
-          } while (Date.now() < deadline);
-          return joinInterventionDismissed
-            ? { unjoinableIntervention: true }
-            : { joinedOrRequested: true };
-        });
-
-        if (
-          joinRes &&
-          typeof joinRes === 'object' &&
-          'unjoinableIntervention' in joinRes &&
-          (joinRes as { unjoinableIntervention?: boolean }).unjoinableIntervention
-        ) {
-          throw new ProductError(
-            'GROUP_INVITER_GROUP_UNINVITABLE',
-            `跳过：当前身份暂不支持直接加入该群 · ${group.groupName.slice(0, 10)}`,
-            409,
-          );
-        }
-
-        await dismissNonInvitePopupIfNeeded();
-      }
-
-      if (!(await inviteButton())) {
-        throw new ProductError(
-          'GROUP_INVITER_GROUP_UNINVITABLE',
-          `小组待审核或不可邀请 · ${group.groupName.slice(0, 10)}`,
-          409,
-        );
-      }
-
-      // Open the same native invitation entry on subsequent result reads.
-      let menuEntry: InvitationMenuItem | undefined;
-      const dialogLocator = (state: GroupInvitationState) => {
-        if (!state.dialog || state.dialogIndex === undefined)
-          throw Error('GROUP_INVITER_DIALOG_REQUIRED');
-        if (state.dialogLabel)
-          return page.getByRole('dialog', { name: state.dialogLabel, exact: true });
-        return page.locator(inviteDialogSelector).nth(state.dialogIndex);
-      };
-      const openDialog = async (bound: boolean) => {
-        let state = await readGroupInvitationState(page, guard);
-        if (state.dialog && state.sendButton && state.items.length) return state;
-        const click = async () => {
-          const button = await inviteButton();
-          if (!button) throw Error('GROUP_INVITER_INVITE_ENTRY_REQUIRED');
-          await clickControl(
-            button,
-            async () => !(await readGroupInvitationState(page, guard)).dialog,
-          );
-        };
-        if (!state.dialog) {
-          if (bound) await this.execBoundOp(conn, boundAccountId, 'open-invite-modal', click);
-          else await click();
-        }
-        const deadline = Date.now() + 15000;
-        do {
-          guard();
-          state = await readGroupInvitationState(page, guard);
-          if (state.verificationRequired)
-            throw new ProductError(
-              'GROUP_INVITER_VERIFICATION_REQUIRED',
-              '受限 · 需要手机验证或操作受限',
-              409,
-            );
-          if (state.dialog && state.sendButton && state.items.length) return state;
-          if (state.menu) {
-            const entries = state.menuItems ?? [];
-            const previousEntry = menuEntry;
-            const matches = previousEntry
-              ? entries.filter((e) => e.fingerprint === previousEntry.fingerprint)
-              : [];
-            const entry = previousEntry
-              ? matches.length === 1
-                ? matches[0]
-                : entries.find(
-                    (e) =>
-                      e.index === previousEntry.index &&
-                      e.fingerprint === previousEntry.fingerprint,
-                  )
-              : (entries.find((e) => e.preferred) ?? entries[0]);
-            if (!entry) throw Error('GROUP_INVITER_INVITE_MENU_CHANGED');
-            menuEntry = entry;
-            const choose = async () => {
-              const marked = page
-                .locator('[role="menuitem"][data-wb-group-invite-menuitem="1"]')
-                .first();
-              const button =
-                entry.preferred && (await marked.count())
-                  ? marked
-                  : page.locator('[role="menuitem"]').filter({ visible: true }).nth(entry.index);
-              await clickControl(button, async () => {
-                const current = await readGroupInvitationState(page, guard);
-                if (current.dialog) return false;
-                if (current.menuItems?.[entry.index]?.fingerprint !== entry.fingerprint)
-                  throw Error('GROUP_INVITER_INVITE_MENU_CHANGED');
-                return true;
-              });
-            };
-            if (bound)
-              await this.execBoundOp(conn, boundAccountId, 'click-invite-menuitem', choose);
-            else await choose();
-          }
-          await sleep(250);
-        } while (Date.now() < deadline);
-        if (state.dialog && state.sendButton) return state;
-        throw new ProductError(
-          'GROUP_INVITER_RESULT_DIALOG_REQUIRED',
-          '邀请列表未能打开，已保留待核对记录，未重发',
-          409,
-        );
-      };
-      await callbacks.setProfileStatus(profileId, `打开邀请弹窗 · ${group.groupName.slice(0, 10)}`);
-      await openDialog(true);
-
-      // Step 5: Select up to invitesPerGroup deduplicated friends
-      const alreadyInvitedIds = await this.repo.getInvitedFriendIdsForGroup(effectiveGroupId);
-      const seenInModal = new Set<string>();
-      const selectedBatch: Array<{ friendId: string; friendName: string }> = [];
-      const alreadyInvitedSkippedSet = new Set<string>();
-      const memberOrInvitedSkippedSet = new Set<string>();
-      let stagnantScrolls = 0;
-      let unscrolledStreak = 0;
-      let lastCheckboxTotal = 0;
-      let lastSignature = '';
-      let lastItemsCount = 0;
-      let lastValidIdCount = 0;
-
-      while (selectedBatch.length < invitesPerGroup && !callbacks.isCancelled(profileId)) {
-        const reading = await readGroupInvitationState(page, guard);
-        guard();
-        if (!reading.dialog) break;
-        lastItemsCount = reading.items.length;
-        lastValidIdCount = 0;
-        for (const row of reading.items) {
-          if (row.id && row.name) lastValidIdCount++;
-          if (row.id) {
-            if (row.invited || row.member || row.disabled) memberOrInvitedSkippedSet.add(row.id);
-            else if (alreadyInvitedIds.has(row.id)) alreadyInvitedSkippedSet.add(row.id);
-          }
-        }
-        const currentSignature = reading.items
-          .map((i) => `${i.id ?? ''}:${i.checked ? 1 : 0}`)
-          .join('|');
-        const index = reading.items.findIndex(
-          (item) =>
-            item.id &&
-            item.name &&
-            !item.checked &&
-            !item.invited &&
-            !item.member &&
-            !item.disabled &&
-            !alreadyInvitedIds.has(item.id) &&
-            !this.selectingByGroup.get(effectiveGroupId)?.has(item.id) &&
-            !seenInModal.has(item.id),
-        );
-        const item = reading.items[index];
-        const candidate = {
-          index,
-          friendId: item?.id ?? '',
-          friendName: item?.name ?? '',
-          totalCheckboxes: reading.items.length,
-        };
-
-        if (candidate.index >= 0) {
-          stagnantScrolls = 0;
-          unscrolledStreak = 0;
-          seenInModal.add(candidate.friendId);
-
-          const checkedNow = await this.selectRecipient(
-            effectiveGroupId,
-            candidate.friendId,
-            selectedInMemory,
-            async () =>
-              Boolean(
-                await this.execBoundOp(
-                  conn,
-                  boundAccountId,
-                  `check-friend-${selectedBatch.length + 1}`,
-                  async () => {
-                    const state = await readGroupInvitationState(page, guard);
-                    if (
-                      !state.items.some((item) => item.id === candidate.friendId) ||
-                      state.items.find((item) => item.id === candidate.friendId)?.checked
-                    )
-                      throw Error('GROUP_INVITER_RECIPIENT_CHANGED');
-                    const marked = dialogLocator(state)
-                      .locator(`[role="checkbox"][data-wb-recipient-id="${candidate.friendId}"]`)
-                      .first();
-                    const cbLoc = (await marked.count())
-                      ? marked
-                      : dialogLocator(state).locator('[role="checkbox"]').nth(candidate.index);
-                    await clickControl(cbLoc, async () => {
-                      const current = await readGroupInvitationState(page, guard);
-                      if (!current.items.some((item) => item.id === candidate.friendId))
-                        throw Error('GROUP_INVITER_RECIPIENT_CHANGED');
-                      return !current.items.find((item) => item.id === candidate.friendId)?.checked;
-                    });
-                    if (await cbLoc.evaluate((el) => el.getAttribute('aria-checked') === 'true'))
-                      return candidate.friendId;
-                    await sleep(150);
-                    return (await cbLoc.evaluate(
-                      (el) => el.getAttribute('aria-checked') === 'true',
-                    ))
-                      ? candidate.friendId
-                      : '';
-                  },
-                ),
-              ),
-          );
-
-          if (checkedNow) {
-            selectedBatch.push({
-              friendId: candidate.friendId,
-              friendName: candidate.friendName,
-            });
-            alreadyInvitedIds.add(candidate.friendId);
-            await callbacks.setProfileStatus(
-              profileId,
-              `已选 ${selectedBatch.length}/${invitesPerGroup} 人 · ${group.groupName.slice(0, 10)}`,
-            );
-          }
-
-          await sleep(randInt(250, 500));
-        } else {
-          if (
-            lastSignature !== '' &&
-            (currentSignature !== lastSignature || candidate.totalCheckboxes > lastCheckboxTotal)
-          ) {
-            stagnantScrolls = 0;
-            unscrolledStreak = 0;
-          } else {
-            stagnantScrolls++;
-          }
-          lastSignature = currentSignature;
-          lastCheckboxTotal = Math.max(lastCheckboxTotal, candidate.totalCheckboxes);
-          if (stagnantScrolls >= 8) break;
-
-          guard();
-          const scrolled = await scrollInvitationList(page, reading);
-
-          if (!scrolled) {
-            unscrolledStreak++;
-            if (unscrolledStreak >= 2) break;
-          } else {
-            unscrolledStreak = 0;
-          }
-          await sleep(700);
-        }
-      }
-
-      if (selectedBatch.length === 0 && !callbacks.isCancelled(profileId)) {
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_NO_CANDIDATE_BREAKDOWN',
-          profileId,
-          reason: `groupId=${group.groupId}`,
-          data: {
-            groupId: group.groupId,
-            itemsCount: lastItemsCount,
-            validIdCount: lastValidIdCount,
-            alreadyInvitedSkipped: alreadyInvitedSkippedSet.size,
-            memberOrInvitedSkipped: memberOrInvitedSkippedSet.size,
-            stagnantScrolls,
-          },
-        });
-      }
-
-      // One native submit; confirmed recipients are committed as soon as observed.
-      let submission: InvitationSubmission | undefined;
-      if (selectedBatch.length > 0 && !callbacks.isCancelled(profileId)) {
-        const selectedIds = selectedBatch.map((f) => f.friendId),
-          confirmed = new Set<string>();
-        const sent = await this.execBoundOp(
-          conn,
-          boundAccountId,
-          'send-group-invites',
-          async (operationId) => {
-            const before = await readGroupInvitationState(page, guard);
-            if (!mountedInvitationSelectionMatches(before, selectedIds))
-              throw Error('GROUP_INVITER_SELECTION_CHANGED');
-            if (!before.sendButton || before.sendButton.disabled)
-              throw Error('邀请发送按钮不可用，未发送');
-            const observation = observeInvitationGraphQL(
-              page,
-              profileId,
-              operationId,
-              effectiveGroupId,
-              selectedIds,
-              boundAccountId,
-            );
-            try {
-              try {
-                const ctx = await conn.context(boundAccountId);
-                const scope = this.scopes.get(conn);
-                if (!scope) throw Error('GROUP_INVITER_SCOPE_REQUIRED');
-                if (ctx)
-                  await conn.enablePostNetworkObservation(
-                    {
-                      ...ctx,
-                      operationId,
-                      jobId: scope.jobId,
-                      stepId: scope.stepId,
-                      actionDigest: invitationDigest(
-                        'send-group-invites',
-                        boundAccountId,
-                        operationId,
-                      ),
-                    },
-                    guard,
-                  );
-              } catch (e) {
-                devDiag.record({
-                  category: 'GROUP_INVITER',
-                  event: 'GROUP_INVITER_NETWORK_OBSERVER_UNAVAILABLE',
-                  profileId,
-                  operationId,
-                  reason: e instanceof Error ? e.message.slice(0, 160) : 'UNAVAILABLE',
-                });
-              }
-              await callbacks.setProfileStatus(profileId, `发送 ${selectedBatch.length} 份邀请`);
-              const markedSend = dialogLocator(before)
-                .locator('[data-wb-group-send-btn="1"]')
-                .first();
-              const sendButton = (await markedSend.count())
-                ? markedSend
-                : dialogLocator(before)
-                    .locator('[role="button"],button')
-                    .nth(before.sendButton.index);
-              await sendButton.evaluate((el) =>
-                el.scrollIntoView({ block: 'center', inline: 'center' }),
-              );
-              await sleep(100);
-              await sendButton.click({ timeout: 5000 });
-              const sentAt = Date.now();
-              const closedDeadline = sentAt + 6000;
-              let closed = false;
-              while (Date.now() < closedDeadline) {
-                guard();
-                const s = await readGroupInvitationState(page, guard);
-                if (s.verificationRequired)
-                  throw new ProductError(
-                    'GROUP_INVITER_VERIFICATION_REQUIRED',
-                    '受限 · 需要手机验证或操作受限',
-                    409,
-                  );
-                if (!s.dialog) {
-                  closed = true;
-                  break;
-                }
-                if (observation.hasSettled() && Date.now() - sentAt >= 800) break;
-                await sleep(250);
-              }
-              observation.endSubmission();
-              const persist = async (ids: string[]) => {
-                const inserted = await this.repo.recordInvites(
-                  selectedBatch
-                    .filter((f) => ids.includes(f.friendId))
-                    .map((f) => ({
-                      profileId,
-                      accountId: effectiveAccountId,
-                      friendId: f.friendId,
-                      friendName: f.friendName,
-                      groupId: effectiveGroupId,
-                      invitedAt: Date.now(),
-                    })),
-                  operationId,
-                );
-                await callbacks.addSessionInvited(profileId, inserted);
-                await callbacks.setProfileStatus(
-                  profileId,
-                  invitationResultStatus(
-                    confirmed.size + ids.filter((id) => !confirmed.has(id)).length,
-                    selectedIds.length -
-                      confirmed.size -
-                      ids.filter((id) => !confirmed.has(id)).length,
-                  ),
-                );
-              };
-              const collect = () =>
-                collectInvitationConfirmations({
-                  selectedIds,
-                  accountId: boundAccountId,
-                  groupId: effectiveGroupId,
-                  read: () => readGroupInvitationState(page, guard),
-                  scroll: (s) => scrollInvitationList(page, s),
-                  persist,
-                  confirmed,
-                  guard,
-                  budgetMs: 6000,
-                  allowHidden: scopeRef.backgroundAllowed === true,
-                });
-              let fallbackReopens = 0,
-                reloads = 0;
-              const graphqlConfirmed = await settleInvitationConfirmation({
-                selectedIds,
-                confirmed,
-                persist,
-                graphql:
-                  closed || observation.hasSettled() ? observation.confirmations : async () => [],
-                assertCurrent: async () => {
-                  guard();
-                  const current = await readGroupInvitationState(page, guard);
-                  if (current.verificationRequired)
-                    throw new ProductError(
-                      'GROUP_INVITER_VERIFICATION_REQUIRED',
-                      '受限 · 需要手机验证或操作受限',
-                      409,
-                    );
-                  if (current.accountId !== boundAccountId || !atGroup())
-                    throw new ProductError(
-                      'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
-                      '邀请核对页面发生变化，结果仍待确认，未重发',
-                      409,
-                    );
-                },
-                fallback: async () => {
-                  if (observation.hasSettled() && confirmed.size > 0) return;
-                  if (confirmed.size === 0) {
-                    try {
-                      fallbackReopens++;
-                      await openDialog(false);
-                      await collect();
-                    } catch (e) {
-                      if (
-                        e instanceof ProductError &&
-                        e.code === 'GROUP_INVITER_VERIFICATION_REQUIRED'
-                      )
-                        throw e;
-                      devDiag.record({
-                        category: 'GROUP_INVITER',
-                        event: 'GROUP_INVITER_RESULT_READ_INCOMPLETE',
-                        profileId,
-                        operationId,
-                        reason: e instanceof Error ? e.message.slice(0, 200) : 'READ_FAILED',
-                        data: {
-                          confirmed: confirmed.size,
-                          pending: selectedIds.length - confirmed.size,
-                        },
-                      });
-                    }
-                  }
-                },
-              });
-              return {
-                submitted: true as const,
-                total: selectedIds.length,
-                confirmedIds: [...confirmed],
-                pending: selectedIds.length - confirmed.size,
-                graphqlConfirmed,
-                fallbackReopens,
-                reloads,
-              };
-            } finally {
-              await observation.close();
-            }
-          },
-          undefined,
-          async (operationId) => {
-            if (!this.repo.reserveInvites) throw Error('GROUP_INVITER_RESERVATION_REQUIRED');
-            await this.repo.reserveInvites(
-              operationId,
-              selectedBatch.map((f) => ({
-                ...f,
-                profileId,
-                accountId: effectiveAccountId,
-                groupId: effectiveGroupId,
-              })),
-            );
-            // The durable PENDING rows now own deduplication, including after
-            // cancellation or an unknown submit. No memory claim is needed.
-            this.releaseSelections(effectiveGroupId, selectedInMemory);
-          },
-        );
-        submission = sent;
-        await callbacks.reportBatchResult?.(profileId, sent.confirmedIds.length, sent.pending);
-        await callbacks.setProfileStatus(
-          profileId,
-          invitationResultStatus(sent.confirmedIds.length, sent.pending),
-        );
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_BATCH_RESULT',
-          profileId,
-          data: {
-            selected: sent.total,
-            confirmed: sent.confirmedIds.length,
-            pending: sent.pending,
-            submitted: true,
-            graphqlConfirmed: sent.graphqlConfirmed ?? 0,
-            fallbackReopens: sent.fallbackReopens ?? 0,
-            reloads: sent.reloads ?? 0,
-          },
-        });
-      } else if (!callbacks.isCancelled(profileId))
-        await callbacks.setProfileStatus(profileId, '无可邀请对象');
-
-      if (!callbacks.isCancelled(profileId) && (!submission || submission.pending === 0)) {
-        const state = await readGroupInvitationState(page, guard);
-        if (state.dialog && state.closeButton) {
-          await this.execBoundOp(conn, boundAccountId, 'close-invite-modal', async () => {
-            const latest = await readGroupInvitationState(page, guard);
-            if (!latest.dialog || !latest.closeButton) return;
-            const marked = dialogLocator(latest).locator('[data-wb-group-close-btn="1"]').first();
-            const button = (await marked.count())
-              ? marked
-              : dialogLocator(latest)
-                  .locator('[role="button"],button')
-                  .nth(latest.closeButton.index);
-            await clickControl(
-              button,
-              async () => (await readGroupInvitationState(page, guard)).dialog,
-            );
-          });
-        }
-      }
+      await ensureGroupReadyAndJoin(flowCtx);
+      await runInviteBatchAndSubmit(flowCtx, {
+        effectiveGroupId,
+        invitesPerGroup,
+        scopeRef,
+        scopes: this.scopes,
+        selectedInMemory,
+        selectingByGroup: this.selectingByGroup,
+        repo: this.repo,
+        selectRecipient: this.selectRecipient.bind(this),
+        releaseSelections: this.releaseSelections.bind(this),
+      });
     } catch (runErr) {
-      const page = conn.browser.contexts()[0]?.pages()[0];
-      if (page) {
-        await kernel.observeExternalPageAccount?.(profileId, page, null)?.catch(() => {});
-        const currentUrl = page.url();
-        const scope = inferAbnormalScopeFromUrl(currentUrl);
-        if (scope === 'global_route') {
-          const msg = runErr instanceof Error ? runErr.message : String(runErr);
-          const abnormalState =
-            inferAbnormalStateFromCodeOrMessage(classifyFacebookAbnormalUrl(currentUrl) ?? msg) ??
-            'restricted';
-          await this.onAccountAbnormal?.({
-            profileId,
-            scope: 'global_route',
-            state: abnormalState,
-            reason: msg,
-          });
-        }
-      }
+      await reportGlobalRouteAbnormalIfNeeded({
+        profileId,
+        page: conn.browser.contexts()[0]?.pages()[0],
+        kernel,
+        onAccountAbnormal: this.onAccountAbnormal,
+        error: runErr,
+      });
       throw runErr;
     } finally {
       this.releaseSelections(effectiveGroupId, selectedInMemory);
-      conn.revokeInput('GROUP_INVITER_FINISH');
-      const requestId = stopRequestId;
-      try {
-        await conn.close(requestId);
-        for (const binding of this.scopes.get(conn)?.pendingSetup.values() ?? []) {
-          const inventory = await kernel.withSummary(peer, (port) => port.inventory());
-          if (
-            !inventory.operations.some(
-              (op) => op.binding.operationId === binding.operationId && kernelOperationPending(op),
-            )
-          )
-            continue;
-          await kernel.withSummary(peer, (port) =>
-            port.notify(binding, {
-              id: randomUUID(),
-              outcome: 'ENDED_UNKNOWN',
-              evidenceDigest: invitationDigest(
-                'Non-submit setup ended',
-                boundAccountId,
-                binding.operationId,
-              ),
-            }),
-          );
-        }
-        const pending = this.scopes.get(conn)?.pendingSubmission;
-        if (pending)
-          await kernel.withSummary(peer, (port) =>
-            port.notify(pending, {
-              id: randomUUID(),
-              outcome: 'ENDED_UNKNOWN',
-              evidenceDigest: createHash('sha256')
-                .update(
-                  JSON.stringify({
-                    pending,
-                    reason:
-                      'Invitation batch ended; unconfirmed recipients remain PENDING and will not be resent',
-                  }),
-                )
-                .digest('hex'),
-            }),
-          );
-      } catch (cause) {
-        const scopeSnap = this.scopes.get(conn);
-        this.stopping.set(profileId, {
-          connection: conn,
-          requestId,
-          peerEpoch: peer.epoch,
-          boundAccountId,
-          pendingSetup: [...(scopeSnap?.pendingSetup.values() ?? [])],
-          pendingSubmission: scopeSnap?.pendingSubmission,
-        });
-        await conn.closeLocalAfterDisconnect().catch(() => {});
-        throw new Error('GROUP_INVITER_STOP_UNCONFIRMED', { cause });
-      } finally {
-        this.scopes.delete(conn);
-      }
+      await finalizeInviterConnection({
+        profileId,
+        conn,
+        peer,
+        kernel,
+        stopRequestId,
+        boundAccountId,
+        scopes: this.scopes,
+        stopping: this.stopping,
+      });
     }
   }
 }

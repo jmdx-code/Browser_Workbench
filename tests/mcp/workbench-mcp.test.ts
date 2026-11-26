@@ -860,7 +860,6 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
       pageTotal: 1,
       dailyStats: [],
       pageDailyStats: [],
-      scheduledTasks: [],
       pendingReviewOperations: [],
     }),
     manage: async (route: string, input: Record<string, unknown>) => {
@@ -1250,7 +1249,7 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
     combinationId: '浏览 Reels',
     profileIds: ['用户8'],
   });
-  assert.deepEqual(launchedOfflineProfiles, [profileId]);
+  assert.deepEqual(launchedOfflineProfiles, []);
   assert.equal(aaStart.plansCount, 1);
 
   const overviewAfterStart = await callTool('wb_get_overview', {});
@@ -1263,7 +1262,7 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
   assert.equal(aaPause.acceptedCount, 1);
 
   const aaStop = await callTool('wb_active_accounts_control', { action: 'stop' });
-  assert.equal(aaStop.acceptedCount, 1);
+  assert.equal(aaStop.acceptedCount, 0);
 
   const waitAa = await callTool('wb_wait_for_task', {
     module: 'active-accounts',
@@ -1283,7 +1282,9 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
   });
   assert.equal(inviterGroupsList[0]?.groupId, '9876543210');
 
-  // 6. Browser Lifecycle cleanup_tabs targets online registered profiles
+  // 6. Browser Lifecycle open + cleanup_tabs targets online registered profiles
+  await callTool('wb_browser_lifecycle', { action: 'open', profileIds: ['用户8'] });
+  assert.deepEqual(launchedOfflineProfiles, [profileId]);
   const cleanupRes = await callTool('wb_browser_lifecycle', { action: 'cleanup_tabs' });
   assert.equal(cleanupRes.cleanedProfiles, 1);
   assert.deepEqual(cleanedTabProfileIds, [profileId]);

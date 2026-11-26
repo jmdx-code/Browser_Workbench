@@ -16,27 +16,13 @@ export function taskAlertReason(
 ) {
   if (!profile?.online && !['FAILED', 'STOPPED', 'COMPLETED'].includes(plan.state))
     return { summary: '浏览器未连接', next: '打开这份浏览器并等待自动连接，再查看任务状态。' };
-  if (['PAUSING', 'STOPPING'].includes(plan.state))
-    return { summary: '等待浏览器停止确认', next: '保持浏览器连接；需要处理时请打开该任务记录。' };
   const known = taskReasonDescription(plan.reason);
   if (known) return known;
-  if (plan.state === 'REVIEW')
-    return {
-      summary: '任务结果需要核对',
-      next: '查看记录；可以停止并结束本次任务，原可能已提交内容不自动重发。',
-    };
   return {
-    summary: plan.state === 'FAILED' ? '任务失败' : '任务已暂停',
-    next: '查看原任务记录中的具体原因，再决定继续或结束。',
+    summary: plan.state === 'FAILED' ? '任务失败' : '任务已停止',
+    next: '查看原任务记录中的具体原因。',
   };
 }
-export function attentionPlans(plans: Plan[], profiles: Profile[]) {
-  const byId = new Map(profiles.map((profile) => [profile.id, profile]));
-  return plans
-    .filter((plan) => {
-      const online = Boolean(byId.get(plan.profileId)?.online);
-      if (plan.state === 'REVIEW' && !online) return true;
-      return false;
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+export function attentionPlans(_plans: Plan[], _profiles: Profile[]) {
+  return [];
 }

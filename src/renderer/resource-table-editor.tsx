@@ -1,34 +1,252 @@
-import { copyTextToClipboard } from './clipboard.js';
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
-import type { ResourceRowValue, ResourceTableValue } from '../shared/resource-table.js';
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type Ref,
+} from 'react';
+import type { z } from 'zod';
 import {
   emptyResourceRow,
   fillResourceMedia,
-  pasteResourceCells,
-  mediaReference,
-  validateResourceRows,
-  hasResource,
-  resourceType,
-  resourceCellValue,
   formatResourceCellsForClipboard,
+  hasResource,
+  mediaReference,
+  pasteResourceCells,
+  resourceCellValue,
+  resourceType,
+  validateResourceRows,
 } from '../domain/resource-table.js';
+import { resourceSourceIssueText } from '../domain/resource-material-rules.js';
 import type { SavedCombination } from '../shared/contracts.js';
+import type { ResourceDownloadProgressValue } from '../shared/resource-download.js';
+import type { ResourceCheckProgressValue, ResourceSourceRow } from '../shared/resource-source.js';
+import type { ResourceRowValue } from '../shared/resource-table.js';
 import { api } from './api.js';
-import type {
-  ResourceSourceReportValue,
-  ResourceCheckProgressValue,
-} from '../shared/resource-source.js';
-import { resourceSourceIssueText } from '../domain/resource-source.js';
+import {
+  expandFillDownTsv,
+  getSelectedRowIndices,
+  isRowInGridBounds,
+  MatrixDataCell,
+  parseElectronFilePaths,
+  useSpreadsheetGrid,
+} from './matrix-grid.js';
+import { Btn, errMsg, useShowModal } from './modules/shared/module-ui.js';
 import { resourceMatches, type ResourceFilter } from './resource-filter.js';
-import { ResourceRowPreview } from './resource-row-preview.js';
-import type {
-  ResourceDownloadProgressValue,
-  ResourceDownloadReportValue,
-} from '../shared/resource-download.js';
+import { FileLocationButton, UI_INPUT_SM, UI_SELECT_SM } from './ui/primitives.js';
 
 export interface ResourceEditorHandle {
   persist(): Promise<boolean>;
 }
+type ObservationRow = z.infer<typeof ResourceSourceRow>;
+
+const mkOpts = (vals: readonly string[]) => vals.map((v) => ({ value: v, label: v }));
+const FILTER_OPTIONS: [ResourceFilter, string][] = [
+  ['all', '全部行'],
+  ['attention', '需关注/异常'],
+  ['unchecked', '未检查'],
+  ['verified', '已通过'],
+  ['duplicate', '重复内容'],
+  ['drive', '含 Drive 链接'],
+  ['post', '仅帖子'],
+  ['story', '仅快拍'],
+];
+const COLS = [
+  { col: 0, placeholder: '输入发帖文案' },
+  { col: 1, placeholder: '拖入本机文件或粘贴 Drive 链接' },
+  { col: 2, opts: mkOpts(['彩贴', '普通文字']), placeholder: '彩贴' },
+  { col: 3, opts: mkOpts(['帖子', '快拍', '通用']), placeholder: '帖子' },
+  { col: 4, opts: mkOpts(['默认', '开启', '关闭']), placeholder: '默认' },
+] as const;
+const createId = () => globalThis.crypto.randomUUID();
+const isSelectCol = (col: number) => col >= 2 && col <= 4;
+
+function rowStatusDisplay(
+  row: ResourceRowValue,
+  obs: ObservationRow | undefined,
+): { text: string; cls: string; title: string } {
+  const kind = resourceType(row);
+  if (!hasResource(row)) return { text: '空行', cls: 'text-[var(--text-3)]', title: '未填写内容' };
+  if (!obs) return { text: kind, cls: 'text-[var(--text-2)]', title: kind };
+  if (!obs.sourceVerified && obs.issue) {
+    const m = resourceSourceIssueText[obs.issue] ?? obs.issue;
+    return {
+      text: `${kind} · ${m}`,
+      cls: 'is-error bg-rose-50/70 font-medium text-rose-700',
+      title: m,
+    };
+  }
+  if (obs.blockers.length > 0) {
+    const m = obs.blockers.includes('TEXT_INPUT_LIMIT') ? '正文过长受限' : '背景未验证';
+    return {
+      text: `${kind} · ${m}`,
+      cls: 'is-warn bg-amber-50/70 font-medium text-amber-800',
+      title: m,
+    };
+  }
+  if (obs.duplicateOf)
+    return {
+      text: `${kind} · 内容重复`,
+      cls: 'is-warn bg-amber-50/70 font-medium text-amber-800',
+      title: '与表格内其他行内容重复',
+    };
+  return {
+    text: `${kind} · 已核验`,
+    cls: 'is-ok bg-emerald-50/70 font-medium text-emerald-700',
+    title: '来源已核验可用',
+  };
+}
+
+function ResourceRowPreview({
+  combinationId,
+  revision,
+  row,
+  rowNumber,
+  onClose,
+}: {
+  combinationId: string;
+  revision: number;
+  row: ResourceRowValue;
+  rowNumber: number;
+  onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useShowModal(dialog);
+  const [index, setIndex] = useState(0);
+  const [attempt, setAttempt] = useState(0);
+  const [loaded, setLoaded] = useState<{ index: number; url: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const file = row.media[index];
+
+  useEffect(() => {
+    const ac = new AbortController();
+    let disposed = false;
+    let url: string | null = null;
+    setLoaded(null);
+    setError('');
+    setBusy(false);
+    if (!file || file.kind !== 'local') return;
+    setBusy(true);
+    void api
+      .resourceMedia(combinationId, revision, row.id, index, ac.signal)
+      .then((blob) => {
+        if (!disposed) {
+          url = URL.createObjectURL(blob);
+          setLoaded({ index, url });
+        }
+      })
+      .catch((f: unknown) => !disposed && setError(errMsg(f, '媒体预览未完成')))
+      .finally(() => !disposed && setBusy(false));
+    return () => {
+      disposed = true;
+      ac.abort();
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [combinationId, revision, row, index, file, attempt]);
+
+  return (
+    <dialog
+      ref={dialog}
+      className="max-h-[84vh] w-[min(740px,92vw)] rounded-[var(--r-lg)] border border-[var(--line)] bg-[#f8f9fa] p-0 text-[var(--text)] shadow-[var(--shadow-3)] backdrop:bg-[rgba(20,24,31,0.4)] backdrop:backdrop-blur-[2px]"
+      aria-label={`预览资源第${rowNumber}行`}
+      onCancel={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }}
+    >
+      <header className="flex items-center justify-between border-b border-[var(--line)] bg-white px-4 py-3">
+        <div>
+          <strong className="text-sm font-semibold text-slate-900">
+            第 {rowNumber} 行 · {resourceType(row)}
+          </strong>
+          <small className="mt-0.5 block text-xs text-[var(--text-3)]">已保存资源预览</small>
+        </div>
+        <Btn v="ghost" onClick={onClose} aria-label="关闭资源预览">
+          关闭
+        </Btn>
+      </header>
+      <div className="max-h-[68vh] overflow-auto p-4">
+        <div className="mb-3.5 max-h-[200px] overflow-auto rounded-lg border border-[var(--line)] bg-white p-3 text-sm leading-[1.6] whitespace-pre-wrap wrap-anywhere">
+          {row.text || <span className="text-[var(--text-3)]">无文案 · 纯媒体发布</span>}
+        </div>
+        {file && (
+          <section
+            className="my-3 min-w-0 rounded-xl border border-[var(--line)] bg-white p-3 [&_img]:mt-2 [&_img]:block [&_img]:max-h-[260px] [&_img]:w-full [&_img]:rounded-lg [&_img]:bg-[#15191e] [&_img]:object-contain [&_video]:mt-2 [&_video]:block [&_video]:max-h-[260px] [&_video]:w-full [&_video]:rounded-lg [&_video]:bg-[#15191e] [&_video]:object-contain"
+            aria-label="资源媒体预览"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <strong className="font-semibold text-slate-800">
+                媒体 {index + 1} / {row.media.length}
+              </strong>
+              <div className="flex gap-1.5">
+                <Btn disabled={index === 0} onClick={() => setIndex(index - 1)}>
+                  上一份
+                </Btn>
+                <Btn disabled={index + 1 >= row.media.length} onClick={() => setIndex(index + 1)}>
+                  下一份
+                </Btn>
+              </div>
+            </div>
+            <small className="my-1.5 block text-xs wrap-anywhere text-[var(--text-2)]">
+              {file.name}
+            </small>
+            {file.kind === 'local' && (
+              <FileLocationButton source={file.source} label="查看原文件位置" />
+            )}
+            {file.kind === 'drive' && (
+              <p className="mt-2 text-xs text-[var(--text-2)]" role="status">
+                这是公开网盘引用，需先下载才能预览；本次未自动下载。
+              </p>
+            )}
+            {busy && (
+              <p className="mt-2 text-xs text-[var(--text-2)]" role="status">
+                正在读取媒体…
+              </p>
+            )}
+            {error && (
+              <div
+                className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+                role="alert"
+              >
+                <p className="m-0">{error}</p>
+                <Btn onClick={() => setAttempt(attempt + 1)}>重试预览</Btn>
+              </div>
+            )}
+            {!error &&
+              loaded?.index === index &&
+              (file.mediaType === 'video' ? (
+                <video
+                  src={loaded.url}
+                  controls
+                  preload="metadata"
+                  playsInline
+                  aria-label="资源视频播放器"
+                  onError={() => setError('浏览器无法解码这份视频，请检查视频编码；原文件保留')}
+                />
+              ) : (
+                <img
+                  src={loaded.url}
+                  alt={`资源图片 ${index + 1}`}
+                  onError={() => setError('浏览器无法显示这份图片，请检查文件；原文件保留')}
+                />
+              ))}
+          </section>
+        )}
+        {!row.media.length && row.background === 'color' && (
+          <p className="mt-2 block text-xs text-[var(--text-3)]">
+            彩贴背景需在实际发布窗口核对；这里显示文案，未模拟平台背景。
+          </p>
+        )}
+      </div>
+    </dialog>
+  );
+}
+
 export function ResourceTableEditor({
   combination,
   onClose,
@@ -37,914 +255,466 @@ export function ResourceTableEditor({
 }: {
   combination: SavedCombination;
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  onSaved: () => void;
   ref?: Ref<ResourceEditorHandle>;
 }) {
-  const [table, setTable] = useState<ResourceTableValue | null>(null);
-  const [rows, setRows] = useState<ResourceRowValue[]>([]);
-  const [undo, setUndo] = useState<ResourceRowValue[][]>([]);
-  const [range, setRange] = useState({ r1: 0, c1: 0, r2: 0, c2: 0 });
-  const bounds = {
-    minRow: Math.min(range.r1, range.r2, Math.max(0, rows.length - 1)),
-    maxRow: Math.min(
-      range.r1 === range.r2 ? range.r1 : Math.max(range.r1, range.r2),
-      Math.max(0, rows.length - 1),
-    ),
-    minCol: Math.min(range.c1, range.c2),
-    maxCol: Math.max(range.c1, range.c2),
-  };
-  const selected = new Set(rows.slice(bounds.minRow, bounds.maxRow + 1).map((row) => row.id));
-  const cell = { row: range.r1, column: range.c1 };
-  const [editing, setEditing] = useState<{ r: number; c: number; value: string } | null>(null);
-  const editingRef = useRef<typeof editing>(null);
-  const grid = useRef<HTMLDivElement>(null);
-  const drag = useRef<'cells' | 'rows' | 'fill' | null>(null);
-  const anchor = useRef({ r: 0, c: 0 });
-  const fillTarget = useRef(0);
-  const finishDrag = useRef(() => {});
-  const [query, setQuery] = useState('');
+  const [rows, setRows] = useState<ResourceRowValue[]>([emptyResourceRow(createId())]);
+  const [savedJson, setSavedJson] = useState('');
+  const [revision, setRevision] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [filter, setFilter] = useState<ResourceFilter>('all');
-  const [dirty, setDirty] = useState(false);
-  const dirtyRef = useRef(false);
-  const [busy, setBusy] = useState(false);
-  const saving = useRef(false);
-  const activeSaveRef = useRef<Promise<ResourceTableValue | false> | null>(null);
-  const checking = useRef<AbortController | null>(null);
-  const downloading = useRef<AbortController | null>(null);
-  const mounted = useRef(true);
-  const [sourceReport, setSourceReport] = useState<ResourceSourceReportValue | null>(null);
+  const [query, setQuery] = useState('');
+  const [observations, setObservations] = useState<ReadonlyMap<string, ObservationRow>>(
+    () => new Map(),
+  );
   const [checkProgress, setCheckProgress] = useState<ResourceCheckProgressValue | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<ResourceDownloadProgressValue | null>(
     null,
   );
-  const [downloadReport, setDownloadReport] = useState<ResourceDownloadReportValue | null>(null);
-  const [sourceRows, setSourceRows] = useState<ResourceSourceReportValue['rows']>([]);
-  const [error, setError] = useState('');
-  const [discard, setDiscard] = useState(false);
-  const [preview, setPreview] = useState<{
-    row: ResourceRowValue;
-    revision: number;
-    rowNumber: number;
-  } | null>(null);
-  const files = useRef<HTMLInputElement>(null);
-  const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const up = () => finishDrag.current();
-    window.addEventListener('pointerup', up);
-    return () => window.removeEventListener('pointerup', up);
-  }, []);
-  const createId = () => crypto.randomUUID();
-  useEffect(() => {
-    let alive = true;
-    mounted.current = true;
-    dialog.current?.showModal();
-    void api
-      .resourceTable(combination.id)
-      .then((value) => {
-        if (!alive) return;
-        if (value.combinationId !== combination.id) throw Error('RESOURCE_RESPONSE_MISMATCH');
-        setTable(value);
-        setRows(value.rows.length ? value.rows : [emptyResourceRow(createId())]);
-      })
-      .catch(() => {
-        if (alive) setError('资源表读取失败，请保留当前窗口并重试');
-      });
-    return () => {
-      alive = false;
-      mounted.current = false;
-      checking.current?.abort();
-      downloading.current?.abort();
-    };
-  }, [combination.id]);
-  useEffect(() => {
-    if (window.workbenchDesktop) return;
-    const handler = (event: BeforeUnloadEvent) => {
-      if (dirtyRef.current) event.preventDefault();
-    };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
-  }, []);
-  function edit(next: ResourceRowValue[], remember = true) {
-    setDownloadReport(null);
-    setSourceReport(null);
-    setSourceRows([]);
-    setFilter('all');
-    setUndo((history) => (remember ? [...history.slice(-9), rows] : history));
-    setRows(next);
-    dirtyRef.current = true;
-    setDirty(true);
+  const [previewRowIdx, setPreviewRowIdx] = useState<number | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [filePickRow, setFilePickRow] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  const dirty = useMemo(
+    () => !loading && JSON.stringify(rows) !== savedJson,
+    [loading, rows, savedJson],
+  );
+  const busy = loading || saving || checking || downloading;
+
+  const loadTable = useCallback(async () => {
+    setLoading(true);
     setError('');
-    setDiscard(false);
-  }
-  function preparedRows() {
-    const current = validateResourceRows(rows);
-    const e = editingRef.current;
-    return e
-      ? pasteResourceCells(current, e.r, e.c, '"' + e.value.replace(/"/g, '""') + '"', createId)
-      : current;
-  }
-  function attempt(work: () => ResourceRowValue[]) {
     try {
-      const next = work();
-      editingRef.current = null;
-      setEditing(null);
-      edit(next);
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : '本次修改未添加');
-    }
-  }
-  async function save(close: boolean) {
-    if (!table || saving.current) return false;
-    saving.current = true;
-    setBusy(true);
-    setError('');
-    let shouldClose = false;
-    const work = (async (): Promise<ResourceTableValue | false> => {
-      try {
-        const next = preparedRows();
-        const saved = dirtyRef.current
-          ? await api.saveResourceTable(combination.id, table.revision, next)
-          : table;
-        if (
-          saved.combinationId !== combination.id ||
-          (dirtyRef.current && saved.revision !== table.revision + 1) ||
-          (dirtyRef.current && JSON.stringify(saved.rows) !== JSON.stringify(next))
-        )
-          throw Error('RESOURCE_RESPONSE_MISMATCH');
-        setTable(saved);
-        editingRef.current = null;
-        setEditing(null);
-        setRows(saved.rows);
-        dirtyRef.current = false;
-        setDirty(false);
-        await onSaved();
-        if (close) shouldClose = true;
-        return saved;
-      } catch (failure) {
-        setError(failure instanceof Error ? failure.message : '保存未确认，当前编辑保留');
-        return false;
-      } finally {
-        saving.current = false;
-        activeSaveRef.current = null;
-        setBusy(false);
-      }
-    })();
-    activeSaveRef.current = work;
-    const result = await work;
-    if (shouldClose) onClose();
-    return result;
-  }
-  useImperativeHandle(ref, () => ({
-    persist: async () => {
-      if (activeSaveRef.current) {
-        const prevOk = await activeSaveRef.current;
-        if (!prevOk && dirtyRef.current) return false;
-      }
-      if (!dirtyRef.current) return true;
-      if (busy && !saving.current) return false;
-      return Boolean(await save(false));
-    },
-  }));
-  async function checkSources() {
-    if (!table || checking.current || saving.current) return;
-    const controller = new AbortController();
-    checking.current = controller;
-    setCheckProgress(null);
-    setError('');
-    setBusy(true);
-    try {
-      // The check consumes the server's exact saved version; unsaved cells never authorize IO.
-      const saved = dirty ? await save(false) : table;
-      if (!saved || controller.signal.aborted || !mounted.current) return;
-      setBusy(true);
-      const selectedIds = saved.rows.filter((row) => selected.has(row.id)).map((row) => row.id);
-      const report = await api.checkResourceSources(
-        combination.id,
-        saved.revision,
-        controller.signal,
-        selectedIds.length ? selectedIds : undefined,
-        (progress) => {
-          if (mounted.current && !controller.signal.aborted) setCheckProgress(progress);
-        },
-      );
-      if (!mounted.current || controller.signal.aborted) return;
-      if (
-        report.combinationId !== combination.id ||
-        report.expectedRevision !== saved.revision ||
-        JSON.stringify(report.rows.map((row) => row.rowId)) !==
-          JSON.stringify(selectedIds.length ? selectedIds : saved.rows.map((row) => row.id))
-      )
-        throw Error('来源检查结果与当前资源版本不匹配');
-      setSourceReport(report);
-      setSourceRows((previous) => {
-        const samples = new Map(previous.map((row) => [row.rowId, row]));
-        for (const row of report.rows) samples.set(row.rowId, row);
-        // Display observations only; any edit clears them, execution rechecks actual files.
-        const first = new Map<string, string>();
-        return saved.rows.flatMap((row) => {
-          const sample = samples.get(row.id);
-          if (!sample) return [];
-          const duplicateOf = sample.fingerprint ? (first.get(sample.fingerprint) ?? null) : null;
-          if (sample.fingerprint && !first.has(sample.fingerprint))
-            first.set(sample.fingerprint, row.id);
-          return [{ ...sample, duplicateOf }];
-        });
-      });
-    } catch (failure) {
-      if (mounted.current)
-        setError(
-          controller.signal.aborted
-            ? '检查已取消，已保存资源保持'
-            : failure instanceof Error
-              ? failure.message
-              : '来源检查未完成，请重试',
-        );
+      const table = await api.resourceTable(combination.id);
+      const loaded = table.rows.length ? table.rows : [emptyResourceRow(createId())];
+      setRows(loaded);
+      setSavedJson(JSON.stringify(loaded));
+      setRevision(table.revision);
+      setObservations(new Map());
+      setConfirmDiscard(false);
+    } catch (e) {
+      setError(errMsg(e, '加载资源表失败'));
     } finally {
-      if (checking.current === controller) checking.current = null;
-      if (mounted.current) setCheckProgress(null);
-      if (mounted.current) setBusy(false);
+      setLoading(false);
     }
-  }
-  async function downloadSources(failedOnly = false) {
-    if (!table || busy || saving.current || downloading.current) return;
-    const controller = new AbortController();
-    downloading.current = controller;
-    setBusy(true);
+  }, [combination.id]);
+
+  useEffect(() => {
+    void loadTable();
+    return () => streamAbortRef.current?.abort();
+  }, [loadTable]);
+
+  const applyCell = useCallback(
+    (
+      current: ResourceRowValue[],
+      rowIdx: number,
+      col: number,
+      value: string,
+    ): ResourceRowValue[] => {
+      try {
+        setError('');
+        return pasteResourceCells(current, rowIdx, col, value, createId, rowIdx, col);
+      } catch (e) {
+        setError(errMsg(e, '单元格格式无效'));
+        return current;
+      }
+    },
+    [],
+  );
+
+  const grid = useSpreadsheetGrid<ResourceRowValue>({
+    rows,
+    colCount: 5,
+    disabled: busy,
+    onRowsChange: setRows,
+    getCellValue: resourceCellValue,
+    applyCellEdit: applyCell,
+    isSelectCol,
+    isEditableCell: (r, c) => !(c === 2 && (rows[r]?.media.length ?? 0) > 0),
+    copyRangeText: (cur, b) =>
+      formatResourceCellsForClipboard(cur, b.minRow, b.maxRow, b.minCol, b.maxCol),
+    fillDown: (cur, b, endRow) =>
+      pasteResourceCells(
+        cur,
+        b.maxRow + 1,
+        b.minCol,
+        expandFillDownTsv(cur, b, endRow, resourceCellValue),
+        createId,
+        endRow,
+        b.maxCol,
+      ),
+    pasteTsv: (cur, b, text) =>
+      pasteResourceCells(cur, b.minRow, b.minCol, text, createId, b.maxRow, b.maxCol),
+    onError: setError,
+    createEmptyRow: () => emptyResourceRow(createId()),
+  });
+
+  const persist = useCallback(async (): Promise<boolean> => {
+    const latest = grid.commitEdit();
+    setSaving(true);
     setError('');
+    try {
+      const saved = await api.saveResourceTable(
+        combination.id,
+        revision,
+        validateResourceRows(latest),
+      );
+      const nextRows = saved.rows.length ? saved.rows : [emptyResourceRow(createId())];
+      setRows(nextRows);
+      setSavedJson(JSON.stringify(nextRows));
+      setRevision(saved.revision);
+      setNotice('资源表已保存');
+      onSaved();
+      return true;
+    } catch (e) {
+      setError(errMsg(e, '保存资源表失败'));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [combination.id, grid, onSaved, revision]);
+
+  useImperativeHandle(ref, () => ({ persist }), [persist]);
+
+  const fillMediaFiles = (startRow: number, files: FileList | null) => {
+    const paths = parseElectronFilePaths(files);
+    if (!paths.length) return setError('浏览器环境无法读取本地绝对路径，请手动粘贴或拖动链接');
+    try {
+      grid.commitRows(fillResourceMedia(rows, startRow, paths.map(mediaReference), createId), true);
+    } catch (e) {
+      setError(errMsg(e, '填充本机文件失败'));
+    }
+  };
+
+  const mergeSelectedImages = () => {
+    const indices = getSelectedRowIndices(grid.bounds, rows.length);
+    if (indices.length < 2) return setError('请先选中至少两行再合并图片');
+    const targetIdx = indices[0];
+    if (targetIdx === undefined) return;
+    const collected = indices.flatMap((idx) => rows[idx]?.media ?? []);
+    const imagesOnly = collected.filter((m) => m.mediaType === 'image');
+    if (!imagesOnly.length || imagesOnly.length !== collected.length)
+      return setError('只能将多行纯图片合并为一组多图，视频不可合并');
+    if (imagesOnly.length > 20) return setError('单行最多合并 20 张图片');
+    const set = new Set(indices);
+    grid.commitRows(
+      rows.map((r, i) =>
+        i === targetIdx
+          ? { ...r, media: imagesOnly, background: 'plain' as const }
+          : set.has(i)
+            ? { ...r, media: [] }
+            : r,
+      ),
+      true,
+    );
+    setNotice(`已合并 ${imagesOnly.length} 张图片到第 ${targetIdx + 1} 行`);
+  };
+
+  async function runStreamOp(kind: 'check' | 'download') {
+    if (dirty && !(await persist())) return;
+    streamAbortRef.current?.abort();
+    const ac = new AbortController();
+    streamAbortRef.current = ac;
+    (kind === 'check' ? setChecking : setDownloading)(true);
+    setError('');
+    setNotice('');
+    setCheckProgress(null);
     setDownloadProgress(null);
     try {
-      const saved = dirty ? await save(false) : table;
-      if (!saved || !mounted.current || controller.signal.aborted) return;
-      setBusy(true);
-      const failedIds = new Set(downloadReport?.issues.map((issue) => issue.rowId) ?? []);
-      const ids = saved.rows
-        .filter(
-          (row) =>
-            (failedOnly ? failedIds.has(row.id) : !selected.size || selected.has(row.id)) &&
-            row.media.some((item) => item.kind === 'drive'),
-        )
-        .map((row) => row.id);
-      if (!ids.length) {
-        setError('当前选择没有待下载的网盘素材');
-        return;
-      }
-      const report = await api.downloadResourceSources(
-        combination.id,
-        saved.revision,
-        controller.signal,
-        ids,
-        (progress) => {
-          if (mounted.current && !controller.signal.aborted) setDownloadProgress(progress);
-        },
-      );
-      if (!mounted.current || controller.signal.aborted) return;
-      setTable(report.table);
-      setRows(report.table.rows);
-      setUndo([]);
-      setDirty(false);
-      setSourceRows([]);
-      setSourceReport(null);
-      setDownloadReport(report);
-      await onSaved();
-    } catch (failure) {
-      if (mounted.current) {
-        // Successful members were saved through original revisions before delivery. Do not
-        // save a stale editor over them after a cancellation or disconnected response.
-        try {
-          const refreshed = await api.resourceTable(combination.id);
-          if (mounted.current) {
-            setTable(refreshed);
-            setRows(refreshed.rows);
-            setUndo([]);
-            setDirty(false);
-            setSourceRows([]);
-            setSourceReport(null);
-            await onSaved();
-          }
-        } catch {
-          /* Keep current display, revision CAS still rejects a stale save. */
-        }
-        setError(
-          controller.signal.aborted
-            ? '下载已取消；成功下载的素材已保存，未完成链接保留'
-            : failure instanceof Error
-              ? failure.message
-              : '下载未完成，请重新读取后继续',
+      if (kind === 'check') {
+        const report = await api.checkResourceSources(
+          combination.id,
+          revision,
+          ac.signal,
+          undefined,
+          setCheckProgress,
         );
+        setObservations(new Map(report.rows.map((item) => [item.rowId, item])));
+        setNotice(`来源检查完成：共 ${report.rows.length} 条`);
+      } else {
+        const report = await api.downloadResourceSources(
+          combination.id,
+          revision,
+          ac.signal,
+          undefined,
+          setDownloadProgress,
+        );
+        const nextRows = report.table.rows.length
+          ? report.table.rows
+          : [emptyResourceRow(createId())];
+        setRows(nextRows);
+        setSavedJson(JSON.stringify(nextRows));
+        setRevision(report.table.revision);
+        setNotice(
+          `网盘下载完成：成功 ${report.progress.downloaded}，失败 ${report.progress.failed}`,
+        );
+        onSaved();
       }
+    } catch (e) {
+      if (!ac.signal.aborted)
+        setError(errMsg(e, kind === 'check' ? '来源检查失败' : '下载网盘媒体失败'));
     } finally {
-      if (downloading.current === controller) downloading.current = null;
-      if (mounted.current) {
-        setBusy(false);
-        setDownloadProgress(null);
-      }
+      setChecking(false);
+      setDownloading(false);
+      setCheckProgress(null);
+      setDownloadProgress(null);
     }
   }
-  async function previewRow(rowId: string) {
-    if (!table || busy || saving.current || checking.current) return;
-    const saved = dirty ? await save(false) : table;
-    if (!saved || !mounted.current) return;
-    const index = saved.rows.findIndex((row) => row.id === rowId);
-    const row = saved.rows[index];
-    if (row) setPreview({ row, revision: saved.revision, rowNumber: index + 1 });
-  }
-  const quoteCell = (value: string) => '"' + value.replace(/"/g, '""') + '"';
-  function undoEdit() {
-    const previous = undo.at(-1);
-    if (previous) {
-      edit(previous, false);
-      setUndo(undo.slice(0, -1));
-      setEditing(null);
-      editingRef.current = null;
-    }
-  }
-  function paste(event: React.ClipboardEvent) {
-    if (editingRef.current || busy || !table) return;
-    event.preventDefault();
-    attempt(() =>
-      pasteResourceCells(
-        preparedRows(),
-        bounds.minRow,
-        bounds.minCol,
-        event.clipboardData.getData('text/plain'),
-        createId,
-        bounds.maxRow,
-        bounds.maxCol,
-      ),
-    );
-  }
-  function copy(event: React.ClipboardEvent) {
-    if (editingRef.current) return;
-    if (!rows.length) {
-      event.preventDefault();
-      return;
-    }
-    event.preventDefault();
-    event.clipboardData.setData(
-      'text/plain',
-      formatResourceCellsForClipboard(
-        preparedRows(),
-        bounds.minRow,
-        bounds.maxRow,
-        bounds.minCol,
-        bounds.maxCol,
-      ),
-    );
-  }
-  async function copyTable() {
-    try {
-      await copyTextToClipboard(
-        formatResourceCellsForClipboard(preparedRows(), 0, rows.length - 1, 0, 4),
-      );
-    } catch {
-      setError('复制失败，请选择表格后按 Ctrl/Cmd+C');
-    }
-  }
-  function startEdit(r: number, c: number) {
-    if (busy || !table) return;
-    const row = rows[r];
-    if (!row) return;
-    if (c === 2 && row.media.length > 0) return;
-    const next = { r, c, value: resourceCellValue(row, c) };
-    editingRef.current = next;
-    setEditing(next);
-  }
-  function commitEdit() {
-    const e = editingRef.current;
-    if (!e) return;
-    try {
-      const next = pasteResourceCells(preparedRows(), e.r, e.c, quoteCell(e.value), createId);
-      editingRef.current = null;
-      setEditing(null);
-      edit(next);
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : '单元格格式不正确');
-    }
-  }
-  function clearRange() {
-    attempt(() => {
-      const next = structuredClone(preparedRows());
-      const keys = ['text', 'media', 'background', 'purpose', 'aiLabel'] as const;
-      const defaults = ['', [], 'color', 'post', 'preserve-current'];
-      for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
-        for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-          const target = next[r],
-            key = keys[c];
-          if (target && key) Object.assign(target, { [key]: structuredClone(defaults[c]) });
-        }
-        const target = next[r];
-        if (target && target.media.length > 0) target.background = 'plain';
-      }
-      return validateResourceRows(next);
-    });
-  }
-  function deleteRows() {
-    attempt(() => preparedRows().filter((row) => !selected.has(row.id)));
-    setRange({ r1: 0, c1: 0, r2: 0, c2: 0 });
-  }
-  function beginRange(r: number, c: number, shift: boolean, kind: 'cells' | 'rows' = 'cells') {
-    if (busy || !table) return;
-    if (editingRef.current) commitEdit();
-    grid.current?.focus();
-    drag.current = kind;
-    if (!shift) anchor.current = { r, c };
-    const from = shift ? { r: range.r1, c: range.c1 } : anchor.current;
-    anchor.current = from;
-    setRange({ r1: from.r, c1: kind === 'rows' ? 0 : from.c, r2: r, c2: kind === 'rows' ? 4 : c });
-  }
-  function extendRange(r: number, c: number) {
-    if (drag.current === 'fill') {
-      fillTarget.current = r;
-      setRange({ ...range, r2: Math.max(r, bounds.maxRow) });
-    } else if (drag.current) {
-      setRange({
-        r1: anchor.current.r,
-        c1: drag.current === 'rows' ? 0 : anchor.current.c,
-        r2: r,
-        c2: drag.current === 'rows' ? 4 : c,
-      });
-    }
-  }
-  finishDrag.current = () => {
-    if (busy || !table) {
-      drag.current = null;
-      return;
-    }
-    if (drag.current === 'fill') {
-      const end = fillTarget.current,
-        first = rows[bounds.minRow];
-      if (first && end > bounds.minRow)
-        attempt(() => {
-          const next = structuredClone(preparedRows()),
-            keys = ['text', 'media', 'background', 'purpose', 'aiLabel'] as const;
-          for (let r = bounds.minRow + 1; r <= end; r++) {
-            for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-              const target = next[r],
-                key = keys[c];
-              if (target && key) Object.assign(target, { [key]: structuredClone(first[key]) });
-            }
-            const target = next[r];
-            if (target && target.media.length > 0) target.background = 'plain';
-          }
-          return validateResourceRows(next);
-        });
-    }
-    drag.current = null;
-  };
-  function gridKeys(event: React.KeyboardEvent) {
-    if (editingRef.current || busy || !table) return;
-    if (!rows.length) return;
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
-      event.preventDefault();
-      undoEdit();
-      return;
-    }
-    if (['Delete', 'Backspace'].includes(event.key)) {
-      event.preventDefault();
-      clearRange();
-      return;
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      startEdit(range.r1, range.c1);
-      return;
-    }
-    const delta: Record<string, [number, number]> = {
-      ArrowUp: [-1, 0],
-      ArrowDown: [1, 0],
-      ArrowLeft: [0, -1],
-      ArrowRight: [0, 1],
-    };
-    const movement = delta[event.key];
-    if (movement) {
-      event.preventDefault();
-      const [dr, dc] = movement;
-      const r = Math.max(0, Math.min(rows.length - 1, (event.shiftKey ? range.r2 : range.r1) + dr)),
-        c = Math.max(0, Math.min(4, (event.shiftKey ? range.c2 : range.c1) + dc));
-      setRange(event.shiftKey ? { ...range, r2: r, c2: c } : { r1: r, c1: c, r2: r, c2: c });
-      grid.current
-        ?.querySelector(`[data-r="${r}"][data-c="${c}"]`)
-        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    }
-  }
-  function addFiles(list: FileList | null, start?: number) {
-    if (!list?.length) return;
-    attempt(() => {
-      const desktop = window.workbenchDesktop;
-      if (!desktop) throw Error('完整本机文件路径仅桌面端可用；请在桌面软件选择或拖入媒体。');
-      const media = Array.from(list).map((file) => {
-        const source = desktop.materialFilePath(file);
-        if (!source) throw Error('文件没有真实本机路径，本批次尚未添加');
-        return mediaReference(source);
-      });
-      const current = preparedRows();
-      const firstEmpty = current.findIndex((row) => !row.media.length);
-      if (start !== undefined)
-        return pasteResourceCells(
-          current,
-          start,
-          1,
-          media.map((m) => quoteCell(m.source)).join('\n'),
-          createId,
-        );
-      return fillResourceMedia(
-        current,
-        start ?? cell?.row ?? (firstEmpty < 0 ? current.length : firstEmpty),
-        media,
-        createId,
-      );
-    });
-  }
-  function mergeImages() {
-    attempt(() => {
-      const current = preparedRows();
-      const chosen = current.filter((row) => selected.has(row.id));
-      const first = chosen[0];
-      if (
-        !first ||
-        chosen.length < 2 ||
-        chosen.some(
-          (row) =>
-            row.text.trim() ||
-            !row.media.length ||
-            row.media.some((item) => item.mediaType !== 'image'),
-        ) ||
-        chosen.flatMap((row) => row.media).length > 20
-      )
-        throw Error('请选择2至20张没有文案的本机图片，合并成一条多图帖');
-      return validateResourceRows(
-        current
-          .filter((row) => !selected.has(row.id) || row.id === first.id)
-          .map((row) =>
-            row.id === first.id ? { ...row, media: chosen.flatMap((item) => item.media) } : row,
-          ),
-      );
-    });
-  }
-  const checkedRows = new Map(sourceRows.map((row) => [row.rowId, row]));
-  const matching = rows
-    .map((row, index) => ({ row, index }))
-    .filter(({ row, index }) => resourceMatches(row, index, query, filter, checkedRows));
-  const entries = matching;
-  const remaining = rows.filter(hasResource).length;
+
+  const visibleEntries = useMemo(
+    () =>
+      rows
+        .map((row, index) => ({ row, index }))
+        .filter(({ row, index }) => resourceMatches(row, index, query, filter, observations)),
+    [filter, observations, query, rows],
+  );
+  const previewRow = previewRowIdx !== null ? (rows[previewRowIdx] ?? null) : null;
+  const toolbarButtons: ReadonlyArray<[string, () => void, boolean?, 'danger'?]> = [
+    ['+1 行', () => grid.commitRows([...rows, emptyResourceRow(createId())], true)],
+    [
+      '+5 行',
+      () =>
+        grid.commitRows(
+          [...rows, ...Array.from({ length: 5 }, () => emptyResourceRow(createId()))],
+          true,
+        ),
+    ],
+    [
+      '选择本机文件',
+      () => {
+        setFilePickRow(grid.bounds?.minRow ?? 0);
+        fileInputRef.current?.click();
+      },
+    ],
+    ['合并选中行图片', mergeSelectedImages],
+    [
+      '删除选中行',
+      () => {
+        const set = new Set(getSelectedRowIndices(grid.bounds, rows.length));
+        if (!set.size) return;
+        const next = rows.filter((_, i) => !set.has(i));
+        grid.commitRows(next.length ? next : [emptyResourceRow(createId())], true);
+      },
+      busy || !grid.bounds,
+      'danger',
+    ],
+    ['撤销', grid.handleUndo, busy || !grid.canUndo],
+    ['重做', grid.handleRedo, busy || !grid.canRedo],
+  ];
+
   return (
-    <dialog
-      ref={dialog}
-      className="resource-dialog"
-      aria-labelledby="resource-heading"
-      onCancel={(event) => {
-        event.preventDefault();
-        if (busy) return;
-        if (dirty) setDiscard(true);
-        else onClose();
-      }}
-    >
-      <header className="resource-header">
-        <div>
-          <h2 id="resource-heading">设置发帖资源</h2>
-          <p>{combination.draft?.name || combination.saved?.name || '任务组合'} · 发帖子任务共用</p>
-        </div>
-        <span className="version">
-          {dirty ? '未保存' : '已保存'} · {remaining} 条资源
-        </span>
-      </header>
-      <fieldset disabled={busy || !table} className="resource-body">
-        <div className="resource-toolbar resource-main-toolbar">
-          <div className="resource-toolbar-actions">
-            <button
-              disabled={rows.length >= 1000}
-              onClick={() => {
-                attempt(() => [...preparedRows(), emptyResourceRow(createId())]);
-                setRange({ r1: rows.length, c1: 0, r2: rows.length, c2: 0 });
-              }}
-            >
-              ＋ 新增一行
-            </button>
-            <button onClick={() => files.current?.click()}>＋ 添加本机图片/视频</button>
-            <button disabled={!rows.length} onClick={() => void copyTable()}>
-              复制整表
-            </button>
-            <button disabled={!undo.length} onClick={undoEdit}>
-              撤销 (Ctrl+Z)
-            </button>
-            {rows.some((row) => row.media.some((m) => m.kind === 'drive')) && (
-              <button onClick={() => void downloadSources()}>下载网盘素材</button>
-            )}
-            <input
-              ref={files}
-              type="file"
-              accept=".mp4,.mov,.png,.jpg,.jpeg,.webp"
-              multiple
-              hidden
-              onChange={(event) => {
-                addFiles(event.target.files);
-                event.target.value = '';
-              }}
-            />
+    <div className="resource-editor-shell fixed inset-0 z-75 flex flex-col bg-slate-950/40 p-4 backdrop-blur-[2px]">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 rounded-2xl border border-[var(--line)] bg-white p-4 shadow-2xl">
+        <div className="resource-editor-header flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] pb-3">
+          <div>
+            <h2 className="m-0 text-base font-semibold text-slate-900">
+              资源表 · {combination.saved?.name ?? '未命名'}
+            </h2>
+            <p className="mt-0.5 mb-0 text-xs text-[var(--text-3)]">
+              版本号 r{revision} · 共 {rows.filter(hasResource).length} 条有效资源（{rows.length}{' '}
+              行）
+            </p>
           </div>
-          <div className="resource-toolbar-actions resource-search">
+          <div className="resource-editor-header-actions flex flex-wrap items-center gap-2">
+            {dirty && (
+              <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-800">
+                有未保存修改
+              </span>
+            )}
+            <Btn onClick={() => setShowHelp((v) => !v)}>快捷键</Btn>
+            {dirty && <Btn onClick={() => setConfirmDiscard(true)}>放弃修改</Btn>}
+            <Btn v="primary" disabled={busy} onClick={() => void persist()}>
+              {saving ? '保存中…' : '保存'}
+            </Btn>
+            <Btn onClick={() => (dirty ? setConfirmDiscard(true) : onClose())}>关闭</Btn>
+          </div>
+        </div>
+
+        {confirmDiscard && (
+          <div className="notice-banner is-warn flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+            <span>当前有未保存修改，确定放弃修改吗？</span>
+            <div className="inline-actions flex flex-wrap items-center gap-1.5">
+              <Btn
+                v="danger"
+                onClick={() => {
+                  setConfirmDiscard(false);
+                  onClose();
+                }}
+              >
+                放弃并关闭
+              </Btn>
+              <Btn onClick={() => void loadTable()}>还原为已保存版本</Btn>
+              <Btn onClick={() => setConfirmDiscard(false)}>继续编辑</Btn>
+            </div>
+          </div>
+        )}
+        {showHelp && (
+          <div className="rounded-lg border border-[var(--line)] bg-slate-50 px-3 py-2 text-xs text-[var(--text-2)]">
+            双击或直接键入进入编辑 · Enter 向下 · Tab 向右 · Shift+Enter 换行 · Ctrl+C/V/X
+            复制粘贴剪切 · Ctrl+Z/Y 撤销重做 · 拖拽右下角绿点向下填充 · 点击行号预览该行媒体
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="resource-toolbar-group flex flex-wrap items-center gap-1.5">
+            {toolbarButtons.map(([label, onClick, dis, v]) => (
+              <Btn key={label} v={v ?? 'default'} disabled={dis ?? busy} onClick={onClick}>
+                {label}
+              </Btn>
+            ))}
+          </div>
+          <div className="resource-toolbar-group flex flex-wrap items-center gap-1.5">
             <input
-              aria-label="搜索资源"
-              placeholder="搜索文案、文件或行号"
+              type="search"
+              className={`${UI_INPUT_SM} w-44`}
+              placeholder="筛选文案/路径…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
             <select
-              aria-label="筛选资源状态"
+              className={UI_SELECT_SM}
+              aria-label="筛选资源行"
               value={filter}
               onChange={(e) => setFilter(e.target.value as ResourceFilter)}
             >
-              <option value="all">全部状态</option>
-              <option value="attention">需处理</option>
-              <option value="unchecked">未检查</option>
-              <option value="verified">来源已核对</option>
-              <option value="duplicate">内容重复</option>
-              <option value="drive">网盘待下载</option>
-              <option value="post">可用于帖子</option>
-              <option value="story">可用于快拍</option>
+              {FILTER_OPTIONS.map(([val, label]) => (
+                <option key={val} value={val}>
+                  {label}
+                </option>
+              ))}
             </select>
-            <button disabled={!remaining} onClick={() => void checkSources()}>
-              检查资源
-            </button>
+            <Btn
+              disabled={loading || saving || downloading}
+              onClick={() =>
+                checking ? streamAbortRef.current?.abort() : void runStreamOp('check')
+              }
+            >
+              {checking
+                ? `取消检查 (${checkProgress?.completed ?? 0}/${checkProgress?.total ?? rows.length})`
+                : '检查来源'}
+            </Btn>
+            <Btn
+              disabled={loading || saving || checking}
+              onClick={() =>
+                downloading ? streamAbortRef.current?.abort() : void runStreamOp('download')
+              }
+            >
+              {downloading
+                ? `取消下载 (${downloadProgress?.completed ?? 0}/${downloadProgress?.total ?? 0})`
+                : '下载网盘媒体'}
+            </Btn>
           </div>
         </div>
-        <div className="resource-selection-toolbar">
-          <span>
-            当前选区：{String.fromCharCode(65 + bounds.minCol)}
-            {bounds.minRow + 1}:{String.fromCharCode(65 + bounds.maxCol)}
-            {bounds.maxRow + 1}（{bounds.maxRow - bounds.minRow + 1}行×
-            {bounds.maxCol - bounds.minCol + 1}列）
-          </span>
-          <button disabled={!rows.length} onClick={clearRange}>
-            清空选区 (Del)
-          </button>
-          <select
-            aria-label="一键填充选区选项"
-            value=""
-            onChange={(e) => {
-              const [column, value] = e.target.value.split(':');
-              if (!column || !value) return;
-              attempt(() =>
-                pasteResourceCells(
-                  preparedRows(),
-                  bounds.minRow,
-                  Number(column),
-                  value,
-                  createId,
-                  bounds.maxRow,
-                  Number(column),
-                ),
-              );
-            }}
+
+        {error && (
+          <div
+            className="alert-banner is-error rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-relaxed text-rose-700"
+            role="alert"
           >
-            <option value="">一键填充选区选项…</option>
-            <optgroup label="C列·文字背景">
-              <option value="2:color">彩贴</option>
-              <option value="2:plain">普通文字</option>
-            </optgroup>
-            <optgroup label="D列·用途">
-              <option value="3:post">帖子</option>
-              <option value="3:story">快拍</option>
-              <option value="3:both">通用</option>
-            </optgroup>
-            <optgroup label="E列·AI声明">
-              <option value="4:preserve-current">默认</option>
-              <option value="4:on">开启</option>
-              <option value="4:off">关闭</option>
-            </optgroup>
-          </select>
-          <button disabled={selected.size < 2} onClick={mergeImages}>
-            合并为多图帖
-          </button>
-          <button disabled={!rows.length} onClick={deleteRows}>
-            删除所涉整行
-          </button>
-        </div>
-        {downloadReport && (
-          <p className="resource-check-summary">
-            下载成功 {downloadReport.progress.downloaded} 份 · 失败 {downloadReport.progress.failed}{' '}
-            份{' '}
-            {!!downloadReport.issues.length && (
-              <button onClick={() => void downloadSources(true)}>重试失败行</button>
-            )}
-          </p>
+            {error}
+          </div>
         )}
-        {sourceReport && (
-          <p className="resource-check-summary">
-            已检查 {sourceReport.rows.length} 行 · {sourceReport.verifiedSources} 条来源可用 ·{' '}
-            {sourceReport.uniqueContents} 条不同内容
-          </p>
+        {notice && (
+          <div className="alert-banner is-ok rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-800">
+            {notice}
+          </div>
         )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,video/*"
+          className="hidden"
+          onChange={(e) => {
+            fillMediaFiles(filePickRow, e.target.files);
+            e.target.value = '';
+          }}
+        />
+
         <div
-          className="resource-grid-scroll"
-          ref={grid}
+          ref={grid.wrapRef}
+          className="resource-matrix-scroll relative min-h-0 flex-1 overflow-auto rounded-xl border border-[#e0e5ec] bg-white focus:outline-none"
           tabIndex={0}
-          onKeyDown={gridKeys}
-          onPaste={paste}
-          onCopy={copy}
-          aria-label="发帖资源矩阵"
+          onKeyDown={grid.handleGridKeyDown}
+          onPaste={grid.handlePaste}
         >
-          <table
-            className="resource-grid resource-matrix"
-            role="grid"
-            aria-rowcount={rows.length + 1}
-            aria-colcount={7}
-          >
+          <table className="resource-matrix w-full border-collapse text-xs">
             <thead>
               <tr>
-                <th>
-                  <button
-                    aria-label="选择整表"
-                    onClick={() =>
-                      setRange({ r1: 0, c1: 0, r2: Math.max(0, rows.length - 1), c2: 4 })
-                    }
-                  >
-                    #
-                  </button>
-                </th>
-                {[
-                  'A · 发帖文案',
-                  'B · 本机媒体 / 网盘链接',
-                  'C · 文字背景',
-                  'D · 用途',
-                  'E · AI 声明',
-                ].map((title, c) => (
-                  <th key={title}>
-                    <button
-                      onClick={() =>
-                        setRange({ r1: 0, c1: c, r2: Math.max(0, rows.length - 1), c2: c })
-                      }
+                {['#', 'A 文案', 'B 媒体路径/链接', 'C 背景', 'D 用途', 'E AI 声明', '状态'].map(
+                  (h) => (
+                    <th
+                      key={h}
+                      className="sticky top-0 z-[2] border border-[#e0e5ec] bg-slate-50 px-2.5 py-2 text-left text-[11px] font-semibold text-[var(--text-2)] select-none"
                     >
-                      {title}
-                    </button>
-                  </th>
-                ))}
-                <th>预览 / 状态</th>
+                      {h}
+                    </th>
+                  ),
+                )}
               </tr>
             </thead>
             <tbody>
-              {entries.map(({ row, index: r }) => {
-                const checked = checkedRows.get(row.id);
+              {visibleEntries.map(({ row, index: rIdx }) => {
+                const status = rowStatusDisplay(row, observations.get(row.id));
                 return (
-                  <tr key={row.id}>
-                    <th
-                      className="resource-row-number"
-                      onPointerDown={(e) => {
+                  <tr
+                    key={row.id}
+                    className={
+                      isRowInGridBounds(grid.bounds, rIdx, 5)
+                        ? 'row-selected bg-[#f3f7ff]'
+                        : 'hover:bg-slate-50/50'
+                    }
+                    onDragOver={(e) => {
+                      if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+                    }}
+                    onDrop={(e: ReactDragEvent) => {
+                      if (e.dataTransfer.files.length) {
                         e.preventDefault();
-                        beginRange(r, 0, e.shiftKey, 'rows');
-                      }}
-                      onPointerEnter={() => extendRange(r, 4)}
+                        fillMediaFiles(rIdx, e.dataTransfer.files);
+                      }
+                    }}
+                  >
+                    <td
+                      className="resource-row-number w-12 cursor-cell border border-[#e0e5ec] bg-[var(--surface-2)] px-2 py-1.5 text-center align-middle font-mono text-[11px] text-[var(--text-3)] select-none"
+                      title="点击预览该行媒体，拖拽选择整行"
+                      onMouseDown={(e) => grid.beginRowMouseDown(e, rIdx)}
+                      onMouseEnter={() => grid.handleCellMouseEnter(rIdx, 0)}
+                      onClick={() => row.media.length && setPreviewRowIdx(rIdx)}
                     >
-                      {r + 1}
-                    </th>
-                    {[0, 1, 2, 3, 4].map((c) => {
-                      const inRange =
-                          r >= bounds.minRow &&
-                          r <= bounds.maxRow &&
-                          c >= bounds.minCol &&
-                          c <= bounds.maxCol,
-                        active = r === range.r1 && c === range.c1,
-                        isEditing = editing?.r === r && editing.c === c;
+                      {rIdx + 1}
+                    </td>
+                    {COLS.map((c) => {
+                      const mediaLocked = c.col === 2 && row.media.length > 0;
+                      const opts = 'opts' in c ? c.opts : undefined;
                       return (
-                        <td
-                          key={c}
-                          data-r={r}
-                          data-c={c}
-                          role="gridcell"
-                          aria-selected={inRange}
-                          className={`${inRange ? 'in-range ' : ''}${active ? 'active-anchor ' : ''}${isEditing ? 'editing-cell' : ''}`}
-                          onPointerDown={(e) => {
-                            if (isEditing || e.button !== 0) return;
-                            e.preventDefault();
-                            beginRange(r, c, e.shiftKey);
-                          }}
-                          onPointerEnter={() => extendRange(r, c)}
-                          onDoubleClick={() => startEdit(r, c)}
-                          onDragOver={(e) => {
-                            if (c === 1) e.preventDefault();
-                          }}
-                          onDrop={(e) => {
-                            if (c === 1) {
-                              e.preventDefault();
-                              addFiles(e.dataTransfer.files, r);
-                            }
-                          }}
-                        >
-                          {isEditing ? (
-                            c < 2 ? (
-                              <textarea
-                                autoFocus
-                                aria-label={`${c === 0 ? '文案' : '媒体'}第${r + 1}行`}
-                                value={editing.value}
-                                onChange={(e) => {
-                                  const next = { ...editing, value: e.target.value };
-                                  editingRef.current = next;
-                                  setEditing(next);
-                                  setDirty(true);
-                                }}
-                                onBlur={commitEdit}
-                                onKeyDown={(e) => {
-                                  e.stopPropagation();
-                                  if (e.key === 'Enter' && !e.shiftKey) {
-                                    e.preventDefault();
-                                    commitEdit();
-                                    grid.current?.focus();
-                                  } else if (e.key === 'Escape') {
-                                    editingRef.current = null;
-                                    setEditing(null);
-                                    grid.current?.focus();
-                                  }
-                                }}
-                              />
-                            ) : (
-                              <select
-                                autoFocus
-                                onFocus={(e) => {
-                                  try {
-                                    e.currentTarget.showPicker?.();
-                                  } catch {
-                                    /* Keyboard edit remains available. */
-                                  }
-                                }}
-                                aria-label={`${['', '', '背景', '用途', 'AI声明'][c]}第${r + 1}行`}
-                                value={editing.value}
-                                onChange={(e) => {
-                                  editingRef.current = { ...editing, value: e.target.value };
-                                  commitEdit();
-                                  grid.current?.focus();
-                                }}
-                                onBlur={commitEdit}
-                                onKeyDown={(e) => {
-                                  e.stopPropagation();
-                                  if (e.key === 'Escape') {
-                                    editingRef.current = null;
-                                    setEditing(null);
-                                  } else if (e.key === 'Enter') {
-                                    commitEdit();
-                                  }
-                                }}
-                              >
-                                {(c === 2
-                                  ? ['彩贴', '普通文字']
-                                  : c === 3
-                                    ? ['帖子', '快拍', '通用']
-                                    : ['默认', '开启', '关闭']
-                                ).map((v) => (
-                                  <option key={v}>{v}</option>
-                                ))}
-                              </select>
-                            )
-                          ) : (
-                            <>
-                              <span
-                                className={`resource-cell-value${c === 2 && row.media.length > 0 ? ' media-background-readonly' : ''}`}
-                                title={resourceCellValue(row, c)}
-                              >
-                                {resourceCellValue(row, c) || ' '}
-                              </span>
-                              {(c === 3 || c === 4 || (c === 2 && row.media.length === 0)) && (
-                                <button
-                                  className="cell-arrow"
-                                  aria-label={`编辑${String.fromCharCode(65 + c)}${r + 1}`}
-                                  onPointerDown={(e) => e.stopPropagation()}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setRange({ r1: r, c1: c, r2: r, c2: c });
-                                    startEdit(r, c);
-                                  }}
-                                >
-                                  ▾
-                                </button>
-                              )}
-                            </>
-                          )}
-                          {!editing && r === bounds.maxRow && c === bounds.maxCol && (
-                            <span
-                              className="fill-handle"
-                              aria-label="向下填充选区"
-                              onPointerDown={(e) => {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                drag.current = 'fill';
-                                fillTarget.current = bounds.maxRow;
-                              }}
-                            />
-                          )}
-                        </td>
+                        <MatrixDataCell
+                          key={c.col}
+                          {...grid.getCellProps(rIdx, c.col)}
+                          showArrow={Boolean(opts) && !mediaLocked}
+                          displayClassName={
+                            mediaLocked
+                              ? 'resource-cell-value flex min-h-[20px] cursor-default items-center justify-between gap-1.5 text-[#919aa7] whitespace-pre-wrap break-words'
+                              : 'resource-cell-value flex min-h-[20px] items-center justify-between gap-1.5 whitespace-pre-wrap break-words'
+                          }
+                          valueText={resourceCellValue(row, c.col)}
+                          placeholder={c.placeholder}
+                          selectOptions={opts}
+                        />
                       );
                     })}
-                    <td className="resource-status">
-                      <span>{resourceType(row)}</span>
-                      <small>
-                        {checked
-                          ? checked.issue
-                            ? resourceSourceIssueText[checked.issue]
-                            : '可用'
-                          : '未检查'}
-                      </small>
-                      <button disabled={!hasResource(row)} onClick={() => void previewRow(row.id)}>
-                        预览
-                      </button>
+                    <td
+                      className={`resource-status border border-[#e0e5ec] px-2.5 py-1.5 align-middle text-xs ${status.cls}`.trim()}
+                      title={status.title}
+                    >
+                      {status.text}
                     </td>
                   </tr>
                 );
@@ -952,72 +722,18 @@ export function ResourceTableEditor({
             </tbody>
           </table>
         </div>
-        <div className="resource-row-count">
-          显示 {matching.length} / {rows.length} 行 · Ctrl/Cmd+C 复制，Ctrl/Cmd+V
-          覆盖粘贴，Shift+Enter 在编辑格内换行
-        </div>
-      </fieldset>
-      {preview && (
-        <ResourceRowPreview
-          combinationId={combination.id}
-          revision={preview.revision}
-          row={preview.row}
-          rowNumber={preview.rowNumber}
-          onClose={() => setPreview(null)}
-        />
-      )}
-      {error && (
-        <p className="resource-error" role="alert">
-          {error}
-        </p>
-      )}
-      {discard && (
-        <div className="resource-error">
-          放弃这次尚未保存的修改？
-          <button disabled={busy} onClick={onClose}>
-            放弃修改
-          </button>
-          <button disabled={busy} onClick={() => setDiscard(false)}>
-            继续编辑
-          </button>
-        </div>
-      )}
-      <footer className="resource-footer">
-        <p>
-          {checkProgress && (
-            <span role="status">
-              已检查 {checkProgress.completed} / {checkProgress.total} 行<br />
-            </span>
-          )}
-          {downloadProgress && (
-            <span role="status">
-              已处理 {downloadProgress.completed} / {downloadProgress.total} 份 · 下载成功{' '}
-              {downloadProgress.downloaded} · 失败 {downloadProgress.failed} ·{' '}
-              {(downloadProgress.bytes / 1024 ** 2).toFixed(1)} MiB
-              <br />
-            </span>
-          )}
-          检查资源只读取文件，不上传或发布。
-        </p>
-        <div>
-          {checking.current && <button onClick={() => checking.current?.abort()}>取消检查</button>}
-          {downloading.current && (
-            <button onClick={() => downloading.current?.abort()}>取消下载</button>
-          )}
-          <button disabled={busy} onClick={() => (dirty ? setDiscard(true) : onClose())}>
-            取消
-          </button>
-          <button className="primary" disabled={busy || !table} onClick={() => void save(true)}>
-            {busy
-              ? downloading.current
-                ? '下载中…'
-                : checking.current
-                  ? '检查中…'
-                  : '保存中…'
-              : '保存资源'}
-          </button>
-        </div>
-      </footer>
-    </dialog>
+
+        {previewRow && previewRowIdx !== null && (
+          <ResourceRowPreview
+            combinationId={combination.id}
+            revision={revision}
+            row={previewRow}
+            rowNumber={previewRowIdx + 1}
+            onClose={() => setPreviewRowIdx(null)}
+          />
+        )}
+      </div>
+    </div>
   );
 }
+export { mediaReference };

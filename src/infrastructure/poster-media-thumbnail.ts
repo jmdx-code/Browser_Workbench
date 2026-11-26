@@ -4,10 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MediaRuntimeComponent } from './media-runtime-component.js';
-
 export const MAX_POSTER_THUMBNAIL_DIM = 480;
 export const MAX_POSTER_THUMBNAIL_DATA_URL_BYTES = 96 * 1024;
-
 export async function encodeImageBufferToPosterThumbnail(
   bytes: Buffer | Uint8Array,
 ): Promise<string | null> {
@@ -26,7 +24,6 @@ export async function encodeImageBufferToPosterThumbnail(
     const canvas = createCanvas(targetW, targetH);
     const ctx = canvas.getContext('2d');
     ctx.drawImage(image, 0, 0, targetW, targetH);
-
     for (const quality of [78, 65, 50]) {
       try {
         const encoded = canvas.toBuffer('image/webp', quality);
@@ -43,7 +40,6 @@ export async function encodeImageBufferToPosterThumbnail(
     return null;
   }
 }
-
 export async function generatePosterImageThumbnail(filePath: string): Promise<string | null> {
   try {
     const bytes = await readFile(filePath);
@@ -52,7 +48,6 @@ export async function generatePosterImageThumbnail(filePath: string): Promise<st
     return null;
   }
 }
-
 export async function generatePosterVideoThumbnail(
   filePath: string,
   mediaComponent?: MediaRuntimeComponent | undefined,
@@ -82,24 +77,6 @@ export async function generatePosterVideoThumbnail(
     return null;
   }
 }
-
-export function decodePosterThumbnailDataUrl(
-  dataUrl: string | null | undefined,
-): { bytes: Buffer; contentType: string } | null {
-  if (typeof dataUrl !== 'string') return null;
-  const match = /^data:(image\/(?:webp|jpeg|png));base64,([A-Za-z0-9+/=\s]+)$/i.exec(
-    dataUrl.trim(),
-  );
-  if (!match?.[1] || !match[2]) return null;
-  try {
-    const bytes = Buffer.from(match[2], 'base64');
-    if (bytes.byteLength < 8 || bytes.byteLength > 128 * 1024) return null;
-    return { bytes, contentType: match[1].toLowerCase() };
-  } catch {
-    return null;
-  }
-}
-
 export function isPathInsidePosterCacheDir(cacheDir: string, targetPath: string): boolean {
   if (!cacheDir || !targetPath) return false;
   const resolvedBase = path.resolve(cacheDir);
@@ -109,7 +86,6 @@ export function isPathInsidePosterCacheDir(cacheDir: string, targetPath: string)
   const rel = path.relative(normBase, normTarget);
   return Boolean(rel && !rel.startsWith('..') && !path.isAbsolute(rel));
 }
-
 export async function removePosterCachedFileIfSafe(
   cacheDir: string,
   targetPath: string,

@@ -43,15 +43,10 @@ export function inferAbnormalStateFromCodeOrMessage(
   codeOrMessage: string,
   fallback: AccountAbnormalState = 'restricted',
 ): AccountAbnormalState {
-  if (/LOGGED_OUT|LOGIN_REQUIRED|未登录|登录已失效/i.test(codeOrMessage)) {
-    return 'logged-out';
-  }
-  if (/VERIFICATION_REQUIRED|CHECKPOINT|需要验证|安全验证/i.test(codeOrMessage)) {
+  if (/LOGGED_OUT|LOGIN_REQUIRED|未登录|登录已失效/i.test(codeOrMessage)) return 'logged-out';
+  if (/VERIFICATION_REQUIRED|CHECKPOINT|需要验证|安全验证/i.test(codeOrMessage))
     return 'verification';
-  }
-  if (/RESTRICTED|受限|停用|disabled|suspended/i.test(codeOrMessage)) {
-    return 'restricted';
-  }
+  if (/RESTRICTED|受限|停用|disabled|suspended/i.test(codeOrMessage)) return 'restricted';
   return fallback;
 }
 
@@ -59,49 +54,28 @@ export function inferAbnormalScopeFromUrl(
   currentUrl: string | null | undefined,
   wholePageDisabledWall = false,
 ): AccountAbnormalScope {
-  if (wholePageDisabledWall) {
-    return 'global_route';
-  }
-  return classifyAccountRestrictionScope({
-    url: currentUrl ?? '',
-    hasCUserCookie: true,
-  }).scope;
+  if (wholePageDisabledWall) return 'global_route';
+  return classifyAccountRestrictionScope({ url: currentUrl ?? '', hasCUserCookie: true }).scope;
 }
 
 export function createGlobalAccountAbnormalReporter(
   deps: GlobalAccountAbnormalReporterDeps,
 ): GlobalAccountAbnormalReporter {
-  return async (input: GlobalAccountAbnormalReportInput): Promise<boolean> => {
-    if (input.scope !== 'global_route') {
-      return false;
-    }
-    const cachePatch: {
-      state: AccountAbnormalState;
-      scope: AccountAbnormalScope;
-      accountId?: string | null;
-      name?: string | null;
-      avatar?: string | null;
-    } = {
-      state: input.state,
-      scope: 'global_route',
+  return async (input) => {
+    if (input.scope !== 'global_route') return false;
+    const identityPatch = {
+      ...(input.accountId !== undefined ? { accountId: input.accountId } : {}),
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.avatar !== undefined ? { avatar: input.avatar } : {}),
     };
-    if (input.accountId !== undefined) cachePatch.accountId = input.accountId;
-    if (input.name !== undefined) cachePatch.name = input.name;
-    if (input.avatar !== undefined) cachePatch.avatar = input.avatar;
-    await Promise.resolve(deps.updateProfileAccountCache(input.profileId, cachePatch));
-
-    const syncPatch: {
-      state: AccountAbnormalState;
-      accountId?: string | null;
-      name?: string | null;
-      avatar?: string | null;
-    } = {
-      state: input.state,
-    };
-    if (input.accountId !== undefined) syncPatch.accountId = input.accountId;
-    if (input.name !== undefined) syncPatch.name = input.name;
-    if (input.avatar !== undefined) syncPatch.avatar = input.avatar;
-    deps.syncExternalObservation?.(input.profileId, syncPatch);
+    await Promise.resolve(
+      deps.updateProfileAccountCache(input.profileId, {
+        state: input.state,
+        scope: 'global_route',
+        ...identityPatch,
+      }),
+    );
+    deps.syncExternalObservation?.(input.profileId, { state: input.state, ...identityPatch });
     return true;
   };
 }

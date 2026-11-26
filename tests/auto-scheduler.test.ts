@@ -11,12 +11,13 @@ import { syncGlobalConcurrencyToModules } from '../src/application/global-concur
 import type { GroupBumperService } from '../src/application/group-bumper-service.js';
 import type { GroupInviterService } from '../src/application/group-inviter-service.js';
 import type { GroupPosterService } from '../src/application/group-poster-service.js';
-import type { TaskService } from '../src/application/task-service.js';
+import { TaskService } from '../src/application/task-service.js';
 import type { WorkspaceService } from '../src/application/workspace-service.js';
+import { TaskRuntimeRequest } from '../src/shared/task-contracts.js';
 import {
   isAccountHardBlockTaskReason,
   stepFailureAllowsAutoContinuation,
-} from '../src/domain/step-failure-policy.js';
+} from '../src/shared/task-issues.js';
 import { SqliteAutoSchedulerRepository } from '../src/infrastructure/auto-scheduler-store.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { persistenceRoutes } from '../src/infrastructure/persistence-routes.js';
@@ -1239,44 +1240,14 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       ],
     );
     expect(assigned).toHaveLength(1);
-    const claimed = store.tasks.claimNext(
-      [
-        {
-          id: profileId,
-          online: true,
-          synced: true,
-          unresolved: 0,
-          dispatchAllowed: true,
-          account: { state: 'logged-in', id: '1000888', name: 'Tester', avatar: null },
-        },
-      ],
-      new Set(['feed', 'video']),
-    );
+    const claimed = store.tasks.claimPlanForProfile(profileId, '1000888');
     expect(claimed?.state).toBe('RUNNING');
     const step0 = store.tasks.steps(claimed?.id ?? '')[0];
     expect(step0?.status).toBe('ACTIVE');
 
     const failReason = 'INITIAL_SESSION_FAILED:FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED';
-    store.tasks.noteStepFailure(claimed?.id ?? '', step0?.id ?? '', failReason);
-    const reviewed = store.tasks.reviewFailedAdmission(
-      claimed?.id ?? '',
-      '1000888',
-      'FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED',
-    );
-    expect(reviewed.state).toBe('REVIEW');
-    expect(reviewed.controlMode).toBeNull();
-
-    const endingId = store.tasks.requestStepEnd(reviewed.id, step0?.id ?? '', failReason);
-    const stopReceipt = {
-      profileId,
-      connectionEpoch: randomUUID(),
-      requestId: endingId,
-      state: 'stopped' as const,
-    };
-    store.tasks.prepareEnd(reviewed.id, stopReceipt);
-    store.tasks.finishEnd(reviewed.id, stopReceipt);
-    const advanced = store.tasks.finishStepContinuation(reviewed.id);
-    expect(advanced.state).toBe('QUEUED');
+    const advanced = store.tasks.failStepDirect(claimed?.id ?? '', step0?.id ?? '', failReason);
+    expect(advanced.state).toBe('RUNNING');
     expect(advanced.position).toBe(1);
 
     store.close();
@@ -1588,6 +1559,480 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     expect(lastRun?.hardBlockedCount).toBe(1);
 
     await service.shutdown();
+    db.close();
+  });
+
+  it('active-combination polls real step progress without hitting strict TaskRuntimeRequest validation error or false watchdog timeout', async () => {
+    const db = new DatabaseSync(':memory:');
+    const repo = new SqliteAutoSchedulerRepository(db);
+    const p1 = randomUUID();
+    const comboId = randomUUID();
+    const stepId = randomUUID();
+    const planId = randomUUID();
+    let effectiveMs = 0;
+    let revision = 1;
+    let planState: 'RUNNING' | 'COMPLETED' | 'STOPPED' = 'RUNNING';
+    let batchIdRef = '';
+    const runtimeInputsSeen: unknown[] = [];
+
+    const combo: SavedCombination = {
+      id: comboId,
+      version: 1,
+      updatedAt: Date.now(),
+      draft: null,
+      saved: {
+        name: '日常',
+        note: '',
+        randomOrder: false,
+        loop: { mode: 'finite', rounds: 1 },
+        steps: [{ id: stepId, type: 'video', durationMinutes: 15, maxLikes: 2, minLikeCount: 500 }],
+      },
+    };
+
+    const makePlan = () => ({
+      id: planId,
+      batchId: batchIdRef,
+      profileId: p1,
+      accountId: '1001',
+      combinationId: comboId,
+      version: 1,
+      snapshot: combo.saved,
+      state: planState,
+      round: 1,
+      position: 0,
+      reason: '',
+      controlMode: null,
+      controlRequestId: null,
+      controlConfirmed: false,
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
+    // Test BOTH the direct currentStepForPlan path AND the runtimeOverview fallback with real TaskRuntimeRequest.parse
+    for (const withCurrentStepMethod of [true, false]) {
+      effectiveMs = 0;
+      revision = 1;
+      planState = 'RUNNING';
+      runtimeInputsSeen.length = 0;
+
+      const ticker = setInterval(() => {
+        if (planState === 'RUNNING') {
+          effectiveMs += 3000;
+          revision += 1;
+          if (revision >= 8) planState = 'COMPLETED';
+        }
+      }, 40);
+
+      const taskStub: Record<string, unknown> = {
+        settings: async () => ({ maxConcurrentProfiles: 6 }),
+        setSettings: async () => {},
+        releaseErroredPausedPlans: async () => 0,
+        livePlans: async () => [],
+        stopActiveProfile: async () => {
+          planState = 'STOPPED';
+        },
+        start: async (inp: { requestId: string }) => {
+          batchIdRef = inp.requestId;
+          return { plans: [makePlan()] };
+        },
+        plansForBatch: async () => [makePlan()],
+        runtimeOverview: async (input: unknown = {}) => {
+          runtimeInputsSeen.push(input);
+          // Enforce the REAL strict Zod schema — any unrecognized key like `profileIds` throws!
+          TaskRuntimeRequest.parse(input);
+          return {
+            currentSteps: [
+              {
+                id: stepId,
+                jobId: planId,
+                round: 1,
+                position: 0,
+                status: 'ACTIVE',
+                progress: {
+                  revision,
+                  effectiveMilliseconds: effectiveMs,
+                  likes: 0,
+                  published: 0,
+                  cursor: null,
+                },
+              },
+            ],
+          };
+        },
+      };
+      if (withCurrentStepMethod) {
+        taskStub.currentStepForPlan = async () => ({
+          id: stepId,
+          jobId: planId,
+          round: 1,
+          position: 0,
+          status: 'ACTIVE',
+          progress: {
+            revision,
+            effectiveMilliseconds: effectiveMs,
+            likes: 0,
+            published: 0,
+            cursor: null,
+          },
+        });
+      }
+
+      const service = new AutoSchedulerService(repo, {
+        workspace: {
+          snapshot: async () => ({
+            profiles: [makeProfile(p1, '用户8', null, 'logged-in', true)],
+            groups: [],
+            combinations: [combo],
+          }),
+          repository: { combinations: async () => [combo] },
+        } as unknown as WorkspaceService,
+        tasks: taskStub as unknown as TaskService,
+        featureExecution: new FeatureExecutionRegistry(),
+        pollIntervalMs: 25,
+        idleWatchdogOverrideMs: 120,
+      });
+
+      try {
+        await service.start();
+        const saved = await service.saveSchedule({
+          name: `活跃组合防误杀-${withCurrentStepMethod ? 'direct' : 'overview'}`,
+          enabled: false,
+          carrier: 'browser',
+          targetSelector: {
+            mode: 'explicit',
+            groupIds: [],
+            targetIds: [p1],
+            skipAbnormalAccounts: true,
+          },
+          trigger: {
+            weekdays: [1, 2, 3, 4, 5, 6, 7],
+            times: ['07:00'],
+            timeZone: 'Asia/Shanghai',
+            jitterMinutes: 0,
+            misfireGraceMinutes: 60,
+          },
+          prewarm: { enabled: false, leadMinutes: 60, steps: [] },
+          steps: [{ id: randomUUID(), type: 'active-combination', combinationId: comboId }],
+          closeWindowOnFinish: false,
+          maxSafetyMinutesPerTarget: null,
+        });
+        const sched = saved.schedules.find((s) =>
+          s.name.includes(withCurrentStepMethod ? 'direct' : 'overview'),
+        );
+        expect(sched).toBeTruthy();
+        await service.runNow({ id: sched?.id ?? '', phase: 'main' });
+        await waitUntil(async () => !(await service.state()).running, 4000);
+        const finalState = await service.state();
+        const run = finalState.recentRuns[0];
+        expect(run?.completedCount).toBe(1);
+        expect(run?.watchdogTimeoutCount).toBe(0);
+        expect(run?.items[0]?.status).toBe('completed');
+        if (!withCurrentStepMethod) {
+          expect(runtimeInputsSeen.length).toBeGreaterThan(0);
+          for (const seen of runtimeInputsSeen) {
+            expect(() => TaskRuntimeRequest.parse(seen)).not.toThrow();
+          }
+        }
+      } finally {
+        clearInterval(ticker);
+        await service.shutdown();
+      }
+    }
+
+    // Verify real TaskService.runtimeOverview still rejects unknown keys via TaskRuntimeRequest.strict()
+    const realTaskService = new TaskService({} as never);
+    await expect(realTaskService.runtimeOverview({ profileIds: [p1] } as never)).rejects.toThrow();
+    db.close();
+  });
+
+  it('returns watchdog_timeout when browser launch stalls and continues multi-step browser pipeline after step 1 watchdog', async () => {
+    const db = new DatabaseSync(':memory:');
+    const repo = new SqliteAutoSchedulerRepository(db);
+    const p1 = randomUUID();
+    const p2 = randomUUID();
+    const nowMs = Date.now();
+
+    // Case A: launch stalls past idle watchdog -> must report watchdog_timeout (never completed!)
+    let releaseLaunch: (() => void) | undefined;
+    const launchWait = new Promise<void>((r) => {
+      releaseLaunch = r;
+    });
+    const serviceA = new AutoSchedulerService(repo, {
+      workspace: {
+        snapshot: async () => ({
+          profiles: [makeProfile(p1, '启动卡死号', null, 'logged-in', false)],
+          groups: [],
+          combinations: [],
+        }),
+        repository: { combinations: async () => [] },
+      } as unknown as WorkspaceService,
+      profileLifecycle: {
+        ensureProfilesOnline: async () => {
+          await launchWait;
+          return { readyIds: [p1], failed: [] };
+        },
+        closeProfiles: async () => ({ closedIds: [p1], failed: [] }),
+      } as unknown as ProfileLifecyclePort,
+      featureExecution: new FeatureExecutionRegistry(),
+      pollIntervalMs: 20,
+      idleWatchdogOverrideMs: 60,
+    });
+    try {
+      await serviceA.start();
+      const saved = await serviceA.saveSchedule({
+        name: '启动超时测试',
+        enabled: false,
+        carrier: 'browser',
+        targetSelector: {
+          mode: 'explicit',
+          groupIds: [],
+          targetIds: [p1],
+          skipAbnormalAccounts: true,
+        },
+        trigger: {
+          weekdays: [1, 2, 3, 4, 5, 6, 7],
+          times: ['07:00'],
+          timeZone: 'Asia/Shanghai',
+          jitterMinutes: 0,
+          misfireGraceMinutes: 60,
+        },
+        prewarm: { enabled: false, leadMinutes: 60, steps: [] },
+        steps: [
+          {
+            id: randomUUID(),
+            type: 'group-bumper',
+            groupIds: ['g1'],
+            pageIds: ['pg1'],
+          },
+        ],
+        closeWindowOnFinish: false,
+        maxSafetyMinutesPerTarget: null,
+      });
+      const sched = saved.schedules.find((s) => s.name === '启动超时测试');
+      expect(sched).toBeTruthy();
+      setTimeout(() => releaseLaunch?.(), 150);
+      await serviceA.runNow({ id: sched?.id ?? '', phase: 'main' });
+      await waitUntil(async () => !(await serviceA.state()).running, 4000);
+      const runA = (await serviceA.state()).recentRuns[0];
+      expect(runA?.items[0]?.status).toBe('watchdog_timeout');
+      expect(runA?.watchdogTimeoutCount).toBe(1);
+    } finally {
+      await serviceA.shutdown();
+    }
+
+    // Case B: Step 1 stalls and hits watchdog -> Step 2 STILL runs and bumps!
+    let step1Stopped = false;
+    let step2Ran = false;
+    const serviceB = new AutoSchedulerService(repo, {
+      workspace: {
+        snapshot: async () => ({
+          profiles: [makeProfile(p2, '多步续跑号', null, 'logged-in', true)],
+          groups: [],
+          combinations: [],
+        }),
+        repository: { combinations: async () => [] },
+      } as unknown as WorkspaceService,
+      groupBumper: {
+        runScheduledProfileStep: async (inp: { mode: string }) => {
+          if (inp.mode === 'group-bumper') {
+            await waitUntil(() => step1Stopped, 2000);
+            return { bumpedCount: 0, status: 'stopped', hardBlocked: false, softIssue: false };
+          }
+          step2Ran = true;
+          return { bumpedCount: 2, status: 'ok', hardBlocked: false, softIssue: false };
+        },
+        stop: async () => {
+          step1Stopped = true;
+        },
+      } as unknown as GroupBumperService,
+      featureExecution: new FeatureExecutionRegistry(),
+      pollIntervalMs: 20,
+      idleWatchdogOverrideMs: 70,
+      now: () => nowMs,
+    });
+    try {
+      await serviceB.start();
+      const savedB = await serviceB.saveSchedule({
+        name: '多步看门狗续跑测试',
+        enabled: false,
+        carrier: 'browser',
+        targetSelector: {
+          mode: 'explicit',
+          groupIds: [],
+          targetIds: [p2],
+          skipAbnormalAccounts: true,
+        },
+        trigger: {
+          weekdays: [1, 2, 3, 4, 5, 6, 7],
+          times: ['07:00'],
+          timeZone: 'Asia/Shanghai',
+          jitterMinutes: 0,
+          misfireGraceMinutes: 60,
+        },
+        prewarm: { enabled: false, leadMinutes: 60, steps: [] },
+        steps: [
+          { id: randomUUID(), type: 'group-bumper', groupIds: ['g1'], pageIds: ['pg1'] },
+          { id: randomUUID(), type: 'page-bumper', pageIds: ['pg1'] },
+        ],
+        closeWindowOnFinish: false,
+        maxSafetyMinutesPerTarget: null,
+      });
+      const schedB = savedB.schedules.find((s) => s.name === '多步看门狗续跑测试');
+      expect(schedB).toBeTruthy();
+      await serviceB.runNow({ id: schedB?.id ?? '', phase: 'main' });
+      await waitUntil(async () => !(await serviceB.state()).running, 4000);
+      expect(step2Ran).toBe(true);
+      const runB = (await serviceB.state()).recentRuns.find(
+        (r) => r.scheduleName === '多步看门狗续跑测试',
+      );
+      expect(runB?.items[0]?.bumpedCount).toBe(2);
+      expect(runB?.items[0]?.status).toBe('soft_warning');
+    } finally {
+      await serviceB.shutdown();
+    }
+    db.close();
+  });
+
+  it('10. executes single-shot mode once and auto-disables, forwards bumper settingsOverride, and runs Browser group-inviter steps', async () => {
+    const db = new DatabaseSync(':memory:');
+    const repo = new SqliteAutoSchedulerRepository(db);
+    const p1 = randomUUID();
+    const g1 = '100000000001';
+    const pg1 = '200000000001';
+    let nowMs = 1_800_000_000_000;
+
+    let capturedOverride: Record<string, unknown> | undefined;
+    let inviterCall: { profileId: string; groupIds: string[]; invitesPerGroup: number } | undefined;
+
+    const service = new AutoSchedulerService(repo, {
+      workspace: {
+        snapshot: async () => ({
+          profiles: [
+            {
+              id: p1,
+              alias: '单次全能号',
+              browserName: '单次全能号',
+              groupId: null,
+              order: 0,
+              online: true,
+              phase: 'READY',
+              synced: true,
+              unresolved: 0,
+              extensionVersion: '0.3.92',
+              capabilities: [],
+              presentation: null,
+              account: { state: 'logged-in', id: '123456', name: 'Tester', avatar: null },
+            },
+          ],
+          groups: [],
+          combinations: [],
+        }),
+        repository: { combinations: async () => [] },
+      } as unknown as WorkspaceService,
+      groupBumper: {
+        runScheduledProfileStep: async (inp: { settingsOverride?: Record<string, unknown> }) => {
+          capturedOverride = inp.settingsOverride;
+          return { bumpedCount: 3, status: 'ok', hardBlocked: false, softIssue: false };
+        },
+        stop: async () => ({}),
+      } as unknown as GroupBumperService,
+      groupInviter: {
+        runScheduledProfileStep: async (inp: {
+          profileId: string;
+          groupIds: string[];
+          invitesPerGroup: number;
+        }) => {
+          inviterCall = {
+            profileId: inp.profileId,
+            groupIds: inp.groupIds,
+            invitesPerGroup: inp.invitesPerGroup,
+          };
+          return { invitedCount: 4, status: '已确认 4 人', hardBlocked: false, softIssue: false };
+        },
+        stopProfiles: async () => ({}),
+      } as unknown as GroupInviterService,
+      featureExecution: new FeatureExecutionRegistry(),
+      pollIntervalMs: 20,
+      now: () => nowMs,
+    });
+
+    try {
+      await service.start();
+      const onceAt = nowMs - 2_000;
+      const saved = await service.saveSchedule({
+        name: '单次综合排班',
+        enabled: true,
+        carrier: 'browser',
+        targetSelector: {
+          mode: 'explicit',
+          groupIds: [],
+          targetIds: [p1],
+          skipAbnormalAccounts: true,
+        },
+        trigger: {
+          mode: 'once',
+          onceAt,
+          weekdays: [1, 2, 3, 4, 5, 6, 7],
+          times: ['09:00'],
+          timeZone: 'Asia/Shanghai',
+          jitterMinutes: 0,
+          misfireGraceMinutes: 120,
+        },
+        prewarm: { enabled: false, leadMinutes: 90, steps: [] },
+        steps: [
+          {
+            id: randomUUID(),
+            type: 'group-bumper',
+            groupIds: [g1],
+            pageIds: [pg1],
+            settingsOverride: {
+              likeProbability: 55,
+              commentProbability: 80,
+              enableSound: true,
+            },
+          },
+          {
+            id: randomUUID(),
+            type: 'group-inviter',
+            groupIds: [g1],
+            invitesPerGroup: 7,
+            playSoundOnComplete: false,
+          },
+        ],
+        closeWindowOnFinish: false,
+        maxSafetyMinutesPerTarget: null,
+      });
+
+      const schedId = saved.schedules.find((s) => s.name === '单次综合排班')?.id ?? '';
+      expect(schedId).toBeTruthy();
+
+      await service.tick();
+      await waitUntil(async () => !(await service.state()).running, 4000);
+
+      expect(capturedOverride).toEqual({
+        likeProbability: 55,
+        commentProbability: 80,
+        enableSound: true,
+      });
+      expect(inviterCall).toEqual({
+        profileId: p1,
+        groupIds: [g1],
+        invitesPerGroup: 7,
+      });
+
+      const afterTickState = await service.state();
+      const refreshedSched = afterTickState.schedules.find((s) => s.id === schedId);
+      expect(refreshedSched?.enabled).toBe(false);
+      expect(afterTickState.recentRuns[0]?.items[0]?.bumpedCount).toBe(3);
+      expect(afterTickState.recentRuns[0]?.items[0]?.summary).toContain('邀人 4 人');
+
+      // Subsequent tick must NOT re-fire disabled single-shot schedule
+      nowMs += 60_000;
+      await service.tick();
+      expect((await service.state()).recentRuns.length).toBe(1);
+    } finally {
+      await service.shutdown();
+    }
     db.close();
   });
 });

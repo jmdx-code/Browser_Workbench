@@ -1,36 +1,29 @@
 import { z } from 'zod';
+import { Id, NonNegInt, PosInt, optBool, strictObj } from './contracts.js';
 import { OwnedTabProof } from './kernel-state.js';
-
-export const ShowBrowserRequest = z.object({ profileId: z.uuid() }).strict();
-export const ShowBrowserResult = z
-  .object({ profileId: z.uuid(), tabId: z.number().int().positive(), focused: z.literal(true) })
-  .strict();
-export const ConsolidateBrowserRequest = z
-  .object({ profileId: z.uuid(), preferActiveTab: z.boolean().optional() })
-  .strict();
-export const CleanupProfileTabsRequest = z
-  .object({
-    profileIds: z.array(z.uuid()).min(1).max(500),
-    preferActiveTab: z.boolean().optional(),
-  })
-  .strict();
-export const CleanupProfileTabsResult = z
-  .object({
-    cleanedProfiles: z.number().int().nonnegative(),
-    closedTabs: z.number().int().nonnegative(),
-    skippedBusy: z.number().int().nonnegative(),
-    skippedOffline: z.number().int().nonnegative(),
-  })
-  .strict();
-export const ConsolidateBrowserResult = z
-  .object({
-    profileId: z.uuid(),
-    proof: OwnedTabProof.optional(),
-    url: z.string(),
-    closedTabIds: z.array(z.number().int().positive()),
-    remainingTabCount: z.number().int().positive(),
-  })
-  .strict();
+export const ShowBrowserRequest = strictObj({ profileId: Id });
+export const ShowBrowserResult = strictObj({
+  profileId: Id,
+  tabId: PosInt,
+  focused: z.literal(true),
+});
+export const CleanupProfileTabsRequest = strictObj({
+  profileIds: z.array(Id).min(1).max(500),
+  preferActiveTab: optBool,
+});
+export const CleanupProfileTabsResult = strictObj({
+  cleanedProfiles: NonNegInt,
+  closedTabs: NonNegInt,
+  skippedBusy: NonNegInt,
+  skippedOffline: NonNegInt,
+});
+const ConsolidateBrowserResult = strictObj({
+  profileId: Id,
+  proof: OwnedTabProof.optional(),
+  url: z.string(),
+  closedTabIds: z.array(PosInt),
+  remainingTabCount: PosInt,
+});
 export interface BrowserWindowPort {
   cleanupTabs?(
     profileIds: string[],

@@ -1,5 +1,4 @@
 import { PageReadRequest, type PageProjectionRequest } from './page-read.js';
-
 // Fixed, read-only DOM implementation shared by the extension and the private SDK observer.
 // Callers supply selectors as validated data; this never accepts executable source from the UI.
 export function projectPage(request: PageProjectionRequest) {
@@ -38,7 +37,6 @@ export function projectPage(request: PageProjectionRequest) {
     }),
   };
 }
-
 export function pageProjectionExpression(input: PageProjectionRequest): string {
   const request = PageReadRequest.parse(input);
   return '(' + projectPage.toString() + ')(' + JSON.stringify(request) + ')';

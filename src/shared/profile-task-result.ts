@@ -1,5 +1,4 @@
 import type { ProfileTaskResultValue } from './task-contracts.js';
-
 export function profileTaskResultLabel(result: ProfileTaskResultValue): {
   tone: 'warn' | 'err' | 'pause' | 'ok';
   text: string;

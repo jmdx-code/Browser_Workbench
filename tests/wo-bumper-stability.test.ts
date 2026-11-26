@@ -422,20 +422,12 @@ describe('WO-BUMPER-STABILITY-20261109: 11 Mandatory Stability & Recovery Scenar
     }
   });
 
-  it('Scenario 4: Core.inspectKernelProfileIdle and reconcileRecoveringPeerIfPossible (auto-abandon legacyFixture=1, auto-sync RECOVERING, block UNRESOLVED_BRIDGE_COMMANDS)', async () => {
+  it('Scenario 4: Core.inspectKernelProfileIdle and reconcileRecoveringPeerIfPossible enforce 3-state Phase (PAUSED/RUNNING/OFFLINE) cleanly', async () => {
     const profileId = randomUUID();
-    const unresolvedRows: Array<{ commandId: string; legacyFixture: 0 | 1 }> = [
-      { commandId: 'cmd-legacy-1', legacyFixture: 1 },
-    ];
-    const reviewedIds: string[] = [];
     const fakeStore = {
-      unresolved: async () => [...unresolvedRows],
-      get: async (commandId: string) => ({ commandId, profileId }),
-      review: async (commandId: string) => {
-        reviewedIds.push(commandId);
-        const idx = unresolvedRows.findIndex((r) => r.commandId === commandId);
-        if (idx >= 0) unresolvedRows.splice(idx, 1);
-      },
+      unresolved: async () => [],
+      get: async () => undefined,
+      review: async () => {},
       cancelPrepared: async () => {},
     };
     const core = new Core(fakeStore as unknown as ConstructorParameters<typeof Core>[0]);
@@ -445,50 +437,36 @@ describe('WO-BUMPER-STABILITY-20261109: 11 Mandatory Stability & Recovery Scenar
       (m) => sent.push(m),
       () => {},
     );
-    peer.synced = true;
-    peer.phase = 'RECOVERING';
-
-    // 4a. Legacy fixture is reported as UNRESOLVED_LEGACY_FIXTURE even when peer.phase === 'RECOVERING'
-    const insp1 = await core.inspectKernelProfileIdle(profileId);
-    expect(insp1.idle).toBe(false);
-    expect(insp1.reason).toBe('UNRESOLVED_LEGACY_FIXTURE');
-    expect(insp1.legacyFixtureCount).toBe(1);
-
-    // Reconcile automatically abandons legacyFixture === 1 and transitions peer to PAUSED
-    const reconciled1 = await core.reconcileRecoveringPeerIfPossible(profileId);
-    expect(reconciled1).toBe(true);
-    expect(reviewedIds).toEqual(['cmd-legacy-1']);
     expect(peer.phase).toBe('PAUSED');
-    const inspAfter1 = await core.inspectKernelProfileIdle(profileId);
-    expect(inspAfter1.idle).toBe(true);
+    expect(peer.synced).toBe(true);
 
-    // 4b. Real unresolved bridge command (legacyFixture === 0) is NEVER auto-abandoned and waitKernelProfileIdle fails immediately
-    unresolvedRows.push({ commandId: 'cmd-real-write', legacyFixture: 0 });
-    peer.phase = 'RECOVERING';
+    // 4a. Connected PAUSED + synced peer is immediately idle
+    const insp1 = await core.inspectKernelProfileIdle(profileId);
+    expect(insp1.idle).toBe(true);
+    expect(insp1.reason).toBe('IDLE');
+    expect(await core.reconcileRecoveringPeerIfPossible(profileId)).toBe(true);
+
+    // 4b. RUNNING peer reports PHASE_RUNNING and blocks claimFixtureKernel
+    peer.phase = 'RUNNING';
+    peer.paused = false;
     const insp2 = await core.inspectKernelProfileIdle(profileId);
-    expect(insp2.reason).toBe('UNRESOLVED_BRIDGE_COMMANDS');
-    const reconciled2 = await core.reconcileRecoveringPeerIfPossible(profileId);
-    expect(reconciled2).toBe(false);
+    expect(insp2.idle).toBe(false);
+    expect(insp2.reason).toBe('PHASE_RUNNING');
+    expect(await core.reconcileRecoveringPeerIfPossible(profileId)).toBe(false);
     await expect(
       FacebookGroupSessionHelper.waitKernelProfileIdle({
         inspectIdle: () => core.inspectKernelProfileIdle(profileId),
         reconcileRecovering: () => core.reconcileRecoveringPeerIfPossible(profileId),
         guard: () => {},
-        timeoutMs: 1000,
+        timeoutMs: 250,
       }),
-    ).rejects.toThrow('UNRESOLVED_BRIDGE_COMMANDS');
+    ).rejects.toThrow('PHASE_RUNNING');
 
-    // 4c. RECOVERING_CONTROL_OR_SYNC (e.g. STOP_CONFIRMATION_TIMEOUT with 0 unresolved rows) triggers core.sync(peer)
-    unresolvedRows.length = 0;
-    peer.synced = false;
-    peer.phase = 'RECOVERING';
-    peer.error = 'STOP_CONFIRMATION_TIMEOUT';
-    const insp3 = await core.inspectKernelProfileIdle(profileId);
-    expect(insp3.reason).toBe('RECOVERING_CONTROL_OR_SYNC');
-    const reconciled3 = await core.reconcileRecoveringPeerIfPossible(profileId);
-    expect(reconciled3).toBe(true);
-    expect(peer.phase).toBe('SYNCING');
-    expect(sent.some((m) => (m as { type?: string }).type === 'SYNC')).toBe(true);
+    // 4c. Stopping returns peer synchronously to PAUSED and ready
+    await core.stop(profileId);
+    expect(peer.phase).toBe('PAUSED');
+    expect((await core.inspectKernelProfileIdle(profileId)).idle).toBe(true);
+    expect(sent.some((m) => (m as { type?: string }).type === 'STOP')).toBe(true);
   });
 
   it('Scenario 5: Startup preparation stage encounters transient disconnect -> waits for reconnect + idle -> succeeds and completes bumping', async () => {

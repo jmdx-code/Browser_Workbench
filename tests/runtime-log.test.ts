@@ -7,7 +7,6 @@ import { DatabaseSync } from 'node:sqlite';
 import { FilesystemRuntimeLog } from '../src/infrastructure/runtime-log.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { RuntimeLogRecord } from '../src/shared/runtime-log.js';
-import { dropStoryPrivacySchema } from './fixtures/workspace-schema.js';
 const header = '{"format":"browser-workbench-runtime-log","version":1}\n';
 const record = {
   version: 1 as const,
@@ -74,10 +73,7 @@ test('schema28 upgrade keeps preferences and shares CAS revision with log mainte
     });
     store.close();
     const old = new DatabaseSync(file);
-    old.exec(
-      dropStoryPrivacySchema +
-        "DROP INDEX one_original_post_background; DELETE FROM workspace_execution_contracts WHERE name='post-native-background'; ALTER TABLE workspace_preferences DROP COLUMN log_retention_days; PRAGMA user_version=28",
-    );
+    old.exec('PRAGMA user_version=61');
     old.close();
     store = await WorkspaceStore.open(file);
     try {

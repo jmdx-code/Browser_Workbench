@@ -6,95 +6,17 @@ import {
   FACEBOOK_BACKGROUND_OPTIONS,
   FACEBOOK_NO_BACKGROUND,
   facebookBackgroundScope,
-} from '../shared/facebook-background.js';
-
-export function projectFacebookBackground(input: {
+} from '../shared/facebook-post-options.js';
+import { serializeDomEval, type createDomEvalRuntime } from './shared-dom-eval-runtime.js';
+interface BackgroundInput {
   scope: string;
   openCSS: string;
   clearCSS: string;
   solids: readonly { id: 'red' | 'purple' | 'black'; label: string; color: string }[];
-}) {
-  type DOMRecord = Record<string, unknown>;
-  const record = (v: unknown): v is DOMRecord => !!v && typeof v === 'object';
-  const cacheHost = (typeof window === 'undefined' ? document : window) as unknown as {
-    __wbReactRootNodesV1?: WeakMap<Element, DOMRecord>;
-  };
-  const rootNodes = (cacheHost.__wbReactRootNodesV1 ??= new WeakMap<Element, DOMRecord>());
-  let rootScanned = false;
-  const currentRootNode = (node: DOMRecord | undefined): DOMRecord | undefined => {
-    for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
-      let root: unknown = candidate;
-      for (let depth = 0; record(root) && depth < 256; depth++) {
-        if (!root.return) {
-          if (record(root.stateNode) && root.stateNode.current === root) return candidate;
-          break;
-        }
-        root = root.return;
-      }
-    }
-    return undefined;
-  };
-  const fiberNode = (el: Element) => {
-    const key = Object.keys(el).find(
-      (k) => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'),
-    );
-    if (key) return Reflect.get(el, key) as unknown;
-    const cached = currentRootNode(rootNodes.get(el));
-    if (cached) {
-      rootNodes.set(el, cached);
-      return cached;
-    }
-    if (!rootScanned) {
-      rootScanned = true;
-      const stack: unknown[] = [],
-        seen = new Set<unknown>();
-      for (const host of Array.from(document.querySelectorAll('*')))
-        for (const k of Object.keys(host).filter((k) => k.startsWith('__reactContainer$'))) {
-          const r: unknown = Reflect.get(host, k);
-          stack.push(record(r) && record(r.stateNode) ? (r.stateNode.current ?? r) : r);
-        }
-      while (stack.length && seen.size < 100000) {
-        const f = stack.pop();
-        if (!record(f) || seen.has(f)) continue;
-        seen.add(f);
-        if (f.stateNode instanceof Element) rootNodes.set(f.stateNode, f);
-        if (f.child) stack.push(f.child);
-        if (f.sibling) stack.push(f.sibling);
-      }
-    }
-    return rootNodes.get(el);
-  };
-  const frames = (el: Element, limit = 40) => {
-    const out: { name: string; props: DOMRecord }[] = [];
-    let f: unknown = fiberNode(el);
-    for (let i = 0; record(f) && i < limit; i++, f = f.return) {
-      const t = f.type ?? f.elementType;
-      const name =
-        typeof t === 'function'
-          ? String(Reflect.get(t, 'displayName') ?? t.name)
-          : record(t)
-            ? String(t.displayName ?? '')
-            : typeof t === 'string'
-              ? t
-              : '';
-      out.push({ name, props: record(f.memoizedProps) ? f.memoizedProps : {} });
-    }
-    return out;
-  };
-  const visible = (node: Element) => {
-    const r = node.getBoundingClientRect(),
-      s = getComputedStyle(node);
-    return (
-      r.width > 0 &&
-      r.height > 0 &&
-      r.bottom > 0 &&
-      r.right > 0 &&
-      r.top < innerHeight &&
-      r.left < innerWidth &&
-      s.display !== 'none' &&
-      s.visibility !== 'hidden'
-    );
-  };
+}
+function projectBackgroundEntry(createRt: typeof createDomEvalRuntime, input: BackgroundInput) {
+  const { visible, enabled, chain, clearDataAttrs } = createRt();
+  const vis = (node: Element) => visible(node, { viewport: true });
   const base = {
     url: location.href,
     timeOrigin: performance.timeOrigin,
@@ -107,47 +29,29 @@ export function projectFacebookBackground(input: {
     options: [] as { id: 'red' | 'purple' | 'black'; css: string }[],
   };
   if (location.origin !== 'https://www.facebook.com') return { ...base, phase: 'absent' as const };
-  const roots = Array.from(document.querySelectorAll(input.scope)).filter(visible);
+  const roots = Array.from(document.querySelectorAll(input.scope)).filter(vis);
   if (roots.length !== 1 || !roots[0])
     return { ...base, phase: roots.length ? ('ambiguous' as const) : ('absent' as const) };
-  const root = roots[0],
-    edits = Array.from(root.querySelectorAll('[role="textbox"][contenteditable="true"]')).filter(
-      (el) => {
-        // Creator scrolls the editor above the viewport when opening lower options.
-        // Its rendered draft still determines the background; input targets retain
-        // their own viewport/visibility checks below.
-        const r = el.getBoundingClientRect(),
-          s = getComputedStyle(el);
-        return (
-          r.width > 0 &&
-          r.height > 0 &&
-          s.display !== 'none' &&
-          s.visibility !== 'hidden' &&
-          !el.closest('[aria-hidden="true"]')
-        );
-      },
-    );
+  const root = roots[0];
+  const edits = Array.from(
+    root.querySelectorAll('[role="textbox"][contenteditable="true"]'),
+  ).filter((el) =>
+    // Creator scrolls the editor above the viewport when opening lower options.
+    visible(el, { noAriaHidden: true }),
+  );
   if (edits.length !== 1 || !edits[0] || !base.ready)
     return { ...base, phase: 'ambiguous' as const };
   base.draftEmpty = (edits[0].textContent ?? '') === '' && !edits[0].querySelector('img,video,a');
-  const control = (css: string) => {
-    const matches = Array.from(root.querySelectorAll(css)).filter(
-      (node) => visible(node) && !node.matches('[aria-disabled="true"],:disabled'),
-    );
-    return matches.length === 1;
-  };
-  for (const el of Array.from(
-    root.querySelectorAll(
-      '[data-wb-background-open],[data-wb-background-clear],[data-wb-background]',
-    ),
-  )) {
-    el.removeAttribute('data-wb-background-open');
-    el.removeAttribute('data-wb-background-clear');
-    el.removeAttribute('data-wb-background');
-  }
-  const buttons = Array.from(root.querySelectorAll('[role="button"],button')).filter(visible);
+  const control = (css: string) =>
+    Array.from(root.querySelectorAll(css)).filter((node) => vis(node) && enabled(node)).length ===
+    1;
+  clearDataAttrs(
+    ['data-wb-background-open', 'data-wb-background-clear', 'data-wb-background'],
+    root,
+  );
+  const buttons = Array.from(root.querySelectorAll('[role="button"],button')).filter(vis);
   const native = (el: Element) =>
-    frames(el, 50).some((f) =>
+    chain(el, 50).some((f) =>
       f.name.includes('FeedComposerCometStatusAreaClickHandlerForLexical.react'),
     );
   const opening = buttons.filter(
@@ -179,13 +83,13 @@ export function projectFacebookBackground(input: {
     const css = '[data-wb-background="' + solid.id + '"]';
     if (control(css)) base.options.push({ id: solid.id, css });
   }
-  let node: Element | null = edits[0],
-    phase: 'plain' | 'solid' | 'unsupported' = 'plain';
+  let node: Element | null = edits[0];
+  let phase: 'plain' | 'solid' | 'unsupported' = 'plain';
   for (let level = 0; node && node !== root && level < 12; level++, node = node.parentElement) {
     const r = node.getBoundingClientRect();
     if (r.width < 200 || r.height < 120) continue;
-    const style = getComputedStyle(node),
-      solid = input.solids.find((value) => value.color === style.backgroundColor);
+    const style = getComputedStyle(node);
+    const solid = input.solids.find((value) => value.color === style.backgroundColor);
     if (solid && style.backgroundImage === 'none') {
       phase = 'solid';
       base.selectedCSS = '[data-wb-background="' + solid.id + '"]';
@@ -199,7 +103,9 @@ export function projectFacebookBackground(input: {
   }
   return { ...base, phase };
 }
-
+export const projectFacebookBackground = serializeDomEval<
+  (input: BackgroundInput) => ReturnType<typeof projectBackgroundEntry>
+>('projectFacebookBackground', projectBackgroundEntry);
 export async function readFacebookBackground(page: Page, guard: () => Awaitable<void>) {
   await guard();
   const result = FacebookBackground.parse(

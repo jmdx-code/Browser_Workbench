@@ -13,7 +13,6 @@ import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { Store } from '../src/bridge/store.js';
 import { Core } from '../src/bridge/core.js';
 import type { TaskRepository } from '../src/domain/tasks.js';
-import type { SettlementRepository } from '../src/domain/settlement.js';
 import type { Operation } from '../src/shared/task-contracts.js';
 
 test('WO51: idle queued reload is permitted, active admission, operations and notices remain busy', async () => {
@@ -42,24 +41,12 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
     ],
   );
   let opening = false,
-    notices = false,
     operations = false,
     releases = 0;
   const tasks: Pick<TaskRepository, 'plansForProfile' | 'blockingOperations' | 'operations'> = {
     plansForProfile: (...args) => workspace.tasks.plansForProfile(...args),
     operations: () => (operations ? [{} as Operation] : []),
     blockingOperations: () => (operations ? [{} as Operation] : []),
-  };
-  const settlements: SettlementRepository = {
-    ...workspace.tasks.settlements,
-    list: () =>
-      notices
-        ? [{ state: 'PENDING' } as Awaited<ReturnType<SettlementRepository['list']>>[number]]
-        : [],
-    claim: () => null,
-    delivered: () => {},
-    retry: () => {},
-    recoverOnStartup: () => {},
   };
   const sent: unknown[] = [];
   const peer = core.connect(
@@ -81,21 +68,20 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
     async (id) =>
       opening ||
       core.hasPendingControlOrOperation(id) ||
-      (await extensionReloadTasksBusy(tasks, settlements, id)),
+      (await extensionReloadTasksBusy(tasks, id)),
     async () => {
       releases++;
     },
   );
   try {
-    for (const kind of ['opening', 'operations', 'notices']) {
+    for (const kind of ['opening', 'operations'] as const) {
       opening = kind === 'opening';
       operations = kind === 'operations';
-      notices = kind === 'notices';
       assert.equal((await manager.reload([profileId])).skippedBusy, 1);
       await manager.automatic(peer);
       assert.equal(sent.length, 0);
     }
-    opening = operations = notices = false;
+    opening = operations = false;
     assert.equal((await manager.reload([profileId])).reloaded, 1);
     assert.equal(releases, 1);
     ready();
@@ -118,8 +104,7 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
       '0.3.74',
       'fixture',
       async (id) =>
-        core.hasPendingControlOrOperation(id) ||
-        (await extensionReloadTasksBusy(tasks, settlements, id)),
+        core.hasPendingControlOrOperation(id) || (await extensionReloadTasksBusy(tasks, id)),
       async () => core.releaseFixtureKernel(peer, owner),
     );
     assert.equal((await idleManager.reload([profileId])).reloaded, 1);

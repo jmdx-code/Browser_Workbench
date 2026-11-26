@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { ProfileInspectionService } from '../src/application/profile-inspection.js';
-import type { ProfileInspectionPort } from '../src/domain/profile-inspection.js';
+import type { ProfileInspectionPort } from '../src/domain/system-ports.js';
 import { facebookIdentityProjection } from '../src/infrastructure/facebook-read-adapter.js';
 import type { PageProjection } from '../src/shared/page-read.js';
 import { InspectProfiles } from '../src/shared/profile-inspection.js';
@@ -517,7 +517,7 @@ test('temporary busy inspection retries automatically once the same browser beco
 test('abnormal account errors immediately transition profile inspection state to verification, restricted or logged-out', async () => {
   for (const [errorCode, expectedState, expectedReason] of [
     ['FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED', 'verification', 'CHECKPOINT_ROUTE'],
-    ['FACEBOOK_ACCOUNT_RESTRICTED', 'restricted', 'VISIBLE_LOGIN_FORM'],
+    ['FACEBOOK_ACCOUNT_RESTRICTED', 'restricted', 'ACCOUNT_RESTRICTED'],
     ['FACEBOOK_ACCOUNT_LOGGED_OUT', 'logged-out', 'VISIBLE_LOGIN_FORM'],
   ] as const) {
     const f = fixture(),

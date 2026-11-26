@@ -51,10 +51,17 @@ function repository(overrides: Partial<GroupInviterRepository> = {}): GroupInvit
   return {
     listGroups: () => [group],
     upsertGroups: () => [group],
-    updateGroupAvatar: () => {},
     deleteGroups: () => 0,
-    getInvitesPerGroup: () => 1,
-    setInvitesPerGroup: () => 1,
+    getSettings: () => ({
+      invitesPerGroup: 1,
+      maxConcurrentProfiles: 4,
+      playSoundOnComplete: true,
+    }),
+    saveSettings: () => ({
+      invitesPerGroup: 1,
+      maxConcurrentProfiles: 4,
+      playSoundOnComplete: true,
+    }),
     getInvitedFriendIdsForGroup: () => new Set(),
     recordInvites: () => 0,
     getTotalInvitedByProfile: () => new Map(),
@@ -68,7 +75,6 @@ function browser(
   return {
     isAvailable: () => true,
     isProfileReady: () => true,
-    fetchGroupAvatar: async () => null,
     inviteForGroup,
   };
 }
@@ -135,9 +141,9 @@ test('inviter reserves startup before awaiting and retains occupancy until runne
   let entered = false;
   const service = new GroupInviterService(
     repository({
-      getInvitesPerGroup: async () => {
+      getSettings: async () => {
         await startup.promise;
-        return 1;
+        return { invitesPerGroup: 1, maxConcurrentProfiles: 4, playSoundOnComplete: true };
       },
     }),
     browser(async () => {
@@ -168,9 +174,9 @@ test('cancel during startup never dispatches', async () => {
   let entered = 0;
   const service = new GroupInviterService(
     repository({
-      getInvitesPerGroup: async () => {
+      getSettings: async () => {
         await startup.promise;
-        return 1;
+        return { invitesPerGroup: 1, maxConcurrentProfiles: 4, playSoundOnComplete: true };
       },
     }),
     browser(async () => {
@@ -201,7 +207,6 @@ test('same group accounts overlap and claim different recipients; failure is not
     repo,
     () => undefined,
     () => undefined,
-    () => null,
   );
   const clicked: string[] = [];
   const service = new GroupInviterService(
@@ -343,7 +348,6 @@ test('actual adapter attempts orphan cleanup but refuses to connect if the nativ
     repository(),
     () => kernel,
     () => core,
-    () => '123456789',
   );
   await assert.rejects(
     adapter.inviteForGroup(profileId, group, 1, {

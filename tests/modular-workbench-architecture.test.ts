@@ -455,9 +455,6 @@ test('split workspaceApi routes respond for group-inviter, group-bumper, diagnos
     undefined,
     undefined,
     undefined,
-    undefined,
-    undefined,
-    undefined,
     fakeInviter,
     async (opts) => ({
       filePath: 'C:/tmp/workbench-feedback.zip',
@@ -530,18 +527,6 @@ test('split workspaceApi routes respond for group-inviter, group-bumper, diagnos
     const revealBody = (await revealRes.json()) as { revealed: boolean; fileName: string };
     assert.equal(revealBody.revealed, true);
     assert.equal(revealedFile, 'workbench-feedback.zip');
-
-    const stopRes = await fetch(`${baseUrl}/api/workspace/profiles/stop`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ profileIds: [p1.id] }),
-    });
-    assert.equal(stopRes.status, 200);
-    const stopBody = (await stopRes.json()) as {
-      results: { profileId: string; requested: boolean }[];
-    };
-    assert.deepEqual(stopBody.results, [{ profileId: p1.id, requested: true }]);
-    assert.deepEqual(stoppedIds, [p1.id]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

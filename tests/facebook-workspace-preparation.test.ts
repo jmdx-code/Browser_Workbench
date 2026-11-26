@@ -218,7 +218,7 @@ test('bulk cleanup counts idle/paused, offline, daily busy and inviter busy accu
       list: () =>
         [
           { profileId: peers[1]!.profileId, state: 'RUNNING' },
-          { profileId: peers[3]!.profileId, state: 'PAUSED' },
+          { profileId: peers[3]!.profileId, state: 'STOPPED' },
         ] as Plan[],
     },
     undefined,
@@ -280,7 +280,7 @@ test('authenticated cleanup-tabs HTTP routes to native consolidation and returns
     dataDir: dir,
     port: address.port,
     extensionIds: ['a'.repeat(32)],
-    appRoutes: ({ core, store, tasks }) => {
+    appRoutes: ({ core, store }) => {
       const peer = core.connect(
         randomUUID(),
         () => {},
@@ -305,10 +305,7 @@ test('authenticated cleanup-tabs HTTP routes to native consolidation and returns
         },
       );
       return workspaceApi(
-        new WorkspaceService(repo, new BridgeProfileSource(core, store, tasks)),
-        undefined,
-        undefined,
-        undefined,
+        new WorkspaceService(repo, new BridgeProfileSource(core, store)),
         undefined,
         undefined,
         undefined,

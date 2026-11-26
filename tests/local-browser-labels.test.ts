@@ -7,7 +7,6 @@ import { randomUUID } from 'node:crypto';
 import { LocalBrowserLabels } from '../src/infrastructure/local-browser-labels.js';
 import { Store } from '../src/bridge/store.js';
 import { Core } from '../src/bridge/core.js';
-import { WatchTasks } from '../src/bridge/watch.js';
 import { BridgeProfileSource } from '../src/infrastructure/browser-source.js';
 
 test('window count and disconnect update public presence without losing profile identity', async () => {
@@ -22,7 +21,7 @@ test('window count and disconnect update public presence without losing profile 
   );
   peer.synced = true;
   peer.phase = 'PAUSED';
-  const source = new BridgeProfileSource(core, store, new WatchTasks(core), undefined, {
+  const source = new BridgeProfileSource(core, store, undefined, {
     name: () => '004',
   });
   try {

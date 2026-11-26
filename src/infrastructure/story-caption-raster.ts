@@ -1,11 +1,9 @@
 import type { Awaitable } from '../domain/persistence.js';
 import { createHash } from 'node:crypto';
-
 const families =
   '"Segoe UI", "Helvetica Neue", "Noto Sans", "Myanmar Text", "Myanmar MN", "Noto Sans Myanmar", "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
 const words = new Intl.Segmenter(undefined, { granularity: 'word' });
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-
 export interface StoryCaptionRaster {
   rendererVersion: 1;
   textSha256: string;
@@ -16,7 +14,6 @@ export interface StoryCaptionRaster {
   lines: string[];
   bounds: { x: number; y: number; width: number; height: number };
 }
-
 // A derived-media input only. It never edits a source file or grants upload/publication authority.
 export async function renderStoryCaption(
   text: string,

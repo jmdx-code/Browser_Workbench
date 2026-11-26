@@ -4,6 +4,9 @@ import { api } from '../../api.js';
 import { orderedFinderItems, rangeFinderSelection } from '../../finder-list-model.js';
 import { FinderAvatar, FinderCheck } from '../../finder-target-list.js';
 import { buildTargetCandidates, SelectByIdsDialog } from '../../select-by-ids-dialog.js';
+import { toggleSet } from '../../selection.js';
+import { UI_INPUT_SM } from '../../ui/primitives.js';
+import { Btn } from './module-ui.js';
 
 export interface UnifiedPickerItem {
   id: string;
@@ -15,16 +18,10 @@ export interface UnifiedPickerItem {
   sortOrder?: number | undefined;
 }
 
-export function UnifiedTargetPicker({
-  title,
-  listKind,
-  items,
-  selectedIds,
-  onChange,
-  onDone,
-  emptyHint = '当前列表为空，请先在对应功能模块添加目标',
-  showCodeSub = false,
-}: {
+const LINK_BTN =
+  'h-auto border-0 bg-transparent p-0 text-xs font-medium text-[var(--primary)] cursor-pointer hover:underline';
+
+export function UnifiedTargetPicker(p: {
   title: string;
   listKind?: TargetListKind | undefined;
   items: readonly UnifiedPickerItem[];
@@ -34,6 +31,16 @@ export function UnifiedTargetPicker({
   emptyHint?: string | undefined;
   showCodeSub?: boolean | undefined;
 }) {
+  const {
+    title,
+    listKind,
+    items,
+    selectedIds,
+    onChange,
+    onDone,
+    emptyHint = '当前列表为空，请先在对应功能模块添加目标',
+    showCodeSub = false,
+  } = p;
   const [folders, setFolders] = useState<TargetFolder[]>([]);
   const [closed, setClosed] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
@@ -41,91 +48,69 @@ export function UnifiedTargetPicker({
   const anchorRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!listKind) {
-      setFolders([]);
-      return;
-    }
+    if (!listKind) return setFolders([]);
     let alive = true;
-    void api
-      .targetFolders(listKind)
-      .then((rows) => {
-        if (alive) setFolders(rows);
-      })
-      .catch(() => {
-        if (alive) setFolders([]);
-      });
+    void api.targetFolders(listKind).then(
+      (rows) => alive && setFolders(rows),
+      () => alive && setFolders([]),
+    );
     return () => {
       alive = false;
     };
   }, [listKind]);
 
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
-
-  const orderedItems = useMemo(() => {
-    if (!listKind) return [...items];
-    const finderMapped = items.map((it, idx) => ({
-      ...it,
-      folderId: it.folderId ?? null,
-      sortOrder: it.sortOrder ?? idx,
-      avatarUrl: it.avatarUrl ?? null,
-      count: 0,
-    }));
-    return orderedFinderItems(finderMapped, folders);
-  }, [items, listKind, folders]);
-
+  const orderedItems = useMemo(
+    () =>
+      !listKind
+        ? [...items]
+        : orderedFinderItems(
+            items.map((it, idx) => ({
+              ...it,
+              folderId: it.folderId ?? null,
+              sortOrder: it.sortOrder ?? idx,
+              avatarUrl: it.avatarUrl ?? null,
+              count: 0,
+            })),
+            folders,
+          ),
+    [items, listKind, folders],
+  );
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return orderedItems;
-    return orderedItems.filter(
-      (it) =>
-        it.name.toLowerCase().includes(q) ||
-        it.id.toLowerCase().includes(q) ||
-        (it.sub ?? '').toLowerCase().includes(q),
-    );
+    return !q
+      ? orderedItems
+      : orderedItems.filter((it) =>
+          `${it.name} ${it.id} ${it.sub ?? ''}`.toLowerCase().includes(q),
+        );
   }, [orderedItems, query]);
-
   const sections = useMemo(() => {
-    if (!listKind || folders.length === 0) {
-      return [{ id: '__all__', name: '', rows: filtered }];
-    }
+    if (!listKind || folders.length === 0) return [{ id: '__all__', name: '', rows: filtered }];
     const base = [
       ...folders.map((f) => ({
         id: f.id,
         name: f.name,
         rows: filtered.filter((it) => (it.folderId ?? '') === f.id),
       })),
-      {
-        id: '',
-        name: '未分组',
-        rows: filtered.filter((it) => (it.folderId ?? '') === ''),
-      },
+      { id: '', name: '未分组', rows: filtered.filter((it) => (it.folderId ?? '') === '') },
     ];
     return query.trim() ? base.filter((sec) => sec.rows.length > 0) : base;
   }, [listKind, folders, filtered, query]);
-
   const visibleIds = useMemo(
-    () => sections.flatMap((sec) => (closed.has(sec.id) ? [] : sec.rows.map((row) => row.id))),
+    () => sections.flatMap((sec) => (closed.has(sec.id) ? [] : sec.rows.map((r) => r.id))),
     [sections, closed],
   );
 
   const applySelectionSet = (next: Set<string>) => {
     const orderedIds = orderedItems.filter((it) => next.has(it.id)).map((it) => it.id);
-    // Preserve any pre-existing selected IDs not in current list (defensive)
-    for (const id of next) {
-      if (!orderedIds.includes(id)) orderedIds.push(id);
-    }
+    for (const id of next) if (!orderedIds.includes(id)) orderedIds.push(id);
     onChange(orderedIds);
   };
-
   const toggleMany = (ids: readonly string[], checked: boolean) => {
     const next = new Set(selectedIds);
-    for (const id of ids) {
-      if (checked) next.add(id);
-      else next.delete(id);
-    }
+    for (const id of ids) checked ? next.add(id) : next.delete(id);
     applySelectionSet(next);
   };
-
   const toggleOne = (id: string, shiftKey: boolean) => {
     const next = rangeFinderSelection(
       selectedSet,
@@ -138,52 +123,60 @@ export function UnifiedTargetPicker({
     anchorRef.current = id;
     applySelectionSet(next);
   };
+  const openMatchedFolders = (matchedIds: readonly string[]) => {
+    const matchedSet = new Set(matchedIds),
+      toOpen = items.filter((i) => matchedSet.has(i.id)).map((i) => i.folderId ?? '');
+    if (toOpen.length)
+      setClosed((prev) => {
+        const n = new Set(prev);
+        toOpen.forEach((fid) => n.delete(fid));
+        return n;
+      });
+  };
 
   const selectedInPool = useMemo(
     () => items.filter((it) => selectedSet.has(it.id)).length,
     [items, selectedSet],
   );
-
-  const selectByIdsCandidates = useMemo(() => {
-    if (!listKind) return [];
-    return buildTargetCandidates(
-      orderedItems.map((it, idx) => ({
-        id: it.id,
-        name: it.name,
-        avatarUrl: it.avatarUrl ?? null,
-        folderId: it.folderId ?? null,
-        sortOrder: it.sortOrder ?? idx,
-        count: 0,
-      })),
-    );
-  }, [listKind, orderedItems]);
+  const candidates = useMemo(
+    () =>
+      !listKind
+        ? []
+        : buildTargetCandidates(
+            orderedItems.map((it, idx) => ({
+              id: it.id,
+              name: it.name,
+              avatarUrl: it.avatarUrl ?? null,
+              folderId: it.folderId ?? null,
+              sortOrder: it.sortOrder ?? idx,
+              count: 0,
+            })),
+          ),
+    [listKind, orderedItems],
+  );
 
   return (
-    <div className="sched-drawer unified-picker">
-      <div className="sched-drawer-bar">
-        <span className="sched-drawer-title">
+    <div className="mt-2 flex flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-white">
+      <div className="flex flex-wrap items-center gap-2 border-b border-[var(--line)] bg-slate-50 px-2.5 py-2 text-xs">
+        <span className="font-medium text-slate-800">
           {title}（已选 <strong>{selectedInPool}</strong> / {items.length}）
         </span>
         <input
           type="search"
-          className="sched-drawer-search"
+          className={UI_INPUT_SM + ' min-w-[140px] flex-1'}
           placeholder="搜索名称或 ID…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <div className="sched-drawer-actions">
+        <div className="flex items-center gap-2">
           {listKind && items.length > 0 && (
-            <button
-              type="button"
-              className="sched-link-btn"
-              onClick={() => setSelectByIdsOpen(true)}
-            >
+            <button type="button" className={LINK_BTN} onClick={() => setSelectByIdsOpen(true)}>
               按 ID 选中
             </button>
           )}
           <button
             type="button"
-            className="sched-link-btn"
+            className={LINK_BTN}
             onClick={() =>
               toggleMany(
                 filtered.map((it) => it.id),
@@ -193,60 +186,53 @@ export function UnifiedTargetPicker({
           >
             全选
           </button>
-          <button type="button" className="sched-link-btn" onClick={() => onChange([])}>
+          <button type="button" className={LINK_BTN} onClick={() => onChange([])}>
             清空
           </button>
           {onDone && (
-            <button type="button" className="sched-drawer-done" onClick={onDone}>
+            <Btn v="primary" onClick={onDone}>
               收起
-            </button>
+            </Btn>
           )}
         </div>
       </div>
 
       {filtered.length === 0 ? (
-        <div className="sched-drawer-empty">{items.length === 0 ? emptyHint : '无匹配结果'}</div>
+        <div className="p-4 text-center text-xs text-[var(--muted)]">
+          {items.length === 0 ? emptyHint : '无匹配结果'}
+        </div>
       ) : (
-        <div className="unified-picker-scroll">
+        <div className="max-h-64 overflow-y-auto p-1.5">
           {sections.map((sec) => {
-            const secIds = sec.rows.map((r) => r.id);
-            const isClosed = closed.has(sec.id);
-            const showFolderHeader = Boolean(
-              listKind && folders.length > 0 && sec.id !== '__all__',
-            );
+            const secIds = sec.rows.map((r) => r.id),
+              isClosed = closed.has(sec.id);
+            const showHeader = Boolean(listKind && folders.length > 0 && sec.id !== '__all__');
             return (
-              <div key={sec.id || 'unfiled'} className="unified-picker-section">
-                {showFolderHeader && (
-                  <div className="unified-picker-folder">
+              <div key={sec.id || 'unfiled'} className="mb-1 last:mb-0">
+                {showHeader && (
+                  <div className="flex items-center gap-1.5 rounded-md bg-slate-50 px-2 py-1 text-xs">
                     <FinderCheck
                       ids={secIds}
                       selected={selectedSet}
                       label={'选择整组 ' + sec.name}
                       disabled={secIds.length === 0}
-                      onChange={(checked) => toggleMany(secIds, checked)}
+                      onChange={(c) => toggleMany(secIds, c)}
                     />
                     <button
                       type="button"
-                      className="unified-picker-folder-btn"
-                      onClick={() =>
-                        setClosed((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(sec.id)) next.delete(sec.id);
-                          else next.add(sec.id);
-                          return next;
-                        })
-                      }
+                      className="flex flex-1 items-center gap-1.5 border-0 bg-transparent p-0 text-left text-xs text-slate-800"
+                      onClick={() => setClosed((prev) => toggleSet(prev, sec.id))}
                     >
                       <span>{isClosed ? '▸' : '▾'}</span>
                       <strong>{sec.name}</strong>
-                      <small>
+                      <small className="text-[var(--muted)]">
                         ({secIds.filter((id) => selectedSet.has(id)).length}/{secIds.length})
                       </small>
                     </button>
                   </div>
                 )}
                 {!isClosed && (
-                  <div className="unified-picker-list">
+                  <div className="flex flex-col gap-0.5 py-0.5">
                     {sec.rows.map((it) => {
                       const checked = selectedSet.has(it.id);
                       return (
@@ -254,11 +240,12 @@ export function UnifiedTargetPicker({
                           key={it.id}
                           role="option"
                           aria-selected={checked}
-                          className={'unified-picker-row' + (checked ? ' is-checked' : '')}
+                          className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-xs ${checked ? 'bg-slate-100 font-medium text-slate-900' : 'hover:bg-slate-50'}`}
                           onClick={(e) => toggleOne(it.id, e.shiftKey)}
                         >
                           <input
                             type="checkbox"
+                            className="h-3.5 w-3.5 shrink-0"
                             checked={checked}
                             aria-label={'选择 ' + it.name}
                             readOnly
@@ -267,30 +254,40 @@ export function UnifiedTargetPicker({
                               toggleOne(it.id, e.shiftKey);
                             }}
                           />
-                          <span className="unified-picker-avatar">
+                          <span className="unified-picker-avatar inline-flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-100">
                             <FinderAvatar
                               item={{ name: it.name, avatarUrl: it.avatarUrl ?? null }}
                             />
                           </span>
-                          <span className="unified-picker-main">
+                          <span className="flex min-w-0 flex-1 flex-col">
                             <span
-                              className="unified-picker-name"
+                              className="truncate"
                               title={it.sub ? `${it.name} (${it.sub})` : it.name}
                             >
                               {it.name}
                             </span>
                             {!showCodeSub && it.sub && (
-                              <span className="unified-picker-sub">{it.sub}</span>
+                              <span className="truncate text-[11px] text-[var(--muted)]">
+                                {it.sub}
+                              </span>
                             )}
                           </span>
-                          {it.badge && <span className="unified-picker-badge">{it.badge}</span>}
+                          {it.badge && (
+                            <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+                              {it.badge}
+                            </span>
+                          )}
                           {showCodeSub && it.sub && (
-                            <code className="unified-picker-id">{it.sub}</code>
+                            <code className="shrink-0 font-mono text-[11px] text-[var(--muted)]">
+                              {it.sub}
+                            </code>
                           )}
                         </div>
                       );
                     })}
-                    {sec.rows.length === 0 && <div className="sched-drawer-empty">暂无条目</div>}
+                    {sec.rows.length === 0 && (
+                      <div className="p-2 text-center text-xs text-[var(--muted)]">暂无条目</div>
+                    )}
                   </div>
                 )}
               </div>
@@ -303,25 +300,15 @@ export function UnifiedTargetPicker({
         <SelectByIdsDialog
           title={'按 ID 批量选中 · ' + title}
           kind={listKind}
-          candidates={selectByIdsCandidates}
+          candidates={candidates}
           onClose={() => setSelectByIdsOpen(false)}
           onApply={(matchedIds, applyMode) => {
-            const next =
+            applySelectionSet(
               applyMode === 'replace'
                 ? new Set(matchedIds)
-                : new Set([...selectedIds, ...matchedIds]);
-            applySelectionSet(next);
-            const matchedSet = new Set(matchedIds);
-            const foldersToOpen = new Set(
-              items.filter((i) => matchedSet.has(i.id)).map((i) => i.folderId ?? ''),
+                : new Set([...selectedIds, ...matchedIds]),
             );
-            if (foldersToOpen.size > 0) {
-              setClosed((prev) => {
-                const nextClosed = new Set(prev);
-                for (const fid of foldersToOpen) nextClosed.delete(fid);
-                return nextClosed;
-              });
-            }
+            openMatchedFolders(matchedIds);
           }}
         />
       )}

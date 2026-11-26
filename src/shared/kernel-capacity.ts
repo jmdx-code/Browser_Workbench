@@ -1,2 +1,0 @@
-export const MAX_PENDING_KERNEL_RPC = 128;
-export const RESERVED_KERNEL_CONTROL_RPC = 16;

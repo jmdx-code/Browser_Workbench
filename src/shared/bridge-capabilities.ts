@@ -44,36 +44,20 @@ export const bridgeCapabilities = [
   'agent-browser-kernel-v1',
   'browser-window-close-v1',
   'kernel-passive-page-reveal-v1',
+  'kernel-tab-reset-v1',
 ] as const;
-
-// Old controllers reject unknown HELLO capability names. Advertise this optional
-// feature only after the current controller explicitly lists it in CHALLENGE.
+const challengeGated = new Set(
+  'task-window-passive-layout-v1 kernel-direct-operation-files-v1 kernel-control-release-v1 kernel-journal-collection-v1 browser-window-reveal-v1 agent-browser-kernel-v1 browser-window-close-v1 kernel-passive-page-reveal-v1 kernel-tab-reset-v1 task-presentation-recovery-v1 task-window-layout-v1 task-window-content-layout-v1 task-window-simple-recovery-v1 task-window-occlusion-recovery-v1'.split(
+    ' ',
+  ),
+);
+// Old controllers reject unknown HELLO capability names. Advertise optional
+// features only after the current controller explicitly lists them in CHALLENGE.
 export function bridgeHelloCapabilities(supported: unknown) {
-  const recovery =
-    Array.isArray(supported) &&
-    supported.some((value) => value === 'task-presentation-recovery-v1');
+  const list = Array.isArray(supported) ? supported : [];
   return bridgeCapabilities.filter(
     (value) =>
-      (![
-        'task-window-passive-layout-v1',
-        'kernel-direct-operation-files-v1',
-        'kernel-control-release-v1',
-        'kernel-journal-collection-v1',
-        'browser-window-reveal-v1',
-        'agent-browser-kernel-v1',
-        'browser-window-close-v1',
-        'kernel-passive-page-reveal-v1',
-      ].includes(value) ||
-        (Array.isArray(supported) && supported.includes(value))) &&
-      (value !== 'task-presentation-recovery-v1' || recovery) &&
-      (value !== 'task-window-layout-v1' ||
-        (Array.isArray(supported) && supported.includes(value))) &&
       value !== 'task-window-occlusion-focus-v1' &&
-      (value !== 'task-window-content-layout-v1' ||
-        (Array.isArray(supported) && supported.includes(value))) &&
-      (value !== 'task-window-simple-recovery-v1' ||
-        (Array.isArray(supported) && supported.includes(value))) &&
-      (value !== 'task-window-occlusion-recovery-v1' ||
-        (Array.isArray(supported) && supported.includes(value))),
+      (!challengeGated.has(value) || list.includes(value)),
   );
 }

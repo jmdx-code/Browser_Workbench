@@ -4,8 +4,7 @@ import type { TaskRepository } from '../domain/tasks.js';
 import { ProductError } from '../domain/workspace.js';
 import type { BrowserWindowPort } from '../shared/browser-window.js';
 import type { TabProof } from '../shared/kernel-state.js';
-import { marketplaceBridgeSupported } from '../shared/task-features.js';
-
+import { marketplaceBridgeSupported } from '../shared/task-policies.js';
 // Local window management reuses the original bridge journal. It never executes a FB task.
 export class BridgeBrowserWindow implements BrowserWindowPort {
   private readonly active = new Set<string>();
@@ -28,7 +27,6 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     }>,
     private readonly inviterBusy: (profileId: string) => boolean | Promise<boolean> = () => false,
   ) {}
-
   async consolidate(profileId: string, preferActiveTab = true) {
     if (this.active.has(profileId))
       throw new ProductError('BROWSER_CLEANUP_PENDING', '正在整理这份浏览器标签，请稍候', 409);
@@ -64,7 +62,6 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
       this.active.delete(profileId);
     }
   }
-
   async cleanupTabs(profileIds: string[], preferActiveTab = false) {
     const result = { cleanedProfiles: 0, closedTabs: 0, skippedBusy: 0, skippedOffline: 0 };
     const uniqueIds = [...new Set(profileIds)];
@@ -108,7 +105,6 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     );
     return result;
   }
-
   async show(profileId: string, _alias: string) {
     const peer = this.core.peers.get(profileId);
     if (!peer?.online)
@@ -135,23 +131,14 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
       throw error;
     }
   }
-  private async assertIdle(profileId: string, allowPaused = false) {
+  private async assertIdle(profileId: string, _allowPaused = false) {
     if (
       this.tasks.hasProfilePlanInStates
-        ? await this.tasks.hasProfilePlanInStates(profileId, [
-            'QUEUED',
-            'RUNNING',
-            'PAUSING',
-            ...(allowPaused ? [] : ['PAUSED' as const]),
-            'STOPPING',
-            'REVIEW',
-          ])
+        ? await this.tasks.hasProfilePlanInStates(profileId, ['QUEUED', 'RUNNING'])
         : (await this.tasks.list()).some(
             (plan) =>
               plan.profileId === profileId &&
-              !['COMPLETED', 'FAILED', 'STOPPED', ...(allowPaused ? ['PAUSED'] : [])].includes(
-                plan.state,
-              ),
+              !['COMPLETED', 'FAILED', 'STOPPED'].includes(plan.state),
           )
     )
       throw new ProductError(

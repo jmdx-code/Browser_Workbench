@@ -13,7 +13,6 @@ import type {
   KernelTargetInfo as TargetInfo,
 } from '../shared/kernel-protocol.js';
 import { kernelAccessURL, type KernelAccess } from '../shared/kernel-policy.js';
-
 type TabSession = { tabId: number; sessionId: string; targetInfo: TargetInfo };
 type ChildSession = { tabId: number; chromeSessionId: string; parent: string };
 export class KernelRelayModel {

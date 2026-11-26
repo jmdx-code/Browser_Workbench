@@ -1,6 +1,5 @@
 import { readdir, lstat, realpath, unlink } from 'node:fs/promises';
 import path from 'node:path';
-
 export type LogFile = { name: string; bytes: number; modified: number; identity: string };
 export class LogCleanup {
   constructor(

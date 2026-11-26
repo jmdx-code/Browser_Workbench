@@ -12,7 +12,7 @@ import { emptyResourceRow } from '../src/domain/resource-table.js';
 
 test('worker bundle persists optional row AI and retains immutable pre-AI resource versions', async () => {
   await fixture(async (client) => {
-    const combo = await client.workspace.createDraft({
+    const combo = await client.workspace.createCombination({
       name: 'row AI worker',
       note: '',
       steps: [

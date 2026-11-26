@@ -58,13 +58,13 @@ export function computePopoverPlacement(
   return { effectiveAlign: 'start', offsetPx: Math.round(shift) };
 }
 
-// Lightweight dropdown: closes on outside click, Escape or selection.
 export function PopoverMenu({
   label,
   trigger,
   items,
   align = 'end',
   className = '',
+  triggerClassName,
   disabled,
   children,
 }: {
@@ -73,6 +73,7 @@ export function PopoverMenu({
   items?: MenuItem[];
   align?: 'start' | 'end';
   className?: string;
+  triggerClassName?: string;
   disabled?: boolean;
   children?: (close: () => void) => ReactNode;
 }) {
@@ -122,10 +123,13 @@ export function PopoverMenu({
 
   const close = () => setOpen(false);
   return (
-    <div className={'popover ' + className} ref={root}>
+    <div className={`popover relative inline-flex ${className}`.trim()} ref={root}>
       <button
         type="button"
-        className="btn btn-icon btn-ghost"
+        className={
+          triggerClassName ??
+          'btn btn-icon btn-ghost inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-transparent bg-transparent p-0 text-[var(--text-2)] transition-colors hover:not-disabled:bg-slate-200/70 hover:not-disabled:text-slate-900 disabled:cursor-not-allowed disabled:opacity-45'
+        }
         aria-label={label}
         title={label}
         aria-haspopup="menu"
@@ -146,7 +150,7 @@ export function PopoverMenu({
       {open && (
         <div
           ref={panelRef}
-          className={'popover-panel align-' + effectiveAlign}
+          className={`popover-panel align-${effectiveAlign} ${effectiveAlign === 'end' ? 'right-0' : 'left-0'} absolute top-[calc(100%+4px)] z-50 max-h-[360px] min-w-[184px] overflow-y-auto rounded-xl border border-[var(--line)] bg-white p-1.5 text-[var(--text)] shadow-xl`}
           style={offsetPx !== 0 ? { left: `${offsetPx}px`, right: 'auto' } : undefined}
           role="menu"
           onClick={(event) => event.stopPropagation()}
@@ -154,7 +158,10 @@ export function PopoverMenu({
           {children?.(close)}
           {items?.map((item, index) =>
             'separator' in item ? (
-              <div className="popover-separator" key={'s' + index}>
+              <div
+                className={`mt-1 mb-0.5 block border-t border-[var(--line)] px-2 pt-1.5 pb-0.5 text-[11px] font-bold tracking-wide text-[var(--text-3)] ${index === 0 ? 'mt-0 border-t-0' : ''}`}
+                key={'s' + index}
+              >
                 {item.label}
               </div>
             ) : (
@@ -162,7 +169,7 @@ export function PopoverMenu({
                 type="button"
                 role="menuitem"
                 key={item.label + index}
-                className={'popover-item' + (item.danger ? ' danger-text' : '')}
+                className={`flex h-8 w-full items-center gap-2 rounded-md border-0 bg-transparent pr-2.5 pl-2 text-left text-[13px] whitespace-nowrap transition-colors enabled:hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-45 ${item.danger ? 'text-rose-600' : 'text-[var(--text)]'}`}
                 disabled={item.disabled}
                 title={item.title}
                 onClick={() => {
@@ -170,7 +177,11 @@ export function PopoverMenu({
                   item.onSelect();
                 }}
               >
-                <span className="popover-icon">{item.icon}</span>
+                <span
+                  className={`inline-flex w-4 shrink-0 justify-center ${item.danger ? 'text-rose-600' : 'text-[var(--text-3)]'}`}
+                >
+                  {item.icon}
+                </span>
                 {item.label}
               </button>
             ),

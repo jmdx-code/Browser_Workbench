@@ -1,122 +1,72 @@
 import { KernelJsonObject, type KernelJsonObject as Params } from './kernel-protocol.js';
 export type KernelAccess = 'fixture' | 'facebook-readonly' | 'facebook-task' | 'agent-browser';
-
-// The SDK is private to trusted controller code. Runtime commands are not a read-only API.
-// All explicit UI mutations need an original, currently active operation in the native journal.
-export function kernelRequiresOperation(method: string, access: KernelAccess): boolean {
-  if (access === 'agent-browser') return false;
-  return (
-    /^(Input\.|DOM\.setFileInputFiles$)/.test(method) ||
-    (access === 'facebook-task' &&
-      [
-        'Page.navigate',
-        'Page.reload',
-        'Page.bringToFront',
-        'Page.handleJavaScriptDialog',
-        'DOM.scrollIntoViewIfNeeded',
-      ].includes(method))
-  );
-}
-
-export function isBenignScrollPreconditionError(
-  method: string,
-  error: unknown,
-  fenced = false,
-): boolean {
-  if (fenced || method !== 'DOM.scrollIntoViewIfNeeded') return false;
-  const message = error instanceof Error ? error.message : String(error ?? '');
+const TASK_METHODS = new Set(
+  'Page.navigate Page.reload Page.bringToFront Page.handleJavaScriptDialog DOM.scrollIntoViewIfNeeded'.split(
+    ' ',
+  ),
+);
+const READONLY_METHODS = new Set(['Page.enable', 'Page.getFrameTree', 'Target.getTargetInfo']);
+const FIXTURE_ORIGINS = new Set(['http://127.0.0.1:18767', 'http://localhost:18767']);
+export const kernelRequiresOperation = (method: string, access: KernelAccess): boolean =>
+  access !== 'agent-browser' &&
+  (/^(Input\.|DOM\.setFileInputFiles$)/.test(method) ||
+    (access === 'facebook-task' && TASK_METHODS.has(method)));
+export function isBenignScrollPreconditionError(m: string, error: unknown, fenced = false) {
+  if (fenced || m !== 'DOM.scrollIntoViewIfNeeded') return false;
+  const msg = error instanceof Error ? error.message : String(error ?? '');
   return /Node is detached from document|Could not find (?:node|object)|Node does not have a layout object|Cannot find context/i.test(
-    message,
+    msg,
   );
 }
-
-export function kernelFacebookReadURL(value: string): boolean {
+const parseCleanUrl = (value: string): URL | null => {
   try {
     const url = new URL(value);
-    return url.origin === 'https://www.facebook.com' && !url.username && !url.password && !url.port;
+    return url.username || url.password ? null : url;
   } catch {
-    return false;
+    return null;
   }
-}
-export function kernelAgentBrowserURL(value: string): boolean {
+};
+export const kernelFacebookReadURL = (value: string): boolean => {
+  const url = parseCleanUrl(value);
+  return url !== null && url.origin === 'https://www.facebook.com' && !url.port;
+};
+const checkUrl = (value: string, pred: (u: URL) => boolean): boolean => {
   if (value === 'about:blank') return true;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
-    if (url.username || url.password) return false;
-    if (['http://127.0.0.1:18767', 'http://localhost:18767'].includes(url.origin)) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-export function kernelAccessURL(value: string, access: KernelAccess): boolean {
-  if (access === 'agent-browser') return kernelAgentBrowserURL(value);
-  return access === 'fixture' ? kernelFixtureURL(value) : kernelFacebookReadURL(value);
-}
-
-// The fixture SDK scope remains isolated. Facebook has a separate declarative read scope.
-export function kernelFixtureURL(value: string): boolean {
-  if (value === 'about:blank') return true;
-  try {
-    const url = new URL(value);
-    return (
-      !url.username &&
-      !url.password &&
-      ['http://127.0.0.1:18767', 'http://localhost:18767'].includes(url.origin) &&
-      ['/kernel-fixture', '/kernel-frame'].includes(url.pathname)
-    );
-  } catch {
-    return false;
-  }
-}
-const sessionMethods = new Set([
-  'Page.enable',
-  'Page.getFrameTree',
-  'Page.getLayoutMetrics',
-  'Page.getNavigationHistory',
-  'Page.createIsolatedWorld',
-  'Page.addScriptToEvaluateOnNewDocument',
-  'Page.removeScriptToEvaluateOnNewDocument',
-  'Page.navigate',
-  'Page.reload',
-  'Page.bringToFront',
-  'Page.setLifecycleEventsEnabled',
-  'Page.setInterceptFileChooserDialog',
-  'Page.handleJavaScriptDialog',
-  'Page.stopLoading',
-  'Runtime.enable',
-  'Runtime.evaluate',
-  'Runtime.callFunctionOn',
-  'Runtime.releaseObject',
-  'Runtime.releaseObjectGroup',
-  'Runtime.getProperties',
-  'Runtime.runIfWaitingForDebugger',
-  'Runtime.addBinding',
-  'Runtime.removeBinding',
-  'DOM.enable',
-  'DOM.getDocument',
-  'DOM.describeNode',
-  'DOM.getFrameOwner',
-  'DOM.resolveNode',
-  'DOM.getBoxModel',
-  'DOM.getContentQuads',
-  'DOM.scrollIntoViewIfNeeded',
-  'DOM.setFileInputFiles',
-  'Input.dispatchMouseEvent',
-  'Input.dispatchKeyEvent',
-  'Input.insertText',
-  'Input.synthesizeScrollGesture',
-  'Network.enable',
-  'Network.disable',
-  'Network.setCacheDisabled',
-  'Network.getResponseBody',
-  'Log.enable',
-  'Inspector.enable',
-  'Emulation.clearGeolocationOverride',
-  'Target.setAutoAttach',
-  'Target.getTargetInfo',
-]);
+  const u = parseCleanUrl(value);
+  return u !== null && pred(u);
+};
+export const kernelAgentBrowserURL = (value: string): boolean =>
+  checkUrl(
+    value,
+    (u) => (u.protocol === 'https:' || u.protocol === 'http:') && !FIXTURE_ORIGINS.has(u.origin),
+  );
+export const kernelAccessURL = (value: string, access: KernelAccess): boolean =>
+  access === 'agent-browser'
+    ? kernelAgentBrowserURL(value)
+    : access === 'fixture'
+      ? kernelFixtureURL(value)
+      : kernelFacebookReadURL(value);
+export const kernelFixtureURL = (value: string): boolean =>
+  checkUrl(
+    value,
+    (u) =>
+      FIXTURE_ORIGINS.has(u.origin) &&
+      (u.pathname === '/kernel-fixture' || u.pathname === '/kernel-frame'),
+  );
+const sessionMethods = new Set(
+  (
+    'Page.enable Page.getFrameTree Page.getLayoutMetrics Page.getNavigationHistory ' +
+    'Page.createIsolatedWorld Page.addScriptToEvaluateOnNewDocument Page.removeScriptToEvaluateOnNewDocument ' +
+    'Page.navigate Page.reload Page.bringToFront Page.setLifecycleEventsEnabled Page.setInterceptFileChooserDialog ' +
+    'Page.handleJavaScriptDialog Page.stopLoading Runtime.enable Runtime.evaluate Runtime.callFunctionOn ' +
+    'Runtime.releaseObject Runtime.releaseObjectGroup Runtime.getProperties Runtime.runIfWaitingForDebugger ' +
+    'Runtime.addBinding Runtime.removeBinding DOM.enable DOM.getDocument DOM.describeNode DOM.getFrameOwner ' +
+    'DOM.resolveNode DOM.getBoxModel DOM.getContentQuads DOM.scrollIntoViewIfNeeded DOM.setFileInputFiles ' +
+    'Input.dispatchMouseEvent Input.dispatchKeyEvent Input.insertText Input.synthesizeScrollGesture ' +
+    'Network.enable Network.disable Network.setCacheDisabled Network.getResponseBody Log.enable ' +
+    'Inspector.enable Emulation.clearGeolocationOverride Target.setAutoAttach Target.getTargetInfo'
+  ).split(' '),
+);
 const fileKey = (file: string) => file.replaceAll('\\', '/').toLowerCase();
 export function assertKernelSessionCommand(
   method: string,
@@ -124,11 +74,7 @@ export function assertKernelSessionCommand(
   files: ReadonlySet<string>,
   access: KernelAccess = 'fixture',
 ): Params {
-  // The read scope cannot tunnel arbitrary Runtime scripts, input, navigation or file operations.
-  if (
-    access === 'facebook-readonly' &&
-    !['Page.enable', 'Page.getFrameTree', 'Target.getTargetInfo'].includes(method)
-  )
+  if (access === 'facebook-readonly' && !READONLY_METHODS.has(method))
     throw Error('KERNEL_READONLY_METHOD_REJECTED_' + method);
   if (
     !sessionMethods.has(method) &&
@@ -139,27 +85,26 @@ export function assertKernelSessionCommand(
   if (method === 'Target.setAutoAttach') {
     if (typeof params.autoAttach !== 'boolean' || params.flatten !== true)
       throw Error('KERNEL_AUTO_ATTACH_REJECTED');
-    // The V1 integration needs frames, not control of workers belonging to the profile.
     return {
       ...params,
       filter: params.autoAttach ? [{ type: 'iframe', exclude: false }] : [],
       waitForDebuggerOnStart: false,
     };
   }
-  if (method === 'Page.navigate') {
-    if (typeof params.url !== 'string' || !kernelAccessURL(params.url, access))
-      throw Error('KERNEL_URL_REJECTED');
-  }
+  if (
+    method === 'Page.navigate' &&
+    (typeof params.url !== 'string' || !kernelAccessURL(params.url, access))
+  )
+    throw Error('KERNEL_URL_REJECTED');
   if (method === 'DOM.setFileInputFiles') {
     const accepted = new Set([...files].map(fileKey));
     if (
       !Array.isArray(params.files) ||
       params.files.length === 0 ||
       params.files.length > 20 ||
-      params.files.some((file) => typeof file !== 'string' || !accepted.has(fileKey(file)))
+      params.files.some((f) => typeof f !== 'string' || !accepted.has(fileKey(f)))
     )
       throw Error('KERNEL_FILE_REJECTED');
   }
-  // Browser-level commands must never pass just because they have a tab session.
   return params;
 }

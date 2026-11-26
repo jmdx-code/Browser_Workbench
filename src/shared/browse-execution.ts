@@ -1,259 +1,64 @@
 import { z } from 'zod';
-import { OwnedTabProof } from './kernel-state.js';
-import { Id } from './contracts.js';
-import { Action } from './browser-actions.js';
-import { BoundReceipt } from './task-execution.js';
-
-export const BrowseScrollRoot = z
-  .object({
-    tag: z.string().max(12),
-    role: z.string().max(40).nullable(),
-    x: z.number().finite(),
-    y: z.number().finite(),
-    width: z.number().finite().nonnegative(),
-    height: z.number().finite().nonnegative(),
-    top: z.number().finite().nonnegative(),
-    max: z.number().finite().nonnegative(),
-  })
-  .strict();
-export const BrowseCenterHit = z
-  .object({
-    tag: z.string().max(12),
-    role: z.string().max(40).nullable(),
-    withinMain: z.boolean(),
-  })
-  .strict();
-export const BrowseVisiblePlayer = z
-  .object({
-    area: z.number().finite().nonnegative(),
-    sourceLength: z.number().int().nonnegative(),
-    srcObject: z.boolean(),
-    readyState: z.number().int().min(0).max(4),
-    paused: z.boolean(),
-    ended: z.boolean(),
-    timeSeconds: z.number().finite().nonnegative(),
-    errorCode: z.number().int().nullable(),
-    videoWidth: z.number().finite().nonnegative().optional(),
-    videoHeight: z.number().finite().nonnegative().optional(),
-  })
-  .strict();
-export const BrowseContentPosition = z
-  .object({
-    left: z.number().finite(),
-    top: z.number().finite(),
-    width: z.number().finite().positive(),
-    height: z.number().finite().positive(),
-    viewportHeight: z.number().finite().positive(),
-  })
-  .strict();
-const BrowseWheelStartV1 = z
-  .object({
-    version: z.literal(1),
-    url: z.string().max(4096),
-    timeOrigin: z.number().finite().nonnegative(),
-    scrollY: z.number().finite().nonnegative(),
-  })
-  .strict();
-export const BrowseWheelStart = z.discriminatedUnion('version', [
-  BrowseWheelStartV1,
-  BrowseWheelStartV1.extend({
-    version: z.literal(2),
-    anchor: z
-      .object({ contentId: z.string().regex(/^[a-f0-9]{64}$/), position: BrowseContentPosition })
-      .strict()
-      .nullable(),
-  }).strict(),
-]);
-const BrowsePendingDiagnosticV1 = z
-  .object({
-    version: z.literal(1),
-    independent: z.literal(true),
-    url: z.string().max(4096),
-    timeOrigin: z.number().finite().nonnegative(),
-    ready: z.boolean(),
-    visible: z.boolean(),
-    blocked: z.boolean(),
-    scrollY: z.number().finite().nonnegative(),
-    scrollMaxY: z.number().finite().nonnegative().nullable(),
-    viewportHeight: z.number().finite().nonnegative(),
-    contentId: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .nullable(),
-    mainCount: z.number().int().nonnegative().nullable(),
-    scrollRoots: z.array(BrowseScrollRoot).max(4),
-    centerHit: BrowseCenterHit.nullable(),
-    visiblePlayers: z.array(BrowseVisiblePlayer).max(8).optional(),
-    structuralPosts: z.number().int().nonnegative().nullable().optional(),
-    inputFence: z
-      .object({
-        fromY: z.number().finite().nonnegative(),
-        requestedDelta: z.number().finite(),
-        appliedDelta: z.number().finite().nullable(),
-        positionMatches: z.boolean(),
-        movementValid: z.boolean(),
-        sameUrl: z.boolean(),
-        sameTimeOrigin: z.boolean(),
-      })
-      .strict()
-      .optional(),
-  })
-  .strict();
-export const BrowsePendingDiagnostic = z.discriminatedUnion('version', [
-  BrowsePendingDiagnosticV1,
-  BrowsePendingDiagnosticV1.extend({
-    version: z.literal(2),
-    contentPosition: BrowseContentPosition.nullable(),
-    wheelStart: BrowseWheelStart.optional(),
-  }).strict(),
-]);
-export type PendingDiagnostic = z.infer<typeof BrowsePendingDiagnostic>;
-export class BrowseReadTimeout extends Error {
-  constructor(
-    reason: string,
-    readonly diagnostic: PendingDiagnostic,
-  ) {
-    super(reason);
-    BrowsePendingDiagnostic.parse(diagnostic);
-  }
-}
-
-const purpose = z.enum(['play', 'advance', 'dismiss', 'activate', 'acceptFriend']);
-const scope = {
-  proof: OwnedTabProof,
-  documentEpoch: z.number().int().nonnegative(),
-  routeEpoch: z.number().int().nonnegative(),
-};
-export const BrowseIntent = z.discriminatedUnion('kind', [
-  z
-    .object({
-      kind: z.literal('auxiliary'),
-      purpose,
-      beforeContentId: z
-        .string()
-        .regex(/^[a-f0-9]{64}$/)
-        .optional(),
-      ...scope,
-    })
-    .strict(),
-  z
-    .object({
-      kind: z.literal('like'),
-      contentId: z.string().min(1).max(500),
-      observedLikeCount: z.number().int().nonnegative(),
-      observedLiked: z.literal(false),
-      ...scope,
-    })
-    .strict(),
-]);
-export const BrowseOperationIntent = z
-  .object({ operationId: Id, jobId: Id, stepId: Id, intent: BrowseIntent })
-  .strict();
-const observed = {
-  ...scope,
-  contentId: z.string().min(1).max(500),
-  visible: z.boolean(),
-  ready: z.boolean(),
-};
-export const BrowseObservation = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('feed'), ...observed }).strict(),
-  z.object({ type: z.literal('marketplace'), ...observed }).strict(),
-  z.object({ type: z.literal('friends'), ...observed }).strict(),
-  z
-    .object({
-      type: z.literal('video'),
-      ...observed,
-      paused: z.boolean(),
-      buffering: z.boolean(),
-      timeSeconds: z.number().finite().nonnegative(),
-      playbackRate: z.number().min(0).max(4),
-    })
-    .strict(),
-]);
-export const BrowseDecision = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('observe'), observation: BrowseObservation }).strict(),
-  z
-    .object({
-      kind: z.literal('action'),
-      action: Action,
-      intent: BrowseIntent,
-      observation: BrowseObservation.optional(),
-    })
-    .strict(),
-  z.object({ kind: z.literal('wait'), reason: z.string().min(1).max(200) }).strict(),
-]);
-export const BrowseEffect = z.discriminatedUnion('kind', [
-  z
-    .object({
-      kind: z.literal('auxiliary'),
-      purpose,
-      observed: z.literal(true),
-      afterContentId: z
-        .string()
-        .regex(/^[a-f0-9]{64}$/)
-        .optional(),
-    })
-    .strict(),
-  z
-    .object({
-      kind: z.literal('liked'),
-      contentId: z.string().min(1).max(500),
-      observedLiked: z.literal(true),
-    })
-    .strict(),
-]);
-export const BrowseVerdict = z.discriminatedUnion('outcome', [
-  z
-    .object({
-      outcome: z.literal('WAIT'),
-      receipt: BoundReceipt,
-      reason: z.string().min(1).max(200),
-    })
-    .strict(),
-  z
-    .object({
-      outcome: z.literal('VERIFIED'),
-      receipt: BoundReceipt,
-      effect: BrowseEffect,
-      observation: BrowseObservation.optional(),
-    })
-    .strict(),
-  z.object({ outcome: z.literal('NOT_APPLIED'), receipt: BoundReceipt }).strict(),
-  z
-    .object({
-      outcome: z.literal('UNKNOWN'),
-      receipt: BoundReceipt,
-      reason: z.string().min(1).max(200),
-    })
-    .strict(),
-]);
-export type Intent = z.infer<typeof BrowseIntent>;
-export type IntentRecord = z.infer<typeof BrowseOperationIntent>;
-export type BrowseReading = z.infer<typeof BrowseObservation>;
-export type Decision = z.infer<typeof BrowseDecision>;
-export type Verdict = z.infer<typeof BrowseVerdict>;
-
-export function isRecoverableBrowseFault(reason: string): boolean {
-  const text = String(reason ?? '');
-  if (/\bKERNEL_DEBUGGER_CANCELED_BY_USER\b/.test(text)) return false;
-  return (
-    /(?:^|:\s*)(?:KERNEL_FENCED|KERNEL_LEASE_REJECTED|KERNEL_LEASE_EXPIRED|KERNEL_LEASE_RENEW_FAILED(?:_DURING_READ)?|KERNEL_OPERATION_BINDING_REJECTED|TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED|KERNEL_DEBUGGER_DETACHED|KERNEL_CONNECTION_LOST(?:_DURING_READ)?|KERNEL_RPC_RESULT_UNKNOWN|KERNEL_PEER_NOT_IDLE|KERNEL_OPERATION_FINISH_TIMEOUT|KERNEL_EXECUTE_TIMEOUT|KERNEL_BRIDGE_TIMEOUT|FACEBOOK_BROWSE_LOADING_OR_DIALOG_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|FACEBOOK_TASK_DOCUMENT_READ_FAILED|FACEBOOK_NAVIGATION_SCOPE_CHANGED|FACEBOOK_NAVIGATION_TIMEOUT|FACEBOOK_NAVIGATION_READ_TIMEOUT|FACEBOOK_NAVIGATION_DOCUMENT_TIMEOUT|FACEBOOK_NAVIGATION_ABORTED|FACEBOOK_MANAGED_CONTEXT_CHANGED|STEP_EXECUTION_CONTEXT_CHANGED|ACTOR_INPUT_FENCED|ACTOR_TASK_TAB_CONTEXT_CHANGED|ACTOR_TASK_SCOPE_FAILED|ACTOR_TRANSPORT_OR_IDENTITY_CHANGED|TASK_TAB_SOURCE_CONTEXT_CHANGED|TASK_TAB_OBSERVATION_CHANGED|BROWSE_EFFECT_TIMEOUT|FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT|FACEBOOK_PROFILE_ADMISSION_EXPIRED_OR_CHANGED|FACEBOOK_PROFILE_CONNECTION_CHANGED|FACEBOOK_BROWSE_SCHEMA_MISMATCH|FACEBOOK_BROWSE_ROUTE_REQUIRED|FACEBOOK_IDENTITY_UNCONFIRMED|FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED|FACEBOOK_BROWSE_SAMPLE_DOCUMENT_CHANGED)\b/.test(
-      text,
-    ) ||
-    /(?:Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Execution context was destroyed|Cannot find context|Frame was detached|Session closed|Inspector\.detached|Navigation failed because page was closed|timeout\s+\d+ms\s+exceeded)/i.test(
-      text,
-    )
-  );
-}
-
-export function isSessionBreakingBrowseFault(reason: string): boolean {
+import { NonNegFinite, NonNegInt, intRange, strictObj } from './contracts.js';
+const finite = z.number().finite(),
+  posFinite = finite.positive();
+export const BrowseScrollRoot = strictObj({
+  tag: z.string().max(12),
+  role: z.string().max(40).nullable(),
+  x: finite,
+  y: finite,
+  width: NonNegFinite,
+  height: NonNegFinite,
+  top: NonNegFinite,
+  max: NonNegFinite,
+});
+export const BrowseCenterHit = strictObj({
+  tag: z.string().max(12),
+  role: z.string().max(40).nullable(),
+  withinMain: z.boolean(),
+});
+export const BrowseVisiblePlayer = strictObj({
+  area: NonNegFinite,
+  sourceLength: NonNegInt,
+  srcObject: z.boolean(),
+  readyState: intRange(0, 4),
+  paused: z.boolean(),
+  ended: z.boolean(),
+  timeSeconds: NonNegFinite,
+  errorCode: z.number().int().nullable(),
+  videoWidth: NonNegFinite.optional(),
+  videoHeight: NonNegFinite.optional(),
+});
+export const BrowseContentPosition = strictObj({
+  left: finite,
+  top: finite,
+  width: posFinite,
+  height: posFinite,
+  viewportHeight: posFinite,
+});
+const SHARED_FAULTS =
+    'KERNEL_FENCED|KERNEL_READ_FENCED|KERNEL_SCOPE_CHANGED|KERNEL_BOUND_INPUT_INACTIVE|KERNEL_NOT_ATTACHED|KERNEL_SESSION_PARKING|KERNEL_SESSION_NOT_CURRENT|KERNEL_PRESENTATION_REVOKED|KERNEL_LEASE_REJECTED|KERNEL_LEASE_EXPIRED|KERNEL_LEASE_RENEW_FAILED(?:_DURING_READ)?|KERNEL_OPERATION_BINDING_REJECTED|TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED|KERNEL_CONNECTION_LOST(?:_DURING_READ)?|KERNEL_RPC_RESULT_UNKNOWN|KERNEL_PEER_NOT_IDLE|KERNEL_OPERATION_FINISH_TIMEOUT|KERNEL_EXECUTE_TIMEOUT|KERNEL_BRIDGE_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|FACEBOOK_TASK_DOCUMENT_ERROR_PAGE|FACEBOOK_TASK_DOCUMENT_CONTEXT_CHANGED|FACEBOOK_NAVIGATION_TIMEOUT|FACEBOOK_NAVIGATION_READ_TIMEOUT|FACEBOOK_NAVIGATION_DOCUMENT_TIMEOUT|FACEBOOK_NAVIGATION_DOCUMENT_INVALID|FACEBOOK_NAVIGATION_REJECTED|ACTOR_TASK_TAB_CONTEXT_CHANGED|ACTOR_TASK_SCOPE_FAILED|ACTOR_TRANSPORT_OR_IDENTITY_CHANGED',
+  RECOVERABLE_ONLY_FAULTS =
+    'KERNEL_DEBUGGER_DETACHED|FACEBOOK_BROWSE_LOADING_OR_DIALOG_TIMEOUT|FACEBOOK_TASK_DOCUMENT_READ_FAILED|FACEBOOK_NAVIGATION_SCOPE_CHANGED|FACEBOOK_NAVIGATION_ABORTED|FACEBOOK_BROWSE_LIKE_TARGET_CHANGED|FACEBOOK_BROWSE_DIALOG_DISMISS_TARGET_CHANGED|FACEBOOK_BROWSE_DOCUMENT_OR_TARGET_CHANGED|FACEBOOK_MANAGED_CONTEXT_CHANGED|STEP_EXECUTION_CONTEXT_CHANGED|ACTOR_INPUT_FENCED|TASK_TAB_SOURCE_CONTEXT_CHANGED|TASK_TAB_OBSERVATION_CHANGED|BROWSE_EFFECT_TIMEOUT|FACEBOOK_BROWSE_FOREGROUND_REQUIRED_TIMEOUT|FACEBOOK_PROFILE_ADMISSION_EXPIRED_OR_CHANGED|FACEBOOK_PROFILE_CONNECTION_CHANGED|FACEBOOK_BROWSE_SCHEMA_MISMATCH|FACEBOOK_BROWSE_ROUTE_REQUIRED|FACEBOOK_IDENTITY_UNCONFIRMED|FACEBOOK_CURRENT_NATIVE_IDENTITY_UNCONFIRMED|FACEBOOK_BROWSE_SAMPLE_DOCUMENT_CHANGED',
+  RECOVERABLE_CODE_RE = new RegExp(`(?:^|:\\s*)(?:${SHARED_FAULTS}|${RECOVERABLE_ONLY_FAULTS})\\b`),
+  BREAKING_CODE_RE = new RegExp(
+    `(?:^|:\\s*)(?:${SHARED_FAULTS}|KERNEL_DEBUGGER_(?:DETACHED|CANCELED_BY_USER))\\b`,
+  ),
+  SHARED_PW_MSG =
+    'Target page, context or browser has been closed|Target\\.detachedFromTarget|Inspected target navigated or closed|Execution context was destroyed|Frame was detached|Session closed|Inspector\\.detached',
+  RECOVERABLE_PW_RE = new RegExp(
+    `(?:${SHARED_PW_MSG}|Cannot find context|Navigation failed because page was closed|timeout\\s+\\d+ms\\s+exceeded)`,
+    'i',
+  ),
+  BREAKING_PW_RE = new RegExp(`(?:${SHARED_PW_MSG}|Cannot find context with specified id)`, 'i');
+export const isRecoverableBrowseFault = (reason: string): boolean => {
   const text = String(reason ?? '');
   return (
-    /(?:^|:\s*)(?:KERNEL_FENCED|KERNEL_LEASE_REJECTED|KERNEL_LEASE_EXPIRED|KERNEL_LEASE_RENEW_FAILED(?:_DURING_READ)?|KERNEL_OPERATION_BINDING_REJECTED|TASK_RUNTIME_FAILED_OPEN_STOP_REQUIRED|KERNEL_DEBUGGER_(?:DETACHED|CANCELED_BY_USER)|KERNEL_CONNECTION_LOST(?:_DURING_READ)?|KERNEL_RPC_RESULT_UNKNOWN|KERNEL_PEER_NOT_IDLE|KERNEL_OPERATION_FINISH_TIMEOUT|KERNEL_EXECUTE_TIMEOUT|KERNEL_BRIDGE_TIMEOUT|FACEBOOK_NAVIGATION_READ_TIMEOUT|FACEBOOK_NAVIGATION_TIMEOUT|FACEBOOK_TASK_DOCUMENT_TIMEOUT|ACTOR_TASK_TAB_CONTEXT_CHANGED|ACTOR_TASK_SCOPE_FAILED|ACTOR_TRANSPORT_OR_IDENTITY_CHANGED)\b/.test(
-      text,
-    ) ||
-    /(?:Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|Frame was detached|Session closed|Inspector\.detached)/i.test(
-      text,
-    )
+    !/\bKERNEL_DEBUGGER_CANCELED_BY_USER\b/.test(text) &&
+    (RECOVERABLE_CODE_RE.test(text) || RECOVERABLE_PW_RE.test(text))
   );
-}
+};
+export const isSessionBreakingBrowseFault = (reason: string): boolean => {
+  const text = String(reason ?? '');
+  return BREAKING_CODE_RE.test(text) || BREAKING_PW_RE.test(text);
+};

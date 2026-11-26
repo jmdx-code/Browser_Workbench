@@ -1,9 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  PresentationFocusGate,
-  PositionRecoveryGate,
-} from '../src/application/presentation-focus-gate.js';
+import { PresentationFocusGate, PositionRecoveryGate } from '../src/application/kernel-gates.js';
 
 test('position recovery has no absent FIFO owner; all 100 live profiles reach the native serial queue', () => {
   const gate = new PositionRecoveryGate();

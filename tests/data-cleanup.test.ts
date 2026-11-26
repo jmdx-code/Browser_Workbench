@@ -1,4 +1,3 @@
-import { deliverPostNotices } from './fixtures/material-post.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, readdir } from 'node:fs/promises';
@@ -14,7 +13,7 @@ import { LogCleanup } from '../src/infrastructure/log-cleanup.js';
 import { FilesystemRuntimeLog } from '../src/infrastructure/runtime-log.js';
 import { DataCleanupService } from '../src/application/data-cleanup.js';
 import { TaskService } from '../src/application/task-service.js';
-import { settlementFixture, prepareBound } from './fixtures/settlement.js';
+import { assignSamplePlan, workspaceFixture } from './fixtures/workspace-fixture.js';
 
 for (const mode of ['execute', 'automatic'] as const)
   test('cleanup yields real I/O between 100-step synchronous batches: ' + mode, async () => {
@@ -70,38 +69,27 @@ for (const mode of ['execute', 'automatic'] as const)
     }
   });
 
-test('record cleanup removes only ended display rows and preserves original UNKNOWN, receipts and paging semantics', async () => {
-  await settlementFixture(async (store) => {
-    const f = prepareBound(store);
-    store.tasks.markBoundUnknown(f.binding, 'TEST_UNKNOWN');
-    const original = store.tasks.operations(f.plan.id);
-    const end = store.tasks.requestEnd(f.plan.id);
-    const stop = {
-      profileId: f.profile.id,
-      connectionEpoch: f.binding.connectionEpoch,
-      requestId: end,
-      state: 'stopped' as const,
-    };
-    store.tasks.prepareEnd(f.plan.id, stop);
-    deliverPostNotices(store, f.profile.id);
-    store.tasks.finishEnd(f.plan.id, stop);
-    const second = prepareBound(store);
+test('record cleanup removes only ended display rows and preserves receipts and paging semantics', async () => {
+  await workspaceFixture(async (store) => {
+    const first = assignSamplePlan(store);
+    const fStep = store.tasks.steps(first.plan.id)[0]!;
+    store.tasks.claimPlanForProfile(first.profile.id, first.profile.account.id);
+    store.tasks.failPlanDirect(first.plan.id, 'TEST_FAILED');
+    const second = assignSamplePlan(store);
+    const sStep = store.tasks.steps(second.plan.id)[0]!;
+    store.tasks.claimPlanForProfile(second.profile.id, second.profile.account.id);
     const service = new TaskService(store.tasks);
     const before = await service.records({ limit: 1 });
-    const scope = { stepIds: [f.step.id, second.step.id] };
+    const scope = { stepIds: [fStep.id, sStep.id] };
     assert.deepEqual(store.dataCleanup.preview(scope), { eligible: 1, protected: 1, bytes: 0 });
     assert.equal(store.dataCleanup.removeBatch(scope), 1);
     assert.equal(store.dataCleanup.removeBatch(scope), 0);
     const after = await service.records({ limit: 100 });
     assert.equal(after.total, 1);
-    assert.ok(after.records.every((row) => row.stepId === second.step.id));
+    assert.ok(after.records.every((row) => row.stepId === sStep.id));
     assert.deepEqual(after.records, (await service.recordsLegacy({ limit: 100 })).records);
-    assert.deepEqual(
-      store.tasks.operations(f.plan.id).map((o) => [o.id, o.status, o.receipt]),
-      original.map((o) => [o.id, o.status, o.receipt]),
-    );
-    assert.equal(store.tasks.get(f.plan.id).state, 'FAILED');
-    assert.deepEqual((await service.history({ profileId: f.profile.id })).plans, []);
+    assert.throws(() => store.tasks.get(first.plan.id), /任务计划不存在/);
+    assert.deepEqual((await service.history({ profileId: first.profile.id })).plans, []);
     if (before.nextCursor)
       await assert.rejects(service.records({ limit: 1, cursor: before.nextCursor }), /记录已变化/);
     assert.equal(store.dataCleanup.settings().historyRetentionDays, null);

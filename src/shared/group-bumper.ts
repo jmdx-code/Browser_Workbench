@@ -1,33 +1,51 @@
 import { z } from 'zod';
-import { Id } from './contracts.js';
+import { Id, NonNegInt, StrNull, intRange, optBool, strictObj } from './contracts.js';
 import { extractFacebookGroupId, extractFacebookPageId } from './facebook-target-id.js';
-import { GroupIdString, GroupNameString, AVATAR_URL_MAX_LENGTH } from './group-inviter.js';
+import { AVATAR_URL_MAX_LENGTH, GroupIdString, GroupNameString } from './group-inviter.js';
 export { AVATAR_URL_MAX_LENGTH };
-
 export const BumperReactionType = z.enum(['like', 'love', 'care', 'haha', 'wow', 'sad', 'angry']);
 export type BumperReactionType = z.infer<typeof BumperReactionType>;
-
-export const BumperSettings = z
-  .object({
-    searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']).default('time_sort'),
-    maxPostAgeHours: z.number().int().min(1).max(720).default(24),
-    maxPostsPerGroupPage: z.number().int().min(1).max(50).default(5),
-    maxPostsPerPage: z.number().int().min(1).max(50).default(3),
-    maxConcurrentProfiles: z.number().int().min(1).max(50).default(8),
-    dailyMaxLikesPerAccount: z.number().int().min(1).max(500).default(20),
-    maxLikesPerPost: z.number().int().min(1).max(500).default(50),
-    likeProbability: z.number().int().min(0).max(100).default(100),
-    commentProbability: z.number().int().min(0).max(100).default(30),
-    consumeCommentOnUse: z.boolean().default(false),
-    enableSound: z.boolean().default(false),
-    useLongPressReaction: z.boolean().default(false),
-    reactionTypes: z.array(BumperReactionType).min(1).max(7).default(['care', 'love', 'like']),
-  })
-  .strict();
+const max50 = intRange(1, 50),
+  max500 = intRange(1, 500),
+  pct = intRange(0, 100);
+const bumperSettingsShape = {
+  searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']),
+  maxPostAgeHours: intRange(1, 720),
+  maxPostsPerGroupPage: max50,
+  maxPostsPerPage: max50,
+  maxConcurrentProfiles: max50,
+  dailyMaxLikesPerAccount: max500,
+  maxLikesPerPost: max500,
+  likeProbability: pct,
+  commentProbability: pct,
+  shareToStoryProbability: pct,
+  consumeCommentOnUse: z.boolean(),
+  enableSound: z.boolean(),
+  useLongPressReaction: z.boolean(),
+  reactionTypes: z.array(BumperReactionType).min(1).max(7),
+};
+export const BumperSettings = strictObj({
+  searchMode: bumperSettingsShape.searchMode.default('time_sort'),
+  maxPostAgeHours: bumperSettingsShape.maxPostAgeHours.default(24),
+  maxPostsPerGroupPage: bumperSettingsShape.maxPostsPerGroupPage.default(5),
+  maxPostsPerPage: bumperSettingsShape.maxPostsPerPage.default(3),
+  maxConcurrentProfiles: bumperSettingsShape.maxConcurrentProfiles.default(8),
+  dailyMaxLikesPerAccount: bumperSettingsShape.dailyMaxLikesPerAccount.default(20),
+  maxLikesPerPost: bumperSettingsShape.maxLikesPerPost.default(50),
+  likeProbability: bumperSettingsShape.likeProbability.default(100),
+  commentProbability: bumperSettingsShape.commentProbability.default(30),
+  shareToStoryProbability: bumperSettingsShape.shareToStoryProbability.default(0),
+  consumeCommentOnUse: bumperSettingsShape.consumeCommentOnUse.default(false),
+  enableSound: bumperSettingsShape.enableSound.default(false),
+  useLongPressReaction: bumperSettingsShape.useLongPressReaction.default(false),
+  reactionTypes: bumperSettingsShape.reactionTypes.default(['care', 'love', 'like']),
+});
+export const PartialBumperSettings = strictObj(bumperSettingsShape).partial();
 export type BumperSettings = Omit<
   z.infer<typeof BumperSettings>,
-  'enableSound' | 'useLongPressReaction' | 'reactionTypes'
+  'shareToStoryProbability' | 'enableSound' | 'useLongPressReaction' | 'reactionTypes'
 > & {
+  shareToStoryProbability?: number;
   enableSound?: boolean;
   useLongPressReaction?: boolean;
   reactionTypes?: BumperReactionType[];
@@ -35,133 +53,79 @@ export type BumperSettings = Omit<
 export const BumperTarget = z.object({
   id: GroupIdString,
   name: GroupNameString,
-  avatarUrl: z.string().nullable(),
-  folderId: z.string().nullable().default(null),
+  avatarUrl: StrNull,
+  folderId: StrNull.default(null),
   sortOrder: z.number().int().default(0),
-  totalBumpedCount: z.number().int().nonnegative(),
+  totalBumpedCount: NonNegInt,
   createdAt: z.number(),
   updatedAt: z.number(),
 });
 export type BumperTarget = z.infer<typeof BumperTarget>;
-
-export const MAX_LOCAL_AVATAR_BYTES = 131_072; // 128KB
-
-export function isCompleteNumericId(id: string | null | undefined): boolean {
-  return typeof id === 'string' && /^\d+$/.test(id.trim());
-}
-
+export const MAX_LOCAL_AVATAR_BYTES = AVATAR_URL_MAX_LENGTH; // 128KB
+export const isCompleteNumericId = (id: string | null | undefined): boolean =>
+  typeof id === 'string' && /^\d+$/.test(id.trim());
 export function isPlaceholderTargetName(
   name: string | null | undefined,
   id: string | null | undefined,
 ): boolean {
-  const trimmedName = typeof name === 'string' ? name.trim() : '';
-  const trimmedId = typeof id === 'string' ? id.trim() : '';
-  return (
-    !trimmedName ||
-    trimmedName === trimmedId ||
-    trimmedName === `Group ${trimmedId}` ||
-    trimmedName === `小组 ${trimmedId}`
-  );
+  const tn = typeof name === 'string' ? name.trim() : '',
+    ti = typeof id === 'string' ? id.trim() : '';
+  return !tn || tn === ti || tn === `Group ${ti}` || tn === `小组 ${ti}`;
 }
-
 export function isLocalAvatar(url: string | null | undefined): boolean {
   if (typeof url !== 'string') return false;
   const trimmed = url.trim();
-  if (trimmed.length === 0 || trimmed.length > MAX_LOCAL_AVATAR_BYTES) return false;
-  return /^data:image\/(?:webp|jpeg|png);base64,[A-Za-z0-9+/=]{32,}$/i.test(trimmed);
+  return (
+    trimmed.length > 0 &&
+    trimmed.length <= MAX_LOCAL_AVATAR_BYTES &&
+    /^data:image\/(?:webp|jpeg|png);base64,[A-Za-z0-9+/=]{32,}$/i.test(trimmed)
+  );
 }
-
-export function isTargetIncomplete(item: {
+export const isTargetIncomplete = (item: {
   id: string;
   name: string;
   avatarUrl?: string | null;
-}): boolean {
-  return (
-    !isCompleteNumericId(item.id) ||
-    isPlaceholderTargetName(item.name, item.id) ||
-    !isLocalAvatar(item.avatarUrl)
-  );
-}
-
+}): boolean =>
+  !isCompleteNumericId(item.id) ||
+  isPlaceholderTargetName(item.name, item.id) ||
+  !isLocalAvatar(item.avatarUrl);
 export interface BumperRefreshResult {
   updated: number;
   needsBrowser: number;
   failed: number;
   error?: string;
 }
-export const BumperTargetsInput = z
-  .object({
+const targetsInput = (extract: (raw: string) => string) =>
+  strictObj({
     items: z
       .array(
-        z
-          .object({
-            id: z.preprocess(
-              (v) =>
-                typeof v === 'string' ? extractFacebookGroupId(v) || extractFacebookPageId(v) : v,
-              GroupIdString,
-            ),
-            name: z.string().trim().max(200, '名字过长').optional().default(''),
-            folderId: z.string().nullable().optional(),
-          })
-          .strict(),
+        strictObj({
+          id: z.preprocess((v) => (typeof v === 'string' ? extract(v) : v), GroupIdString),
+          name: z.string().trim().max(200, '名字过长').optional().default(''),
+          folderId: StrNull.optional(),
+        }),
       )
       .min(1)
       .max(500),
-  })
-  .strict();
-export const BumperGroupTargetsInput = z
-  .object({
-    items: z
-      .array(
-        z
-          .object({
-            id: z.preprocess(
-              (v) => (typeof v === 'string' ? extractFacebookGroupId(v) : v),
-              GroupIdString,
-            ),
-            name: z.string().trim().max(200, '名字过长').optional().default(''),
-            folderId: z.string().nullable().optional(),
-          })
-          .strict(),
-      )
-      .min(1)
-      .max(500),
-  })
-  .strict();
-export const BumperPageTargetsInput = z
-  .object({
-    items: z
-      .array(
-        z
-          .object({
-            id: z.preprocess(
-              (v) => (typeof v === 'string' ? extractFacebookPageId(v) : v),
-              GroupIdString,
-            ),
-            name: z.string().trim().max(200, '名字过长').optional().default(''),
-            folderId: z.string().nullable().optional(),
-          })
-          .strict(),
-      )
-      .min(1)
-      .max(500),
-  })
-  .strict();
-export const BumperIdsInput = z.object({ ids: z.array(GroupIdString).min(1).max(500) }).strict();
+  });
+export const BumperTargetsInput = targetsInput(
+  (v) => extractFacebookGroupId(v) || extractFacebookPageId(v),
+);
+export const BumperGroupTargetsInput = targetsInput(extractFacebookGroupId);
+export const BumperPageTargetsInput = targetsInput(extractFacebookPageId);
+export const BumperIdsInput = strictObj({ ids: z.array(GroupIdString).min(1).max(500) });
 export const BumperScope = z.enum(['group', 'page']);
 export type BumperScope = z.infer<typeof BumperScope>;
-
-export const BumperCommentsInput = z
-  .object({
-    texts: z.array(z.string().trim().min(1).max(8000)).max(5000),
-    consumeCommentOnUse: z.boolean(),
-    scope: BumperScope.optional(),
-    baseComments: z
-      .array(z.object({ id: z.uuid(), text: z.string().trim().min(1).max(8000) }).strict())
-      .max(5000)
-      .optional(),
-  })
-  .strict();
+const commentStr = z.string().trim().min(1).max(8000);
+export const BumperCommentsInput = strictObj({
+  texts: z.array(commentStr).max(5000),
+  consumeCommentOnUse: optBool,
+  scope: BumperScope.optional(),
+  baseComments: z
+    .array(strictObj({ id: Id, text: commentStr }))
+    .max(5000)
+    .optional(),
+});
 export interface BumperComment {
   id: string;
   text: string;
@@ -169,7 +133,7 @@ export interface BumperComment {
   createdAt: number;
   scope?: BumperScope;
 }
-export interface BumperLog {
+interface BumperRecordBase {
   id: string;
   profileId: string;
   accountId: string;
@@ -178,59 +142,23 @@ export interface BumperLog {
   pageId: string;
   pageName: string;
   postId: string;
+}
+export interface BumperLog extends BumperRecordBase {
   postUrl: string;
   liked: boolean;
   commentText: string | null;
+  storyShared?: boolean;
   bumpedAt: number;
   sourceMode?: BumperScope;
 }
-export const StartBumper = z
-  .object({
-    profileIds: z.array(Id).min(1).max(500),
-    groupIds: z.array(GroupIdString).min(1).max(500),
-    pageIds: z.array(GroupIdString).min(1).max(500),
-  })
-  .strict();
-export const StartPageBumper = z
-  .object({
-    profileIds: z.array(Id).min(1).max(500),
-    pageIds: z.array(GroupIdString).min(1).max(500),
-  })
-  .strict();
-
-export const BumperTaskStatus = z.enum([
-  'scheduled',
-  'running',
-  'completed',
-  'failed',
-  'cancelled',
-]);
-export type BumperTaskStatus = z.infer<typeof BumperTaskStatus>;
-
-export const BumperScheduledTask = z.strictObject({
-  id: Id,
-  mode: z.enum(['group-bumper', 'page-bumper']),
-  profileIds: z.array(Id).min(1).max(500),
-  groupIds: z.array(GroupIdString).max(500),
-  pageIds: z.array(GroupIdString).min(1).max(500),
-  scheduledAt: z.number().int().positive(),
-  status: BumperTaskStatus,
-  statusReason: z.string().max(400).default(''),
-  runId: z.string().max(120).nullable().default(null),
-  createdAt: z.number().int().nonnegative(),
-  startedAt: z.number().int().nonnegative().nullable().default(null),
-  finishedAt: z.number().int().nonnegative().nullable().default(null),
+const profileList = z.array(Id).min(1).max(500),
+  targetList = z.array(GroupIdString).min(1).max(500);
+export const StartBumper = strictObj({
+  profileIds: profileList,
+  groupIds: targetList,
+  pageIds: targetList,
 });
-export type BumperScheduledTask = z.infer<typeof BumperScheduledTask>;
-
-export const CreateBumperTaskInput = z.strictObject({
-  mode: z.enum(['group-bumper', 'page-bumper']).default('group-bumper'),
-  profileIds: z.array(Id).min(1).max(500),
-  groupIds: z.array(GroupIdString).max(500).default([]),
-  pageIds: z.array(GroupIdString).min(1).max(500),
-  scheduledAt: z.number().int().positive(),
-});
-export type CreateBumperTaskInput = z.infer<typeof CreateBumperTaskInput>;
+export const StartPageBumper = strictObj({ profileIds: profileList, pageIds: targetList });
 export interface BumperProfileStat {
   today: number;
   session: number;
@@ -238,19 +166,11 @@ export interface BumperProfileStat {
   running: boolean;
 }
 export interface BumperDailyStat {
-  date: string; // yyyy-mm-dd（本地时区日期）
+  date: string;
   count: number;
 }
-export interface BumperPendingOperation {
-  id: string;
-  profileId: string;
-  accountId: string;
-  groupId: string;
-  groupName: string;
-  pageId: string;
-  pageName: string;
-  postId: string;
-  actionKind: 'like' | 'comment';
+export interface BumperPendingOperation extends BumperRecordBase {
+  actionKind: 'like' | 'comment' | 'story_share';
   reason: string;
   updatedAt: number;
 }
@@ -275,9 +195,5 @@ export interface BumperState {
   groupAvatarRefreshing?: boolean;
   pageAvatarRefreshing?: boolean;
   pendingReviewOperations?: BumperPendingOperation[];
-  scheduledTasks?: BumperScheduledTask[];
 }
-
-export function extractBumperPageId(raw: string): string {
-  return extractFacebookPageId(raw);
-}
+export const extractBumperPageId = (raw: string): string => extractFacebookPageId(raw);

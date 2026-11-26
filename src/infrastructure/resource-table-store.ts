@@ -15,11 +15,14 @@ import {
 } from '../domain/resource-table.js';
 import { ProductError } from '../domain/workspace.js';
 import { readSnapshot, transaction } from './sqlite-transaction.js';
-import { assertArchiveSourcesAvailable } from './material-archive-source-protection.js';
 import { ResourceMaterialPostIntent } from '../shared/material-index.js';
 import { AttemptVerdict } from '../shared/material-post.js';
-import { summarizeResourceUsage, type ResourceUsageFact } from '../domain/resource-usage.js';
-import { historicalArchiveTestEnabled } from './material-usage-store.js';
+import { ResourceMaterialOrigin } from '../shared/resource-materials.js';
+import {
+  summarizeResourceUsage,
+  type ResourceUsageFact,
+} from '../domain/resource-material-rules.js';
+import * as Q from './persistence/sqlite-query-helpers.js';
 
 export class SqliteResourceTableRepository implements ResourceTableRepository {
   private usageCache: {
@@ -29,14 +32,15 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
   } | null = null;
   constructor(private readonly db: DatabaseSync) {}
   private consumed(combinationId: string, row: ResourceRowValue) {
+    const key = 'resource:' + combinationId + ':' + JSON.stringify(row);
+    const s1 =
+      "SELECT 1 FROM material_publications p JOIN material_post_intents i USING(attempt_id) WHERE p.usage_source_key=? AND p.usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1) AND coalesce(json_extract(i.body,'$.allowRepeat'),0)=0 LIMIT 1";
+    const s2 =
+      'SELECT 1 FROM direct_material_publications WHERE usage_source_key=? AND usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1) AND allow_repeat=0 LIMIT 1';
     return Boolean(
-      this.db
-        .prepare(
-          `SELECT 1 FROM material_publications p JOIN material_post_intents i USING(attempt_id)
-      WHERE p.usage_source_key=? AND p.usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1)
-      AND coalesce(json_extract(i.body,'$.allowRepeat'),0)=0 LIMIT 1`,
-        )
-        .get('resource:' + combinationId + ':' + JSON.stringify(row)),
+      this.db.prepare(s1).get(key) ||
+      (Q.sqliteTableExists(this.db, 'direct_material_publications') &&
+        this.db.prepare(s2).get(key)),
     );
   }
   private append(
@@ -45,43 +49,42 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
     rows: ResourceRowValue[],
     now = Date.now(),
   ) {
-    this.db
-      .prepare('INSERT INTO resource_table_versions VALUES(?,?,?,?)')
-      .run(combinationId, revision, JSON.stringify(rows), now);
-    this.db
-      .prepare(
-        'INSERT INTO resource_table_heads VALUES(?,?) ON CONFLICT(combination_id) DO UPDATE SET revision=excluded.revision',
-      )
-      .run(combinationId, revision);
+    const hSql =
+      'INSERT INTO resource_table_heads VALUES(?,?) ON CONFLICT(combination_id) DO UPDATE SET revision=excluded.revision';
+    Q.run(
+      this.db,
+      'INSERT INTO resource_table_versions VALUES(?,?,?,?)',
+      combinationId,
+      revision,
+      JSON.stringify(rows),
+      now,
+    );
+    Q.run(this.db, hSql, combinationId, revision);
     this.usageCache = null;
   }
   removePublishedRow(combinationId: string, consumed: ResourceRowValue, now: number) {
-    const current = this.read(combinationId);
-    const rows = current.rows.filter(
-      (row) => row.id !== consumed.id && JSON.stringify(row) !== JSON.stringify(consumed),
-    );
-    if (rows.length !== current.rows.length)
-      this.append(combinationId, current.revision + 1, rows, now);
+    transaction(this.db, () => {
+      const cur = this.read(combinationId),
+        cJson = JSON.stringify(consumed),
+        rows = cur.rows.filter((r) => JSON.stringify(r) !== cJson);
+      if (rows.length !== cur.rows.length) this.append(combinationId, cur.revision + 1, rows, now);
+    });
   }
   pruneConsumedRows() {
-    if (historicalArchiveTestEnabled(this.db)) return;
     transaction(this.db, () => {
       for (const head of this.db.prepare('SELECT combination_id FROM resource_table_heads').all()) {
-        const current = this.read(String(head.combination_id));
-        const rows = current.rows.filter((row) => !this.consumed(current.combinationId, row));
-        if (rows.length !== current.rows.length)
-          this.append(current.combinationId, current.revision + 1, rows);
+        const cur = this.read(String(head.combination_id)),
+          rows = cur.rows.filter((r) => !this.consumed(cur.combinationId, r));
+        if (rows.length !== cur.rows.length) this.append(cur.combinationId, cur.revision + 1, rows);
       }
     });
   }
   readVersion(combinationId: string, revision: number) {
     z.uuid().parse(combinationId);
     z.number().int().positive().parse(revision);
-    const row = this.db
-      .prepare(
-        'SELECT body,updated_at FROM resource_table_versions WHERE combination_id=? AND revision=?',
-      )
-      .get(combinationId, revision);
+    const sql =
+      'SELECT body,updated_at FROM resource_table_versions WHERE combination_id=? AND revision=?';
+    const row = Q.getRow(this.db, sql, combinationId, revision);
     if (!row) throw new ProductError('RESOURCE_VERSION_NOT_FOUND', '任务固定的资源版本不存在', 404);
     return ResourceTable.parse({
       combinationId,
@@ -93,11 +96,9 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
   }
   revision(combinationId: string) {
     z.uuid().parse(combinationId);
-    const row = this.db
-      .prepare(
-        'SELECT c.id,h.revision FROM combinations c LEFT JOIN resource_table_heads h ON c.id=h.combination_id WHERE c.id=?',
-      )
-      .get(combinationId);
+    const sql =
+      'SELECT c.id,h.revision FROM combinations c LEFT JOIN resource_table_heads h ON c.id=h.combination_id WHERE c.id=?';
+    const row = Q.getRow(this.db, sql, combinationId);
     if (!row) throw new ProductError('COMBINATION_NOT_FOUND', '任务组合不存在', 404);
     return row.revision === null ? 0 : Number(row.revision);
   }
@@ -105,11 +106,9 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
     z.uuid().parse(combinationId);
     if (!this.db.prepare('SELECT id FROM combinations WHERE id=?').get(combinationId))
       throw new ProductError('COMBINATION_NOT_FOUND', '任务组合不存在', 404);
-    const row = this.db
-      .prepare(
-        'SELECT v.* FROM resource_table_versions v JOIN resource_table_heads h ON v.combination_id=h.combination_id AND v.revision=h.revision WHERE v.combination_id=?',
-      )
-      .get(combinationId);
+    const sql =
+      'SELECT v.* FROM resource_table_versions v JOIN resource_table_heads h ON v.combination_id=h.combination_id AND v.revision=h.revision WHERE v.combination_id=?';
+    const row = Q.getRow(this.db, sql, combinationId);
     return ResourceTable.parse({
       combinationId,
       revision: row ? Number(row.revision) : 0,
@@ -122,29 +121,21 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
     const value = SaveResourceTable.parse({ combinationId, expectedRevision, rows: input });
     let rows = validateResourceRows(value.rows);
     return transaction(this.db, () => {
-      const current = this.read(value.combinationId);
-      assertArchiveSourcesAvailable(
-        this.db,
-        rows.flatMap((row) => row.media.filter((m) => m.kind === 'local').map((m) => m.source)),
-      );
-      if (current.revision !== value.expectedRevision) {
+      const cur = this.read(value.combinationId);
+      if (cur.revision !== value.expectedRevision) {
         let merged = false;
-        if (
-          !historicalArchiveTestEnabled(this.db) &&
-          current.revision > value.expectedRevision &&
-          value.expectedRevision > 0
-        ) {
-          const base = this.readVersion(combinationId, value.expectedRevision);
-          const keys = new Set(current.rows.map((row) => JSON.stringify(row)));
-          const removed = base.rows.filter((row) => !keys.has(JSON.stringify(row)));
+        if (cur.revision > value.expectedRevision && value.expectedRevision > 0) {
+          const base = this.readVersion(combinationId, value.expectedRevision),
+            keys = new Set(cur.rows.map((r) => JSON.stringify(r))),
+            removed = base.rows.filter((r) => !keys.has(JSON.stringify(r)));
           if (
             removed.length > 0 &&
-            JSON.stringify(base.rows.filter((row) => keys.has(JSON.stringify(row)))) ===
-              JSON.stringify(current.rows) &&
-            removed.every((row) => this.consumed(combinationId, row))
+            JSON.stringify(base.rows.filter((r) => keys.has(JSON.stringify(r)))) ===
+              JSON.stringify(cur.rows) &&
+            removed.every((r) => this.consumed(combinationId, r))
           ) {
-            const ids = new Set(removed.map((row) => row.id));
-            rows = rows.filter((row) => !ids.has(row.id));
+            const ids = new Set(removed.map((r) => r.id));
+            rows = rows.filter((r) => !ids.has(r.id));
             merged = true;
           }
         }
@@ -155,87 +146,79 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
             409,
           );
       }
-      const revision = current.revision + 1;
-      this.db
-        .prepare('INSERT INTO resource_table_versions VALUES(?,?,?,?)')
-        .run(combinationId, revision, JSON.stringify(rows), Date.now());
-      this.db
-        .prepare(
-          'INSERT INTO resource_table_heads VALUES(?,?) ON CONFLICT(combination_id) DO UPDATE SET revision=excluded.revision',
-        )
-        .run(combinationId, revision);
+      this.append(combinationId, cur.revision + 1, rows);
       return this.read(combinationId);
     });
   }
-  summaries() {
-    return this.db
+  summaries = () =>
+    this.db
       .prepare('SELECT combination_id FROM resource_table_heads ORDER BY combination_id')
       .all()
       .map((row) => {
-        const table = this.read(String(row.combination_id));
+        const t = this.read(String(row.combination_id));
         return ResourceSummary.parse({
-          combinationId: table.combinationId,
-          revision: table.revision,
-          remaining: table.rows.filter(hasResource).length,
+          combinationId: t.combinationId,
+          revision: t.revision,
+          remaining: t.rows.filter(hasResource).length,
           verifiedReady: 0,
         });
       });
-  }
   usageSummaries() {
-    // One read transaction observes the head and the original settlement atomically, including
-    // writes from other handles. It acquires no write lock and creates no usage ledger.
     const read = () => {
-      const facts = new Map<string, ResourceUsageFact[]>();
-      const records = this.db
-        .prepare(
-          `SELECT i.body,r.state,b.combination_id,b.resource_revision,
-            p.account_id,p.fingerprint,p.post_id,v.body AS verdict,
-            EXISTS(SELECT 1 FROM material_post_operations m JOIN task_outbox o ON o.id=m.operation_id
-              WHERE m.attempt_id=i.attempt_id AND o.status='UNKNOWN') AS unresolved
-          FROM material_post_intents i JOIN material_reservations r USING(attempt_id)
-          JOIN task_resource_bindings b ON b.job_id=i.job_id
-          LEFT JOIN material_publications p USING(attempt_id)
-          LEFT JOIN material_attempt_verdicts v USING(attempt_id)
-          WHERE r.state IN ('RESERVED','REVIEW','PUBLISHED')
-            AND (r.state<>'PUBLISHED' OR p.usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1))
-            AND json_type(i.body,'$.resource') IS NOT NULL`,
-        )
-        .all();
-      for (const record of records) {
-        const intent = ResourceMaterialPostIntent.parse(JSON.parse(String(record.body)) as unknown);
+      const facts = new Map<string, ResourceUsageFact[]>(),
+        pushFact = (id: string, fact: ResourceUsageFact) => {
+          const list = facts.get(id) ?? [];
+          list.push(fact);
+          facts.set(id, list);
+        };
+      const sql = `SELECT i.body,r.state,b.combination_id,b.resource_revision,p.account_id,p.fingerprint,p.post_id,v.body AS verdict, EXISTS(SELECT 1 FROM material_post_operations m JOIN task_outbox o ON o.id=m.operation_id WHERE m.attempt_id=i.attempt_id AND o.status='UNKNOWN') AS unresolved FROM material_post_intents i JOIN material_reservations r USING(attempt_id) JOIN task_resource_bindings b ON b.job_id=i.job_id LEFT JOIN material_publications p USING(attempt_id) LEFT JOIN material_attempt_verdicts v USING(attempt_id) WHERE r.state IN ('RESERVED','REVIEW','PUBLISHED') AND (r.state<>'PUBLISHED' OR p.usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1)) AND json_type(i.body,'$.resource') IS NOT NULL`;
+      for (const rec of Q.allRows(this.db, sql)) {
+        const intent = ResourceMaterialPostIntent.parse(JSON.parse(String(rec.body)) as unknown);
         if (
-          intent.resource.combinationId !== record.combination_id ||
-          intent.resource.revision !== Number(record.resource_revision)
+          intent.resource.combinationId !== rec.combination_id ||
+          intent.resource.revision !== Number(rec.resource_revision)
         )
           throw Error('RESOURCE_USAGE_LEDGER_INVALID');
-        if (record.state === 'PUBLISHED') {
-          const verdict = AttemptVerdict.parse(JSON.parse(String(record.verdict)) as unknown);
+        if (rec.state === 'PUBLISHED') {
+          const verdict = AttemptVerdict.parse(JSON.parse(String(rec.verdict)) as unknown);
           if (
             verdict.basis !== 'SUBMIT_OPERATION' ||
             verdict.outcome !== 'PUBLISHED' ||
             verdict.attemptId !== intent.attemptId ||
             verdict.receipt.evidence.fingerprint !== intent.fingerprint ||
             verdict.receipt.evidence.observedAccountId !== intent.context.accountId ||
-            verdict.receipt.evidence.postId !== record.post_id ||
-            record.account_id !== intent.context.accountId ||
-            record.fingerprint !== intent.fingerprint
+            verdict.receipt.evidence.postId !== rec.post_id ||
+            rec.account_id !== intent.context.accountId ||
+            rec.fingerprint !== intent.fingerprint
           )
             throw Error('RESOURCE_USAGE_LEDGER_INVALID');
-        } else if (record.post_id !== null || record.verdict !== null)
+        } else if (rec.post_id !== null || rec.verdict !== null)
           throw Error('RESOURCE_USAGE_LEDGER_INVALID');
-        const combinationId = intent.resource.combinationId;
-        const list = facts.get(combinationId) ?? [];
-        list.push({
+        pushFact(intent.resource.combinationId, {
           attemptId: intent.attemptId,
           resource: intent.resource,
           state:
-            record.state === 'PUBLISHED'
+            rec.state === 'PUBLISHED'
               ? 'PUBLISHED'
-              : record.state === 'REVIEW' || record.unresolved === 1
+              : rec.state === 'REVIEW' || rec.unresolved === 1
                 ? 'REVIEW'
                 : 'RESERVED',
         });
-        facts.set(combinationId, list);
+      }
+      if (Q.sqliteTableExists(this.db, 'direct_material_publications')) {
+        const dSql =
+          'SELECT id, resource_origin FROM direct_material_publications WHERE usage_generation=(SELECT generation FROM material_usage_policy WHERE id=1) AND resource_origin IS NOT NULL';
+        for (const rec of Q.allRows(this.db, dSql)) {
+          const parsed = ResourceMaterialOrigin.safeParse(
+            JSON.parse(String(rec.resource_origin)) as unknown,
+          );
+          if (parsed.success)
+            pushFact(parsed.data.combinationId, {
+              attemptId: String(rec.id),
+              resource: parsed.data,
+              state: 'PUBLISHED',
+            });
+        }
       }
       return this.db
         .prepare('SELECT combination_id FROM resource_table_heads ORDER BY combination_id')
@@ -246,8 +229,6 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
         });
     };
     if (this.db.isTransaction) return readSnapshot(this.db, read);
-    // Five-second UI polling must not reparse an unchanged publication history. Both counters
-    // matter: data_version changes for other handles, total_changes for this connection.
     const dataVersion = Number(this.db.prepare('PRAGMA data_version').get()?.data_version),
       changes = Number(this.db.prepare('SELECT total_changes() AS n').get()?.n);
     if (this.usageCache?.dataVersion === dataVersion && this.usageCache.changes === changes)

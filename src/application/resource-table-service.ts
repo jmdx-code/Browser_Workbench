@@ -9,7 +9,10 @@ import {
 } from '../shared/resource-table.js';
 import type { ResourceTableRepository } from '../domain/resource-table.js';
 import { ProductError } from '../domain/workspace.js';
-import type { ResourceSourceReader } from '../domain/resource-source.js';
+import {
+  normalizeMaterialText,
+  type ResourceSourceReader,
+} from '../domain/resource-material-rules.js';
 import {
   CheckResourceSources,
   ResourceSourceReport,
@@ -17,18 +20,30 @@ import {
   type ResourceCheckProgressValue,
 } from '../shared/resource-source.js';
 import { BROWSER_TEXT_INPUT_LIMIT } from '../shared/browser-actions.js';
-import { normalizeMaterialText } from '../domain/materials.js';
 import type { ResourceDownloadService } from './resource-download-service.js';
 import type { ResourceDownloadProgressValue } from '../shared/resource-download.js';
+
 export class ResourceTableService {
   private checking = false;
   private previewing = false;
+
   constructor(
     private readonly repository: ResourceTableRepository,
     private readonly sourceReader?: ResourceSourceReader,
     private readonly now = Date.now,
     private readonly downloads?: ResourceDownloadService,
   ) {}
+
+  private async assertMatchingRevision(
+    combinationId: string,
+    expectedRevision: number,
+    message: string,
+  ): Promise<void> {
+    if ((await this.repository.revision(combinationId)) !== expectedRevision) {
+      throw new ProductError('RESOURCE_REVISION_CONFLICT', message, 409);
+    }
+  }
+
   downloadSources(
     input: unknown,
     assertConnected: () => Awaitable<void>,
@@ -42,6 +57,7 @@ export class ResourceTableService {
       );
     return this.downloads.download(input, assertConnected, onProgress);
   }
+
   async previewMedia(
     input: unknown,
     assertConnected: () => Awaitable<void> = () => {},
@@ -57,24 +73,29 @@ export class ResourceTableService {
     const current = async () => {
       await assertConnected();
       const now = this.now();
-      if (!Number.isFinite(now) || now < started || now - started > 30000)
+      if (!Number.isFinite(now) || now < started || now - started > 30000) {
         throw new ProductError('RESOURCE_PREVIEW_TIMEOUT', '媒体读取超时，请重试', 409);
-      if ((await this.repository.revision(request.combinationId)) !== request.expectedRevision)
-        throw new ProductError('RESOURCE_REVISION_CONFLICT', '资源表已修改，请重新打开预览', 409);
+      }
+      await this.assertMatchingRevision(
+        request.combinationId,
+        request.expectedRevision,
+        '资源表已修改，请重新打开预览',
+      );
     };
     await current();
     const row = (await this.repository.read(request.combinationId)).rows.find(
-      (row) => row.id === request.rowId,
+      (r) => r.id === request.rowId,
     );
     if (!row)
       throw new ProductError('RESOURCE_ROW_NOT_FOUND', '这行资源已删除，请重新打开资源表', 404);
     const media = row.media[request.fileIndex];
-    if (!media || media.kind !== 'local')
+    if (!media || media.kind !== 'local') {
       throw new ProductError(
         'RESOURCE_PREVIEW_LOCAL_MEDIA_REQUIRED',
         '网盘素材需先下载；当前不会为预览自动下载',
         409,
       );
+    }
     this.previewing = true;
     try {
       const result = await reader.previewMedia(row, request.fileIndex, current);
@@ -94,6 +115,7 @@ export class ResourceTableService {
       this.previewing = false;
     }
   }
+
   async checkSources(
     input: unknown,
     assertConnected: () => Awaitable<void> = () => {},
@@ -105,20 +127,22 @@ export class ResourceTableService {
     if (this.checking)
       throw new ProductError('RESOURCE_CHECK_BUSY', '正在检查其他资源，请稍后再试', 409);
     const table = await this.repository.read(request.combinationId);
-    if (table.revision !== request.expectedRevision)
+    if (table.revision !== request.expectedRevision) {
       throw new ProductError(
         'RESOURCE_REVISION_CONFLICT',
         '资源表已修改，请重新打开后检查；当前编辑保留',
         409,
       );
+    }
     const selected = request.rowIds ? new Set(request.rowIds) : null;
     const selectedRows = selected ? table.rows.filter((row) => selected.has(row.id)) : table.rows;
-    if (selected && selectedRows.length !== selected.size)
+    if (selected && selectedRows.length !== selected.size) {
       throw new ProductError(
         'RESOURCE_ROW_NOT_FOUND',
         '选中的资源行不在当前版本中，请重新打开后检查',
         404,
       );
+    }
     let lastProgressAt = this.now();
     let readBytes = 0;
     const current = async (bytesRead = 0) => {
@@ -129,12 +153,13 @@ export class ResourceTableService {
         !Number.isFinite(lastProgressAt) ||
         now < lastProgressAt ||
         now - lastProgressAt > 30_000
-      )
+      ) {
         throw new ProductError(
           'RESOURCE_CHECK_TIMEOUT',
           '来源读取长时间没有进展，请检查文件后重试',
           409,
         );
+      }
       if (bytesRead > 0) lastProgressAt = now;
       readBytes += bytesRead;
       if (
@@ -142,17 +167,16 @@ export class ResourceTableService {
         bytesRead < 0 ||
         !Number.isSafeInteger(readBytes) ||
         readBytes > 10 * 1024 ** 3
-      )
+      ) {
         throw new ProductError('RESOURCE_CHECK_BUDGET', '本次检查超过10GiB，请分批整理资源', 409);
+      }
     };
-    const assertRevision = async () => {
-      if ((await this.repository.revision(request.combinationId)) !== request.expectedRevision)
-        throw new ProductError(
-          'RESOURCE_REVISION_CONFLICT',
-          '资源表已修改，请重新打开后检查；当前编辑保留',
-          409,
-        );
-    };
+    const assertRevision = () =>
+      this.assertMatchingRevision(
+        request.combinationId,
+        request.expectedRevision,
+        '资源表已修改，请重新打开后检查；当前编辑保留',
+      );
     await current();
     this.checking = true;
     try {
@@ -166,24 +190,25 @@ export class ResourceTableService {
         await assertRevision();
         await current();
         const fingerprint = source.verified ? source.fingerprint : null;
-        const result = ResourceSourceRow.parse({
-          rowId: row.id,
-          sourceVerified: source.verified,
-          issue: source.verified ? null : source.issue,
-          fingerprint,
-          files: source.verified ? source.files : [],
-          duplicateOf: fingerprint ? (first.get(fingerprint) ?? null) : null,
-          blockers: [
-            ...(normalizeMaterialText(row.text).length > BROWSER_TEXT_INPUT_LIMIT
-              ? ['TEXT_INPUT_LIMIT']
-              : []),
-            ...(!row.media.length && row.text.trim() && row.background === 'color'
-              ? ['BACKGROUND_UNVERIFIED']
-              : []),
-          ],
-        });
+        rows.push(
+          ResourceSourceRow.parse({
+            rowId: row.id,
+            sourceVerified: source.verified,
+            issue: source.verified ? null : source.issue,
+            fingerprint,
+            files: source.verified ? source.files : [],
+            duplicateOf: fingerprint ? (first.get(fingerprint) ?? null) : null,
+            blockers: [
+              ...(normalizeMaterialText(row.text).length > BROWSER_TEXT_INPUT_LIMIT
+                ? ['TEXT_INPUT_LIMIT']
+                : []),
+              ...(!row.media.length && row.text.trim() && row.background === 'color'
+                ? ['BACKGROUND_UNVERIFIED']
+                : []),
+            ],
+          }),
+        );
         if (fingerprint && !first.has(fingerprint)) first.set(fingerprint, row.id);
-        rows.push(result);
         lastProgressAt = this.now();
         await onProgress?.({ completed: rows.length, total: selectedRows.length });
         await current();
@@ -210,6 +235,7 @@ export class ResourceTableService {
       this.checking = false;
     }
   }
+
   async read(input: unknown) {
     return ResourceTable.parse(
       await this.repository.read(GetResourceTable.parse(input).combinationId),

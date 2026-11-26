@@ -265,7 +265,7 @@ test('BrowserLifecycleManager enforces registered-only guard, launches/closes/re
   }
 });
 
-test('GroupBumperService scheduled tasks persist, recover stale running on startup, and auto-launch offline browsers when due', async () => {
+test('GroupBumperService executes page-bumper via runScheduledProfileStep with synthetic group id', async () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'wb-bumper-sched-'));
   try {
     const workspaceStore = await WorkspaceStore.open(join(tempRoot, 'workspace.sqlite'));
@@ -277,33 +277,9 @@ test('GroupBumperService scheduled tasks persist, recover stale running on start
       items: [{ id: '987654321098', name: '测试专页' }],
     });
 
-    // Seed a stale running task and reopen store to verify startup recovery
-    const staleTask = workspaceStore.groupBumper.createScheduledTask({
-      mode: 'group-bumper',
-      profileIds: [profileId],
-      groupIds: ['123456789012'],
-      pageIds: ['987654321098'],
-      scheduledAt: Date.now() + 60_000,
-    });
-    workspaceStore.groupBumper.updateScheduledTask(staleTask.id, {
-      status: 'running',
-      statusReason: '执行中',
-      runId: 'stale-run',
-      startedAt: Date.now() - 10_000,
-    });
-    workspaceStore.close();
-
-    const reopened = await WorkspaceStore.open(join(tempRoot, 'workspace.sqlite'));
-    const recovered = reopened.groupBumper.scheduledTasks().find((t) => t.id === staleTask.id);
-    assert.equal(recovered?.status, 'failed');
-    assert.equal(recovered?.statusReason, '软件重启中断');
-
-    let browserOnline = false;
-    const autoLaunchedIds: string[] = [];
     const executedRuns: Array<{ profileId: string; groupsFirstId: string }> = [];
-
     const mockRunner: BumperRunner = {
-      ready: () => browserOnline,
+      ready: () => true,
       busy: async () => false,
       run: async (id, groups, _pages, _settings, callbacks) => {
         executedRuns.push({ profileId: id, groupsFirstId: groups[0]?.id ?? '' });
@@ -312,86 +288,24 @@ test('GroupBumperService scheduled tasks persist, recover stale running on start
       stop: async () => {},
     };
 
-    const service = new GroupBumperService(reopened.groupBumper, mockRunner, async () => ({
+    const service = new GroupBumperService(workspaceStore.groupBumper, mockRunner, async () => ({
       comments: [],
       total: 0,
     }));
-    service.setProfileLifecycle({
-      isLaunching: () => false,
-      getStatus: async () => [],
-      launchProfile: async (id) => ({
-        profileId: id,
-        browserName: '用户8',
-        action: 'open',
-        ok: true,
-        online: true,
-        phase: 'PAUSED',
-        synced: true,
-        launchable: true,
-        elapsedMs: 10,
-      }),
-      closeProfile: async (id) => ({
-        profileId: id,
-        browserName: '用户8',
-        action: 'close',
-        ok: true,
-        online: false,
-        phase: 'OFFLINE',
-        synced: false,
-        launchable: true,
-        elapsedMs: 10,
-      }),
-      restartProfile: async (id) => ({
-        profileId: id,
-        browserName: '用户8',
-        action: 'restart',
-        ok: true,
-        online: true,
-        phase: 'PAUSED',
-        synced: true,
-        launchable: true,
-        elapsedMs: 10,
-      }),
-      ensureProfilesOnline: async (ids) => {
-        autoLaunchedIds.push(...ids);
-        browserOnline = true;
-        return {
-          requestedIds: [...ids],
-          readyIds: [...ids],
-          launchedIds: [...ids],
-          failed: [],
-          items: [],
-        };
-      },
-    });
-
-    // Create a due page-bumper scheduled task (scheduled ~2.3s in the future)
-    const afterCreate = await service.manage('tasks/create', {
+    const result = await service.runScheduledProfileStep({
+      profileId,
       mode: 'page-bumper',
-      profileIds: [profileId],
       groupIds: [],
       pageIds: ['987654321098'],
-      scheduledAt: Date.now() + 2300,
+      minConcurrency: 1,
+      onProgress: () => {},
     });
-    const createdTask = afterCreate.scheduledTasks?.find((t) => t.mode === 'page-bumper');
-    assert.ok(createdTask);
-    assert.equal(createdTask.status, 'scheduled');
-
-    await new Promise((r) => setTimeout(r, 2450));
-    await service.tickScheduledTasks();
-    await new Promise((r) => setTimeout(r, 80));
-
-    assert.deepEqual(autoLaunchedIds, [profileId]);
+    assert.equal(result.hardBlocked, false);
     assert.equal(executedRuns.length, 1);
-    // Page bumper uses synthetic group id '-'
     assert.equal(executedRuns[0]?.groupsFirstId, '-');
 
-    const finalState = await service.state();
-    const completedTask = finalState.scheduledTasks?.find((t) => t.id === createdTask.id);
-    assert.equal(completedTask?.status, 'completed');
-
     service.shutdown();
-    reopened.close();
+    workspaceStore.close();
   } finally {
     safeCleanupDir(tempRoot);
   }
@@ -581,10 +495,9 @@ test('persistenceRoutes allowlists all browser lifecycle binding and bumper sche
       const requiredRoutes = [
         'workspace.profileLaunchBindings',
         'workspace.upsertProfileLaunchBindings',
-        'workspace.groupBumper.scheduledTasks',
-        'workspace.groupBumper.createScheduledTask',
-        'workspace.groupBumper.updateScheduledTask',
-        'workspace.groupBumper.deleteScheduledTask',
+        'workspace.autoScheduler.listSchedules',
+        'workspace.autoScheduler.saveSchedule',
+        'workspace.postBumpRecords.list',
       ];
       for (const route of requiredRoutes) {
         assert.equal(persistenceRoutes.has(route), true, `Missing persistence route: ${route}`);

@@ -9,7 +9,7 @@ export interface FinderItem {
 }
 export function orderedFinderItems<T extends { folderId?: string | null; sortOrder?: number }>(
   items: T[],
-  folders: TargetFolder[],
+  folders: readonly TargetFolder[],
 ): T[] {
   const rank = new Map(folders.map((f, i) => [f.id, i]));
   return [...items].sort(

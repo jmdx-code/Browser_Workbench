@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { SessionCloser } from '../src/application/session-closer.js';
-import type { SessionClosePort } from '../src/domain/session-close.js';
+import type { SessionClosePort } from '../src/domain/system-ports.js';
 
 function fixture() {
   const state = { local: 0, remote: [] as string[], released: 0, transport: true };

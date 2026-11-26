@@ -1,6 +1,6 @@
 import type { Awaitable } from '../domain/persistence.js';
 import type { ResourceTableRepository } from '../domain/resource-table.js';
-import type { ResourceDriveDownloader } from '../domain/resource-download.js';
+import type { ResourceDriveDownloader } from '../domain/resource-material-rules.js';
 import { ProductError } from '../domain/workspace.js';
 import {
   DownloadResourceSources,
@@ -9,24 +9,30 @@ import {
 } from '../shared/resource-download.js';
 import { ResourceMedia, type ResourceMediaValue } from '../shared/resource-table.js';
 
-const issueText = (failure: unknown) => {
-  const code = failure instanceof Error ? failure.message : '';
-  if (/PERMISSION|CONFIRMATION|PUBLIC_DOWNLOAD_UNAVAILABLE/.test(code))
-    return '链接不公开、需要登录或暂时无法下载，请检查共享权限';
-  if (/TIMEOUT/.test(code)) return '下载超时，可单独重试此行';
-  if (/NO_SPACE/.test(code)) return '本机可用空间不足';
-  if (/SIZE_LIMIT/.test(code)) return '文件超过下载容量';
-  if (/MEDIA_TYPE|ENCODING/.test(code)) return '不支持的媒体格式或传输编码';
-  return '下载未完成，请检查链接后重试此行';
-};
+const ISSUE_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [
+    /PERMISSION|CONFIRMATION|PUBLIC_DOWNLOAD_UNAVAILABLE/,
+    '链接不公开、需要登录或暂时无法下载，请检查共享权限',
+  ],
+  [/TIMEOUT/, '下载超时，可单独重试此行'],
+  [/NO_SPACE/, '本机可用空间不足'],
+  [/SIZE_LIMIT/, '文件超过下载容量'],
+  [/MEDIA_TYPE|ENCODING/, '不支持的媒体格式或传输编码'],
+];
+
+const issueText = (failure: unknown) =>
+  ISSUE_RULES.find(([re]) => re.test(failure instanceof Error ? failure.message : ''))?.[1] ??
+  '下载未完成，请检查链接后重试此行';
 
 export class ResourceDownloadService {
   private downloading = false;
+
   constructor(
     private readonly repository: ResourceTableRepository,
     private readonly downloader: ResourceDriveDownloader,
     private readonly now = Date.now,
   ) {}
+
   async download(
     input: unknown,
     assertConnected: () => Awaitable<void>,
@@ -39,8 +45,9 @@ export class ResourceDownloadService {
     if (table.revision !== request.expectedRevision)
       throw new ProductError('RESOURCE_REVISION_CONFLICT', '资源表已修改，请重新读取后下载', 409);
     const selected = request.rowIds ? new Set(request.rowIds) : null;
-    if (selected && table.rows.filter((row) => selected.has(row.id)).length !== selected.size)
+    if (selected && table.rows.filter((row) => selected.has(row.id)).length !== selected.size) {
       throw new ProductError('RESOURCE_ROW_NOT_FOUND', '选中的资源行已变化', 404);
+    }
     const members = table.rows.flatMap((row) =>
       selected && !selected.has(row.id)
         ? []
@@ -59,24 +66,29 @@ export class ResourceDownloadService {
     };
     const issues: { rowId: string; fileIndex: number; error: string }[] = [];
     let failure: unknown;
+    let delivery = Promise.resolve();
+
     const current = async (bytes = 0) => {
       if (failure) throw failure;
       await assertConnected();
       const now = this.now();
-      if (!Number.isFinite(now) || now < started || now - started > 30 * 60_000)
+      if (!Number.isFinite(now) || now < started || now - started > 30 * 60_000) {
         throw new ProductError(
           'RESOURCE_DOWNLOAD_TIMEOUT',
           '本批下载达到30分钟，请继续下载剩余行',
           409,
         );
-      if ((await this.repository.revision(request.combinationId)) !== table.revision)
+      }
+      if ((await this.repository.revision(request.combinationId)) !== table.revision) {
         throw new ProductError(
           'RESOURCE_REVISION_CONFLICT',
           '资源表已被其他窗口修改，下载已停止；此前下载保持',
           409,
         );
-      if (!Number.isSafeInteger(bytes) || bytes < 0 || progress.bytes + bytes > 64 * 1024 ** 3)
+      }
+      if (!Number.isSafeInteger(bytes) || bytes < 0 || progress.bytes + bytes > 64 * 1024 ** 3) {
         throw new ProductError('RESOURCE_DOWNLOAD_BUDGET', '本批下载达到64GiB，请分批继续', 409);
+      }
       progress.bytes += bytes;
       if (bytes > 0 && now - lastProgressAt >= 500) {
         lastProgressAt = now;
@@ -85,7 +97,7 @@ export class ResourceDownloadService {
         });
       }
     };
-    let delivery = Promise.resolve();
+
     const emit = () => {
       const snapshot = { ...progress };
       delivery = delivery
@@ -96,8 +108,9 @@ export class ResourceDownloadService {
         .catch((error: unknown) => {
           failure = error;
         });
-      return delivery.then(async () => await current());
+      return delivery.then(() => current());
     };
+
     await current();
     this.downloading = true;
     let next = 0;
@@ -120,7 +133,7 @@ export class ResourceDownloadService {
                 throw Error('DRIVE_MEDIA_TYPE_UNSUPPORTED');
               media = downloaded;
             } catch (error) {
-              await current(); // Cancellation/version revocation is never disguised as a bad link.
+              await current();
               issues.push({
                 rowId: member.rowId,
                 fileIndex: member.index,
@@ -129,13 +142,12 @@ export class ResourceDownloadService {
               progress.failed++;
             }
             if (media) {
-              const downloadedMedia = media;
+              const local = media;
               commits = commits.then(async () => {
                 await current();
                 const row = table.rows.find((value) => value.id === member.rowId);
                 if (row?.media[member.index]?.source !== member.source)
                   throw Error('RESOURCE_DOWNLOAD_MEMBER_CHANGED');
-                const local = downloadedMedia;
                 const rows = table.rows.map((value) =>
                   value.id === member.rowId
                     ? {
@@ -147,8 +159,6 @@ export class ResourceDownloadService {
                       }
                     : value,
                 );
-                // Per-member CAS uses original immutable resource revisions, not a download ledger.
-                // Completed downloads survive cancel/disconnect. In-flight plans retain old revisions.
                 table = await this.repository.save(request.combinationId, table.revision, rows);
                 progress.downloaded++;
               });

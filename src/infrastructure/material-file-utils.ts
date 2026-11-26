@@ -1,15 +1,7 @@
 import path from 'node:path';
 import type { BigIntStats } from 'node:fs';
-import type { PostIntent } from '../shared/material-index.js';
-export const stagedMaterialName = (file: PostIntent['snapshot']['files'][number], index: number) =>
-  String(index).padStart(2, '0') +
-  '-' +
-  file.digest +
-  path.extname(file.relativePath).toLowerCase();
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const videoExtensions = new Set(['.mp4', '.mov']);
-export const temporaryMaterialFile = (name: string) =>
-  name.startsWith('.') || name.startsWith('~') || /\.(?:tmp|part|crdownload)$/i.test(name);
 export const proofOf = (stat: BigIntStats) => ({
   dev: String(stat.dev),
   ino: String(stat.ino),

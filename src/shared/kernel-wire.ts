@@ -1,160 +1,75 @@
 import { z } from 'zod';
-import { KernelJsonObject, KernelStamp, KernelTarget } from './kernel-protocol.js';
-import { DispatchBinding } from './task-execution.js';
-import { OwnedTabProof, OwnedTabRecord, KernelOperationRecord } from './kernel-state.js';
-import { PageReadRequest } from './page-read.js';
+import { Id, PosInt, optBool, sMax, sReq, strictObj } from './contracts.js';
 import { KernelOperationFileGrant } from './kernel-file-grant.js';
-import { OperationDisposition } from './task-ending.js';
-import { ExecutionContext } from './task-execution.js';
-import { TaskWindowSnapshot, WindowRect } from './window-layout.js';
-
+import { KernelJsonObject, KernelStamp, KernelTarget } from './kernel-protocol.js';
+import { KernelOperationRecord, OwnedTabProof, OwnedTabRecord } from './kernel-state.js';
+import { PageReadRequest } from './page-read.js';
+import { DispatchBinding, ExecutionContext } from './task-execution.js';
+import { OperationDisposition } from './task-policies.js';
 const header = {
   type: z.literal('KERNEL_REQUEST'),
-  requestId: z.string().uuid(),
-  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  connectionEpoch: z.string().uuid(),
-  leaseId: z.string().uuid(),
+  requestId: Id,
+  sequence: PosInt.max(Number.MAX_SAFE_INTEGER),
+  connectionEpoch: Id,
+  leaseId: Id,
 };
+const req = <K extends string, T extends z.ZodRawShape>(kind: K, shape: T) =>
+  strictObj({ ...header, kind: z.literal(kind), ...shape });
+const tabReq = <K extends string>(kind: K) => req(kind, { tabId: PosInt });
+const proofReq = <K extends string>(kind: K) => req(kind, { proof: OwnedTabProof });
 export const KernelRequest = z.discriminatedUnion('kind', [
-  z
-    .object({
-      ...header,
-      kind: z.literal('open'),
-      stamp: KernelStamp,
-      files: z.array(z.string().min(1).max(4096)).max(20),
-      access: z.enum(['fixture', 'facebook-readonly', 'facebook-task', 'agent-browser']).optional(),
-      summaryOnly: z.boolean().optional(),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('renew'), stamp: KernelStamp }).strict(),
-  z.object({ ...header, kind: z.literal('stop') }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('quiesce'),
-      context: ExecutionContext,
-      proof: OwnedTabProof,
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('scope'), tabId: z.number().int().positive() }).strict(),
-  z.object({ ...header, kind: z.literal('attach'), tabId: z.number().int().positive() }).strict(),
-  z.object({ ...header, kind: z.literal('detach'), tabId: z.number().int().positive() }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('create'),
-      url: z.string().max(4096),
-      ownershipId: z.uuid().optional(),
-      foreground: z.boolean().optional(),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('inventory') }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('observeFacebookIdentity'),
-      tabId: z.number().int().positive(),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('adopt'), proof: OwnedTabProof }).strict(),
-  z.object({ ...header, kind: z.literal('armTaskPresentation'), proof: OwnedTabProof }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('revealOwnedPage'),
-      proof: OwnedTabProof,
-      focus: z.boolean().optional(),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('inspectTaskWindow'), proof: OwnedTabProof }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('positionTaskWindow'),
-      expected: TaskWindowSnapshot,
-      rect: WindowRect,
-      exposed: z.boolean(),
-      focus: z.boolean().optional(),
-      deadline: z.number().finite().positive().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('consolidateWorkspace'),
-      preferActiveTab: z.boolean().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('beginOperation'),
-      binding: DispatchBinding,
-      operationSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
-    })
-    .strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('collectOperations'),
-      records: z.array(KernelOperationRecord).max(200),
-      browserSessionEpoch: z.uuid(),
-    })
-    .strict(),
-  z
-    .object({ ...header, kind: z.literal('acknowledgeSessionEnd'), browserSessionEpoch: z.uuid() })
-    .strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('retireOperation'),
-      binding: DispatchBinding,
-      resolution: z.union([KernelOperationRecord.shape.resolution.unwrap(), OperationDisposition]),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('withdrawTaskTab'), proof: OwnedTabProof }).strict(),
-  z.object({ ...header, kind: z.literal('withdrawIdleTaskTab'), record: OwnedTabRecord }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('endUnknownOperation'),
-      binding: DispatchBinding,
-      disposition: OperationDisposition,
-    })
-    .strict(),
-  z
-    .object({ ...header, kind: z.literal('grantOperationFiles'), grant: KernelOperationFileGrant })
-    .strict(),
-  z.object({ ...header, kind: z.literal('finishOperation'), binding: DispatchBinding }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('reconcileOperation'),
-      binding: DispatchBinding,
-      resolution: KernelOperationRecord.shape.resolution.unwrap(),
-    })
-    .strict(),
-  z.object({ ...header, kind: z.literal('remove'), tabId: z.number().int().positive() }).strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('project'),
-      tabId: z.number().int().positive(),
-      projection: PageReadRequest,
-    })
-    .strict(),
-  z
-    .object({
-      ...header,
-      kind: z.literal('send'),
-      target: KernelTarget,
-      method: z
-        .string()
-        .regex(/^[A-Za-z]+\.[A-Za-z]+$/)
-        .max(160),
-      params: KernelJsonObject,
-    })
-    .strict(),
+  req('open', {
+    stamp: KernelStamp,
+    files: z.array(sReq(4096)).max(20),
+    access: z.enum(['fixture', 'facebook-readonly', 'facebook-task', 'agent-browser']).optional(),
+    summaryOnly: optBool,
+  }),
+  req('renew', { stamp: KernelStamp }),
+  req('stop', {}),
+  req('quiesce', { context: ExecutionContext, proof: OwnedTabProof }),
+  tabReq('scope'),
+  tabReq('attach'),
+  tabReq('detach'),
+  tabReq('remove'),
+  tabReq('observeFacebookIdentity'),
+  req('create', { url: sMax(4096), ownershipId: Id.optional(), foreground: optBool }),
+  req('inventory', {}),
+  proofReq('adopt'),
+  proofReq('armTaskPresentation'),
+  req('revealOwnedPage', { proof: OwnedTabProof, focus: optBool }),
+  req('consolidateWorkspace', { preferActiveTab: optBool }),
+  proofReq('recoverTabToHome'),
+  req('beginOperation', {
+    binding: DispatchBinding,
+    operationSequence: PosInt.max(Number.MAX_SAFE_INTEGER).optional(),
+  }),
+  req('collectOperations', {
+    records: z.array(KernelOperationRecord).max(200),
+    browserSessionEpoch: Id,
+  }),
+  req('acknowledgeSessionEnd', { browserSessionEpoch: Id }),
+  req('retireOperation', {
+    binding: DispatchBinding,
+    resolution: z.union([KernelOperationRecord.shape.resolution.unwrap(), OperationDisposition]),
+  }),
+  proofReq('withdrawTaskTab'),
+  req('withdrawIdleTaskTab', { record: OwnedTabRecord }),
+  req('endUnknownOperation', { binding: DispatchBinding, disposition: OperationDisposition }),
+  req('grantOperationFiles', { grant: KernelOperationFileGrant }),
+  req('finishOperation', { binding: DispatchBinding }),
+  req('reconcileOperation', {
+    binding: DispatchBinding,
+    resolution: KernelOperationRecord.shape.resolution.unwrap(),
+  }),
+  req('project', { tabId: PosInt, projection: PageReadRequest }),
+  req('send', {
+    target: KernelTarget,
+    method: z
+      .string()
+      .regex(/^[A-Za-z]+\.[A-Za-z]+$/)
+      .max(160),
+    params: KernelJsonObject,
+  }),
 ]);
 export type KernelRequest = z.infer<typeof KernelRequest>;
 export type KernelRequestBody = KernelRequest extends infer R
@@ -162,23 +77,19 @@ export type KernelRequestBody = KernelRequest extends infer R
     ? Omit<R, keyof typeof header>
     : never
   : never;
-export const KernelReply = z
-  .object({
-    type: z.literal('KERNEL_REPLY'),
-    requestId: z.string().uuid(),
-    connectionEpoch: z.string().uuid(),
-    leaseId: z.string().uuid(),
-    result: KernelJsonObject.optional(),
-    error: z.string().max(300).optional(),
-  })
-  .strict();
-export const KernelEvent = z
-  .object({
-    type: z.literal('KERNEL_EVENT'),
-    connectionEpoch: z.string().uuid(),
-    leaseId: z.string().uuid(),
-    source: KernelTarget,
-    method: z.string().max(160),
-    params: KernelJsonObject,
-  })
-  .strict();
+export const KernelReply = strictObj({
+  type: z.literal('KERNEL_REPLY'),
+  requestId: Id,
+  connectionEpoch: Id,
+  leaseId: Id,
+  result: KernelJsonObject.optional(),
+  error: sMax(300).optional(),
+});
+export const KernelEvent = strictObj({
+  type: z.literal('KERNEL_EVENT'),
+  connectionEpoch: Id,
+  leaseId: Id,
+  source: KernelTarget,
+  method: sMax(160),
+  params: KernelJsonObject,
+});

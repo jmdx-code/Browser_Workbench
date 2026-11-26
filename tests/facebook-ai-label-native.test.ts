@@ -6,8 +6,8 @@ import {
   facebookAILabelReading,
   facebookAILabelScope,
   facebookAILabelSwitch,
-} from '../src/shared/facebook-ai-label.js';
-import { decidePostAILabel } from '../src/domain/facebook-ai-label.js';
+} from '../src/shared/facebook-post-options.js';
+import { decidePostAILabel } from '../src/domain/facebook-content-rules.js';
 
 function dom(html: string, run: () => void, route = '/') {
   const win = new Window({ url: 'https://www.facebook.com' + route, width: 1280, height: 900 });

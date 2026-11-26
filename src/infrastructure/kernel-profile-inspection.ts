@@ -1,28 +1,22 @@
 import { prepareFacebookWorkspace } from './facebook-workspace-preparation.js';
 import type { Awaitable } from '../domain/persistence.js';
 import type { Core, Peer } from '../bridge/core.js';
-import type { ProfileInspectionPort, InspectionConnection } from '../domain/profile-inspection.js';
+import type { ProfileInspectionPort, InspectionConnection } from '../domain/system-ports.js';
 import type { TaskRepository } from '../domain/tasks.js';
-import type { SettlementRepository } from '../domain/settlement.js';
 import type { KernelBridge } from './kernel-bridge.js';
-import { SettlementNotifier } from '../application/settlement-notifier.js';
-import { isInertSettledBrowseOperation } from '../domain/kernel-readiness.js';
 import { facebookDisplayInspectionProjection } from './facebook-read-adapter.js';
 import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
 import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
-import { marketplaceBridgeSupported } from '../shared/task-features.js';
+import { marketplaceBridgeSupported } from '../shared/task-policies.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { validateProjection } from '../shared/page-read.js';
-import { sameTabProof } from '../domain/task-tabs.js';
-
 export class KernelProfileInspection implements ProfileInspectionPort {
   constructor(
     private readonly kernel: KernelBridge,
     private readonly core: Core,
     private readonly tasks: TaskRepository,
-    private readonly settlements: SettlementRepository | undefined = tasks.settlements,
   ) {}
   connection(profileId: string) {
     const peer = this.core.peers.get(profileId);
@@ -39,23 +33,12 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       throw Error('INSPECTION_PROFILE_NOT_IDLE');
     if (!peer.capabilities?.includes('facebook-readonly-v2'))
       throw Error('INSPECTION_EXTENSION_UPDATE_REQUIRED');
-    const pending = await this.tasks.plansForProfile(peer.profileId, [
-      'QUEUED',
-      'RUNNING',
-      'PAUSING',
-      'PAUSED',
-      'STOPPING',
-      'REVIEW',
-    ]);
+    const pending = await this.tasks.plansForProfile(peer.profileId, ['QUEUED', 'RUNNING']);
     if (
       queuedPlanId &&
       (pending.length !== 1 ||
         pending[0]?.id !== queuedPlanId ||
-        !['QUEUED', 'RUNNING'].includes(pending[0]?.state ?? '') ||
-        (
-          (await this.tasks.blockingOperations?.(queuedPlanId)) ??
-          (await this.tasks.operations(queuedPlanId))
-        ).some((op) => ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status)))
+        !['QUEUED', 'RUNNING'].includes(pending[0]?.state ?? ''))
     )
       throw Error('INSPECTION_QUEUED_BOOTSTRAP_REVOKED');
     if (!queuedPlanId && pending.length) throw Error('INSPECTION_PLAN_PENDING');
@@ -63,41 +46,11 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       throw Error('INSPECTION_OPERATION_PENDING');
     return peer;
   }
-  private async settledBrowseOperationIds(
-    planId?: string,
-  ): Promise<ReadonlySet<string> | undefined> {
-    if (!planId) return undefined;
-    const ops = await this.tasks.operations(planId);
-    const ids = ops.filter(isInertSettledBrowseOperation).map((op) => op.id);
-    return ids.length > 0 ? new Set(ids) : undefined;
-  }
-  private async flushIdleSettlements(peer: Peer, guard: () => Awaitable<void>): Promise<void> {
-    if (!this.settlements || !peer.capabilities?.includes('kernel-journal-v1')) return;
-    if (
-      this.settlements.hasUndelivered &&
-      !(await this.settlements.hasUndelivered(peer.profileId))
-    ) {
-      return;
-    }
-    const notifier = new SettlementNotifier(this.settlements);
-    const pendingCount = (await this.settlements.list(peer.profileId)).filter(
-      (notice) => notice.state !== 'DELIVERED',
-    ).length;
-    for (let index = 0; index < pendingCount; index++) {
-      await guard();
-      const sent = await this.kernel.withSummary(peer, (port) => notifier.flushOne(port));
-      if (!sent) break;
-    }
-  }
   async assertIdle(connection: InspectionConnection) {
     await this.assertNativeIdle(connection);
   }
   private async assertNativeIdle(connection: InspectionConnection, queuedPlanId?: string) {
     const peer = await this.peer(connection, queuedPlanId);
-    await this.flushIdleSettlements(peer, async () => {
-      await this.peer(connection, queuedPlanId);
-    });
-    const settledIds = await this.settledBrowseOperationIds(queuedPlanId);
     const { inventory } = await prepareFacebookWorkspace(
       this.kernel,
       peer,
@@ -105,35 +58,27 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       async () => {
         await this.peer(connection, queuedPlanId);
       },
-      settledIds,
+      undefined,
       true,
     );
     await this.peer(connection, queuedPlanId);
-    const main = peer.capabilities?.includes('kernel-workspace-main-proof-v1')
-      ? inventory.workspaceMain
-      : undefined;
-    if (
-      inventory.operations.some(kernelOperationPending) ||
-      inventory.tabs.some(
-        (tab) =>
-          !['CLOSED', 'LOST'].includes(tab.state) &&
-          !(main && tab.state === 'READY' && tab.proof && sameTabProof(tab.proof, main)),
-      )
-    )
+    if (inventory.operations.some(kernelOperationPending)) {
       throw Error('INSPECTION_NATIVE_REVIEW_REQUIRED');
+    }
   }
   async read(connection: InspectionConnection, assertCurrent: () => Awaitable<void>) {
     return (await this.readPublicPage(connection, assertCurrent, false)).page;
   }
   async readDisplay(connection: InspectionConnection, assertCurrent: () => Awaitable<void>) {
-    if ((await this.peer(connection)).capabilities?.includes('kernel-workspace-main-proof-v1')) {
-      const guard = async () => {
+    const p = await this.peer(connection),
+      guard = async () => {
         await this.peer(connection);
         await assertCurrent();
       };
+    if (p.capabilities?.includes('kernel-workspace-main-proof-v1')) {
       const { inventory: native } = await prepareFacebookWorkspace(
         this.kernel,
-        await this.peer(connection),
+        p,
         undefined,
         guard,
         undefined,
@@ -150,24 +95,19 @@ export class KernelProfileInspection implements ProfileInspectionPort {
         );
       }
     }
-    if ((await this.peer(connection)).capabilities?.includes('facebook-existing-display-v1')) {
+    if (p.capabilities?.includes('facebook-existing-display-v1')) {
       const existing = await this.readExisting(connection, assertCurrent);
       if (!existing) throw Error('INSPECTION_DOCUMENT_NOT_READY');
       return existing;
     }
-    if (marketplaceBridgeSupported((await this.peer(connection)).extensionVersion, '0.3.21')) {
-      const guard = async () => {
-        await this.peer(connection);
-        await assertCurrent();
-      };
+    if (marketplaceBridgeSupported(p.extensionVersion, '0.3.21')) {
       await guard();
       const result = await this.kernel.inspectFacebookDisplay(await this.peer(connection), guard);
       await guard();
       return result;
     }
-    const capture =
-      (await this.peer(connection)).capabilities?.includes('facebook-native-identity-v1') === true;
-    const result = await this.readPublicPage(connection, assertCurrent, capture);
+    const capture = p.capabilities?.includes('facebook-native-identity-v1') === true,
+      result = await this.readPublicPage(connection, assertCurrent, capture);
     return {
       page: result.page,
       actor: FacebookNativeActor.nullable().parse(result.nativeIdentity),
@@ -245,15 +185,12 @@ export class KernelProfileInspection implements ProfileInspectionPort {
     const storyAdmission = step?.spec.type === 'post' && step.spec.destination === 'story';
     const browseAdmission = Boolean(step && (step.spec.type !== 'post' || storyAdmission));
     const peer = await this.peer(connection, planId);
-    await this.flushIdleSettlements(peer, guard);
-    const retained = (await this.tasks.retainedTaskPage?.(connection.profileId)) ?? undefined;
-    const settledIds = await this.settledBrowseOperationIds(planId);
     const prepared = await prepareFacebookWorkspace(
       this.kernel,
       peer,
-      retained,
+      undefined,
       guard,
-      settledIds,
+      undefined,
       true,
     );
     if (prepared.inventory.operations.some(kernelOperationPending))
@@ -276,27 +213,13 @@ export class KernelProfileInspection implements ProfileInspectionPort {
     ) {
       const existing = await this.readExisting(connection, guard, planId);
       if (existing?.actor) {
-        const links =
-          existing.page.rows.find((row) => row.key === 'composerProfileLinks')?.nodes ?? [];
-        const composers =
-          existing.page.rows.find((row) => row.key === 'homeComposers')?.nodes ?? [];
-        const href = links[0]?.attributes.href;
-        let creatorURL: URL | null = null;
-        if (href) {
-          try {
-            creatorURL = new URL(href, existing.page.url);
-          } catch {
-            creatorURL = null;
-          }
-        }
-        const creatorConfirmed =
+        const { composers, links, href, creatorUrl } = inspectCreatorNodes(existing.page);
+        if (
           composers.length === 1 &&
           links.length === 1 &&
           Boolean(href) &&
-          creatorURL?.origin === 'https://www.facebook.com' &&
-          creatorURL.pathname === '/profile.php' &&
-          creatorURL.searchParams.get('id') === existing.actor.accountId;
-        if (creatorConfirmed) {
+          isMatchedHomeCreator(creatorUrl, existing.actor.accountId)
+        )
           return {
             actor: existing.actor,
             transport: 'document-preload' as const,
@@ -307,7 +230,6 @@ export class KernelProfileInspection implements ProfileInspectionPort {
             page: existing.page,
             passive: true as const,
           };
-        }
       }
     }
     const evidence = await this.kernel.inspectFacebookIdentity(
@@ -323,20 +245,26 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       throw Error('INSPECTION_READ_RELEASE_UNCONFIRMED');
     return evidence;
   }
-  private async readExisting(
+  private async ensureCurrent(
     connection: InspectionConnection,
     assertCurrent: () => Awaitable<void>,
     queuedPlanId?: string,
   ) {
     await this.peer(connection, queuedPlanId);
     await assertCurrent();
+  }
+  private async readExisting(
+    connection: InspectionConnection,
+    assertCurrent: () => Awaitable<void>,
+    queuedPlanId?: string,
+  ) {
+    await this.ensureCurrent(connection, assertCurrent, queuedPlanId);
     const row = await this.core.run({
       profileId: connection.profileId,
       operationId: randomUUID(),
       action: { kind: 'readFacebookDisplay', projection: facebookDisplayInspectionProjection },
     });
-    await this.peer(connection, queuedPlanId);
-    await assertCurrent();
+    await this.ensureCurrent(connection, assertCurrent, queuedPlanId);
     if (row.status !== 'VERIFIED' || !row.result) throw Error('INSPECTION_FAILED');
     const data = z
       .object({
@@ -361,7 +289,6 @@ export class KernelProfileInspection implements ProfileInspectionPort {
     await this.kernel.observeProjectedAccount?.(connection.profileId, page, identity.actor);
     return { page, actor: identity.actor };
   }
-
   private async readActor(
     connection: InspectionConnection,
     assertCurrent: () => Awaitable<void>,
@@ -374,14 +301,10 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       await this.peer(connection, queuedPlanId),
       facebookDisplayInspectionProjection,
       'home',
-      async () => {
-        await this.peer(connection, queuedPlanId);
-        await assertCurrent();
-      },
+      () => this.ensureCurrent(connection, assertCurrent, queuedPlanId),
       true,
     );
-    await this.peer(connection, queuedPlanId);
-    await assertCurrent();
+    await this.ensureCurrent(connection, assertCurrent, queuedPlanId);
     if (
       result.connectionEpoch !== connection.connectionEpoch ||
       !result.closed ||
@@ -389,49 +312,33 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       result.inputRPCs !== 0
     )
       throw Error('INSPECTION_READ_RELEASE_UNCONFIRMED');
-    const actor = FacebookNativeActor.nullable().parse(result.nativeIdentity);
-    const composers = result.page.rows.find((r) => r.key === 'homeComposers')?.nodes ?? [];
-    const links = result.page.rows.find((r) => r.key === 'composerProfileLinks')?.nodes ?? [];
-    const decision = (reason: string) =>
-      observeDecision({
-        reason,
-        nativeActorObserved: actor !== null,
-        transport: result.nativeIdentityTransport,
-        ready: result.page.ready,
-        composers: composers.length,
-        profileLinks: links.length,
-      });
+    const actor = FacebookNativeActor.nullable().parse(result.nativeIdentity),
+      { composers, links, href, creatorUrl } = inspectCreatorNodes(result.page),
+      decision = (reason: string) =>
+        observeDecision({
+          reason,
+          nativeActorObserved: actor !== null,
+          transport: result.nativeIdentityTransport,
+          ready: result.page.ready,
+          composers: composers.length,
+          profileLinks: links.length,
+        });
     if (
       !actor ||
       result.page.url !== 'https://www.facebook.com/' ||
       result.page.ready !== 'complete'
-    ) {
-      decision(actor ? 'HOME_DOCUMENT_UNCONFIRMED' : 'NATIVE_ACTOR_ABSENT');
-      return null;
-    }
+    )
+      return (decision(actor ? 'HOME_DOCUMENT_UNCONFIRMED' : 'NATIVE_ACTOR_ABSENT'), null);
     if (
       composers.length !== 1 ||
       !composers[0]?.visible ||
       links.length !== 1 ||
       !links[0]?.visible
-    ) {
-      decision('HOME_CREATOR_AMBIGUOUS');
-      return null;
-    }
-    const href = links[0].attributes.href;
-    if (!href) {
-      decision('HOME_CREATOR_LINK_ABSENT');
-      return null;
-    }
-    const url = new URL(href, result.page.url);
-    if (
-      url.origin !== 'https://www.facebook.com' ||
-      url.pathname !== '/profile.php' ||
-      url.searchParams.get('id') !== actor.accountId
-    ) {
-      decision('HOME_CREATOR_ACTOR_MISMATCH');
-      return null;
-    }
+    )
+      return (decision('HOME_CREATOR_AMBIGUOUS'), null);
+    if (!href) return (decision('HOME_CREATOR_LINK_ABSENT'), null);
+    if (!isMatchedHomeCreator(creatorUrl, actor.accountId))
+      return (decision('HOME_CREATOR_ACTOR_MISMATCH'), null);
     decision('CURRENT_ACTOR_AND_CREATOR_MATCHED');
     return {
       actor,
@@ -443,4 +350,23 @@ export class KernelProfileInspection implements ProfileInspectionPort {
       page: result.page,
     };
   }
+}
+function inspectCreatorNodes(page: Awaited<ReturnType<typeof validateProjection>>) {
+  const composers = page.rows.find((r) => r.key === 'homeComposers')?.nodes ?? [],
+    links = page.rows.find((r) => r.key === 'composerProfileLinks')?.nodes ?? [],
+    href = links[0]?.attributes.href;
+  let creatorUrl: URL | null = null;
+  if (href) {
+    try {
+      creatorUrl = new URL(href, page.url);
+    } catch {}
+  }
+  return { composers, links, href, creatorUrl };
+}
+function isMatchedHomeCreator(url: URL | null, accountId: string) {
+  return (
+    url?.origin === 'https://www.facebook.com' &&
+    url.pathname === '/profile.php' &&
+    url.searchParams.get('id') === accountId
+  );
 }

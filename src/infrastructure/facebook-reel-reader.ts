@@ -2,7 +2,6 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { FacebookPostEffects } from '../shared/facebook-post-observation.js';
-
 // Bounded DOM-only projection of the actual Chinese profile Reels stages. The editor does
 // not display the original caption. Return null there rather than inventing it from a cache.
 export function projectFacebookReelContent() {

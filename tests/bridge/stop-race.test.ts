@@ -22,18 +22,20 @@ test('立即停止再恢复，停止之前的排队任务仍然取消', async ()
     () => {},
   );
   await start(core, p);
-  const a = await core.submit({
-    profileId: p.profileId,
-    operationId: randomUUID(),
-    action: { kind: 'observe', tabId: 1 },
-  });
-  const b = await core.submit({
-    profileId: p.profileId,
-    operationId: randomUUID(),
-    action: { kind: 'observe', tabId: 1 },
-  });
-  await core.stop(p.profileId);
-  await assert.rejects(async () => await core.resume(p.profileId), /CONTROL_CONFIRMATION_PENDING/);
+  const [a, b] = await Promise.all([
+    core.submit({
+      profileId: p.profileId,
+      operationId: randomUUID(),
+      action: { kind: 'observe', tabId: 1 },
+    }),
+    core.submit({
+      profileId: p.profileId,
+      operationId: randomUUID(),
+      action: { kind: 'observe', tabId: 1 },
+    }),
+    core.stop(p.profileId),
+  ]);
+  assert.equal(p.phase, 'PAUSED');
   await core.stopped(p, p.controlId!);
   await core.resume(p.profileId);
   await core.resumed(p, p.controlId!);

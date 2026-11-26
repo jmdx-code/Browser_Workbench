@@ -1,5 +1,4 @@
 import { chromium } from 'playwright-core';
-
 // Uses the public stable SDK only. Scope/ownership are enforced by the private relay owner;
 // the historical function name is retained for diagnostic callers.
 export async function connectFixtureKernel(endpoint: string, headers: Record<string, string>) {

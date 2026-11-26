@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { observeFacebookHomeName } from '../src/domain/facebook-name-analysis.js';
+import { observeFacebookHomeName } from '../src/domain/facebook-content-rules.js';
 import { facebookDisplayInspectionProjection } from '../src/infrastructure/facebook-read-adapter.js';
 import { type PageProjection, validateProjection } from '../src/shared/page-read.js';
 import { ProfileInspectionService } from '../src/application/profile-inspection.js';

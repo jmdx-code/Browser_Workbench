@@ -1,4 +1,3 @@
-import { dropDataCleanupSchema } from './fixtures/workspace-schema.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -9,8 +8,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { SchedulerSettings } from '../src/shared/task-contracts.js';
 import type { RuntimeProfile } from '../src/domain/tasks.js';
-import { MAX_CONCURRENT_UPLOAD_PREPARATIONS } from '../src/shared/task-capacity.js';
-import { AsyncWorkBudget } from '../src/application/async-work-budget.js';
+import { MAX_CONCURRENT_UPLOAD_PREPARATIONS } from '../src/shared/task-policies.js';
+import { AsyncWorkBudget } from '../src/application/kernel-gates.js';
 
 test('new databases default to 100, retain a subsequently edited limit on reopen, and admit 100 upload preparations', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-default-capacity-'));
@@ -48,7 +47,7 @@ test('new databases default to 100, retain a subsequently edited limit on reopen
   }
 });
 
-test('schema34 capacity upgrade preserves its selected setting and creates an original backup', async () => {
+test('v60->v62 capacity upgrade preserves its selected setting and creates an original backup', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-capacity-'));
   const file = path.join(directory, 'workspace.sqlite');
   try {
@@ -63,14 +62,7 @@ test('schema34 capacity upgrade preserves its selected setting and creates an or
     });
     original.close();
     const legacy = new DatabaseSync(file);
-    legacy.exec(dropDataCleanupSchema);
-    legacy.exec(
-      "BEGIN IMMEDIATE; ALTER TABLE scheduler_settings RENAME TO capacity_new; CREATE TABLE scheduler_settings(id INTEGER PRIMARY KEY CHECK(id=1),max_concurrent_profiles INTEGER NOT NULL CHECK(max_concurrent_profiles BETWEEN 1 AND 50)); INSERT INTO scheduler_settings SELECT * FROM capacity_new; DROP TABLE capacity_new; DELETE FROM workspace_execution_contracts WHERE name='task-capacity'; PRAGMA user_version=34; COMMIT;",
-    );
-    assert.throws(
-      () => legacy.prepare('UPDATE scheduler_settings SET max_concurrent_profiles=100').run(),
-      /CHECK/,
-    );
+    legacy.exec('PRAGMA user_version=60;');
     legacy.close();
     const upgraded = await WorkspaceStore.open(file);
     try {
@@ -134,16 +126,14 @@ test('one hundred actual SQL claims respect account ownership and leave the 101s
       },
       profiles,
     );
-    const claimed = Array.from({ length: 100 }, () =>
-      store.tasks.claimNext(profiles, new Set(['feed'])),
-    );
-    assert.ok(claimed.every((p) => p?.state === 'RUNNING'));
-    assert.equal(new Set(claimed.map((p) => p?.accountId)).size, 100);
-    assert.equal(store.tasks.claimNext(profiles, new Set(['feed'])), null);
+    const claimed = profiles.map((p) => store.tasks.claimPlanForProfile(p.id, p.account.id));
+    assert.ok(claimed.slice(0, 100).every((p) => p?.state === 'RUNNING'));
+    assert.equal(claimed[100], null);
+    assert.equal(new Set(claimed.slice(0, 100).map((p) => p?.accountId)).size, 100);
+    assert.equal(store.tasks.livePlans().filter((p) => p.state === 'RUNNING').length, 100);
     assert.equal(store.tasks.livePlans().filter((p) => p.state === 'QUEUED').length, 1);
     store.tasks.setSettings({ maxConcurrentProfiles: 50 });
     assert.equal(store.tasks.livePlans().filter((p) => p.state === 'RUNNING').length, 100);
-    assert.equal(store.tasks.claimNext(profiles, new Set(['feed'])), null);
   } finally {
     store.close();
   }

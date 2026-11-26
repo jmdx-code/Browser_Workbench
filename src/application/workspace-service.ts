@@ -79,11 +79,13 @@ export class WorkspaceService {
                 ? preferredAvatar
                 : null
               : preferredAvatar;
+        const customAlias = metadata.get(profile.id)?.alias;
         return {
           ...profile,
           groupId: metadata.get(profile.id)?.groupId ?? null,
           order: metadata.get(profile.id)?.order ?? 0,
-          alias: metadata.get(profile.id)?.alias ?? profile.alias,
+          alias: customAlias ?? profile.alias,
+          ...(customAlias ? { browserName: customAlias } : {}),
           account: {
             state,
             id: (useLiveIdentity ? live.id : null) ?? cached?.id ?? live.id ?? null,
@@ -107,28 +109,9 @@ export class WorkspaceService {
     if (ids.some((id) => !known.has(id)))
       throw new ProductError('PROFILE_NOT_FOUND', '所选浏览器资料已不存在，请刷新列表', 404);
   }
-  async moveProfiles(ids: string[], groupId: string | null) {
-    await this.requireProfiles(ids);
-    await this.repository.moveProfiles(ids, groupId);
-  }
   async renameProfile(id: string, alias: string) {
     await this.requireProfiles([id]);
     await this.repository.renameProfile(id, alias);
-  }
-  async stopProfiles(ids: string[]) {
-    await this.requireProfiles(ids);
-    return await mapAsync([...new Set(ids)], async (profileId) => {
-      try {
-        await this.browsers.stop(profileId);
-        return { profileId, requested: true };
-      } catch (error) {
-        return {
-          profileId,
-          requested: false,
-          reason: error instanceof Error ? error.message : '停止请求失败',
-        };
-      }
-    });
   }
   async deleteProfiles(ids: string[]) {
     const unique = [...new Set(ids)];
@@ -144,12 +127,5 @@ export class WorkspaceService {
       throw new ProductError('COMBINATION_DELETE_UNAVAILABLE', '组合删除服务未加载', 503);
     await this.repository.deleteCombination(id);
     return { deletedId: id };
-  }
-  startCombination(): never {
-    throw new ProductError(
-      'COMBINATION_EXECUTOR_UNAVAILABLE',
-      '组合执行器尚未实现，本次没有分配或操作浏览器',
-      409,
-    );
   }
 }

@@ -260,16 +260,6 @@ test('HTTP/WS integration uses an isolated database and simulated peers, not a b
     );
     const welcome = await paired.next();
     secret = welcome.secret;
-    const sync = await paired.next();
-    assert.equal(sync.type, 'SYNC');
-    paired.ws.send(
-      JSON.stringify({
-        type: 'SYNC_STATE',
-        requestId: sync.requestId,
-        connectionEpoch: welcome.connectionEpoch,
-        entries: [],
-      }),
-    );
     for (let i = 0; i < 30; i++) {
       if ((await state()).profiles.find((p: any) => p.profileId === profileId)?.synced) break;
       await new Promise((r) => setTimeout(r, 20));
@@ -294,44 +284,24 @@ test('HTTP/WS integration uses an isolated database and simulated peers, not a b
       },
     );
     await t.test(
-      'parent STOP that interrupts SYNC automatically reconciles again without resuming input',
+      'stateless sync and stop settle immediately in PAUSED state without blocking subsequent resume',
       async () => {
         const nextControl = async (type: string) => {
           for (let i = 0; i < 10; i++) {
             const message = await paired.next();
             if (message.type === type) return message;
-            assert.equal(message.type, 'PING');
+            assert.ok(message.type === 'PING' || message.type === 'HEARTBEAT');
           }
           throw Error('EXPECTED_CONTROL_MISSING');
         };
         assert.equal((await post('/api/sync', { profileId })).status, 200);
-        const interrupted = await nextControl('SYNC');
         assert.equal((await post('/api/stop', { profileId })).status, 200);
         const stop = await nextControl('STOP');
-        paired.ws.send(
-          JSON.stringify({
-            type: 'SYNC_STATE',
-            requestId: interrupted.requestId,
-            connectionEpoch: welcome.connectionEpoch,
-            entries: [],
-          }),
-        );
         paired.ws.send(
           JSON.stringify({
             type: 'STOPPED',
             requestId: stop.requestId,
             connectionEpoch: welcome.connectionEpoch,
-          }),
-        );
-        const fresh = await nextControl('SYNC');
-        assert.notEqual(fresh.requestId, interrupted.requestId);
-        assert.notEqual(fresh.requestId, stop.requestId);
-        paired.ws.send(
-          JSON.stringify({
-            type: 'SYNC_STATE',
-            requestId: fresh.requestId,
-            connectionEpoch: welcome.connectionEpoch,
-            entries: [],
           }),
         );
         let profile;

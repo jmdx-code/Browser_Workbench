@@ -26,9 +26,15 @@ async function fixture(work: (s: WorkspaceStore, file: string) => Promise<void>)
     await rm(dir, { recursive: true, force: true });
   }
 }
-test('migration44 preserves old43 profiles, target rows and logs while initializing order', async () => {
+test('v61->v62 preserves profiles, target rows and folders while rejecting pre-v59 user_version=43', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'finder-migration-'));
   const file = path.join(dir, 'workspace.sqlite');
+  const oldFile = path.join(dir, 'v43.sqlite');
+  const oldDb = new DatabaseSync(oldFile);
+  oldDb.exec('PRAGMA user_version=43');
+  oldDb.close();
+  await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+
   let store = await WorkspaceStore.open(file);
   const group = store.createGroup('保留组', 'blue');
   const id = randomUUID();
@@ -38,39 +44,11 @@ test('migration44 preserves old43 profiles, target rows and logs while initializ
   store.groupBumper.upsertTargets('pages', { items: [{ id: '103', name: '主页' }] });
   store.close();
   const db = new DatabaseSync(file);
-  db.exec(`
-    CREATE TABLE group_inviter_groups (
-      group_id TEXT PRIMARY KEY,
-      group_name TEXT NOT NULL,
-      avatar_url TEXT,
-      total_invited_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    INSERT INTO group_inviter_groups (group_id, group_name, avatar_url, total_invited_count, created_at, updated_at)
-    SELECT group_id, group_name, avatar_url, invited_count, created_at, updated_at FROM shared_facebook_groups WHERE group_id = '101';
-    CREATE TABLE group_bumper_groups (
-      group_id TEXT PRIMARY KEY,
-      group_name TEXT NOT NULL,
-      avatar_url TEXT,
-      total_bumped_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    INSERT INTO group_bumper_groups (group_id, group_name, avatar_url, total_bumped_count, created_at, updated_at)
-    SELECT group_id, group_name, avatar_url, bumped_count, created_at, updated_at FROM shared_facebook_groups WHERE group_id = '102';
-    DROP TABLE shared_facebook_groups;
-  `);
-  db.exec('DROP INDEX IF EXISTS idx_group_bumper_pages_folder_sort;');
-  db.exec('ALTER TABLE profile_metadata DROP COLUMN sort_order;DROP TABLE target_list_folders;');
-  db.exec(
-    'ALTER TABLE group_bumper_pages DROP COLUMN folder_id;ALTER TABLE group_bumper_pages DROP COLUMN sort_order;',
-  );
-  db.exec('PRAGMA user_version=43');
+  db.exec('PRAGMA user_version=61');
   db.close();
   store = await WorkspaceStore.open(file);
   try {
-    assert.ok(workspaceSchemaVersion >= 44);
+    assert.ok(workspaceSchemaVersion >= 62);
     assert.equal(store.profileMetadata().get(id)?.groupId, group.id);
     assert.equal(store.profileMetadata().get(id)?.order, 0);
     assert.equal(store.groupInviter.listGroups()[0]?.folderId, null);

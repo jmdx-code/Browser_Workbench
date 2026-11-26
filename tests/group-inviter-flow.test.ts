@@ -84,9 +84,6 @@ for (const retained of [false, true])
       {} as GroupInviterRepository,
       () => kernel,
       () => ({ peers: new Map([[profileId, peer]]) }) as unknown as Core,
-      () => {
-        throw Error('must not read account cache');
-      },
     );
     await assert.rejects(
       adapter.inviteForGroup(profileId, group, 1, {
@@ -120,7 +117,6 @@ test('STOP during home identity read prevents binding or invitations', async () 
     {} as GroupInviterRepository,
     () => kernel,
     () => ({ peers: new Map([[profileId, peer]]) }) as unknown as Core,
-    () => null,
   );
   await assert.rejects(
     adapter.inviteForGroup(profileId, group, 1, {
@@ -180,7 +176,6 @@ async function verify(states: GroupInvitationState[]) {
     {} as GroupInviterRepository,
     () => undefined,
     () => undefined,
-    () => null,
   );
   let reads = 0,
     scrolls = 0,
@@ -336,7 +331,6 @@ for (const reserved of [false, true])
       repo,
       () => kernel,
       () => ({ peers: new Map([[profileId, peer]]) }) as unknown as Core,
-      () => null,
     );
     await assert.rejects(
       adapter.inviteForGroup(profileId, group, 1, {
@@ -355,7 +349,6 @@ test('hidden invitation page is activated once and verified before input continu
     {} as GroupInviterRepository,
     () => undefined,
     () => undefined,
-    () => null,
   );
   let visible = false,
     activated = 0,
@@ -435,7 +428,6 @@ test('native mobile identity verification stops before input or reservation', as
     {} as GroupInviterRepository,
     () => undefined,
     () => undefined,
-    () => null,
   );
   let executions = 0,
     reservations = 0;

@@ -105,6 +105,10 @@ const reasons: Record<InspectionReasonCode, { title: string; detail: string }> =
     title: 'Facebook 需要验证',
     detail: '检查页进入了验证流程。请在浏览器中完成平台要求的验证。',
   },
+  ACCOUNT_RESTRICTED: {
+    title: 'Facebook 账号受限',
+    detail: '账号已被平台限制、封禁或停用。请在浏览器中核对账号状态。',
+  },
   PROFILE_OFFLINE: {
     title: '浏览器未连接',
     detail: '请打开这份已安装桥接插件的浏览器，并保持本机软件运行。',
@@ -228,6 +232,12 @@ export function inspectionPresentation(
       detail: '最近只读检查已确认当前账号。任务执行前仍会独立核验身份。',
       canCheck,
     };
+  if (current?.state === 'OBSERVED' && current.account.state === 'restricted')
+    return { ...reasons.ACCOUNT_RESTRICTED, canCheck };
+  if (current?.state === 'OBSERVED' && current.account.state === 'verification')
+    return { ...reasons.CHECKPOINT_ROUTE, canCheck };
+  if (current?.state === 'OBSERVED' && current.account.state === 'logged-out')
+    return { ...reasons.VISIBLE_LOGIN_FORM, canCheck };
   return {
     title: '尚未检查 Facebook',
     detail: '连接就绪后自动检查一次，也可点击“检查这份FB状态”。只读检查不会点赞或发布内容。',

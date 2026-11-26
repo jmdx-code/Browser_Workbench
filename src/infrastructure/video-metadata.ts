@@ -2,10 +2,8 @@ import type { Awaitable } from '../domain/persistence.js';
 import { open, lstat, type FileHandle } from 'node:fs/promises';
 import type { MaterialFileSnapshot } from '../shared/materials.js';
 import { proofOf, sameStat } from './material-file-utils.js';
-
 export type VideoMetadata = { width: number; height: number; durationSeconds: number };
 type Box = { type: string; start: number; end: number };
-
 // MP4/QuickTime container metadata only, not a decoder or a promise of Facebook acceptance.
 // Positional reads skip media payloads, including mdat before moov; bounded at 64KiB/4096 boxes.
 export async function readVideoMetadata(
@@ -95,7 +93,6 @@ export async function readVideoMetadata(
   if (videos.length !== 1 || !videos[0]) throw Error('VIDEO_METADATA_VIDEO_TRACK_REQUIRED');
   return videos[0];
 }
-
 // A conservative rejection of limits actually returned by the tested composer (2026-10-11).
 // Passing is not permission or complete codec validation; server-side limits can change.
 export async function checkKnownFacebookVideo(
@@ -113,7 +110,6 @@ export async function checkKnownFacebookVideo(
   if (aspect < 0.25 || aspect > 4) throw Error('视频宽高比应在1:4到4:1之间');
   if (bytes < 1024) throw Error('视频文件小于当前页面要求的1KiB');
 }
-
 export async function checkKnownFacebookVideoPath(
   file: string,
   expected: MaterialFileSnapshot,

@@ -61,30 +61,40 @@ test('WO-U3: migrates fresh database (version = 0 -> v50) and upgrades v49 datab
     );
     rawSeed
       .prepare(
-        `INSERT INTO group_bumper_logs (
-          id, profile_id, account_id, group_id, group_name, page_id, page_name,
-          post_id, post_url, liked, comment_text, bumped_at, source_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'group')`,
+        `INSERT INTO group_bumper_effects (
+          log_id, profile_id, account_id, group_id, page_id, post_id,
+          source_mode, liked, commented, comment_digest, applied_at, story_shared
+        ) VALUES (?, ?, ?, ?, ?, ?, 'page', 1, 1, NULL, ?, 0)`,
       )
       .run(
         'legacy-page-log-1',
         'p-1',
         '100088888888888',
         '-',
-        '专页主页',
         '100099999999999',
-        'Target Page',
         '1234567890',
-        'https://www.facebook.com/100099999999999/posts/1234567890',
-        1,
-        'legacy page comment',
         Date.now(),
       );
-    rawSeed.exec('PRAGMA user_version = 49;');
+    rawSeed
+      .prepare(
+        `INSERT INTO post_bump_records (
+          id, record_type, carrier, status, profile_id, account_id, account_name,
+          group_id, group_name, page_id, page_name, post_id, post_url,
+          liked, comment_text, story_shared, caption_preview, error_reason,
+          source_log_id, created_at
+        ) VALUES ('pbb:legacy-page-log-1', 'page_bump', 'browser', 'success', 'p-1', '100088888888888', '', '', '', '100099999999999', 'Target Page', '1234567890', 'https://www.facebook.com/100099999999999/posts/1234567890', 1, 'legacy page comment', 0, '', '', 'legacy-page-log-1', ?)`,
+      )
+      .run(Date.now());
+    rawSeed.exec('PRAGMA user_version = 61;');
     rawSeed.exec('PRAGMA foreign_keys = ON;');
     rawSeed.close();
 
     const upgradedStore = await WorkspaceStore.open(upgDbPath);
+    upgradedStore.groupBumper.savePageSettings({
+      maxPostsPerPage: 9,
+      dailyMaxLikesPerAccount: 33,
+      enableSound: true,
+    });
     assert.equal(upgradedStore.groupBumper.pageSettings().maxPostsPerPage, 9);
     assert.equal(upgradedStore.groupBumper.pageSettings().dailyMaxLikesPerAccount, 33);
     assert.equal(upgradedStore.groupBumper.pageSettings().enableSound, true);
@@ -229,7 +239,6 @@ test('WO-U3: supports append-run in GroupInviterService and GroupPosterService w
       isAvailable: () => true,
       isProfileReady: () => true,
       isProfileBusy: () => false,
-      fetchGroupAvatar: async () => null,
       inviteForGroup: async (profileId, group, _invitesPerGroup, callbacks) => {
         visitedByProfile.push({ profileId, groupId: group.groupId });
         if (profileId === pA && visitedByProfile.length === 1) {
@@ -329,17 +338,19 @@ test('WO-U3: supports append-run in GroupInviterService and GroupPosterService w
       },
     );
 
-    await posterService.start({
-      profileIds: [pA],
+    await posterService.createTask({
+      materialId: savedMaterials[0]!.id,
       groupIds: ['333000333', '444000444'],
-      materialIds: savedMaterials.map((m) => m.id),
+      accountMode: 'selected',
+      profileIds: [pA],
     });
     await posterFirstStarted;
 
-    const posterAfterAppend = await posterService.start({
-      profileIds: [pB],
+    const posterAfterAppend = await posterService.createTask({
+      materialId: savedMaterials[0]!.id,
       groupIds: ['333000333', '444000444'],
-      materialIds: savedMaterials.map((m) => m.id),
+      accountMode: 'selected',
+      profileIds: [pB],
     });
     assert.equal(posterAfterAppend.running, true);
     if (unblockPosterFirst) (unblockPosterFirst as () => void)();
@@ -545,18 +556,20 @@ test('WO-U3: GroupPosterService maxPostsPerAccount enforces per-round session qu
       );
 
       // Start round on p21 (which already has today=2) with video material across 3 groups
-      await service.start({
-        profileIds: [p21],
+      await service.createTask({
+        materialId: 'm-vid',
         groupIds: ['900001', '900002', '900003'],
-        materialIds: ['m-vid'],
+        accountMode: 'selected',
+        profileIds: [p21],
       });
       await firstClaimed;
 
       // Append p22 with ONLY m-txt while m-vid tasks are still in taskQueue!
-      await service.start({
-        profileIds: [p22],
+      await service.createTask({
+        materialId: 'm-txt',
         groupIds: ['900001'],
-        materialIds: ['m-txt'],
+        accountMode: 'selected',
+        profileIds: [p22],
       });
       if (unblockFirst) (unblockFirst as () => void)();
 

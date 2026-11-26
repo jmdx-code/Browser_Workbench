@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
+import path from 'node:path';
 import type { Core, Peer } from '../bridge/core.js';
 import type { BridgeStorePort } from './persistence-port.js';
 import type { LocalBrowserLabels } from './local-browser-labels.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
+import { cleanupProfileSavedTabGroups } from './saved-tab-groups-hygiene.js';
 import {
   buildNormalBrowserLaunchArgs,
   type EnsureProfilesOnlineResult,
@@ -10,25 +12,22 @@ import {
   type ProfileLifecycleItemResult,
   type ProfileLifecyclePort,
 } from '../shared/profile-lifecycle.js';
-
 export interface BrowserLifecycleManagerOptions {
   core: Core;
   store: BridgeStorePort;
   browserLabels: LocalBrowserLabels;
   persistBindings?: (bindings: readonly ProfileLaunchBinding[]) => Promise<void> | void;
   stopActiveTasksForProfile?: (profileId: string) => Promise<void>;
+  releaseIdleKernelSession?: (profileId: string) => Promise<void>;
   spawnProcess?: (executablePath: string, args: readonly string[]) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
 }
-
 const DEFAULT_LAUNCH_TIMEOUT_MS = 35_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 15_000;
 const RESTART_SETTLE_DELAY_MS = 800;
-
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 function defaultSpawnDetached(executablePath: string, args: readonly string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(executablePath, [...args], {
@@ -50,29 +49,106 @@ function defaultSpawnDetached(executablePath: string, args: readonly string[]): 
     });
   });
 }
-
-function isPeerWindowOnline(peer: Peer | undefined): boolean {
-  return Boolean(peer?.online && (peer.browserWindowCount ?? 1) > 0);
-}
-
+const isPeerWindowOnline = (peer: Peer | undefined) =>
+  Boolean(peer?.online && (peer.browserWindowCount ?? 1) > 0);
+const isPeerIdleReady = (peer: Peer | undefined) =>
+  Boolean(isPeerWindowOnline(peer) && peer?.synced && peer.phase === 'PAUSED');
+const diagBridge = (
+  event: string,
+  profileId: string,
+  data?: Record<string, unknown>,
+  level: 'INFO' | 'WARN' = 'INFO',
+  reason?: string,
+) =>
+  devDiag.record({
+    level,
+    category: 'BRIDGE_WS',
+    event,
+    profileId,
+    ...(reason ? { reason } : {}),
+    ...(data ? { data } : {}),
+  });
 export class BrowserLifecycleManager implements ProfileLifecyclePort {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly launchingIds = new Set<string>();
+  private readonly disconnectCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly spawnFn: (executablePath: string, args: readonly string[]) => Promise<void>;
   private readonly sleepFn: (ms: number) => Promise<void>;
-
   constructor(private readonly opts: BrowserLifecycleManagerOptions) {
     this.spawnFn = opts.spawnProcess ?? defaultSpawnDetached;
     this.sleepFn = opts.sleep ?? defaultSleep;
   }
-
+  private runOfflineTabGroupCleanup(
+    profileId: string,
+    binding: { userDataDir: string; profileDirectory: string },
+    mode: 'keep-one' | 'prepare-launch',
+    diagMode: string,
+    includePreserved: boolean,
+  ): void {
+    try {
+      const res = cleanupProfileSavedTabGroups(
+        path.join(binding.userDataDir, binding.profileDirectory),
+        mode,
+      );
+      if (res.ok && (res.deletedGroups > 0 || res.deletedTabs > 0)) {
+        diagBridge('SAVED_TAB_GROUPS_CLEANED', profileId, {
+          mode: diagMode,
+          profileDirectory: binding.profileDirectory,
+          deletedGroups: res.deletedGroups,
+          deletedTabs: res.deletedTabs,
+          remainingWorkbenchGroups: res.remainingWorkbenchGroups,
+          ...(includePreserved ? { preservedUserGroups: res.preservedUserGroups } : {}),
+        });
+      }
+    } catch {}
+  }
+  private notRegisteredResult(
+    profileId: string,
+    action: ProfileLifecycleItemResult['action'],
+    reason: string,
+    includeDir = false,
+  ): ProfileLifecycleItemResult {
+    return {
+      profileId,
+      browserName: null,
+      action,
+      ok: false,
+      online: false,
+      phase: 'OFFLINE',
+      synced: false,
+      launchable: false,
+      ...(includeDir ? { browserKind: null, profileDirectory: null } : {}),
+      elapsedMs: 0,
+      errorCode: 'PROFILE_NOT_REGISTERED',
+      reason,
+    };
+  }
+  scheduleOfflineTabGroupHygiene(profileId: string, delayMs = 4000): void {
+    const existing = this.disconnectCleanupTimers.get(profileId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.disconnectCleanupTimers.delete(profileId);
+      if (this.launchingIds.has(profileId)) return;
+      if (isPeerWindowOnline(this.opts.core.peers.get(profileId))) return;
+      const binding = this.opts.browserLabels.binding(profileId);
+      if (binding)
+        this.runOfflineTabGroupCleanup(
+          profileId,
+          binding,
+          'keep-one',
+          'keep-one-disconnect',
+          false,
+        );
+    }, delayMs);
+    timer.unref();
+    this.disconnectCleanupTimers.set(profileId, timer);
+  }
   isLaunching(profileId: string): boolean {
     return this.launchingIds.has(profileId);
   }
-
   private async withProfileLock<T>(profileId: string, work: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(profileId) ?? Promise.resolve();
-    let release!: () => void;
+    let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -83,12 +159,9 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       return await work();
     } finally {
       release();
-      if (this.locks.get(profileId) === chained) {
-        this.locks.delete(profileId);
-      }
+      if (this.locks.get(profileId) === chained) this.locks.delete(profileId);
     }
   }
-
   private buildCurrentStatus(
     profileId: string,
     action: ProfileLifecycleItemResult['action'],
@@ -113,52 +186,54 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       ...extra,
     };
   }
-
+  private async refreshBindings(): Promise<void> {
+    const allRows = await this.opts.store.profileList();
+    await this.opts.browserLabels.refreshNow(
+      allRows.map((p) => String(p.profileId)),
+      this.opts.persistBindings,
+    );
+  }
+  private async pollUntil(
+    timeoutMs: number,
+    intervalMs: number,
+    pred: () => boolean,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      await this.sleepFn(intervalMs);
+    }
+    return pred();
+  }
   async getStatus(profileIds: readonly string[]): Promise<ProfileLifecycleItemResult[]> {
-    const uniqueIds = [...new Set(profileIds)];
-    const registeredSet = new Set<string>();
+    const uniqueIds = [...new Set(profileIds)],
+      registeredSet = new Set<string>();
     let needsRefresh = false;
     for (const id of uniqueIds) {
       if (await this.opts.store.profileSummary(id)) {
         registeredSet.add(id);
-        if (!this.opts.browserLabels.binding(id)) {
-          needsRefresh = true;
-        }
+        if (!this.opts.browserLabels.binding(id)) needsRefresh = true;
       }
     }
-    if (needsRefresh) {
-      const allRows = await this.opts.store.profileList();
-      await this.opts.browserLabels.refreshNow(
-        allRows.map((p) => String(p.profileId)),
-        this.opts.persistBindings,
-      );
-    }
+    if (needsRefresh) await this.refreshBindings();
     const out: ProfileLifecycleItemResult[] = [];
     for (const profileId of uniqueIds) {
       const startedAt = Date.now();
       if (!registeredSet.has(profileId)) {
-        out.push({
-          profileId,
-          browserName: null,
-          action: 'status',
-          ok: false,
-          online: false,
-          phase: 'OFFLINE',
-          synced: false,
-          launchable: false,
-          browserKind: null,
-          profileDirectory: null,
-          elapsedMs: 0,
-          errorCode: 'PROFILE_NOT_REGISTERED',
-          reason: '该浏览器未安装工作台插件或尚未在工作台配对注册',
-        });
+        out.push(
+          this.notRegisteredResult(
+            profileId,
+            'status',
+            '该浏览器未安装工作台插件或尚未在工作台配对注册',
+            true,
+          ),
+        );
         continue;
       }
       out.push(this.buildCurrentStatus(profileId, 'status', startedAt));
     }
     return out;
   }
-
   async launchProfile(
     profileId: string,
     options?: { timeoutMs?: number | undefined },
@@ -167,7 +242,6 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       this.launchUnlocked(profileId, 'open', options?.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS),
     );
   }
-
   async closeProfile(
     profileId: string,
     options?: { timeoutMs?: number | undefined; stopTasksFirst?: boolean | undefined },
@@ -179,7 +253,6 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       }),
     );
   }
-
   async restartProfile(
     profileId: string,
     options?: { closeTimeoutMs?: number | undefined; openTimeoutMs?: number | undefined },
@@ -213,188 +286,125 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       };
     });
   }
-
   private async waitForPeerReady(
     profileId: string,
     timeoutMs: number,
   ): Promise<{ ready: boolean; peer: Peer | undefined }> {
-    const deadline = Date.now() + Math.max(2000, timeoutMs);
-    while (Date.now() < deadline) {
-      const peer = this.opts.core.peers.get(profileId);
-      if (
-        isPeerWindowOnline(peer) &&
-        peer?.synced &&
-        (peer.phase === 'PAUSED' || peer.phase === 'RUNNING' || peer.phase === 'RECOVERING')
-      ) {
-        return { ready: true, peer };
-      }
-      await this.sleepFn(200);
-    }
-    return { ready: false, peer: this.opts.core.peers.get(profileId) };
+    const ready = await this.pollUntil(Math.max(2000, timeoutMs), 200, () => {
+      const p = this.opts.core.peers.get(profileId);
+      return Boolean(
+        isPeerWindowOnline(p) && p?.synced && (p.phase === 'PAUSED' || p.phase === 'RUNNING'),
+      );
+    });
+    return { ready, peer: this.opts.core.peers.get(profileId) };
   }
-
   private async launchUnlocked(
     profileId: string,
     action: 'open' | 'restart',
     timeoutMs: number,
   ): Promise<ProfileLifecycleItemResult> {
-    const startedAt = Date.now();
-    if (!(await this.opts.store.profileSummary(profileId))) {
-      return {
+    const startedAt = Date.now(),
+      done = (alreadyInTargetState: boolean, extra?: Partial<ProfileLifecycleItemResult>) =>
+        this.buildCurrentStatus(profileId, action, startedAt, { alreadyInTargetState, ...extra }),
+      fail = (errorCode: string, reason: string, extra?: Partial<ProfileLifecycleItemResult>) =>
+        this.buildCurrentStatus(profileId, action, startedAt, {
+          ok: false,
+          errorCode,
+          reason,
+          ...extra,
+        });
+    if (!(await this.opts.store.profileSummary(profileId)))
+      return this.notRegisteredResult(
         profileId,
-        browserName: null,
         action,
-        ok: false,
-        online: false,
-        phase: 'OFFLINE',
-        synced: false,
-        launchable: false,
-        elapsedMs: 0,
-        errorCode: 'PROFILE_NOT_REGISTERED',
-        reason: '该浏览器未安装工作台插件或尚未配对注册，禁止启动',
-      };
-    }
-
+        '该浏览器未安装工作台插件或尚未配对注册，禁止启动',
+      );
     const existingPeer = this.opts.core.peers.get(profileId);
     if (isPeerWindowOnline(existingPeer)) {
-      if (existingPeer?.synced && existingPeer.phase === 'PAUSED') {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          alreadyInTargetState: true,
-        });
-      }
-      const syncedWait = await this.waitForPeerReady(profileId, Math.min(timeoutMs, 12_000));
-      if (syncedWait.ready) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          alreadyInTargetState: true,
-        });
-      }
+      if (existingPeer?.synced && existingPeer.phase === 'PAUSED') return done(true);
+      if ((await this.waitForPeerReady(profileId, Math.min(timeoutMs, 12_000))).ready)
+        return done(true);
       const afterWaitPeer = this.opts.core.peers.get(profileId);
-      if (isPeerWindowOnline(afterWaitPeer)) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          ok: false,
-          errorCode: 'BROWSER_LAUNCH_SYNC_TIMEOUT',
-          reason: `浏览器窗口已在线但插件状态尚未就绪（当前阶段：${afterWaitPeer?.phase ?? 'UNKNOWN'}）`,
-        });
-      }
+      if (isPeerWindowOnline(afterWaitPeer))
+        return fail(
+          'BROWSER_LAUNCH_SYNC_TIMEOUT',
+          `浏览器窗口已在线但插件状态尚未就绪（当前阶段：${afterWaitPeer?.phase ?? 'UNKNOWN'}）`,
+        );
     }
-
     let binding = this.opts.browserLabels.binding(profileId);
     if (!binding) {
-      const allRows = await this.opts.store.profileList();
-      await this.opts.browserLabels.refreshNow(
-        allRows.map((p) => String(p.profileId)),
-        this.opts.persistBindings,
-      );
+      await this.refreshBindings();
       binding = this.opts.browserLabels.binding(profileId);
     }
-    if (!binding) {
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        ok: false,
-        launchable: false,
-        errorCode: 'PROFILE_LAUNCH_BINDING_NOT_FOUND',
-        reason:
-          '尚未在本机唯一识别到该已装插件浏览器的本地资料目录（或存在多副本冲突），请先手动正常打开该浏览器一次完成关联',
-      });
-    }
-
+    if (!binding)
+      return fail(
+        'PROFILE_LAUNCH_BINDING_NOT_FOUND',
+        '尚未在本机唯一识别到该已装插件浏览器的本地资料目录（或存在多副本冲突），请先手动正常打开该浏览器一次完成关联',
+        { launchable: false },
+      );
     const verified = await this.opts.browserLabels.verifyBindingOnDisk(binding);
-    if (!verified.ok) {
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        ok: false,
-        launchable: false,
-        errorCode: verified.errorCode,
-        reason: verified.reason,
-      });
-    }
-
+    if (!verified.ok) return fail(verified.errorCode, verified.reason, { launchable: false });
     const validBinding = verified.updatedBinding;
-    if (this.opts.persistBindings) {
-      await this.opts.persistBindings([validBinding]);
-    }
+    if (this.opts.persistBindings) await this.opts.persistBindings([validBinding]);
+    this.runOfflineTabGroupCleanup(
+      profileId,
+      validBinding,
+      'prepare-launch',
+      'prepare-launch',
+      true,
+    );
     const args = buildNormalBrowserLaunchArgs(validBinding);
-
     this.launchingIds.add(profileId);
     try {
-      devDiag.record({
-        level: 'INFO',
-        category: 'BRIDGE_WS',
-        event: 'BROWSER_PROFILE_LAUNCHING',
-        profileId,
-        data: {
-          browserKind: validBinding.browserKind,
-          profileDirectory: validBinding.profileDirectory,
-          browserName: validBinding.browserName,
-        },
+      diagBridge('BROWSER_PROFILE_LAUNCHING', profileId, {
+        browserKind: validBinding.browserKind,
+        profileDirectory: validBinding.profileDirectory,
+        browserName: validBinding.browserName,
       });
       await this.spawnFn(validBinding.executablePath, args);
-      const remainingMs = Math.max(3000, timeoutMs - (Date.now() - startedAt));
-      const { ready, peer } = await this.waitForPeerReady(profileId, remainingMs);
-      if (!ready) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          ok: false,
-          errorCode: 'BROWSER_LAUNCH_SYNC_TIMEOUT',
-          reason: isPeerWindowOnline(peer)
+      const { ready, peer } = await this.waitForPeerReady(
+        profileId,
+        Math.max(3000, timeoutMs - (Date.now() - startedAt)),
+      );
+      if (!ready)
+        return fail(
+          'BROWSER_LAUNCH_SYNC_TIMEOUT',
+          isPeerWindowOnline(peer)
             ? `浏览器已打开但插件状态尚未完成同步（当前阶段：${peer?.phase ?? 'UNKNOWN'}）`
             : '已发出正常启动指令，但在超时时间内未收到该浏览器工作台插件的回连信号',
-        });
-      }
-      devDiag.record({
-        level: 'INFO',
-        category: 'BRIDGE_WS',
-        event: 'BROWSER_PROFILE_LAUNCHED',
-        profileId,
-        data: {
-          phase: peer?.phase ?? 'PAUSED',
-          elapsedMs: Date.now() - startedAt,
-        },
+        );
+      diagBridge('BROWSER_PROFILE_LAUNCHED', profileId, {
+        phase: peer?.phase ?? 'PAUSED',
+        elapsedMs: Date.now() - startedAt,
       });
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        alreadyInTargetState: false,
-        ...(peer?.phase === 'RECOVERING'
-          ? { reason: '浏览器已启动连接，存在待核对记录需先确认' }
-          : {}),
-      });
+      return done(false);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        ok: false,
-        errorCode: 'BROWSER_SPAWN_FAILED',
-        reason: `启动浏览器进程失败：${msg}`,
-      });
+      return fail(
+        'BROWSER_SPAWN_FAILED',
+        `启动浏览器进程失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       this.launchingIds.delete(profileId);
     }
   }
-
   private async closeUnlocked(
     profileId: string,
     action: 'close' | 'restart',
     options: { timeoutMs: number; stopTasksFirst: boolean },
   ): Promise<ProfileLifecycleItemResult> {
-    const startedAt = Date.now();
-    if (!(await this.opts.store.profileSummary(profileId))) {
-      return {
+    const startedAt = Date.now(),
+      done = (alreadyInTargetState: boolean, extra?: Partial<ProfileLifecycleItemResult>) =>
+        this.buildCurrentStatus(profileId, action, startedAt, { alreadyInTargetState, ...extra }),
+      fail = (errorCode: string, reason: string) =>
+        this.buildCurrentStatus(profileId, action, startedAt, { ok: false, errorCode, reason });
+    if (!(await this.opts.store.profileSummary(profileId)))
+      return this.notRegisteredResult(
         profileId,
-        browserName: null,
         action,
-        ok: false,
-        online: false,
-        phase: 'OFFLINE',
-        synced: false,
-        launchable: false,
-        elapsedMs: 0,
-        errorCode: 'PROFILE_NOT_REGISTERED',
-        reason: '该浏览器未安装工作台插件或尚未配对注册，禁止关闭操作',
-      };
-    }
-
+        '该浏览器未安装工作台插件或尚未配对注册，禁止关闭操作',
+      );
     const initialPeer = this.opts.core.peers.get(profileId);
-    if (!initialPeer?.online) {
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        alreadyInTargetState: true,
-      });
-    }
-
+    if (!initialPeer?.online) return done(true);
     if (options.stopTasksFirst && this.opts.stopActiveTasksForProfile) {
       const stopOutcome = await Promise.race([
         this.opts
@@ -407,112 +417,78 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
         this.sleepFn(6_000).then(() => 'TIMEOUT' as const),
       ]);
       if (stopOutcome !== 'STOPPED') {
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'BROWSER_CLOSE_PRESTEP_STOP_INCOMPLETE',
+        diagBridge(
+          'BROWSER_CLOSE_PRESTEP_STOP_INCOMPLETE',
           profileId,
-          reason: stopOutcome === 'TIMEOUT' ? 'STOP_TASKS_TIMEOUT' : stopOutcome.reason,
-        });
+          undefined,
+          'WARN',
+          stopOutcome === 'TIMEOUT' ? 'STOP_TASKS_TIMEOUT' : stopOutcome.reason,
+        );
       }
     }
-
     let peer = this.opts.core.peers.get(profileId);
-    if (!peer?.online) {
-      return this.buildCurrentStatus(profileId, action, startedAt, {
-        alreadyInTargetState: false,
-      });
-    }
-
+    if (!peer?.online) return done(false);
+    const missingCap = () =>
+      fail(
+        'BROWSER_CLOSE_CAPABILITY_MISSING',
+        '该浏览器内工作台插件尚未升级到支持安全单资料关窗的版本，请先重载插件',
+      );
     if (!peer.capabilities?.includes('browser-window-close-v1')) {
       const reloadResult = await Promise.resolve(this.opts.core.reloadExtension(profileId)).catch(
         () => ({ requested: false, reason: 'RELOAD_FAILED' }),
       );
-      if (!reloadResult.requested) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          ok: false,
-          errorCode: 'BROWSER_CLOSE_CAPABILITY_MISSING',
-          reason: '该浏览器内工作台插件尚未升级到支持安全单资料关窗的版本，请先重载插件',
-        });
-      }
-      const reloadDeadline = Date.now() + 5000;
-      while (Date.now() < reloadDeadline) {
-        const current = this.opts.core.peers.get(profileId);
-        if (current?.online && current.capabilities?.includes('browser-window-close-v1')) {
-          peer = current;
-          break;
-        }
-        await this.sleepFn(150);
-      }
+      if (!reloadResult.requested) return missingCap();
+      await this.pollUntil(5000, 150, () => {
+        const c = this.opts.core.peers.get(profileId);
+        return Boolean(c?.online && c.capabilities?.includes('browser-window-close-v1'));
+      });
       peer = this.opts.core.peers.get(profileId);
-      if (!peer?.online) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          alreadyInTargetState: false,
-        });
-      }
-      if (!peer.capabilities?.includes('browser-window-close-v1')) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          ok: false,
-          errorCode: 'BROWSER_CLOSE_CAPABILITY_MISSING',
-          reason: '该浏览器内工作台插件尚未升级到支持安全单资料关窗的版本，请先重载插件',
-        });
-      }
+      if (!peer?.online) return done(false);
+      if (!peer.capabilities?.includes('browser-window-close-v1')) return missingCap();
     }
-
+    if (this.opts.releaseIdleKernelSession) {
+      await Promise.race([
+        this.opts.releaseIdleKernelSession(profileId).catch(() => {}),
+        this.sleepFn(3_000),
+      ]);
+    }
     try {
       await this.opts.core.closeBrowserWindows(profileId, Math.min(options.timeoutMs, 10_000));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'BROWSER_CLOSE_BLOCKED') {
-        // Win32 window teardown can take ~50-300ms after chrome.windows.remove resolves
-        const teardownDeadline = Date.now() + 1200;
-        while (Date.now() < teardownDeadline) {
-          if (!isPeerWindowOnline(this.opts.core.peers.get(profileId))) break;
-          await this.sleepFn(100);
-        }
-      }
-      const afterErrPeer = this.opts.core.peers.get(profileId);
-      if (isPeerWindowOnline(afterErrPeer)) {
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          ok: false,
-          errorCode:
-            msg === 'BROWSER_CLOSE_BLOCKED' ? 'BROWSER_CLOSE_BLOCKED' : 'BROWSER_CLOSE_FAILED',
-          reason:
-            msg === 'BROWSER_CLOSE_BLOCKED'
-              ? '该浏览器窗口存在未确认离开提示或拦截弹窗，未能关闭全部窗口'
-              : `安全关闭该浏览器窗口失败：${msg}`,
-        });
-      }
+      // Win32 window teardown can take ~50-300ms after chrome.windows.remove resolves
+      if (msg === 'BROWSER_CLOSE_BLOCKED')
+        await this.pollUntil(
+          1200,
+          100,
+          () => !isPeerWindowOnline(this.opts.core.peers.get(profileId)),
+        );
+      if (isPeerWindowOnline(this.opts.core.peers.get(profileId)))
+        return fail(
+          msg === 'BROWSER_CLOSE_BLOCKED' ? 'BROWSER_CLOSE_BLOCKED' : 'BROWSER_CLOSE_FAILED',
+          msg === 'BROWSER_CLOSE_BLOCKED'
+            ? '该浏览器窗口存在未确认离开提示或拦截弹窗，未能关闭全部窗口'
+            : `安全关闭该浏览器窗口失败：${msg}`,
+        );
     }
-
-    const waitDeadline = Date.now() + Math.max(1500, options.timeoutMs - (Date.now() - startedAt));
-    while (Date.now() < waitDeadline) {
-      const current = this.opts.core.peers.get(profileId);
-      if (!isPeerWindowOnline(current)) {
-        devDiag.record({
-          level: 'INFO',
-          category: 'BRIDGE_WS',
-          event: 'BROWSER_PROFILE_CLOSED',
-          profileId,
-          data: { elapsedMs: Date.now() - startedAt },
-        });
-        return this.buildCurrentStatus(profileId, action, startedAt, {
-          alreadyInTargetState: false,
-          online: false,
-          phase: 'OFFLINE',
-          synced: false,
-        });
-      }
-      await this.sleepFn(150);
+    if (
+      await this.pollUntil(
+        Math.max(1500, options.timeoutMs - (Date.now() - startedAt)),
+        150,
+        () => !isPeerWindowOnline(this.opts.core.peers.get(profileId)),
+      )
+    ) {
+      const closedBinding = this.opts.browserLabels.binding(profileId);
+      if (closedBinding)
+        this.runOfflineTabGroupCleanup(profileId, closedBinding, 'keep-one', 'keep-one', false);
+      diagBridge('BROWSER_PROFILE_CLOSED', profileId, { elapsedMs: Date.now() - startedAt });
+      return done(false, { online: false, phase: 'OFFLINE', synced: false });
     }
-
-    return this.buildCurrentStatus(profileId, action, startedAt, {
-      ok: false,
-      errorCode: 'BROWSER_CLOSE_UNCONFIRMED',
-      reason: '已发送关闭指令，但该浏览器窗口在超时时间内尚未完全退出连接',
-    });
+    return fail(
+      'BROWSER_CLOSE_UNCONFIRMED',
+      '已发送关闭指令，但该浏览器窗口在超时时间内尚未完全退出连接',
+    );
   }
-
   async ensureProfilesOnline(
     profileIds: readonly string[],
     options?: { timeoutMs?: number | undefined; maxParallelLaunches?: number | undefined },
@@ -520,34 +496,28 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
     const requestedIds = [...new Set(profileIds)];
     const timeoutMs = options?.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
     const maxParallel = Math.max(1, Math.min(6, options?.maxParallelLaunches ?? 3));
-
     const readyIds: string[] = [];
     const launchedIds: string[] = [];
     const failed: EnsureProfilesOnlineResult['failed'] = [];
     const itemsByProfile = new Map<string, ProfileLifecycleItemResult>();
     const toLaunch: string[] = [];
-
     for (const id of requestedIds) {
       const peer = this.opts.core.peers.get(id);
-      if (isPeerWindowOnline(peer) && peer?.synced && peer.phase === 'PAUSED') {
+      if (isPeerIdleReady(peer)) {
         readyIds.push(id);
         itemsByProfile.set(
           id,
           this.buildCurrentStatus(id, 'open', Date.now(), { alreadyInTargetState: true }),
         );
-      } else {
-        toLaunch.push(id);
-      }
+      } else toLaunch.push(id);
     }
-
     if (toLaunch.length > 0) {
       let cursor = 0;
       const workerCount = Math.min(maxParallel, toLaunch.length);
       await Promise.all(
         Array.from({ length: workerCount }, async () => {
           while (cursor < toLaunch.length) {
-            const idx = cursor++;
-            const id = toLaunch[idx];
+            const id = toLaunch[cursor++];
             if (!id) continue;
             const res = await this.launchProfile(id, { timeoutMs });
             itemsByProfile.set(id, res);
@@ -571,7 +541,6 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
         }),
       );
     }
-
     return {
       requestedIds,
       readyIds,

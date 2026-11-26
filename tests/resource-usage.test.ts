@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { summarizeResourceUsage, type ResourceUsageFact } from '../src/domain/resource-usage.js';
+import {
+  summarizeResourceUsage,
+  type ResourceUsageFact,
+} from '../src/domain/resource-material-rules.js';
 import { ResourceUsageSummary } from '../src/shared/resource-table.js';
 
 test('saved-row consumption counts once across accounts and versions while repeated in-flight attempts remain visible', () => {

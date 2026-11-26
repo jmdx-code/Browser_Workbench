@@ -1,30 +1,29 @@
 import type { Awaitable } from './persistence.js';
 import type { Profile, Step } from '../shared/contracts.js';
-import type { Action } from '../shared/browser-actions.js';
 import type {
   Assignment,
   Event,
   Operation,
   Plan,
+  ProfileTaskResultValue,
   Progress,
   RuntimeEvent,
   RuntimeRequest,
   Settings,
   StepInstance,
+  TaskRecord,
+  TaskRecordsResponse,
 } from '../shared/task-contracts.js';
+import type { ResourceOrigin } from '../shared/resource-materials.js';
+import type { RecordProfile } from './task-record-projection.js';
 import { ProductError } from './workspace.js';
-import type { Binding, ExecutionReceipt, ExecutionSession } from '../shared/task-execution.js';
-import type { PendingDiagnostic } from '../shared/browse-execution.js';
-import type { TabProof } from '../shared/kernel-state.js';
-import type { ChildPageLifecycle } from '../shared/task-child-page.js';
-import type { SettlementRepository } from './settlement.js';
-
 export type RuntimeSnapshotResult = {
   settings: Settings;
   plans: Plan[];
   currentSteps: StepInstance[];
+  roundSteps?: StepInstance[];
   recentTerminalPlans: Plan[];
-  profileResults?: import('../shared/task-contracts.js').ProfileTaskResultValue[];
+  profileResults?: ProfileTaskResultValue[];
   events: RuntimeEvent[];
   lastEventSequence: number;
   lastScannedSequence: number;
@@ -44,17 +43,22 @@ export type RuntimeProfile = Pick<
   // Private first failure code; not a display identity or permission to resume.
   unreadyReason?: string;
 };
+export interface DirectPublicationInput {
+  id?: string;
+  jobId: string;
+  stepId: string;
+  accountId: string;
+  combinationId: string;
+  fingerprint: string;
+  postId: string;
+  usageSourceKey: string;
+  allowRepeat: boolean;
+  resourceOrigin?: ResourceOrigin;
+}
 export interface TaskRepository {
-  readonly settlements?: SettlementRepository;
   hiddenRecordIds?(): Awaitable<string[]>;
-  finalRecords?(
-    id: string,
-    round: number,
-  ): Awaitable<import('../shared/task-contracts.js').TaskRecord[] | null>;
-  recordsPage?(
-    input: unknown,
-    profiles: readonly import('./task-record-projection.js').RecordProfile[],
-  ): Awaitable<import('../shared/task-contracts.js').TaskRecordsResponse>;
+  finalRecords?(id: string, round: number): Awaitable<TaskRecord[] | null>;
+  recordsPage?(input: unknown, profiles: readonly RecordProfile[]): Awaitable<TaskRecordsResponse>;
   settings(): Awaitable<Settings>;
   setSettings(value: Settings): Awaitable<void>;
   assign(request: Assignment, profiles: RuntimeProfile[]): Awaitable<Plan[]>;
@@ -73,96 +77,40 @@ export interface TaskRepository {
   events(id: string): Awaitable<Event[]>;
   runtimeSnapshot?(options?: RuntimeRequest): Awaitable<RuntimeSnapshotResult>;
   cacheStateToken?(): Awaitable<string | null>;
-  claimNext(
-    profiles: RuntimeProfile[],
-    supported: ReadonlySet<Step['type']>,
-    sourceCapabilities?: { resourceTables: boolean; profileId?: string },
-  ): Awaitable<Plan | null>;
-  reviewFailedAdmission(id: string, expectedAccountId: string, reason: string): Awaitable<Plan>;
+  claimPlanForProfile(profileId: string, accountId: string | null): Awaitable<Plan | null>;
+  bindPlanAccount(id: string, accountId: string): Awaitable<Plan>;
+  updateStepProgress(id: string, stepId: string, progress: Progress): Awaitable<void>;
+  completeStepDirect(id: string, stepId: string, finalProgress?: Progress): Awaitable<Plan>;
+  skipStepDirect(
+    id: string,
+    stepId: string,
+    reason:
+      | 'DEPENDENCY_FAILED'
+      | 'RESOURCE_EXHAUSTED'
+      | 'FEATURE_UNAVAILABLE'
+      | 'MARKETPLACE_UNAVAILABLE',
+    dependencyStepId?: string,
+  ): Awaitable<Plan>;
+  failStepDirect(
+    id: string,
+    stepId: string,
+    reason: string,
+    businessResult?: 'NOT_APPLICABLE' | 'PUBLISHED' | 'NOT_PUBLISHED' | 'UNKNOWN',
+  ): Awaitable<Plan>;
+  stopPlanDirect(id: string, reason?: string): Awaitable<Plan>;
+  failPlanDirect(id: string, reason: string): Awaitable<Plan>;
+  recordAccountLike(accountId: string, targetKey: string): Awaitable<void>;
+  hasAccountLiked(accountId: string, targetKey: string): Awaitable<boolean>;
+  recordDirectPublication(input: DirectPublicationInput): Awaitable<void>;
+  hasAccountPublishedFingerprint(accountId: string, fingerprint: string): Awaitable<boolean>;
+  isMaterialSourceUsed(usageSourceKey: string): Awaitable<boolean>;
   noteQueuedWait?(id: string, reason: string): Awaitable<void>;
   noteRunningWait?(id: string, reason: string): Awaitable<void>;
-  noteChildPageLifecycle?(binding: Binding, value: ChildPageLifecycle): Awaitable<void>;
-  retainedTaskPage?(profileId: string): Awaitable<TabProof | null>;
-  canRestartStoryPage?(jobId: string, proof: TabProof): Awaitable<boolean>;
-  reconcileRuntime(profiles: RuntimeProfile[]): Awaitable<void>;
-  reconcileProfileRuntime?(profile: RuntimeProfile): Awaitable<void>;
-  requestControl(id: string, mode: 'pause' | 'stop', reason?: string): Awaitable<Plan>;
-  confirmControl(id: string, requestId: string): Awaitable<Plan>;
-  resume(id: string): Awaitable<Plan>;
-  releaseErroredPausedPlans?(profileIds: readonly string[]): Awaitable<number>;
   recoverOnStartup(preserveFutureSchedules?: boolean): Awaitable<void>;
-  unresolved?(id: string): Awaitable<boolean>;
-  stopOfflineBrowse?(
-    id: string,
-    reason?: string,
-    options?: { expectedUpdatedAt?: number; reviewIfBlocked?: boolean },
-  ): Awaitable<Plan | null>;
-  prepareOperation(
-    id: string,
-    stepId: string,
-    operationId: string,
-    action: Action,
-  ): Awaitable<Operation>;
-  takeOperation(): Awaitable<Operation | null>;
-  takeBoundOperation(context: ExecutionSession): Awaitable<Operation | null>;
-  acknowledgeBound(receipt: ExecutionReceipt): Awaitable<void>;
-  releaseBrowseControl?(receipt: ExecutionReceipt): Awaitable<void>;
-  settleBound(
-    receipt: ExecutionReceipt,
-    outcome: 'VERIFIED' | 'NOT_APPLIED',
-    progress?: Progress,
-  ): Awaitable<void>;
-  reconcileBound(
-    receipt: ExecutionReceipt,
-    outcome: 'VERIFIED' | 'NOT_APPLIED',
-    progress?: Progress,
-  ): Awaitable<void>;
-  markBoundUnknown(
-    binding: Binding,
-    reason: string,
-    observation?: ExecutionReceipt,
-  ): Awaitable<void>;
-  noteBrowseReadFailure(
-    jobId: string,
-    stepId: string,
-    context: ExecutionSession,
-    reason: string,
-    diagnostic: PendingDiagnostic,
-    kind?: 'timeout' | 'input-fence',
-  ): Awaitable<void>;
   operations(id: string): Awaitable<Operation[]>;
   recentOperations?(id: string, limit: number): Awaitable<Operation[]>;
   findOperation?(jobId: string, operationId: string): Awaitable<Operation | null>;
   blockingOperations?(id: string): Awaitable<Operation[]>;
-  settleTransientBrowseOperations?(id: string, reason: string): Awaitable<boolean>;
-  noteStepFailure?(id: string, stepId: string, reason: string): Awaitable<void>;
-  markAcknowledged(operationId: string, receipt: Operation['receipt']): Awaitable<void>;
-  settleOperation(
-    operationId: string,
-    outcome: 'VERIFIED' | 'NOT_APPLIED' | 'UNKNOWN',
-    evidence: Operation['receipt'],
-    progress?: Progress,
-  ): Awaitable<void>;
-  checkpoint(
-    id: string,
-    stepId: string,
-    expectedRevision: number,
-    progress: Progress,
-  ): Awaitable<void>;
-  checkpointAsync?(
-    id: string,
-    stepId: string,
-    expectedRevision: number,
-    progress: Progress,
-  ): Awaitable<Promise<void>>;
-  completeStep(id: string, stepId: string): Awaitable<Plan>;
-}
-export interface TaskBrowserPort {
-  profile?(profileId: string): Awaitable<RuntimeProfile | undefined>;
-  // Complete inventory, including offline known profiles. A per-actor subset would mark other plans offline.
-  profiles(): Awaitable<RuntimeProfile[]>;
-  session(profileId: string): Awaitable<ExecutionSession | null>;
-  send(operation: Operation & { binding: Binding }): Promise<ExecutionReceipt>;
 }
 export const terminal = (state: Plan['state']) =>
   ['STOPPED', 'COMPLETED', 'FAILED'].includes(state);
@@ -177,15 +125,15 @@ export function orderedSteps(steps: Step[], randomOrder: boolean, random: () => 
   const result = [...steps];
   if (!randomOrder) return result;
   for (let i = result.length - 1; i > 0; i--) {
-    const value = random();
-    if (!Number.isFinite(value) || value < 0 || value >= 1)
+    const v = random();
+    if (!Number.isFinite(v) || v < 0 || v >= 1)
       throw new ProductError('INVALID_RANDOM_SOURCE', '随机源不符合约束');
-    const j = Math.floor(value * (i + 1));
-    const one = result[i],
-      two = result[j];
-    if (!one || !two) throw new ProductError('STEP_ORDER_INVALID', '子任务顺序不完整');
-    result[i] = two;
-    result[j] = one;
+    const j = Math.floor(v * (i + 1)),
+      a = result[i],
+      b = result[j];
+    if (!a || !b) throw new ProductError('STEP_ORDER_INVALID', '子任务顺序不完整');
+    result[i] = b;
+    result[j] = a;
   }
   return result;
 }
@@ -195,34 +143,24 @@ export const FRIENDS_EXHAUSTED_CURSOR =
 export function validateProgress(spec: Step, previous: Progress, next: Progress) {
   if (next.revision !== previous.revision + 1)
     throw new ProductError('CHECKPOINT_CONFLICT', '执行进度已变化', 409);
+  const acc = next.accepted ?? 0;
   if (
     next.effectiveMilliseconds < previous.effectiveMilliseconds ||
     next.likes < previous.likes ||
     next.published < previous.published ||
-    (next.accepted ?? 0) < (previous.accepted ?? 0)
+    acc < (previous.accepted ?? 0)
   )
     throw new ProductError('CHECKPOINT_REGRESSED', '执行进度不能回退', 409);
-  if (
+  const bad =
     spec.type === 'post'
       ? next.likes !== 0 ||
         next.effectiveMilliseconds !== 0 ||
-        (next.accepted ?? 0) !== 0 ||
+        acc !== 0 ||
         next.published > spec.count
       : spec.type === 'friends'
         ? next.likes !== 0 ||
           next.published !== 0 ||
-          (spec.acceptMode === 'count' && (next.accepted ?? 0) > spec.maxAccepts)
-        : next.likes > spec.maxLikes || next.published !== 0 || (next.accepted ?? 0) !== 0
-  )
-    throw new ProductError('CHECKPOINT_OUT_OF_BOUNDS', '执行进度超出子任务约束', 409);
-}
-export function stepComplete(spec: Step, progress: Progress) {
-  if (spec.type === 'post') return progress.published === spec.count;
-  if (spec.type === 'friends')
-    return (
-      progress.cursor === FRIENDS_EXHAUSTED_CURSOR ||
-      (spec.acceptMode === 'count' && (progress.accepted ?? 0) >= spec.maxAccepts) ||
-      progress.effectiveMilliseconds >= spec.durationMinutes * 60_000
-    );
-  return progress.effectiveMilliseconds >= spec.durationMinutes * 60_000;
+          (spec.acceptMode === 'count' && acc > spec.maxAccepts)
+        : next.likes > spec.maxLikes || next.published !== 0 || acc !== 0;
+  if (bad) throw new ProductError('CHECKPOINT_OUT_OF_BOUNDS', '执行进度超出子任务约束', 409);
 }

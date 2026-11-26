@@ -1,5 +1,4 @@
 import { isFacebookAvatarURL } from '../shared/account-display.js';
-
 // Display-only official endpoint. Never grants task identity or exposes the application token.
 export class GraphAvatar {
   private readonly cache = new Map<string, { url: string | null; until: number }>();

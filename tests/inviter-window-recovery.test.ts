@@ -42,7 +42,6 @@ test('failed non-submit execution retains its binding for final cleanup rather t
     {} as GroupInviterRepository,
     () => undefined,
     () => undefined,
-    () => null,
   );
   const pendingSetup = new Map();
   const conn = {

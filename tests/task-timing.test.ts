@@ -3,10 +3,21 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { TaskTiming } from '../src/shared/task-timing.js';
-import { taskTimingEligibility } from '../src/domain/task-timing.js';
+import { taskTimingEligibility } from '../src/domain/system-ports.js';
 import { SqliteTaskRepository } from '../src/infrastructure/task-store.js';
-import { settlementFixture } from './fixtures/settlement.js';
+import { workspaceFixture } from './fixtures/workspace-fixture.js';
 import type { RuntimeProfile } from '../src/domain/tasks.js';
+
+function claimAny(tasks: SqliteTaskRepository, profiles: RuntimeProfile[]) {
+  const settings = tasks.settings();
+  const running = tasks.livePlans().filter((p) => p.state === 'RUNNING').length;
+  if (running >= settings.maxConcurrentProfiles) return null;
+  for (const p of profiles) {
+    const claimed = tasks.claimPlanForProfile(p.id, p.account.id);
+    if (claimed) return claimed;
+  }
+  return null;
+}
 
 test('daily windows use configured timezone and start-day weekdays for overnight work; missed one-time jobs never catch up', () => {
   const window = TaskTiming.parse({
@@ -28,7 +39,7 @@ test('daily windows use configured timezone and start-day weekdays for overnight
   assert.throws(() => TaskTiming.parse({ ...window, startTime: '24:99' }));
 });
 test('50 scheduled plans pin original combination, release once as a batch and continue concurrency queueing after the startup grace', async () =>
-  settlementFixture(async (store, file) => {
+  workspaceFixture(async (store, file) => {
     const db = new DatabaseSync(file);
     let now = 10000;
     const tasks = new SqliteTaskRepository(db, {
@@ -64,13 +75,12 @@ test('50 scheduled plans pin original combination, release once as a batch and c
       const plans = tasks.assign(request, profiles);
       assert.equal(plans.length, 50);
       tasks.setSettings({ maxConcurrentProfiles: 1 });
-      assert.equal(tasks.claimNext(profiles, new Set(['feed'])), null);
+      assert.equal(claimAny(tasks, profiles), null);
       assert.ok(tasks.list().every((plan) => plan.state === 'QUEUED' && !plan.timingReleased));
-      const edited = await store.writeDraft(row.id, row.revision, {
+      await store.saveCombination(row.id, row.revision, {
         ...row.saved!,
         name: '后来编辑的组合',
       });
-      await store.publish(row.id, edited.revision);
       now = 20000;
       tasks.releaseScheduled();
       tasks.releaseScheduled();
@@ -81,13 +91,13 @@ test('50 scheduled plans pin original combination, release once as a batch and c
         ),
         1,
       );
-      const first = tasks.claimNext(profiles, new Set(['feed']));
+      const first = claimAny(tasks, profiles);
       assert.ok(first);
       assert.equal(first.snapshot.name, '生成定时批量');
       now = 100000;
-      assert.equal(tasks.claimNext(profiles, new Set(['feed'])), null);
+      assert.equal(claimAny(tasks, profiles), null);
       tasks.setSettings({ maxConcurrentProfiles: 2 });
-      const second = tasks.claimNext(profiles, new Set(['feed']));
+      const second = claimAny(tasks, profiles);
       assert.ok(second);
       assert.equal(second.snapshot.name, '生成定时批量');
       assert.ok(tasks.list().every((plan) => plan.state !== 'FAILED'));
@@ -101,7 +111,7 @@ test('50 scheduled plans pin original combination, release once as a batch and c
     }
   }));
 test('restart retains future unstarted schedules but ends released work and missed time; no original operation is replayed', async () =>
-  settlementFixture(async (store, file) => {
+  workspaceFixture(async (store, file) => {
     const db = new DatabaseSync(file);
     let now = 10000;
     const tasks = new SqliteTaskRepository(db, {
@@ -145,7 +155,7 @@ test('restart retains future unstarted schedules but ends released work and miss
       tasks.recoverOnStartup();
       assert.equal(tasks.get(plan.id).state, 'STOPPED');
       assert.equal(tasks.operations(plan.id).length, 0);
-      assert.equal(tasks.claimNext([profile], new Set(['feed'])), null);
+      assert.equal(claimAny(tasks, [profile]), null);
       const restoredProfile = {
         ...profile,
         id: randomUUID(),

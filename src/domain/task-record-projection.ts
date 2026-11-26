@@ -1,24 +1,29 @@
 import type { Plan, StepInstance, Event, Operation, TaskRecord } from '../shared/task-contracts.js';
-export type RecordProjectionRow = {
-  row: TaskRecord;
-  isCurrentStep: boolean;
-  hasUnresolved: boolean;
-};
+type RecordProjectionRow = { row: TaskRecord; isCurrentStep: boolean; hasUnresolved: boolean };
+const COMPLETED_EVENTS = new Set([
+    'STEP_COMPLETED',
+    'STEP_FAILED',
+    'STEP_SKIPPED',
+    'STEP_CONTINUATION_READY',
+  ]),
+  TERMINAL_STATES = new Set(['STOPPED', 'COMPLETED', 'FAILED']);
 export function projectTaskRecords(
   plan: Plan,
   steps: StepInstance[],
   operations: Pick<Operation, 'stepId' | 'createdAt' | 'updatedAt' | 'status' | 'disposition'>[],
   events: Event[],
 ): RecordProjectionRow[] {
-  const allRows: RecordProjectionRow[] = [];
-  const hasUnresolved = operations.some(
-    (op) => op.status === 'UNKNOWN' && op.disposition === undefined,
-  );
-  const firstRunningAt = events.find((event) => event.type === 'RUNNING')?.createdAt ?? null;
-  const roundCreatedAt = new Map<number, number>();
-  const stepCompletedAt = new Map<string, number>();
-  const stepFirstEventAt = new Map<string, number>();
-  const stepLastEventAt = new Map<string, number>();
+  const allRows: RecordProjectionRow[] = [],
+    hasUnresolved = operations.some(
+      (op) => op.status === 'UNKNOWN' && op.disposition === undefined,
+    ),
+    firstRunningAt = events.find((e) => e.type === 'RUNNING')?.createdAt ?? null,
+    roundCreatedAt = new Map<number, number>(),
+    stepCompletedAt = new Map<string, number>(),
+    stepFirstEventAt = new Map<string, number>(),
+    stepLastEventAt = new Map<string, number>(),
+    stepFirstOpAt = new Map<string, number>(),
+    stepLastOpAt = new Map<string, number>();
   for (const event of events) {
     const detail =
       event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)
@@ -30,27 +35,17 @@ export function projectTaskRecords(
     if (stepId) {
       if (!stepFirstEventAt.has(stepId)) stepFirstEventAt.set(stepId, event.createdAt);
       stepLastEventAt.set(stepId, event.createdAt);
-      if (
-        event.type === 'STEP_COMPLETED' ||
-        event.type === 'STEP_FAILED' ||
-        event.type === 'STEP_SKIPPED' ||
-        event.type === 'STEP_CONTINUATION_READY'
-      )
-        stepCompletedAt.set(stepId, event.createdAt);
+      if (COMPLETED_EVENTS.has(event.type)) stepCompletedAt.set(stepId, event.createdAt);
     }
   }
-  const stepFirstOpAt = new Map<string, number>();
-  const stepLastOpAt = new Map<string, number>();
   for (const op of operations) {
-    const prevFirst = stepFirstOpAt.get(op.stepId);
-    if (prevFirst === undefined || op.createdAt < prevFirst)
-      stepFirstOpAt.set(op.stepId, op.createdAt);
-    const prevLast = stepLastOpAt.get(op.stepId);
-    if (prevLast === undefined || op.updatedAt > prevLast)
-      stepLastOpAt.set(op.stepId, op.updatedAt);
+    const f = stepFirstOpAt.get(op.stepId),
+      l = stepLastOpAt.get(op.stepId);
+    if (f === undefined || op.createdAt < f) stepFirstOpAt.set(op.stepId, op.createdAt);
+    if (l === undefined || op.updatedAt > l) stepLastOpAt.set(op.stepId, op.updatedAt);
   }
-  let prevFinishedAt: number | null = null;
-  let prevRound = 0;
+  let prevFinishedAt: number | null = null,
+    prevRound = 0;
   for (const step of steps) {
     if (step.round !== prevRound) {
       prevRound = step.round;
@@ -58,47 +53,41 @@ export function projectTaskRecords(
     }
     let startedAt: number | null = null;
     if (step.status !== 'PENDING') {
-      const opFirst = stepFirstOpAt.get(step.id);
-      const evFirst = stepFirstEventAt.get(step.id);
-      const candidates = [opFirst, evFirst].filter((v): v is number => v !== undefined);
-      if (prevFinishedAt !== null) candidates.push(prevFinishedAt);
-      else if (firstRunningAt !== null) candidates.push(firstRunningAt);
-      else candidates.push(plan.createdAt);
-      startedAt = Math.min(...candidates);
+      const c = [stepFirstOpAt.get(step.id), stepFirstEventAt.get(step.id)].filter(
+        (v): v is number => v !== undefined,
+      );
+      c.push(prevFinishedAt ?? firstRunningAt ?? plan.createdAt);
+      startedAt = Math.min(...c);
     }
     let finishedAt: number | null = null;
-    if (step.outcome?.endedAt !== undefined) {
-      finishedAt = step.outcome.endedAt;
-    } else if (['COMPLETED', 'FAILED', 'SKIPPED'].includes(step.status)) {
+    if (step.outcome?.endedAt !== undefined) finishedAt = step.outcome.endedAt;
+    else if (['COMPLETED', 'FAILED', 'SKIPPED'].includes(step.status))
       finishedAt =
         stepCompletedAt.get(step.id) ??
         stepLastOpAt.get(step.id) ??
         stepLastEventAt.get(step.id) ??
         plan.updatedAt;
-    } else if (
-      step.status === 'ACTIVE' &&
-      ['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state)
-    ) {
+    else if (step.status === 'ACTIVE' && TERMINAL_STATES.has(plan.state))
       finishedAt = stepLastOpAt.get(step.id) ?? plan.updatedAt;
-    }
     if (startedAt !== null && finishedAt !== null && startedAt > finishedAt) startedAt = finishedAt;
     if (finishedAt !== null) prevFinishedAt = finishedAt;
-    const budget =
-      step.spec.type === 'post'
-        ? { kind: 'posts' as const, count: step.spec.count }
-        : step.spec.type === 'friends'
-          ? {
-              kind: 'friends' as const,
-              mode: step.spec.acceptMode,
-              count: step.spec.acceptMode === 'count' ? step.spec.maxAccepts : null,
-            }
-          : { kind: 'time' as const, milliseconds: step.spec.durationMinutes * 60_000 };
-    const isCurrentStep =
-      step.status === 'ACTIVE' ||
-      (step.status === 'PENDING' &&
-        step.round === plan.round &&
-        step.position === plan.position &&
-        !['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state));
+    const { spec } = step,
+      budget =
+        spec.type === 'post'
+          ? { kind: 'posts' as const, count: spec.count }
+          : spec.type === 'friends'
+            ? {
+                kind: 'friends' as const,
+                mode: spec.acceptMode,
+                count: spec.acceptMode === 'count' ? spec.maxAccepts : null,
+              }
+            : { kind: 'time' as const, milliseconds: spec.durationMinutes * 60_000 },
+      isCurrentStep =
+        step.status === 'ACTIVE' ||
+        (step.status === 'PENDING' &&
+          step.round === plan.round &&
+          step.position === plan.position &&
+          !TERMINAL_STATES.has(plan.state));
     allRows.push({
       isCurrentStep,
       hasUnresolved,
@@ -111,9 +100,13 @@ export function projectTaskRecords(
         combinationVersion: plan.version,
         round: step.round,
         position: step.position,
-        type: step.spec.type,
-        ...(step.spec.type === 'post' && step.spec.destination
-          ? { destination: step.spec.destination }
+        type: spec.type,
+        ...(spec.type === 'post' && spec.destination ? { destination: spec.destination } : {}),
+        ...(spec.type === 'friends' && spec.friendAction
+          ? { friendAction: spec.friendAction }
+          : {}),
+        ...(spec.type === 'feed' && spec.feedMode && spec.feedMode !== 'home'
+          ? { feedMode: spec.feedMode }
           : {}),
         status: step.status,
         planState: plan.state,
@@ -128,48 +121,52 @@ export function projectTaskRecords(
       },
     });
   }
-
   return allRows;
 }
-
 export type RecordProfile = {
   id: string;
-  online?: boolean | undefined;
-  alias?: string | null | undefined;
-  browserName?: string | null | undefined;
-  account?: { state: string; id?: string | null | undefined } | null | undefined;
+  online?: boolean;
+  alias?: string | null;
+  browserName?: string | null;
+  account?: { state: string; id?: string | null } | null;
 };
-export const stepTypeSearchText: Record<TaskRecord['type'], string> = {
+const stepTypeSearchText: Record<TaskRecord['type'], string> = {
   feed: '浏览首页 feed',
   video: '浏览 reels video 短视频',
   post: '随机发帖 发布帖子 post',
   marketplace: '浏览商城 marketplace',
   friends: '接受好友请求 friends',
 };
-export function recordMatches(
-  row: Pick<TaskRecord, 'combinationName' | 'profileId' | 'type' | 'destination'>,
+const feedModeText: Record<string, string> = {
+  random_profile: '逛他人时间线 随机时间线 random_profile',
+  random_page: '逛公共专页 随机专页 random_page',
+  search_pages: '搜专页逛时间线 搜索专页 指定专页 search_pages',
+};
+export const recordMatches = (
+  row: Pick<
+    TaskRecord,
+    'combinationName' | 'profileId' | 'type' | 'destination' | 'friendAction' | 'feedMode'
+  >,
   profile: RecordProfile | undefined,
   query: string,
-) {
-  return [
+) =>
+  [
     row.combinationName,
     profile?.browserName ?? '',
     profile?.alias ?? '',
     row.profileId,
     stepTypeSearchText[row.type],
     row.destination === 'story' ? '发布快拍 story' : '',
+    row.friendAction === 'add_suggested' ? '加推荐好友 添加好友 add_suggested' : '',
+    row.feedMode ? (feedModeText[row.feedMode] ?? '') : '',
   ]
     .join(' ')
     .toLocaleLowerCase()
     .includes(query);
-}
-export function compareRecords(a: TaskRecord, b: TaskRecord) {
-  return (
-    (b.finishedAt ?? b.startedAt ?? b.planCreatedAt) -
-      (a.finishedAt ?? a.startedAt ?? a.planCreatedAt) ||
-    b.planCreatedAt - a.planCreatedAt ||
-    b.round - a.round ||
-    b.position - a.position ||
-    b.stepId.localeCompare(a.stepId)
-  );
-}
+export const compareRecords = (a: TaskRecord, b: TaskRecord) =>
+  (b.finishedAt ?? b.startedAt ?? b.planCreatedAt) -
+    (a.finishedAt ?? a.startedAt ?? a.planCreatedAt) ||
+  b.planCreatedAt - a.planCreatedAt ||
+  b.round - a.round ||
+  b.position - a.position ||
+  b.stepId.localeCompare(a.stepId);

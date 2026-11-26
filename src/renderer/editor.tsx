@@ -1,671 +1,420 @@
-import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
-  CombinationDraftSchema,
   CombinationSchema,
   type Combination,
+  type Profile,
   type SavedCombination,
   type Step,
-  type Profile,
 } from '../shared/contracts.js';
+import type { BumperTarget } from '../shared/group-bumper.js';
+import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
+import { bluestacksStepSupport } from './active-quick-step-dialogs.js';
 import { api } from './api.js';
 import {
   newCombination,
   newPostStep,
   normalizeCombinationResources,
-} from './combination-defaults.js';
-import { DraftSession } from './draft-session.js';
-import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
-import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
+} from './modules/module-contracts.js';
+import { Btn, Chk, errMsg } from './modules/shared/module-ui.js';
+import { StepConfigFields } from './step-config-fields.js';
+import { UI_CARD, UI_COUNT_CHIP, UI_INPUT } from './ui/primitives.js';
 
 export { newCombination, normalizeCombinationResources };
 
-const stepNames = {
-  video: '浏览 Reels',
-  feed: '浏览首页',
-  post: '随机发帖',
-  marketplace: '浏览商城',
-  friends: '接受好友请求',
+const normalizeForEditor = (v: Combination): Combination => ({
+  ...normalizeCombinationResources(v),
+  loop: { mode: 'finite', rounds: 1 },
+});
+const FEED_LABELS: Record<string, string> = {
+  random_profile: '逛他人时间线',
+  random_page: '逛公共专页',
+  search_pages: '搜专页逛时间线',
+  home: '浏览首页',
 };
-export interface EditorHandle {
-  persist(): Promise<boolean>;
-}
-export function Editor({
-  initial,
-  onSaved,
-  onClose,
-  notify,
-  ref,
-  onResources,
-  resourceUsage,
-  resourceUsageLoaded,
-}: {
-  initial: SavedCombination;
+const stepHeadingLabel = (step: Step) =>
+  step.type === 'post'
+    ? step.destination === 'story'
+      ? '发布快拍'
+      : '随机发帖'
+    : step.type === 'friends'
+      ? step.friendAction === 'add_suggested'
+        ? '加推荐好友'
+        : '接受好友请求'
+      : step.type === 'marketplace'
+        ? '浏览商城'
+        : step.type === 'video'
+          ? '浏览 Reels'
+          : (FEED_LABELS[step.feedMode ?? 'home'] ?? '浏览首页');
+
+const STEP_BORDER_TONE: Record<Step['type'], string> = {
+  feed: 'border-l-emerald-500',
+  video: 'border-l-violet-500',
+  marketplace: 'border-l-amber-500',
+  friends: 'border-l-sky-500',
+  post: 'border-l-pink-500',
+};
+
+const STEP_PRESETS: ReadonlyArray<[string, (id: string) => Step]> = [
+  [
+    '浏览 Reels',
+    (id) => ({ id, type: 'video', durationMinutes: 15, maxLikes: 0, minLikeCount: 500 }),
+  ],
+  ['浏览首页', (id) => ({ id, type: 'feed', durationMinutes: 4, maxLikes: 0, minLikeCount: 200 })],
+  [
+    '逛时间线 / 专页',
+    (id) => ({
+      id,
+      type: 'feed',
+      feedMode: 'random_profile',
+      detourDwellSeconds: 25,
+      durationMinutes: 5,
+      maxLikes: 0,
+      minLikeCount: 0,
+    }),
+  ],
+  [
+    '浏览商城',
+    (id) => ({
+      id,
+      type: 'marketplace',
+      durationMinutes: 4,
+      keyword: '',
+      maxLikes: 0,
+      minLikeCount: 0,
+    }),
+  ],
+  [
+    '接受好友',
+    (id) => ({
+      id,
+      type: 'friends',
+      durationMinutes: 15,
+      acceptMode: 'count',
+      maxAccepts: 5,
+      maxLikes: 0,
+      minLikeCount: 0,
+    }),
+  ],
+  [
+    '加推荐好友',
+    (id) => ({
+      id,
+      type: 'friends',
+      friendAction: 'add_suggested',
+      durationMinutes: 15,
+      acceptMode: 'count',
+      maxAccepts: 3,
+      maxLikes: 0,
+      minLikeCount: 0,
+    }),
+  ],
+  ['发布快拍', (id) => newPostStep(id, 'story')],
+  ['随机发帖', (id) => newPostStep(id, 'post')],
+];
+
+const BS_SUPPORTED_PRESETS = new Set(['浏览 Reels', '浏览首页', '浏览商城', '接受好友']);
+
+export function Editor(p: {
+  carrier?: 'browser' | 'bluestacks' | undefined;
+  initial: SavedCombination | null;
+  initialValue?: Combination | undefined;
+  onCreated?: (created: SavedCombination) => void;
   onSaved: () => Promise<void>;
+  onSavedAndStart?: (saved: SavedCombination) => Promise<void>;
   onClose: () => void;
   notify: (message: string) => void;
-  ref?: Ref<EditorHandle>;
   selectedProfiles: Profile[];
-  onResources: () => void;
+  selectedTargetCount?: number | undefined;
+  onResources: (row: SavedCombination) => void;
   resourceUsage: ResourceUsageSummaryValue | null;
   resourceUsageLoaded: boolean;
 }) {
-  const [value, setValue] = useState<Combination>(
-    normalizeCombinationResources(initial?.draft ?? initial?.saved ?? newCombination()),
+  const isBs = p.carrier === 'bluestacks';
+  const startTargetCount = isBs
+    ? (p.selectedTargetCount ?? 0)
+    : (p.selectedTargetCount ?? p.selectedProfiles.length);
+  const [currentRow, setCurrentRow] = useState<SavedCombination | null>(p.initial);
+  const currentRowRef = useRef<SavedCombination | null>(p.initial);
+  currentRowRef.current = currentRow;
+  const [value, setValue] = useState<Combination>(() =>
+    normalizeForEditor(p.initial?.saved ?? p.initialValue ?? newCombination()),
   );
   const valueRef = useRef(value);
   valueRef.current = value;
-  const [revision, setRevision] = useState(initial.revision);
-  const [dirty, setDirty] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [autoSaveFailed, setAutoSaveFailed] = useState(false);
-  const [manualSaveRequired, setManualSaveRequired] = useState(false);
-  const [recoveryConflict, setRecoveryConflict] = useState<SavedCombination | null>(null);
-  const generation = useRef(0);
-  const dirtyRef = useRef(false);
-  const saving = useRef(false);
-  const activeSaveRef = useRef<Promise<boolean> | null>(null);
-  const session = useRef(
-    new DraftSession(
-      initial.id,
-      initial.revision,
-      api.draft,
-      initial.draft ?? initial.saved ?? undefined,
-      async () => {
-        const row = (await api.snapshot()).combinations.find((item) => item.id === initial.id);
-        if (!row) throw Error('组合已不存在，当前编辑仍保留');
-        return row;
-      },
-    ),
+  const [dirty, setDirty] = useState(false),
+    [busy, setBusy] = useState(false),
+    [libraryPages, setLibraryPages] = useState<BumperTarget[]>([]);
+
+  const hasSearchPagesStep = value.steps.some(
+    (s) => s.type === 'feed' && s.feedMode === 'search_pages',
   );
-  async function recoverDraft(choice?: 'local' | 'remote') {
+  useEffect(() => {
+    if (!hasSearchPagesStep || libraryPages.length > 0) return;
+    let alive = true;
+    void api
+      .bumperState()
+      .then((s) => alive && setLibraryPages(s.pages ?? []))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [hasSearchPagesStep, libraryPages.length]);
+
+  const generation = useRef(0),
+    saving = useRef(false);
+  const change = (next: Combination | ((prev: Combination) => Combination)) => {
+    generation.current++;
+    setValue((prev) => {
+      const resolved = normalizeForEditor(typeof next === 'function' ? next(prev) : next);
+      valueRef.current = resolved;
+      return resolved;
+    });
+    setDirty(true);
+  };
+  const move = (index: number, offset: number) =>
+    change((prev) => {
+      const steps = [...prev.steps],
+        src = steps[index],
+        dst = steps[index + offset];
+      if (!src || !dst) return prev;
+      steps[index + offset] = src;
+      steps[index] = dst;
+      return { ...prev, steps };
+    });
+
+  async function save(mode: 'save' | 'start' | 'resources') {
+    if (mode === 'resources' && currentRowRef.current) return p.onResources(currentRowRef.current);
     if (saving.current) return;
     saving.current = true;
-    const recoveringGeneration = generation.current;
+    const gen = generation.current;
     setBusy(true);
+    let savedRow: SavedCombination | null = null;
     try {
-      const row = (await api.snapshot()).combinations.find((item) => item.id === initial.id);
-      if (!row) throw Error('组合已不存在，当前编辑仍保留');
-      if (choice === 'remote' && generation.current !== recoveringGeneration)
-        throw Error('读取期间编辑内容已变化，当前编辑保留，请重新选择');
-      if (choice && recoveryConflict?.revision !== row.revision) {
-        setRecoveryConflict(row);
-        throw Error('已保存内容再次变化，请重新选择');
-      }
-      if (!(await session.current.recover(row, !!choice))) {
-        setRecoveryConflict(row);
-        notify('已保存内容与本地版本不同，当前编辑仍保留，请选择如何恢复');
-        return;
-      }
-      setRevision(row.revision);
-      setRecoveryConflict(null);
-      setAutoSaveFailed(false);
-      setManualSaveRequired(choice !== 'remote');
-      if (choice === 'remote') {
-        generation.current++;
-        setValue(normalizeCombinationResources(row.draft ?? row.saved ?? newCombination()));
-        dirtyRef.current = false;
-        setDirty(false);
-      }
-      // Recovery reads and rebases only; the user's next save remains an explicit CAS write.
-      notify(choice === 'remote' ? '已载入保存内容' : '已核对保存状态，当前编辑保留，可以再次保存');
-    } catch (error) {
-      notify(error instanceof Error ? error.message : '保存状态读取失败，当前编辑保留');
+      const parsed = CombinationSchema.safeParse(normalizeForEditor(valueRef.current));
+      if (!parsed.success) throw Error(parsed.error.issues.map((i) => i.message).join('；'));
+      const existing = currentRowRef.current;
+      savedRow = existing
+        ? await api.saveCombination(existing.id, existing.revision, parsed.data)
+        : await api.create(parsed.data);
+      if (!existing) p.onCreated?.(savedRow);
+      currentRowRef.current = savedRow;
+      setCurrentRow(savedRow);
+      if (generation.current === gen) setDirty(false);
+      await p.onSaved();
+      if (mode === 'save') p.notify('已保存');
+    } catch (err) {
+      p.notify(errMsg(err, '保存失败'));
+      savedRow = null;
     } finally {
       saving.current = false;
       setBusy(false);
     }
+    if (!savedRow) return;
+    if (mode === 'resources') return p.onResources(savedRow);
+    if (mode === 'start' && p.onSavedAndStart) await p.onSavedAndStart(savedRow);
+    p.onClose();
   }
-  function change(next: Combination | ((prev: Combination) => Combination)) {
-    generation.current++;
-    setValue((prev) => {
-      const resolved = normalizeCombinationResources(
-        typeof next === 'function' ? next(prev) : next,
-      );
-      valueRef.current = resolved;
-      return resolved;
-    });
-    setAutoSaveFailed(false);
-    setDirty(true);
-    dirtyRef.current = true;
-  }
-  function stepChange(id: string, patch: Partial<Step>) {
-    change((prev) => ({
-      ...prev,
-      steps: prev.steps.map((step) => (step.id === id ? ({ ...step, ...patch } as Step) : step)),
-    }));
-  }
-  function add(type: Step['type'], destination?: 'post' | 'story') {
-    const id = crypto.randomUUID();
-    const step: Step =
-      type === 'post'
-        ? newPostStep(id, destination)
-        : type === 'friends'
-          ? {
-              id,
-              type: 'friends',
-              durationMinutes: 15,
-              acceptMode: 'count',
-              maxAccepts: 5,
-              maxLikes: 0,
-              minLikeCount: 0,
-            }
-          : type === 'marketplace'
-            ? {
-                id,
-                type,
-                durationMinutes: 4,
-                keyword: '',
-                maxLikes: 0,
-                minLikeCount: 0,
-              }
-            : {
-                id,
-                type,
-                durationMinutes: type === 'video' ? 15 : 4,
-                maxLikes: 0,
-                minLikeCount: type === 'video' ? 500 : 200,
-              };
-    change({ ...value, steps: [...value.steps, step] });
-  }
-  function move(index: number, offset: number) {
-    const steps = [...value.steps];
-    const source = steps[index],
-      target = steps[index + offset];
-    if (!source || !target) return;
-    steps[index + offset] = source;
-    steps[index] = target;
-    change({ ...value, steps });
-  }
-  async function save(publish: boolean) {
-    if (saving.current) return;
-    saving.current = true;
-    const savingGeneration = generation.current;
-    setBusy(true);
-    let shouldClose = false;
-    const work = (async (): Promise<boolean> => {
-      try {
-        const parsed = (publish ? CombinationSchema : CombinationDraftSchema).safeParse(
-          normalizeCombinationResources(valueRef.current),
-        );
-        if (!parsed.success)
-          throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
-        const draft =
-          dirtyRef.current || publish ? await session.current.write(parsed.data) : { revision };
-        const saved = publish ? await api.publish(initial.id, draft.revision) : draft;
-        if (publish) session.current.acceptPublishedRevision(saved.revision);
-        setRevision(saved.revision);
-        if (generation.current === savingGeneration) {
-          setDirty(false);
-          dirtyRef.current = false;
-        }
-        setAutoSaveFailed(false);
-        setManualSaveRequired(false);
-        await onSaved();
-        notify(publish ? '组合已保存为新版本' : '草稿已保存，启动仍使用已保存版本');
-        if (publish) shouldClose = true;
-        return true;
-      } catch (error) {
-        setAutoSaveFailed(true);
-        notify(error instanceof Error ? error.message : '保存失败');
-        return false;
-      } finally {
-        saving.current = false;
-        activeSaveRef.current = null;
-        setBusy(false);
-      }
-    })();
-    activeSaveRef.current = work;
-    await work;
-    if (shouldClose) onClose();
-  }
-  async function persist() {
-    if (activeSaveRef.current) {
-      const prevOk = await activeSaveRef.current;
-      if (!prevOk && dirtyRef.current) return false;
-    }
-    if (!dirtyRef.current) return true;
-    if (saving.current) return false;
-    saving.current = true;
-    setBusy(true);
-    const savingGeneration = generation.current;
-    const work = (async (): Promise<boolean> => {
-      try {
-        const parsed = CombinationDraftSchema.safeParse(
-          normalizeCombinationResources(valueRef.current),
-        );
-        if (!parsed.success)
-          throw Error(parsed.error.issues.map((issue) => issue.message).join('；'));
-        const saved = await session.current.write(parsed.data);
-        setRevision(saved.revision);
-        if (generation.current === savingGeneration) {
-          setDirty(false);
-          dirtyRef.current = false;
-        }
-        await onSaved();
-        return generation.current === savingGeneration;
-      } catch (error) {
-        setAutoSaveFailed(true);
-        notify(
-          '草稿未保存，请保留当前编辑：' + (error instanceof Error ? error.message : '保存失败'),
-        );
-        return false;
-      } finally {
-        saving.current = false;
-        activeSaveRef.current = null;
-        setBusy(false);
-      }
-    })();
-    activeSaveRef.current = work;
-    return work;
-  }
-  useImperativeHandle(ref, () => ({ persist }));
-  useEffect(() => {
-    if (!dirty || busy || autoSaveFailed || manualSaveRequired) return;
-    const timer = setTimeout(() => void save(false), 800);
-    return () => clearTimeout(timer);
-  }, [value, dirty, busy, autoSaveFailed, manualSaveRequired]);
+
   return (
-    <section className="editor">
-      <div className="page-heading">
-        <div>
-          <button className="back" onClick={onClose}>
+    <section className="mx-auto flex max-w-[920px] flex-col">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-col items-start gap-1">
+          <Btn v="ghost" className="back -ml-2" onClick={p.onClose}>
             ← 任务组合
-          </button>
-          <h2>{initial.saved ? '编辑任务组合' : '新建任务组合'}</h2>
+          </Btn>
+          <h2 className="m-0 text-lg font-semibold text-slate-900">
+            {currentRow ? '编辑组合' : '新建组合'}
+          </h2>
         </div>
-        <span className="version">
-          {initial.saved ? '已保存 v' + initial.version : '新组合草稿'}
-          {dirty ? ' · 未保存' : ''}
-        </span>
+        {dirty && (
+          <span className="inline-flex h-6 items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 text-xs font-semibold text-amber-800">
+            未保存
+          </span>
+        )}
       </div>
-      {autoSaveFailed && (
-        <div className="error-note draft-recovery" role="alert">
-          <span>保存尚未确认，当前编辑保留。</span>
-          <button disabled={busy} onClick={() => void recoverDraft()}>
-            核对保存状态
-          </button>
-          {recoveryConflict && (
-            <>
-              <span>
-                已保存：{(recoveryConflict.draft ?? recoveryConflict.saved)?.name || '未命名组合'}
-                ，版本 {recoveryConflict.revision}
-              </span>
-              <button disabled={busy} onClick={() => void recoverDraft('local')}>
-                保留当前编辑
-              </button>
-              <button disabled={busy} onClick={() => void recoverDraft('remote')}>
-                载入已保存内容
-              </button>
-            </>
-          )}
-        </div>
-      )}
-      <div className="combination-fields">
-        <label>
-          名称
+      <div className="combination-fields mb-4 grid grid-cols-[minmax(180px,1fr)_minmax(220px,2fr)] gap-3 max-[640px]:grid-cols-1">
+        <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
+          <span>名称</span>
           <input
             maxLength={80}
+            className={`${UI_INPUT} w-full`}
             value={value.name}
-            onChange={(event) => change({ ...value, name: event.target.value })}
+            onChange={(e) => change((c) => ({ ...c, name: e.target.value }))}
           />
         </label>
-        <label className="wide">
-          备注
+        <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
+          <span>备注</span>
           <input
             maxLength={300}
+            className={`${UI_INPUT} w-full`}
             value={value.note}
-            onChange={(event) => change({ ...value, note: event.target.value })}
-            placeholder="说明这个组合的用途"
+            onChange={(e) => change((c) => ({ ...c, note: e.target.value }))}
+            placeholder="可选"
           />
         </label>
       </div>
-      <div className="step-toolbar">
-        <strong>
-          子任务 <span>{value.steps.length}</span>
-        </strong>
-        <div>
-          <button onClick={() => add('video')}>＋ 浏览 Reels</button>
-          <button onClick={() => add('feed')}>＋ 浏览首页</button>
-          <button onClick={() => add('marketplace')}>＋ 浏览商城</button>
-          <button onClick={() => add('friends')}>＋ 接受好友请求</button>
-          <button onClick={() => add('post', 'story')}>＋ 发布快拍</button>
-          <button onClick={() => add('post')}>＋ 随机发帖</button>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-white px-3.5 py-2.5 shadow-2xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <strong className="flex items-center gap-2 text-[13px] font-semibold text-[var(--text)]">
+            <span>步骤</span>
+            <span className={UI_COUNT_CHIP}>{value.steps.length}</span>
+          </strong>
+          {isBs && (
+            <span className="text-[11px] text-[var(--text-3)]">
+              与浏览器端共用组合库 · 蓝蝶支持首页 / Reels / 商城 / 接受好友
+            </span>
+          )}
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {STEP_PRESETS.filter(([label]) => !isBs || BS_SUPPORTED_PRESETS.has(label)).map(
+            ([label, create]) => (
+              <Btn
+                key={label}
+                onClick={() =>
+                  change((prev) => ({
+                    ...prev,
+                    steps: [...prev.steps, create(crypto.randomUUID())],
+                  }))
+                }
+              >
+                ＋ {label}
+              </Btn>
+            ),
+          )}
         </div>
       </div>
-      {value.steps.some((step) => step.type === 'post') && (
-        <div className="combo-resource-bar">
-          <div className="combo-resource-info">
-            <strong>本组合发帖 / 快拍资源表</strong>
-            <span>
-              本组合内所有「随机发帖」与「发布快拍」子任务共用此表；未勾选重复使用时，发布成功后自动从表中移除。
-            </span>
-          </div>
-          <button type="button" className="resource-settings-button" onClick={onResources}>
-            📋 设置发帖资源…（可用 {resourceUsageLoaded ? (resourceUsage?.remaining ?? 0) : '…'}{' '}
-            条）
-          </button>
+      {!isBs && value.steps.some((s) => s.type === 'post') && (
+        <div
+          className={`${UI_CARD} mb-3 flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5`}
+        >
+          <strong className="text-[13px] font-semibold text-[var(--text)]">
+            发帖 / 快拍资源表
+          </strong>
+          <Btn
+            className="border-blue-200 bg-[var(--brand-soft)] font-semibold text-[var(--brand)] hover:not-disabled:bg-blue-100"
+            disabled={busy}
+            onClick={() => void save('resources')}
+          >
+            管理资源（可用 {p.resourceUsageLoaded ? (p.resourceUsage?.remaining ?? 0) : '…'} 条）
+          </Btn>
         </div>
       )}
-      <div className="step-list">
+      <div className="flex flex-col gap-2.5">
         {value.steps.map((step, index) => (
-          <article className={'step step-' + step.type} key={step.id}>
-            <div className="step-heading">
-              <span className="step-number">{index + 1}</span>
-              <strong>
-                {step.type === 'post' && step.destination === 'story'
-                  ? '发布快拍'
-                  : stepNames[step.type]}
+          <article
+            className={`rounded-xl border border-[var(--line)] border-l-[3px] ${STEP_BORDER_TONE[step.type]} bg-white p-3.5 shadow-2xs`}
+            key={step.id}
+          >
+            <div className="mb-2.5 flex items-center gap-2">
+              <span className="inline-grid h-[22px] min-w-[22px] place-content-center rounded-md bg-[var(--surface-3)] px-1.5 text-[11px] font-bold text-[var(--text-2)] tabular-nums">
+                {index + 1}
+              </span>
+              <strong className="text-[13px] font-semibold text-[var(--text)]">
+                {stepHeadingLabel(step)}
               </strong>
-              <div className="step-actions">
-                <button disabled={index === 0} onClick={() => move(index, -1)} title="上移">
+              {isBs && bluestacksStepSupport(step) !== 'supported' && (
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                    bluestacksStepSupport(step) === 'unsupported'
+                      ? 'bg-slate-100 text-slate-500'
+                      : 'bg-amber-50 text-amber-700'
+                  }`}
+                >
+                  {bluestacksStepSupport(step) === 'unsupported'
+                    ? '仅浏览器执行，蓝蝶将跳过'
+                    : '蓝蝶按首页执行'}
+                </span>
+              )}
+              <div className="ml-auto flex items-center gap-1">
+                <Btn
+                  v="ghost"
+                  className="px-2"
+                  disabled={index === 0}
+                  title="上移"
+                  onClick={() => move(index, -1)}
+                >
                   ↑
-                </button>
-                <button
+                </Btn>
+                <Btn
+                  v="ghost"
+                  className="px-2"
                   disabled={index === value.steps.length - 1}
-                  onClick={() => move(index, 1)}
                   title="下移"
+                  onClick={() => move(index, 1)}
                 >
                   ↓
-                </button>
-                <button
+                </Btn>
+                <Btn
+                  v="ghost"
+                  className="px-2"
                   onClick={() =>
-                    change({
-                      ...value,
-                      steps: [
-                        ...value.steps.slice(0, index + 1),
-                        { ...step, id: crypto.randomUUID() },
-                        ...value.steps.slice(index + 1),
-                      ],
+                    change((prev) => {
+                      const idx = prev.steps.findIndex((i) => i.id === step.id),
+                        cur = prev.steps[idx];
+                      return idx < 0 || !cur
+                        ? prev
+                        : {
+                            ...prev,
+                            steps: [
+                              ...prev.steps.slice(0, idx + 1),
+                              { ...structuredClone(cur), id: crypto.randomUUID() },
+                              ...prev.steps.slice(idx + 1),
+                            ],
+                          };
                     })
                   }
                 >
                   复制
-                </button>
-                <button
-                  className="text-danger"
+                </Btn>
+                <Btn
+                  v="ghost"
+                  className="px-2 text-rose-600 hover:not-disabled:bg-rose-50 hover:not-disabled:text-rose-700"
                   onClick={() =>
-                    change({ ...value, steps: value.steps.filter((item) => item.id !== step.id) })
+                    change((prev) => ({
+                      ...prev,
+                      steps: prev.steps.filter((i) => i.id !== step.id),
+                    }))
                   }
                 >
                   删除
-                </button>
+                </Btn>
               </div>
             </div>
-            {step.type === 'friends' ? (
-              <div className="step-fields">
-                <label>
-                  接受方式
-                  <select
-                    value={step.acceptMode}
-                    onChange={(event) =>
-                      stepChange(step.id, {
-                        acceptMode: event.target.value === 'all' ? 'all' : 'count',
-                      })
-                    }
-                  >
-                    <option value="count">指定数量</option>
-                    <option value="all">全部接受</option>
-                  </select>
-                </label>
-                {step.acceptMode === 'count' && (
-                  <label>
-                    接受数量
-                    <div className="unit-field">
-                      <ControlledNumberInput
-                        ariaLabel="接受数量"
-                        min={1}
-                        max={500}
-                        defaultValue={step.maxAccepts}
-                        value={step.maxAccepts}
-                        onChange={(maxAccepts) => stepChange(step.id, { maxAccepts })}
-                      />
-                      <span>个</span>
-                    </div>
-                  </label>
-                )}
-                <label>
-                  最长执行时间
-                  <div className="unit-field">
-                    <ControlledNumberInput
-                      ariaLabel="最长执行时间"
-                      min={1}
-                      max={240}
-                      defaultValue={step.durationMinutes}
-                      value={step.durationMinutes}
-                      onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
-                    />
-                    <span>分钟</span>
-                  </div>
-                </label>
-              </div>
-            ) : step.type !== 'post' ? (
-              <div className="step-fields">
-                <label>
-                  浏览时间
-                  <div className="unit-field">
-                    <ControlledNumberInput
-                      ariaLabel="浏览时间"
-                      min={1}
-                      max={240}
-                      defaultValue={step.durationMinutes}
-                      value={step.durationMinutes}
-                      onChange={(durationMinutes) => stepChange(step.id, { durationMinutes })}
-                    />
-                    <span>分钟</span>
-                  </div>
-                </label>
-                {step.type !== 'marketplace' && (
-                  <>
-                    <label className="check-label browse-like-toggle">
-                      <input
-                        type="checkbox"
-                        checked={step.maxLikes > 0}
-                        onChange={(e) =>
-                          stepChange(step.id, {
-                            maxLikes: e.target.checked ? step.maxLikes || 3 : 0,
-                          })
-                        }
-                      />
-                      随机点赞
-                    </label>
-                    {step.maxLikes > 0 && (
-                      <>
-                        <label>
-                          随机点赞上限
-                          <div className="unit-field">
-                            <ControlledNumberInput
-                              ariaLabel="随机点赞上限"
-                              min={1}
-                              max={100}
-                              defaultValue={step.maxLikes}
-                              value={step.maxLikes}
-                              onChange={(maxLikes) => stepChange(step.id, { maxLikes })}
-                            />
-                            <span>个</span>
-                          </div>
-                        </label>
-                        <label>
-                          目标点赞量至少
-                          <div className="unit-field">
-                            <ControlledNumberInput
-                              ariaLabel="目标点赞量至少"
-                              min={0}
-                              max={1_000_000}
-                              defaultValue={step.minLikeCount}
-                              value={step.minLikeCount}
-                              disabled={step.maxLikes === 0}
-                              onChange={(minLikeCount) => stepChange(step.id, { minLikeCount })}
-                            />
-                            <span>赞</span>
-                          </div>
-                        </label>
-
-                        <label>
-                          单帖触发概率
-                          <div className="unit-field">
-                            <ControlledNumberInput
-                              ariaLabel="单帖触发概率"
-                              min={1}
-                              max={100}
-                              defaultValue={step.likeProbability ?? 35}
-                              value={step.likeProbability ?? 35}
-                              onChange={(likeProbability) =>
-                                stepChange(step.id, { likeProbability })
-                              }
-                            />
-                            <span>%</span>
-                          </div>
-                        </label>
-                        <label>
-                          包含关键词（可选）
-                          <input
-                            maxLength={300}
-                            value={step.includeKeywords ?? ''}
-                            placeholder="多个词用逗号分隔，留空不限"
-                            onChange={(event) =>
-                              stepChange(step.id, {
-                                includeKeywords: event.target.value || undefined,
-                              })
-                            }
-                          />
-                        </label>
-                        <label>
-                          排除关键词（可选）
-                          <input
-                            maxLength={300}
-                            value={step.excludeKeywords ?? ''}
-                            placeholder="遇到含这些词的内容不点赞"
-                            onChange={(event) =>
-                              stepChange(step.id, {
-                                excludeKeywords: event.target.value || undefined,
-                              })
-                            }
-                          />
-                        </label>
-                        <label className="check-label wide">
-                          <input
-                            type="checkbox"
-                            checked={step.skipSponsored ?? true}
-                            onChange={(event) =>
-                              stepChange(step.id, { skipSponsored: event.target.checked })
-                            }
-                          />
-                          自动跳过赞助 / 广告内容（Sponsored）
-                        </label>
-                      </>
-                    )}
-                  </>
-                )}
-              </div>
-            ) : (
-              <div className="post-fields">
-                <label>
-                  {step.destination === 'story' ? '每个账号快拍数' : '每个账号发帖数'}
-                  <div className="unit-field">
-                    <ControlledNumberInput
-                      ariaLabel={step.destination === 'story' ? '每个账号快拍数' : '每个账号发帖数'}
-                      min={1}
-                      max={20}
-                      defaultValue={step.count}
-                      value={step.count}
-                      onChange={(count) => stepChange(step.id, { count })}
-                    />
-                    <span>条</span>
-                  </div>
-                </label>
-                <label>
-                  分享范围
-                  <select
-                    value={step.audience ?? 'preserve-current'}
-                    onChange={(event) =>
-                      stepChange(step.id, {
-                        audience:
-                          event.target.value === 'self'
-                            ? 'self'
-                            : event.target.value === 'friends'
-                              ? 'friends'
-                              : 'preserve-current',
-                      })
-                    }
-                  >
-                    <option value="preserve-current">保持 Facebook 当前范围</option>
-                    <option value="self" disabled={step.destination === 'story'}>
-                      {step.destination === 'story' ? '仅自己（快拍不支持）' : '仅自己'}
-                    </option>
-                    <option value="friends" disabled={step.destination !== 'story'}>
-                      {step.destination === 'story' ? '好友（需当前身份支持）' : '好友（仅快拍）'}
-                    </option>
-                  </select>
-                </label>
-                <label className="check-label">
-                  <input
-                    type="checkbox"
-                    checked={step.allowRepeat}
-                    onChange={(event) => stepChange(step.id, { allowRepeat: event.target.checked })}
-                  />
-                  重复使用素材
-                </label>
-              </div>
-            )}
+            <StepConfigFields
+              carrier={p.carrier}
+              step={step}
+              libraryPages={libraryPages}
+              disabled={busy}
+              onChange={(patch) =>
+                change((prev) => ({
+                  ...prev,
+                  steps: prev.steps.map((s) =>
+                    s.id === step.id ? ({ ...s, ...patch } as Step) : s,
+                  ),
+                }))
+              }
+            />
           </article>
         ))}
       </div>
-      <div className="loop-fields">
-        <label className="check-label">
-          <input
-            type="checkbox"
-            checked={value.randomOrder}
-            onChange={(event) => change({ ...value, randomOrder: event.target.checked })}
-          />
-          随机执行顺序
-        </label>
-        <label>
-          循环
-          <select
-            value={value.loop.mode}
-            onChange={(event) =>
-              change({
-                ...value,
-                loop:
-                  event.target.value === 'finite'
-                    ? { mode: 'finite', rounds: 1 }
-                    : { mode: 'until-stopped' },
-              })
-            }
-          >
-            <option value="finite">指定总轮数</option>
-            <option value="until-stopped">直到手动停止</option>
-          </select>
-        </label>
-        {value.loop.mode === 'finite' && (
-          <label>
-            总轮数
-            <ControlledNumberInput
-              ariaLabel="总轮数"
-              min={1}
-              max={10000}
-              defaultValue={value.loop.rounds}
-              value={value.loop.rounds}
-              onChange={(rounds) =>
-                change((prev) => ({ ...prev, loop: { mode: 'finite', rounds } }))
-              }
-            />
-          </label>
-        )}
-      </div>
-      <footer className="editor-footer">
-        <span>返回自动保存草稿；运行任务使用保存版本。</span>
-        <div>
-          <button disabled={busy} onClick={onClose}>
+      <footer className="editor-footer sticky -bottom-8 -mx-6 mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)] bg-[#eef0f3]/90 px-6 py-3 backdrop-blur-sm max-[1080px]:-mx-3.5 max-[1080px]:px-3.5">
+        <Chk
+          label="随机执行顺序"
+          checked={value.randomOrder}
+          onChange={(randomOrder) => change((c) => ({ ...c, randomOrder }))}
+        />
+        <div className="flex items-center gap-2">
+          <Btn sm={false} disabled={busy} onClick={p.onClose}>
             返回
-          </button>
-          <button
-            className="primary"
-            disabled={busy || !!recoveryConflict}
-            onClick={() => void save(true)}
-          >
+          </Btn>
+          <Btn v="primary" sm={false} disabled={busy} onClick={() => void save('save')}>
             {busy ? '保存中…' : '保存组合'}
-          </button>
+          </Btn>
+          {p.onSavedAndStart && startTargetCount > 0 && (
+            <Btn v="primary" sm={false} disabled={busy} onClick={() => void save('start')}>
+              {busy ? '处理中…' : `保存并启动 (${startTargetCount})`}
+            </Btn>
+          )}
         </div>
       </footer>
     </section>

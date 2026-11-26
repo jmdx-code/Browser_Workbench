@@ -1,9 +1,6 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import { FeatureEvidenceMap } from '../shared/task-features.js';
-import { PublicationAcceptanceScope } from './publication-acceptance-scope.js';
-
 export async function loadServerConfig(root: string) {
   const read = async (file: string): Promise<unknown> =>
     JSON.parse(await readFile(path.join(root, file), 'utf8'));
@@ -32,20 +29,12 @@ export async function loadServerConfig(root: string) {
     })
     .strict()
     .parse(await read('config/execution-acceptance.json'));
-  const featureEvidence = FeatureEvidenceMap.parse(await read('config/feature-evidence.json'));
-  let publicationAcceptanceScope = null;
-  try {
-    publicationAcceptanceScope = PublicationAcceptanceScope.parse(
-      await read('config/publication-acceptance-scope.json'),
-    );
-  } catch (error) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
-  }
   return {
     softwareVersion,
     identity,
     executionAcceptance,
-    featureEvidence,
-    publicationAcceptanceScope,
   };
 }
+export type ExecutionAcceptance = Awaited<
+  ReturnType<typeof loadServerConfig>
+>['executionAcceptance'];

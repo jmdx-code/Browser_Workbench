@@ -8,17 +8,7 @@ test('only explicitly selected ended task histories stop polling; overview and u
     id: 'selected',
     state,
   });
-  for (const state of [
-    'FAILED',
-    'COMPLETED',
-    'STOPPED',
-    'STOPPING',
-    'PAUSING',
-    'REVIEW',
-    'PAUSED',
-    'RUNNING',
-    'QUEUED',
-  ] as const) {
+  for (const state of ['FAILED', 'COMPLETED', 'STOPPED', 'RUNNING', 'QUEUED'] as const) {
     const history = {
       selectedPlanId: 'selected',
       plans: [row(state)],

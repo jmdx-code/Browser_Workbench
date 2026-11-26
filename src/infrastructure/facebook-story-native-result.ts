@@ -1,5 +1,4 @@
 import { z } from 'zod';
-
 const id = z.string().regex(/^\d{1,30}$/);
 const response = z.object({
   errors: z.never().optional(),
@@ -19,47 +18,52 @@ const response = z.object({
   extensions: z.object({ is_final: z.literal(true) }),
 });
 export type NativeStoryCreation = { actorId: string; bucketId: string; storyId: string };
+const storyBaseSchema = z.object({
+  actor_id: id,
+  source: z.literal('WWW'),
+  audiences_is_complete: z.literal(true),
+  audiences: z
+    .array(
+      z
+        .object({ stories: z.object({ self: z.object({ target_id: id }).strict() }).strict() })
+        .strict(),
+    )
+    .length(1),
+});
+const msgSchema = z.object({ text: z.string(), ranges: z.array(z.never()).length(0) }).strict();
+function parseStoryCreateInput<S extends z.ZodTypeAny>(
+  body: string,
+  actorId: string,
+  schema: S,
+  unwrapRoot = false,
+): z.infer<S> | null {
+  const params = new URLSearchParams(body);
+  if (
+    ['av', 'variables', 'fb_api_req_friendly_name'].some((k) => params.getAll(k).length !== 1) ||
+    params.get('av') !== actorId ||
+    params.get('fb_api_req_friendly_name') !== 'StoriesCreateMutation'
+  )
+    return null;
+  const raw = JSON.parse(params.get('variables') ?? ''),
+    target = unwrapRoot ? z.object({ input: z.unknown() }).parse(raw).input : raw?.input,
+    base = storyBaseSchema.passthrough().parse(target);
+  return base.actor_id === actorId && base.audiences[0]?.stories.self.target_id === actorId
+    ? schema.parse(target)
+    : null;
+}
 export function isNativeTextStoryRequest(body: string, actorId: string, text: string) {
   try {
-    const params = new URLSearchParams(body);
-    if (
-      ['av', 'variables', 'fb_api_req_friendly_name'].some(
-        (key) => params.getAll(key).length !== 1,
-      ) ||
-      params.get('av') !== actorId ||
-      params.get('fb_api_req_friendly_name') !== 'StoriesCreateMutation'
-    )
-      return false;
-    const vars = z
-      .object({
-        input: z.object({
-          actor_id: id,
-          source: z.literal('WWW'),
-          audiences_is_complete: z.literal(true),
-          audiences: z
-            .array(
-              z
-                .object({
-                  stories: z.object({ self: z.object({ target_id: id }).strict() }).strict(),
-                })
-                .strict(),
-            )
-            .length(1),
-          message: z.object({ text: z.string(), ranges: z.array(z.never()).length(0) }).strict(),
-          attachments: z.never().optional(),
-        }),
-      })
-      .parse(JSON.parse(params.get('variables') ?? ''));
-    return (
-      vars.input.actor_id === actorId &&
-      vars.input.audiences[0]?.stories.self.target_id === actorId &&
-      vars.input.message.text === text
+    const input = parseStoryCreateInput(
+      body,
+      actorId,
+      storyBaseSchema.extend({ message: msgSchema, attachments: z.never().optional() }),
+      true,
     );
+    return input?.message.text === text;
   } catch {
     return false;
   }
 }
-
 // The observed photo request contains an empty overlays array after native rendering.
 // Original media/text must match before input; unknown/nonempty overlay shapes stay unconfirmed.
 export function isNativeMediaStoryRequest(
@@ -71,48 +75,25 @@ export function isNativeMediaStoryRequest(
 ) {
   if (body.length > 512 * 1024) return false;
   try {
-    const params = new URLSearchParams(body);
-    if (
-      ['av', 'variables', 'fb_api_req_friendly_name'].some(
-        (key) => params.getAll(key).length !== 1,
-      ) ||
-      params.get('av') !== actorId ||
-      params.get('fb_api_req_friendly_name') !== 'StoriesCreateMutation'
-    )
-      return false;
     const attachment =
-      format === 'single-image'
-        ? z
-            .object({
-              photo: z.object({ id, overlays: z.array(z.never()).length(0).optional() }).strict(),
-            })
-            .strict()
-        : z.object({ video: z.object({ id }).strict() }).strict();
-    const input = z
-      .object({
-        actor_id: id,
-        source: z.literal('WWW'),
-        audiences_is_complete: z.literal(true),
-        audiences: z
-          .array(
-            z
+        format === 'single-image'
+          ? z
               .object({
-                stories: z.object({ self: z.object({ target_id: id }).strict() }).strict(),
+                photo: z.object({ id, overlays: z.array(z.never()).length(0).optional() }).strict(),
               })
-              .strict(),
-          )
-          .length(1),
-        message: z
-          .object({ text: z.string(), ranges: z.array(z.never()).length(0) })
-          .strict()
-          .optional(),
-        attachments: z.array(attachment).length(1),
-      })
-      .parse(JSON.parse(params.get('variables') ?? '').input);
+              .strict()
+          : z.object({ video: z.object({ id }).strict() }).strict(),
+      input = parseStoryCreateInput(
+        body,
+        actorId,
+        storyBaseSchema.extend({
+          message: msgSchema.optional(),
+          attachments: z.array(attachment).length(1),
+        }),
+      );
+    if (!input) return false;
     const uploaded = input.attachments[0];
     return (
-      input.actor_id === actorId &&
-      input.audiences[0]?.stories.self.target_id === actorId &&
       (format !== 'video' ||
         expectedVideoId === undefined ||
         (!!uploaded && 'video' in uploaded && uploaded.video.id === expectedVideoId)) &&
@@ -122,7 +103,6 @@ export function isNativeMediaStoryRequest(
     return false;
   }
 }
-
 // This is the observed StoriesCreateMutation, not ordinary ComposerStoryCreateMutation.
 // Complete native creation is accepted only for the matched original request and actor.
 export function parseNativeStoryCreation(
@@ -162,8 +142,4 @@ export function parseNativeStoryCreation(
   } catch {
     return null;
   }
-}
-
-export function nativeStoryResultURL(value: NativeStoryCreation) {
-  return 'https://www.facebook.com/stories/' + value.bucketId + '/' + value.storyId + '/';
 }

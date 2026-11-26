@@ -2,31 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { ProductError } from '../domain/workspace.js';
-import {
-  BluestacksAccountState,
-  BluestacksFolderSchema,
-  BluestacksIdentityType,
-  BluestacksInstanceIdsInput,
-  BluestacksInstanceSchema,
-  BluestacksManagedIdentitySchema,
-  BluestacksRiskLimitSettings,
-  CreateBluestacksFolderInput,
-  DEFAULT_BLUESTACKS_RISK_LIMIT_SETTINGS,
-  DeleteBluestacksFolderInput,
-  RenameBluestacksFolderInput,
-  RenameBluestacksInstanceInput,
-  ReorderBluestacksFoldersInput,
-  ReorderBluestacksInstancesInput,
-  UpdateBluestacksPathsInput,
-  evaluateBluestacksRiskQuota,
-  type BluestacksDailyInstanceStats,
-  type BluestacksDailyUsageOverview,
-  type BluestacksFolder,
-  type BluestacksIdentityType as BluestacksIdentityTypeValue,
-  type BluestacksInstance,
-  type BluestacksManagedIdentity,
-  type BluestacksRawDailyCounts,
-} from '../shared/bluestacks.js';
+import * as BS from '../shared/bluestacks.js';
 import {
   BumperSettings,
   isLocalAvatar,
@@ -36,36 +12,36 @@ import {
   type BumperScope,
   type BumperTarget,
 } from '../shared/group-bumper.js';
+import * as Q from './persistence/sqlite-query-helpers.js';
+import { ensurePostBumpRecordsSchema } from './post-bump-records-store.js';
 import { saveRecordAvatar } from './record-avatar-store.js';
-import { ensureBumperEffects } from './record-retention-migration.js';
 import { transaction } from './sqlite-transaction.js';
+import {
+  BumperLogInputSchema,
+  ensureBumperCommentsSchema,
+  listBumperCommentsFromDb,
+  pickBumperCommentFromDb,
+  queryBumperEligibilityCounts,
+  recordBumpEntryInDb,
+} from './stores/bumper-comments-helper.js';
+import { ensureBumperEffectsSchema } from './group-bumper-store.js';
 import {
   ensureTargetLibrarySchema,
   SqliteTargetLibraryRepository,
 } from './target-library-store.js';
 
-function formatLocalYmd(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
-function sqliteTableExists(db: DatabaseSync, name: string): boolean {
-  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
-}
-
 export function deterministicBluestacksId(instanceKey: string): string {
-  const hash = createHash('sha256')
-    .update('workbench-bluestacks-instance:' + instanceKey.trim())
-    .digest();
-  const b = Uint8Array.from(hash.subarray(0, 16));
+  const b = Uint8Array.from(
+    createHash('sha256')
+      .update('workbench-bluestacks-instance:' + instanceKey.trim())
+      .digest()
+      .subarray(0, 16),
+  );
   b[6] = ((b[6] ?? 0) & 0x0f) | 0x40;
   b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
-  const hex = Buffer.from(b).toString('hex');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  const h = Buffer.from(b).toString('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
-
 export interface DiscoveredInstanceRecord {
   instanceKey: string;
   displayName: string;
@@ -77,328 +53,190 @@ export interface DiscoveredInstanceRecord {
   androidSdk?: number | null;
   fbLiteVersion?: string | null;
 }
-
 export interface BluestacksSavedSettings {
   installDir: string | null;
   confPath: string | null;
   apkPath: string | null;
   bumperSettings: BumperSettings;
   pageBumperSettings: BumperSettings;
-  riskLimitSettings: BluestacksRiskLimitSettings;
+  riskLimitSettings: BS.BluestacksRiskLimitSettings;
 }
 
-const DEFAULT_BLUESTACKS_BUMPER_SETTINGS: BumperSettings = BumperSettings.parse({
+const DEFAULT_BUMPER = BumperSettings.parse({
   searchMode: 'page_group_feed',
   maxConcurrentProfiles: 4,
 });
+const DEFAULT_PAGE_BUMPER = BumperSettings.parse({ maxPostsPerPage: 3, maxConcurrentProfiles: 4 });
 
-const DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS: BumperSettings = BumperSettings.parse({
-  maxPostsPerPage: 3,
-  maxConcurrentProfiles: 4,
-});
+function initBluestacksSchema(db: DatabaseSync): void {
+  ensureTargetLibrarySchema(db);
+  ensurePostBumpRecordsSchema(db);
+  ensureBumperEffectsSchema(db);
+  ensureBumperCommentsSchema(db);
+  Q.ensureRecordAvatarSchema(db);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bluestacks_folders( id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, sort_order INTEGER NOT NULL );
+    CREATE TABLE IF NOT EXISTS bluestacks_instances( id TEXT PRIMARY KEY, instance_key TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, alias TEXT, folder_id TEXT REFERENCES bluestacks_folders(id) ON DELETE SET NULL, sort_order INTEGER NOT NULL DEFAULT 0, adb_port INTEGER NOT NULL DEFAULT 5555, fb_width INTEGER NOT NULL DEFAULT 900, fb_height INTEGER NOT NULL DEFAULT 1600, fb_lite_installed INTEGER, account_state TEXT NOT NULL DEFAULT 'unknown' CHECK(account_state IN ('unknown','logged-in','logged-out','missing-app','restricted','verification')), account_id TEXT NOT NULL DEFAULT '', account_name TEXT NOT NULL DEFAULT '', avatar_url TEXT, last_status TEXT, updated_at INTEGER NOT NULL, identity_type TEXT NOT NULL DEFAULT 'unknown', numeric_account_id TEXT NOT NULL DEFAULT '', managed_identities_json TEXT NOT NULL DEFAULT '[]', android_sdk INTEGER, fb_lite_version TEXT );
+    CREATE INDEX IF NOT EXISTS idx_bluestacks_instances_folder_order ON bluestacks_instances(folder_id, sort_order, instance_key);
+    CREATE TABLE IF NOT EXISTS bluestacks_settings( id INTEGER PRIMARY KEY CHECK(id=1), install_dir TEXT, conf_path TEXT, apk_path TEXT, bumper_settings TEXT NOT NULL DEFAULT '{}', page_bumper_settings TEXT NOT NULL DEFAULT '{}', risk_limit_settings TEXT NOT NULL DEFAULT '{}' );
+    CREATE TABLE IF NOT EXISTS bluestacks_daily_actions( ymd TEXT NOT NULL, instance_id TEXT NOT NULL, active_likes INTEGER NOT NULL DEFAULT 0, active_actions INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY(ymd, instance_id) );
+    INSERT OR IGNORE INTO bluestacks_settings(id, install_dir, conf_path, bumper_settings) VALUES(1, NULL, NULL, '{}');
+  `);
+  Q.ensureColumns(db, 'bluestacks_settings', [
+    ['page_bumper_settings', "TEXT NOT NULL DEFAULT '{}'"],
+    ['apk_path', 'TEXT'],
+    ['risk_limit_settings', "TEXT NOT NULL DEFAULT '{}'"],
+  ]);
+  const tableSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='bluestacks_instances'")
+    .get();
+  const tableSql = String(tableSqlRow?.sql ?? '');
+  if (tableSql && !tableSql.includes("'restricted'")) {
+    const cols = Q.tableColumns(db, 'bluestacks_instances');
+    transaction(db, () => {
+      db.exec(`
+        CREATE TABLE bluestacks_instances_v2( id TEXT PRIMARY KEY, instance_key TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, alias TEXT, folder_id TEXT REFERENCES bluestacks_folders(id) ON DELETE SET NULL, sort_order INTEGER NOT NULL DEFAULT 0, adb_port INTEGER NOT NULL DEFAULT 5555, fb_width INTEGER NOT NULL DEFAULT 900, fb_height INTEGER NOT NULL DEFAULT 1600, fb_lite_installed INTEGER, account_state TEXT NOT NULL DEFAULT 'unknown' CHECK(account_state IN ('unknown','logged-in','logged-out','missing-app','restricted','verification')), account_id TEXT NOT NULL DEFAULT '', account_name TEXT NOT NULL DEFAULT '', avatar_url TEXT, last_status TEXT, updated_at INTEGER NOT NULL, identity_type TEXT NOT NULL DEFAULT 'unknown', numeric_account_id TEXT NOT NULL DEFAULT '', managed_identities_json TEXT NOT NULL DEFAULT '[]', android_sdk INTEGER, fb_lite_version TEXT );
+        INSERT INTO bluestacks_instances_v2( id, instance_key, display_name, alias, folder_id, sort_order, adb_port, fb_width, fb_height, fb_lite_installed, account_state, account_id, account_name, avatar_url, last_status, updated_at, identity_type, numeric_account_id, managed_identities_json, android_sdk, fb_lite_version )
+        SELECT id, instance_key, display_name, alias, folder_id, sort_order, adb_port, fb_width, fb_height, fb_lite_installed, account_state, account_id, account_name, avatar_url, last_status, updated_at, ${cols.has('identity_type') ? 'identity_type' : "'unknown'"}, ${cols.has('numeric_account_id') ? 'numeric_account_id' : "''"}, ${cols.has('managed_identities_json') ? 'managed_identities_json' : "'[]'"}, ${cols.has('android_sdk') ? 'android_sdk' : 'NULL'}, ${cols.has('fb_lite_version') ? 'fb_lite_version' : 'NULL'} FROM bluestacks_instances;
+        DROP TABLE bluestacks_instances;
+        ALTER TABLE bluestacks_instances_v2 RENAME TO bluestacks_instances;
+        CREATE INDEX IF NOT EXISTS idx_bluestacks_instances_folder_order ON bluestacks_instances(folder_id, sort_order, instance_key);
+      `);
+    });
+  } else {
+    Q.ensureColumns(db, 'bluestacks_instances', [
+      ['identity_type', "TEXT NOT NULL DEFAULT 'unknown'"],
+      ['numeric_account_id', "TEXT NOT NULL DEFAULT ''"],
+      ['managed_identities_json', "TEXT NOT NULL DEFAULT '[]'"],
+      ['android_sdk', 'INTEGER'],
+      ['fb_lite_version', 'TEXT'],
+    ]);
+  }
+}
+
+function mapInstanceRow(r: Record<string, unknown>, online = false): BS.BluestacksInstance {
+  const adbPort = Q.n(r.adb_port, 5555),
+    rawSdk = Number(r.android_sdk),
+    rawIds = Q.s(r.managed_identities_json).trim(),
+    parsedIds = rawIds
+      ? Q.parseWithFallback(
+          () => z.array(BS.BluestacksManagedIdentitySchema).safeParse(JSON.parse(rawIds)),
+          null,
+        )
+      : null;
+  const { managedIdentitiesJson: _m, ...base } = Q.camel(r);
+  return BS.BluestacksInstanceSchema.parse({
+    ...base,
+    alias: Q.nonEmptyTrimmed(r.alias),
+    folderId: Q.nonEmptyTrimmed(r.folder_id),
+    adbPort,
+    serial: `127.0.0.1:${adbPort}`,
+    fbWidth: Q.n(r.fb_width, 900),
+    fbHeight: Q.n(r.fb_height, 1600),
+    online,
+    fbLiteInstalled: r.fb_lite_installed === 1 ? true : r.fb_lite_installed === 0 ? false : null,
+    accountState: BS.BluestacksAccountState.parse(Q.s(r.account_state, 'unknown')),
+    avatarUrl: Q.nonEmptyTrimmed(r.avatar_url),
+    lastStatus: Q.nonEmptyTrimmed(r.last_status),
+    identityType: BS.BluestacksIdentityType.parse(Q.s(r.identity_type, 'unknown')),
+    managedIdentities: parsedIds?.success ? parsedIds.data : [],
+    androidSdk: Number.isFinite(rawSdk) && rawSdk > 0 ? Math.round(rawSdk) : null,
+    fbLiteVersion: Q.nonEmptyTrimmed(r.fb_lite_version),
+  });
+}
+
+function saveBluestacksJsonCol<T>(db: DatabaseSync, col: string, parsed: T): T {
+  Q.run(db, `UPDATE bluestacks_settings SET ${col}=? WHERE id=1`, JSON.stringify(parsed));
+  return parsed;
+}
 
 export class SqliteBluestacksRepository {
   private readonly targetLibrary: SqliteTargetLibraryRepository;
-
   constructor(private readonly db: DatabaseSync) {
-    ensureTargetLibrarySchema(db);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS group_bumper_comments(
-        id TEXT PRIMARY KEY,
-        comment_text TEXT NOT NULL,
-        used_count INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        scope TEXT NOT NULL DEFAULT 'group' CHECK(scope IN ('group','page'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_comments_scope
-        ON group_bumper_comments(scope, created_at, id);
-      CREATE TABLE IF NOT EXISTS group_bumper_logs(
-        id TEXT PRIMARY KEY,
-        profile_id TEXT NOT NULL,
-        account_id TEXT NOT NULL,
-        group_id TEXT NOT NULL,
-        group_name TEXT NOT NULL,
-        page_id TEXT NOT NULL,
-        page_name TEXT NOT NULL,
-        post_id TEXT NOT NULL,
-        post_url TEXT NOT NULL,
-        liked INTEGER NOT NULL DEFAULT 0,
-        comment_text TEXT,
-        bumped_at INTEGER NOT NULL,
-        source_mode TEXT NOT NULL DEFAULT 'group' CHECK(source_mode IN ('group','page'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_post ON group_bumper_logs(post_id);
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_account_time ON group_bumper_logs(account_id,bumped_at);
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_profile_post ON group_bumper_logs(profile_id,post_id);
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_bumped_at ON group_bumper_logs(bumped_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_source_mode_bumped ON group_bumper_logs(source_mode, bumped_at DESC);
-      CREATE TABLE IF NOT EXISTS record_avatar_cache(
-        kind TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        image TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(kind, entity_id)
-      );
-      CREATE TABLE IF NOT EXISTS bluestacks_folders(
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-        sort_order INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS bluestacks_instances(
-        id TEXT PRIMARY KEY,
-        instance_key TEXT NOT NULL UNIQUE,
-        display_name TEXT NOT NULL,
-        alias TEXT,
-        folder_id TEXT REFERENCES bluestacks_folders(id) ON DELETE SET NULL,
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        adb_port INTEGER NOT NULL DEFAULT 5555,
-        fb_width INTEGER NOT NULL DEFAULT 900,
-        fb_height INTEGER NOT NULL DEFAULT 1600,
-        fb_lite_installed INTEGER,
-        account_state TEXT NOT NULL DEFAULT 'unknown' CHECK(account_state IN ('unknown','logged-in','logged-out','missing-app','restricted','verification')),
-        account_id TEXT NOT NULL DEFAULT '',
-        account_name TEXT NOT NULL DEFAULT '',
-        avatar_url TEXT,
-        last_status TEXT,
-        updated_at INTEGER NOT NULL,
-        identity_type TEXT NOT NULL DEFAULT 'unknown',
-        numeric_account_id TEXT NOT NULL DEFAULT '',
-        managed_identities_json TEXT NOT NULL DEFAULT '[]',
-        android_sdk INTEGER,
-        fb_lite_version TEXT
-      );
-      CREATE INDEX IF NOT EXISTS idx_bluestacks_instances_folder_order
-        ON bluestacks_instances(folder_id, sort_order, instance_key);
-      CREATE TABLE IF NOT EXISTS bluestacks_settings(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        install_dir TEXT,
-        conf_path TEXT,
-        apk_path TEXT,
-        bumper_settings TEXT NOT NULL DEFAULT '{}',
-        page_bumper_settings TEXT NOT NULL DEFAULT '{}',
-        risk_limit_settings TEXT NOT NULL DEFAULT '{}'
-      );
-      CREATE TABLE IF NOT EXISTS bluestacks_daily_actions(
-        ymd TEXT NOT NULL,
-        instance_id TEXT NOT NULL,
-        active_likes INTEGER NOT NULL DEFAULT 0,
-        active_actions INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY(ymd, instance_id)
-      );
-      INSERT OR IGNORE INTO bluestacks_settings(id, install_dir, conf_path, bumper_settings)
-        VALUES(1, NULL, NULL, '{}');
-    `);
-    const settingCols = db
-      .prepare('PRAGMA table_info(bluestacks_settings)')
-      .all()
-      .map((r) => String(r.name));
-    if (!settingCols.includes('page_bumper_settings')) {
-      db.exec(
-        "ALTER TABLE bluestacks_settings ADD COLUMN page_bumper_settings TEXT NOT NULL DEFAULT '{}';",
-      );
-    }
-    if (!settingCols.includes('apk_path')) {
-      db.exec('ALTER TABLE bluestacks_settings ADD COLUMN apk_path TEXT;');
-    }
-    if (!settingCols.includes('risk_limit_settings')) {
-      db.exec(
-        "ALTER TABLE bluestacks_settings ADD COLUMN risk_limit_settings TEXT NOT NULL DEFAULT '{}';",
-      );
-    }
-
-    // Non-destructive migration for existing bluestacks_instances tables (expand account_state CHECK + new metadata cols)
-    const tableSqlRow = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='bluestacks_instances'")
-      .get();
-    const tableSql = String(tableSqlRow?.sql ?? '');
-    if (tableSql && !tableSql.includes("'restricted'")) {
-      const existingCols = new Set(
-        db
-          .prepare('PRAGMA table_info(bluestacks_instances)')
-          .all()
-          .map((r) => String(r.name)),
-      );
-      transaction(db, () => {
-        db.exec(`
-          CREATE TABLE bluestacks_instances_v2(
-            id TEXT PRIMARY KEY,
-            instance_key TEXT NOT NULL UNIQUE,
-            display_name TEXT NOT NULL,
-            alias TEXT,
-            folder_id TEXT REFERENCES bluestacks_folders(id) ON DELETE SET NULL,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            adb_port INTEGER NOT NULL DEFAULT 5555,
-            fb_width INTEGER NOT NULL DEFAULT 900,
-            fb_height INTEGER NOT NULL DEFAULT 1600,
-            fb_lite_installed INTEGER,
-            account_state TEXT NOT NULL DEFAULT 'unknown' CHECK(account_state IN ('unknown','logged-in','logged-out','missing-app','restricted','verification')),
-            account_id TEXT NOT NULL DEFAULT '',
-            account_name TEXT NOT NULL DEFAULT '',
-            avatar_url TEXT,
-            last_status TEXT,
-            updated_at INTEGER NOT NULL,
-            identity_type TEXT NOT NULL DEFAULT 'unknown',
-            numeric_account_id TEXT NOT NULL DEFAULT '',
-            managed_identities_json TEXT NOT NULL DEFAULT '[]',
-            android_sdk INTEGER,
-            fb_lite_version TEXT
-          );
-          INSERT INTO bluestacks_instances_v2(
-            id, instance_key, display_name, alias, folder_id, sort_order,
-            adb_port, fb_width, fb_height, fb_lite_installed,
-            account_state, account_id, account_name, avatar_url, last_status, updated_at,
-            identity_type, numeric_account_id, managed_identities_json, android_sdk, fb_lite_version
-          )
-          SELECT
-            id, instance_key, display_name, alias, folder_id, sort_order,
-            adb_port, fb_width, fb_height, fb_lite_installed,
-            account_state, account_id, account_name, avatar_url, last_status, updated_at,
-            ${existingCols.has('identity_type') ? 'identity_type' : "'unknown'"},
-            ${existingCols.has('numeric_account_id') ? 'numeric_account_id' : "''"},
-            ${existingCols.has('managed_identities_json') ? 'managed_identities_json' : "'[]'"},
-            ${existingCols.has('android_sdk') ? 'android_sdk' : 'NULL'},
-            ${existingCols.has('fb_lite_version') ? 'fb_lite_version' : 'NULL'}
-          FROM bluestacks_instances;
-          DROP TABLE bluestacks_instances;
-          ALTER TABLE bluestacks_instances_v2 RENAME TO bluestacks_instances;
-          CREATE INDEX IF NOT EXISTS idx_bluestacks_instances_folder_order
-            ON bluestacks_instances(folder_id, sort_order, instance_key);
-        `);
-      });
-    } else {
-      const instCols = db
-        .prepare('PRAGMA table_info(bluestacks_instances)')
-        .all()
-        .map((r) => String(r.name));
-      if (!instCols.includes('identity_type')) {
-        db.exec(
-          "ALTER TABLE bluestacks_instances ADD COLUMN identity_type TEXT NOT NULL DEFAULT 'unknown';",
-        );
-      }
-      if (!instCols.includes('numeric_account_id')) {
-        db.exec(
-          "ALTER TABLE bluestacks_instances ADD COLUMN numeric_account_id TEXT NOT NULL DEFAULT '';",
-        );
-      }
-      if (!instCols.includes('managed_identities_json')) {
-        db.exec(
-          "ALTER TABLE bluestacks_instances ADD COLUMN managed_identities_json TEXT NOT NULL DEFAULT '[]';",
-        );
-      }
-      if (!instCols.includes('android_sdk')) {
-        db.exec('ALTER TABLE bluestacks_instances ADD COLUMN android_sdk INTEGER;');
-      }
-      if (!instCols.includes('fb_lite_version')) {
-        db.exec('ALTER TABLE bluestacks_instances ADD COLUMN fb_lite_version TEXT;');
-      }
-    }
-    ensureBumperEffects(db);
+    initBluestacksSchema(db);
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
   }
-
   savedSettings(): BluestacksSavedSettings {
-    const row = this.db
-      .prepare(
-        'SELECT install_dir, conf_path, apk_path, bumper_settings, page_bumper_settings, risk_limit_settings FROM bluestacks_settings WHERE id=1',
-      )
-      .get();
-    let bumperSettings = DEFAULT_BLUESTACKS_BUMPER_SETTINGS;
-    try {
-      const raw = JSON.parse(String(row?.bumper_settings ?? '{}')) as Record<string, unknown>;
-      bumperSettings = BumperSettings.parse({
-        maxConcurrentProfiles: 4,
-        ...raw,
-      });
-    } catch {
-      bumperSettings = DEFAULT_BLUESTACKS_BUMPER_SETTINGS;
-    }
-    let pageBumperSettings = DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS;
-    try {
-      const rawPage = JSON.parse(String(row?.page_bumper_settings ?? '{}')) as Record<
-        string,
-        unknown
-      >;
-      pageBumperSettings = BumperSettings.parse({
-        maxPostsPerPage: 3,
-        maxConcurrentProfiles: 4,
-        ...rawPage,
-      });
-    } catch {
-      pageBumperSettings = DEFAULT_BLUESTACKS_PAGE_BUMPER_SETTINGS;
-    }
-    let riskLimitSettings = DEFAULT_BLUESTACKS_RISK_LIMIT_SETTINGS;
-    try {
-      const rawRisk = JSON.parse(String(row?.risk_limit_settings ?? '{}')) as Record<
-        string,
-        unknown
-      >;
-      riskLimitSettings = BluestacksRiskLimitSettings.parse(rawRisk);
-    } catch {
-      riskLimitSettings = DEFAULT_BLUESTACKS_RISK_LIMIT_SETTINGS;
-    }
+    const row = Q.getRow(
+      this.db,
+      'SELECT install_dir, conf_path, apk_path, bumper_settings, page_bumper_settings, risk_limit_settings FROM bluestacks_settings WHERE id=1',
+    );
+    const parseBumper = (raw: unknown, extra: Record<string, unknown>, fallback: BumperSettings) =>
+      Q.parseWithFallback(
+        () => BumperSettings.parse({ ...extra, ...Q.parseJsonObject(raw) }),
+        fallback,
+      );
     return {
-      installDir:
-        typeof row?.install_dir === 'string' && row.install_dir.trim()
-          ? row.install_dir.trim()
-          : null,
-      confPath:
-        typeof row?.conf_path === 'string' && row.conf_path.trim() ? row.conf_path.trim() : null,
-      apkPath:
-        typeof row?.apk_path === 'string' && row.apk_path.trim() ? row.apk_path.trim() : null,
-      bumperSettings,
-      pageBumperSettings,
-      riskLimitSettings,
+      installDir: Q.nonEmptyTrimmed(row?.install_dir),
+      confPath: Q.nonEmptyTrimmed(row?.conf_path),
+      apkPath: Q.nonEmptyTrimmed(row?.apk_path),
+      bumperSettings: parseBumper(
+        row?.bumper_settings,
+        { maxConcurrentProfiles: 4 },
+        DEFAULT_BUMPER,
+      ),
+      pageBumperSettings: parseBumper(
+        row?.page_bumper_settings,
+        { maxPostsPerPage: 3, maxConcurrentProfiles: 4 },
+        DEFAULT_PAGE_BUMPER,
+      ),
+      riskLimitSettings: Q.parseWithFallback(
+        () => BS.BluestacksRiskLimitSettings.parse(Q.parseJsonObject(row?.risk_limit_settings)),
+        BS.DEFAULT_BLUESTACKS_RISK_LIMIT_SETTINGS,
+      ),
     };
   }
-
-  saveRiskLimitSettings(input: unknown): BluestacksRiskLimitSettings {
-    const parsed = BluestacksRiskLimitSettings.parse(input);
-    this.db
-      .prepare('UPDATE bluestacks_settings SET risk_limit_settings=? WHERE id=1')
-      .run(JSON.stringify(parsed));
-    return parsed;
+  saveRiskLimitSettings = (input: unknown) =>
+    saveBluestacksJsonCol(
+      this.db,
+      'risk_limit_settings',
+      BS.BluestacksRiskLimitSettings.parse(input),
+    );
+  saveBumperSettings = (input: unknown) =>
+    saveBluestacksJsonCol(this.db, 'bumper_settings', BumperSettings.parse(input));
+  savePageBumperSettings = (input: unknown) =>
+    saveBluestacksJsonCol(this.db, 'page_bumper_settings', BumperSettings.parse(input));
+  savePaths(input: unknown): BluestacksSavedSettings {
+    const p = BS.UpdateBluestacksPathsInput.parse(input),
+      c = this.savedSettings(),
+      sql = 'UPDATE bluestacks_settings SET install_dir=?, conf_path=?, apk_path=? WHERE id=1';
+    Q.run(
+      this.db,
+      sql,
+      p.installDir !== undefined ? p.installDir?.trim() || null : c.installDir,
+      p.confPath !== undefined ? p.confPath?.trim() || null : c.confPath,
+      p.apkPath !== undefined ? p.apkPath?.trim() || null : c.apkPath,
+    );
+    return this.savedSettings();
   }
-
   recordDailyActiveAction(
     instanceId: string,
     kind: 'like' | 'action' = 'like',
     delta = 1,
     now = Date.now(),
   ): void {
-    const parsedId = z.uuid().parse(instanceId);
-    const inc = Math.max(0, Math.round(delta));
+    const parsedId = z.uuid().parse(instanceId),
+      inc = Math.max(0, Math.round(delta));
     if (inc <= 0) return;
-    const ymd = formatLocalYmd(new Date(now));
-    const likeInc = kind === 'like' ? inc : 0;
-    this.db
-      .prepare(
-        `INSERT INTO bluestacks_daily_actions(ymd, instance_id, active_likes, active_actions, updated_at)
-         VALUES(?,?,?,?,?)
-         ON CONFLICT(ymd, instance_id) DO UPDATE SET
-           active_likes = active_likes + excluded.active_likes,
-           active_actions = active_actions + excluded.active_actions,
-           updated_at = excluded.updated_at`,
-      )
-      .run(ymd, parsedId, likeInc, inc, now);
+    const sql =
+      'INSERT INTO bluestacks_daily_actions(ymd, instance_id, active_likes, active_actions, updated_at) VALUES(?,?,?,?,?) ON CONFLICT(ymd, instance_id) DO UPDATE SET active_likes=active_likes+excluded.active_likes, active_actions=active_actions+excluded.active_actions, updated_at=excluded.updated_at';
+    Q.run(
+      this.db,
+      sql,
+      Q.formatLocalYmd(new Date(now)),
+      parsedId,
+      kind === 'like' ? inc : 0,
+      inc,
+      now,
+    );
   }
-
-  dailyInstanceUsage(now = Date.now()): BluestacksDailyUsageOverview {
-    const date = new Date(now);
-    const dateYmd = formatLocalYmd(date);
-    date.setHours(0, 0, 0, 0);
-    const dayStartMs = date.getTime();
-    const saved = this.savedSettings();
-    const riskSettings = saved.riskLimitSettings;
-
-    const instIds = this.db
-      .prepare('SELECT id FROM bluestacks_instances')
-      .all()
-      .map((r) => String(r.id));
-
-    const countsMap = new Map<string, BluestacksRawDailyCounts>();
-    const getOrCreate = (id: string): BluestacksRawDailyCounts => {
-      let c = countsMap.get(id);
+  dailyInstanceUsage(now = Date.now()): BS.BluestacksDailyUsageOverview {
+    const dateYmd = Q.formatLocalYmd(new Date(now)),
+      dayStartMs = Q.localDayStartMs(now),
+      risk = this.savedSettings().riskLimitSettings,
+      counts = new Map<string, BS.BluestacksRawDailyCounts>();
+    const slot = (id: string) => {
+      let c = counts.get(id);
       if (!c) {
         c = {
           groupBumpsToday: 0,
@@ -408,369 +246,184 @@ export class SqliteBluestacksRepository {
           activeLikesToday: 0,
           activeActionsToday: 0,
         };
-        countsMap.set(id, c);
+        counts.set(id, c);
       }
       return c;
     };
-    for (const id of instIds) getOrCreate(id);
-
-    const bumpRows = this.db
-      .prepare(
-        `SELECT profile_id, source_mode, COUNT(*) n
-           FROM group_bumper_effects
-          WHERE applied_at >= ?
-            AND profile_id IN (SELECT id FROM bluestacks_instances)
-          GROUP BY profile_id, source_mode`,
-      )
-      .all(dayStartMs);
-    for (const r of bumpRows) {
-      const c = getOrCreate(String(r.profile_id));
-      if (String(r.source_mode) === 'page') c.pageBumpsToday += Number(r.n ?? 0);
-      else c.groupBumpsToday += Number(r.n ?? 0);
+    for (const r of Q.allRows(this.db, 'SELECT id FROM bluestacks_instances')) slot(Q.s(r.id));
+    const bumpSql =
+      'SELECT profile_id, source_mode, COUNT(*) n FROM group_bumper_effects WHERE applied_at>=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id, source_mode';
+    for (const r of Q.allRows(this.db, bumpSql, dayStartMs)) {
+      const c = slot(Q.s(r.profile_id));
+      if (Q.s(r.source_mode) === 'page') c.pageBumpsToday += Q.n(r.n);
+      else c.groupBumpsToday += Q.n(r.n);
     }
-
-    if (sqliteTableExists(this.db, 'group_poster_logs')) {
-      const postRows = this.db
-        .prepare(
-          `SELECT profile_id, COUNT(*) n
-             FROM group_poster_logs
-            WHERE posted_at >= ?
-              AND profile_id IN (SELECT id FROM bluestacks_instances)
-            GROUP BY profile_id`,
-        )
-        .all(dayStartMs);
-      for (const r of postRows) {
-        getOrCreate(String(r.profile_id)).postsToday += Number(r.n ?? 0);
+    const postSql =
+      "SELECT profile_id, COUNT(*) n FROM post_bump_records WHERE record_type='post' AND status='success' AND created_at>=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id";
+    for (const r of Q.allRows(this.db, postSql, dayStartMs))
+      slot(Q.s(r.profile_id)).postsToday += Q.n(r.n);
+    if (Q.sqliteTableExists(this.db, 'group_inviter_logs')) {
+      const invSql =
+        "SELECT profile_id, COUNT(*) n FROM group_inviter_logs WHERE invited_at>=? AND confirmation='CONFIRMED' AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id";
+      for (const r of Q.allRows(this.db, invSql, dayStartMs))
+        slot(Q.s(r.profile_id)).invitesToday += Q.n(r.n);
+    }
+    const actSql =
+      'SELECT instance_id, active_likes, active_actions FROM bluestacks_daily_actions WHERE ymd=?';
+    for (const r of Q.allRows(this.db, actSql, dateYmd)) {
+      const c = counts.get(Q.s(r.instance_id));
+      if (c) {
+        c.activeLikesToday += Q.n(r.active_likes);
+        c.activeActionsToday += Q.n(r.active_actions);
       }
     }
-
-    if (sqliteTableExists(this.db, 'group_inviter_logs')) {
-      const inviteRows = this.db
-        .prepare(
-          `SELECT profile_id, COUNT(*) n
-             FROM group_inviter_logs
-            WHERE invited_at >= ?
-              AND confirmation = 'CONFIRMED'
-              AND profile_id IN (SELECT id FROM bluestacks_instances)
-            GROUP BY profile_id`,
-        )
-        .all(dayStartMs);
-      for (const r of inviteRows) {
-        getOrCreate(String(r.profile_id)).invitesToday += Number(r.n ?? 0);
-      }
-    }
-
-    const activeRows = this.db
-      .prepare(
-        `SELECT instance_id, active_likes, active_actions
-           FROM bluestacks_daily_actions
-          WHERE ymd = ?`,
-      )
-      .all(dateYmd);
-    for (const r of activeRows) {
-      const id = String(r.instance_id);
-      if (!countsMap.has(id)) continue;
-      const c = getOrCreate(id);
-      c.activeLikesToday += Number(r.active_likes ?? 0);
-      c.activeActionsToday += Number(r.active_actions ?? 0);
-    }
-
-    const perInstance: Record<string, BluestacksDailyInstanceStats> = {};
-    let totalGroupBumps = 0;
-    let totalPageBumps = 0;
-    let totalPosts = 0;
-    let totalInvites = 0;
-    let totalActiveLikes = 0;
-    let totalActions = 0;
-    let reachedLimitInstances = 0;
-
-    for (const [id, raw] of countsMap.entries()) {
-      const evalRes = evaluateBluestacksRiskQuota(riskSettings, id, raw);
-      const stat: BluestacksDailyInstanceStats = {
+    const out: BS.BluestacksDailyUsageOverview = {
+      dateYmd,
+      totalGroupBumps: 0,
+      totalPageBumps: 0,
+      totalPosts: 0,
+      totalInvites: 0,
+      totalActiveLikes: 0,
+      totalActions: 0,
+      reachedLimitInstances: 0,
+      perInstance: {},
+    };
+    for (const [id, raw] of counts) {
+      const ev = BS.evaluateBluestacksRiskQuota(risk, id, raw);
+      out.perInstance[id] = {
         instanceId: id,
         ...raw,
-        totalActionsToday: evalRes.totalActions,
-        effectiveLimits: evalRes.effectiveLimits,
-        hasOverride: evalRes.hasOverride,
-        limitReached: !evalRes.allowed,
-        limitReason: evalRes.reason,
+        totalActionsToday: ev.totalActions,
+        effectiveLimits: ev.effectiveLimits,
+        hasOverride: ev.hasOverride,
+        limitReached: !ev.allowed,
+        limitReason: ev.reason,
       };
-      perInstance[id] = stat;
-      totalGroupBumps += raw.groupBumpsToday;
-      totalPageBumps += raw.pageBumpsToday;
-      totalPosts += raw.postsToday;
-      totalInvites += raw.invitesToday;
-      totalActiveLikes += raw.activeLikesToday;
-      totalActions += evalRes.totalActions;
-      if (!evalRes.allowed) reachedLimitInstances++;
+      out.totalGroupBumps += raw.groupBumpsToday;
+      out.totalPageBumps += raw.pageBumpsToday;
+      out.totalPosts += raw.postsToday;
+      out.totalInvites += raw.invitesToday;
+      out.totalActiveLikes += raw.activeLikesToday;
+      out.totalActions += ev.totalActions;
+      if (!ev.allowed) out.reachedLimitInstances++;
     }
-
-    return {
-      dateYmd,
-      totalGroupBumps,
-      totalPageBumps,
-      totalPosts,
-      totalInvites,
-      totalActiveLikes,
-      totalActions,
-      reachedLimitInstances,
-      perInstance,
-    };
+    return out;
   }
-
-  savePaths(input: unknown): BluestacksSavedSettings {
-    const parsed = UpdateBluestacksPathsInput.parse(input);
-    const current = this.savedSettings();
-    const nextInstall =
-      parsed.installDir !== undefined ? parsed.installDir?.trim() || null : current.installDir;
-    const nextConf =
-      parsed.confPath !== undefined ? parsed.confPath?.trim() || null : current.confPath;
-    const nextApk = parsed.apkPath !== undefined ? parsed.apkPath?.trim() || null : current.apkPath;
-    this.db
-      .prepare('UPDATE bluestacks_settings SET install_dir=?, conf_path=?, apk_path=? WHERE id=1')
-      .run(nextInstall, nextConf, nextApk);
-    return this.savedSettings();
-  }
-
-  saveBumperSettings(input: unknown): BumperSettings {
-    const parsed = BumperSettings.parse(input);
-    this.db
-      .prepare('UPDATE bluestacks_settings SET bumper_settings=? WHERE id=1')
-      .run(JSON.stringify(parsed));
-    return parsed;
-  }
-
-  savePageBumperSettings(input: unknown): BumperSettings {
-    const parsed = BumperSettings.parse(input);
-    this.db
-      .prepare('UPDATE bluestacks_settings SET page_bumper_settings=? WHERE id=1')
-      .run(JSON.stringify(parsed));
-    return parsed;
-  }
-
-  folders(): BluestacksFolder[] {
-    return this.db
-      .prepare('SELECT id, name, sort_order FROM bluestacks_folders ORDER BY sort_order, id')
-      .all()
-      .map((r) =>
-        BluestacksFolderSchema.parse({
-          id: String(r.id),
-          name: String(r.name),
-          sortOrder: Number(r.sort_order),
-        }),
-      );
-  }
-
-  createFolder(input: unknown): BluestacksFolder {
-    const { name } = CreateBluestacksFolderInput.parse(input);
+  folders = (): BS.BluestacksFolder[] => {
+    const sql = 'SELECT id, name, sort_order FROM bluestacks_folders ORDER BY sort_order, id';
+    return Q.allRows(this.db, sql).map((r) => BS.BluestacksFolderSchema.parse(Q.camel(r)));
+  };
+  createFolder(input: unknown): BS.BluestacksFolder {
+    const { name } = BS.CreateBluestacksFolderInput.parse(input);
     return transaction(this.db, () => {
-      const dup = this.db
-        .prepare('SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?)')
-        .get(name);
-      if (dup) throw new ProductError('FOLDER_NAME_EXISTS', '同名分组已存在', 409);
-      const nextOrder = Number(
-        this.db.prepare('SELECT COALESCE(MAX(sort_order),-1)+1 n FROM bluestacks_folders').get()
-          ?.n ?? 0,
+      if (this.db.prepare('SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?)').get(name))
+        throw new ProductError('FOLDER_NAME_EXISTS', '同名分组已存在', 409);
+      const sortOrder = Q.nextSortOrder(this.db, 'bluestacks_folders'),
+        id = randomUUID();
+      Q.run(
+        this.db,
+        'INSERT INTO bluestacks_folders(id, name, sort_order) VALUES(?,?,?)',
+        id,
+        name,
+        sortOrder,
       );
-      const id = randomUUID();
-      this.db
-        .prepare('INSERT INTO bluestacks_folders(id, name, sort_order) VALUES(?,?,?)')
-        .run(id, name, nextOrder);
-      return { id, name, sortOrder: nextOrder };
+      return { id, name, sortOrder };
     });
   }
-
-  renameFolder(input: unknown): BluestacksFolder {
-    const { id, name } = RenameBluestacksFolderInput.parse(input);
+  renameFolder(input: unknown): BS.BluestacksFolder {
+    const { id, name } = BS.RenameBluestacksFolderInput.parse(input);
     return transaction(this.db, () => {
-      const existing = this.db
-        .prepare('SELECT id, sort_order FROM bluestacks_folders WHERE id=?')
-        .get(id);
-      if (!existing) throw new ProductError('FOLDER_NOT_FOUND', '分组不存在', 404);
-      const dup = this.db
-        .prepare('SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?) AND id<>?')
-        .get(name, id);
-      if (dup) throw new ProductError('FOLDER_NAME_EXISTS', '同名分组已存在', 409);
-      this.db.prepare('UPDATE bluestacks_folders SET name=? WHERE id=?').run(name, id);
-      return { id, name, sortOrder: Number(existing.sort_order) };
+      const ex = Q.getRow(this.db, 'SELECT id, sort_order FROM bluestacks_folders WHERE id=?', id);
+      if (!ex) throw new ProductError('FOLDER_NOT_FOUND', '分组不存在', 404);
+      const dupSql = 'SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?) AND id<>?';
+      if (this.db.prepare(dupSql).get(name, id))
+        throw new ProductError('FOLDER_NAME_EXISTS', '同名分组已存在', 409);
+      Q.run(this.db, 'UPDATE bluestacks_folders SET name=? WHERE id=?', name, id);
+      return { id, name, sortOrder: Q.n(ex.sort_order) };
     });
   }
-
   deleteFolder(input: unknown): void {
-    const { id } = DeleteBluestacksFolderInput.parse(input);
+    const { id } = BS.DeleteBluestacksFolderInput.parse(input);
     transaction(this.db, () => {
-      this.db.prepare('UPDATE bluestacks_instances SET folder_id=NULL WHERE folder_id=?').run(id);
-      this.db.prepare('DELETE FROM bluestacks_folders WHERE id=?').run(id);
+      Q.run(this.db, 'UPDATE bluestacks_instances SET folder_id=NULL WHERE folder_id=?', id);
+      Q.run(this.db, 'DELETE FROM bluestacks_folders WHERE id=?', id);
     });
   }
-
   reorderFolders(input: unknown): void {
-    const { ids } = ReorderBluestacksFoldersInput.parse(input);
+    const { ids } = BS.ReorderBluestacksFoldersInput.parse(input);
     transaction(this.db, () => {
-      const known = new Set(this.folders().map((f) => f.id));
-      if (
-        ids.length !== known.size ||
-        new Set(ids).size !== known.size ||
-        ids.some((id) => !known.has(id))
-      ) {
-        throw new ProductError('FOLDER_ORDER_INVALID', '分组列表已变化，请刷新');
-      }
+      const folderIds = new Set(this.folders().map((f) => f.id));
+      Q.assertCompleteIdOrder(ids, folderIds, 'FOLDER_ORDER_INVALID', '分组列表已变化，请刷新');
       const stmt = this.db.prepare('UPDATE bluestacks_folders SET sort_order=? WHERE id=?');
       ids.forEach((id, idx) => stmt.run(idx, id));
     });
   }
-
-  private mapInstanceRow(r: Record<string, unknown>, online = false): BluestacksInstance {
-    const adbPort = Number(r.adb_port ?? 5555);
-    let managedIdentities: BluestacksManagedIdentity[] = [];
-    if (typeof r.managed_identities_json === 'string' && r.managed_identities_json.trim()) {
-      try {
-        const parsed = z
-          .array(BluestacksManagedIdentitySchema)
-          .safeParse(JSON.parse(r.managed_identities_json));
-        if (parsed.success) managedIdentities = parsed.data;
-      } catch {
-        managedIdentities = [];
-      }
-    }
-    const rawSdk = Number(r.android_sdk);
-    return BluestacksInstanceSchema.parse({
-      id: String(r.id),
-      instanceKey: String(r.instance_key),
-      displayName: String(r.display_name),
-      alias: typeof r.alias === 'string' && r.alias.trim() ? r.alias.trim() : null,
-      folderId: typeof r.folder_id === 'string' && r.folder_id ? r.folder_id : null,
-      sortOrder: Number(r.sort_order ?? 0),
-      adbPort,
-      serial: `127.0.0.1:${adbPort}`,
-      fbWidth: Number(r.fb_width ?? 900),
-      fbHeight: Number(r.fb_height ?? 1600),
-      online,
-      fbLiteInstalled: r.fb_lite_installed === 1 ? true : r.fb_lite_installed === 0 ? false : null,
-      accountState: BluestacksAccountState.parse(String(r.account_state ?? 'unknown')),
-      accountId: String(r.account_id ?? ''),
-      accountName: String(r.account_name ?? ''),
-      avatarUrl: typeof r.avatar_url === 'string' && r.avatar_url ? r.avatar_url : null,
-      lastStatus: typeof r.last_status === 'string' && r.last_status ? r.last_status : null,
-      updatedAt: Number(r.updated_at ?? 0),
-      identityType: BluestacksIdentityType.parse(String(r.identity_type ?? 'unknown')),
-      numericAccountId: String(r.numeric_account_id ?? ''),
-      managedIdentities,
-      androidSdk: Number.isFinite(rawSdk) && rawSdk > 0 ? Math.round(rawSdk) : null,
-      fbLiteVersion:
-        typeof r.fb_lite_version === 'string' && r.fb_lite_version.trim()
-          ? r.fb_lite_version.trim()
-          : null,
-    });
+  listInstances(onlineKeys?: ReadonlyArray<string>): BS.BluestacksInstance[] {
+    const onlineSet = new Set(onlineKeys ?? []),
+      sql = 'SELECT * FROM bluestacks_instances ORDER BY sort_order, display_name, instance_key';
+    return Q.allRows(this.db, sql).map((r) =>
+      mapInstanceRow(r, onlineSet.has(Q.s(r.instance_key))),
+    );
   }
-
-  listInstances(onlineKeys?: ReadonlyArray<string>): BluestacksInstance[] {
-    const onlineSet = new Set(onlineKeys ?? []);
-    return this.db
-      .prepare('SELECT * FROM bluestacks_instances ORDER BY sort_order, display_name, instance_key')
-      .all()
-      .map((r) => this.mapInstanceRow(r, onlineSet.has(String(r.instance_key))));
+  getInstance(id: string): BS.BluestacksInstance | null {
+    const sql = 'SELECT * FROM bluestacks_instances WHERE id=?';
+    const row = Q.getRow(this.db, sql, z.uuid().parse(id));
+    return row ? mapInstanceRow(row, false) : null;
   }
-
-  getInstance(id: string): BluestacksInstance | null {
-    const parsedId = z.uuid().parse(id);
-    const row = this.db.prepare('SELECT * FROM bluestacks_instances WHERE id=?').get(parsedId);
-    return row ? this.mapInstanceRow(row, false) : null;
-  }
-
-  upsertDiscoveredInstances(items: ReadonlyArray<DiscoveredInstanceRecord>): BluestacksInstance[] {
+  upsertDiscoveredInstances(
+    items: ReadonlyArray<DiscoveredInstanceRecord>,
+  ): BS.BluestacksInstance[] {
     const now = Date.now();
     return transaction(this.db, () => {
-      let nextOrder = Number(
-        this.db
-          .prepare(
-            'SELECT COALESCE(MAX(sort_order),-1)+1 n FROM bluestacks_instances WHERE folder_id IS NULL',
-          )
-          .get()?.n ?? 0,
-      );
+      let nextOrder = Q.nextSortOrder(this.db, 'bluestacks_instances', 'folder_id IS NULL');
       const selectByKey = this.db.prepare(
         'SELECT * FROM bluestacks_instances WHERE instance_key=?',
       );
-      const insertStmt = this.db.prepare(`
-        INSERT INTO bluestacks_instances(
-          id, instance_key, display_name, alias, folder_id, sort_order,
-          adb_port, fb_width, fb_height, fb_lite_installed,
-          account_state, account_id, account_name, avatar_url, last_status, updated_at,
-          identity_type, numeric_account_id, managed_identities_json, android_sdk, fb_lite_version
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `);
-      const updateStmt = this.db.prepare(`
-        UPDATE bluestacks_instances
-           SET display_name=?,
-               adb_port=?,
-               fb_width=?,
-               fb_height=?,
-               fb_lite_installed=?,
-               account_state=?,
-               android_sdk=COALESCE(?, android_sdk),
-               fb_lite_version=COALESCE(?, fb_lite_version),
-               updated_at=?
-         WHERE instance_key=?
-      `);
-
+      const insSql =
+        'INSERT INTO bluestacks_instances(id,instance_key,display_name,sort_order,adb_port,fb_width,fb_height,fb_lite_installed,account_state,updated_at,android_sdk,fb_lite_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)';
+      const ins = this.db.prepare(insSql),
+        upd = this.db.prepare(
+          'UPDATE bluestacks_instances SET display_name=?, adb_port=?, fb_width=?, fb_height=?, fb_lite_installed=?, account_state=?, android_sdk=COALESCE(?, android_sdk), fb_lite_version=COALESCE(?, fb_lite_version), updated_at=? WHERE instance_key=?',
+        );
       for (const item of items) {
         const key = item.instanceKey.trim();
         if (!key) continue;
-        const existing = selectByKey.get(key);
-        if (!existing) {
-          const id = deterministicBluestacksId(key);
-          const fbLiteFlag =
-            item.fbLiteInstalled === true ? 1 : item.fbLiteInstalled === false ? 0 : null;
-          const initState: BluestacksAccountState =
-            item.fbLiteInstalled === false ? 'missing-app' : 'unknown';
-          insertStmt.run(
-            id,
+        const ex = selectByKey.get(key),
+          inst = item.fbLiteInstalled,
+          instNum = inst === true ? 1 : inst === false ? 0 : null;
+        if (!ex) {
+          const args = [
+            deterministicBluestacksId(key),
             key,
             item.displayName.trim() || key,
-            null,
-            null,
             nextOrder++,
             item.adbPort,
             item.fbWidth,
             item.fbHeight,
-            fbLiteFlag,
-            initState,
-            '',
-            '',
-            null,
-            null,
+            instNum,
+            inst === false ? 'missing-app' : 'unknown',
             now,
-            'unknown',
-            '',
-            '[]',
             item.androidSdk ?? null,
             item.fbLiteVersion ?? null,
-          );
+          ];
+          ins.run(...args);
         } else {
-          const prevInstalled =
-            existing.fb_lite_installed === 1
-              ? true
-              : existing.fb_lite_installed === 0
-                ? false
-                : null;
-          const mergedInstalled =
-            item.fbLiteInstalled !== null ? item.fbLiteInstalled : prevInstalled;
-          const prevState = BluestacksAccountState.parse(
-            String(existing.account_state ?? 'unknown'),
-          );
-          // Anti-regression: preserve confirmed logged-in/restricted/verification account unless live check proves app was uninstalled
-          let nextState: BluestacksAccountState = prevState;
-          if (item.fbLiteInstalled === false) {
-            nextState = 'missing-app';
-          } else if (item.fbLiteInstalled === true && prevState === 'missing-app') {
-            nextState = 'unknown';
-          }
-          updateStmt.run(
-            item.displayName.trim() || String(existing.display_name),
-            item.adbPort > 0 ? item.adbPort : Number(existing.adb_port),
-            item.fbWidth > 0 ? item.fbWidth : Number(existing.fb_width),
-            item.fbHeight > 0 ? item.fbHeight : Number(existing.fb_height),
-            mergedInstalled === true ? 1 : mergedInstalled === false ? 0 : null,
+          const prevInst =
+            ex.fb_lite_installed === 1 ? true : ex.fb_lite_installed === 0 ? false : null;
+          const merged = inst !== null ? inst : prevInst,
+            prevState = BS.BluestacksAccountState.parse(Q.s(ex.account_state, 'unknown'));
+          const nextState: BS.BluestacksAccountState =
+            inst === false
+              ? 'missing-app'
+              : inst === true && prevState === 'missing-app'
+                ? 'unknown'
+                : prevState;
+          upd.run(
+            item.displayName.trim() || Q.s(ex.display_name),
+            item.adbPort > 0 ? item.adbPort : Q.n(ex.adb_port),
+            item.fbWidth > 0 ? item.fbWidth : Q.n(ex.fb_width),
+            item.fbHeight > 0 ? item.fbHeight : Q.n(ex.fb_height),
+            merged === true ? 1 : merged === false ? 0 : null,
             nextState,
             item.androidSdk ?? null,
             item.fbLiteVersion ?? null,
@@ -779,177 +432,115 @@ export class SqliteBluestacksRepository {
           );
         }
       }
-
-      const onlineKeys = items.filter((i) => i.online).map((i) => i.instanceKey);
-      return this.listInstances(onlineKeys);
+      return this.listInstances(items.filter((i) => i.online).map((i) => i.instanceKey));
     });
   }
-
   saveInspectionResult(input: {
     id: string;
     fbLiteInstalled: boolean;
-    accountState: BluestacksAccountState;
+    accountState: BS.BluestacksAccountState;
     accountId?: string;
     accountName?: string;
     avatarUrl?: string | null;
     fbWidth?: number;
     fbHeight?: number;
-    identityType?: BluestacksIdentityTypeValue;
+    identityType?: BS.BluestacksIdentityType;
     numericAccountId?: string;
-    managedIdentities?: ReadonlyArray<BluestacksManagedIdentity>;
+    managedIdentities?: ReadonlyArray<BS.BluestacksManagedIdentity>;
     androidSdk?: number | null;
     fbLiteVersion?: string | null;
-  }): BluestacksInstance {
-    const parsedId = z.uuid().parse(input.id);
-    const now = Date.now();
+  }): BS.BluestacksInstance {
+    const parsedId = z.uuid().parse(input.id),
+      now = Date.now();
     return transaction(this.db, () => {
-      const existing = this.db
-        .prepare('SELECT * FROM bluestacks_instances WHERE id=?')
-        .get(parsedId);
-      if (!existing) throw new ProductError('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
-
-      const clearedAccount =
-        input.accountState === 'logged-out' || input.accountState === 'missing-app';
-      const keepExistingAccount =
-        input.accountState === 'logged-in' ||
-        input.accountState === 'restricted' ||
-        input.accountState === 'verification';
-
-      const prevAvatar = typeof existing.avatar_url === 'string' ? existing.avatar_url : null;
-      let nextAvatar = prevAvatar;
-      if (clearedAccount) {
-        nextAvatar = null;
-      } else if (input.avatarUrl && isLocalAvatar(input.avatarUrl)) {
-        nextAvatar = input.avatarUrl;
-      } else if (input.avatarUrl && !isLocalAvatar(prevAvatar)) {
-        nextAvatar = input.avatarUrl;
-      }
-
-      const prevAccountName = String(existing.account_name ?? '');
-      const nextAccountName = keepExistingAccount
-        ? input.accountName?.trim() || prevAccountName
-        : '';
-      const nameChanged = Boolean(
-        input.accountName?.trim() &&
-        prevAccountName &&
-        input.accountName.trim().toLowerCase() !== prevAccountName.toLowerCase(),
-      );
-
-      const prevNumericId = String(existing.numeric_account_id ?? '');
-      const incomingNumericId =
+      const ex = Q.getRow(this.db, 'SELECT * FROM bluestacks_instances WHERE id=?', parsedId);
+      if (!ex) throw new ProductError('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
+      const cleared = input.accountState === 'logged-out' || input.accountState === 'missing-app',
+        keep = ['logged-in', 'restricted', 'verification'].includes(input.accountState);
+      const prevAv = typeof ex.avatar_url === 'string' ? ex.avatar_url : null;
+      const nextAv = cleared
+        ? null
+        : input.avatarUrl && (isLocalAvatar(input.avatarUrl) || !isLocalAvatar(prevAv))
+          ? input.avatarUrl
+          : prevAv;
+      const prevName = Q.s(ex.account_name),
+        nextName = keep ? input.accountName?.trim() || prevName : '',
+        inName = input.accountName?.trim();
+      const nameCh = Boolean(inName && prevName && inName.toLowerCase() !== prevName.toLowerCase());
+      const inNum =
         input.numericAccountId && /^\d{5,}$/.test(input.numericAccountId.trim())
           ? input.numericAccountId.trim()
           : '';
-      const nextNumericId = clearedAccount
-        ? ''
-        : incomingNumericId || (nameChanged ? '' : prevNumericId);
-
-      const nextAccountId = keepExistingAccount
-        ? input.accountId?.trim() || nextNumericId || String(existing.account_id ?? '')
-        : '';
-
-      const prevIdentityType = BluestacksIdentityType.parse(
-        String(existing.identity_type ?? 'unknown'),
-      );
-      const nextIdentityType: BluestacksIdentityTypeValue = clearedAccount
+      const nextNumId = cleared ? '' : inNum || (nameCh ? '' : Q.s(ex.numeric_account_id));
+      const nextAccId = keep ? input.accountId?.trim() || nextNumId || Q.s(ex.account_id) : '';
+      const nextIdType: BS.BluestacksIdentityType = cleared
         ? 'unknown'
         : input.identityType && input.identityType !== 'unknown'
           ? input.identityType
-          : prevIdentityType;
-
-      const nextManagedJson = clearedAccount
+          : BS.BluestacksIdentityType.parse(Q.s(ex.identity_type, 'unknown'));
+      const nextManagedJson = cleared
         ? '[]'
         : input.managedIdentities !== undefined
-          ? JSON.stringify(z.array(BluestacksManagedIdentitySchema).parse(input.managedIdentities))
-          : String(existing.managed_identities_json ?? '[]');
-
-      this.db
-        .prepare(
-          `UPDATE bluestacks_instances
-              SET fb_lite_installed=?,
-                  account_state=?,
-                  account_id=?,
-                  account_name=?,
-                  avatar_url=?,
-                  identity_type=?,
-                  numeric_account_id=?,
-                  managed_identities_json=?,
-                  android_sdk=COALESCE(?, android_sdk),
-                  fb_lite_version=COALESCE(?, fb_lite_version),
-                  fb_width=COALESCE(?, fb_width),
-                  fb_height=COALESCE(?, fb_height),
-                  updated_at=?
-            WHERE id=?`,
-        )
-        .run(
-          input.fbLiteInstalled ? 1 : 0,
-          input.accountState,
-          nextAccountId,
-          nextAccountName,
-          nextAvatar,
-          nextIdentityType,
-          nextNumericId,
-          nextManagedJson,
-          input.androidSdk ?? null,
-          input.fbLiteVersion ?? null,
-          input.fbWidth ?? null,
-          input.fbHeight ?? null,
-          now,
-          parsedId,
-        );
-
-      if (nextAccountId && nextAvatar && isLocalAvatar(nextAvatar)) {
-        saveRecordAvatar(this.db, 'account', nextAccountId, nextAvatar, now);
+          ? JSON.stringify(
+              z.array(BS.BluestacksManagedIdentitySchema).parse(input.managedIdentities),
+            )
+          : Q.s(ex.managed_identities_json, '[]');
+      const sql =
+        'UPDATE bluestacks_instances SET fb_lite_installed=?, account_state=?, account_id=?, account_name=?, avatar_url=?, identity_type=?, numeric_account_id=?, managed_identities_json=?, android_sdk=COALESCE(?, android_sdk), fb_lite_version=COALESCE(?, fb_lite_version), fb_width=COALESCE(?, fb_width), fb_height=COALESCE(?, fb_height), updated_at=? WHERE id=?';
+      Q.run(
+        this.db,
+        sql,
+        input.fbLiteInstalled ? 1 : 0,
+        input.accountState,
+        nextAccId,
+        nextName,
+        nextAv,
+        nextIdType,
+        nextNumId,
+        nextManagedJson,
+        input.androidSdk ?? null,
+        input.fbLiteVersion ?? null,
+        input.fbWidth ?? null,
+        input.fbHeight ?? null,
+        now,
+        parsedId,
+      );
+      if (nextAv && isLocalAvatar(nextAv)) {
+        if (nextAccId) saveRecordAvatar(this.db, 'account', nextAccId, nextAv, now);
+        if (nextNumId && nextNumId !== nextAccId)
+          saveRecordAvatar(this.db, 'account', nextNumId, nextAv, now);
       }
-      if (
-        nextNumericId &&
-        nextNumericId !== nextAccountId &&
-        nextAvatar &&
-        isLocalAvatar(nextAvatar)
-      ) {
-        saveRecordAvatar(this.db, 'account', nextNumericId, nextAvatar, now);
-      }
-
-      const updated = this.db
-        .prepare('SELECT * FROM bluestacks_instances WHERE id=?')
-        .get(parsedId);
+      const updated = Q.getRow(this.db, 'SELECT * FROM bluestacks_instances WHERE id=?', parsedId);
       if (!updated) throw new ProductError('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
-      return this.mapInstanceRow(updated, true);
+      return mapInstanceRow(updated, true);
     });
   }
-
-  saveLastStatus(id: string, status: string | null): void {
-    const parsedId = z.uuid().parse(id);
-    this.db
-      .prepare('UPDATE bluestacks_instances SET last_status=?, updated_at=? WHERE id=?')
-      .run(status?.slice(0, 300) ?? null, Date.now(), parsedId);
-  }
-
-  renameInstance(input: unknown): BluestacksInstance {
-    const { id, alias } = RenameBluestacksInstanceInput.parse(input);
-    const cleaned = alias?.trim() ? alias.trim() : null;
-    this.db
-      .prepare('UPDATE bluestacks_instances SET alias=?, updated_at=? WHERE id=?')
-      .run(cleaned, Date.now(), id);
+  saveLastStatus = (id: string, status: string | null): void => {
+    const sql = 'UPDATE bluestacks_instances SET last_status=?, updated_at=? WHERE id=?';
+    Q.run(this.db, sql, status?.slice(0, 300) ?? null, Date.now(), z.uuid().parse(id));
+  };
+  renameInstance(input: unknown): BS.BluestacksInstance {
+    const { id, alias } = BS.RenameBluestacksInstanceInput.parse(input);
+    Q.run(
+      this.db,
+      'UPDATE bluestacks_instances SET alias=?, updated_at=? WHERE id=?',
+      alias?.trim() ? alias.trim() : null,
+      Date.now(),
+      id,
+    );
     const row = this.getInstance(id);
     if (!row) throw new ProductError('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
     return row;
   }
-
   reorderInstances(input: unknown): void {
-    const { folderId, ids } = ReorderBluestacksInstancesInput.parse(input);
+    const { folderId, ids } = BS.ReorderBluestacksInstancesInput.parse(input);
     transaction(this.db, () => {
-      if (
-        folderId &&
-        !this.db.prepare('SELECT 1 FROM bluestacks_folders WHERE id=?').get(folderId)
-      ) {
+      if (folderId && !this.db.prepare('SELECT 1 FROM bluestacks_folders WHERE id=?').get(folderId))
         throw new ProductError('FOLDER_NOT_FOUND', '分组不存在', 404);
-      }
-      const moved = [...new Set(ids)];
-      const rest = this.db
-        .prepare('SELECT id FROM bluestacks_instances WHERE folder_id IS ? ORDER BY sort_order, id')
-        .all(folderId)
-        .map((r) => String(r.id))
+      const moved = [...new Set(ids)],
+        sql = 'SELECT id FROM bluestacks_instances WHERE folder_id IS ? ORDER BY sort_order, id';
+      const rest = Q.allRows(this.db, sql, folderId)
+        .map((r) => Q.s(r.id))
         .filter((id) => !moved.includes(id));
       const stmt = this.db.prepare(
         'UPDATE bluestacks_instances SET folder_id=?, sort_order=? WHERE id=?',
@@ -957,16 +548,13 @@ export class SqliteBluestacksRepository {
       [...moved, ...rest].forEach((id, idx) => stmt.run(folderId, idx, id));
     });
   }
-
-  deleteInstances(input: unknown): number {
-    const { instanceIds } = BluestacksInstanceIdsInput.parse(input);
-    return Number(
-      this.db
-        .prepare('DELETE FROM bluestacks_instances WHERE id IN (SELECT value FROM json_each(?))')
-        .run(JSON.stringify(instanceIds)).changes,
+  deleteInstances = (input: unknown): number =>
+    Q.deleteByJsonIds(
+      this.db,
+      'bluestacks_instances',
+      'id',
+      BS.BluestacksInstanceIdsInput.parse(input).instanceIds,
     );
-  }
-
   eligibility(
     accountId: string,
     instanceId: string,
@@ -974,42 +562,20 @@ export class SqliteBluestacksRepository {
     now = Date.now(),
     sourceMode: BumperScope = 'group',
   ) {
-    const saved = this.savedSettings();
-    const settings = sourceMode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
-    const date = new Date(now);
-    date.setHours(0, 0, 0, 0);
-    const today = Number(
-      this.db
-        .prepare(
-          `SELECT COUNT(*) n FROM group_bumper_effects
-            WHERE (account_id=? OR profile_id=?) AND applied_at>=? AND source_mode=?`,
-        )
-        .get(accountId, instanceId, date.getTime(), sourceMode)?.n ?? 0,
+    const saved = this.savedSettings(),
+      settings = sourceMode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
+    const { today, postCount, duplicate } = queryBumperEligibilityCounts(
+      this.db,
+      accountId,
+      instanceId,
+      postId,
+      now,
+      sourceMode,
     );
-    const postCount = postId
-      ? Number(
-          this.db
-            .prepare(
-              'SELECT COUNT(*) n FROM group_bumper_effects WHERE post_id=? AND (liked=1 OR commented=1)',
-            )
-            .get(postId)?.n ?? 0,
-        )
-      : 0;
-    const duplicate = postId
-      ? Boolean(
-          this.db
-            .prepare(
-              'SELECT 1 FROM group_bumper_effects WHERE post_id=? AND (account_id=? OR profile_id=?) LIMIT 1',
-            )
-            .get(postId, accountId, instanceId),
-        )
-      : false;
-    const usage = this.dailyInstanceUsage(now);
-    const instUsage = usage.perInstance[instanceId];
+    const instUsage = this.dailyInstanceUsage(now).perInstance[instanceId];
     const riskEval = instUsage
-      ? evaluateBluestacksRiskQuota(saved.riskLimitSettings, instanceId, instUsage, 'bump')
+      ? BS.evaluateBluestacksRiskQuota(saved.riskLimitSettings, instanceId, instUsage, 'bump')
       : null;
-    const riskAllowed = riskEval ? riskEval.allowed : true;
     return {
       today,
       postCount,
@@ -1017,224 +583,66 @@ export class SqliteBluestacksRepository {
       riskLimitReason: riskEval?.reason ?? null,
       allowed:
         !duplicate &&
-        riskAllowed &&
+        (riskEval ? riskEval.allowed : true) &&
         today < settings.dailyMaxLikesPerAccount &&
         postCount < settings.maxLikesPerPost,
     };
   }
-
   recordBump(input: BumperLog, commentId?: string): boolean {
-    const row = z
-      .object({
-        id: z.uuid(),
-        profileId: z.uuid(),
-        accountId: z.string().min(1),
-        groupId: z.string().min(1),
-        groupName: z.string(),
-        pageId: z.string().min(1),
-        pageName: z.string(),
-        postId: z.string().regex(/^\d+$/),
-        postUrl: z.url(),
-        liked: z.boolean(),
-        commentText: z.string().nullable(),
-        bumpedAt: z.number().int(),
-        sourceMode: z.enum(['group', 'page']).optional(),
-      })
-      .strict()
-      .parse(input);
+    const row = BumperLogInputSchema.parse(input);
     if (!row.liked && !row.commentText) return false;
-    const mode: BumperScope = row.sourceMode ?? 'group';
-    const saved = this.savedSettings();
-    const settings = mode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
-
-    return transaction(this.db, () => {
-      const previous = this.db.prepare('SELECT * FROM group_bumper_logs WHERE id=?').get(row.id);
-      if (
-        !previous &&
-        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt, mode).duplicate
-      ) {
-        return false;
-      }
-      const commentNew = Boolean(row.commentText && !previous?.comment_text);
-      this.db
-        .prepare(
-          `INSERT INTO group_bumper_logs(
-             id,profile_id,account_id,group_id,group_name,page_id,page_name,post_id,post_url,liked,comment_text,bumped_at,source_mode
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(id) DO UPDATE SET
-             liked=MAX(liked,excluded.liked),
-             comment_text=COALESCE(comment_text,excluded.comment_text)`,
-        )
-        .run(
-          row.id,
-          row.profileId,
-          row.accountId,
-          row.groupId,
-          row.groupName,
-          row.pageId,
-          row.pageName,
-          row.postId,
-          row.postUrl,
-          row.liked ? 1 : 0,
-          row.commentText,
-          row.bumpedAt,
-          mode,
-        );
-      if (row.commentText) {
-        this.db.prepare('UPDATE group_bumper_effects SET comment_digest=? WHERE log_id=?').run(
-          createHash('sha256')
-            .update(String(previous?.comment_text ?? row.commentText))
-            .digest('hex'),
-          row.id,
-        );
-      }
-      if (!previous) {
-        if (row.groupId && row.groupId !== '-') {
-          this.targetLibrary.incrementGroupBumpedCount(row.groupId, 1);
-        }
-        if (row.pageId) {
-          this.targetLibrary.incrementPageBumpedCount(row.pageId, 1);
-        }
-      }
-      if (commentNew && commentId) {
-        if (settings.consumeCommentOnUse) {
-          this.db
-            .prepare('DELETE FROM group_bumper_comments WHERE id=? AND comment_text=?')
-            .run(commentId, row.commentText);
-        } else {
-          this.db
-            .prepare(
-              'UPDATE group_bumper_comments SET used_count=used_count+1 WHERE id=? AND comment_text=?',
-            )
-            .run(commentId, row.commentText);
-        }
-      }
-      return !previous;
+    const mode: BumperScope = row.sourceMode ?? 'group',
+      saved = this.savedSettings();
+    return recordBumpEntryInDb({
+      db: this.db,
+      targetLibrary: this.targetLibrary,
+      row: { ...row, storyShared: false },
+      sourceMode: mode,
+      carrier: 'bluestacks',
+      commentId,
+      consumeCommentOnUse: (mode === 'page' ? saved.pageBumperSettings : saved.bumperSettings)
+        .consumeCommentOnUse,
+      isDuplicate: () =>
+        this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt, mode).duplicate,
     });
   }
-
-  targets(kind: 'groups' | 'pages'): BumperTarget[] {
-    return kind === 'groups'
-      ? this.targetLibrary.listBumperGroups()
-      : this.targetLibrary.listPages();
-  }
-
-  comments(scope: BumperScope = 'group'): BumperComment[] {
-    return this.db
-      .prepare('SELECT * FROM group_bumper_comments WHERE scope=? ORDER BY created_at, id')
-      .all(scope)
-      .map((r) => ({
-        id: String(r.id),
-        text: String(r.comment_text),
-        usedCount: Number(r.used_count),
-        createdAt: Number(r.created_at),
-        scope,
-      }));
-  }
-
+  targets = (kind: 'groups' | 'pages'): BumperTarget[] =>
+    kind === 'groups' ? this.targetLibrary.listBumperGroups() : this.targetLibrary.listPages();
+  comments = (scope: BumperScope = 'group'): BumperComment[] =>
+    listBumperCommentsFromDb(this.db, scope, false);
   pickComment(
     postId: string,
     random = Math.random(),
     excludeIds: ReadonlyArray<string> = [],
     scope: BumperScope = 'group',
   ): BumperComment | null {
-    const excluded = new Set(excludeIds);
-    const digests = new Set(
-      this.db
-        .prepare(
-          'SELECT comment_digest FROM group_bumper_effects WHERE post_id=? AND comment_digest IS NOT NULL',
-        )
-        .all(postId)
-        .map((r) => String(r.comment_digest)),
-    );
-    const used = new Set(
-      this.db
-        .prepare(
-          'SELECT comment_text FROM group_bumper_logs WHERE post_id=? AND comment_text IS NOT NULL',
-        )
-        .all(postId)
-        .map((r) => String(r.comment_text)),
-    );
-    const all = this.comments(scope).filter((r) => !excluded.has(r.id));
-    const unused = all.filter(
-      (r) => !used.has(r.text) && !digests.has(createHash('sha256').update(r.text).digest('hex')),
-    );
-    const saved = this.savedSettings();
-    const consumeOnUse =
-      scope === 'page'
-        ? saved.pageBumperSettings.consumeCommentOnUse
-        : saved.bumperSettings.consumeCommentOnUse;
-    const pool = unused.length > 0 ? unused : consumeOnUse ? [] : all;
-    return pool[Math.min(pool.length - 1, Math.max(0, Math.floor(random * pool.length)))] ?? null;
+    const saved = this.savedSettings(),
+      consume = (scope === 'page' ? saved.pageBumperSettings : saved.bumperSettings)
+        .consumeCommentOnUse;
+    return pickBumperCommentFromDb(this.db, postId, scope, consume, random, excludeIds, false);
   }
-
   todayCounts(now = Date.now(), sourceMode: BumperScope = 'group'): Record<string, number> {
-    const today = new Date(now);
-    today.setHours(0, 0, 0, 0);
+    const sql =
+      'SELECT profile_id, COUNT(*) n FROM group_bumper_effects WHERE applied_at>=? AND source_mode=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id';
     return Object.fromEntries(
-      this.db
-        .prepare(
-          `SELECT profile_id, COUNT(*) n
-             FROM group_bumper_effects
-            WHERE applied_at>=?
-              AND source_mode=?
-              AND profile_id IN (SELECT id FROM bluestacks_instances)
-            GROUP BY profile_id`,
-        )
-        .all(today.getTime(), sourceMode)
-        .map((r) => [String(r.profile_id), Number(r.n)]),
+      Q.allRows(this.db, sql, Q.localDayStartMs(now), sourceMode).map((r) => [
+        Q.s(r.profile_id),
+        Q.n(r.n),
+      ]),
     );
   }
-
-  total(sourceMode: BumperScope = 'group'): number {
-    return Number(
-      this.db
-        .prepare(
-          `SELECT COUNT(*) n
-             FROM group_bumper_logs
-            WHERE source_mode=?
-              AND profile_id IN (SELECT id FROM bluestacks_instances)`,
-        )
-        .get(sourceMode)?.n ?? 0,
-    );
-  }
-
+  total = (sourceMode: BumperScope = 'group'): number => {
+    const sql =
+      "SELECT COUNT(*) n FROM post_bump_records WHERE record_type=? AND status='success' AND carrier='bluestacks'";
+    return Q.countSql(this.db, sql, sourceMode === 'page' ? 'page_bump' : 'group_bump');
+  };
   weeklyDailyCounts(now = Date.now(), sourceMode: BumperScope = 'group'): BumperDailyStat[] {
-    const base = new Date(now);
-    base.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(base);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const sixDaysAgo = new Date(base);
-    sixDaysAgo.setDate(sixDaysAgo.getDate() - 6);
-    const startMs = sixDaysAgo.getTime();
-    const endMs = tomorrow.getTime();
-
-    const buckets = new Map<string, number>();
-    const days: string[] = [];
-    for (let offset = 0; offset <= 6; offset += 1) {
-      const d = new Date(base);
-      d.setDate(d.getDate() - offset);
-      const ymd = formatLocalYmd(d);
-      days.push(ymd);
-      buckets.set(ymd, 0);
-    }
-
-    const rows = this.db
-      .prepare(
-        `SELECT applied_at AS bumped_at
-           FROM group_bumper_effects
-          WHERE applied_at >= ? AND applied_at < ?
-            AND source_mode=?
-            AND profile_id IN (SELECT id FROM bluestacks_instances)`,
-      )
-      .all(startMs, endMs, sourceMode);
-    for (const r of rows) {
-      const ymd = formatLocalYmd(new Date(Number(r.bumped_at)));
-      if (buckets.has(ymd)) {
-        buckets.set(ymd, (buckets.get(ymd) ?? 0) + 1);
-      }
-    }
-
-    return days.map((date) => ({ date, count: buckets.get(date) ?? 0 }));
+    const { startMs, endMs } = Q.localWeekWindow(now),
+      sql =
+        'SELECT applied_at AS bumped_at FROM group_bumper_effects WHERE applied_at>=? AND applied_at<? AND source_mode=? AND profile_id IN (SELECT id FROM bluestacks_instances)';
+    return Q.collectWeeklyDailyCounts(
+      Q.allRows(this.db, sql, startMs, endMs, sourceMode).map((r) => Q.n(r.bumped_at)),
+      now,
+    );
   }
 }

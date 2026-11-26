@@ -1,0 +1,109 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-canvas: #eef0f3;
+  --color-surface: #ffffff;
+  --color-surface-subtle: #f7f8fa;
+  --color-surface-muted: #f0f2f5;
+  --color-line: #e3e6ea;
+  --color-line-strong: #d3d8de;
+  --color-graphite: #262b33;
+  --color-rail: #1f242c;
+  --color-brand: #2f6fed;
+  --color-brand-hover: #255fd6;
+  --color-ink: #1d2127;
+  --color-ink-2: #5b6470;
+  --color-ink-3: #8a929c;
+  --font-sans:
+    'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'Cascadia Mono', Consolas, 'SFMono-Regular', monospace;
+}
+
+:root {
+  --bg: #eef0f3;
+  --surface: #ffffff;
+  --surface-2: #f7f8fa;
+  --surface-3: #f0f2f5;
+  --line: #e3e6ea;
+  --line-strong: #d3d8de;
+  --text: #1d2127;
+  --text-2: #5b6470;
+  --text-3: #8a929c;
+  --graphite: #262b33;
+  --brand: #2f6fed;
+  --brand-hover: #255fd6;
+  --brand-soft: #e9f0fe;
+  --focus: 0 0 0 3px rgba(47, 111, 237, 0.25);
+  --run: #2f6fed;
+  --run-soft: #e9f0fe;
+  --ok: #1f9d55;
+  --ok-soft: #e5f5ec;
+  --warn: #c98200;
+  --warn-dot: #e6a417;
+  --warn-soft: #fdf3dd;
+  --err: #d64545;
+  --err-soft: #fdeaea;
+  --idle: #9aa1aa;
+  --idle-soft: #eef0f2;
+  --sidebar-bg: #f7f8fa;
+  --bg-subtle: #f7f8fa;
+  --bg-surface: #ffffff;
+  --text-1: #1d2127;
+  --muted: #8a929c;
+  --primary: #2f6fed;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --shadow-1: 0 1px 2px rgba(20, 24, 31, 0.06), 0 1px 1px rgba(20, 24, 31, 0.03);
+  --shadow-2: 0 8px 24px rgba(20, 24, 31, 0.12), 0 2px 6px rgba(20, 24, 31, 0.06);
+  --shadow-3: 0 24px 64px rgba(20, 24, 31, 0.22);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --z-popover: 50;
+  --z-modal: 80;
+  --z-toast: 300;
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-line);
+  }
+  html,
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
+  input[type='checkbox'] {
+    accent-color: var(--color-brand);
+  }
+  dialog::backdrop {
+    background: rgba(15, 20, 28, 0.42);
+    backdrop-filter: blur(2px);
+  }
+  :focus-visible {
+    outline: none;
+    box-shadow: var(--focus);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

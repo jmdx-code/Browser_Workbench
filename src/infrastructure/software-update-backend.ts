@@ -22,10 +22,8 @@ import {
 import { syncProductExtensionDirectory, productExtensionDirectory } from './paths.js';
 import { syncProductAiWorkspaceDirectory } from './ai-workspace.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
-
 const STALE_BACKUP_DIR_RX =
   /^(?:runtime-before-|runtime-backup-|runtime-wo53-|runtime-composer-|installation-before-)/i;
-
 /**
  * Safely reclaim orphaned historical update backup folders inside `%APPDATA%\Browser Workbench`.
  * NEVER touches active `runtime`, single latest `runtime-previous`, `data`, or `extension`.
@@ -54,7 +52,6 @@ export async function pruneStaleRuntimeBackups(
   }
   return { removedDirs };
 }
-
 export async function extractRuntimeArchive(archive: string, destination: string) {
   const zip = await new Promise<ZipFile>((resolve, reject) =>
     open(archive, { lazyEntries: true, strictFileNames: true }, (error, file) =>

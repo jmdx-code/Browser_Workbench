@@ -1,54 +1,111 @@
-import { useRef, useState } from 'react';
-import { hasPosterMaterialContent, type PosterState } from '../../shared/group-poster.js';
+import { useRef, useState, type ReactNode } from 'react';
+import {
+  hasPosterMaterialContent,
+  type PosterState,
+  type PosterTask,
+} from '../../shared/group-poster.js';
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
 import { ConfirmDialog } from '../confirm-dialog.js';
+import { IconClock, IconPlay } from '../icons.js';
+import { toggleSet } from '../selection.js';
 import {
   formatCreatedDate,
   PosterMaterialCardPreview,
   PosterMediaPreviewModal,
+  posterRowBadge,
   taskStatusBadge,
+  useSerialVideoThumbnailGenerator,
 } from './poster-material-modals.js';
+import { Btn, Chk } from './shared/module-ui.js';
+import { UI_CHECKBOX, UI_INPUT_SM, UI_SELECT_SM } from '../ui/primitives.js';
 
-function resolveLocalFilePath(file: File): string {
-  return (
+export { PosterTaskDispatchModal } from './poster-task-dispatch-modal.js';
+export { PosterMaterialDetailModal } from './poster-material-detail-modal.js';
+export { PosterMaterialEditModal } from './poster-material-modals.js';
+
+const resolveLocalFilePath = (file: File) =>
+  (
     window.workbenchDesktop?.materialFilePath?.(file) ||
     ((file as File & { path?: string }).path ?? '')
   ).trim();
+
+const BATCH_OPTS = [
+  ['bg:color', '文字背景：设为彩贴'],
+  ['bg:plain', '文字背景：设为普通文字'],
+  ['ai:on', 'AI 声明：设为开启'],
+  ['ai:off', 'AI 声明：设为关闭'],
+  ['ai:default', 'AI 声明：设为默认'],
+] as const;
+
+function PosterTaskBanner(p: {
+  title: string;
+  ariaLabel: string;
+  tasks: readonly PosterTask[];
+  validRows: readonly MaterialDraft[];
+  onOpenDetail: (row: MaterialDraft) => void;
+  renderAction: (task: PosterTask) => ReactNode;
+}) {
+  if (!p.tasks.length) return null;
+  return (
+    <div
+      className="mb-1 flex flex-col gap-2 rounded-xl border border-[var(--line)] bg-slate-50/80 p-3 text-xs"
+      aria-label={p.ariaLabel}
+    >
+      <strong className="text-xs font-semibold text-slate-800">
+        {p.title} ({p.tasks.length})
+      </strong>
+      <div className="flex flex-col gap-1.5">
+        {p.tasks.map((t) => {
+          const badge = taskStatusBadge(t.status);
+          const matched = p.validRows.find((r) => r.id === t.materialId);
+          const desc =
+            t.status === 'running' || t.status === 'scheduled'
+              ? `${t.accountMode === 'all_online' ? '全部在线账号' : `${t.profileIds.length}个指定号`} · 已发 ${t.postedCount}/${t.totalGroups} 组${t.scheduledAt && t.status === 'scheduled' ? ` · 启动时间 ${new Date(t.scheduledAt).toLocaleString()}` : ''}`
+              : `已发 ${t.postedCount}/${t.totalGroups} 组${t.statusReason ? ` · ${t.statusReason}` : ''}`;
+          return (
+            <div
+              key={t.id}
+              className="flex flex-wrap items-center gap-2 rounded-lg border border-[var(--line)] bg-white px-2.5 py-1.5"
+            >
+              <span
+                className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${badge.cls}`}
+              >
+                {badge.label}
+              </span>
+              <span
+                className="max-w-[240px] truncate font-medium text-slate-900"
+                title={t.captionPreview}
+              >
+                {t.captionPreview || '（媒体贴文）'}
+              </span>
+              <span
+                className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-3)]"
+                title={t.statusReason}
+              >
+                {desc}
+              </span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {matched && <Btn onClick={() => p.onOpenDetail(matched)}>查看</Btn>}
+                {p.renderAction(t)}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
-import {
-  posterRowBadge,
-  useSerialVideoThumbnailGenerator,
-} from './poster-material-thumbnail-cell.js';
 
-export { formatCreatedDate, PosterMaterialCardPreview, taskStatusBadge };
-export { PosterTaskDispatchModal } from './poster-task-dispatch-modal.js';
-export { PosterMaterialDetailModal } from './poster-material-detail-modal.js';
-export { PosterMaterialEditModal } from './poster-material-edit-modal.js';
-
-export function PosterMaterialCardGrid({
-  rows,
-  state,
-  persistedIds,
-  pauseThumbnailGeneration,
-  busy,
-  onOpenDispatch,
-  onOpenDetail,
-  onEditCard,
-  onAddCard,
-  onAddLocalFiles,
-  onDeleteCard,
-  onBatchDeleteCards,
-  onBatchUpdateCards,
-  onOpenTableEditor,
-  onCancelTask,
-  onThumbnailSaved,
-}: {
+export function PosterMaterialCardGrid(p: {
   rows: readonly MaterialDraft[];
   state: PosterState | null;
   persistedIds: ReadonlySet<string>;
   pauseThumbnailGeneration?: boolean | undefined;
   busy: boolean;
-  onOpenDispatch: (row: MaterialDraft, initialTimingMode?: 'immediate' | 'scheduled') => void;
+  selectedCardIds?: ReadonlySet<string> | undefined;
+  onSelectedCardIdsChange?: ((next: Set<string>) => void) | undefined;
+  onOpenDispatch: (row: MaterialDraft) => void;
+  onQuickScheduleMaterial?: ((row: MaterialDraft) => void) | undefined;
   onOpenDetail: (row: MaterialDraft) => void;
   onEditCard: (row: MaterialDraft) => void;
   onAddCard: () => void;
@@ -58,125 +115,131 @@ export function PosterMaterialCardGrid({
   onBatchUpdateCards?: (ids: string[], patch: Partial<MaterialDraft>) => void;
   onOpenTableEditor: () => void;
   onCancelTask: (taskId: string) => Promise<void>;
+  onDeleteTask?: (taskId: string) => Promise<void>;
   onThumbnailSaved: (id: string) => void;
 }) {
+  const {
+    rows,
+    state,
+    busy,
+    onOpenDispatch,
+    onQuickScheduleMaterial,
+    onOpenDetail,
+    onEditCard,
+    onDeleteCard,
+    onBatchDeleteCards,
+    onBatchUpdateCards,
+    onCancelTask,
+    onDeleteTask,
+  } = p;
   const [query, setQuery] = useState('');
   const [previewRow, setPreviewRow] = useState<MaterialDraft | null>(null);
-  const [selectedCardIds, setSelectedCardIds] = useState<Set<string>>(new Set());
+  const [uncontrolledIds, setUncontrolledIds] = useState<Set<string>>(new Set());
   const [confirmDelete, setConfirmDelete] = useState<{ ids: string[]; label: string } | null>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
+  const selectedIds = p.selectedCardIds ?? uncontrolledIds;
+  const setSelectedIds = (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    const next = typeof updater === 'function' ? updater(new Set(selectedIds)) : updater;
+    if (p.onSelectedCardIdsChange) p.onSelectedCardIdsChange(next);
+    else setUncontrolledIds(next);
+  };
 
   const validRows = rows.filter(hasPosterMaterialContent);
-  useSerialVideoThumbnailGenerator(validRows, onThumbnailSaved, {
-    persistedIds,
-    paused: pauseThumbnailGeneration,
+  useSerialVideoThumbnailGenerator(validRows, p.onThumbnailSaved, {
+    persistedIds: p.persistedIds,
+    paused: p.pauseThumbnailGeneration,
   });
 
-  const normalizedQuery = query.trim().toLowerCase();
-  const visibleRows = validRows.filter((r) => {
-    if (!normalizedQuery) return true;
-    return (
-      r.caption.toLowerCase().includes(normalizedQuery) ||
-      r.mediaSource.toLowerCase().includes(normalizedQuery) ||
-      (r.localFilePath ?? '').toLowerCase().includes(normalizedQuery)
-    );
-  });
-
-  const selectedVisibleIds = visibleRows.filter((r) => selectedCardIds.has(r.id)).map((r) => r.id);
-  const allVisibleSelected =
-    visibleRows.length > 0 && selectedVisibleIds.length === visibleRows.length;
-  const activeOrScheduledTasks = (state?.tasks ?? []).filter(
+  const q = query.trim().toLowerCase();
+  const visibleRows = validRows.filter(
+    (r) =>
+      !q || `${r.caption}\n${r.mediaSource}\n${r.localFilePath ?? ''}`.toLowerCase().includes(q),
+  );
+  const selectedVisibleIds = visibleRows.filter((r) => selectedIds.has(r.id)).map((r) => r.id);
+  const activeTasks = (state?.tasks ?? []).filter(
     (t) => t.status === 'running' || t.status === 'scheduled',
   );
+  const issueTasks = (state?.tasks ?? [])
+    .filter((t) => t.status === 'failed' || t.status === 'partial')
+    .slice(0, 5);
 
   const handleBatchPatch = (val: string) => {
-    if (!val || selectedVisibleIds.length === 0 || !onBatchUpdateCards) return;
-    if (val === 'bg:color' || val === 'bg:plain') {
+    if (!val || !selectedVisibleIds.length || !onBatchUpdateCards) return;
+    if (val.startsWith('bg:'))
       onBatchUpdateCards(selectedVisibleIds, {
         background: val === 'bg:color' ? 'color' : 'plain',
       });
-    } else if (val === 'ai:default' || val === 'ai:on' || val === 'ai:off') {
-      const aiLabel = val === 'ai:on' ? 'on' : val === 'ai:off' ? 'off' : 'default';
-      onBatchUpdateCards(selectedVisibleIds, { aiLabel });
-    }
+    else if (val.startsWith('ai:'))
+      onBatchUpdateCards(selectedVisibleIds, {
+        aiLabel: val === 'ai:on' ? 'on' : val === 'ai:off' ? 'off' : 'default',
+      });
   };
 
   return (
     <div
-      className="poster-cards-container"
-      onDragOver={(e) => {
-        if (e.dataTransfer?.types?.includes('Files')) e.preventDefault();
-      }}
+      className="flex flex-col gap-3"
+      onDragOver={(e) => e.dataTransfer?.types?.includes('Files') && e.preventDefault()}
       onDrop={(e) => {
-        const files = Array.from(e.dataTransfer?.files ?? []);
-        if (files.length === 0) return;
+        const f = Array.from(e.dataTransfer?.files ?? []);
+        if (!f.length) return;
         e.preventDefault();
-        const paths = files.map(resolveLocalFilePath).filter(Boolean);
-        if (paths.length > 0) onAddLocalFiles(paths);
+        const paths = f.map(resolveLocalFilePath).filter(Boolean);
+        if (paths.length) p.onAddLocalFiles(paths);
       }}
     >
-      <div className="poster-cards-toolbar">
-        <div className="poster-cards-toolbar-left">
-          <label className="poster-cards-select-all">
-            <input
-              type="checkbox"
-              aria-label="全选贴文卡片"
-              checked={allVisibleSelected}
-              onChange={(e) => {
-                const next = new Set(selectedCardIds);
-                for (const r of visibleRows) {
-                  if (e.target.checked) next.add(r.id);
-                  else next.delete(r.id);
-                }
-                setSelectedCardIds(next);
-              }}
-            />
-            <span>
-              全选 ({selectedVisibleIds.length}/{visibleRows.length})
-            </span>
-          </label>
+      <div className="poster-cards-toolbar flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-slate-50/80 px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Chk
+            className="font-medium text-slate-700"
+            label={`全选 (${selectedVisibleIds.length}/${visibleRows.length})`}
+            checked={visibleRows.length > 0 && selectedVisibleIds.length === visibleRows.length}
+            onChange={(c) =>
+              setSelectedIds((prev) =>
+                toggleSet(
+                  prev,
+                  visibleRows.map((r) => r.id),
+                  c,
+                ),
+              )
+            }
+          />
           <input
             type="search"
             aria-label="搜索贴文卡片"
+            className={`${UI_INPUT_SM} w-52`}
             placeholder="搜索贴文文案、媒体或文件名…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
-            disabled={busy}
-            onClick={onAddCard}
-          >
+          <Btn v="primary" disabled={busy} onClick={p.onAddCard}>
             ＋ 新建贴文
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm"
+          </Btn>
+          <Btn
             disabled={busy}
             onClick={() => filesInputRef.current?.click()}
             title="支持多选本机图片/视频批量新增贴文（也可直接把文件拖拽到下方区域）"
           >
-            ＋ 批量添加本机图片/视频
-          </button>
+            ＋ 导入媒体
+          </Btn>
           <input
             ref={filesInputRef}
             type="file"
             multiple
             accept=".png,.jpg,.jpeg,.webp,.gif,.mp4,.mov,image/*,video/*"
-            style={{ display: 'none' }}
+            className="hidden"
             onChange={(e) => {
-              const picked = Array.from(e.target.files ?? [])
+              const paths = Array.from(e.target.files ?? [])
                 .map(resolveLocalFilePath)
                 .filter(Boolean);
               e.target.value = '';
-              if (picked.length > 0) onAddLocalFiles(picked);
+              if (paths.length) p.onAddLocalFiles(paths);
             }}
           />
           {selectedVisibleIds.length > 0 && (
             <>
               <select
                 aria-label="批量修改已选贴文"
+                className={UI_SELECT_SM}
                 value=""
                 disabled={busy}
                 onChange={(e) => {
@@ -185,215 +248,184 @@ export function PosterMaterialCardGrid({
                 }}
               >
                 <option value="">批量设置已选 ({selectedVisibleIds.length})…</option>
-                <option value="bg:color">文字背景：设为彩贴</option>
-                <option value="bg:plain">文字背景：设为普通文字</option>
-                <option value="ai:on">AI 声明：设为开启</option>
-                <option value="ai:off">AI 声明：设为关闭</option>
-                <option value="ai:default">AI 声明：设为默认</option>
+                {BATCH_OPTS.map(([v, l]) => (
+                  <option key={v} value={v}>
+                    {l}
+                  </option>
+                ))}
               </select>
-              <button
-                type="button"
-                className="btn btn-sm btn-danger"
+              <Btn
+                v="danger"
                 disabled={busy}
-                onClick={() => {
-                  const ids = [...selectedVisibleIds];
-                  setConfirmDelete({ ids, label: `所选的 ${ids.length} 条贴文素材` });
-                }}
+                onClick={() =>
+                  setConfirmDelete({
+                    ids: [...selectedVisibleIds],
+                    label: `所选的 ${selectedVisibleIds.length} 条贴文素材`,
+                  })
+                }
               >
                 批量删除 ({selectedVisibleIds.length})
-              </button>
+              </Btn>
             </>
           )}
         </div>
-        <div className="poster-cards-toolbar-right">
-          <button
-            type="button"
-            className="btn btn-sm"
-            onClick={onOpenTableEditor}
-            title="打开类 Excel 表格批量新增、粘贴或批量编辑贴文"
-          >
-            表格批量新增 / Excel粘贴
-          </button>
-        </div>
+        <Btn onClick={p.onOpenTableEditor} title="打开类 Excel 表格批量新增、粘贴或批量编辑贴文">
+          表格编辑
+        </Btn>
       </div>
 
-      {activeOrScheduledTasks.length > 0 && (
-        <div className="poster-tasks-banner" aria-label="当前进行中与定时发帖任务">
-          <div className="poster-tasks-banner-title">
-            <strong>进行中 / 定时发帖任务 ({activeOrScheduledTasks.length})</strong>
-          </div>
-          <div className="poster-tasks-banner-list">
-            {activeOrScheduledTasks.map((t) => {
-              const badge = taskStatusBadge(t.status);
-              const matchedRow = validRows.find((r) => r.id === t.materialId);
-              return (
-                <div key={t.id} className={'poster-task-pill ' + badge.cls}>
-                  <span className={'poster-task-badge ' + badge.cls}>{badge.label}</span>
-                  <span className="poster-task-pill-caption" title={t.captionPreview}>
-                    {t.captionPreview || '（媒体贴文）'}
-                  </span>
-                  <span className="poster-task-pill-meta">
-                    {t.accountMode === 'all_online'
-                      ? '全部在线账号'
-                      : `${t.profileIds.length}个指定号`}{' '}
-                    · 已发 {t.postedCount}/{t.totalGroups} 组
-                    {t.scheduledAt && t.status === 'scheduled'
-                      ? ` · 启动时间 ${new Date(t.scheduledAt).toLocaleString()}`
-                      : ''}
-                  </span>
-                  <div className="poster-task-pill-actions">
-                    {matchedRow && (
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => onOpenDetail(matchedRow)}
-                      >
-                        查看
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-danger"
-                      disabled={busy}
-                      onClick={() => void onCancelTask(t.id)}
-                    >
-                      {t.status === 'scheduled' ? '取消定时' : '停止'}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+      <PosterTaskBanner
+        title="进行中 / 定时发帖任务"
+        ariaLabel="当前进行中与定时发帖任务"
+        tasks={activeTasks}
+        validRows={validRows}
+        onOpenDetail={onOpenDetail}
+        renderAction={(t) => (
+          <Btn v="danger" disabled={busy} onClick={() => void onCancelTask(t.id)}>
+            {t.status === 'scheduled' ? '取消定时' : '停止'}
+          </Btn>
+        )}
+      />
+      <PosterTaskBanner
+        title="近期失败 / 部分成功任务"
+        ariaLabel="近期异常或部分完成任务"
+        tasks={issueTasks}
+        validRows={validRows}
+        onOpenDetail={onOpenDetail}
+        renderAction={(t) =>
+          onDeleteTask ? (
+            <Btn disabled={busy} onClick={() => void onDeleteTask(t.id)}>
+              忽略
+            </Btn>
+          ) : null
+        }
+      />
 
       {visibleRows.length === 0 ? (
-        <div className="poster-materials-empty">
+        <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center text-xs text-[var(--text-3)]">
           {validRows.length === 0
             ? '暂无贴文素材，请点击上方「＋ 新建贴文」、「＋ 批量添加本机图片/视频」或「表格批量新增 / Excel粘贴」添加贴文'
             : '没有匹配的贴文卡片'}
         </div>
       ) : (
-        <div className="poster-cards-grid">
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(235px,1fr))] gap-3">
           {visibleRows.map((row, index) => {
             const badge = posterRowBadge(row);
-            const postedGroupIds = state?.postedGroupIdsByMaterial?.[row.id] ?? [];
-            const postedCount = Math.max(postedGroupIds.length, row.usedCount ?? 0);
+            const postedCount = Math.max(
+              state?.postedGroupIdsByMaterial?.[row.id]?.length ?? 0,
+              row.usedCount ?? 0,
+            );
             const activeGroups = state?.activeGroupsByMaterial?.[row.id] ?? [];
             const postingCount = activeGroups.filter((a) => a.state === 'posting').length;
             const queuedCount = activeGroups.filter((a) => a.state === 'queued').length;
             const scheduledCount = (state?.tasks ?? []).filter(
               (t) => t.materialId === row.id && t.status === 'scheduled',
             ).length;
-            const isCardChecked = selectedCardIds.has(row.id);
-
+            const isChecked = selectedIds.has(row.id);
             return (
               <article
                 key={row.id}
-                className={'poster-rect-card' + (isCardChecked ? ' is-selected' : '')}
+                className={`poster-rect-card flex flex-col overflow-hidden rounded-xl border bg-white shadow-xs transition-shadow hover:shadow-sm ${isChecked ? 'border-slate-900 ring-1 ring-slate-900' : 'border-[var(--line)]'}`}
               >
-                <div className="poster-rect-card-media-wrap">
+                <div className="relative h-40 w-full overflow-hidden bg-slate-100">
                   <PosterMaterialCardPreview row={row} onPreview={setPreviewRow} />
-                  <div className="poster-rect-card-top-badges">
-                    <label className="poster-rect-card-check" onClick={(e) => e.stopPropagation()}>
+                  <div className="pointer-events-none absolute inset-x-2 top-2 flex items-center justify-between gap-1">
+                    <label
+                      className="pointer-events-auto inline-flex cursor-pointer items-center gap-1 rounded-full bg-white/90 px-2 py-0.5 text-[11px] font-semibold shadow-2xs"
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       <input
                         type="checkbox"
+                        className={UI_CHECKBOX}
                         aria-label={`选择贴文 #${index + 1}`}
-                        checked={isCardChecked}
-                        onChange={(e) => {
-                          const next = new Set(selectedCardIds);
-                          if (e.target.checked) next.add(row.id);
-                          else next.delete(row.id);
-                          setSelectedCardIds(next);
-                        }}
+                        checked={isChecked}
+                        onChange={(e) =>
+                          setSelectedIds((n0) => toggleSet(n0, row.id, e.target.checked))
+                        }
                       />
-                      <span className="poster-rect-index-badge">#{index + 1}</span>
+                      <span>#{index + 1}</span>
                     </label>
-                    <div className="poster-rect-top-right-badges">
+                    <div className="flex flex-wrap items-center gap-1">
                       {row.aiLabel && row.aiLabel !== 'default' && (
-                        <span className={'poster-ai-badge is-' + row.aiLabel}>
+                        <span
+                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap shadow-2xs ${row.aiLabel === 'on' ? 'bg-violet-100 text-violet-800' : 'bg-slate-200 text-slate-700'}`}
+                        >
                           {row.aiLabel === 'on' ? 'AI声明:开' : 'AI声明:关'}
                         </span>
                       )}
-                      <span className={'poster-cache-badge ' + badge.cls} title={badge.title}>
+                      <span
+                        className={`poster-status-badge inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap shadow-2xs ${badge.cls}`}
+                        title={badge.title}
+                      >
                         {badge.text}
                       </span>
                     </div>
                   </div>
                   {(activeGroups.length > 0 || scheduledCount > 0) && (
-                    <div className="poster-rect-card-live-badges">
+                    <div className="pointer-events-none absolute inset-x-2 bottom-2 flex flex-wrap gap-1">
                       {activeGroups.length > 0 && (
-                        <span className="poster-rect-live-pill is-running">
+                        <span className="inline-flex items-center rounded-full bg-blue-600/90 px-2 py-0.5 text-[11px] font-semibold text-white">
                           ▶ 正在发 {postingCount} · 排队 {queuedCount}
                         </span>
                       )}
                       {scheduledCount > 0 && (
-                        <span className="poster-rect-live-pill is-scheduled">
+                        <span className="inline-flex items-center rounded-full bg-amber-600/90 px-2 py-0.5 text-[11px] font-semibold text-white">
                           ⏰ 定时任务 {scheduledCount}
                         </span>
                       )}
                     </div>
                   )}
                 </div>
-
-                <div className="poster-rect-card-stats">
+                <div className="flex items-center justify-between border-b border-slate-100 px-2.5 py-1.5 text-[11px] text-[var(--text-3)]">
                   <button
                     type="button"
-                    className="poster-rect-stat-btn"
+                    className="cursor-pointer bg-transparent p-0 text-left text-[11px] text-slate-700 hover:underline"
                     title="点击查看该贴文已发小组、正在发小组与发帖链接"
                     onClick={() => onOpenDetail(row)}
                   >
                     已发小组：<strong>{postedCount}</strong>
                   </button>
-                  <span className="poster-rect-date" title="创建日期">
-                    {formatCreatedDate(row.createdAt)}
-                  </span>
+                  <span title="创建日期">{formatCreatedDate(row.createdAt)}</span>
                 </div>
-
-                <div className="poster-rect-card-caption" title={row.caption || row.mediaSource}>
+                <div
+                  className="line-clamp-3 min-h-[48px] flex-1 px-2.5 py-2 text-xs leading-relaxed text-slate-800"
+                  title={row.caption || row.mediaSource}
+                >
                   {row.caption.trim() ? (
                     row.caption
                   ) : (
-                    <span className="muted">（仅画面媒体，无文字文案）</span>
+                    <span className="text-[var(--text-3)]">（仅画面媒体，无文字文案）</span>
                   )}
                 </div>
-
-                <div className="poster-rect-card-actions">
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-primary poster-card-post-btn"
+                <div className="poster-rect-card-actions flex flex-wrap items-center gap-1 border-t border-slate-100 bg-slate-50/70 px-2 py-1.5">
+                  <Btn
+                    v="primary"
+                    className="poster-card-post-btn"
                     disabled={busy}
-                    onClick={() => onOpenDispatch(row, 'immediate')}
+                    onClick={() => onOpenDispatch(row)}
                   >
-                    ▶ 发帖
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm poster-card-schedule-btn"
-                    disabled={busy}
-                    onClick={() => onOpenDispatch(row, 'scheduled')}
+                    <IconPlay size={12} /> 发帖
+                  </Btn>
+                  <Btn
+                    className="poster-card-schedule-btn"
+                    disabled={busy || !onQuickScheduleMaterial}
+                    title="将此贴文一键加入定时排班（支持单次或按周执行）"
+                    onClick={() => onQuickScheduleMaterial?.(row)}
                   >
-                    ⏰ 定时任务
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
+                    <IconClock size={13} /> 加入排班
+                  </Btn>
+                  <Btn
                     onClick={() => onOpenDetail(row)}
                     title="查看该贴文的已发小组、正在发小组、发帖链接与发帖账号"
                   >
                     详情 ({postedCount})
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    disabled={busy}
-                    onClick={() => onEditCard(row)}
-                  >
+                  </Btn>
+                  <Btn disabled={busy} onClick={() => onEditCard(row)}>
                     编辑
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm"
+                  </Btn>
+                  <Btn
+                    v="ghost"
+                    className="text-rose-700"
                     disabled={busy}
                     onClick={() =>
                       setConfirmDelete({
@@ -405,7 +437,7 @@ export function PosterMaterialCardGrid({
                     }
                   >
                     删除
-                  </button>
+                  </Btn>
                 </div>
               </article>
             );
@@ -426,11 +458,7 @@ export function PosterMaterialCardGrid({
           onConfirm={() => {
             const ids = confirmDelete.ids;
             setConfirmDelete(null);
-            setSelectedCardIds((prev) => {
-              const next = new Set(prev);
-              ids.forEach((id) => next.delete(id));
-              return next;
-            });
+            setSelectedIds((prev) => toggleSet(prev, ids, false));
             if (ids.length === 1 && ids[0]) onDeleteCard(ids[0]);
             else if (onBatchDeleteCards) onBatchDeleteCards(ids);
             else ids.forEach((id) => onDeleteCard(id));

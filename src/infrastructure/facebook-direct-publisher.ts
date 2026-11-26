@@ -1,0 +1,736 @@
+import { randomUUID } from 'node:crypto';
+import { mkdir, rm } from 'node:fs/promises';
+import path from 'node:path';
+import type { Page, Response } from 'playwright-core';
+import { sleepAbortable } from '../application/workboard.js';
+import {
+  audienceTarget,
+  decidePostAILabel,
+  decideStoryFriendsPrivacy,
+  type StoryPrivacyCheckpoint,
+} from '../domain/facebook-content-rules.js';
+import { NATIVE_COLOR_BACKGROUND_MAX_CHARS } from '../domain/material-post.js';
+import { resourceEffectiveRow } from '../domain/resource-materials.js';
+import { hasResource, resourceSupportsDestination } from '../domain/resource-table.js';
+import {
+  aiLabelTarget,
+  facebookBackgroundScope,
+  type AILabelPurpose,
+  type AILabelSetting,
+} from '../shared/facebook-post-options.js';
+import { classifyFacebookAbnormalUrl } from '../shared/facebook-browse-route.js';
+import { nativeStoryMediaTextLimit, storyMediaTextFinish } from '../shared/facebook-story.js';
+import { ResourceMaterialOrigin, type ResourceMaterial } from '../shared/resource-materials.js';
+import type { ResourceRowValue } from '../shared/resource-table.js';
+import type { Plan, Progress, StepInstance } from '../shared/task-contracts.js';
+import type { BrowserSessionLease } from './browser-session-lease.js';
+import { readFacebookAILabel } from './facebook-ai-label-reader.js';
+import { readFacebookBackground } from './facebook-background-reader.js';
+import { readFacebookComposerAudience } from './facebook-composer-audience.js';
+import { parseFacebookJsonChunks } from './facebook-group-session.js';
+import { readFacebookPostPage } from './facebook-post-page-reader.js';
+import { parseNativeStoryCreation } from './facebook-story-native-result.js';
+import { readFacebookStoryPage } from './facebook-story-page-reader.js';
+import { materialUsageSourceKey } from './material-usage-store.js';
+import type { WorkspaceStorePort } from './persistence-port.js';
+import { PublicDriveDownloader } from './public-drive-download.js';
+import { FilesystemResourceMaterialVerifier } from './resource-material-verifier.js';
+import { StoryVideoCaptionDeriver } from './story-video-caption-deriver.js';
+import { checkKnownFacebookVideoPath } from './video-metadata.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
+type DirectPostStepResult =
+  | { kind: 'COMPLETED'; published: number }
+  | { kind: 'SKIP_EXHAUSTED'; published: 0 }
+  | { kind: 'FAIL_EXHAUSTED'; published: number };
+interface ExecuteDirectPostStepOptions {
+  readonly plan: Plan;
+  readonly step: StepInstance;
+  readonly lease: BrowserSessionLease;
+  readonly store: WorkspaceStorePort;
+  readonly dataDirectory: string;
+  readonly uploadCacheRoot: string;
+  readonly claimedSourceKeys: Set<string>;
+  readonly onProgress?: (progress: Progress) => Promise<void> | void;
+}
+const selectorOf = (t: { scope?: string | undefined; css: string }): string =>
+    t.scope ? `${t.scope} ${t.css}` : t.css,
+  assertSafeUrl = (url: string) => {
+    const abnormal = classifyFacebookAbnormalUrl(url);
+    if (abnormal) throw Error(abnormal);
+  },
+  runLocAction = async (
+    lease: BrowserSessionLease,
+    label: string,
+    selector: string,
+    op: (loc: ReturnType<Page['locator']>) => Promise<void>,
+    state: 'visible' | 'attached' = 'visible',
+  ) => {
+    lease.guard();
+    await lease.execOp(label, async () => {
+      const loc = lease.page.locator(selector).first();
+      await loc.waitFor({ state, timeout: state === 'attached' ? 10_000 : 8_000 });
+      await op(loc);
+    });
+  },
+  clickSelector = (lease: BrowserSessionLease, label: string, selector: string) =>
+    runLocAction(lease, label, selector, (loc) => loc.click({ timeout: 10_000 })),
+  insertTextIntoSelector = (
+    lease: BrowserSessionLease,
+    label: string,
+    selector: string,
+    text: string,
+  ) =>
+    runLocAction(lease, label, selector, async (loc) => {
+      await loc.click({ timeout: 10_000 });
+      await lease.page.keyboard.insertText(text);
+    }),
+  uploadFilesToSelector = (
+    lease: BrowserSessionLease,
+    label: string,
+    selector: string,
+    files: readonly string[],
+  ) =>
+    runLocAction(
+      lease,
+      label,
+      selector,
+      (loc) => loc.setInputFiles([...files], { timeout: 20_000 }),
+      'attached',
+    ),
+  uploadTimelineMedia = async (
+    lease: BrowserSessionLease,
+    scope: string,
+    preferredCss: string,
+    mediaPaths: readonly string[],
+    format: ResourceMaterial['format'],
+  ) => {
+    const primarySel = `${scope} ${preferredCss}`;
+    if ((await lease.page.locator(primarySel).count()) > 0) {
+      await uploadFilesToSelector(lease, 'upload-post-media', primarySel, mediaPaths);
+      return;
+    }
+    const scopedAnyFileSel = `${scope} input[type="file"]`;
+    let count = await lease.page.locator(scopedAnyFileSel).count();
+    if (count === 0) {
+      devDiag.record({
+        level: 'WARN',
+        category: 'TASK_RUNNER',
+        event: 'POST_TIMELINE_MEDIA_INPUT_FALLBACK_CLICK',
+        reason: 'COMPOSER_FILE_INPUT_ABSENT_OPENING_MEDIA_DRAWER',
+        data: { accountId: lease.accountId, format },
+      });
+      await lease.execOp('open-post-media-drawer', async () => {
+        await lease.page.evaluate((sc) => {
+          const dialog = document.querySelector(sc);
+          if (!dialog) return;
+          const btn = Array.from(
+            dialog.querySelectorAll<HTMLElement>('[role="button"], button'),
+          ).find((b) =>
+            /Photo\/video|Photo|Video|照片\/视频|相片\/影片|图片|视频|圖片|影片|ဓာတ်ပုံ|ဗီဒီယို|Ảnh\/video/i.test(
+              `${b.getAttribute('aria-label') ?? ''} ${b.textContent ?? ''}`,
+            ),
+          );
+          btn?.click();
+        }, scope);
+      });
+      await sleepAbortable(700, lease.signal);
+      count = await lease.page.locator(scopedAnyFileSel).count();
+    }
+    if (count === 0) throw Error('FACEBOOK_POST_MEDIA_INPUT_NOT_FOUND');
+    const wantKind = format === 'video' ? 'video' : 'image';
+    let picked = 0;
+    const inputs = lease.page.locator(scopedAnyFileSel);
+    for (let i = 0; i < count; i++) {
+      const accept = ((await inputs.nth(i).getAttribute('accept')) ?? '').toLowerCase();
+      if (accept.includes(wantKind) || (wantKind === 'video' && accept.includes('mp4'))) {
+        picked = i;
+        break;
+      }
+    }
+    lease.guard();
+    await lease.execOp('upload-post-media', () =>
+      inputs.nth(picked).setInputFiles([...mediaPaths], { timeout: 20_000 }),
+    );
+  },
+  navigateToUrl = async (lease: BrowserSessionLease, label: string, url: string) => {
+    lease.guard();
+    await lease.execOp(label, () =>
+      lease.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 }),
+    );
+    assertSafeUrl(lease.page.url());
+  };
+async function applyAILabelSetting(
+  lease: BrowserSessionLease,
+  setting: AILabelSetting,
+): Promise<void> {
+  if (setting === 'preserve-current') return;
+  const applied = new Set<AILabelPurpose>();
+  for (let attempt = 0; attempt < 12; attempt++) {
+    lease.guard();
+    const reading = await readFacebookAILabel(lease.page, lease.guard);
+    if (reading.phase === 'absent') return;
+    if (reading.phase === 'ambiguous') {
+      await sleepAbortable(700, lease.signal);
+      continue;
+    }
+    const decision = decidePostAILabel(setting, reading, (purpose) => applied.has(purpose));
+    if (decision.kind === 'ready') return;
+    if (decision.kind === 'wait') {
+      await sleepAbortable(700, lease.signal);
+      continue;
+    }
+    const target = aiLabelTarget(decision.purpose, reading);
+    await clickSelector(lease, `ai-label:${decision.purpose}`, selectorOf(target));
+    applied.add(decision.purpose);
+    await sleepAbortable(600, lease.signal);
+  }
+  throw Error('POST_AI_LABEL_TIMEOUT');
+}
+async function pollUntilReady<T>(
+  lease: BrowserSessionLease,
+  maxAttempts: number,
+  delayMs: number,
+  step: () => Promise<T | null>,
+  errorCode: string,
+): Promise<T> {
+  for (let i = 0; i < maxAttempts; i++) {
+    lease.guard();
+    const hit = await step();
+    if (hit !== null) return hit;
+    await sleepAbortable(delayMs, lease.signal);
+  }
+  throw Error(errorCode);
+}
+function decodeBase64StoryPostId(storyId: string): string | null {
+  try {
+    const decoded = Buffer.from(storyId, 'base64').toString('utf8');
+    const match = /^S:_I\d{1,30}:(\d{1,30})(?::(\d{1,30}))?$/.exec(decoded);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+function extractTimelinePostId(body: string): { postId: string | null; error: string | null } {
+  for (const rawObj of parseFacebookJsonChunks(body) ?? []) {
+    if (!rawObj || typeof rawObj !== 'object') continue;
+    const obj = rawObj as Record<string, unknown>;
+    if (Array.isArray(obj.errors) && obj.errors.length > 0) {
+      const firstErr = obj.errors[0] as Record<string, unknown> | undefined;
+      const msg =
+        (typeof firstErr?.summary === 'string' && firstErr.summary) ||
+        (typeof firstErr?.message === 'string' && firstErr.message) ||
+        'FACEBOOK_POST_SUBMISSION_REJECTED';
+      return { postId: null, error: msg.slice(0, 180) };
+    }
+    const data = obj.data as Record<string, unknown> | undefined;
+    const create = data?.story_create as Record<string, unknown> | undefined;
+    if (!create) continue;
+    if (typeof create.post_id === 'string' && /^\d{1,30}$/.test(create.post_id)) {
+      return { postId: create.post_id, error: null };
+    }
+    if (typeof create.story_id === 'string') {
+      const decoded = decodeBase64StoryPostId(create.story_id);
+      if (decoded) return { postId: decoded, error: null };
+    }
+    const story = create.story as Record<string, unknown> | undefined;
+    if (typeof story?.id === 'string') {
+      const decoded = decodeBase64StoryPostId(story.id);
+      if (decoded) return { postId: decoded, error: null };
+      return { postId: story.id.slice(0, 120), error: null };
+    }
+  }
+  return { postId: null, error: null };
+}
+async function publishTimelinePost(
+  lease: BrowserSessionLease,
+  step: StepInstance,
+  row: ResourceRowValue,
+  material: ResourceMaterial,
+  effective: ResourceRowValue,
+  aiLabel: AILabelSetting,
+): Promise<string> {
+  if (step.spec.type !== 'post') throw Error('FACEBOOK_POST_STEP_REQUIRED');
+  const mediaPaths = effective.media.map((item) => item.source);
+  if (mediaPaths.length > 0) {
+    await lease.reconnectWithFiles(mediaPaths);
+  }
+  await navigateToUrl(lease, 'timeline-home', 'https://www.facebook.com/');
+  const openerTarget = await pollUntilReady(
+    lease,
+    20,
+    1000,
+    async () => {
+      const reading = await readFacebookPostPage(lease.page, undefined, lease.guard);
+      assertSafeUrl(reading.projection.url);
+      return reading.opener ? { scope: reading.opener.scope, css: reading.opener.css } : null;
+    },
+    'FACEBOOK_POST_OPENER_NOT_FOUND',
+  );
+  await clickSelector(lease, 'open-composer', selectorOf(openerTarget));
+  await sleepAbortable(800, lease.signal);
+  if (step.spec.audience === 'self') {
+    for (let i = 0; i < 16; i++) {
+      lease.guard();
+      const audience = await readFacebookComposerAudience(lease.page, lease.guard);
+      if (audience.audience === 'SELF' && audience.phase === 'COMPOSER') break;
+      if (audience.ready === 'loading') {
+        await sleepAbortable(700, lease.signal);
+        continue;
+      }
+      if (audience.phase === 'MENU' && audience.selfAvailable === false) {
+        throw Error('POST_SELF_AUDIENCE_UNAVAILABLE');
+      }
+      const purpose =
+        audience.phase === 'COMPOSER'
+          ? 'OPEN_AUDIENCE'
+          : audience.phase === 'MENU'
+            ? audience.selfSelected
+              ? 'CONFIRM_AUDIENCE'
+              : 'SELECT_SELF'
+            : null;
+      const target = purpose ? audienceTarget(audience, purpose) : null;
+      if (target) {
+        await clickSelector(lease, `audience:${purpose}`, selectorOf(target));
+        await sleepAbortable(600, lease.signal);
+        continue;
+      }
+      await sleepAbortable(700, lease.signal);
+    }
+  }
+  let postPage = await pollUntilReady(
+    lease,
+    13,
+    700,
+    async () => {
+      const p = await readFacebookPostPage(lease.page, undefined, lease.guard);
+      return p.surface ? p : null;
+    },
+    'FACEBOOK_COMPOSER_NOT_READY',
+  );
+  const trimmedText = material.text.trim();
+  const wantsColorBg =
+    row.background === 'color' &&
+    mediaPaths.length === 0 &&
+    [...trimmedText].length <= NATIVE_COLOR_BACKGROUND_MAX_CHARS &&
+    material.text.split('\n').length <= 4;
+  if (postPage.background) {
+    for (let i = 0; i < 6; i++) {
+      lease.guard();
+      const bg = await readFacebookBackground(lease.page, lease.guard);
+      if (!bg.ready || !bg.visible || bg.phase === 'absent' || bg.phase === 'ambiguous') break;
+      const matches = wantsColorBg ? bg.phase === 'solid' : bg.phase === 'plain';
+      if (matches) break;
+      const targetCss = wantsColorBg ? bg.options[0]?.css : bg.clearCSS;
+      if (targetCss) {
+        await clickSelector(lease, 'set-background', `${facebookBackgroundScope} ${targetCss}`);
+        await sleepAbortable(500, lease.signal);
+        continue;
+      }
+      if (bg.openCSS) {
+        await clickSelector(lease, 'open-background', `${facebookBackgroundScope} ${bg.openCSS}`);
+        await sleepAbortable(500, lease.signal);
+        continue;
+      }
+      break;
+    }
+  }
+  if (material.text !== '') {
+    postPage = await readFacebookPostPage(lease.page, postPage.locale, lease.guard);
+    if (!postPage.surface) throw Error('FACEBOOK_COMPOSER_LOST');
+    await insertTextIntoSelector(
+      lease,
+      'set-post-text',
+      `${postPage.surface.scope} ${postPage.surface.textCSS}`,
+      material.text,
+    );
+    await sleepAbortable(600, lease.signal);
+  }
+  if (mediaPaths.length > 0) {
+    postPage = await readFacebookPostPage(lease.page, postPage.locale, lease.guard);
+    if (!postPage.surface) throw Error('FACEBOOK_COMPOSER_LOST');
+    await uploadTimelineMedia(
+      lease,
+      postPage.surface.scope,
+      postPage.surface.mediaCSS,
+      mediaPaths,
+      material.format,
+    );
+    await sleepAbortable(1000, lease.signal);
+  }
+  const readyTimeoutMs = material.format === 'video' ? 900_000 : 120_000;
+  const readyDeadline = Date.now() + readyTimeoutMs;
+  let submitSelector: string | null = null;
+  while (Date.now() < readyDeadline) {
+    lease.guard();
+    postPage = await readFacebookPostPage(lease.page, postPage.locale, lease.guard);
+    assertSafeUrl(postPage.projection.url);
+    const aiReading =
+      aiLabel !== 'preserve-current'
+        ? await readFacebookAILabel(lease.page, lease.guard)
+        : undefined;
+    if (aiReading?.phase === 'settings') {
+      await applyAILabelSetting(lease, aiLabel);
+      await sleepAbortable(700, lease.signal);
+      continue;
+    }
+    const surface = postPage.surface;
+    if (surface?.advance) {
+      if (aiReading?.phase === 'composer') {
+        await applyAILabelSetting(lease, aiLabel);
+      }
+      if (surface.advance.enabled) {
+        await clickSelector(lease, 'advance-composer', selectorOf(surface.advance));
+        await sleepAbortable(1000, lease.signal);
+        continue;
+      }
+    }
+    if (surface?.submit?.enabled) {
+      if (aiLabel !== 'preserve-current') {
+        await applyAILabelSetting(lease, aiLabel);
+        postPage = await readFacebookPostPage(lease.page, postPage.locale, lease.guard);
+      }
+      const finalSubmit = postPage.surface?.submit;
+      if (finalSubmit?.enabled) {
+        submitSelector = selectorOf(finalSubmit);
+        break;
+      }
+    }
+    await sleepAbortable(1200, lease.signal);
+  }
+  if (!submitSelector) throw Error('FACEBOOK_POST_SUBMIT_NOT_READY');
+  return await waitForSubmitGraphqlConfirmation(
+    lease,
+    submitSelector,
+    'ComposerStoryCreateMutation',
+    (body) => extractTimelinePostId(body),
+  );
+}
+async function publishStoryPost(
+  lease: BrowserSessionLease,
+  step: StepInstance,
+  material: ResourceMaterial,
+  effective: ResourceRowValue,
+  aiLabel: AILabelSetting,
+  dataDirectory: string,
+  uploadCacheRoot: string,
+): Promise<string> {
+  if (step.spec.type !== 'post') throw Error('FACEBOOK_POST_STEP_REQUIRED');
+  if (material.format === 'multi-image') throw Error('STORY_SINGLE_MEDIA_FORMAT_REQUIRED');
+  const mediaTextLimit = material.format === 'video' ? 2000 : nativeStoryMediaTextLimit;
+  if (material.format !== 'text' && material.text.length > mediaTextLimit) {
+    throw Error('STORY_TEXT_LIMIT_EXCEEDED');
+  }
+  let tempDir: string | null = null;
+  let uploadPath: string | null = effective.media[0]?.source ?? null;
+  let usedDerivedCaption = false;
+  try {
+    if (material.format === 'video' && material.text.trim() !== '' && uploadPath) {
+      const videoFile = material.files.find((f) => f.role === 'video');
+      if (!videoFile) throw Error('STORY_VIDEO_FILE_REQUIRED');
+      tempDir = path.join(uploadCacheRoot, `story-cap-${randomUUID()}`);
+      await mkdir(tempDir, { recursive: true });
+      const deriver = new StoryVideoCaptionDeriver(dataDirectory);
+      const derived = await deriver.derive(
+        uploadPath,
+        tempDir,
+        material.text,
+        videoFile.digest,
+        lease.guard,
+        () => {},
+      );
+      uploadPath = path.join(tempDir, derived.name);
+      usedDerivedCaption = true;
+    }
+    if (uploadPath) {
+      await lease.reconnectWithFiles([uploadPath]);
+    }
+    await navigateToUrl(lease, 'story-create-nav', 'https://www.facebook.com/stories/create/');
+    let story = await pollUntilReady(
+      lease,
+      21,
+      1000,
+      async () => {
+        const s = await readFacebookStoryPage(lease.page, lease.guard);
+        assertSafeUrl(s.url);
+        return s.ready && s.phase !== 'ambiguous' ? s : null;
+      },
+      'STORY_EDITOR_NOT_READY',
+    );
+    if (step.spec.audience === 'friends') {
+      let checkpoint: StoryPrivacyCheckpoint = 'OPEN_INITIAL';
+      for (let i = 0; i < 16 && checkpoint !== 'READY'; i++) {
+        lease.guard();
+        story = await readFacebookStoryPage(lease.page, lease.guard);
+        const decision = decideStoryFriendsPrivacy(checkpoint, story.privacy, 'friends');
+        if (decision.kind === 'ready') {
+          checkpoint = 'READY';
+          break;
+        }
+        if (decision.kind === 'wait') {
+          await sleepAbortable(800, lease.signal);
+          continue;
+        }
+        await clickSelector(lease, `story-privacy:${decision.action}`, selectorOf(decision.target));
+        if (decision.action === 'open') {
+          checkpoint = checkpoint === 'OPEN_INITIAL' ? 'SELECT_FRIENDS' : 'CLOSE_VERIFIED';
+        } else if (decision.action === 'selectFriends') {
+          checkpoint = 'SAVE';
+        } else if (decision.action === 'save' || decision.action === 'saveChange') {
+          checkpoint = 'OPEN_SAVED';
+        } else if (decision.action === 'close') {
+          checkpoint = 'READY';
+        }
+        await sleepAbortable(700, lease.signal);
+      }
+      story = await readFacebookStoryPage(lease.page, lease.guard);
+    }
+    if (material.format === 'text') {
+      if (story.phase === 'entry') {
+        if (!story.textEntry?.enabled) throw Error('STORY_TEXT_ENTRY_UNAVAILABLE');
+        await clickSelector(lease, 'story-open-text', story.textEntry.css);
+        await sleepAbortable(800, lease.signal);
+      }
+      story = await pollUntilReady(
+        lease,
+        13,
+        700,
+        async () => {
+          const s = await readFacebookStoryPage(lease.page, lease.guard);
+          return s.textCSS && s.phase === 'text-editor' ? s : null;
+        },
+        'STORY_TEXT_EDITOR_NOT_READY',
+      );
+      if (material.text !== '') {
+        await insertTextIntoSelector(lease, 'story-set-text', story.textCSS ?? '', material.text);
+        await sleepAbortable(600, lease.signal);
+      }
+    } else {
+      if (!uploadPath) throw Error('STORY_MEDIA_FILE_REQUIRED');
+      story = await pollUntilReady(
+        lease,
+        16,
+        800,
+        async () => {
+          const s = await readFacebookStoryPage(lease.page, lease.guard);
+          return s.mediaCSS ? s : null;
+        },
+        'STORY_MEDIA_INPUT_REQUIRED',
+      );
+      await uploadFilesToSelector(lease, 'story-upload-media', story.mediaCSS ?? '', [uploadPath]);
+      const uploadDeadline = Date.now() + 180_000;
+      while (Date.now() < uploadDeadline) {
+        lease.guard();
+        story = await readFacebookStoryPage(lease.page, lease.guard);
+        assertSafeUrl(story.url);
+        const readyMedia =
+          story.phase === 'media-editor' &&
+          Boolean(
+            story.media?.ready || story.submit?.enabled || story.nativeVideoControls?.enabled,
+          );
+        if (readyMedia) break;
+        await sleepAbortable(1200, lease.signal);
+      }
+      if (story.phase !== 'media-editor') throw Error('STORY_MEDIA_UPLOAD_TIMEOUT');
+      if (material.text !== '' && !usedDerivedCaption) {
+        if (!story.addText?.enabled) throw Error('STORY_TEXT_TOOL_NOT_READY');
+        await clickSelector(lease, 'story-add-text', story.addText.css);
+        story = await pollUntilReady(
+          lease,
+          13,
+          700,
+          async () => {
+            const s = await readFacebookStoryPage(lease.page, lease.guard);
+            return s.textEditing && s.textCSS ? s : null;
+          },
+          'STORY_TEXT_EDITOR_NOT_READY',
+        );
+        await insertTextIntoSelector(
+          lease,
+          'story-set-overlay-text',
+          story.textCSS ?? '',
+          material.text,
+        );
+        await sleepAbortable(500, lease.signal);
+        await clickSelector(lease, 'story-text-finish', selectorOf(storyMediaTextFinish));
+        await sleepAbortable(700, lease.signal);
+      }
+    }
+    if (aiLabel !== 'preserve-current') {
+      await applyAILabelSetting(lease, aiLabel);
+    }
+    const submitSelector = await pollUntilReady(
+      lease,
+      20,
+      1000,
+      async () => {
+        const s = await readFacebookStoryPage(lease.page, lease.guard),
+          sub = s.submit?.enabled
+            ? s.submit
+            : s.nativeVideoControls?.enabled
+              ? s.nativeVideoControls
+              : null;
+        return sub ? sub.css : null;
+      },
+      'STORY_SUBMIT_NOT_READY',
+    );
+    return await waitForSubmitGraphqlConfirmation(
+      lease,
+      submitSelector,
+      'StoriesCreateMutation',
+      (body, res) => {
+        const created = parseNativeStoryCreation(body, res.status(), lease.accountId);
+        return { postId: created ? created.storyId || created.bucketId : null, error: null };
+      },
+    );
+  } finally {
+    if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+async function waitForSubmitGraphqlConfirmation(
+  lease: BrowserSessionLease,
+  submitSelector: string,
+  friendlyName: string,
+  parseBody: (body: string, res: Response) => { postId: string | null; error: string | null },
+): Promise<string> {
+  const page: Page = lease.page;
+  let resolvedPostId: string | null = null,
+    rejectedError: string | null = null;
+  const pending = new Set<Promise<void>>();
+  const onResponse = (res: Response) => {
+    if (!res.request().url().includes('/api/graphql')) return;
+    const params = new URLSearchParams(res.request().postData() ?? '');
+    if (
+      params.get('fb_api_req_friendly_name') !== friendlyName ||
+      params.get('av') !== lease.accountId
+    )
+      return;
+    const task = (async () => {
+      try {
+        const parsed = parseBody(await res.text(), res);
+        if (parsed.error) rejectedError ??= parsed.error;
+        if (parsed.postId) resolvedPostId ??= parsed.postId;
+      } catch {}
+    })();
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  };
+  page.on('response', onResponse);
+  try {
+    await clickSelector(lease, 'submit-publish', submitSelector);
+    for (const deadline = Date.now() + 120_000; Date.now() < deadline;) {
+      lease.guard();
+      if (resolvedPostId) return resolvedPostId;
+      if (rejectedError) throw Error(rejectedError);
+      assertSafeUrl(page.url());
+      await sleepAbortable(300, lease.signal);
+    }
+    if (pending.size > 0) await Promise.allSettled([...pending]);
+    if (resolvedPostId) return resolvedPostId;
+    if (rejectedError) throw Error(rejectedError);
+    throw Error('PUBLISH_RESULT_UNCONFIRMED');
+  } finally {
+    page.off('response', onResponse);
+  }
+}
+export async function executeDirectPostStep(
+  options: ExecuteDirectPostStepOptions,
+): Promise<DirectPostStepResult> {
+  const { plan, step, lease, store, dataDirectory, uploadCacheRoot, claimedSourceKeys } = options;
+  if (step.spec.type !== 'post') throw Error('FACEBOOK_POST_STEP_REQUIRED');
+  if (step.spec.resourceMode !== 'table') throw Error('RESOURCE_TABLE_MODE_REQUIRED');
+  const destination: 'post' | 'story' = step.spec.destination === 'story' ? 'story' : 'post';
+  const snapshot = await store.tasks.resources.snapshot(plan.id);
+  const candidateRows = snapshot.table.rows.filter(
+    (row) => hasResource(row) && resourceSupportsDestination(row, destination),
+  );
+  if (candidateRows.length === 0) {
+    return step.progress.published === 0
+      ? { kind: 'SKIP_EXHAUSTED', published: 0 }
+      : { kind: 'FAIL_EXHAUSTED', published: step.progress.published };
+  }
+  let published = step.progress.published;
+  while (published < step.spec.count) {
+    lease.guard();
+    let publishedThisRound = false;
+    for (const row of candidateRows) {
+      lease.guard();
+      const origin = ResourceMaterialOrigin.parse({
+        version: 1,
+        combinationId: plan.combinationId,
+        revision: snapshot.binding.resourceRevision,
+        row,
+      });
+      const usageKey = materialUsageSourceKey(origin);
+      let claimed = false;
+      if (!step.spec.allowRepeat) {
+        if (claimedSourceKeys.has(usageKey)) continue;
+        if (await store.tasks.isMaterialSourceUsed(usageKey)) continue;
+        claimedSourceKeys.add(usageKey);
+        claimed = true;
+      }
+      let downloadDir: string | null = null;
+      try {
+        downloadDir = path.join(dataDirectory, 'drive-cache', randomUUID());
+        const downloader = new PublicDriveDownloader(downloadDir);
+        const verifier = new FilesystemResourceMaterialVerifier(
+          undefined,
+          undefined,
+          downloader,
+          checkKnownFacebookVideoPath,
+        );
+        const material = await verifier.snapshot(row, lease.guard);
+        const effective = resourceEffectiveRow(row, material);
+        if (
+          await store.tasks.hasAccountPublishedFingerprint(lease.accountId, material.fingerprint)
+        ) {
+          continue;
+        }
+        const aiLabel: AILabelSetting = row.aiLabel ?? step.spec.aiLabel ?? 'preserve-current';
+        const postId =
+          destination === 'story'
+            ? await publishStoryPost(
+                lease,
+                step,
+                material,
+                effective,
+                aiLabel,
+                dataDirectory,
+                uploadCacheRoot,
+              )
+            : await publishTimelinePost(lease, step, row, material, effective, aiLabel);
+        await store.tasks.recordDirectPublication({
+          jobId: plan.id,
+          stepId: step.id,
+          accountId: lease.accountId,
+          combinationId: plan.combinationId,
+          fingerprint: material.fingerprint,
+          postId,
+          usageSourceKey: usageKey,
+          allowRepeat: step.spec.allowRepeat,
+          resourceOrigin: origin,
+        });
+        if (!step.spec.allowRepeat) {
+          await store.resourceTables.removePublishedRow(plan.combinationId, row, Date.now());
+        }
+        published += 1;
+        publishedThisRound = true;
+        await options.onProgress?.({ ...step.progress, published });
+        break;
+      } finally {
+        if (claimed) claimedSourceKeys.delete(usageKey);
+        if (downloadDir && row.media.some((item) => item.kind === 'drive')) {
+          await rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    }
+    if (!publishedThisRound) {
+      return published === 0
+        ? { kind: 'SKIP_EXHAUSTED', published: 0 }
+        : { kind: 'FAIL_EXHAUSTED', published };
+    }
+    if (published < step.spec.count) {
+      await sleepAbortable(2500, lease.signal);
+    }
+  }
+  return { kind: 'COMPLETED', published };
+}

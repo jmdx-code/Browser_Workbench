@@ -1,6 +1,5 @@
 import type { Page } from 'playwright-core';
 import type { BumperPost } from './group-bumper-effects.js';
-
 // Runs inside the existing bound setup operation. It does not grant control,
 // submit reactions, or credit a wall-clock wait as actual video playback.
 export async function watchBumperVideo(input: {
@@ -35,14 +34,15 @@ export async function watchBumperVideo(input: {
     unmuteClicks = 0,
     speakerConfirmedUnmuted = current.videoSpeakerMuted === false,
     css = current.videoCSS;
+  const evalFirst = (sel: string, fn: (el: HTMLElement | SVGElement) => unknown, timeout = 2000) =>
+    page.locator(sel).first().evaluate(fn, undefined, { timeout });
   const center = async (selector: string) => {
     guard();
-    await page
-      .locator(selector)
-      .first()
-      .evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }), undefined, {
-        timeout: 3000,
-      });
+    await evalFirst(
+      selector,
+      (el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }),
+      3000,
+    );
   };
   const read = async () => {
     guard();
@@ -62,109 +62,60 @@ export async function watchBumperVideo(input: {
       // ever moving the pointer. force:true moves the real pointer onto the player overlay.
       await videoLocator.hover({ force: true, timeout: 2000 }).catch(() => {});
     }
-    await videoLocator
-      .evaluate(
-        (el) => {
-          if (!(el instanceof Element)) return;
-          const r = el.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0) return;
-          const cx = r.left + r.width / 2;
-          const cy = r.top + r.height / 2;
-          const hit =
-            typeof document !== 'undefined' && typeof document.elementFromPoint === 'function'
-              ? document.elementFromPoint(cx, cy)
-              : null;
-          const targets = hit && hit !== el ? [hit, el] : [el];
-          for (const target of targets) {
-            try {
-              if (typeof PointerEvent === 'function') {
-                target.dispatchEvent(
-                  new PointerEvent('pointerover', {
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: cx,
-                    clientY: cy,
-                  }),
-                );
-                target.dispatchEvent(
-                  new PointerEvent('pointermove', {
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: cx,
-                    clientY: cy,
-                  }),
-                );
-              }
-              if (typeof MouseEvent === 'function') {
-                target.dispatchEvent(
-                  new MouseEvent('mouseover', {
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: cx,
-                    clientY: cy,
-                  }),
-                );
-                target.dispatchEvent(
-                  new MouseEvent('mousemove', {
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: cx,
-                    clientY: cy,
-                  }),
-                );
-              }
-            } catch {
-              /* Synthetic hover wakeup is best-effort alongside pointer hover. */
-            }
-          }
-        },
-        undefined,
-        { timeout: 2000 },
-      )
-      .catch(() => {});
+    await evalFirst(videoSelector, (el) => {
+      if (!(el instanceof Element)) return;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      const cx = r.left + r.width / 2,
+        cy = r.top + r.height / 2;
+      const hit =
+        typeof document !== 'undefined' && typeof document.elementFromPoint === 'function'
+          ? document.elementFromPoint(cx, cy)
+          : null;
+      for (const target of hit && hit !== el ? [hit, el] : [el]) {
+        try {
+          const init = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
+          if (typeof PointerEvent === 'function')
+            for (const t of ['pointerover', 'pointermove'])
+              target.dispatchEvent(new PointerEvent(t, init));
+          if (typeof MouseEvent === 'function')
+            for (const t of ['mouseover', 'mousemove'])
+              target.dispatchEvent(new MouseEvent(t, init));
+        } catch {
+          /* Synthetic hover wakeup is best-effort alongside pointer hover. */
+        }
+      }
+    }).catch(() => {});
   };
   const clickSpeakerControl = async (audioSelector: string) => {
     guard();
-    const audioLocator = page.locator(audioSelector).first();
     // Vertical 9:16 Reels inside tiled windows (500-602px tall) often leave the top-right
     // speaker icon above the viewport or behind Facebook's ~130px sticky group header after
     // centering <video>. Nudge scroll just enough to expose the speaker icon unobstructed
     // while keeping >70% of the video inside the viewport.
-    await audioLocator
-      .evaluate(
+    await evalFirst(
+      audioSelector,
+      (el) => {
+        if (!(el instanceof Element) || typeof window === 'undefined') return;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || !(window.innerHeight > 0)) return;
+        const topSafe = Math.min(148, Math.floor(window.innerHeight * 0.28));
+        const bottomSafe = Math.max(topSafe + 40, window.innerHeight - 28);
+        if (r.top < topSafe) window.scrollBy(0, r.top - (topSafe + 12));
+        else if (r.bottom > bottomSafe) window.scrollBy(0, r.bottom - (bottomSafe - 16));
+      },
+      undefined,
+    ).catch(() => {});
+    try {
+      await page.locator(audioSelector).first().click({ timeout: 2000 });
+    } catch {
+      await evalFirst(
+        audioSelector,
         (el) => {
-          if (!(el instanceof Element) || typeof window === 'undefined') return;
-          const r = el.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0 || !(window.innerHeight > 0)) return;
-          const topSafe = Math.min(148, Math.floor(window.innerHeight * 0.28));
-          const bottomSafe = Math.max(topSafe + 40, window.innerHeight - 28);
-          if (r.top < topSafe) {
-            window.scrollBy(0, r.top - (topSafe + 12));
-          } else if (r.bottom > bottomSafe) {
-            window.scrollBy(0, r.bottom - (bottomSafe - 16));
-          }
+          if (el instanceof HTMLElement) el.click();
         },
         undefined,
-        { timeout: 2000 },
-      )
-      .catch(() => {});
-    let clickedOk = false;
-    try {
-      await audioLocator.click({ timeout: 2000 });
-      clickedOk = true;
-    } catch {
-      clickedOk = false;
-    }
-    if (!clickedOk) {
-      await audioLocator
-        .evaluate(
-          (el) => {
-            if (el instanceof HTMLElement) el.click();
-          },
-          undefined,
-          { timeout: 2000 },
-        )
-        .catch(() => {});
+      ).catch(() => {});
     }
   };
   const ensureUnmuted = async () => {

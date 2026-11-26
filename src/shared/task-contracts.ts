@@ -1,146 +1,140 @@
 import { z } from 'zod';
-import { CombinationSchema, Id, StepSchema } from './contracts.js';
+import {
+  CombinationSchema,
+  Id,
+  MAX_CONCURRENT_PROFILES,
+  NonNegInt,
+  NumNull,
+  OperationDisposition,
+  PosInt,
+  StepSchema,
+  intRange,
+  optBool,
+  sMax,
+  sReq,
+  strictObj,
+} from './contracts.js';
 import { Action } from './browser-actions.js';
 import { DispatchBinding } from './task-execution.js';
-import { OperationDisposition } from './task-ending.js';
 import { TaskTiming } from './task-timing.js';
 import { TaskStepOutcome } from './task-step-outcome.js';
-import { MAX_CONCURRENT_PROFILES } from './task-capacity.js';
-
-export const TaskState = z.enum([
-  'QUEUED',
-  'RUNNING',
-  'PAUSING',
-  'PAUSED',
-  'STOPPING',
-  'STOPPED',
-  'REVIEW',
-  'COMPLETED',
-  'FAILED',
-]);
-export const TaskProgress = z
-  .object({
-    revision: z.number().int().nonnegative(),
-    effectiveMilliseconds: z.number().int().nonnegative(),
-    likes: z.number().int().nonnegative(),
-    published: z.number().int().nonnegative(),
-    accepted: z.number().int().nonnegative().optional(),
-    cursor: z.string().max(4096).nullable(),
-  })
-  .strict();
-export const TaskStepLegacy = z
-  .object({
-    id: Id,
-    jobId: Id,
-    round: z.number().int().positive(),
-    position: z.number().int().nonnegative(),
-    spec: StepSchema,
-    status: z.enum(['PENDING', 'ACTIVE', 'COMPLETED']),
-    progress: TaskProgress,
-  })
-  .strict();
+const ts = { createdAt: z.number(), updatedAt: z.number() },
+  errStr = sMax(200),
+  cursorStr = sReq(600),
+  optNumNull = NumNull.optional(),
+  TaskState = z.enum(['QUEUED', 'RUNNING', 'STOPPED', 'COMPLETED', 'FAILED']);
+export const TaskProgress = strictObj({
+  revision: NonNegInt,
+  effectiveMilliseconds: NonNegInt,
+  likes: NonNegInt,
+  published: NonNegInt,
+  accepted: NonNegInt.optional(),
+  cursor: sMax(4096).nullable(),
+});
+export const TaskStepLegacy = strictObj({
+  id: Id,
+  jobId: Id,
+  round: PosInt,
+  position: NonNegInt,
+  spec: StepSchema,
+  status: z.enum(['PENDING', 'ACTIVE', 'COMPLETED']),
+  progress: TaskProgress,
+});
 export const TaskStep = TaskStepLegacy.extend({
   status: z.enum(['PENDING', 'ACTIVE', 'COMPLETED', 'FAILED', 'SKIPPED']),
   outcome: TaskStepOutcome.optional(),
 });
-export const TaskPlan = z
-  .object({
-    id: Id,
-    batchId: Id,
-    profileId: Id,
-    combinationId: Id,
-    version: z.number().int().positive(),
-    accountId: z.string().min(1).max(200).nullable(),
-    snapshot: CombinationSchema,
-    state: TaskState,
-    reason: z.string().max(200),
-    controlMode: z.enum(['pause', 'stop']).nullable(),
-    controlRequestId: Id.nullable(),
-    controlConfirmed: z.boolean(),
-    round: z.number().int().positive(),
-    position: z.number().int().nonnegative(),
-    createdAt: z.number(),
-    updatedAt: z.number(),
-    timing: TaskTiming.optional(),
-    timingReleased: z.boolean().optional(),
-  })
-  .strict();
-export const TaskOperation = z
-  .object({
-    id: Id,
-    jobId: Id,
-    stepId: Id,
-    action: Action,
-    binding: DispatchBinding.nullable(),
-    status: z.enum([
-      'PREPARED',
-      'DISPATCHING',
-      'ACKNOWLEDGED',
-      'VERIFIED',
-      'FAILED',
-      'UNKNOWN',
-      'CANCELLED',
-    ]),
-    receipt: z.json().nullable(),
-    checkpointApplied: z.boolean(),
-    disposition: OperationDisposition.optional(),
-    inertBrowseProof: z
-      .object({
-        verified: z.literal(true),
-        purpose: z.enum(['play', 'advance', 'dismiss', 'activate']).optional(),
-        planConfirmedStopped: z.boolean(),
-      })
-      .strict()
-      .optional(),
-    createdAt: z.number(),
-    updatedAt: z.number(),
-  })
-  .strict();
-export const TaskEvent = z
-  .object({
-    sequence: z.number().int().positive(),
-    jobId: Id,
-    type: z.string(),
-    detail: z.json(),
-    createdAt: z.number(),
-  })
-  .strict();
-export const SchedulerSettings = z
-  .object({ maxConcurrentProfiles: z.number().int().min(1).max(MAX_CONCURRENT_PROFILES) })
-  .strict();
-export const AssignTasks = z
-  .object({
-    requestId: Id,
-    combinationId: Id,
-    version: z.number().int().positive(),
-    profileIds: z.array(Id).min(1).max(1000),
-    expectedResourceRevision: z.number().int().positive().optional(),
-    timing: TaskTiming.optional(),
-  })
-  .strict();
-export const TaskOverview = z
-  .object({
-    dispatchEnabled: z.boolean(),
-    settings: SchedulerSettings,
-    plans: z.array(TaskPlan),
-  })
-  .strict();
-export const TaskHistoryRequest = z
-  .object({ profileId: Id, planId: Id.optional(), round: z.number().int().positive().optional() })
-  .strict();
-// Public display budget follows the persisted step instance, including shuffled rounds.
-// Optional for older controller responses and historical exports; never an input grant.
+export const TaskPlan = strictObj({
+  id: Id,
+  batchId: Id,
+  profileId: Id,
+  combinationId: Id,
+  version: PosInt,
+  accountId: sReq(200).nullable(),
+  snapshot: CombinationSchema,
+  state: TaskState,
+  reason: errStr,
+  controlMode: z.enum(['pause', 'stop']).nullable(),
+  controlRequestId: Id.nullable(),
+  controlConfirmed: z.boolean(),
+  round: PosInt,
+  position: NonNegInt,
+  ...ts,
+  timing: TaskTiming.optional(),
+  timingReleased: optBool,
+  closeBrowserOnFinish: optBool,
+});
+export const TaskOperation = strictObj({
+  id: Id,
+  jobId: Id,
+  stepId: Id,
+  action: Action,
+  binding: DispatchBinding.nullable(),
+  status: z.enum([
+    'PREPARED',
+    'DISPATCHING',
+    'ACKNOWLEDGED',
+    'VERIFIED',
+    'FAILED',
+    'UNKNOWN',
+    'CANCELLED',
+  ]),
+  receipt: z.json().nullable(),
+  checkpointApplied: z.boolean(),
+  disposition: OperationDisposition.optional(),
+  inertBrowseProof: strictObj({
+    verified: z.literal(true),
+    purpose: z.enum(['play', 'advance', 'dismiss', 'activate']).optional(),
+    planConfirmedStopped: z.boolean(),
+  }).optional(),
+  ...ts,
+});
+export const TaskEvent = strictObj({
+  sequence: PosInt,
+  jobId: Id,
+  type: z.string(),
+  detail: z.json(),
+  createdAt: z.number(),
+});
+export const SchedulerSettings = strictObj({
+  maxConcurrentProfiles: intRange(1, MAX_CONCURRENT_PROFILES),
+});
+export const AssignTasks = strictObj({
+  requestId: Id,
+  combinationId: Id,
+  version: PosInt,
+  profileIds: z.array(Id).min(1).max(1000),
+  expectedResourceRevision: PosInt.optional(),
+  timing: TaskTiming.optional(),
+  closeBrowserOnFinish: optBool,
+});
+export const TaskOverview = strictObj({
+  dispatchEnabled: z.boolean(),
+  settings: SchedulerSettings,
+  plans: z.array(TaskPlan),
+});
+export const TaskHistoryRequest = strictObj({
+  profileId: Id,
+  planId: Id.optional(),
+  round: PosInt.optional(),
+});
 export const TaskStepBudget = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('time'), milliseconds: z.number().int().positive() }).strict(),
-  z.object({ kind: z.literal('posts'), count: z.number().int().positive() }).strict(),
-  z
-    .object({
-      kind: z.literal('friends'),
-      mode: z.enum(['count', 'all']),
-      count: z.number().int().positive().nullable(),
-    })
-    .strict(),
+  strictObj({ kind: z.literal('time'), milliseconds: PosInt }),
+  strictObj({ kind: z.literal('posts'), count: PosInt }),
+  strictObj({
+    kind: z.literal('friends'),
+    mode: z.enum(['count', 'all']),
+    count: PosInt.nullable(),
+  }),
 ]);
+const stepDescriptor = {
+  type: z.enum(['feed', 'video', 'post', 'marketplace', 'friends']),
+  destination: z.enum(['post', 'story']).optional(),
+  friendAction: z.enum(['accept', 'add_suggested']).optional(),
+  feedMode: z.enum(['home', 'random_profile', 'random_page', 'search_pages']).optional(),
+  maxLikes: NonNegInt.optional(),
+  budget: TaskStepBudget.optional(),
+};
 const HistoryPlan = TaskPlan.pick({
   timing: true,
   id: true,
@@ -155,53 +149,38 @@ const HistoryPlan = TaskPlan.pick({
   createdAt: true,
   updatedAt: true,
 })
-  .extend({ name: z.string().max(200) })
+  .extend({ name: errStr })
   .strict();
-export const TaskHistory = z
-  .object({
-    detailsReclaimed: z.boolean().optional(),
-    profileId: Id,
-    plans: z.array(HistoryPlan).max(50),
-    selectedPlanId: Id.nullable(),
-    steps: z.array(
-      TaskStep.pick({
-        id: true,
-        round: true,
-        position: true,
-        status: true,
-        outcome: true,
-        progress: true,
-      })
-        .extend({
-          type: z.enum(['video', 'feed', 'post', 'marketplace', 'friends']),
-          destination: z.enum(['post', 'story']).optional(),
-          budget: TaskStepBudget.optional(),
-          startedAt: z.number().nullable().optional(),
-          finishedAt: z.number().nullable().optional(),
-        })
-        .strict(),
-    ),
-    operations: z
-      .array(
-        TaskOperation.pick({
-          id: true,
-          stepId: true,
-          status: true,
-          createdAt: true,
-          updatedAt: true,
-        })
-          .extend({ kind: z.string().max(40) })
-          .strict(),
-      )
-      .max(100),
-    events: z
-      .array(TaskEvent.pick({ sequence: true, type: true, createdAt: true }).strict())
-      .max(100),
-    truncated: z
-      .object({ plans: z.boolean(), operations: z.boolean(), events: z.boolean() })
+const stepPick = {
+  id: true as const,
+  round: true as const,
+  position: true as const,
+  status: true as const,
+  outcome: true as const,
+  progress: true as const,
+};
+export const TaskHistory = strictObj({
+  detailsReclaimed: optBool,
+  profileId: Id,
+  plans: z.array(HistoryPlan).max(50),
+  selectedPlanId: Id.nullable(),
+  steps: z.array(
+    TaskStep.pick(stepPick)
+      .extend({ ...stepDescriptor, startedAt: optNumNull, finishedAt: optNumNull })
       .strict(),
-  })
-  .strict();
+  ),
+  operations: z
+    .array(
+      TaskOperation.pick({ id: true, stepId: true, status: true, createdAt: true, updatedAt: true })
+        .extend({ kind: sMax(40) })
+        .strict(),
+    )
+    .max(100),
+  events: z
+    .array(TaskEvent.pick({ sequence: true, type: true, createdAt: true }).strict())
+    .max(100),
+  truncated: strictObj({ plans: z.boolean(), operations: z.boolean(), events: z.boolean() }),
+});
 export type History = z.infer<typeof TaskHistory>;
 export type Plan = z.infer<typeof TaskPlan>;
 export type StepInstance = z.infer<typeof TaskStep>;
@@ -210,175 +189,126 @@ export type Operation = z.infer<typeof TaskOperation>;
 export type Assignment = z.infer<typeof AssignTasks>;
 export type Settings = z.infer<typeof SchedulerSettings>;
 export type Event = z.infer<typeof TaskEvent>;
-export const TaskCapabilities = z
-  .object({
-    types: z.array(z.enum(['feed', 'video', 'post', 'marketplace', 'friends'])).max(5),
-    combinations: z.array(
-      z
-        .object({
-          id: Id,
-          version: z.number().int().nonnegative(),
-          enabled: z.boolean(),
-          reason: z.string().max(200),
-        })
-        .strict(),
-    ),
-  })
-  .strict();
-export const TaskStartResult = z.object({ plans: z.array(TaskPlan).max(1000) }).strict();
-export const TaskCommandRequest = z
-  .object({
-    command: z.enum(['pause', 'resume', 'stop']),
-    plans: z
-      .array(
-        z
-          .object({
-            profileId: Id,
-            planId: Id,
-            expectedState: TaskState,
-            expectedUpdatedAt: z.number(),
-          })
-          .strict(),
-      )
-      .min(1)
-      .max(1000),
-  })
-  .strict()
-  .refine(
-    (value) => new Set(value.plans.map((plan) => plan.planId)).size === value.plans.length,
-    '任务不能重复',
-  );
+export const TaskCapabilities = strictObj({
+  types: z.array(stepDescriptor.type).max(5),
+  combinations: z.array(
+    strictObj({ id: Id, version: NonNegInt, enabled: z.boolean(), reason: errStr }),
+  ),
+});
+export const TaskStartResult = strictObj({ plans: z.array(TaskPlan).max(1000) });
+export const TaskCommandRequest = strictObj({
+  command: z.enum(['pause', 'resume', 'stop']),
+  plans: z
+    .array(
+      strictObj({
+        profileId: Id,
+        planId: Id,
+        expectedState: TaskState,
+        expectedUpdatedAt: z.number(),
+      }),
+    )
+    .min(1)
+    .max(1000),
+}).refine((v) => new Set(v.plans.map((p) => p.planId)).size === v.plans.length, '任务不能重复');
 export type TaskCommand = z.infer<typeof TaskCommandRequest>;
-export const TaskCommandResult = z
-  .object({
-    results: z
-      .array(
-        z
-          .object({
-            profileId: Id,
-            planId: Id,
-            accepted: z.boolean(),
-            state: TaskState.nullable(),
-            controlConfirmed: z.boolean(),
-            reason: z.string().max(200),
-          })
-          .strict(),
-      )
-      .max(1000),
-  })
-  .strict();
-export const TaskRuntimeEventCategory = z.enum([
+export const TaskCommandResult = strictObj({
+  results: z
+    .array(
+      strictObj({
+        profileId: Id,
+        planId: Id,
+        accepted: z.boolean(),
+        state: TaskState.nullable(),
+        controlConfirmed: z.boolean(),
+        reason: errStr,
+      }),
+    )
+    .max(1000),
+});
+const TaskRuntimeEventCategory = z.enum([
   'PLAN_TERMINAL',
   'PLAN_STATE',
   'STEP_EVENT',
   'OPERATION_EVENT',
 ]);
-export const TaskRuntimeEvent = TaskEvent.extend({
-  category: TaskRuntimeEventCategory,
-}).strict();
+export const TaskRuntimeEvent = TaskEvent.extend({ category: TaskRuntimeEventCategory }).strict();
 export type RuntimeEvent = z.infer<typeof TaskRuntimeEvent>;
-export const TaskRuntimeRequest = z
-  .object({
-    afterSequence: z.number().int().nonnegative().optional(),
-    cursor: z.string().min(1).max(600).optional(),
-    limit: z.number().int().min(1).max(200).optional(),
-    maxBytes: z.number().int().min(256).max(262_144).optional(),
-  })
-  .strict();
+export const TaskRuntimeRequest = strictObj({
+  afterSequence: NonNegInt.optional(),
+  cursor: cursorStr.optional(),
+  limit: intRange(1, 200).optional(),
+  maxBytes: intRange(256, 262_144).optional(),
+});
 export type RuntimeRequest = z.infer<typeof TaskRuntimeRequest>;
-export const ProfileTaskResult = z
-  .object({
-    profileId: Id,
-    source: z.enum(['task', 'group-inviter', 'group-bumper', 'page-bumper', 'group-poster']),
-    runId: z.string().min(1).max(200),
-    name: z.string().max(300),
-    state: z.enum(['COMPLETED', 'FAILED', 'STOPPED']),
-    reason: z.string().max(500),
-    finishedAt: z.number().int().nonnegative(),
-    failedSteps: z.number().int().nonnegative().default(0),
-    skippedSteps: z.number().int().nonnegative().default(0),
-  })
-  .strict();
+export const ProfileTaskResult = strictObj({
+  profileId: Id,
+  source: z.enum(['task', 'group-inviter', 'group-bumper', 'page-bumper', 'group-poster']),
+  runId: sReq(200),
+  name: sMax(300),
+  state: z.enum(['COMPLETED', 'FAILED', 'STOPPED']),
+  reason: sMax(500),
+  finishedAt: NonNegInt,
+  failedSteps: NonNegInt.default(0),
+  skippedSteps: NonNegInt.default(0),
+});
 export type ProfileTaskResultValue = z.infer<typeof ProfileTaskResult>;
+const projectedStepSchema = TaskStep.pick({ ...stepPick, jobId: true })
+  .extend(stepDescriptor)
+  .strict();
 export const TaskRuntimeOverview = TaskOverview.extend({
   profileResults: z.array(ProfileTaskResult).optional(),
-  currentSteps: z.array(
-    TaskStep.pick({
-      id: true,
-      jobId: true,
-      round: true,
-      position: true,
-      status: true,
-      outcome: true,
-      progress: true,
-    })
-      .extend({
-        type: z.enum(['feed', 'video', 'post', 'marketplace', 'friends']),
-        destination: z.enum(['post', 'story']).optional(),
-        budget: TaskStepBudget.optional(),
-      })
-      .strict(),
-  ),
+  currentSteps: z.array(projectedStepSchema),
+  roundSteps: z.array(projectedStepSchema).optional(),
   recentTerminalPlans: z.array(TaskPlan).max(200).optional(),
   events: z.array(TaskRuntimeEvent).max(200).optional(),
-  lastEventSequence: z.number().int().nonnegative().optional(),
-  lastScannedSequence: z.number().int().nonnegative().optional(),
-  hasMore: z.boolean().optional(),
-  resetRequired: z.boolean().optional(),
-  visibleTerminalFloorSequence: z.number().int().nonnegative().optional(),
-  epoch: z.string().min(1).max(200).optional(),
-  cursor: z.string().min(1).max(600).optional(),
+  lastEventSequence: NonNegInt.optional(),
+  lastScannedSequence: NonNegInt.optional(),
+  hasMore: optBool,
+  resetRequired: optBool,
+  visibleTerminalFloorSequence: NonNegInt.optional(),
+  epoch: sReq(200).optional(),
+  cursor: cursorStr.optional(),
 }).strict();
-export const TaskRecordsRequest = z
-  .object({
-    groupBy: z.literal('run').optional(),
-    profileId: Id.optional(),
-    status: z.enum(['all', 'running', 'completed', 'failed', 'review']).default('all'),
-    query: z.string().max(100).optional(),
-    cursor: z.string().max(600).optional(),
-    limit: z.number().int().min(1).max(200).default(100),
-  })
-  .strict();
-export const TaskRecordRow = z
-  .object({
-    stepId: Id,
-    planId: Id,
-    profileId: Id,
-    combinationId: Id,
-    combinationName: z.string().max(200),
-    combinationVersion: z.number().int().positive(),
-    round: z.number().int().positive(),
-    position: z.number().int().nonnegative(),
-    type: z.enum(['feed', 'video', 'post', 'marketplace', 'friends']),
-    destination: z.enum(['post', 'story']).optional(),
-    status: z.enum(['PENDING', 'ACTIVE', 'COMPLETED', 'FAILED', 'SKIPPED']),
-    planState: TaskState,
-    planReason: z.string().max(200),
-    outcome: TaskStepOutcome.optional(),
-    progress: TaskProgress,
-    budget: TaskStepBudget.optional(),
-    startedAt: z.number().nullable(),
-    finishedAt: z.number().nullable(),
-    planCreatedAt: z.number(),
-    planUpdatedAt: z.number(),
-  })
-  .strict();
-export const TaskRecords = z
-  .object({
-    records: z.array(TaskRecordRow).max(200),
-    viewVersion: z.string().max(100).optional(),
-    nextCursor: z.string().max(600).nullable(),
-    total: z.number().int().nonnegative(),
-    counts: z
-      .object({
-        all: z.number().int().nonnegative(),
-        running: z.number().int().nonnegative(),
-        completed: z.number().int().nonnegative(),
-        failed: z.number().int().nonnegative(),
-        review: z.number().int().nonnegative(),
-      })
-      .strict(),
-  })
-  .strict();
+export const TaskRecordsRequest = strictObj({
+  groupBy: z.literal('run').optional(),
+  profileId: Id.optional(),
+  status: z.enum(['all', 'running', 'completed', 'failed', 'review']).default('all'),
+  query: sMax(100).optional(),
+  cursor: sMax(600).optional(),
+  limit: intRange(1, 200).default(100),
+});
+const TaskRecordRow = strictObj({
+  stepId: Id,
+  planId: Id,
+  profileId: Id,
+  combinationId: Id,
+  combinationName: errStr,
+  combinationVersion: PosInt,
+  round: PosInt,
+  position: NonNegInt,
+  ...stepDescriptor,
+  status: TaskStep.shape.status,
+  planState: TaskState,
+  planReason: errStr,
+  outcome: TaskStepOutcome.optional(),
+  progress: TaskProgress,
+  startedAt: NumNull,
+  finishedAt: NumNull,
+  planCreatedAt: z.number(),
+  planUpdatedAt: z.number(),
+});
+export const TaskRecords = strictObj({
+  records: z.array(TaskRecordRow).max(200),
+  viewVersion: sMax(100).optional(),
+  nextCursor: sMax(600).nullable(),
+  total: NonNegInt,
+  counts: strictObj({
+    all: NonNegInt,
+    running: NonNegInt,
+    completed: NonNegInt,
+    failed: NonNegInt,
+    review: NonNegInt,
+  }),
+});
 export type TaskRecord = z.infer<typeof TaskRecordRow>;
 export type TaskRecordsResponse = z.infer<typeof TaskRecords>;

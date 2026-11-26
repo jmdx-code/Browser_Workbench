@@ -14,11 +14,7 @@ import {
   type BumperTarget,
 } from '../src/shared/group-bumper.js';
 import { applyGroupGridPaste } from '../src/renderer/group-inviter-grid.js';
-import {
-  extractBumperPost,
-  relativePostAge,
-  bumperAuthorMatch,
-} from '../src/infrastructure/group-bumper-effects.js';
+import { relativePostAge, bumperAuthorMatch } from '../src/infrastructure/group-bumper-effects.js';
 import {
   bumperSetupLabels,
   bumperSetupKinds,
@@ -83,7 +79,9 @@ test('schema 43 adds only bumper data, target CRUD and inviter import preserve e
     assert.ok(workspaceSchemaVersion >= 43);
     const r = store.groupBumper;
     store.groupInviter.upsertGroups({ items: [{ groupId: '12345', groupName: 'original' }] });
-    store.groupInviter.updateGroupAvatar('12345', 'https://example.com/avatar.jpg');
+    store.groupInviter.applyResolvedGroupMetadata('12345', {
+      avatarUrl: 'https://example.com/avatar.jpg',
+    });
     assert.equal(r.targets('groups')[0]?.avatarUrl, 'https://example.com/avatar.jpg');
     r.upsertTargets('groups', { items: [{ id: '12345', name: 'updated' }] });
     assert.equal(r.targets('groups')[0]?.name, 'updated');
@@ -301,16 +299,7 @@ test('page URLs and shared quoted multiline matrix preserve aligned ID/name pair
     ],
   );
 });
-test('post link normalization, author identity and relative ages reject wrong-group or contrary IDs', () => {
-  for (const url of [
-    '/groups/123/posts/345/',
-    '/groups/123/permalink/345/',
-    '/story.php?story_fbid=345',
-    '/photo/?set=pcb.345',
-  ])
-    assert.equal(extractBumperPost(url, '123')?.postId, '345');
-  assert.equal(extractBumperPost('/groups/999/posts/345/', '123'), null);
-  assert.equal(extractBumperPost('https://evil.example/groups/123/posts/345/', '123'), null);
+test('author identity and relative ages reject wrong-group or contrary IDs', () => {
   for (const [value, expected] of [
     ['just now', 0],
     ['1m', 1 / 60],
@@ -513,7 +502,7 @@ test('start rejects 0% like+comment probabilities and comment-only mode with emp
     );
     await assert.rejects(
       () => service.start({ profileIds: [id], groupIds: ['12345'], pageIds: ['20001'] }),
-      /点赞概率和留言概率不能同时为 0%/,
+      /点赞、留言和分享快拍概率不能同时为 0%/,
     );
 
     r.saveSettings({
@@ -694,13 +683,12 @@ test('WO56: maxLikesPerPost defaults to 50, idempotent migration upgrades legacy
     ]);
   }));
 
-test('WO58: bumperSetupLabels maps 加入小组 to setup_open_group and extractBumperPost parses Reel links', async () =>
+test('WO58: bumperSetupLabels maps 加入小组 to setup_open_group', async () =>
   fixture((store) => {
     const joinIdx = bumperSetupLabels.indexOf('加入小组');
     assert.ok(joinIdx >= 0);
     assert.equal(bumperSetupKinds[joinIdx], 'setup_open_group');
     assert.equal(bumperSetupLabels.length, bumperSetupKinds.length);
-    assert.equal(extractBumperPost('/reel/9876543210/', '12345')?.postId, '9876543210');
 
     // Verify prepareOperation accepts setup_open_group for 加入小组 without violating SQLite CHECK constraint
     const opId = randomUUID();

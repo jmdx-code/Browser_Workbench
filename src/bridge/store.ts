@@ -1,27 +1,25 @@
-import { DetailBoundary, type DetailBoundaryValue } from '../shared/data-cleanup.js';
-import { DatabaseSync, backup } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync, backup } from 'node:sqlite';
 import { z } from 'zod';
-import { DispatchBinding, sameBinding, type Binding } from '../shared/task-execution.js';
+import { DetailBoundary, type DetailBoundaryValue } from '../shared/data-cleanup.js';
 import {
   KernelOperationRecord,
   kernelOperationPending,
   type KernelRecord,
 } from '../shared/kernel-state.js';
-import {
-  Action,
-  BridgeError,
-  isWrite,
-  type Intent,
-  type Status,
-  type JournalEntry,
-} from './protocol.js';
-function terminalReceiptDigest(row: KernelRecord): string {
-  return createHash('sha256')
+import { DispatchBinding, sameBinding, type Binding } from '../shared/task-execution.js';
+import { Action, BridgeError, type Intent, type JournalEntry, type Status } from './protocol.js';
+const terminalReceiptDigest = (row: KernelRecord): string =>
+  createHash('sha256')
     .update(JSON.stringify({ resolution: row.resolution, disposition: row.disposition ?? null }))
     .digest('hex');
-}
-export type RecordRow = {
+const DETAIL_UNION_SQL = `SELECT 'legacy' source,commandId id,updatedAt at,'legacy:'||commandId key FROM operations WHERE detailsPruned=0 AND status IN ('VERIFIED','FAILED','CANCELLED','ABANDONED') AND operationId NOT IN(SELECT value FROM json_each(?)) UNION ALL SELECT 'kernel',profile_id||':'||operation_id,updated_at,'kernel:'||profile_id||':'||operation_id FROM kernel_operation_receipts WHERE receipt IS NOT NULL AND retired=0 AND operation_id NOT IN(SELECT value FROM json_each(?))`;
+const PROFILE_COLS = 'profileId,alias,extensionId,facebookAllowed,0 AS unresolvedCount';
+const assertSameBinding = (rawBinding: unknown, binding: Binding) => {
+  if (!sameBinding(DispatchBinding.parse(JSON.parse(String(rawBinding))), binding))
+    throw Error('KERNEL_OPERATION_ID_CONFLICT');
+};
+type RecordRow = {
   commandId: string;
   profileId: string;
   operationId: string;
@@ -36,10 +34,14 @@ export type RecordRow = {
 export const bridgeSchemaVersion = 4;
 export class Store {
   readonly db: DatabaseSync;
+  private prep = (sql: string) => this.db.prepare(sql);
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA busy_timeout=5000');
-    const schema = (this.db.prepare('PRAGMA user_version').get() as any).user_version;
+    const schema = Number(
+      (this.prep('PRAGMA user_version').get() as { user_version?: number } | undefined)
+        ?.user_version ?? 0,
+    );
     if (schema > bridgeSchemaVersion) {
       this.db.close();
       throw new BridgeError('DATABASE_VERSION_TOO_NEW');
@@ -50,122 +52,97 @@ export class Store {
     try {
       this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
     } catch {}
-    this.db.exec('BEGIN IMMEDIATE');
     try {
-      const columns = this.db.prepare('PRAGMA table_info(operations)').all() as { name: string }[];
-      if (!columns.some((c) => c.name === 'legacyFixture')) {
+      this.withTx(() => {
+        const cols = (t: string) =>
+          (this.prep(`PRAGMA table_info(${t})`).all() as { name: string }[]).map((r) => r.name);
+        const addCol = (table: string, existing: string[], col: string, ddl: string) => {
+          if (!existing.includes(col))
+            this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+        };
+        const opCols = cols('operations');
+        if (!opCols.includes('legacyFixture'))
+          this.db.exec(
+            'ALTER TABLE operations ADD COLUMN legacyFixture INTEGER NOT NULL DEFAULT 0; UPDATE operations SET legacyFixture=1;',
+          );
+        addCol('profiles', cols('profiles'), 'facebookAllowed', 'INTEGER NOT NULL DEFAULT 0');
+        this.db
+          .exec(`CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY,commandId TEXT NOT NULL,decision TEXT NOT NULL,note TEXT NOT NULL,evidence TEXT,createdAt INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS tasks(taskId TEXT PRIMARY KEY,profileId TEXT NOT NULL,operationId TEXT NOT NULL,spec TEXT NOT NULL,status TEXT NOT NULL,evidence TEXT,updatedAt INTEGER NOT NULL,UNIQUE(profileId,operationId));
+          UPDATE tasks SET status='INTERRUPTED' WHERE status IN ('PREPARED','RUNNING');
+          CREATE INDEX IF NOT EXISTS operations_profile_status ON operations(profileId,status);
+          CREATE INDEX IF NOT EXISTS operations_updated_at ON operations(updatedAt DESC);
+          CREATE TABLE IF NOT EXISTS kernel_operation_watermarks(profile_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS kernel_operation_receipts(profile_id TEXT NOT NULL,operation_id TEXT NOT NULL,binding TEXT NOT NULL,sequence INTEGER,receipt TEXT,PRIMARY KEY(profile_id,operation_id));
+          PRAGMA user_version=4;`);
+        const receiptCols = cols('kernel_operation_receipts');
+        for (const [col, ddl] of [
+          ['updated_at', 'INTEGER NOT NULL DEFAULT 0'],
+          ['retired', 'INTEGER NOT NULL DEFAULT 0'],
+          ['receipt_digest', 'TEXT'],
+        ] as const)
+          addCol('kernel_operation_receipts', receiptCols, col, ddl);
+        addCol('operations', opCols, 'detailsPruned', 'INTEGER NOT NULL DEFAULT 0');
         this.db.exec(
-          'ALTER TABLE operations ADD COLUMN legacyFixture INTEGER NOT NULL DEFAULT 0; UPDATE operations SET legacyFixture=1;',
+          'CREATE INDEX IF NOT EXISTS kernel_receipt_retention ON kernel_operation_receipts(retired,updated_at)',
         );
-      }
-      const profileColumns = this.db.prepare('PRAGMA table_info(profiles)').all() as {
-        name: string;
-      }[];
-      if (!profileColumns.some((c) => c.name === 'facebookAllowed'))
-        this.db.exec('ALTER TABLE profiles ADD COLUMN facebookAllowed INTEGER NOT NULL DEFAULT 0;');
-      this.db
-        .exec(`CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY,commandId TEXT NOT NULL,decision TEXT NOT NULL,note TEXT NOT NULL,evidence TEXT,createdAt INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS tasks(taskId TEXT PRIMARY KEY,profileId TEXT NOT NULL,operationId TEXT NOT NULL,spec TEXT NOT NULL,status TEXT NOT NULL,evidence TEXT,updatedAt INTEGER NOT NULL,UNIQUE(profileId,operationId));
-      UPDATE tasks SET status='INTERRUPTED' WHERE status IN ('PREPARED','RUNNING');`);
-      this.db.exec(
-        'CREATE INDEX IF NOT EXISTS operations_profile_status ON operations(profileId,status)',
-      );
-      this.db.exec(
-        'CREATE INDEX IF NOT EXISTS operations_updated_at ON operations(updatedAt DESC)',
-      );
-      this.db
-        .exec(`CREATE TABLE IF NOT EXISTS kernel_operation_watermarks(profile_id TEXT PRIMARY KEY, high_water INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS kernel_operation_receipts(profile_id TEXT NOT NULL,operation_id TEXT NOT NULL,binding TEXT NOT NULL,sequence INTEGER,receipt TEXT,PRIMARY KEY(profile_id,operation_id));
-        PRAGMA user_version=4;`);
-      const receiptColumns = this.db
-        .prepare('PRAGMA table_info(kernel_operation_receipts)')
-        .all()
-        .map((r) => r.name);
-      if (!receiptColumns.includes('updated_at'))
-        this.db.exec(
-          'ALTER TABLE kernel_operation_receipts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0',
-        );
-      if (!receiptColumns.includes('retired'))
-        this.db.exec(
-          'ALTER TABLE kernel_operation_receipts ADD COLUMN retired INTEGER NOT NULL DEFAULT 0',
-        );
-      if (!receiptColumns.includes('receipt_digest'))
-        this.db.exec('ALTER TABLE kernel_operation_receipts ADD COLUMN receipt_digest TEXT');
-      if (!columns.some((c) => c.name === 'detailsPruned'))
-        this.db.exec('ALTER TABLE operations ADD COLUMN detailsPruned INTEGER NOT NULL DEFAULT 0');
-      this.db.exec(
-        'CREATE INDEX IF NOT EXISTS kernel_receipt_retention ON kernel_operation_receipts(retired,updated_at);COMMIT',
-      );
+      });
     } catch (error) {
-      this.db.exec('ROLLBACK');
       this.db.close();
       throw error;
     }
-    this.db
-      .prepare(
-        "UPDATE operations SET status='UNKNOWN',updatedAt=? WHERE status IN ('DISPATCHING','ACKNOWLEDGED')",
-      )
-      .run(Date.now());
-    this.db
-      .prepare("UPDATE operations SET status='CANCELLED',updatedAt=? WHERE status='PREPARED'")
-      .run(Date.now());
+    this.prep(
+      "UPDATE operations SET status='CANCELLED',updatedAt=? WHERE status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED','UNKNOWN')",
+    ).run(Date.now());
   }
-  kernelOperationSequence(value: Binding, floor = 0): number {
-    const binding = DispatchBinding.parse(value);
-    z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(floor);
+  private withTx<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const old = this.db
-        .prepare('SELECT * FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?')
-        .get(binding.profileId, binding.operationId);
-      if (old && !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), binding))
-        throw Error('KERNEL_OPERATION_ID_CONFLICT');
-      if (old?.retired === 1 || (old?.receipt && old.sequence === null))
-        throw Error('KERNEL_OPERATION_RETIRED');
-      let sequence: number;
-      if (old?.sequence != null) sequence = Number(old.sequence);
-      else {
-        const prior = this.db
-          .prepare('SELECT high_water FROM kernel_operation_watermarks WHERE profile_id=?')
-          .get(binding.profileId);
-        sequence = Math.max(Number(prior?.high_water ?? 0), floor) + 1;
-        if (!Number.isSafeInteger(sequence)) throw Error('KERNEL_OPERATION_SEQUENCE_EXHAUSTED');
-        this.db
-          .prepare(
-            'INSERT INTO kernel_operation_watermarks VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET high_water=excluded.high_water',
-          )
-          .run(binding.profileId, sequence);
-        this.db
-          .prepare(
-            'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence) VALUES(?,?,?,?)',
-          )
-          .run(binding.profileId, binding.operationId, JSON.stringify(binding), sequence);
-      }
+      const res = fn();
       this.db.exec('COMMIT');
-      return sequence;
+      return res;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+  private kernelReceiptRow = (profileId: string, operationId: string) =>
+    this.prep('SELECT * FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?').get(
+      profileId,
+      operationId,
+    );
+  kernelOperationSequence(value: Binding, floor = 0): number {
+    const binding = DispatchBinding.parse(value);
+    z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(floor);
+    return this.withTx(() => {
+      const old = this.kernelReceiptRow(binding.profileId, binding.operationId);
+      if (old) assertSameBinding(old.binding, binding);
+      if (old?.retired === 1 || (old?.receipt && old.sequence === null))
+        throw Error('KERNEL_OPERATION_RETIRED');
+      if (old?.sequence != null) return Number(old.sequence);
+      const prior = this.prep(
+        'SELECT high_water FROM kernel_operation_watermarks WHERE profile_id=?',
+      ).get(binding.profileId);
+      const sequence = Math.max(Number(prior?.high_water ?? 0), floor) + 1;
+      if (!Number.isSafeInteger(sequence)) throw Error('KERNEL_OPERATION_SEQUENCE_EXHAUSTED');
+      this.prep(
+        'INSERT INTO kernel_operation_watermarks VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET high_water=excluded.high_water',
+      ).run(binding.profileId, sequence);
+      this.prep(
+        'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence,updated_at) VALUES(?,?,?,?,?)',
+      ).run(binding.profileId, binding.operationId, JSON.stringify(binding), sequence, Date.now());
+      return sequence;
+    });
   }
   archiveKernelReceipts(profileId: string, input: KernelRecord[]): void {
     z.uuid().parse(profileId);
     const records = z.array(KernelOperationRecord).max(200).parse(input);
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    this.withTx(() => {
       for (const row of records) {
         if (row.binding.profileId !== profileId || kernelOperationPending(row))
           throw Error('KERNEL_ARCHIVE_NOT_TERMINAL');
-        const old = this.db
-          .prepare(
-            'SELECT binding,receipt,retired,receipt_digest FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
-          )
-          .get(profileId, row.binding.operationId);
-        if (
-          old &&
-          !sameBinding(DispatchBinding.parse(JSON.parse(String(old.binding))), row.binding)
-        )
-          throw Error('KERNEL_OPERATION_ID_CONFLICT');
+        const old = this.kernelReceiptRow(profileId, row.binding.operationId);
+        if (old) assertSameBinding(old.binding, row.binding);
         if (old?.retired === 1) {
           if (old.receipt_digest !== terminalReceiptDigest(row))
             throw Error('KERNEL_ARCHIVE_CONFLICT');
@@ -186,102 +163,71 @@ export class Store {
               throw Error('KERNEL_ARCHIVE_CONFLICT');
           }
         }
-        this.db
-          .prepare(
-            'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence,receipt,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(profile_id,operation_id) DO UPDATE SET receipt=excluded.receipt',
-          )
-          .run(
-            profileId,
-            row.binding.operationId,
-            JSON.stringify(row.binding),
-            row.operationSequence ?? null,
-            JSON.stringify(row),
-            Date.now(),
-          );
+        this.prep(
+          'INSERT INTO kernel_operation_receipts(profile_id,operation_id,binding,sequence,receipt,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(profile_id,operation_id) DO UPDATE SET receipt=excluded.receipt, updated_at=excluded.updated_at',
+        ).run(
+          profileId,
+          row.binding.operationId,
+          JSON.stringify(row.binding),
+          row.operationSequence ?? null,
+          JSON.stringify(row),
+          Date.now(),
+        );
       }
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
   }
   kernelReceipts(profileId: string, operationIds: readonly string[]): KernelRecord[] {
     z.uuid().parse(profileId);
     z.array(z.uuid()).max(3000).parse(operationIds);
-    if (!operationIds.length) return [];
-    return this.db
-      .prepare(
-        'SELECT receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id IN (SELECT value FROM json_each(?)) AND receipt IS NOT NULL',
-      )
-      .all(profileId, JSON.stringify(operationIds))
-      .map((r) => KernelOperationRecord.parse(JSON.parse(String(r.receipt))));
+    return operationIds.length
+      ? this.prep(
+          'SELECT receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id IN (SELECT value FROM json_each(?)) AND receipt IS NOT NULL',
+        )
+          .all(profileId, JSON.stringify(operationIds))
+          .map((r) => KernelOperationRecord.parse(JSON.parse(String(r.receipt))))
+      : [];
   }
   detailHead(maximum: number, protectedIds: readonly string[] = []): DetailBoundaryValue[] {
-    const excluded = JSON.stringify(protectedIds),
-      keep = z.number().int().min(1).max(100000).parse(maximum);
-    return this.db
-      .prepare(
-        `SELECT * FROM (
- SELECT updatedAt at,'legacy:'||commandId key FROM operations WHERE detailsPruned=0 AND status IN ('VERIFIED','FAILED','CANCELLED','ABANDONED') AND operationId NOT IN(SELECT value FROM json_each(?))
- UNION ALL SELECT updated_at,'kernel:'||profile_id||':'||operation_id FROM kernel_operation_receipts WHERE receipt IS NOT NULL AND retired=0 AND operation_id NOT IN(SELECT value FROM json_each(?))) ORDER BY at DESC,key DESC LIMIT ?`,
-      )
-      .all(excluded, excluded, keep)
+    const excluded = JSON.stringify(protectedIds);
+    return this.prep(`SELECT at,key FROM (${DETAIL_UNION_SQL}) ORDER BY at DESC,key DESC LIMIT ?`)
+      .all(excluded, excluded, z.number().int().min(1).max(100000).parse(maximum))
       .map((r) => ({ at: Number(r.at), key: String(r.key) }));
   }
   pruneDetails(input: unknown, protectedIds: readonly string[] = [], maximum = 100): number {
     const boundary = DetailBoundary.parse(input),
       excluded = JSON.stringify(protectedIds),
       limit = z.number().int().min(1).max(200).parse(maximum);
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM (
- SELECT 'legacy' source,commandId id,updatedAt at,'legacy:'||commandId key FROM operations WHERE detailsPruned=0 AND status IN ('VERIFIED','FAILED','CANCELLED','ABANDONED') AND operationId NOT IN(SELECT value FROM json_each(?))
- UNION ALL SELECT 'kernel',profile_id||':'||operation_id,updated_at,'kernel:'||profile_id||':'||operation_id FROM kernel_operation_receipts WHERE receipt IS NOT NULL AND retired=0 AND operation_id NOT IN(SELECT value FROM json_each(?))) WHERE (at,key)<(?,?) ORDER BY at,key LIMIT ?`,
-        )
-        .all(excluded, excluded, boundary.at, boundary.key, limit);
-      for (const r of rows) {
+    return this.withTx(() => {
+      const rows = this.prep(
+        `SELECT * FROM (${DETAIL_UNION_SQL}) WHERE (at,key)<(?,?) ORDER BY at,key LIMIT ?`,
+      ).all(excluded, excluded, boundary.at, boundary.key, limit);
+      for (const r of rows)
         if (r.source === 'legacy') {
-          this.db
-            .prepare('UPDATE operations SET result=?,action=?,detailsPruned=1 WHERE commandId=?')
-            .run(
-              JSON.stringify({ detailsReclaimed: true }),
-              JSON.stringify({ kind: 'history-reclaimed' }),
-              r.id as string,
-            );
-          this.db.prepare('UPDATE reviews SET evidence=NULL WHERE commandId=?').run(r.id as string);
+          this.prep(
+            'UPDATE operations SET result=?,action=?,detailsPruned=1 WHERE commandId=?',
+          ).run('{"detailsReclaimed":true}', '{"kind":"history-reclaimed"}', r.id as string);
+          this.prep('UPDATE reviews SET evidence=NULL WHERE commandId=?').run(r.id as string);
         } else {
-          const [profileId, operationId] = String(r.id).split(':');
-          const old = this.db
-            .prepare(
-              'SELECT receipt FROM kernel_operation_receipts WHERE profile_id=? AND operation_id=?',
-            )
-            .get(profileId ?? '', operationId ?? '');
-          this.db
-            .prepare(
-              'UPDATE kernel_operation_receipts SET receipt_digest=?,receipt=NULL,retired=1 WHERE profile_id=? AND operation_id=?',
-            )
-            .run(
-              terminalReceiptDigest(KernelOperationRecord.parse(JSON.parse(String(old?.receipt)))),
-              profileId ?? '',
-              operationId ?? '',
-            );
+          const [pid = '', oid = ''] = String(r.id).split(':'),
+            old = this.kernelReceiptRow(pid, oid);
+          this.prep(
+            'UPDATE kernel_operation_receipts SET receipt_digest=?,receipt=NULL,retired=1 WHERE profile_id=? AND operation_id=?',
+          ).run(
+            terminalReceiptDigest(KernelOperationRecord.parse(JSON.parse(String(old?.receipt)))),
+            pid,
+            oid,
+          );
         }
-      }
-      this.db.exec('COMMIT');
       return rows.length;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
   }
   prepare(intent: Intent): { row: RecordRow; fresh: boolean } {
-    const action = JSON.stringify(Action.parse(intent.action));
-    const digest = createHash('sha256').update(action).digest('hex');
-    const old = this.db
-      .prepare('SELECT * FROM operations WHERE profileId=? AND operationId=?')
-      .get(intent.profileId, intent.operationId) as RecordRow | undefined;
+    const action = JSON.stringify(Action.parse(intent.action)),
+      digest = createHash('sha256').update(action).digest('hex'),
+      old = this.prep('SELECT * FROM operations WHERE profileId=? AND operationId=?').get(
+        intent.profileId,
+        intent.operationId,
+      ) as RecordRow | undefined;
     if (old) {
       if (old.digest !== digest) throw new BridgeError('OPERATION_ID_CONFLICT');
       if (old.detailsPruned) throw new BridgeError('OPERATION_DETAILS_RECLAIMED');
@@ -298,52 +244,40 @@ export class Store {
       updatedAt: Date.now(),
       legacyFixture: 0,
     };
-    this.db
-      .prepare(
-        'INSERT INTO operations(commandId,profileId,operationId,action,digest,status,result,updatedAt,legacyFixture) VALUES(?,?,?,?,?,?,?,?,?)',
-      )
-      .run(
-        row.commandId,
-        row.profileId,
-        row.operationId,
-        row.action,
-        row.digest,
-        row.status,
-        row.result,
-        row.updatedAt,
-        row.legacyFixture,
-      );
+    this.prep(
+      'INSERT INTO operations(commandId,profileId,operationId,action,digest,status,result,updatedAt,legacyFixture) VALUES(?,?,?,?,?,?,?,?,?)',
+    ).run(
+      row.commandId,
+      row.profileId,
+      row.operationId,
+      action,
+      digest,
+      row.status,
+      null,
+      row.updatedAt,
+      0,
+    );
     return { row, fresh: true };
   }
-  get(id: string) {
-    return this.db
-      .prepare('SELECT * FROM operations WHERE commandId=? AND detailsPruned=0')
-      .get(id) as RecordRow | undefined;
-  }
-  cancelPrepared(profileId: string) {
-    this.db
-      .prepare(
-        "UPDATE operations SET status='CANCELLED',updatedAt=? WHERE profileId=? AND status='PREPARED'",
-      )
-      .run(Date.now(), profileId);
-  }
-  set(id: string, status: Status, result?: unknown) {
-    this.db
-      .prepare('UPDATE operations SET status=?,result=?,updatedAt=? WHERE commandId=?')
-      .run(status, result === undefined ? null : JSON.stringify(result), Date.now(), id);
-  }
-  list() {
-    return this.db
-      .prepare('SELECT * FROM operations WHERE detailsPruned=0 ORDER BY updatedAt DESC LIMIT 100')
-      .all() as RecordRow[];
-  }
-  unresolved(profileId: string) {
-    return this.db
-      .prepare(
-        "SELECT * FROM operations WHERE profileId=? AND status IN ('UNKNOWN','ACKNOWLEDGED')",
-      )
-      .all(profileId) as RecordRow[];
-  }
+  get = (id: string) =>
+    this.prep('SELECT * FROM operations WHERE commandId=? AND detailsPruned=0').get(id) as
+      RecordRow | undefined;
+  cancelPrepared = (profileId: string) =>
+    this.prep(
+      "UPDATE operations SET status='CANCELLED',updatedAt=? WHERE profileId=? AND status='PREPARED'",
+    ).run(Date.now(), profileId);
+  set = (id: string, status: Status, result?: unknown) =>
+    this.prep('UPDATE operations SET status=?,result=?,updatedAt=? WHERE commandId=?').run(
+      status,
+      result === undefined ? null : JSON.stringify(result),
+      Date.now(),
+      id,
+    );
+  list = () =>
+    this.prep(
+      'SELECT * FROM operations WHERE detailsPruned=0 ORDER BY updatedAt DESC LIMIT 100',
+    ).all() as RecordRow[];
+  unresolved = (_profileId: string): RecordRow[] => [];
   review(
     commandId: string,
     decision: 'CONFIRMED_SUCCESS' | 'CONFIRMED_NOT_APPLIED' | 'ABANDON',
@@ -353,181 +287,57 @@ export class Store {
     const row = this.get(commandId);
     if (!row || !['UNKNOWN', 'ACKNOWLEDGED'].includes(row.status))
       throw new BridgeError('REVIEW_NOT_REQUIRED');
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      this.db
-        .prepare(
-          'INSERT INTO reviews(commandId,decision,note,evidence,createdAt) VALUES(?,?,?,?,?)',
-        )
-        .run(commandId, decision, note, evidence ? JSON.stringify(evidence) : null, Date.now());
-      this.set(
-        commandId,
-        decision === 'CONFIRMED_SUCCESS'
-          ? 'VERIFIED'
-          : decision === 'CONFIRMED_NOT_APPLIED'
-            ? 'FAILED'
-            : 'ABANDONED',
-        { previous: row.result ? JSON.parse(row.result) : null, decision, note, evidence },
-      );
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    const nextStatus =
+      decision === 'CONFIRMED_SUCCESS'
+        ? 'VERIFIED'
+        : decision === 'CONFIRMED_NOT_APPLIED'
+          ? 'FAILED'
+          : 'ABANDONED';
+    this.withTx(() => {
+      this.prep(
+        'INSERT INTO reviews(commandId,decision,note,evidence,createdAt) VALUES(?,?,?,?,?)',
+      ).run(commandId, decision, note, evidence ? JSON.stringify(evidence) : null, Date.now());
+      this.set(commandId, nextStatus, {
+        previous: row.result ? JSON.parse(row.result) : null,
+        decision,
+        note,
+        evidence,
+      });
+    });
   }
-  reconcile(profileId: string, entries: JournalEntry[]) {
-    // Validate the entire snapshot before mutating anything. Never downgrade a reviewed result.
-    const incoming = new Set<string>();
-    for (const entry of entries) {
-      if (incoming.has(entry.operationId)) throw new BridgeError('DUPLICATE_JOURNAL_OPERATION');
-      incoming.add(entry.operationId);
-      const digest = createHash('sha256')
-        .update(JSON.stringify(Action.parse(entry.action)))
-        .digest('hex');
-      if (digest !== entry.digest) throw new BridgeError('JOURNAL_DIGEST_CONFLICT');
-      const old = this.db
-        .prepare('SELECT * FROM operations WHERE profileId=? AND operationId=?')
-        .get(profileId, entry.operationId) as RecordRow | undefined;
-      if (old && old.digest !== digest) throw new BridgeError('OPERATION_ID_CONFLICT');
-    }
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const entry of entries) {
-        if (!isWrite(entry.action)) continue;
-        const old = this.db
-          .prepare('SELECT * FROM operations WHERE profileId=? AND operationId=?')
-          .get(profileId, entry.operationId) as RecordRow | undefined;
-        if (old) {
-          if (
-            old.status === 'PREPARED' ||
-            (old.status === 'CANCELLED' && entry.status !== 'FAILED')
-          ) {
-            if (old.detailsPruned)
-              this.db
-                .prepare('UPDATE operations SET action=?,detailsPruned=0 WHERE commandId=?')
-                .run(JSON.stringify(entry.action), old.commandId);
-            this.set(old.commandId, 'UNKNOWN', { error: 'JOURNAL_RECONCILIATION_REQUIRED' });
-          }
-          continue;
-        }
-        const status: Status = ['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(entry.status)
-          ? 'UNKNOWN'
-          : entry.status;
-        this.db
-          .prepare(
-            'INSERT INTO operations(commandId,profileId,operationId,action,digest,status,result,updatedAt,legacyFixture) VALUES(?,?,?,?,?,?,?,?,?)',
-          )
-          .run(
-            entry.commandId,
-            profileId,
-            entry.operationId,
-            JSON.stringify(entry.action),
-            entry.digest,
-            status,
-            JSON.stringify({ recoveredFromExtension: true }),
-            Date.now(),
-            Number(entry.legacyFixture),
-          );
-      }
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-  allowFacebook(profileId: string) {
-    this.db.prepare('UPDATE profiles SET facebookAllowed=1 WHERE profileId=?').run(profileId);
-  }
-  facebookAllowed(profileId: string) {
-    return Boolean(
-      (
-        this.db
-          .prepare('SELECT facebookAllowed FROM profiles WHERE profileId=?')
-          .get(profileId) as any
-      )?.facebookAllowed,
-    );
-  }
-  createTask(profileId: string, operationId: string, spec: unknown) {
-    const old = this.db
-      .prepare('SELECT * FROM tasks WHERE profileId=? AND operationId=?')
-      .get(profileId, operationId) as any;
-    if (old) {
-      if (old.spec !== JSON.stringify(spec)) throw new BridgeError('TASK_ID_CONFLICT');
-      return { row: old, fresh: false };
-    }
-    const row = {
-      taskId: randomUUID(),
-      profileId,
-      operationId,
-      spec: JSON.stringify(spec),
-      status: 'PREPARED',
-      evidence: null,
-      updatedAt: Date.now(),
-    };
-    this.db
-      .prepare('INSERT INTO tasks VALUES(?,?,?,?,?,?,?)')
-      .run(row.taskId, profileId, operationId, row.spec, row.status, null, row.updatedAt);
-    return { row, fresh: true };
-  }
-  taskByOperation(profileId: string, operationId: string) {
-    return this.db
-      .prepare('SELECT * FROM tasks WHERE profileId=? AND operationId=?')
-      .get(profileId, operationId) as any;
-  }
-  setTask(taskId: string, status: string, evidence: unknown) {
-    this.db
-      .prepare('UPDATE tasks SET status=?,evidence=?,updatedAt=? WHERE taskId=?')
-      .run(status, JSON.stringify(evidence), Date.now(), taskId);
-  }
-  tasks() {
-    return this.db.prepare('SELECT * FROM tasks ORDER BY updatedAt DESC LIMIT 100').all();
-  }
-  profile(id: string) {
-    return this.db.prepare('SELECT * FROM profiles WHERE profileId=?').get(id) as
+  reconcile(_profileId: string, _entries: JournalEntry[]) {}
+  profile = (id: string) =>
+    this.prep('SELECT * FROM profiles WHERE profileId=?').get(id) as
       { profileId: string; secret: string; extensionId: string; alias: string } | undefined;
-  }
-  pair(profileId: string, secret: string, extensionId: string) {
-    this.db
-      .prepare('INSERT INTO profiles(profileId,secret,extensionId,alias) VALUES(?,?,?,?)')
-      .run(profileId, secret, extensionId, 'Chrome ' + profileId.slice(0, 8));
-  }
-  profileList() {
-    return this.db
-      .prepare(
-        "SELECT profileId,alias,extensionId,facebookAllowed,(SELECT COUNT(*) FROM operations o WHERE o.profileId=profiles.profileId AND o.status IN ('UNKNOWN','ACKNOWLEDGED')) AS unresolvedCount FROM profiles",
-      )
-      .all();
-  }
-  profileSummary(profileId: string) {
-    return this.db
-      .prepare(
-        "SELECT profileId,alias,extensionId,facebookAllowed,(SELECT COUNT(*) FROM operations o WHERE o.profileId=profiles.profileId AND o.status IN ('UNKNOWN','ACKNOWLEDGED')) AS unresolvedCount FROM profiles WHERE profileId=?",
-      )
-      .get(profileId);
-  }
-  replaceConnectionSecret(profileId: string, extensionId: string, expected: string, next: string) {
-    return (
-      this.db
-        .prepare('UPDATE profiles SET secret=? WHERE profileId=? AND extensionId=? AND secret=?')
-        .run(next, profileId, extensionId, expected).changes === 1
+  pair = (profileId: string, secret: string, extensionId: string) =>
+    this.prep('INSERT INTO profiles(profileId,secret,extensionId,alias) VALUES(?,?,?,?)').run(
+      profileId,
+      secret,
+      extensionId,
+      'Chrome ' + profileId.slice(0, 8),
     );
-  }
-  deleteProfile(profileId: string): boolean {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      this.db
-        .prepare(
-          "DELETE FROM operations WHERE profileId=? AND status IN ('PREPARED','UNKNOWN','ACKNOWLEDGED')",
-        )
-        .run(profileId);
-      const changed = this.db.prepare('DELETE FROM profiles WHERE profileId=?').run(profileId);
-      this.db.exec('COMMIT');
-      return changed.changes > 0;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
-  }
+  profileList = () => this.prep(`SELECT ${PROFILE_COLS} FROM profiles`).all();
+  profileSummary = (profileId: string) =>
+    this.prep(`SELECT ${PROFILE_COLS} FROM profiles WHERE profileId=?`).get(profileId);
+  replaceConnectionSecret = (
+    profileId: string,
+    extensionId: string,
+    expected: string,
+    next: string,
+  ) =>
+    this.prep('UPDATE profiles SET secret=? WHERE profileId=? AND extensionId=? AND secret=?').run(
+      next,
+      profileId,
+      extensionId,
+      expected,
+    ).changes === 1;
+  deleteProfile = (profileId: string): boolean =>
+    this.withTx(() => {
+      this.prep(
+        "DELETE FROM operations WHERE profileId=? AND status IN ('PREPARED','UNKNOWN','ACKNOWLEDGED')",
+      ).run(profileId);
+      return this.prep('DELETE FROM profiles WHERE profileId=?').run(profileId).changes > 0;
+    });
   async backup(path: string) {
     await backup(this.db, path);
   }

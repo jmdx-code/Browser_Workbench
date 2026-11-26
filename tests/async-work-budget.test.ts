@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AsyncWorkBudget } from '../src/application/async-work-budget.js';
+import { AsyncWorkBudget } from '../src/application/kernel-gates.js';
 
 test('expensive phases are bounded, FIFO and recheck stop before any queued work starts', async () => {
   const budget = new AsyncWorkBudget(1, 2);

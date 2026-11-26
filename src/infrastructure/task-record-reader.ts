@@ -18,7 +18,6 @@ import {
   type TaskRecordsResponse,
 } from '../shared/task-contracts.js';
 import { beforeCommit, readSnapshot, transaction } from './sqlite-transaction.js';
-
 const terminal = "p.state IN ('STOPPED','COMPLETED','FAILED')";
 const expression = (prefix: string) =>
   `CASE WHEN r.${prefix}u=0 THEN r.${prefix} WHEN r.${prefix} IS NULL THEN p.updated_at ELSE min(r.${prefix},p.updated_at) END`;
@@ -42,14 +41,13 @@ function dependency(low: number | null, high: number | null): [number | null, nu
   if (low !== LOW || high === null) throw Error('RECORD_TIME_DEPENDENCY_UNSUPPORTED');
   return [high === HIGH ? null : high, 1];
 }
-
-/** Incrementally rebuilds ONLY dirty rounds. The original per-row rules also encode dynamic
- * plan.updatedAt dependencies, so legacy fallback rows never need a whole-history JS rebuild. */
+/** Rebuilds ONLY dirty rounds; dynamic plan.updatedAt dependencies preserve legacy fallback rows. */
 export class TaskRecordReader {
   private backfilling = false;
   private readonly responseCache = new Map<string, TaskRecordsResponse>();
   private cacheToken: string | null = null;
   private readonly epoch = randomUUID();
+  private prep = (sql: string) => this.db.prepare(sql);
   constructor(
     private readonly db: DatabaseSync,
     private readonly getPlan: (id: string) => Plan,
@@ -60,36 +58,22 @@ export class TaskRecordReader {
       'CREATE TABLE IF NOT EXISTS task_run_summaries(job_id TEXT NOT NULL REFERENCES task_plans(id) ON DELETE CASCADE,round INTEGER NOT NULL,records TEXT NOT NULL,details_pruned INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(job_id,round))',
     );
     beforeCommit(db, () => {
-      // Live operation receipts only mark the current round dirty. Rebuilding that round on
-      // every mouse/ACK/checkpoint would move history work onto the input hot path.
-      // Closed rounds are materialized atomically at the boundary; current rounds are brought
-      // up to date once when records are actually requested, before any row is exposed.
       if (!this.backfilling) this.flush(undefined, true);
     });
   }
   async initialize(onProgress?: (completed: number, total: number) => void) {
-    const total = Number(
-      this.db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n ?? 0,
-    );
+    const dirtyCount = () =>
+        Number(this.prep('SELECT count(*) AS n FROM task_record_dirty').get()?.n ?? 0),
+      total = dirtyCount();
     if (!total) return;
     onProgress?.(0, total);
-    const previousCacheSize = Number(
-      this.db.prepare('PRAGMA cache_size').get()?.cache_size ?? -2000,
-    );
+    const previousCacheSize = Number(this.prep('PRAGMA cache_size').get()?.cache_size ?? -2000);
     this.backfilling = true;
     try {
-      // A bounded transient pager cache avoids random-index page thrashing during backfill.
-      // Restore the connection's original setting before accepting ordinary runtime work.
       this.db.exec('PRAGMA cache_size=-32768');
-      while (this.db.prepare('SELECT 1 FROM task_record_dirty LIMIT 1').get()) {
-        // Startup only (before serving requests): amortize FULL fsync across a bounded batch.
-        // Small per-round transactions can spend minutes waiting for durable disk flushes.
+      while (this.prep('SELECT 1 FROM task_record_dirty LIMIT 1').get()) {
         transaction(this.db, () => this.flush(256));
-        onProgress?.(
-          total -
-            Number(this.db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n ?? 0),
-          total,
-        );
+        onProgress?.(total - dirtyCount(), total);
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
     } finally {
@@ -114,57 +98,54 @@ export class TaskRecordReader {
         round = Number(item.round),
         plan = this.getPlan(id),
         steps = this.getSteps(id, round);
-      const saved = this.db
-        .prepare('SELECT records,details_pruned FROM task_run_summaries WHERE job_id=? AND round=?')
-        .get(id, round);
+      const saved = this.prep(
+        'SELECT records,details_pruned FROM task_run_summaries WHERE job_id=? AND round=?',
+      ).get(id, round);
       if (saved?.details_pruned === 1) {
-        // Keep execution times from the final snapshot. A later explicit review
-        // may still update its step outcome/progress without the discarded logs.
-        const old = JSON.parse(String(saved.records)) as TaskRecord[];
-        const byId = new Map(steps.map((step) => [step.id, step]));
-        const updated = old.map((row) => {
-          const step = byId.get(row.stepId);
-          if (!step) return row;
-          const { outcome: _oldOutcome, ...base } = row;
-          return {
-            ...base,
-            status: step.status,
-            progress: step.progress,
-            ...(step.outcome ? { outcome: step.outcome } : {}),
-            planState: plan.state,
-            planReason: plan.reason,
-            planUpdatedAt: plan.updatedAt,
-          };
-        });
-        const json = JSON.stringify(updated);
-        const timingNeedsFreeze = this.db
-          .prepare(
+        const old = JSON.parse(String(saved.records)) as TaskRecord[],
+          byId = new Map(steps.map((step) => [step.id, step])),
+          updated = old.map((row) => {
+            const step = byId.get(row.stepId);
+            if (!step) return row;
+            const { outcome: _oldOutcome, ...base } = row;
+            return {
+              ...base,
+              status: step.status,
+              progress: step.progress,
+              ...(step.outcome ? { outcome: step.outcome } : {}),
+              planState: plan.state,
+              planReason: plan.reason,
+              planUpdatedAt: plan.updatedAt,
+            };
+          }),
+          json = JSON.stringify(updated),
+          timingNeedsFreeze = this.prep(
             'SELECT 1 FROM task_record_projection WHERE job_id=? AND round=? AND (lsu<>0 OR lfu<>0 OR esu<>0 OR efu<>0) LIMIT 1',
-          )
-          .get(id, round);
+          ).get(id, round);
         if (json !== saved.records || timingNeedsFreeze) {
+          const upd = this.prep(
+            'UPDATE task_record_projection SET status=?,outcome_kind=?,business_unknown=?,payload=?,ls=?,lf=?,es=?,ef=?,lsu=0,lfu=0,esu=0,efu=0,stable_sort=? WHERE step_id=?',
+          );
           for (const row of updated)
-            this.db
-              .prepare(
-                `UPDATE task_record_projection SET status=?,outcome_kind=?,business_unknown=?,payload=?,ls=?,lf=?,es=?,ef=?,lsu=0,lfu=0,esu=0,efu=0,stable_sort=? WHERE step_id=?`,
-              )
-              .run(
-                row.status,
-                row.outcome?.kind ?? null,
-                row.outcome?.kind === 'FAILED' && row.outcome.businessResult === 'UNKNOWN' ? 1 : 0,
-                JSON.stringify(row),
-                row.startedAt,
-                row.finishedAt,
-                row.startedAt,
-                row.finishedAt,
-                row.finishedAt ?? row.startedAt ?? row.planCreatedAt,
-                row.stepId,
-              );
-          this.db
-            .prepare('UPDATE task_run_summaries SET records=? WHERE job_id=? AND round=?')
-            .run(json, id, round);
+            upd.run(
+              row.status,
+              row.outcome?.kind ?? null,
+              row.outcome?.kind === 'FAILED' && row.outcome.businessResult === 'UNKNOWN' ? 1 : 0,
+              JSON.stringify(row),
+              row.startedAt,
+              row.finishedAt,
+              row.startedAt,
+              row.finishedAt,
+              row.finishedAt ?? row.startedAt ?? row.planCreatedAt,
+              row.stepId,
+            );
+          this.prep('UPDATE task_run_summaries SET records=? WHERE job_id=? AND round=?').run(
+            json,
+            id,
+            round,
+          );
         }
-        this.db.prepare('DELETE FROM task_record_dirty WHERE job_id=? AND round=?').run(id, round);
+        this.prep('DELETE FROM task_record_dirty WHERE job_id=? AND round=?').run(id, round);
         continue;
       }
       const ops = this.db
@@ -260,17 +241,15 @@ export class TaskRecordReader {
   }
   page(input: unknown, profiles: readonly RecordProfile[]): TaskRecordsResponse {
     const request = TaskRecordsRequest.parse(input ?? {});
-    // Direct SQL fixture/import writes are also tracked by triggers. Closed rounds flush before
-    // COMMIT; live rounds coalesce here. Never expose a dirty or rolled-back projection.
-    if (this.db.prepare('SELECT 1 FROM task_record_dirty LIMIT 1').get())
+    if (this.prep('SELECT 1 FROM task_record_dirty LIMIT 1').get())
       transaction(this.db, () => this.flush());
     const state = this.token();
     if (state === null || state !== this.cacheToken) {
       this.responseCache.clear();
       this.cacheToken = state;
     }
-    const key = JSON.stringify([request, profiles]);
-    const cached = state === null ? undefined : this.responseCache.get(key);
+    const key = JSON.stringify([request, profiles]),
+      cached = state === null ? undefined : this.responseCache.get(key);
     if (cached) {
       this.responseCache.delete(key);
       this.responseCache.set(key, cached);
@@ -289,23 +268,21 @@ export class TaskRecordReader {
     profiles: readonly RecordProfile[],
   ) {
     const scope = JSON.stringify([
-      request.groupBy ?? '',
-      request.profileId ?? '',
-      request.status,
-      request.query ?? '',
-      profiles,
-    ]);
-    const token = this.token();
-    // token() deliberately returns null inside a transaction; use committed counters directly
-    // for this short read snapshot, including per-reader epoch supplied by the token callback.
-    const version = createHash('sha256')
-      .update(
-        this.epoch +
-          scope +
-          (token ??
-            `${String(this.db.prepare('PRAGMA data_version').get()?.data_version)}:${String(this.db.prepare('SELECT total_changes() AS n').get()?.n)}`),
-      )
-      .digest('hex');
+        request.groupBy ?? '',
+        request.profileId ?? '',
+        request.status,
+        request.query ?? '',
+        profiles,
+      ]),
+      token = this.token(),
+      version = createHash('sha256')
+        .update(
+          this.epoch +
+            scope +
+            (token ??
+              `${String(this.db.prepare('PRAGMA data_version').get()?.data_version)}:${String(this.db.prepare('SELECT total_changes() AS n').get()?.n)}`),
+        )
+        .digest('hex');
     type Cursor = {
       v: number;
       version: string;
@@ -349,7 +326,7 @@ export class TaskRecordReader {
       const byId = new Map(profiles.map((p) => [p.id, p]));
       const tuples = this.db
         .prepare(
-          'SELECT DISTINCT combination_name,profile_id,type,destination FROM task_record_projection' +
+          "SELECT DISTINCT combination_name,profile_id,type,destination,json_extract(payload,'$.friendAction') AS friend_action,json_extract(payload,'$.feedMode') AS feed_mode FROM task_record_projection" +
             (request.profileId ? ' WHERE profile_id=?' : ''),
         )
         .all(...(request.profileId ? [request.profileId] : []));
@@ -361,17 +338,50 @@ export class TaskRecordReader {
               profileId: String(t.profile_id),
               type: t.type as TaskRecord['type'],
               ...(t.destination ? { destination: t.destination as 'post' | 'story' } : {}),
+              ...(t.friend_action === 'accept' || t.friend_action === 'add_suggested'
+                ? { friendAction: t.friend_action }
+                : {}),
+              ...(t.feed_mode === 'home' ||
+              t.feed_mode === 'random_profile' ||
+              t.feed_mode === 'random_page' ||
+              t.feed_mode === 'search_pages'
+                ? { feedMode: t.feed_mode }
+                : {}),
             },
             byId.get(String(t.profile_id)),
             q,
           ),
         )
-        .map((t) => JSON.stringify([t.combination_name, t.profile_id, t.type, t.destination]));
+        .map((t) =>
+          JSON.stringify([
+            t.combination_name,
+            t.profile_id,
+            t.type,
+            t.destination,
+            t.friend_action ?? null,
+            t.feed_mode ?? null,
+          ]),
+        );
       where +=
-        ' AND json_array(r.combination_name,r.profile_id,r.type,r.destination) IN (SELECT value FROM json_each(?))';
+        " AND json_array(r.combination_name,r.profile_id,r.type,r.destination,json_extract(r.payload,'$.friendAction'),json_extract(r.payload,'$.feedMode')) IN (SELECT value FROM json_each(?))";
       params.push(JSON.stringify(matches));
     }
-    const base = ' FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id WHERE ';
+    const base = ' FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id WHERE ',
+      decodeRow = (r: Record<string, unknown>): TaskRecord => ({
+        ...(JSON.parse(String(r.payload)) as TaskRecord),
+        startedAt: r.start_time === null ? null : Number(r.start_time),
+        finishedAt: r.finish_time === null ? null : Number(r.finish_time),
+        planState: r.state as TaskRecord['planState'],
+        planReason: String(r.reason),
+        planUpdatedAt: Number(r.updated_at),
+      }),
+      encodeCursor = (keys: Cursor['keys'] | null) =>
+        keys
+          ? Buffer.from(JSON.stringify({ v: 1, version, keys, signature: sign(keys) })).toString(
+              'base64url',
+            )
+          : null,
+      makeBudgetErr = (msg: string) => new ProductError('RECORD_DETAIL_REQUIRED', msg, 413);
     if (request.groupBy === 'run') {
       // Match whole runs first, then return every visible step in each matching run.
       // Do not paginate/filter individual steps before assembling the report card.
@@ -383,12 +393,11 @@ export class TaskRecordReader {
           max(${review}) AS review
           FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id
           JOIN matching m ON m.job_id=r.job_id AND m.round=r.round
-          GROUP BY r.job_id,r.round)`;
-      const runParams = [...params, offline];
-      const predicate = request.status === 'all' ? '1=1' : request.status + '=1';
-      const result = this.db
-        .prepare(
-          `${cte},
+          GROUP BY r.job_id,r.round)`,
+        predicate = request.status === 'all' ? '1=1' : request.status + '=1',
+        result = this.db
+          .prepare(
+            `${cte},
         counts AS (SELECT count(*) AS all_count,coalesce(sum(running),0) AS running_count,
           coalesce(sum(completed),0) AS completed_count,coalesce(sum(failed),0) AS failed_count,
           coalesce(sum(review),0) AS review_count FROM runs),
@@ -397,27 +406,22 @@ export class TaskRecordReader {
           ORDER BY sort_time DESC,created_at DESC,round DESC,job_id DESC LIMIT ?)
         SELECT counts.*,page.* FROM counts LEFT JOIN page ON 1=1
         ORDER BY page.sort_time DESC,page.created_at DESC,page.round DESC,page.job_id DESC`,
-        )
-        .all(...runParams, ...(cursor?.keys ?? []), request.limit + 1);
-      const countRow = result[0];
-      const counts = {
-        all: Number(countRow?.all_count ?? 0),
-        running: Number(countRow?.running_count ?? 0),
-        completed: Number(countRow?.completed_count ?? 0),
-        failed: Number(countRow?.failed_count ?? 0),
-        review: Number(countRow?.review_count ?? 0),
-      };
-      const runs = result.filter((r) => r.job_id !== null);
-      const pageRuns: typeof runs = [];
+          )
+          .all(...params, offline, ...(cursor?.keys ?? []), request.limit + 1),
+        countRow = result[0],
+        counts = {
+          all: Number(countRow?.all_count ?? 0),
+          running: Number(countRow?.running_count ?? 0),
+          completed: Number(countRow?.completed_count ?? 0),
+          failed: Number(countRow?.failed_count ?? 0),
+          review: Number(countRow?.review_count ?? 0),
+        },
+        runs = result.filter((r) => r.job_id !== null),
+        pageRuns: typeof runs = [];
       let candidateSteps = 0;
       for (const run of runs.slice(0, request.limit)) {
         if (candidateSteps + Number(run.step_count) > 200) {
-          if (!pageRuns.length)
-            throw new ProductError(
-              'RECORD_DETAIL_REQUIRED',
-              '单次任务超过页面预算，请查看任务详情',
-              413,
-            );
+          if (!pageRuns.length) throw makeBudgetErr('单次任务超过页面预算，请查看任务详情');
           break;
         }
         candidateSteps += Number(run.step_count);
@@ -425,41 +429,26 @@ export class TaskRecordReader {
       }
       const byRun = new Map<string, TaskRecord[]>();
       if (pageRuns.length) {
-        const batch = this.db
+        for (const r of this.db
           .prepare(
             `SELECT r.job_id,r.round,r.payload,${started} AS start_time,${finished} AS finish_time,p.state,p.reason,p.updated_at
           FROM task_record_projection r JOIN task_plans p ON p.id=r.job_id
           JOIN json_each(?) selected ON r.job_id=json_extract(selected.value,'$[0]') AND r.round=json_extract(selected.value,'$[1]')
           ORDER BY r.position`,
           )
-          .all(JSON.stringify(pageRuns.map((r) => [r.job_id, r.round])));
-        for (const r of batch) {
+          .all(JSON.stringify(pageRuns.map((r) => [r.job_id, r.round])))) {
           const key = `${String(r.job_id)}:${Number(r.round)}`;
-          const rows = byRun.get(key) ?? [];
-          rows.push({
-            ...(JSON.parse(String(r.payload)) as TaskRecord),
-            startedAt: r.start_time === null ? null : Number(r.start_time),
-            finishedAt: r.finish_time === null ? null : Number(r.finish_time),
-            planState: r.state as TaskRecord['planState'],
-            planReason: String(r.reason),
-            planUpdatedAt: Number(r.updated_at),
-          });
-          byRun.set(key, rows);
+          (byRun.get(key) ?? byRun.set(key, []).get(key) ?? []).push(decodeRow(r));
         }
       }
       const records: TaskRecord[] = [];
-      let bytes = 0;
-      let consumed = 0;
+      let bytes = 0,
+        consumed = 0;
       for (const run of pageRuns) {
-        const rows = byRun.get(`${String(run.job_id)}:${Number(run.round)}`) ?? [];
-        const size = Buffer.byteLength(JSON.stringify(rows));
+        const rows = byRun.get(`${String(run.job_id)}:${Number(run.round)}`) ?? [],
+          size = Buffer.byteLength(JSON.stringify(rows));
         if (records.length + rows.length > 200 || bytes + size > 240000) {
-          if (!records.length)
-            throw new ProductError(
-              'RECORD_DETAIL_REQUIRED',
-              '单次任务超过页面预算，请查看任务详情',
-              413,
-            );
+          if (!records.length) throw makeBudgetErr('单次任务超过页面预算，请查看任务详情');
           break;
         }
         records.push(...rows);
@@ -467,129 +456,99 @@ export class TaskRecordReader {
         consumed++;
       }
       const last = runs[consumed - 1];
-      const keys: Cursor['keys'] | null = last
-        ? [
-            Number(last.sort_time),
-            Number(last.created_at),
-            Number(last.round),
-            0,
-            String(last.job_id),
-          ]
-        : null;
       return TaskRecords.parse({
         viewVersion: version,
         records,
         counts,
         total: counts[request.status],
         nextCursor:
-          runs.length > consumed && keys
-            ? Buffer.from(JSON.stringify({ v: 1, version, keys, signature: sign(keys) })).toString(
-                'base64url',
-              )
+          runs.length > consumed && last
+            ? encodeCursor([
+                Number(last.sort_time),
+                Number(last.created_at),
+                Number(last.round),
+                0,
+                String(last.job_id),
+              ])
             : null,
       });
     }
     const count = (
-      predicate: string,
-      candidate: string,
-      join: boolean,
-      reviewParameter = false,
-    ) => {
-      const from = join ? base : ' FROM task_record_projection r WHERE ';
-      const row = this.db
-        .prepare(
-          'SELECT count(*) AS n' +
-            from +
-            where +
-            ' AND (' +
-            candidate +
-            ') AND (' +
-            predicate +
-            ')',
-        )
-        .get(...params, ...(reviewParameter ? [offline] : []));
-      return Number(row?.n ?? 0);
-    };
-    const counts = {
-      all: count('1=1', '1=1', false),
-      running: count(running, "r.status IN ('ACTIVE','PENDING')", true),
-      completed: count(completed, "r.status IN ('COMPLETED','SKIPPED')", false),
-      failed: count(failed, "r.status IN ('FAILED','ACTIVE')", true),
-      review: count(review, "r.status IN ('ACTIVE','PENDING') OR r.business_unknown=1", true, true),
-    };
-    const predicates = { all: '1=1', running, completed, failed, review };
+        predicate: string,
+        candidate: string,
+        join: boolean,
+        reviewParameter = false,
+      ) => {
+        const from = join ? base : ' FROM task_record_projection r WHERE ';
+        return Number(
+          this.db
+            .prepare(`SELECT count(*) AS n${from}${where} AND (${candidate}) AND (${predicate})`)
+            .get(...params, ...(reviewParameter ? [offline] : []))?.n ?? 0,
+        );
+      },
+      counts = {
+        all: count('1=1', '1=1', false),
+        running: count(running, "r.status IN ('ACTIVE','PENDING')", true),
+        completed: count(completed, "r.status IN ('COMPLETED','SKIPPED')", false),
+        failed: count(failed, "r.status IN ('FAILED','ACTIVE')", true),
+        review: count(
+          review,
+          "r.status IN ('ACTIVE','PENDING') OR r.business_unknown=1",
+          true,
+          true,
+        ),
+      },
+      predicates = { all: '1=1', running, completed, failed, review };
     where += ` AND (${predicates[request.status]})`;
     // Review predicate occurs after WHERE parameters here, unlike SELECT aggregation above.
     if (request.status === 'review') params.push(offline);
-    const keys = cursor?.keys;
-    const columns = `${sort},r.created_at,r.round,r.position,r.id_order`;
-    const keyWhere = keys ? ` AND (${columns}) < (?,?,?,?,?)` : '';
-    const select = `SELECT r.payload,r.id_order,${started} AS start_time,${finished} AS finish_time,${sort} AS sort_time,p.state,p.reason,p.updated_at`;
-    const order =
-      ' ORDER BY sort_time DESC,r.created_at DESC,r.round DESC,r.position DESC,r.id_order DESC LIMIT ?';
-    // Two bounded candidate lists keep the stable-history ordering index usable. Dynamic
-    // legacy fallback expressions remain inside SQLite, never all decoded into JavaScript.
-    const get = (stable: boolean) =>
-      this.db
-        .prepare(
-          (stable ? select.replace(`${sort} AS sort_time`, 'r.stable_sort AS sort_time') : select) +
-            base +
-            where +
-            (stable ? ' AND r.stable_sort IS NOT NULL' : ' AND r.stable_sort IS NULL') +
-            (stable ? keyWhere.replace(sort, 'r.stable_sort') : keyWhere) +
-            order,
-        )
-        .all(...params, ...(keys ?? []), request.limit + 1);
-    const decode = (value: ReturnType<typeof get>[number]) => ({
-      row: {
-        ...(JSON.parse(String(value.payload)) as TaskRecord),
-        startedAt: value.start_time === null ? null : Number(value.start_time),
-        finishedAt: value.finish_time === null ? null : Number(value.finish_time),
-        planState: value.state as TaskRecord['planState'],
-        planReason: String(value.reason),
-        planUpdatedAt: Number(value.updated_at),
-      },
-      key: String(value.id_order),
-    });
-    const candidates = [...get(true), ...get(false)]
-      .map(decode)
-      .sort((a, b) => compareRecords(a.row, b.row));
-    const selected: typeof candidates = [];
+    const keys = cursor?.keys,
+      columns = `${sort},r.created_at,r.round,r.position,r.id_order`,
+      keyWhere = keys ? ` AND (${columns}) < (?,?,?,?,?)` : '',
+      select = `SELECT r.payload,r.id_order,${started} AS start_time,${finished} AS finish_time,${sort} AS sort_time,p.state,p.reason,p.updated_at`,
+      order =
+        ' ORDER BY sort_time DESC,r.created_at DESC,r.round DESC,r.position DESC,r.id_order DESC LIMIT ?',
+      get = (stable: boolean) =>
+        this.db
+          .prepare(
+            (stable
+              ? select.replace(`${sort} AS sort_time`, 'r.stable_sort AS sort_time')
+              : select) +
+              base +
+              where +
+              (stable ? ' AND r.stable_sort IS NOT NULL' : ' AND r.stable_sort IS NULL') +
+              (stable ? keyWhere.replace(sort, 'r.stable_sort') : keyWhere) +
+              order,
+          )
+          .all(...params, ...(keys ?? []), request.limit + 1),
+      candidates = [...get(true), ...get(false)]
+        .map((value) => ({ row: decodeRow(value), key: String(value.id_order) }))
+        .sort((a, b) => compareRecords(a.row, b.row)),
+      selected: typeof candidates = [];
     let bytes = 0;
     for (const candidate of candidates.slice(0, request.limit)) {
       const size = Buffer.byteLength(JSON.stringify(candidate.row)) + 1;
       if (bytes + size > 240000) {
-        if (!selected.length)
-          throw new ProductError(
-            'RECORD_DETAIL_REQUIRED',
-            '单条记录超过页面预算，请查看任务详情',
-            413,
-          );
+        if (!selected.length) throw makeBudgetErr('单条记录超过页面预算，请查看任务详情');
         break;
       }
       selected.push(candidate);
       bytes += size;
     }
     const last = selected.at(-1);
-    const nextKeys: Cursor['keys'] | null = last
-      ? [
-          last.row.finishedAt ?? last.row.startedAt ?? last.row.planCreatedAt,
-          last.row.planCreatedAt,
-          last.row.round,
-          last.row.position,
-          last.key,
-        ]
-      : null;
-    const nextCursor =
-      candidates.length > selected.length && nextKeys
-        ? Buffer.from(
-            JSON.stringify({ v: 1, version, keys: nextKeys, signature: sign(nextKeys) }),
-          ).toString('base64url')
-        : null;
     return TaskRecords.parse({
       viewVersion: version,
       records: selected.map((x) => x.row),
-      nextCursor,
+      nextCursor:
+        candidates.length > selected.length && last
+          ? encodeCursor([
+              last.row.finishedAt ?? last.row.startedAt ?? last.row.planCreatedAt,
+              last.row.planCreatedAt,
+              last.row.round,
+              last.row.position,
+              last.key,
+            ])
+          : null,
       total: counts[request.status],
       counts,
     });

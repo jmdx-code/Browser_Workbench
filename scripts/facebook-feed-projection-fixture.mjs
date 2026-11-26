@@ -230,9 +230,9 @@ if (!process.versions.electron) {
       checks.push('decoded inline feed fallback cannot manufacture a source-less Reel player');
       const { projectFacebookComposerAudience } =
         await import('../dist/src/infrastructure/facebook-composer-audience.js');
-      const { audienceTarget } = await import('../dist/src/domain/facebook-audience.js');
+      const { audienceTarget } = await import('../dist/src/domain/facebook-content-rules.js');
       const { clearAudienceDefaultTarget } =
-        await import('../dist/src/shared/facebook-audience.js');
+        await import('../dist/src/shared/facebook-post-options.js');
       for (const label of ['Done', 'Done with privacy audience selection and close dialog']) {
         for (const duplicate of [false, true]) {
           const button = '<div role="button" aria-label="' + label + '">Done</div>';

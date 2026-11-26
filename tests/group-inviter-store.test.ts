@@ -22,18 +22,17 @@ test('WO57: InviterGroupRow accepts >8KB (10KB+) local data:image/ avatars, prot
     const tenKbLocalAvatar = 'data:image/webp;base64,' + 'A'.repeat(10_500);
     assert.ok(tenKbLocalAvatar.length > 8192 && tenKbLocalAvatar.length <= 16384);
 
-    repo.updateGroupAvatar('3017439278594998', tenKbLocalAvatar);
+    repo.applyResolvedGroupMetadata('3017439278594998', { avatarUrl: tenKbLocalAvatar });
     const groupsAfterLocal = repo.listGroups();
     const g1 = groupsAfterLocal.find((g) => g.groupId === '3017439278594998');
     assert.equal(g1?.avatarUrl, tenKbLocalAvatar);
 
-    // Passing https:// external URL to updateGroupAvatar or updateGroupMetadata must NOT overwrite local avatar
-    repo.updateGroupAvatar(
-      '3017439278594998',
-      'https://scontent.xx.fbcdn.net/v/t39.30808-6/expired.jpg',
-    );
-    repo.updateGroupMetadata('3017439278594998', {
-      groupName: 'Upgraded Name',
+    // Passing https:// external URL to applyResolvedGroupMetadata must NOT overwrite local avatar
+    repo.applyResolvedGroupMetadata('3017439278594998', {
+      avatarUrl: 'https://scontent.xx.fbcdn.net/v/t39.30808-6/expired.jpg',
+    });
+    repo.applyResolvedGroupMetadata('3017439278594998', {
+      name: 'Upgraded Name',
       avatarUrl: 'https://scontent.xx.fbcdn.net/v/t39.30808-6/expired2.jpg',
     });
     const g1AfterExternal = repo.listGroups().find((g) => g.groupId === '3017439278594998');

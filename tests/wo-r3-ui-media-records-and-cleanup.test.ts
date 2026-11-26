@@ -230,7 +230,6 @@ test('WO-R3.3: sidebar projector preserves cross-module lastResult when idle in 
         isAvailable: () => true,
         isProfileReady: () => true,
         isProfileBusy: async () => false,
-        fetchGroupAvatar: async () => null,
         inviteForGroup: async (profileId: string) => {
           activeInRunner.add(profileId);
           await gate;

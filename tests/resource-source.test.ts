@@ -7,13 +7,13 @@ import { mkdtemp, mkdir, writeFile, readFile, copyFile, symlink, rm, open } from
 import { writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { FilesystemResourceSourceReader } from '../src/infrastructure/resource-source-reader.js';
-import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
+import { materialFingerprintPayload } from '../src/domain/resource-material-rules.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { ResourceTableService } from '../src/application/resource-table-service.js';
 import { ResourceSourceReport } from '../src/shared/resource-source.js';
 import { mediaReference } from '../src/domain/resource-table.js';
 import type { ResourceRowValue } from '../src/shared/resource-table.js';
-import type { ResourceSourceReader } from '../src/domain/resource-source.js';
+import type { ResourceSourceReader } from '../src/domain/resource-material-rules.js';
 
 const png = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6fZYAAAAASUVORK5CYII=',
@@ -38,7 +38,7 @@ async function fixture(run: (directory: string, store: WorkspaceStore) => Promis
   }
 }
 async function save(store: WorkspaceStore, rows: ResourceRowValue[]) {
-  const combination = await store.createDraft({
+  const combination = await store.createCombination({
     name: '来源检查生成样本',
     note: '',
     steps: [
@@ -253,15 +253,14 @@ test('saved resource rows inspect real bytes, preserve ordered media and match e
     assert.deepEqual(report.rows[6]?.blockers, ['TEXT_INPUT_LIMIT', 'BACKGROUND_UNVERIFIED']);
     assert.equal(report.rows[7]?.issue, 'EMPTY');
     assert.equal(report.publishingReady, false);
-    const scanRoot = path.join(dir, 'original-scanner');
-    await mkdir(scanRoot);
-    const pack = path.join(scanRoot, '素材');
-    await mkdir(pack);
-    await writeFile(path.join(pack, '正文.txt'), '\uFEFF正文\r\n');
-    await writeFile(path.join(pack, 'image.png'), png);
-    const scan = await new FilesystemMaterialScanner().scan(scanRoot);
-    assert.equal(scan.complete, true);
-    assert.equal(scan.packages[0]?.fingerprint, report.rows[0]?.fingerprint);
+    const expectedFingerprint = createHash('sha256')
+      .update(
+        materialFingerprintPayload('\uFEFF正文\r\n', [
+          { role: 'image', digest: createHash('sha256').update(png).digest('hex') },
+        ]),
+      )
+      .digest('hex');
+    assert.equal(report.rows[0]?.fingerprint, expectedFingerprint);
     assert.deepEqual(await store.resourceTables.read(table.combinationId), table);
     assert.deepEqual(await readFile(source), png);
     const db = new DatabaseSync(path.join(dir, 'workspace.sqlite'), { readOnly: true });

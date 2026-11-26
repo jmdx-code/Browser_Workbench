@@ -10,11 +10,17 @@ import { SqliteGroupInviterRepository } from '../src/infrastructure/group-invite
 import { SqliteGroupBumperRepository } from '../src/infrastructure/group-bumper-store.js';
 import { SqliteGroupPosterRepository } from '../src/infrastructure/group-poster-store.js';
 import {
-  decodePosterThumbnailDataUrl,
   encodeImageBufferToPosterThumbnail,
   isPathInsidePosterCacheDir,
   removePosterCachedFileIfSafe,
 } from '../src/infrastructure/poster-media-thumbnail.js';
+
+function decodeTestThumbnail(dataUrl: string | null | undefined) {
+  const match = /^data:(image\/(?:webp|jpeg|png));base64,([A-Za-z0-9+/=\s]+)$/i.exec(
+    (dataUrl ?? '').trim(),
+  );
+  return match?.[2] ? { bytes: Buffer.from(match[2], 'base64') } : null;
+}
 import {
   createEmptyMaterialDraft,
   fillPosterMaterialFiles,
@@ -55,12 +61,20 @@ test('WO-U4.1: fresh DB (0 -> 51) and legacy DB upgrade reach user_version = 51 
     assert.equal(posterRepo.settings().maxConcurrentProfiles, 4);
     mem.close();
 
-    // Legacy v50 -> v51 upgrade path (pre-thumbnail group_poster_materials)
-    const legacyPath = path.join(dir, 'legacy-v50.sqlite');
+    // Legacy v61 -> v62 upgrade path and pre-v59 rejection
+    const oldV50Path = path.join(dir, 'too-old-v50.sqlite');
+    const rawV50 = new DatabaseSync(oldV50Path);
+    rawV50.exec('PRAGMA user_version = 50');
+    rawV50.close();
+    await assert.rejects(() => WorkspaceStore.open(oldV50Path), {
+      code: 'DATABASE_VERSION_TOO_OLD',
+    });
+
+    const legacyPath = path.join(dir, 'legacy-v61.sqlite');
     const storeLegacy = await WorkspaceStore.open(legacyPath);
     storeLegacy.close();
     const rawLegacy = new DatabaseSync(legacyPath);
-    rawLegacy.exec('PRAGMA user_version = 50');
+    rawLegacy.exec('PRAGMA user_version = 61');
     rawLegacy.close();
     const upgraded = await WorkspaceStore.open(legacyPath);
     upgraded.close();
@@ -148,7 +162,7 @@ test('WO-U4.3: 480px aspect-ratio WebP thumbnail generation, zero-polling-bloat 
     assert.ok(wideThumb);
     assert.ok(wideThumb.startsWith('data:image/webp;base64,'));
     assert.ok(wideThumb.length <= 96 * 1024);
-    const wideDecoded = decodePosterThumbnailDataUrl(wideThumb);
+    const wideDecoded = decodeTestThumbnail(wideThumb);
     assert.ok(wideDecoded);
     const wideImg = await loadImage(wideDecoded.bytes);
     assert.equal(wideImg.width, 480);
@@ -157,7 +171,7 @@ test('WO-U4.3: 480px aspect-ratio WebP thumbnail generation, zero-polling-bloat 
     const tall = createCanvas(540, 960);
     const tallThumb = await encodeImageBufferToPosterThumbnail(tall.toBuffer('image/png'));
     assert.ok(tallThumb);
-    const tallDecoded = decodePosterThumbnailDataUrl(tallThumb);
+    const tallDecoded = decodeTestThumbnail(tallThumb);
     assert.ok(tallDecoded);
     const tallImg = await loadImage(tallDecoded.bytes);
     assert.equal(tallImg.width, 270);
@@ -186,7 +200,7 @@ test('WO-U4.3: 480px aspect-ratio WebP thumbnail generation, zero-polling-bloat 
     assert.equal('thumbnail_data_url' in (list[0] ?? {}), false);
 
     const thumbMeta = await store.groupPoster.getMaterialThumbnail('mat-drive-exp');
-    const binary = decodePosterThumbnailDataUrl(thumbMeta?.thumbnailDataUrl);
+    const binary = decodeTestThumbnail(thumbMeta?.thumbnailDataUrl);
     assert.ok(binary);
     assert.equal(binary.bytes.subarray(0, 4).toString('ascii'), 'RIFF');
     assert.equal(binary.bytes.subarray(8, 12).toString('ascii'), 'WEBP');

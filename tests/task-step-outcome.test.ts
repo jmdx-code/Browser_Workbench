@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { TaskStepLegacy as TaskStep } from '../src/shared/task-contracts.js';
-import { TaskStepV2 } from '../src/shared/task-step-instance.js';
+import { TaskStepV2 } from '../src/shared/task-policies.js';
 import { TaskStepFailure, TaskStepOutcome, TaskStepSkip } from '../src/shared/task-step-outcome.js';
 
 const step = () => ({

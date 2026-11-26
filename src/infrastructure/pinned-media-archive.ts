@@ -3,7 +3,6 @@ import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { open, type ZipFile, type Entry } from 'yauzl';
-
 // Called only after the archive's fixed SHA256 and byte length match. Extract
 // an exact allowlist, not arbitrary archive paths, links, or developer content.
 export async function extractPinnedMediaArchive(

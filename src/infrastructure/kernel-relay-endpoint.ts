@@ -2,7 +2,6 @@ import http from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { KernelRelayModel } from './kernel-relay-model.js';
-
 // Private single-owner loopback endpoint. Not attached to the public workbench server.
 export async function openKernelRelayEndpoint(model: KernelRelayModel) {
   const token = randomBytes(32).toString('hex');

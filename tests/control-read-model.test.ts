@@ -1,5 +1,4 @@
-import { deliverPostNotices } from './fixtures/material-post.js';
-import { prepareBound } from './fixtures/settlement.js';
+import { assignSamplePlan } from './fixtures/workspace-fixture.js';
 import { SqliteTaskRepository } from '../src/infrastructure/task-store.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +14,7 @@ import type { RuntimeProfile } from '../src/domain/tasks.js';
 import type { TaskRecord } from '../src/shared/task-contracts.js';
 import { groupTaskRecords } from '../src/domain/task-run-records.js';
 import { DataCleanupService } from '../src/application/data-cleanup.js';
-import { cleanupDateEnd } from '../src/shared/cleanup-date.js';
+import { cleanupDateEnd } from '../src/shared/data-cleanup.js';
 
 async function fixture(
   run: (store: WorkspaceStore, db: DatabaseSync, file: string) => Promise<void> | void,
@@ -69,7 +68,7 @@ function seed(store: WorkspaceStore, count = 3, mixed = false, repository = stor
 test('run pagination keeps all steps together across filters, boundaries and stopped pending siblings', async () => {
   await fixture(async (store, db) => {
     const { plans } = seed(store, 4, true);
-    for (const plan of plans) store.tasks.requestControl(plan.id, 'stop');
+    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     transaction(db, () => {
       for (const plan of plans)
         db.prepare("UPDATE task_steps SET status='COMPLETED' WHERE job_id=? AND position<2").run(
@@ -124,7 +123,7 @@ test('selected-day cleanup includes afternoon records and expands pending siblin
   await fixture(async (store, db) => {
     const { plans } = seed(store, 1);
     const plan = plans[0]!;
-    store.tasks.requestControl(plan.id, 'stop');
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const steps = store.tasks.steps(plan.id);
     transaction(db, () => {
       db.prepare("UPDATE task_steps SET status='COMPLETED' WHERE id=?").run(steps[0]!.id);
@@ -146,46 +145,13 @@ test('selected-day cleanup includes afternoon records and expands pending siblin
   });
 });
 
-test('hidden terminal history is absent even when READY tab proof prevents physical cleanup', async () => {
+test('hidden terminal history is absent after physical cleanup and keeps foreign keys valid', async () => {
   await fixture(async (store, db) => {
     const { plans, profiles } = seed(store, 1);
     const plan = plans[0]!;
-    const ownership = randomUUID();
-    const proof = {
-      ownershipId: ownership,
-      profileId: plan.profileId,
-      browserSessionEpoch: randomUUID(),
-      tabId: 42,
-      targetId: 'fixture-target',
-    };
-    transaction(db, () => {
-      db.prepare('INSERT INTO task_tab_ownership VALUES(?,?,?,?,?)').run(
-        ownership,
-        plan.id,
-        plan.accountId,
-        JSON.stringify(proof),
-        Date.now(),
-      );
-      db.prepare("INSERT INTO task_tab_state VALUES(?,?,?,'READY',0,NULL,'',?,NULL,NULL)").run(
-        ownership,
-        plan.id,
-        plan.profileId,
-        Date.now(),
-      );
-    });
-    store.tasks.requestControl(plan.id, 'stop');
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     store.dataCleanup.removeBatch({ stepIds: store.tasks.steps(plan.id).map((s) => s.id) });
-    assert.equal(store.tasks.get(plan.id).state, 'STOPPED');
-    const service = new TaskService(store.tasks);
-    assert.deepEqual((await service.history({ profileId: profiles[0]!.id })).plans, []);
-    assert.equal(
-      (await service.history({ profileId: profiles[0]!.id, planId: plan.id })).selectedPlanId,
-      plan.id,
-    );
-    assert.equal(
-      db.prepare('SELECT state FROM task_tab_state WHERE job_id=?').get(plan.id)?.state,
-      'READY',
-    );
+    assert.deepEqual(await store.tasks.historyPlans(profiles[0]!.id), []);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   });
 });
@@ -245,7 +211,7 @@ test('runtime reads only active plans/current steps, drains all terminal events,
     const service = new TaskService(store.tasks);
     const first = await service.runtimeOverview();
     assert.equal(first.plans.length, 3);
-    for (const plan of plans) store.tasks.requestControl(plan.id, 'stop');
+    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const originalList = store.tasks.list;
     store.tasks.list = () => {
       throw Error('FULL_HISTORY_FORBIDDEN');
@@ -347,7 +313,7 @@ test('indexed records equal legacy rows/order/search/counts across long live rou
       /记录已变化/,
     );
     await check();
-    store.tasks.requestControl(plan.id, 'stop');
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     await check();
     labels[1]!.online = true;
     labels[0]!.alias = '已改名';
@@ -367,52 +333,10 @@ test('indexed records equal legacy rows/order/search/counts across long live rou
   });
 });
 
-test('records track original UNKNOWN, operation timestamps and late disposition without rewriting evidence', async () => {
-  await fixture(async (store) => {
-    const f = prepareBound(store);
-    const service = new TaskService(store.tasks);
-    const check = async () => {
-      for (const status of ['all', 'running', 'completed', 'failed', 'review'] as const)
-        assert.deepEqual(
-          (await service.records({ status, limit: 100 })).records,
-          (await service.recordsLegacy({ status, limit: 100 })).records,
-        );
-    };
-    await check();
-    store.tasks.markBoundUnknown(f.binding, 'TEST_UNKNOWN');
-    await check();
-    assert.equal((await service.records({ status: 'review' })).total, 1);
-    const endingId = store.tasks.requestEnd(f.plan.id);
-    const stop = {
-      profileId: f.profile.id,
-      connectionEpoch: f.binding.connectionEpoch,
-      requestId: endingId,
-      state: 'stopped' as const,
-    };
-    store.tasks.prepareEnd(f.plan.id, stop);
-    deliverPostNotices(store, f.profile.id);
-    store.tasks.finishEnd(f.plan.id, stop);
-    await check();
-    assert.equal(store.tasks.operations(f.plan.id)[0]?.status, 'UNKNOWN');
-    const first = await service.records({ limit: 1 });
-    if (first.nextCursor) {
-      const tampered = JSON.parse(Buffer.from(first.nextCursor, 'base64url').toString());
-      tampered.keys[0] = 0;
-      await assert.rejects(
-        async () =>
-          await service.records({
-            limit: 1,
-            cursor: Buffer.from(JSON.stringify(tampered)).toString('base64url'),
-          }),
-        /记录已变化/,
-      );
-    }
-  });
-});
 test('equal-time UUID ties preserve JS collation with mixed-case identifiers and cursor tampering is rejected', async () => {
   await fixture(async (store, db) => {
     const { profiles } = seed(store, 8);
-    for (const plan of store.tasks.livePlans()) store.tasks.requestControl(plan.id, 'stop');
+    for (const plan of store.tasks.livePlans()) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     let serial = 0;
     const repo = new SqliteTaskRepository(db, {
       id: () => {
@@ -460,14 +384,20 @@ test('equal-time UUID ties preserve JS collation with mixed-case identifiers and
   });
 });
 
-test('hot input/receipt writes only invalidate a live round; records refresh it and terminal commit drains it', async () => {
+test('hot progress writes only invalidate a live round; records refresh it and terminal commit drains it', async () => {
   await fixture(async (store, db) => {
-    const f = prepareBound(store);
+    const f = assignSamplePlan(store);
+    const step = store.tasks.steps(f.plan.id)[0]!;
+    store.tasks.claimPlanForProfile(f.profile.id, f.profile.account.id);
     const service = new TaskService(store.tasks);
     assert.ok(Number(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n) > 0);
     await service.records({});
     assert.equal(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n, 0);
-    store.tasks.markBoundUnknown(f.binding, 'HOT_PATH_UNKNOWN');
+    store.tasks.updateStepProgress(f.plan.id, step.id, {
+      ...step.progress,
+      revision: 1,
+      effectiveMilliseconds: 1000,
+    });
     assert.ok(Number(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n) > 0);
     assert.deepEqual(
       (await service.records({})).records,
@@ -545,7 +475,7 @@ test('run reads use one grouped query and one bounded batch; eight-entry LRU sur
         'LRU evicts the oldest of more than eight entries',
       );
       const plan = store.tasks.livePlans()[0]!;
-      store.tasks.requestControl(plan.id, 'stop');
+      store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
       queries.length = 0;
       const changed = await service.records({ groupBy: 'run', limit: 100 });
       assert.equal(changed.counts.running, 19);
@@ -570,7 +500,7 @@ for (const mode of ['count', 'both', 'automatic'] as const)
         random: () => 0.5,
       });
       const { plans } = seed(store, 6, false, repo);
-      for (const plan of plans.slice(0, 5)) repo.requestControl(plan.id, 'stop');
+      for (const plan of plans.slice(0, 5)) repo.stopPlanDirect(plan.id, 'USER_STOP');
       const scope =
         mode === 'both'
           ? { before: repo.get(plans[3]!.id).updatedAt + 1, keepLatestRuns: 4 }
@@ -619,7 +549,7 @@ for (const mode of ['count', 'both', 'automatic'] as const)
 test('quotas count rounds, respect a profile scope, and purge only the affected jobs', async () => {
   await fixture(async (store, db) => {
     const { plans } = seed(store, 2);
-    for (const plan of plans) store.tasks.requestControl(plan.id, 'stop');
+    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const plan = plans[0]!;
     const source = store.tasks.steps(plan.id)[0]!;
     transaction(db, () => {
@@ -662,39 +592,53 @@ test('quotas count rounds, respect a profile scope, and purge only the affected 
   });
 });
 
-test('quota migration upgrades version40 and reopening is idempotent', async () => {
+test('v61->v62 preserves data_cleanup_settings while rejecting pre-v59 v40 DBs', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-quota-upgrade-'));
   const file = path.join(dir, 'workspace.sqlite');
+  const oldFile = path.join(dir, 'v40.sqlite');
   try {
+    const oldDb = new DatabaseSync(oldFile);
+    oldDb.exec('PRAGMA user_version=40');
+    oldDb.close();
+    await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+
     const store = await WorkspaceStore.open(file);
-    store.dataCleanup.saveSettings({ expectedRevision: 0, historyRetentionDays: 7 });
+    store.dataCleanup.saveSettings({
+      expectedRevision: 0,
+      historyRetentionDays: 7,
+      historyMaxCount: null,
+    });
     store.close();
     const db = new DatabaseSync(file);
-    db.exec(
-      'ALTER TABLE data_cleanup_settings DROP COLUMN history_max_count;PRAGMA user_version=40',
-    );
+    db.exec('PRAGMA user_version=61');
     db.close();
     const upgraded = await WorkspaceStore.open(file);
-    assert.equal(upgraded.dataCleanup.settings().historyRetentionDays, 7);
-    assert.equal(upgraded.dataCleanup.settings().historyMaxCount, null);
-    upgraded.dataCleanup.saveSettings({
-      expectedRevision: 1,
-      historyRetentionDays: 7,
-      historyMaxCount: 20,
-    });
-    upgraded.close();
+    try {
+      assert.equal(upgraded.dataCleanup.settings().historyRetentionDays, 7);
+      assert.equal(upgraded.dataCleanup.settings().historyMaxCount, null);
+      upgraded.dataCleanup.saveSettings({
+        expectedRevision: 1,
+        historyRetentionDays: 7,
+        historyMaxCount: 20,
+      });
+    } finally {
+      upgraded.close();
+    }
     const reopened = await WorkspaceStore.open(file);
-    assert.equal(reopened.dataCleanup.settings().historyMaxCount, 20);
-    reopened.close();
+    try {
+      assert.equal(reopened.dataCleanup.settings().historyMaxCount, 20);
+    } finally {
+      reopened.close();
+    }
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 });
 
 test('automatic retention drains excess history across multiple 100-step batches', async () => {
   await fixture(async (store) => {
     const { plans } = seed(store, 90);
-    for (const plan of plans) store.tasks.requestControl(plan.id, 'stop');
+    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     store.dataCleanup.saveSettings({
       expectedRevision: 0,
       historyRetentionDays: null,
@@ -715,30 +659,38 @@ test('automatic retention drains excess history across multiple 100-step batches
   });
 });
 
-test('migration41 to42 installs all job indexes and the resource cleanup guard, including fresh initialization', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'workbench-cleanup42-'));
+test('v62 schema installs all job indexes and the resource cleanup guard while rejecting v41', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'workbench-cleanup62-'));
   const file = path.join(dir, 'workspace.sqlite');
-  const names = [
+  const oldFile = path.join(dir, 'v41.sqlite');
+  const retainedNames = [
     'task_outbox_job_status',
     'task_steps_job_round',
-    'task_tab_state_job',
     'material_post_intents_job',
-    'task_control_bindings_job',
     'task_resource_bindings_job',
     'task_account_locks_job',
   ];
+  const droppedNames = ['task_tab_state_job', 'task_control_bindings_job'];
   try {
+    const oldDb = new DatabaseSync(oldFile);
+    oldDb.exec('PRAGMA user_version=41');
+    oldDb.close();
+    await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+
     const fresh = await WorkspaceStore.open(file);
     fresh.close();
     const db = new DatabaseSync(file);
     assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, workspaceSchemaVersion);
-    for (const name of names) {
+    for (const name of retainedNames) {
       assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name));
-      db.exec('DROP INDEX ' + name);
     }
-    db.exec(
-      "DROP TRIGGER retain_task_resource_binding;CREATE TRIGGER retain_task_resource_binding BEFORE DELETE ON task_resource_bindings BEGIN SELECT RAISE(ABORT,'RETAIN_TASK_RESOURCE_BINDING');END;PRAGMA user_version=41",
-    );
+    for (const name of droppedNames) {
+      assert.equal(
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name),
+        undefined,
+      );
+    }
+    db.exec('PRAGMA user_version=61');
     db.close();
     const upgraded = await WorkspaceStore.open(file);
     upgraded.close();
@@ -748,9 +700,14 @@ test('migration41 to42 installs all job indexes and the resource cleanup guard, 
         verified.prepare('PRAGMA user_version').get()?.user_version,
         workspaceSchemaVersion,
       );
-      for (const name of names)
+      for (const name of retainedNames)
         assert.ok(
           verified.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name),
+        );
+      for (const name of droppedNames)
+        assert.equal(
+          verified.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name),
+          undefined,
         );
       assert.match(
         String(

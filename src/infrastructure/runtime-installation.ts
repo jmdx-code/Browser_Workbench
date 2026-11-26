@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
 import { readFile, lstat, readdir } from 'node:fs/promises';
 import { ReleaseManifest, semverCompare, type Manifest } from '../shared/software-update.js';
 import { productExtensionDirectory } from './paths.js';
-
 export const runtimeDirectory = () =>
   path.join(path.dirname(productExtensionDirectory()), 'runtime');
 export function engineFingerprint(pkg: {

@@ -104,12 +104,13 @@ test('Core.sync does not spoof STOPPING phase and stale peer cannot clear new pe
     releaseCancelPrepared = resolve;
   });
   let gateArmed = true;
-  store.cancelPrepared = async () => {
-    if (gateArmed) {
-      gateArmed = false;
-      await cancelGate;
-    }
-  };
+  (store as unknown as { cancelPrepared: (profileId: string) => Promise<void> }).cancelPrepared =
+    async () => {
+      if (gateArmed) {
+        gateArmed = false;
+        await cancelGate;
+      }
+    };
 
   const sent: Array<{ peerTag: string; msg: Record<string, unknown> }> = [];
   const core = new Core(store, 5000);
@@ -119,9 +120,9 @@ test('Core.sync does not spoof STOPPING phase and stale peer cannot clear new pe
     () => {},
   );
 
-  // Start sync — paused inside cancelPrepared; phase must be SYNCING (never fake STOPPING)
+  // Start sync — even while cancelPrepared is pending, stateless 3-state peer stays PAUSED (never spoofs RUNNING/SYNCING)
   const syncPromise = core.sync(peer1);
-  assert.equal(peer1.phase, 'SYNCING');
+  assert.equal(peer1.phase, 'PAUSED');
 
   // Calling stop() while sync() is awaiting cancelPrepared MUST still send a real STOP command
   const stopRes = await core.stop('profile-sync-test', 'req-stop-1');

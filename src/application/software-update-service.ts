@@ -1,4 +1,4 @@
-import type { SoftwareUpdatePort } from '../domain/software-update.js';
+import type { SoftwareUpdatePort } from '../domain/system-ports.js';
 import { UpdateConfig, type UpdateStatus } from '../shared/software-update.js';
 import { ProductError } from '../domain/workspace.js';
 export class SoftwareUpdateService {

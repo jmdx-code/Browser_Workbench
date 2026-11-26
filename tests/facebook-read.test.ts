@@ -28,7 +28,7 @@ import { KernelJournal } from '../src/application/kernel-journal.js';
 import { MemoryKernelStorage } from './fixtures/kernel-storage.js';
 import { ChromeKernelBackend, type KernelNativeBackend } from '../extension/kernel-backend.js';
 import type { TabProof } from '../src/shared/kernel-state.js';
-import { sampleFacebookPage } from '../src/application/page-read-sampler.js';
+import { sampleFacebookPage } from '../src/application/kernel-gates.js';
 
 const query = PageReadRequest.parse({
   queries: [

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decideStoryFriendsPrivacy } from '../src/domain/facebook-story-privacy.js';
-import type { StoryPrivacy } from '../src/shared/facebook-story-privacy.js';
+import { decideStoryFriendsPrivacy } from '../src/domain/facebook-content-rules.js';
+import type { StoryPrivacy } from '../src/shared/facebook-post-options.js';
 
 const menu: StoryPrivacy = {
   phase: 'MENU',

@@ -154,10 +154,11 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
     };
 
     const service = new GroupPosterService(store.groupPoster, runner, mediaPreparer);
-    await service.start({
-      profileIds: [P001, P002],
+    await service.createTask({
+      materialId: 'mat-1',
       groupIds: ['111111111111111', '222222222222222'],
-      materialIds: ['mat-1'],
+      accountMode: 'selected',
+      profileIds: [P001, P002],
     });
 
     // Wait for workers to finish
@@ -209,10 +210,11 @@ describe('Work Order #65: Group Poster, Reactions & Page Identity Sync', () => {
       },
     };
     const service = new GroupPosterService(store.groupPoster, runner, mediaPreparer);
-    await service.start({
-      profileIds: [P010, P011],
+    await service.createTask({
+      materialId: 'mat-only',
       groupIds: ['333333333333333'],
-      materialIds: ['mat-only'],
+      accountMode: 'selected',
+      profileIds: [P010, P011],
     });
     for (let i = 0; i < 40; i += 1) {
       if (!service.hasActiveExecution()) break;

@@ -1,83 +1,46 @@
-import { RecordCleanupActions } from './data-cleanup-panel.js';
-import { ConfirmDialog } from './confirm-dialog.js';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { z } from 'zod';
-import type { Profile } from '../shared/contracts.js';
-import type { TaskRecord, TaskRuntimeOverview } from '../shared/task-contracts.js';
-import type { Inspection } from '../shared/profile-inspection.js';
-import type { GroupInviteLogRow, GroupInviterState } from '../shared/group-inviter.js';
-import type { BumperLog, BumperState } from '../shared/group-bumper.js';
-import type { PosterLog, PosterState } from '../shared/group-poster.js';
+import { endedTask, groupTaskRecords } from '../domain/task-run-records.js';
+import { profileDisplayName, type Profile } from '../shared/contracts.js';
 import type { GoogleSheetsOverview } from '../shared/google-sheets.js';
-import { attentionPlans, taskReasonDescription } from './task-alerts.js';
-import { groupTaskRecords, endedTask } from '../domain/task-run-records.js';
-import { isMarketplaceUnavailableSkip, isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
-import { runSummary, stepResultLabel } from './task-record-summary.js';
+import type { GroupInviteLogRow, GroupInviterState } from '../shared/group-inviter.js';
+import type { Inspection } from '../shared/profile-inspection.js';
+import type { TaskRecord, TaskRuntimeOverview } from '../shared/task-contracts.js';
 import { api, ApiError } from './api.js';
-import { copyTextToClipboard } from './clipboard.js';
-import {
-  collectAllPaginatedLogs,
-  formatBumperLogsAsTsv,
-  formatPosterLogsAsTsv,
-  formatUnifiedPostAndBumpLogsAsTsv,
-} from '../shared/log-table-copy.js';
-import { ProfileAvatar } from './profile-avatar.js';
-import { inspectionAvatarURL } from './inspection-presentation.js';
+import { ConfirmDialog } from './confirm-dialog.js';
+import { RecordCleanupActions } from './data-cleanup-panel.js';
 import { IconClose, IconDownload, IconSearch } from './icons.js';
+import { Btn, errMsg, NoticeBanner } from './modules/shared/module-ui.js';
 import {
   buildUnifiedActivityFeed,
   type ActivityRecordModuleFilter,
   type ActivityRecordStatusFilter,
-  type UnifiedActivityItem,
 } from './modules/unified-activity-records.js';
+import { toggleSet } from './selection.js';
+import {
+  ActiveAccountGroupRow,
+  planStatus,
+  RECORD_GRID_CLS,
+  UnifiedNonTaskRow,
+  type RunGroup,
+} from './task-records-rows.js';
+import { downloadJsonFile, EmptyState, UI_CHECKBOX, UI_INPUT } from './ui/primitives.js';
 
+export { planStatus };
 declare const __WORKBENCH_VERSION__: string;
 
+const EMPTY_ATTENTION = new Set<string>();
 type Filter = ActivityRecordStatusFilter;
-export const planStatus: Record<string, { label: string; tone: string }> = {
-  QUEUED: { label: '排队中', tone: 'queue' },
-  RUNNING: { label: '执行中', tone: 'run' },
-  PAUSING: { label: '暂停中', tone: 'warn' },
-  PAUSED: { label: '已暂停', tone: 'warn' },
-  STOPPING: { label: '停止中', tone: 'warn' },
-  REVIEW: { label: '待核对', tone: 'warn' },
-  COMPLETED: { label: '已完成', tone: 'ok' },
-  FAILED: { label: '失败', tone: 'err' },
-  STOPPED: { label: '已停止', tone: 'idle' },
-};
+const STATUS_TABS: [Filter, string][] = [
+  ['all', '全部'],
+  ['running', '进行中'],
+  ['completed', '已完成'],
+  ['failed', '失败'],
+  ['attention', '需处理'],
+];
+const isoOrNull = (v?: number | null) => (v ? new Date(v).toISOString() : null);
 
-function shortTime(value: number) {
-  const date = new Date(value);
-  const today = new Date();
-  const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return date.toDateString() === today.toDateString()
-    ? time
-    : `${date.getMonth() + 1}-${String(date.getDate()).padStart(2, '0')} ${time}`;
-}
-
-function span(ms: number) {
-  const minutes = Math.max(0, Math.round(ms / 60000));
-  if (minutes < 1) return '不到 1 分钟';
-  if (minutes < 60) return minutes + ' 分钟';
-  return Math.floor(minutes / 60) + ' 小时' + (minutes % 60 ? ' ' + (minutes % 60) + ' 分' : '');
-}
-
-export function TaskRecordsPage({
-  runtime,
-  profiles,
-  inspections,
-  loaded,
-  filterId,
-  onClearFilter,
-  onOpen,
-  groupInviterState,
-  groupBumperState,
-  onGroupBumperState,
-  groupPosterState,
-  googleSheetsOverview,
-  onOpenCleanupSettings,
-  onNotify,
-}: {
+export function TaskRecordsPage(p: {
   runtime: z.infer<typeof TaskRuntimeOverview> | null;
   profiles: Profile[];
   inspections: Inspection[];
@@ -85,78 +48,42 @@ export function TaskRecordsPage({
   filterId: string | null;
   onClearFilter: () => void;
   onOpen: (profileId: string, planId: string, round: number) => void;
-  groupInviterState?: GroupInviterState | null | undefined;
-  groupBumperState?: BumperState | null | undefined;
-  onGroupBumperState?: ((next: BumperState) => void) | undefined;
-  groupPosterState?: PosterState | null | undefined;
-  googleSheetsOverview?: GoogleSheetsOverview | null | undefined;
-  onOpenCleanupSettings?: (() => void) | undefined;
-  onNotify?: ((msg: string) => void) | undefined;
+  groupInviterState?: GroupInviterState | null;
+  googleSheetsOverview?: GoogleSheetsOverview | null;
+  onOpenCleanupSettings?: () => void;
+  onNotify?: (msg: string) => void;
+  initialModule?: ActivityRecordModuleFilter;
+  moduleKey?: number;
 }) {
-  const [moduleTab, setModuleTab] = useState<ActivityRecordModuleFilter>('all');
-  const [visibleLimit, setVisibleLimit] = useState(80);
-  const [confirmClearBumperScope, setConfirmClearBumperScope] = useState<'group' | 'page' | null>(
-    null,
-  );
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [selectedBumperIds, setSelectedBumperIds] = useState<Set<string>>(new Set());
-  const [selectedPosterIds, setSelectedPosterIds] = useState<Set<string>>(new Set());
-  const [inviterLogs, setInviterLogs] = useState<GroupInviteLogRow[]>([]);
-  const [bumperLogs, setBumperLogs] = useState<BumperLog[]>([]);
-  const [posterLogs, setPosterLogs] = useState<PosterLog[]>([]);
-  const [bumperBusy, setBumperBusy] = useState(false);
-  const [copyingRecords, setCopyingRecords] = useState(false);
-
-  const deleting = useRef(new Set<string>());
-  const afterDelete = (deletedStepIds?: Iterable<string>) => {
-    setSelected(new Set());
-    if (deletedStepIds) {
-      const removed = new Set(deletedStepIds);
-      setRows((previous) => previous.filter((row) => !removed.has(row.stepId)));
-    }
-    setRetry((v) => v + 1);
-  };
+  const {
+    runtime,
+    profiles,
+    inspections,
+    loaded,
+    filterId,
+    onClearFilter,
+    onOpen,
+    groupInviterState,
+    googleSheetsOverview,
+    onOpenCleanupSettings,
+    onNotify,
+    initialModule,
+    moduleKey = 0,
+  } = p;
+  const [moduleTab, setModuleTab] = useState<ActivityRecordModuleFilter>(initialModule ?? 'all');
   useEffect(() => {
-    const handle = (event: Event) =>
-      afterDelete((event as CustomEvent<{ stepIds?: string[] }>).detail?.stepIds);
-    window.addEventListener('task-records-deleted', handle);
-    return () => window.removeEventListener('task-records-deleted', handle);
-  }, []);
+    if (initialModule) setModuleTab(initialModule);
+  }, [initialModule, moduleKey]);
 
-  const scopeGenerationRef = useRef(0);
-  const loadMoreAbortRef = useRef<AbortController | null>(null);
-  const exportAbortRef = useRef<AbortController | null>(null);
-
-  const quickDelete = async (ids: string[]) => {
-    if (ids.some((id) => deleting.current.has(id))) return;
-    const deleteScope = currentScope.current;
-    for (const id of ids) deleting.current.add(id);
-    const removed = new Set(ids);
-    const previous = rowsRef.current.filter((row) => removed.has(row.stepId));
-    setRows((rows) => rows.filter((row) => !removed.has(row.stepId)));
-    try {
-      const preview = await api.cleanupPreview({ kind: 'records', scope: { stepIds: ids } });
-      if (!preview.eligible) throw Error('记录状态已变化，请重新读取后再删除');
-      const result = await api.cleanupExecute(preview.token);
-      if (result.protected) throw Error('部分记录状态已变化，已重新读取');
-      window.dispatchEvent(new CustomEvent('task-records-deleted', { detail: { stepIds: ids } }));
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : '删除失败，请重试';
-      if (currentScope.current === deleteScope) {
-        setRows((rows) => {
-          const known = new Set(rows.map((r) => r.stepId));
-          return [...rows, ...previous.filter((r) => !known.has(r.stepId))];
-        });
-      }
-      if (onNotify) onNotify(msg);
-      else setLoadError(msg);
-      setRetry((v) => v + 1);
-    } finally {
-      for (const id of ids) deleting.current.delete(id);
-    }
-  };
-
+  const [visibleLimit, setVisibleLimit] = useState(80);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [inviterLogs, setInviterLogs] = useState<GroupInviteLogRow[]>([]);
   const [filter, setFilter] = useState<Filter>('all');
+  const [pendingDelete, setPendingDelete] = useState<{
+    kind: 'task';
+    ids: string[];
+    label: string;
+  } | null>(null);
   const [query, setQuery] = useState('');
   const [rows, setRows] = useState<TaskRecord[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -175,23 +102,43 @@ export function TaskRecordsPage({
   const [searchText, setSearchText] = useState('');
   const [retry, setRetry] = useState(0);
 
+  const deleting = useRef(new Set<string>());
+  const scopeGenRef = useRef(0);
+  const loadMoreAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+  const rowsRef = useRef<TaskRecord[]>([]);
+  rowsRef.current = rows;
+
+  const afterDelete = (deletedStepIds?: Iterable<string>) => {
+    setSelected(new Set());
+    if (deletedStepIds) {
+      const rem = new Set(deletedStepIds);
+      setRows((prev) => prev.filter((r) => !rem.has(r.stepId)));
+    }
+    setRetry((v) => v + 1);
+  };
+
   useEffect(() => {
+    const handle = (e: Event) =>
+      afterDelete((e as CustomEvent<{ stepIds?: string[] }>).detail?.stepIds);
+    window.addEventListener('task-records-deleted', handle);
     const timer = setInterval(() => {
       if (!document.hidden) setRetry((v) => v + 1);
-    }, 60000);
-    return () => clearInterval(timer);
+    }, 60_000);
+    return () => {
+      window.removeEventListener('task-records-deleted', handle);
+      clearInterval(timer);
+    };
   }, []);
 
-  // Load inviter, bumper & poster logs on-demand per module so one module's ticks or tab switches never spam unrelated APIs
   const inviterFetchedSigRef = useRef('');
-  const bumperFetchedSigRef = useRef('');
-  const posterFetchedSigRef = useRef('');
-
   const inviterLogSig = `${retry}|${groupInviterState?.running ?? ''}|${groupInviterState?.finishedAt ?? ''}`;
   useEffect(() => {
-    const needFetch =
-      !inviterFetchedSigRef.current || moduleTab === 'all' || moduleTab === 'group-inviter';
-    if (!needFetch || inviterFetchedSigRef.current === inviterLogSig) return;
+    if (
+      (inviterFetchedSigRef.current && moduleTab !== 'all' && moduleTab !== 'group-inviter') ||
+      inviterFetchedSigRef.current === inviterLogSig
+    )
+      return;
     let active = true;
     void api
       .groupInviterLogs('')
@@ -207,81 +154,36 @@ export function TaskRecordsPage({
     };
   }, [moduleTab, inviterLogSig]);
 
-  const bumperLogSig = `${retry}|${groupBumperState?.running ?? ''}|${groupBumperState?.pageBumperRunning ?? ''}|${groupBumperState?.total ?? ''}|${groupBumperState?.pageTotal ?? ''}`;
-  useEffect(() => {
-    const needFetch =
-      !bumperFetchedSigRef.current ||
-      moduleTab === 'all' ||
-      moduleTab === 'group-bumper' ||
-      moduleTab === 'page-bumper';
-    if (!needFetch || bumperFetchedSigRef.current === bumperLogSig) return;
-    let active = true;
-    void api
-      .bumperLogs('')
-      .then((list) => {
-        if (active && Array.isArray(list)) {
-          setBumperLogs(list);
-          bumperFetchedSigRef.current = bumperLogSig;
-        }
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [moduleTab, bumperLogSig]);
-
-  const posterLogSig = `${retry}|${groupPosterState?.running ?? ''}|${groupPosterState?.total ?? ''}`;
-  useEffect(() => {
-    const needFetch =
-      !posterFetchedSigRef.current || moduleTab === 'all' || moduleTab === 'group-poster';
-    if (!needFetch || posterFetchedSigRef.current === posterLogSig) return;
-    let active = true;
-    void api
-      .posterLogs('')
-      .then((list) => {
-        if (active && Array.isArray(list)) {
-          setPosterLogs(list);
-          posterFetchedSigRef.current = posterLogSig;
-        }
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [moduleTab, posterLogSig]);
-
-  const rowsRef = useRef<TaskRecord[]>([]);
-  rowsRef.current = rows;
   const plans = runtime?.plans ?? [];
-  const byInspection = new Map(inspections.map((i) => [i.profileId, i]));
-  const byProfile = new Map(profiles.map((profile) => [profile.id, profile]));
-  const attention = new Set(attentionPlans(plans, profiles).map((plan) => plan.id));
-  const apiStatus = filter === 'attention' ? 'review' : filter;
+  const byInspection = useMemo(
+    () => new Map(inspections.map((i) => [i.profileId, i])),
+    [inspections],
+  );
+  const byProfile = useMemo(() => new Map(profiles.map((pr) => [pr.id, pr])), [profiles]);
+  const apiStatus = filter === 'attention' ? ('review' as const) : filter;
   const runtimeKey = plans
-    .map((plan) => `${plan.id}:${plan.state}:${plan.round}:${plan.position}:${plan.updatedAt}`)
+    .map((x) => `${x.id}:${x.state}:${x.round}:${x.position}:${x.updatedAt}`)
     .join('|');
   const profileVersion = JSON.stringify(
-    profiles.map((p) => [p.id, p.online, p.browserName, p.alias]),
+    profiles.map((x) => [x.id, x.online, x.browserName, x.alias]),
   );
   const scopeKey = `${filterId ?? ''}|${apiStatus}|${query.trim()}`;
-  useEffect(() => {
-    setSelected(new Set());
-    setSelectedBumperIds(new Set());
-    setSelectedPosterIds(new Set());
-  }, [scopeKey, moduleTab]);
+
+  useEffect(() => setSelected(new Set()), [scopeKey, moduleTab]);
   const scopeRef = useRef('');
   const currentScope = useRef(scopeKey);
-  currentScope.current = scopeKey;
   const viewRef = useRef<string | undefined>(undefined);
-  const [recordsKey, setRecordsKey] = useState(runtimeKey);
   const latestKey = useRef(runtimeKey);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const stateKey = plans.map((p) => `${p.id}:${p.state}:${p.round}:${p.position}`).join('|');
-  const previousStateKey = useRef(stateKey);
+  currentScope.current = scopeKey;
+  const [recordsKey, setRecordsKey] = useState(runtimeKey);
+  const stateKey = plans.map((x) => `${x.id}:${x.state}:${x.round}:${x.position}`).join('|');
+  const prevStateKey = useRef(stateKey);
+
   useEffect(() => {
     latestKey.current = runtimeKey;
-    if (stateKey !== previousStateKey.current) {
-      previousStateKey.current = stateKey;
+    if (stateKey !== prevStateKey.current) {
+      prevStateKey.current = stateKey;
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
       refreshTimer.current = null;
       setRecordsKey(runtimeKey);
@@ -295,6 +197,7 @@ export function TaskRecordsPage({
       }, 1500);
     }
   }, [runtimeKey, stateKey, filter]);
+
   useEffect(
     () => () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
@@ -304,32 +207,32 @@ export function TaskRecordsPage({
     [],
   );
   useEffect(() => {
-    scopeGenerationRef.current += 1;
+    scopeGenRef.current += 1;
     loadMoreAbortRef.current?.abort();
     loadMoreAbortRef.current = null;
   }, [scopeKey]);
+
   const now = Math.floor(Date.now() / 60_000) * 60_000;
   useEffect(() => {
-    const timer = setTimeout(() => setQuery(searchText), 300);
-    return () => clearTimeout(timer);
+    const t = setTimeout(() => setQuery(searchText), 300);
+    return () => clearTimeout(t);
   }, [searchText]);
 
+  const queryParams = (extra?: { cursor?: string; limit?: number }) => ({
+    ...(filterId ? { profileId: filterId } : {}),
+    status: apiStatus,
+    ...(query.trim() ? { query: query.trim() } : {}),
+    groupBy: 'run' as const,
+    limit: 100,
+    ...extra,
+  });
+
   useEffect(() => {
-    const controller = new AbortController();
+    const ctrl = new AbortController();
     const scopeChanged = scopeRef.current !== scopeKey;
-    void api
-      .taskRecords(
-        {
-          ...(filterId ? { profileId: filterId } : {}),
-          status: apiStatus,
-          ...(query.trim() ? { query: query.trim() } : {}),
-          groupBy: 'run',
-          limit: 100,
-        },
-        controller.signal,
-      )
-      .then((res) => {
-        if (controller.signal.aborted) return;
+    void api.taskRecords(queryParams(), ctrl.signal).then(
+      (res) => {
+        if (ctrl.signal.aborted) return;
         scopeRef.current = scopeKey;
         setTotal(res.total);
         setCounts({
@@ -339,126 +242,109 @@ export function TaskRecordsPage({
           failed: res.counts.failed,
           attention: res.counts.review,
         });
-        const previous = rowsRef.current;
+        const prev = rowsRef.current;
         if (
           scopeChanged ||
           viewRef.current !== res.viewVersion ||
-          previous.length <= res.records.length
+          prev.length <= res.records.length
         ) {
           setRows(res.records.filter((r) => !deleting.current.has(r.stepId)));
           setNextCursor(res.nextCursor);
         } else {
-          const fresh = new Map(res.records.map((row) => [row.stepId, row]));
-          const known = new Set(previous.map((row) => row.stepId));
+          const fresh = new Map(res.records.map((r) => [r.stepId, r]));
+          const known = new Set(prev.map((r) => r.stepId));
           setRows(
             [
-              ...res.records.filter((row) => !known.has(row.stepId)),
-              ...previous.map((row) => fresh.get(row.stepId) ?? row),
+              ...res.records.filter((r) => !known.has(r.stepId)),
+              ...prev.map((r) => fresh.get(r.stepId) ?? r),
             ].filter((r) => !deleting.current.has(r.stepId)),
           );
         }
         viewRef.current = res.viewVersion;
         setLoadError('');
         setRecordsLoaded(true);
-      })
-      .catch(() => {
-        if (controller.signal.aborted) return;
-        setLoadError('记录读取失败，正在自动重试；下面是上次读取的结果。');
-        setRecordsLoaded(true);
-      });
-    return () => controller.abort();
+      },
+      () => {
+        if (!ctrl.signal.aborted) {
+          setLoadError('记录读取失败，正在自动重试；下面是上次读取的结果。');
+          setRecordsLoaded(true);
+        }
+      },
+    );
+    return () => ctrl.abort();
   }, [scopeKey, recordsKey, profileVersion, retry]);
 
   useEffect(() => {
     if (!loadError) return;
-    const timer = setTimeout(() => setRetry((value) => value + 1), 5000);
-    return () => clearTimeout(timer);
+    const t = setTimeout(() => setRetry((v) => v + 1), 5000);
+    return () => clearTimeout(t);
   }, [loadError, retry]);
+  const reportErr = (msg: string) => (onNotify ? onNotify(msg) : setLoadError(msg));
+
+  const quickDelete = async (ids: string[]) => {
+    if (ids.some((id) => deleting.current.has(id))) return;
+    const deleteScope = currentScope.current;
+    for (const id of ids) deleting.current.add(id);
+    const removed = new Set(ids);
+    const previous = rowsRef.current.filter((r) => removed.has(r.stepId));
+    setRows((list) => list.filter((r) => !removed.has(r.stepId)));
+    try {
+      const preview = await api.cleanupPreview({ kind: 'records', scope: { stepIds: ids } });
+      if (!preview.eligible) throw Error('记录状态已变化，请重新读取后再删除');
+      const result = await api.cleanupExecute(preview.token);
+      if (result.protected) throw Error('部分记录状态已变化，已重新读取');
+      window.dispatchEvent(new CustomEvent('task-records-deleted', { detail: { stepIds: ids } }));
+    } catch (err) {
+      if (currentScope.current === deleteScope)
+        setRows((list) => {
+          const known = new Set(list.map((r) => r.stepId));
+          return [...list, ...previous.filter((r) => !known.has(r.stepId))];
+        });
+      reportErr(errMsg(err, '删除失败，请重试'));
+      setRetry((v) => v + 1);
+    } finally {
+      for (const id of ids) deleting.current.delete(id);
+    }
+  };
 
   async function loadMore() {
     if (!nextCursor || loadingMore) return;
-    const gen = scopeGenerationRef.current;
+    const gen = scopeGenRef.current;
     loadMoreAbortRef.current?.abort();
-    const controller = new AbortController();
-    loadMoreAbortRef.current = controller;
+    const ctrl = new AbortController();
+    loadMoreAbortRef.current = ctrl;
     setLoadingMore(true);
     try {
-      const res = await api.taskRecords(
-        {
-          ...(filterId ? { profileId: filterId } : {}),
-          status: apiStatus,
-          ...(query.trim() ? { query: query.trim() } : {}),
-          cursor: nextCursor,
-          groupBy: 'run',
-          limit: 100,
-        },
-        controller.signal,
-      );
-      if (
-        controller.signal.aborted ||
-        scopeGenerationRef.current !== gen ||
-        currentScope.current !== scopeKey
-      )
+      const res = await api.taskRecords(queryParams({ cursor: nextCursor }), ctrl.signal);
+      if (ctrl.signal.aborted || scopeGenRef.current !== gen || currentScope.current !== scopeKey)
         return;
       setRows((prev) => {
-        const known = new Set(prev.map((row) => row.stepId));
+        const known = new Set(prev.map((r) => r.stepId));
         return [
           ...prev,
-          ...res.records.filter(
-            (row) => !known.has(row.stepId) && !deleting.current.has(row.stepId),
-          ),
+          ...res.records.filter((r) => !known.has(r.stepId) && !deleting.current.has(r.stepId)),
         ];
       });
       setNextCursor(res.nextCursor);
       setTotal(res.total);
     } catch (failure) {
-      if (controller.signal.aborted || scopeGenerationRef.current !== gen) return;
+      if (ctrl.signal.aborted || scopeGenRef.current !== gen) return;
       if (failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED') {
         viewRef.current = undefined;
         setNextCursor(null);
-        setRetry((value) => value + 1);
+        setRetry((v) => v + 1);
         setLoadError('记录已变化，正在重新读取。');
       } else setLoadError('加载更多失败，请再试一次。');
     } finally {
-      if (loadMoreAbortRef.current === controller) loadMoreAbortRef.current = null;
-      if (scopeGenerationRef.current === gen) setLoadingMore(false);
-    }
-  }
-
-  async function deleteBumperLogs(
-    ids: string[],
-    deleteAll = false,
-    scope: 'group' | 'page' = 'group',
-  ) {
-    if (bumperBusy) return;
-    setBumperBusy(true);
-    try {
-      const next = await api.bumperAction(
-        'logs/delete',
-        deleteAll ? { all: true, sourceMode: scope } : { ids },
-      );
-      onGroupBumperState?.(next);
-      const refreshed = await api.bumperLogs('');
-      if (Array.isArray(refreshed)) setBumperLogs(refreshed);
-      setSelectedBumperIds(new Set());
-      const label = scope === 'page' ? '专页顶贴' : '小组顶贴';
-      onNotify?.(deleteAll ? `已清空全部${label}历史记录` : `已删除 ${ids.length} 条顶贴记录`);
-    } catch (err) {
-      onNotify?.(err instanceof Error ? err.message : '删除顶贴记录失败');
-    } finally {
-      setBumperBusy(false);
+      if (loadMoreAbortRef.current === ctrl) loadMoreAbortRef.current = null;
+      if (scopeGenRef.current === gen) setLoadingMore(false);
     }
   }
 
   const groups = useMemo(() => groupTaskRecords(rows), [rows]);
   const byGroupPlanRound = useMemo(
     () =>
-      new Map(
-        groups.map((g) => {
-          const first = g.rows[0];
-          return [first ? `${first.planId}:${first.round}` : g.key, g];
-        }),
-      ),
+      new Map(groups.map((g) => [g.rows[0] ? `${g.rows[0].planId}:${g.rows[0].round}` : g.key, g])),
     [groups],
   );
   const eligibleIds = useMemo(
@@ -469,20 +355,14 @@ export function TaskRecordsPage({
     [groups],
   );
   const filtered = filterId ? byProfile.get(filterId) : undefined;
-
-  // Build unified cross-module feed
   const unifiedFeed = useMemo(
     () =>
       buildUnifiedActivityFeed({
         profiles,
         taskRecords: rows,
-        attentionPlanIds: attention,
+        attentionPlanIds: EMPTY_ATTENTION,
         inviterState: groupInviterState,
         inviterLogs,
-        bumperState: groupBumperState,
-        bumperLogs,
-        posterState: groupPosterState,
-        posterLogs,
         googleSheetsOverview,
         profileId: filterId,
         moduleFilter: moduleTab,
@@ -493,13 +373,8 @@ export function TaskRecordsPage({
     [
       profiles,
       rows,
-      attention,
       groupInviterState,
       inviterLogs,
-      groupBumperState,
-      bumperLogs,
-      groupPosterState,
-      posterLogs,
       googleSheetsOverview,
       filterId,
       moduleTab,
@@ -508,90 +383,59 @@ export function TaskRecordsPage({
       now,
     ],
   );
-
-  useEffect(() => {
-    setVisibleLimit(80);
-  }, [moduleTab, filter, query, filterId]);
+  useEffect(() => setVisibleLimit(80), [moduleTab, filter, query, filterId]);
 
   const nonActiveTotal =
-    unifiedFeed.moduleCounts['group-inviter'] +
-    unifiedFeed.moduleCounts['group-bumper'] +
-    unifiedFeed.moduleCounts['page-bumper'] +
-    unifiedFeed.moduleCounts['group-poster'] +
-    unifiedFeed.moduleCounts['google-sheets'];
-
-  // For moduleTab === 'active-accounts', use exact backend counts; for 'all', add pre-statusFilter non-active counts!
+    unifiedFeed.moduleCounts['group-inviter'] + unifiedFeed.moduleCounts['google-sheets'];
   const displayedStatusCounts: Record<Filter, number> =
     moduleTab === 'active-accounts'
       ? counts
       : moduleTab === 'all'
-        ? {
-            all: counts.all + unifiedFeed.nonActiveStatusCounts.all,
-            running: counts.running + unifiedFeed.nonActiveStatusCounts.running,
-            completed: counts.completed + unifiedFeed.nonActiveStatusCounts.completed,
-            failed: counts.failed + unifiedFeed.nonActiveStatusCounts.failed,
-            attention: counts.attention + unifiedFeed.nonActiveStatusCounts.attention,
-          }
+        ? (Object.fromEntries(
+            STATUS_TABS.map(([k]) => [k, counts[k] + unifiedFeed.nonActiveStatusCounts[k]]),
+          ) as Record<Filter, number>)
         : unifiedFeed.statusCounts;
 
   async function exportRows() {
     if (exporting) return;
     exportAbortRef.current?.abort();
-    const controller = new AbortController();
-    exportAbortRef.current = controller;
+    const ctrl = new AbortController();
+    exportAbortRef.current = ctrl;
     setExporting(true);
     try {
       const allRecords: TaskRecord[] = [];
       if (moduleTab === 'all' || moduleTab === 'active-accounts') {
         let cursor: string | undefined;
-        while (true) {
-          if (controller.signal.aborted) return;
+        while (!ctrl.signal.aborted) {
           const res = await api.taskRecords(
-            {
-              ...(filterId ? { profileId: filterId } : {}),
-              status: apiStatus,
-              ...(query.trim() ? { query: query.trim() } : {}),
-              ...(cursor ? { cursor } : {}),
-              groupBy: 'run',
-              limit: 200,
-            },
-            controller.signal,
+            queryParams({ ...(cursor ? { cursor } : {}), limit: 200 }),
+            ctrl.signal,
           );
-          if (controller.signal.aborted) return;
+          if (ctrl.signal.aborted) return;
           allRecords.push(...res.records);
           if (!res.nextCursor) break;
           cursor = res.nextCursor;
         }
       }
-      const q = query.trim().toLowerCase();
       const visibleIds = new Set(unifiedFeed.items.map((i) => i.id));
-      const payload = {
+      const q = query.trim().toLowerCase();
+      downloadJsonFile(`执行记录-${new Date().toISOString().replaceAll(':', '-')}.json`, {
         format: 'browser-workbench-task-records',
         version: 2,
         softwareVersion: __WORKBENCH_VERSION__,
         exportedAt: new Date().toISOString(),
         scope: { profileId: filterId, module: moduleTab, filter, query: query.trim() },
-        records: allRecords.map((row) => ({
-          stepId: row.stepId,
-          planId: row.planId,
-          profileId: row.profileId,
-          browser: byProfile.get(row.profileId)?.browserName ?? byProfile.get(row.profileId)?.alias,
-          combination: row.combinationName,
-          version: row.combinationVersion,
-          round: row.round,
-          position: row.position,
-          type: row.type,
-          destination: row.destination ?? null,
-          status: row.status,
-          planState: row.planState,
-          planReason: row.planReason,
-          progress: row.progress,
-          budget: row.budget ?? null,
-          outcome: row.outcome ?? null,
-          startedAt: row.startedAt ? new Date(row.startedAt).toISOString() : null,
-          finishedAt: row.finishedAt ? new Date(row.finishedAt).toISOString() : null,
-          planCreatedAt: new Date(row.planCreatedAt).toISOString(),
-          planUpdatedAt: new Date(row.planUpdatedAt).toISOString(),
+        records: allRecords.map((r) => ({
+          ...r,
+          browser: byProfile.has(r.profileId)
+            ? profileDisplayName(byProfile.get(r.profileId))
+            : undefined,
+          combination: r.combinationName,
+          version: r.combinationVersion,
+          startedAt: isoOrNull(r.startedAt),
+          finishedAt: isoOrNull(r.finishedAt),
+          planCreatedAt: new Date(r.planCreatedAt).toISOString(),
+          planUpdatedAt: new Date(r.planUpdatedAt).toISOString(),
         })),
         inviterLogs:
           moduleTab === 'all' || moduleTab === 'group-inviter'
@@ -602,811 +446,208 @@ export function TaskRecordsPage({
                     (!q && (filter === 'all' || filter === 'completed'))),
               )
             : [],
-        bumperLogs:
-          moduleTab === 'all' || moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
-            ? bumperLogs.filter(
-                (l) =>
-                  (!filterId || l.profileId === filterId) &&
-                  (visibleIds.has(`bumper-log:${l.id}`) ||
-                    (!q &&
-                      (filter === 'all' || filter === 'completed') &&
-                      (moduleTab === 'all' ||
-                        (moduleTab === 'page-bumper'
-                          ? l.sourceMode === 'page' || l.groupId === '-'
-                          : l.sourceMode !== 'page' && l.groupId !== '-')))),
-              )
-            : [],
-        posterLogs:
-          moduleTab === 'all' || moduleTab === 'group-poster'
-            ? posterLogs
-                .filter(
-                  (l) =>
-                    (!filterId || l.profileId === filterId) &&
-                    (visibleIds.has(`poster-log:${l.id}`) ||
-                      (!q &&
-                        (filter === 'all' ||
-                          (filter === 'attention' && l.postId === 'pending_approval') ||
-                          (filter === 'completed' && l.postId !== 'pending_approval')))),
-                )
-                .map(({ accountAvatar: _a, groupAvatar: _g, ...rest }) => rest)
-            : [],
-      };
-      const url = URL.createObjectURL(
-        new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }),
-      );
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = '执行记录-' + new Date().toISOString().replaceAll(':', '-') + '.json';
-      document.body.append(anchor);
-      try {
-        anchor.click();
-      } finally {
-        anchor.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-      }
+      });
     } catch (failure) {
-      if (controller.signal.aborted) return;
-      const msg =
-        failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED'
-          ? '导出期间记录已更新，请重新点击导出'
-          : failure instanceof Error
-            ? `导出失败：${failure.message}`
-            : '导出失败，请稍后重试';
-      if (onNotify) onNotify(msg);
-      else setLoadError(msg);
+      if (!ctrl.signal.aborted)
+        reportErr(
+          failure instanceof ApiError && failure.code === 'RECORDS_VIEW_CHANGED'
+            ? '导出期间记录已更新，请重新点击导出'
+            : `导出失败：${errMsg(failure, '请稍后重试')}`,
+        );
     } finally {
-      if (exportAbortRef.current === controller) exportAbortRef.current = null;
+      if (exportAbortRef.current === ctrl) exportAbortRef.current = null;
       setExporting(false);
     }
   }
-
-  const canCopyPostOrBump =
-    moduleTab === 'all' ||
-    moduleTab === 'group-poster' ||
-    moduleTab === 'group-bumper' ||
-    moduleTab === 'page-bumper';
-  const selectedCopyCount =
-    moduleTab === 'group-poster'
-      ? selectedPosterIds.size
-      : moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
-        ? selectedBumperIds.size
-        : moduleTab === 'all'
-          ? selectedPosterIds.size + selectedBumperIds.size
-          : 0;
-
-  async function copyPostAndBumpRecords() {
-    if (copyingRecords || !canCopyPostOrBump) return;
-    setCopyingRecords(true);
-    try {
-      const activeQuery = searchText.trim() || query.trim();
-      if (moduleTab === 'group-poster') {
-        let target: PosterLog[];
-        if (selectedPosterIds.size > 0) {
-          target = posterLogs.filter((l) => selectedPosterIds.has(l.id));
-        } else {
-          const seed = posterLogs.length > 0 ? posterLogs : await api.posterLogs('');
-          const allPoster = await collectAllPaginatedLogs({
-            initialRows: seed,
-            getTimestamp: (r) => r.postedAt,
-            fetchPage: (before, beforeId) => api.posterLogs('', before, beforeId),
-          });
-          const fullFeed = buildUnifiedActivityFeed({
-            profiles,
-            posterState: groupPosterState,
-            posterLogs: allPoster,
-            profileId: filterId,
-            moduleFilter: 'group-poster',
-            statusFilter: filter,
-            query: activeQuery,
-            now,
-          });
-          const byId = new Map(allPoster.map((l) => [l.id, l]));
-          target = fullFeed.items
-            .map((item) => (item.posterLogId ? byId.get(item.posterLogId) : undefined))
-            .filter((row): row is PosterLog => Boolean(row));
-        }
-        if (!target.length) {
-          onNotify?.('当前筛选下没有可复制的发帖记录');
-          return;
-        }
-        await copyTextToClipboard(formatPosterLogsAsTsv(target, profiles));
-        onNotify?.(
-          selectedPosterIds.size > 0
-            ? `已批量复制已选 ${target.length} 条发帖记录，可直接粘贴到表格`
-            : `已批量复制 ${target.length} 条发帖记录，可直接粘贴到表格`,
-        );
-        return;
-      }
-
-      if (moduleTab === 'group-bumper' || moduleTab === 'page-bumper') {
-        let target: BumperLog[];
-        if (selectedBumperIds.size > 0) {
-          target = bumperLogs.filter((l) => selectedBumperIds.has(l.id));
-        } else {
-          const sourceMode = moduleTab === 'page-bumper' ? 'page' : 'group';
-          const seed =
-            bumperLogs.length > 0
-              ? bumperLogs.filter((l) =>
-                  sourceMode === 'page'
-                    ? l.sourceMode === 'page' || l.groupId === '-'
-                    : l.sourceMode !== 'page' && l.groupId !== '-',
-                )
-              : await api.bumperLogs('', undefined, undefined, sourceMode);
-          const firstPage =
-            seed.length >= 200 || bumperLogs.length < 200
-              ? seed
-              : await api.bumperLogs('', undefined, undefined, sourceMode);
-          const allBumper = await collectAllPaginatedLogs({
-            initialRows: firstPage,
-            getTimestamp: (r) => r.bumpedAt,
-            fetchPage: (before, beforeId) => api.bumperLogs('', before, beforeId, sourceMode),
-          });
-          const fullFeed = buildUnifiedActivityFeed({
-            profiles,
-            bumperState: groupBumperState,
-            bumperLogs: allBumper,
-            profileId: filterId,
-            moduleFilter: moduleTab,
-            statusFilter: filter,
-            query: activeQuery,
-            now,
-          });
-          const byId = new Map(allBumper.map((l) => [l.id, l]));
-          target = fullFeed.items
-            .map((item) => (item.bumperLogId ? byId.get(item.bumperLogId) : undefined))
-            .filter((row): row is BumperLog => Boolean(row));
-        }
-        if (!target.length) {
-          onNotify?.('当前筛选下没有可复制的顶贴记录');
-          return;
-        }
-        await copyTextToClipboard(formatBumperLogsAsTsv(target, profiles));
-        onNotify?.(
-          selectedBumperIds.size > 0
-            ? `已批量复制已选 ${target.length} 条顶贴记录，可直接粘贴到表格`
-            : `已批量复制 ${target.length} 条顶贴记录，可直接粘贴到表格`,
-        );
-        return;
-      }
-
-      // moduleTab === 'all'
-      let targetPoster: PosterLog[];
-      let targetBumper: BumperLog[];
-      if (selectedPosterIds.size + selectedBumperIds.size > 0) {
-        targetPoster = posterLogs.filter((l) => selectedPosterIds.has(l.id));
-        targetBumper = bumperLogs.filter((l) => selectedBumperIds.has(l.id));
-      } else {
-        const [allPoster, allBumper] = await Promise.all([
-          collectAllPaginatedLogs({
-            initialRows: posterLogs.length > 0 ? posterLogs : await api.posterLogs(''),
-            getTimestamp: (r) => r.postedAt,
-            fetchPage: (before, beforeId) => api.posterLogs('', before, beforeId),
-          }),
-          collectAllPaginatedLogs({
-            initialRows: bumperLogs.length > 0 ? bumperLogs : await api.bumperLogs(''),
-            getTimestamp: (r) => r.bumpedAt,
-            fetchPage: (before, beforeId) => api.bumperLogs('', before, beforeId),
-          }),
-        ]);
-        const fullFeed = buildUnifiedActivityFeed({
-          profiles,
-          posterState: groupPosterState,
-          posterLogs: allPoster,
-          bumperState: groupBumperState,
-          bumperLogs: allBumper,
-          profileId: filterId,
-          moduleFilter: 'all',
-          statusFilter: filter,
-          query: activeQuery,
-          now,
-        });
-        const posterById = new Map(allPoster.map((l) => [l.id, l]));
-        const bumperById = new Map(allBumper.map((l) => [l.id, l]));
-        targetPoster = fullFeed.items
-          .map((item) => (item.posterLogId ? posterById.get(item.posterLogId) : undefined))
-          .filter((row): row is PosterLog => Boolean(row));
-        targetBumper = fullFeed.items
-          .map((item) => (item.bumperLogId ? bumperById.get(item.bumperLogId) : undefined))
-          .filter((row): row is BumperLog => Boolean(row));
-      }
-      const { tsv, count } = formatUnifiedPostAndBumpLogsAsTsv({
-        posterLogs: targetPoster,
-        bumperLogs: targetBumper,
-        profiles,
-      });
-      if (!count) {
-        onNotify?.('当前筛选下没有可复制的发帖或顶贴记录');
-        return;
-      }
-      await copyTextToClipboard(tsv);
-      onNotify?.(`已批量复制 ${count} 条贴文记录，可直接粘贴到表格`);
-    } catch (err) {
-      onNotify?.(err instanceof Error ? err.message : '批量复制失败');
-    } finally {
-      setCopyingRecords(false);
-    }
-  }
-
-  const tabs: [Filter, string][] = [
-    ['all', '全部'],
-    ['running', '进行中'],
-    ['completed', '已完成'],
-    ['failed', '失败'],
-    ['attention', '需处理'],
-  ];
 
   const moduleTabs: [ActivityRecordModuleFilter, string, number][] = [
     ['all', '全部模块', counts.all + nonActiveTotal],
     ['active-accounts', '活跃账号', counts.all],
     ['google-sheets', '云表协同', unifiedFeed.moduleCounts['google-sheets']],
     ['group-inviter', '小组邀请人', unifiedFeed.moduleCounts['group-inviter']],
-    ['group-bumper', '小组顶贴', unifiedFeed.moduleCounts['group-bumper']],
-    ['page-bumper', '专页顶贴', unifiedFeed.moduleCounts['page-bumper']],
-    ['group-poster', '小组发帖', unifiedFeed.moduleCounts['group-poster']],
   ];
+  const toggleSelectedIds = (ids: string[], checked: boolean) =>
+    setSelected((prev) => toggleSet(prev, ids, checked));
+  const renderGroupRow = (g: RunGroup, showBadge: boolean) => (
+    <ActiveAccountGroupRow
+      key={'active-group-' + g.key}
+      group={g}
+      showModuleBadge={showBadge}
+      byProfile={byProfile}
+      byInspection={byInspection}
+      selected={selected}
+      now={now}
+      onOpen={onOpen}
+      onToggleSelected={toggleSelectedIds}
+      onRequestDelete={setPendingDelete}
+    />
+  );
 
-  function renderActiveAccountGroupRow(
-    group: ReturnType<typeof groupTaskRecords>[number],
-    showModuleBadge: boolean,
-  ) {
-    const row = group.rows[0];
-    if (!row) return null;
-    const profile = byProfile.get(row.profileId);
-    const inspection = byInspection.get(row.profileId);
-    const state = attention.has(row.planId) && !endedTask(row.planState) ? 'REVIEW' : group.state;
-    const status = planStatus[state] ?? planStatus.QUEUED;
-    const ids = group.rows.map((r) => r.stepId);
-    const ended = endedTask(row.planState);
-    const reason = row.planReason ? taskReasonDescription(row.planReason)?.summary : null;
-    const time = group.startedAt ?? row.planCreatedAt;
-    return (
-      <div
-        className={'records-row run-record-row tone-' + status?.tone}
-        role="row"
-        key={'active-group-' + group.key}
-        tabIndex={0}
-        onClick={() => onOpen(row.profileId, row.planId, row.round)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && event.target === event.currentTarget)
-            onOpen(row.profileId, row.planId, row.round);
-        }}
-      >
-        <span role="cell" onClick={(e) => e.stopPropagation()}>
-          <input
-            type="checkbox"
-            aria-label={'选择任务 ' + row.combinationName + ' 第' + row.round + '轮'}
-            disabled={
-              !ended ||
-              (!ids.every((id) => selected.has(id)) &&
-                selected.size + ids.filter((id) => !selected.has(id)).length > 1000)
-            }
-            checked={ids.every((id) => selected.has(id))}
-            onChange={(e) =>
-              setSelected((previous) => {
-                const next = new Set(previous);
-                for (const id of ids) {
-                  if (e.target.checked) next.add(id);
-                  else next.delete(id);
-                }
-                return next;
-              })
-            }
-          />
-        </span>
-        <span role="cell" className="cell-browser record-browser-avatar">
-          <ProfileAvatar
-            url={profile ? inspectionAvatarURL(profile, inspection, true) : null}
-            online={Boolean(profile?.online)}
-          />
-          <span>
-            <strong>
-              {showModuleBadge && (
-                <span className="record-module-tag module-active-accounts">活跃账号</span>
-              )}
-              {profile?.browserName ?? profile?.alias ?? '已移除的浏览器'}
-            </strong>
-            <small>
-              {row.combinationName}
-              {row.round > 1 ? ` · 第 ${row.round} 轮` : ''}
-            </small>
-            <small className="fb-id">
-              {inspection?.state === 'OBSERVED' ? inspection.account.id : profile?.account.id}
-            </small>
-          </span>
-        </span>
-        <span role="cell">
-          <span className={'pill pill-' + status?.tone}>
-            {state === 'FAILED'
-              ? '执行异常'
-              : state === 'REVIEW'
-                ? '需处理'
-                : state === 'COMPLETED' &&
-                    group.rows.some((s) =>
-                      isMarketplaceUnavailableSkip(s.type, s.status, s.outcome),
-                    )
-                  ? '已完成（含正常跳过）'
-                  : status?.label}
-          </span>
-          {state === 'STOPPED' && (
-            <small>
-              完成 {group.completed}/{ids.length}
-            </small>
-          )}
-        </span>
-        <span role="cell" className="run-step-pills">
-          {group.rows.map((step) => {
-            const tone = isSuccessfulTaskStep(step.type, step.status, step.outcome)
-              ? 'ok'
-              : step.status === 'FAILED'
-                ? 'err'
-                : step.status === 'ACTIVE' && !ended
-                  ? 'run'
-                  : 'idle';
-            return (
-              <span
-                key={step.stepId}
-                className={'run-step-pill pill-' + tone}
-                title={stepResultLabel(step)}
-              >
-                {stepResultLabel(step)}
-              </span>
-            );
-          })}
-        </span>
-        <span role="cell" className="cell-note">
-          {(state === 'STOPPED' || state === 'FAILED') && (
-            <strong>
-              {state === 'STOPPED'
-                ? `手动停止（已完成 ${group.completed}/${ids.length} 项）`
-                : (reason ?? '执行异常，请查看步骤原因')}
-            </strong>
-          )}
-          <span>{runSummary(group.rows)}</span>
-        </span>
-        <span role="cell" className="cell-time">
-          <time title={new Date(time).toLocaleString()}>{shortTime(time)}</time>
-          <small>
-            {group.startedAt === null
-              ? '未开始'
-              : '用时 ' +
-                span((group.finishedAt ?? (ended ? row.planUpdatedAt : now)) - group.startedAt)}
-          </small>
-          {ended && (
-            <button
-              className="btn btn-sm"
-              onClick={(e) => {
-                e.stopPropagation();
-                void quickDelete(ids);
-              }}
+  const statusTabsNode = (
+    <div className="mb-3 flex flex-wrap gap-1.5" role="tablist">
+      {STATUS_TABS.map(([key, label]) => {
+        const act = filter === key;
+        return (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={act}
+            onClick={() => setFilter(key)}
+            className={`inline-flex h-[30px] items-center gap-1.5 rounded-full border pr-2.5 pl-3 text-xs font-semibold transition-colors ${act ? 'border-blue-600/30 bg-[var(--brand-soft)] text-[var(--brand)]' : 'border-[var(--line)] bg-white text-[var(--text-2)] hover:border-slate-300'}`}
+          >
+            {label}
+            <span
+              className={`h-[18px] min-w-[20px] rounded-full px-1.5 text-center text-[11px] leading-[18px] tabular-nums ${act ? 'bg-blue-600/15 text-[var(--brand)]' : 'bg-[var(--surface-3)] text-[var(--text-3)]'}`}
             >
-              删除
-            </button>
-          )}
-        </span>
-      </div>
-    );
-  }
-
-  function renderUnifiedNonTaskRow(item: UnifiedActivityItem, showModuleBadge: boolean) {
-    const profile = byProfile.get(item.profileId);
-    const inspection = byInspection.get(item.profileId);
-    const isBumperLog = Boolean(item.bumperLogId);
-    const bumperId = item.bumperLogId ?? '';
-    const isPosterLog = Boolean(item.posterLogId);
-    const posterId = item.posterLogId ?? '';
-    return (
-      <div
-        className={'records-row run-record-row unified-module-row tone-' + item.tone}
-        role="row"
-        key={item.id}
-      >
-        <span role="cell" onClick={(e) => e.stopPropagation()}>
-          {isBumperLog ? (
-            <input
-              type="checkbox"
-              aria-label={'选择顶贴记录 ' + item.targetLabel}
-              checked={selectedBumperIds.has(bumperId)}
-              onChange={(e) =>
-                setSelectedBumperIds((prev) => {
-                  const next = new Set(prev);
-                  if (e.target.checked) next.add(bumperId);
-                  else next.delete(bumperId);
-                  return next;
-                })
-              }
-            />
-          ) : isPosterLog ? (
-            <input
-              type="checkbox"
-              aria-label={'选择发帖记录 ' + item.targetLabel}
-              checked={selectedPosterIds.has(posterId)}
-              onChange={(e) =>
-                setSelectedPosterIds((prev) => {
-                  const next = new Set(prev);
-                  if (e.target.checked) next.add(posterId);
-                  else next.delete(posterId);
-                  return next;
-                })
-              }
-            />
-          ) : (
-            <span className="record-check-placeholder" />
-          )}
-        </span>
-        <span role="cell" className="cell-browser record-browser-avatar">
-          <ProfileAvatar
-            url={profile ? inspectionAvatarURL(profile, inspection, true) : null}
-            online={Boolean(profile?.online)}
-          />
-          <span>
-            <strong>
-              {showModuleBadge && (
-                <span className={'record-module-tag module-' + item.moduleId}>
-                  {item.moduleLabel}
-                </span>
-              )}
-              {item.profileName}
-            </strong>
-            <small>{item.title}</small>
-            <small className="fb-id">
-              {inspection?.state === 'OBSERVED' ? inspection.account.id : profile?.account.id}
-            </small>
-          </span>
-        </span>
-        <span role="cell">
-          <span className={'pill pill-' + item.tone}>{item.statusLabel}</span>
-        </span>
-        <span role="cell" className="run-step-pills">
-          <span className={'run-step-pill pill-' + item.tone} title={item.targetLabel}>
-            {item.targetLabel}
-          </span>
-        </span>
-        <span role="cell" className="cell-note">
-          <span>{item.detailText}</span>
-        </span>
-        <span role="cell" className="cell-time">
-          <time title={new Date(item.timestamp).toLocaleString()}>{shortTime(item.timestamp)}</time>
-          <div className="cell-time-actions">
-            {item.postUrl && (
-              <button
-                className="btn btn-sm"
-                title={item.postUrl}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void copyTextToClipboard(item.postUrl ?? '')
-                    .then(() => onNotify?.('已复制帖子链接'))
-                    .catch(() => {});
-                }}
-              >
-                复制链接
-              </button>
-            )}
-            {bumperId && (
-              <button
-                className="btn btn-sm"
-                disabled={bumperBusy}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void deleteBumperLogs([bumperId]);
-                }}
-              >
-                删除
-              </button>
-            )}
-          </div>
-        </span>
-      </div>
-    );
-  }
-
-  const bumperSelectableIds = unifiedFeed.items
-    .map((item) => item.bumperLogId)
-    .filter((id): id is string => Boolean(id));
-  const posterSelectableIds = unifiedFeed.items
-    .map((item) => item.posterLogId)
-    .filter((id): id is string => Boolean(id));
+              {displayedStatusCounts[key]}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+  const emptyMessage =
+    filter === 'attention'
+      ? '没有需要处理的任务。'
+      : moduleTab === 'active-accounts'
+        ? filtered
+          ? '这个浏览器还没有相关记录。'
+          : '还没有活跃账号任务记录。勾选浏览器后在「活跃账号」模块启动组合或功能测试。'
+        : filtered
+          ? '这个浏览器在当前模块下还没有相关执行记录。'
+          : '当前筛选条件下还没有执行记录。';
+  const isEmpty = moduleTab === 'active-accounts' ? !rows.length : !unifiedFeed.items.length;
+  const colHeaders =
+    moduleTab === 'active-accounts'
+      ? ['浏览器 / 任务组合', '整体状态', '步骤执行明细', '成果与说明', '时间与操作']
+      : ['浏览器 / 模块任务', '执行状态', '目标对象 / 步骤', '成果与说明', '时间与操作'];
 
   return (
-    <section className="records-page" aria-label="执行记录">
-      <div className="section-head">
-        <h2>
-          执行记录
+    <section className="flex min-w-0 flex-col gap-3" aria-label="执行记录">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 className="m-0 flex flex-wrap items-center gap-2 text-base font-semibold text-slate-900">
+          <span>执行记录</span>
           {filtered && (
-            <span className="filter-tag">
-              {filtered.browserName ?? filtered.alias}
-              <button aria-label="取消浏览器筛选" title="取消筛选" onClick={onClearFilter}>
+            <span className="inline-flex h-[26px] items-center gap-1 rounded-full bg-[var(--brand-soft)] pr-1 pl-2.5 text-xs font-semibold text-[var(--brand)]">
+              {profileDisplayName(filtered)}
+              <button
+                type="button"
+                className="grid h-5 w-5 place-content-center rounded-full border-0 bg-transparent p-0 text-inherit hover:bg-blue-500/15"
+                aria-label="取消浏览器筛选"
+                title="取消筛选"
+                onClick={onClearFilter}
+              >
                 <IconClose size={12} />
               </button>
             </span>
           )}
         </h2>
-        <div className="section-tools">
-          <div className="records-module-switcher" role="tablist" aria-label="按功能模块筛选">
-            {moduleTabs.map(([key, label, count]) => (
-              <button
-                key={key}
-                type="button"
-                role="tab"
-                aria-selected={moduleTab === key}
-                className={'module-switch-btn' + (moduleTab === key ? ' active' : '')}
-                onClick={() => setModuleTab(key)}
-              >
-                {label}
-                <span>{count}</span>
-              </button>
-            ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <div
+            className="inline-flex flex-wrap items-center gap-0.5 rounded-lg border border-[var(--line)] bg-slate-100 p-0.5"
+            role="tablist"
+            aria-label="按功能模块筛选"
+          >
+            {moduleTabs.map(([key, label, count]) => {
+              const active = moduleTab === key;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  className={`module-switch-btn inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors ${
+                    active
+                      ? 'bg-white font-semibold text-slate-900 shadow-2xs'
+                      : 'bg-transparent font-medium text-slate-600 hover:text-slate-900'
+                  }`}
+                  onClick={() => setModuleTab(key)}
+                >
+                  <span>{label}</span>
+                  <span className="rounded-full bg-slate-200/70 px-1.5 py-px text-[11px] font-semibold text-[var(--text-2)] tabular-nums">
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
           </div>
-          <label className="search-field">
-            <IconSearch />
+          <label className="relative flex items-center">
+            <IconSearch
+              size={14}
+              className="pointer-events-none absolute left-2.5 text-[var(--text-3)]"
+            />
             <input
               type="search"
               aria-label="搜索任务记录"
-              placeholder="搜索模块、组合、小组或浏览器"
+              placeholder="搜索组合、小组或浏览器"
+              className={`${UI_INPUT} w-52 max-w-full pl-8`}
               value={searchText}
-              onChange={(event) => setSearchText(event.target.value)}
+              onChange={(e) => setSearchText(e.target.value)}
             />
           </label>
-          {canCopyPostOrBump && (
-            <button
-              type="button"
-              className="btn btn-sm btn-primary"
-              title="复制贴文时间、账号、小组/专页、内容与链接，可直接粘贴到 Excel / WPS / 飞书 / Google 表格"
-              disabled={
-                copyingRecords || (!bumperLogs.length && !posterLogs.length && !selectedCopyCount)
-              }
-              onClick={() => void copyPostAndBumpRecords()}
-            >
-              {copyingRecords
-                ? '正在复制…'
-                : selectedCopyCount > 0
-                  ? `批量复制已选 (${selectedCopyCount})`
-                  : moduleTab === 'group-poster'
-                    ? '批量复制发帖记录'
-                    : moduleTab === 'group-bumper' || moduleTab === 'page-bumper'
-                      ? '批量复制顶贴记录'
-                      : '批量复制贴文记录'}
-            </button>
-          )}
-          <button
-            type="button"
-            className={'btn btn-sm' + (exporting ? ' is-busy' : '')}
+          <Btn
+            className={exporting ? 'opacity-70' : undefined}
             title={exporting ? '正在导出…' : '导出当前筛选全部执行记录（JSON）'}
             aria-label="导出任务记录"
-            disabled={
-              (!rows.length && !inviterLogs.length && !bumperLogs.length && !posterLogs.length) ||
-              exporting
-            }
+            disabled={(!rows.length && !inviterLogs.length) || exporting}
             onClick={() => void exportRows()}
           >
-            <IconDownload size={14} />
-            导出
-          </button>
+            <IconDownload size={14} /> 导出
+          </Btn>
           {onOpenCleanupSettings && (
-            <button
-              type="button"
-              className="btn btn-sm btn-ghost"
-              title="前往设置历史记录自动保留规则与数据库清理"
-              onClick={onOpenCleanupSettings}
-            >
+            <Btn title="前往设置历史记录自动保留规则与数据库清理" onClick={onOpenCleanupSettings}>
               保留规则
-            </button>
+            </Btn>
           )}
         </div>
       </div>
 
-      {moduleTab === 'group-bumper' || moduleTab === 'page-bumper' ? (
-        <div className="records-toolbar">
-          <div className="status-tabs" role="tablist">
-            {tabs.map(([key, label]) => (
-              <button
-                key={key}
-                role="tab"
-                aria-selected={filter === key}
-                className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
-                onClick={() => setFilter(key)}
-              >
-                {label}
-                <span>{displayedStatusCounts[key]}</span>
-              </button>
-            ))}
-          </div>
-          <div className="records-cleanup-btns">
-            {selectedBumperIds.size > 0 && (
-              <button
-                type="button"
-                className="btn btn-sm danger"
-                disabled={bumperBusy}
-                onClick={() =>
-                  void deleteBumperLogs(
-                    [...selectedBumperIds],
-                    false,
-                    moduleTab === 'page-bumper' ? 'page' : 'group',
-                  )
-                }
-              >
-                删除所选记录 ({selectedBumperIds.size})
-              </button>
-            )}
-            <button
-              type="button"
-              className="btn btn-sm"
-              disabled={
-                bumperBusy ||
-                bumperSelectableIds.length === 0 ||
-                Boolean(
-                  moduleTab === 'page-bumper'
-                    ? groupBumperState?.pageBumperRunning
-                    : groupBumperState?.running,
-                )
-              }
-              onClick={() =>
-                setConfirmClearBumperScope(moduleTab === 'page-bumper' ? 'page' : 'group')
-              }
-            >
-              {moduleTab === 'page-bumper' ? '清空专页顶贴记录' : '清空小组顶贴记录'}
-            </button>
-          </div>
-        </div>
-      ) : moduleTab === 'group-poster' || moduleTab === 'group-inviter' ? (
-        <div className="records-toolbar">
-          <div className="status-tabs" role="tablist">
-            {tabs.map(([key, label]) => (
-              <button
-                key={key}
-                role="tab"
-                aria-selected={filter === key}
-                className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
-                onClick={() => setFilter(key)}
-              >
-                {label}
-                <span>{displayedStatusCounts[key]}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+      {moduleTab === 'group-inviter' || moduleTab === 'google-sheets' ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">{statusTabsNode}</div>
       ) : (
         <RecordCleanupActions
           showRetention={false}
-          filters={
-            <div className="status-tabs" role="tablist">
-              {tabs.map(([key, label]) => (
-                <button
-                  key={key}
-                  role="tab"
-                  aria-selected={filter === key}
-                  className={'status-tab tab-' + key + (filter === key ? ' active' : '')}
-                  onClick={() => setFilter(key)}
-                >
-                  {label}
-                  <span>{displayedStatusCounts[key]}</span>
-                </button>
-              ))}
-            </div>
-          }
+          filters={statusTabsNode}
           stepIds={[...selected]}
           selectedCount={groups.filter((g) => g.rows.every((r) => selected.has(r.stepId))).length}
           {...(filterId ? { profileId: filterId } : {})}
           onDone={afterDelete}
         />
       )}
-      {confirmClearBumperScope && (
+      {pendingDelete && (
         <ConfirmDialog
-          title={
-            confirmClearBumperScope === 'page' ? '清空全部专页顶贴记录' : '清空全部小组顶贴记录'
-          }
-          description={`确定清空全部${confirmClearBumperScope === 'page' ? '专页顶贴' : '小组顶贴'}历史记录？仅清理该模式记录与对应累计统计，不会影响另一模式。`}
-          label="确认清空"
-          onClose={() => setConfirmClearBumperScope(null)}
-          onConfirm={async () => {
-            const scope = confirmClearBumperScope;
-            setConfirmClearBumperScope(null);
-            await deleteBumperLogs([], true, scope);
-          }}
+          title="删除执行记录"
+          description={`确定删除「${pendingDelete.label}」的执行记录吗？删除后无法恢复。`}
+          label="确认删除"
+          onClose={() => setPendingDelete(null)}
+          onConfirm={() => quickDelete(pendingDelete.ids)}
         />
       )}
-
-      {loadError && (
-        <p className="records-notice" role="status">
-          {loadError}
-        </p>
-      )}
+      {loadError && <NoticeBanner tone="err">{loadError}</NoticeBanner>}
 
       {!loaded && !recordsLoaded ? (
-        <p className="muted records-empty">正在读取执行记录…</p>
-      ) : moduleTab === 'active-accounts' ? (
-        !rows.length ? (
-          <div className="records-empty">
-            <p>
-              {filter === 'attention'
-                ? '没有需要处理的任务。'
-                : filtered
-                  ? '这个浏览器还没有相关记录。'
-                  : '还没有活跃账号任务记录。勾选浏览器后在「活跃账号」模块启动组合或功能测试。'}
-            </p>
-          </div>
-        ) : (
-          <div className="records-table" role="table">
-            <div className="records-row run-record-row records-header" role="row">
-              <span role="columnheader">
-                <input
-                  type="checkbox"
-                  aria-label="选择当前已加载的已结束任务"
-                  checked={eligibleIds.length > 0 && eligibleIds.every((id) => selected.has(id))}
-                  onChange={(e) =>
-                    setSelected(e.target.checked ? new Set(eligibleIds.slice(0, 1000)) : new Set())
-                  }
-                />
-              </span>
-              <span role="columnheader">浏览器 / 任务组合</span>
-              <span role="columnheader">整体状态</span>
-              <span role="columnheader">步骤执行明细</span>
-              <span role="columnheader">成果与说明</span>
-              <span role="columnheader">时间与操作</span>
-            </div>
-            {groups.map((group) => renderActiveAccountGroupRow(group, false))}
-            <div className="records-foot">
-              <span>
-                已显示 {groups.length} / {total} 次任务
-              </span>
-              {nextCursor && (
-                <button
-                  className="btn btn-sm records-more"
-                  disabled={loadingMore}
-                  onClick={() => void loadMore()}
-                >
-                  {loadingMore
-                    ? '正在加载…'
-                    : `再显示 ${Math.min(100, Math.max(1, total - groups.length))} 次任务`}
-                </button>
-              )}
-            </div>
-          </div>
-        )
-      ) : !unifiedFeed.items.length ? (
-        <div className="records-empty">
-          <p>
-            {filter === 'attention'
-              ? '没有需要处理的任务。'
-              : filtered
-                ? '这个浏览器在当前模块下还没有相关执行记录。'
-                : '当前筛选条件下还没有执行记录。'}
-          </p>
+        <div className="rounded-xl border border-dashed border-[var(--line-strong)] bg-slate-50/70 px-4 py-12 text-center text-xs text-[var(--text-3)]">
+          正在读取执行记录…
         </div>
+      ) : isEmpty ? (
+        <EmptyState title={emptyMessage} />
       ) : (
-        <div className="records-table" role="table">
-          <div className="records-row run-record-row records-header" role="row">
-            <span role="columnheader">
-              {moduleTab === 'group-bumper' || moduleTab === 'page-bumper' ? (
-                <input
-                  type="checkbox"
-                  aria-label="全选当前顶贴记录"
-                  checked={
-                    bumperSelectableIds.length > 0 &&
-                    bumperSelectableIds.every((id) => selectedBumperIds.has(id))
-                  }
-                  onChange={(e) =>
-                    setSelectedBumperIds(
-                      e.target.checked ? new Set(bumperSelectableIds) : new Set(),
-                    )
-                  }
-                />
-              ) : moduleTab === 'group-poster' ? (
-                <input
-                  type="checkbox"
-                  aria-label="全选当前发帖记录"
-                  checked={
-                    posterSelectableIds.length > 0 &&
-                    posterSelectableIds.every((id) => selectedPosterIds.has(id))
-                  }
-                  onChange={(e) =>
-                    setSelectedPosterIds(
-                      e.target.checked ? new Set(posterSelectableIds) : new Set(),
-                    )
-                  }
-                />
+        <div
+          className="records-table overflow-hidden rounded-xl border border-[var(--line)] bg-white shadow-xs"
+          role="table"
+        >
+          <div
+            className={`records-row records-header ${RECORD_GRID_CLS} border-b border-[var(--line)] bg-slate-50 text-[11px] font-semibold text-[var(--text-3)]`}
+            role="row"
+          >
+            <span role="columnheader" className="flex items-center justify-center pt-0.5">
+              {moduleTab === 'google-sheets' || moduleTab === 'group-inviter' ? (
+                <span aria-hidden="true" />
               ) : (
                 <input
                   type="checkbox"
+                  className={UI_CHECKBOX}
                   aria-label="选择当前已加载的已结束任务"
                   checked={eligibleIds.length > 0 && eligibleIds.every((id) => selected.has(id))}
                   onChange={(e) =>
@@ -1415,41 +656,49 @@ export function TaskRecordsPage({
                 />
               )}
             </span>
-            <span role="columnheader">浏览器 / 模块任务</span>
-            <span role="columnheader">执行状态</span>
-            <span role="columnheader">目标对象 / 步骤</span>
-            <span role="columnheader">成果与说明</span>
-            <span role="columnheader">时间与操作</span>
+            {colHeaders.map((h) => (
+              <span key={h} role="columnheader">
+                {h}
+              </span>
+            ))}
           </div>
-          {unifiedFeed.items.slice(0, visibleLimit).map((item) => {
-            if (item.moduleId === 'active-accounts' && item.planId !== undefined) {
-              const group = byGroupPlanRound.get(`${item.planId}:${item.round ?? 1}`);
-              if (group) return renderActiveAccountGroupRow(group, moduleTab === 'all');
-            }
-            return renderUnifiedNonTaskRow(item, moduleTab === 'all');
-          })}
-          <div className="records-foot">
+          {moduleTab === 'active-accounts'
+            ? groups.map((g) => renderGroupRow(g, false))
+            : unifiedFeed.items.slice(0, visibleLimit).map((item) => {
+                if (item.moduleId === 'active-accounts' && item.planId !== undefined) {
+                  const g = byGroupPlanRound.get(`${item.planId}:${item.round ?? 1}`);
+                  if (g) return renderGroupRow(g, moduleTab === 'all');
+                }
+                return (
+                  <UnifiedNonTaskRow
+                    key={item.id}
+                    item={item}
+                    showModuleBadge={moduleTab === 'all'}
+                    byProfile={byProfile}
+                    byInspection={byInspection}
+                    onNotify={onNotify}
+                  />
+                );
+              })}
+          <div className="flex min-h-[46px] flex-wrap items-center justify-between gap-3 bg-[var(--surface-2)] px-4 py-2 text-xs text-[var(--text-3)] tabular-nums">
             <span>
-              已显示 {Math.min(visibleLimit, unifiedFeed.items.length)} / {unifiedFeed.items.length}{' '}
-              条执行记录
+              {moduleTab === 'active-accounts'
+                ? `已显示 ${groups.length} / ${total} 次任务`
+                : `已显示 ${Math.min(visibleLimit, unifiedFeed.items.length)} / ${unifiedFeed.items.length} 条执行记录`}
             </span>
-            {unifiedFeed.items.length > visibleLimit && (
-              <button
-                type="button"
-                className="btn btn-sm records-more"
-                onClick={() => setVisibleLimit((v) => v + 80)}
-              >
+            {moduleTab !== 'active-accounts' && unifiedFeed.items.length > visibleLimit && (
+              <Btn onClick={() => setVisibleLimit((v) => v + 80)}>
                 展开更多（剩余 {unifiedFeed.items.length - visibleLimit} 条）
-              </button>
+              </Btn>
             )}
-            {moduleTab === 'all' && nextCursor && (
-              <button
-                className="btn btn-sm records-more"
-                disabled={loadingMore}
-                onClick={() => void loadMore()}
-              >
-                {loadingMore ? '正在加载…' : '加载更多活跃账号记录'}
-              </button>
+            {(moduleTab === 'active-accounts' || moduleTab === 'all') && nextCursor && (
+              <Btn disabled={loadingMore} onClick={() => void loadMore()}>
+                {loadingMore
+                  ? '正在加载…'
+                  : moduleTab === 'active-accounts'
+                    ? `再显示 ${Math.min(100, Math.max(1, total - groups.length))} 次任务`
+                    : '加载更多活跃账号记录'}
+              </Btn>
             )}
           </div>
         </div>

@@ -1,7 +1,7 @@
 import type { TaskService } from './task-service.js';
 import type { WorkspaceService } from './workspace-service.js';
 import { ProductError } from '../domain/workspace.js';
-import { marketplaceBridgeSupported } from '../shared/task-features.js';
+import { marketplaceBridgeSupported } from '../shared/task-policies.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import { CombinationSchema } from '../shared/contracts.js';
 import {
@@ -16,6 +16,7 @@ import {
 // Original plans contain the result/stop history. No second execution or test ledger exists.
 export class TaskTestService {
   private profileLifecycle?: ProfileLifecyclePort;
+  private readonly batchDigests = new Map<string, string>();
   constructor(
     private readonly workspace: WorkspaceService,
     private readonly tasks: TaskService,
@@ -24,20 +25,33 @@ export class TaskTestService {
   setProfileLifecycle(lifecycle: ProfileLifecyclePort): void {
     this.profileLifecycle = lifecycle;
   }
+  private async sha256Hex(value: unknown): Promise<string> {
+    const digest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(JSON.stringify(value)),
+    );
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
   async start(input: unknown) {
     const request = TaskTestRequest.parse(input);
     request.profileIds = [...new Set(request.profileIds)].sort();
     await this.workspace.requireProfiles(request.profileIds);
-    const digest = await crypto.subtle.digest(
-      'SHA-256',
-      new TextEncoder().encode(JSON.stringify(request)),
-    );
-    const note =
-      TEST_COMBINATION_NOTE +
-      [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    // Hash ONLY the step spec for combination reuse so repeated quick tasks do not
+    // leak zombie rows in SQLite `combinations`, while hashing the full request
+    // (including profileIds & params) for strict same-requestId idempotency checks.
+    const stepSpec = taskTestStep(request, '00000000-0000-4000-8000-000000000000');
+    const [requestDigest, comboDigest] = await Promise.all([
+      this.sha256Hex(request),
+      this.sha256Hex(stepSpec),
+    ]);
+    const note = TEST_COMBINATION_NOTE + comboDigest;
     const original = await this.tasks.plansForBatch(request.requestId);
     if (original.length) {
-      if (original.some((plan) => plan.snapshot.note !== note))
+      const recordedDigest = this.batchDigests.get(request.requestId);
+      if (
+        original.some((plan) => plan.snapshot.note !== note) ||
+        (recordedDigest !== undefined && recordedDigest !== requestDigest)
+      )
         throw new ProductError('BATCH_ID_CONFLICT', '同一个测试请求不能改动参数或浏览器范围', 409);
       return TaskTestResult.parse({
         plans: original,
@@ -50,36 +64,35 @@ export class TaskTestService {
       });
     }
     const module = taskTestModules.find((item) => item.id === request.module);
-    if (!module) throw new ProductError('TEST_MODULE_UNAVAILABLE', '未知测试模块', 400);
-    if (!(await this.tasks.capabilities()).types.includes(request.module))
+    if (!module || !module.type)
+      throw new ProductError('TEST_MODULE_UNAVAILABLE', '未知测试模块', 400);
+    if (!(await this.tasks.capabilities()).types.includes(module.type))
       throw new ProductError('TEST_MODULE_UNAVAILABLE', module.name + '的执行模块尚未加载', 409);
-    await this.tasks.releaseErroredPausedPlans(request.profileIds);
-    let snapshot = await this.workspace.snapshot();
+    const snapshot = await this.workspace.snapshot();
     const live = await this.tasks.livePlans();
+    const launchableSet = new Set<string>();
     if (this.profileLifecycle) {
-      const offlineCandidates: string[] = [];
-      for (const profileId of request.profileIds) {
+      const offlineCandidates = request.profileIds.filter((profileId) => {
         const profile = snapshot.profiles.find((item) => item.id === profileId);
-        if (profile?.online) continue;
-        const externalBusy = (await this.isProfileExternalBusy?.(profileId)) === true;
-        const hasLive = live.some((plan) => plan.profileId === profileId);
-        if (!externalBusy && !hasLive) offlineCandidates.push(profileId);
-      }
+        return !profile?.online;
+      });
       if (offlineCandidates.length > 0) {
-        await this.profileLifecycle.ensureProfilesOnline(offlineCandidates);
-        snapshot = await this.workspace.snapshot();
+        const statuses = await this.profileLifecycle.getStatus(offlineCandidates);
+        for (const s of statuses) {
+          if (s.launchable) launchableSet.add(s.profileId);
+        }
       }
     }
     const rejected: { profileId: string; reason: string }[] = [];
     for (const profileId of request.profileIds) {
       const profile = snapshot.profiles.find((item) => item.id === profileId);
       const externalBusy = (await this.isProfileExternalBusy?.(profileId)) === true;
-      const reason = !profile?.online
-        ? '浏览器未连接，请打开对应资料'
-        : !marketplaceBridgeSupported(profile.extensionVersion, '0.3.21')
-          ? '请将这份浏览器的桥接插件刷新到0.3.21或更新版本，再测试'
-          : !profile.synced || profile.unresolved
-            ? '连接正在对账或有待处理操作，请先查看状态'
+      const canAutoLaunch = !profile?.online && launchableSet.has(profileId);
+      const reason =
+        !profile?.online && !canAutoLaunch
+          ? '浏览器未连接，请打开对应资料'
+          : profile?.online && !marketplaceBridgeSupported(profile.extensionVersion, '0.3.21')
+            ? '请将这份浏览器的桥接插件刷新到0.3.21或更新版本，再测试'
             : externalBusy
               ? '该浏览器正在执行其他任务，请先停止'
               : live.some((plan) => plan.profileId === profileId)
@@ -107,7 +120,13 @@ export class TaskTestService {
       combinationId: combination.id,
       version: combination.version,
       profileIds: eligible,
+      ...(request.closeBrowserOnFinish ? { closeBrowserOnFinish: true } : {}),
     });
+    if (this.batchDigests.size >= 512) {
+      const oldest = this.batchDigests.keys().next().value;
+      if (oldest) this.batchDigests.delete(oldest);
+    }
+    this.batchDigests.set(request.requestId, requestDigest);
     return TaskTestResult.parse({ plans, rejected });
   }
 }

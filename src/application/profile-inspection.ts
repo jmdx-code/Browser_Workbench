@@ -1,12 +1,16 @@
-import type { ProfileInspectionPort, InspectionConnection } from '../domain/profile-inspection.js';
-import { analyzeFacebookIdentityPage } from '../domain/facebook-page-analysis.js';
-import { inspectedFacebookAccount } from '../domain/facebook-page-analysis.js';
-import { observeFacebookHomeAvatar } from '../domain/facebook-avatar-analysis.js';
-import { observeFacebookHomeName } from '../domain/facebook-name-analysis.js';
-import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
-import { FacebookBrowseURL } from '../shared/browser-actions.js';
-import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
+import {
+  observeFacebookHomeAvatar,
+  observeFacebookHomeName,
+} from '../domain/facebook-content-rules.js';
+import {
+  analyzeFacebookIdentityPage,
+  inspectedFacebookAccount,
+} from '../domain/facebook-page-analysis.js';
+import type { InspectionConnection, ProfileInspectionPort } from '../domain/system-ports.js';
 import { NameObservation } from '../shared/account-display.js';
+import { FacebookBrowseURL } from '../shared/browser-actions.js';
+import { FacebookNativeActor } from '../shared/facebook-native-identity.js';
+import { kernelFacebookReadURL } from '../shared/kernel-policy.js';
 import {
   InspectionReason,
   ProfileInspection,
@@ -15,6 +19,7 @@ import {
 } from '../shared/profile-inspection.js';
 
 const unknown = () => ({ state: 'unknown' as const, id: null, name: null, avatar: null });
+type AbnormalState = 'verification' | 'restricted' | 'logged-out';
 type Entry = {
   connection: InspectionConnection;
   row: Inspection;
@@ -23,21 +28,30 @@ type Entry = {
   display: { name: string | null; avatar: string | null };
 };
 
-// Public reasons are finite codes. Native/SDK exceptions may contain page or local file data.
-function failureReason(error: unknown): InspectionReasonCode {
-  const message = error instanceof Error ? error.message : '';
-  const known = InspectionReason.safeParse(message);
-  if (known.success && message.startsWith('INSPECTION_')) return known.data;
-  if (
+const ABNORMAL_REASON_MAP: Record<AbnormalState, InspectionReasonCode> = {
+  verification: 'CHECKPOINT_ROUTE',
+  restricted: 'ACCOUNT_RESTRICTED',
+  'logged-out': 'VISIBLE_LOGIN_FORM',
+};
+
+const ABNORMAL_ERROR_MAP: Record<string, AbnormalState> = {
+  FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED: 'verification',
+  FACEBOOK_ACCOUNT_RESTRICTED: 'restricted',
+  FACEBOOK_ACCOUNT_LOGGED_OUT: 'logged-out',
+};
+
+const FAILURE_REASON_GROUPS: ReadonlyArray<readonly [InspectionReasonCode, readonly string[]]> = [
+  [
+    'INSPECTION_READ_RELEASE_UNCONFIRMED',
     [
       'FACEBOOK_READ_TAB_CLOSE_UNCONFIRMED',
       'FACEBOOK_READ_STOP_UNCONFIRMED',
       'KERNEL_STOP_RECEIPT_MISMATCH',
       'SUMMARY_STOP_UNCONFIRMED',
-    ].includes(message)
-  )
-    return 'INSPECTION_READ_RELEASE_UNCONFIRMED';
-  if (
+    ],
+  ],
+  [
+    'INSPECTION_DOCUMENT_CHANGED',
     [
       'PAGE_READ_FOREIGN_DOCUMENT',
       'FB_IDENTITY_SCOPE_REJECTED',
@@ -46,10 +60,10 @@ function failureReason(error: unknown): InspectionReasonCode {
       'FACEBOOK_READ_PROOF_MISMATCH',
       'FACEBOOK_READ_ATTACHED_TARGET_MISMATCH',
       'PAGE_PROJECTION_MISMATCH',
-    ].includes(message)
-  )
-    return 'INSPECTION_DOCUMENT_CHANGED';
-  if (
+    ],
+  ],
+  [
+    'INSPECTION_CONNECTION_CHANGED',
     [
       'FACEBOOK_READ_CONTEXT_CHANGED',
       'SUMMARY_SESSION_CHANGED',
@@ -57,25 +71,44 @@ function failureReason(error: unknown): InspectionReasonCode {
       'KERNEL_LEASE_REJECTED',
       'KERNEL_FENCED',
       'KERNEL_LEASE_RENEW_FAILED',
-    ].includes(message) ||
-    message.startsWith('KERNEL_LEASE_REJECTED:')
-  )
-    return 'INSPECTION_CONNECTION_CHANGED';
-  if (['KERNEL_RPC_RESULT_UNKNOWN', 'KERNEL_RPC_SEND_UNKNOWN'].includes(message))
-    return 'INSPECTION_TRANSPORT_UNCONFIRMED';
-  if (message === 'KERNEL_DEBUGGER_DETACHED' || message === 'KERNEL_DEBUGGER_CANCELED_BY_USER')
-    return 'INSPECTION_CONTROL_INTERRUPTED';
-  if (
-    ['FACEBOOK_READ_CAPABILITY_REQUIRED', 'FACEBOOK_RICH_READ_CAPABILITY_REQUIRED'].includes(
-      message,
-    )
-  )
-    return 'INSPECTION_EXTENSION_UPDATE_REQUIRED';
-  if (message === 'KERNEL_PEER_NOT_IDLE') return 'INSPECTION_PROFILE_NOT_IDLE';
+    ],
+  ],
+  ['INSPECTION_TRANSPORT_UNCONFIRMED', ['KERNEL_RPC_RESULT_UNKNOWN', 'KERNEL_RPC_SEND_UNKNOWN']],
+  [
+    'INSPECTION_CONTROL_INTERRUPTED',
+    ['KERNEL_DEBUGGER_DETACHED', 'KERNEL_DEBUGGER_CANCELED_BY_USER'],
+  ],
+  [
+    'INSPECTION_EXTENSION_UPDATE_REQUIRED',
+    ['FACEBOOK_READ_CAPABILITY_REQUIRED', 'FACEBOOK_RICH_READ_CAPABILITY_REQUIRED'],
+  ],
+  ['INSPECTION_PROFILE_NOT_IDLE', ['KERNEL_PEER_NOT_IDLE']],
+];
+
+function failureReason(error: unknown): InspectionReasonCode {
+  const message = error instanceof Error ? error.message : '';
+  const known = InspectionReason.safeParse(message);
+  if (known.success && message.startsWith('INSPECTION_')) return known.data;
+  if (message.startsWith('KERNEL_LEASE_REJECTED:')) return 'INSPECTION_CONNECTION_CHANGED';
+  for (const [code, names] of FAILURE_REASON_GROUPS) if (names.includes(message)) return code;
   return 'INSPECTION_FAILED';
 }
 
-// Explicit, bounded read workflow. Observations never grant actor/input permission.
+const makeResetRow = (
+  row: Inspection,
+  state: 'BLOCKED' | 'FAILED',
+  reason: InspectionReasonCode,
+  checkedAt = row.checkedAt,
+): Inspection => ({
+  ...row,
+  state,
+  reason,
+  checkedAt,
+  account: unknown(),
+  avatarObservation: null,
+  nameObservation: null,
+});
+
 export class ProfileInspectionService {
   private readonly entries = new Map<string, Entry>();
   private readonly unavailable = new Map<string, Inspection>();
@@ -85,6 +118,7 @@ export class ProfileInspectionService {
   private closing = false;
   private readonly observedConnections = new Map<string, string>();
   private readonly nextAutomaticRead = new Map<string, number>();
+
   constructor(
     private readonly port: ProfileInspectionPort,
     private readonly now: () => number,
@@ -101,38 +135,40 @@ export class ProfileInspectionService {
   ) {}
 
   private current(entry: Entry) {
-    const connection = this.port.connection(entry.connection.profileId);
+    const conn = this.port.connection(entry.connection.profileId);
     if (
       this.closing ||
       entry.cancelled ||
       this.entries.get(entry.connection.profileId) !== entry ||
-      !connection ||
-      connection.connectionEpoch !== entry.connection.connectionEpoch
-    )
+      !conn ||
+      conn.connectionEpoch !== entry.connection.connectionEpoch
+    ) {
       throw Error('INSPECTION_CONNECTION_CHANGED');
+    }
   }
+
+  private applyAbnormalState(profileId: string, entry: Entry, state: AbnormalState): void {
+    entry.display = { name: null, avatar: null };
+    entry.row = ProfileInspection.parse({
+      profileId,
+      state: 'OBSERVED',
+      reason: ABNORMAL_REASON_MAP[state],
+      checkedAt: this.now(),
+      account: { state, id: null, name: null, avatar: null },
+      avatarObservation: null,
+      nameObservation: null,
+    });
+    this.nextAutomaticRead.set(profileId, this.now() + 30_000);
+  }
+
   get(profileId: string): Inspection | null {
     const entry = this.entries.get(profileId);
     if (!entry) return structuredClone(this.unavailable.get(profileId) ?? null);
-    const connection = this.port.connection(profileId);
-    if (!connection || connection.connectionEpoch !== entry.connection.connectionEpoch)
-      return {
-        ...entry.row,
-        state: 'BLOCKED',
-        reason: 'INSPECTION_CONNECTION_CHANGED',
-        account: unknown(),
-        avatarObservation: null,
-        nameObservation: null,
-      };
+    const conn = this.port.connection(profileId);
+    if (!conn || conn.connectionEpoch !== entry.connection.connectionEpoch)
+      return makeResetRow(entry.row, 'BLOCKED', 'INSPECTION_CONNECTION_CHANGED');
     if (entry.cancelled || this.closing)
-      return {
-        ...entry.row,
-        state: 'BLOCKED',
-        reason: 'INSPECTION_CANCELLED',
-        account: unknown(),
-        avatarObservation: null,
-        nameObservation: null,
-      };
+      return makeResetRow(entry.row, 'BLOCKED', 'INSPECTION_CANCELLED');
     const checkedAt = entry.row.checkedAt;
     const now = this.now();
     if (
@@ -140,23 +176,15 @@ export class ProfileInspectionService {
       checkedAt !== null &&
       (now < checkedAt || now - checkedAt >= 30_000)
     ) {
-      entry.row = {
-        ...entry.row,
-        state: 'BLOCKED',
-        reason: 'INSPECTION_EXPIRED',
-        account: unknown(),
-        avatarObservation: null,
-        nameObservation: null,
-      };
+      entry.row = makeResetRow(entry.row, 'BLOCKED', 'INSPECTION_EXPIRED');
     }
     return structuredClone(entry.row);
   }
+
   account(profileId: string) {
     const row = this.get(profileId);
     if (row?.state === 'OBSERVED') return row.account;
     const entry = this.entries.get(profileId);
-    // Preserve labels during this connection after the status expires; the old account ID
-    // and login assertion are withdrawn. Disconnect/change/failure/cancel withdraw everything.
     return row &&
       (['INSPECTION_EXPIRED', 'INSPECTION_DOCUMENT_NOT_READY'].includes(row.reason) ||
         ['QUEUED', 'READING'].includes(row.state)) &&
@@ -166,23 +194,26 @@ export class ProfileInspectionService {
       ? { ...unknown(), ...entry.display }
       : unknown();
   }
+
   observeConnections(profileIds: string[]) {
     if (this.closing) return;
-    const ready = new Set(profileIds);
     for (const id of this.observedConnections.keys())
       if (!this.port.connection(id)) this.observedConnections.delete(id);
     const requests: string[] = [];
-    for (const id of ready) {
-      const connection = this.port.connection(id);
-      if (!connection) continue;
-      const sameConnection = this.observedConnections.get(id) === connection.connectionEpoch;
-      if (sameConnection && this.now() < (this.nextAutomaticRead.get(id) ?? Infinity)) continue;
-      this.observedConnections.set(id, connection.connectionEpoch);
+    for (const id of new Set(profileIds)) {
+      const conn = this.port.connection(id);
+      if (!conn) continue;
+      if (
+        this.observedConnections.get(id) === conn.connectionEpoch &&
+        this.now() < (this.nextAutomaticRead.get(id) ?? Infinity)
+      )
+        continue;
+      this.observedConnections.set(id, conn.connectionEpoch);
       const existing = this.entries.get(id);
       if (
         existing &&
         !existing.cancelled &&
-        existing.connection.connectionEpoch === connection.connectionEpoch
+        existing.connection.connectionEpoch === conn.connectionEpoch
       ) {
         if (
           (existing.row.state === 'FAILED' &&
@@ -202,14 +233,8 @@ export class ProfileInspectionService {
           this.nextAutomaticRead.set(id, existing.row.checkedAt + 120000);
           continue;
         }
+        if (['QUEUED', 'READING'].includes(existing.row.state)) continue;
       }
-      if (
-        existing &&
-        !existing.cancelled &&
-        existing.connection.connectionEpoch === connection.connectionEpoch &&
-        ['QUEUED', 'READING'].includes(existing.row.state)
-      )
-        continue;
       requests.push(id);
       this.nextAutomaticRead.set(
         id,
@@ -218,17 +243,17 @@ export class ProfileInspectionService {
     }
     if (requests.length) this.request(requests);
   }
+
   request(profileIds: string[]): Inspection[] {
     if (this.closing) throw Error('INSPECTION_SERVICE_CLOSED');
     const results = [...new Set(profileIds)].map((profileId) => {
       const old = this.entries.get(profileId);
       if (old && !old.cancelled && ['QUEUED', 'READING'].includes(old.row.state)) {
-        const connection = this.port.connection(profileId);
-        if (connection?.connectionEpoch === old.connection.connectionEpoch)
+        if (this.port.connection(profileId)?.connectionEpoch === old.connection.connectionEpoch)
           return structuredClone(old.row);
         old.cancelled = true;
       }
-      if (this.activeProfiles.has(profileId))
+      if (this.activeProfiles.has(profileId)) {
         return ProfileInspection.parse({
           profileId,
           state: 'BLOCKED',
@@ -236,28 +261,26 @@ export class ProfileInspectionService {
           checkedAt: null,
           account: unknown(),
         });
-      const connection = this.port.connection(profileId);
+      }
+      const conn = this.port.connection(profileId);
       const row = ProfileInspection.parse({
         profileId,
-        state: connection ? 'QUEUED' : 'BLOCKED',
-        reason: connection ? '' : 'PROFILE_OFFLINE',
+        state: conn ? 'QUEUED' : 'BLOCKED',
+        reason: conn ? '' : 'PROFILE_OFFLINE',
         checkedAt: null,
         account: unknown(),
       });
-      if (connection) {
+      if (conn) {
         this.unavailable.delete(profileId);
+        const sameEpoch = Boolean(
+          old && !old.cancelled && old.connection.connectionEpoch === conn.connectionEpoch,
+        );
         const entry: Entry = {
-          connection,
+          connection: conn,
           row,
           cancelled: false,
-          lastAccountId:
-            old && !old.cancelled && old.connection.connectionEpoch === connection.connectionEpoch
-              ? (old.lastAccountId ?? old.row.account.id)
-              : null,
-          display:
-            old && !old.cancelled && old.connection.connectionEpoch === connection.connectionEpoch
-              ? { ...old.display }
-              : { name: null, avatar: null },
+          lastAccountId: sameEpoch && old ? (old.lastAccountId ?? old.row.account.id) : null,
+          display: sameEpoch && old ? { ...old.display } : { name: null, avatar: null },
         };
         this.entries.set(profileId, entry);
         this.queue.push(entry);
@@ -267,20 +290,14 @@ export class ProfileInspectionService {
     this.pump();
     return results;
   }
+
   invalidate(profileId: string) {
     const entry = this.entries.get(profileId);
-    if (entry) {
-      entry.cancelled = true;
-      entry.row = {
-        ...entry.row,
-        state: 'BLOCKED',
-        reason: 'INSPECTION_CANCELLED',
-        account: unknown(),
-        avatarObservation: null,
-        nameObservation: null,
-      };
-    }
+    if (!entry) return;
+    entry.cancelled = true;
+    entry.row = makeResetRow(entry.row, 'BLOCKED', 'INSPECTION_CANCELLED');
   }
+
   private pump() {
     while (!this.closing && this.active.size < 2 && this.queue.length) {
       const entry = this.queue.shift();
@@ -296,7 +313,9 @@ export class ProfileInspectionService {
       });
     }
   }
+
   private async run(entry: Entry) {
+    const profileId = entry.connection.profileId;
     try {
       this.current(entry);
       entry.row.state = 'READING';
@@ -329,7 +348,7 @@ export class ProfileInspectionService {
           ? await this.avatarLookup?.(observed.account.id)
           : null;
       this.current(entry);
-      const sameActorAsDisplay =
+      const sameActor =
         Boolean(observed.account.id) &&
         (!entry.lastAccountId || entry.lastAccountId === observed.account.id);
       const account = {
@@ -337,10 +356,7 @@ export class ProfileInspectionService {
         name: observed.account.name ?? (nativeName?.success ? nativeName.data : null),
         avatar:
           observed.account.state === 'logged-in'
-            ? (graphAvatar ??
-              avatar?.url ??
-              (sameActorAsDisplay ? entry.display.avatar : null) ??
-              null)
+            ? (graphAvatar ?? avatar?.url ?? (sameActor ? entry.display.avatar : null) ?? null)
             : null,
       };
       entry.lastAccountId = account.id;
@@ -351,7 +367,7 @@ export class ProfileInspectionService {
             ? { name: name?.name ?? account.name, avatar: avatar?.url ?? null }
             : { name: null, avatar: null };
       entry.row = ProfileInspection.parse({
-        profileId: entry.connection.profileId,
+        profileId,
         state: 'OBSERVED',
         reason: observed.reason,
         checkedAt: this.now(),
@@ -359,53 +375,27 @@ export class ProfileInspectionService {
         avatarObservation: observed.account.state === 'unknown' ? avatar : null,
         nameObservation: name,
       });
-      this.onObserved?.(entry.connection.profileId, {
+      this.onObserved?.(profileId, {
         state: account.state,
         id: account.id,
         name: entry.display.name,
         avatar: entry.display.avatar,
       });
-      this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 120000);
+      this.nextAutomaticRead.set(profileId, this.now() + 120000);
     } catch (error) {
-      if (this.entries.get(entry.connection.profileId) !== entry || entry.cancelled) return;
-      const msg = error instanceof Error ? error.message : '';
-      const abnormalState: 'verification' | 'restricted' | 'logged-out' | null =
-        msg === 'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED'
-          ? 'verification'
-          : msg === 'FACEBOOK_ACCOUNT_RESTRICTED'
-            ? 'restricted'
-            : msg === 'FACEBOOK_ACCOUNT_LOGGED_OUT'
-              ? 'logged-out'
-              : null;
-      if (abnormalState) {
-        const account = { state: abnormalState, id: null, name: null, avatar: null };
-        entry.display = { name: null, avatar: null };
-        entry.row = ProfileInspection.parse({
-          profileId: entry.connection.profileId,
-          state: 'OBSERVED',
-          reason: abnormalState === 'verification' ? 'CHECKPOINT_ROUTE' : 'VISIBLE_LOGIN_FORM',
-          checkedAt: this.now(),
-          account,
-          avatarObservation: null,
-          nameObservation: null,
-        });
-        this.onObserved?.(entry.connection.profileId, account);
-        this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 30_000);
+      if (this.entries.get(profileId) !== entry || entry.cancelled) return;
+      const abnormal = ABNORMAL_ERROR_MAP[error instanceof Error ? error.message : ''] ?? null;
+      if (abnormal) {
+        this.applyAbnormalState(profileId, entry, abnormal);
+        this.onObserved?.(profileId, entry.row.account);
         return;
       }
-      entry.row = {
-        ...entry.row,
-        state: 'FAILED',
-        account: unknown(),
-        avatarObservation: null,
-        nameObservation: null,
-        checkedAt: this.now(),
-        reason: failureReason(error),
-      };
+      entry.row = makeResetRow(entry.row, 'FAILED', failureReason(error), this.now());
       if (entry.row.reason === 'INSPECTION_DOCUMENT_NOT_READY')
-        this.nextAutomaticRead.set(entry.connection.profileId, this.now() + 15000);
+        this.nextAutomaticRead.set(profileId, this.now() + 15000);
     }
   }
+
   syncExternalObservation(
     profileId: string,
     account: {
@@ -418,10 +408,10 @@ export class ProfileInspectionService {
     if (this.closing) return;
     let entry = this.entries.get(profileId);
     if (!entry || entry.cancelled) {
-      const connection = this.port.connection(profileId);
-      if (!connection) return;
+      const conn = this.port.connection(profileId);
+      if (!conn) return;
       entry = {
-        connection,
+        connection: conn,
         cancelled: false,
         display: { name: account.name ?? null, avatar: account.avatar ?? null },
         row: ProfileInspection.parse({
@@ -436,15 +426,12 @@ export class ProfileInspectionService {
       };
       this.entries.set(profileId, entry);
     }
-    if (['logged-out', 'restricted', 'verification'].includes(account.state)) {
-      entry.display = { name: null, avatar: null };
-      entry.row = {
-        ...entry.row,
-        state: 'OBSERVED',
-        checkedAt: this.now(),
-        account: { state: account.state, id: null, name: null, avatar: null },
-      };
-      this.nextAutomaticRead.set(profileId, this.now() + 30_000);
+    if (
+      account.state === 'logged-out' ||
+      account.state === 'restricted' ||
+      account.state === 'verification'
+    ) {
+      this.applyAbnormalState(profileId, entry, account.state);
       return;
     }
     if (account.state === 'logged-in') {
@@ -459,15 +446,11 @@ export class ProfileInspectionService {
         ...entry.row,
         state: 'OBSERVED',
         checkedAt: this.now(),
-        account: {
-          state: 'logged-in',
-          id: nextId,
-          name: nextName,
-          avatar: nextAvatar,
-        },
+        account: { state: 'logged-in', id: nextId, name: nextName, avatar: nextAvatar },
       };
     }
   }
+
   async close() {
     this.closing = true;
     for (const entry of this.entries.values()) entry.cancelled = true;

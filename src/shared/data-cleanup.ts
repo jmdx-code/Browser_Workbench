@@ -1,68 +1,60 @@
 import { z } from 'zod';
-export const RecordCleanupScope = z
-  .object({
-    stepIds: z.array(z.uuid()).min(1).max(1000).optional(),
-    before: z.number().int().nonnegative().safe().optional(),
-    keepLatestRuns: z.number().int().min(0).max(100000).optional(),
-    profileId: z.uuid().optional(),
-  })
-  .strict()
-  .refine(
-    (v) => (v.stepIds !== undefined) !== (v.before !== undefined || v.keepLatestRuns !== undefined),
-    '请选择记录、截止日期或保留条数',
-  );
+import { Id, NonNegInt, intRange, strictObj } from './contracts.js';
+const millionCount = intRange(1, 1000000),
+  hundredKCount = intRange(1, 100000);
+export const RecordCleanupScope = strictObj({
+  stepIds: z.array(Id).min(1).max(1000).optional(),
+  before: NonNegInt.safe().optional(),
+  keepLatestRuns: intRange(0, 100000).optional(),
+  profileId: Id.optional(),
+}).refine(
+  (v) => (v.stepIds !== undefined) !== (v.before !== undefined || v.keepLatestRuns !== undefined),
+  '请选择记录、截止日期或保留条数',
+);
 export const CleanupSelection = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('records'), scope: RecordCleanupScope }).strict(),
-  z
-    .object({ kind: z.literal('logs'), before: z.number().int().nonnegative().safe().optional() })
-    .strict(),
+  strictObj({ kind: z.literal('records'), scope: RecordCleanupScope }),
+  strictObj({ kind: z.literal('logs'), before: NonNegInt.safe().optional() }),
 ]);
-export const CleanupPreview = z
-  .object({
-    token: z.uuid(),
-    kind: z.enum(['records', 'logs']),
-    eligible: z.number().int().nonnegative(),
-    protected: z.number().int().nonnegative(),
-    bytes: z.number().nonnegative(),
-    expiresAt: z.number(),
-  })
-  .strict();
-export const ExecuteCleanup = z.object({ token: z.uuid(), confirm: z.literal(true) }).strict();
-export const CleanupResult = z
-  .object({
-    deleted: z.number().int().nonnegative(),
-    bytes: z.number().nonnegative(),
-    protected: z.number().int().nonnegative(),
-  })
-  .strict();
-export const CleanupSettings = z
-  .object({
-    revision: z.number().int().nonnegative(),
-    historyRetentionDays: z.number().int().min(1).max(3650).nullable(),
-    historyMaxCount: z.number().int().min(1).max(100000).nullable().optional(),
-    bumperMaxCount: z.number().int().min(1).max(1000000).default(300000),
-    posterMaxCount: z.number().int().min(1).max(1000000).default(100000),
-    detailMaxCount: z.number().int().min(1).max(100000).default(1000),
-    automaticLogs: z.boolean(),
-    logRetentionDays: z.number().int().min(1).max(90),
-  })
-  .strict();
-export const SaveCleanupSettings = z
-  .object({
-    expectedRevision: z.number().int().nonnegative(),
-    historyRetentionDays: CleanupSettings.shape.historyRetentionDays,
-    historyMaxCount: CleanupSettings.shape.historyMaxCount,
-    bumperMaxCount: z.number().int().min(1).max(1000000).optional(),
-    posterMaxCount: z.number().int().min(1).max(1000000).optional(),
-    detailMaxCount: z.number().int().min(1).max(100000).optional(),
-    automaticLogs: z.boolean().default(false),
-  })
-  .strict();
-export const ResetWorkspace = z
-  .object({ confirmation: z.literal('确认重置'), acknowledgeUnknownResults: z.literal(true) })
-  .strict();
+export const CleanupPreview = strictObj({
+  token: Id,
+  kind: z.enum(['records', 'logs']),
+  eligible: NonNegInt,
+  protected: NonNegInt,
+  bytes: z.number().nonnegative(),
+  expiresAt: z.number(),
+});
+export const ExecuteCleanup = strictObj({ token: Id, confirm: z.literal(true) });
+export const CleanupResult = strictObj({
+  deleted: NonNegInt,
+  bytes: z.number().nonnegative(),
+  protected: NonNegInt,
+});
+export const CleanupSettings = strictObj({
+  revision: NonNegInt,
+  historyRetentionDays: intRange(1, 3650).nullable(),
+  historyMaxCount: hundredKCount.nullable().optional(),
+  bumperMaxCount: millionCount.default(300000),
+  posterMaxCount: millionCount.default(100000),
+  detailMaxCount: hundredKCount.default(1000),
+  automaticLogs: z.boolean(),
+  logRetentionDays: intRange(1, 90),
+});
+export const SaveCleanupSettings = strictObj({
+  expectedRevision: NonNegInt,
+  historyRetentionDays: CleanupSettings.shape.historyRetentionDays,
+  historyMaxCount: CleanupSettings.shape.historyMaxCount,
+  bumperMaxCount: millionCount.optional(),
+  posterMaxCount: millionCount.optional(),
+  detailMaxCount: hundredKCount.optional(),
+  automaticLogs: z.boolean().default(false),
+});
+export const ResetWorkspace = strictObj({
+  confirmation: z.literal('确认重置'),
+  acknowledgeUnknownResults: z.literal(true),
+});
 export type RecordCleanup = z.infer<typeof RecordCleanupScope>;
 export type CleanupConfiguration = z.infer<typeof CleanupSettings>;
-
-export const DetailBoundary = z.object({ at: z.number().finite(), key: z.string() }).strict();
+export const DetailBoundary = strictObj({ at: z.number().finite(), key: z.string() });
 export type DetailBoundaryValue = z.infer<typeof DetailBoundary>;
+/** A date input denotes the entire selected local calendar day. */
+export const cleanupDateEnd = (date: string): number => new Date(date + 'T23:59:59.999').getTime();

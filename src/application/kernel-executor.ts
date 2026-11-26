@@ -1,4 +1,10 @@
 import { KernelLease } from '../domain/kernel-lease.js';
+import { FacebookNativeIdentityRead } from '../shared/facebook-native-identity.js';
+import {
+  KernelOperationFileGrant,
+  assertFileGrantActionDigest,
+  type OperationFileGrant,
+} from '../shared/kernel-file-grant.js';
 import {
   assertKernelSessionCommand,
   isBenignScrollPreconditionError,
@@ -6,11 +12,6 @@ import {
   kernelRequiresOperation,
   type KernelAccess,
 } from '../shared/kernel-policy.js';
-import {
-  PageReadRequest,
-  validateProjection,
-  type PageProjectionRequest,
-} from '../shared/page-read.js';
 import type {
   KernelBackend,
   KernelJsonObject,
@@ -19,18 +20,20 @@ import type {
   KernelTargetInfo,
 } from '../shared/kernel-protocol.js';
 import {
-  KernelOperationFileGrant,
-  assertFileGrantActionDigest,
-  type OperationFileGrant,
-} from '../shared/kernel-file-grant.js';
+  PageReadRequest,
+  validateProjection,
+  type PageProjectionRequest,
+} from '../shared/page-read.js';
 import { sameBinding } from '../shared/task-execution.js';
-import { FacebookNativeIdentityRead } from '../shared/facebook-native-identity.js';
 
 export type KernelStopEvidence = {
   requestId: string;
   state: 'stopped' | 'unconfirmed';
   unresolvedMethods: string[];
 };
+
+const isRuntimeEval = (method: string) => /^Runtime\.(evaluate|callFunctionOn)$/.test(method);
+
 export class KernelExecutor {
   private readonly owned = new Set<number>();
   private readonly attached = new Set<number>();
@@ -49,6 +52,7 @@ export class KernelExecutor {
   private stopOperation:
     { id: string; retained: boolean; promise: Promise<KernelStopEvidence> } | undefined;
   private retainedStop: KernelStopEvidence | undefined;
+
   constructor(
     readonly lease: KernelLease,
     private readonly backend: KernelBackend,
@@ -61,6 +65,7 @@ export class KernelExecutor {
       this.owned.add(tabId);
     }
   }
+
   grant(stamp: unknown): KernelStamp {
     if (this.phase === 'stopping' || this.phase === 'unconfirmed')
       throw Error('KERNEL_STOP_NOT_CONFIRMED');
@@ -70,23 +75,51 @@ export class KernelExecutor {
     this.phase = 'running';
     return accepted;
   }
+
   private check(expected?: KernelStamp): KernelStamp {
     if (this.phase !== 'running') throw Error('KERNEL_FENCED');
     return this.lease.check(expected);
   }
+
+  private hasTarget(source: KernelTarget): boolean {
+    return (
+      this.attached.has(source.tabId) &&
+      (!source.sessionId || this.children.has(`${source.tabId}:${source.sessionId}`))
+    );
+  }
+
+  private assertAttached(tabId: number): void {
+    if (!this.owned.has(tabId) || !this.attached.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
+  }
+
   private track<T>(operation: () => Promise<T>): Promise<T> {
     const promise = operation();
     this.pending.add(promise);
     void promise.finally(() => this.pending.delete(promise)).catch(() => {});
     return promise;
   }
+
+  private scoped<T>(
+    tabId: number,
+    stamp: KernelStamp,
+    run: () => Promise<T>,
+    opts?: { skipScope?: boolean; close?: boolean },
+  ): Promise<T> {
+    return this.track(async () => {
+      if (!opts?.skipScope) {
+        await (opts?.close && this.backend.scopeForClose
+          ? this.backend.scopeForClose(tabId)
+          : this.backend.scope(tabId));
+      }
+      this.check(stamp);
+      return run();
+    });
+  }
+
   async attach(tabId: number): Promise<KernelTargetInfo> {
     if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
     const stamp = this.check();
-    return this.track(async () => {
-      await this.backend.scope(tabId);
-      this.check(stamp);
-      // Track the attempt before awaiting: stop must also clean up a late attach or partial failure.
+    return this.scoped(tabId, stamp, async () => {
       this.attached.add(tabId);
       try {
         const info = await this.backend.attach(tabId);
@@ -103,6 +136,7 @@ export class KernelExecutor {
       }
     });
   }
+
   async create(
     url: string,
     ownershipId?: string,
@@ -117,7 +151,6 @@ export class KernelExecutor {
         this.check(stamp);
         return tab;
       } catch (error) {
-        // A tab created after stop belongs to us; clean it up without touching user tabs.
         try {
           await this.backend.remove(tab.tabId);
           this.owned.delete(tab.tabId);
@@ -128,40 +161,44 @@ export class KernelExecutor {
       }
     });
   }
+
   async adopt(tabId: number): Promise<void> {
     const stamp = this.check();
     await this.backend.scope(tabId);
     this.check(stamp);
     this.owned.add(tabId);
   }
+
   async remove(tabId: number): Promise<void> {
     if (!this.owned.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
     if (this.operationFiles?.grant.proof.tabId === tabId) this.revokeFiles();
     const stamp = this.check();
-    return this.track(async () => {
-      if (this.backend.scopeForClose) await this.backend.scopeForClose(tabId);
-      else await this.backend.scope(tabId);
-      this.check(stamp);
-      await this.backend.remove(tabId);
-      this.owned.delete(tabId);
-      this.attached.delete(tabId);
-      this.targetIds.delete(tabId);
-      this.check(stamp);
-    });
+    return this.scoped(
+      tabId,
+      stamp,
+      async () => {
+        await this.backend.remove(tabId);
+        this.owned.delete(tabId);
+        this.attached.delete(tabId);
+        this.targetIds.delete(tabId);
+        this.check(stamp);
+      },
+      { close: true },
+    );
   }
+
   async send(
     target: KernelTarget,
     method: string,
     params: KernelJsonObject,
   ): Promise<KernelJsonObject> {
-    if (!this.owned.has(target.tabId) || !this.attached.has(target.tabId))
-      throw Error('KERNEL_TAB_NOT_OWNED');
+    this.assertAttached(target.tabId);
     if (target.sessionId && !this.children.has(`${target.tabId}:${target.sessionId}`))
       throw Error('KERNEL_CHILD_NOT_OWNED');
-    if (kernelRequiresOperation(method, this.access) && this.fileGrantPending)
-      throw Error('KERNEL_FILE_GRANT_IN_FLIGHT');
-    const fileRecord = this.operationFiles,
-      fileRevision = this.fileGrantRevision;
+    const needsOp = kernelRequiresOperation(method, this.access);
+    if (needsOp && this.fileGrantPending) throw Error('KERNEL_FILE_GRANT_IN_FLIGHT');
+    const fileRecord = this.operationFiles;
+    const fileRevision = this.fileGrantRevision;
     const approved = assertKernelSessionCommand(
       method,
       params,
@@ -171,51 +208,54 @@ export class KernelExecutor {
     if (method === 'DOM.setFileInputFiles')
       this.assertFileCommand(target, approved, fileRecord, fileRevision);
     const stamp = this.check();
-    const input = kernelRequiresOperation(method, this.access);
-    if (input) this.nativeInputsPending++;
+    if (needsOp) this.nativeInputsPending++;
     try {
-      return await this.track(async () => {
-        if (!this.backend.scopeEnforcedBySend) await this.backend.scope(target.tabId);
-        this.check(stamp);
-        if (method === 'DOM.setFileInputFiles')
-          this.assertFileCommand(target, approved, fileRecord, fileRevision);
-        let dispatched = false;
-        const id = Symbol();
-        try {
-          dispatched = true;
-          this.inFlightMethods.set(id, method);
-          const result = await this.backend.send(target, method, approved);
-          this.check(stamp);
-          return result;
-        } catch (error) {
-          // Protocol ACKs are not business verification. Preserve uncertain in-flight inputs.
-          let fenced = false;
+      return await this.scoped(
+        target.tabId,
+        stamp,
+        async () => {
+          if (method === 'DOM.setFileInputFiles')
+            this.assertFileCommand(target, approved, fileRecord, fileRevision);
+          let dispatched = false;
+          const id = Symbol();
           try {
+            dispatched = true;
+            this.inFlightMethods.set(id, method);
+            const result = await this.backend.send(target, method, approved);
             this.check(stamp);
-          } catch {
-            fenced = true;
+            return result;
+          } catch (error) {
+            let fenced = false;
+            try {
+              this.check(stamp);
+            } catch {
+              fenced = true;
+            }
+            if (
+              dispatched &&
+              !isBenignScrollPreconditionError(method, error, fenced) &&
+              (needsOp ||
+                (isRuntimeEval(method) &&
+                  (fenced || (error instanceof Error && error.message.includes('_UNKNOWN')))))
+            ) {
+              this.unresolved.add(method);
+            }
+            throw error;
+          } finally {
+            this.inFlightMethods.delete(id);
           }
-          if (
-            dispatched &&
-            !isBenignScrollPreconditionError(method, error, fenced) &&
-            (kernelRequiresOperation(method, this.access) ||
-              (/^Runtime\.(evaluate|callFunctionOn)$/.test(method) &&
-                (fenced || (error instanceof Error && error.message.includes('_UNKNOWN')))))
-          )
-            this.unresolved.add(method);
-          throw error;
-        } finally {
-          this.inFlightMethods.delete(id);
-        }
-      });
+        },
+        { skipScope: this.backend.scopeEnforcedBySend },
+      );
     } finally {
-      if (input) this.nativeInputsPending--;
+      if (needsOp) this.nativeInputsPending--;
     }
   }
+
   async grantFiles(value: OperationFileGrant, assertCurrent: () => void): Promise<void> {
-    const grant = KernelOperationFileGrant.parse(value),
-      stamp = this.check(),
-      revision = this.fileGrantRevision;
+    const grant = KernelOperationFileGrant.parse(value);
+    const stamp = this.check();
+    const revision = this.fileGrantRevision;
     if (this.access === 'facebook-readonly') throw Error('KERNEL_READONLY_FILES_REJECTED');
     if (this.fileGrantPending || this.nativeInputsPending)
       throw Error('KERNEL_FILE_GRANT_IN_FLIGHT');
@@ -240,8 +280,9 @@ export class KernelExecutor {
       !this.owned.has(grant.proof.tabId) ||
       !this.attached.has(grant.proof.tabId) ||
       this.targetIds.get(grant.proof.tabId) !== grant.proof.targetId
-    )
+    ) {
       throw Error('KERNEL_FILE_GRANT_CONTEXT_MISMATCH');
+    }
     this.fileGrantPending = true;
     try {
       await this.track(async () => {
@@ -256,18 +297,21 @@ export class KernelExecutor {
           this.operationFiles !== previous ||
           !this.attached.has(grant.proof.tabId) ||
           this.targetIds.get(grant.proof.tabId) !== grant.proof.targetId
-        )
+        ) {
           throw Error('KERNEL_FILE_GRANT_REVOKED');
+        }
         this.operationFiles = { grant, assertCurrent, active: true };
       });
     } finally {
       this.fileGrantPending = false;
     }
   }
+
   revokeFiles(): void {
     this.fileGrantRevision++;
     if (this.operationFiles) this.operationFiles.active = false;
   }
+
   private assertFileCommand(
     target: KernelTarget,
     params: KernelJsonObject,
@@ -278,80 +322,76 @@ export class KernelExecutor {
       this.fileGrantPending ||
       revision !== this.fileGrantRevision ||
       this.operationFiles !== expected
-    )
+    ) {
       throw Error('KERNEL_FILE_GRANT_REVOKED');
-    if (!expected) return; // Initial fixed fixture files remain a separate historical diagnostic path.
+    }
+    if (!expected) return;
     if (!expected.active) throw Error('KERNEL_FILE_GRANT_REVOKED');
     expected.assertCurrent();
     if (
       target.tabId !== expected.grant.proof.tabId ||
       JSON.stringify(params.files) !== JSON.stringify(expected.grant.files)
-    )
+    ) {
       throw Error('KERNEL_FILE_GRANT_FILES_MISMATCH');
+    }
   }
+
   async project(tabId: number, input: PageProjectionRequest) {
     if (this.access !== 'facebook-readonly' || !this.backend.project)
       throw Error('KERNEL_PROJECTION_UNAVAILABLE');
-    if (!this.owned.has(tabId) || !this.attached.has(tabId)) throw Error('KERNEL_TAB_NOT_OWNED');
+    this.assertAttached(tabId);
     const request = PageReadRequest.parse(input);
     const project = this.backend.project.bind(this.backend);
     const stamp = this.check();
-    return this.track(async () => {
-      await this.backend.scope(tabId);
-      this.check(stamp);
+    return this.scoped(tabId, stamp, async () => {
       const result = validateProjection(request, await project(tabId, request));
       this.check(stamp);
       if (!kernelAccessURL(result.url, this.access)) throw Error('KERNEL_SCOPE_CHANGED');
       return result;
     });
   }
+
   async observeFacebookIdentity(tabId: number) {
     if (
       this.access !== 'facebook-readonly' ||
       !this.owned.has(tabId) ||
       !this.attached.has(tabId) ||
       !this.backend.observeIdentity
-    )
+    ) {
       throw Error('KERNEL_IDENTITY_READ_UNAVAILABLE');
+    }
     const stamp = this.check();
-    return this.track(async () => {
-      await this.backend.scope(tabId);
-      this.check(stamp);
-      const result = await this.backend.observeIdentity?.(tabId, () => {
-        this.check(stamp);
-      });
+    return this.scoped(tabId, stamp, async () => {
+      const result = await this.backend.observeIdentity?.(tabId, () => this.check(stamp));
       this.check(stamp);
       return result ? FacebookNativeIdentityRead.parse(result) : null;
     });
   }
+
   registerChild(source: KernelTarget, child: string): boolean {
     try {
       this.check();
-      if (
-        !this.attached.has(source.tabId) ||
-        (source.sessionId && !this.children.has(`${source.tabId}:${source.sessionId}`))
-      )
-        return false;
+      if (!this.hasTarget(source)) return false;
       this.children.add(`${source.tabId}:${child}`);
       return true;
     } catch {
       return false;
     }
   }
+
   forgetChild(tabId: number, child: string): void {
     this.children.delete(`${tabId}:${child}`);
   }
+
   acceptsEvent(source: KernelTarget): boolean {
     try {
       this.check();
-      return (
-        this.attached.has(source.tabId) &&
-        (!source.sessionId || this.children.has(`${source.tabId}:${source.sessionId}`))
-      );
+      return this.hasTarget(source);
     } catch {
       return false;
     }
   }
+
   private async detach(tabId: number): Promise<void> {
     if (this.operationFiles?.grant.proof.tabId === tabId) this.revokeFiles();
     try {
@@ -363,6 +403,7 @@ export class KernelExecutor {
       this.cleanupFailures.add(tabId);
     }
   }
+
   markUnconfirmed(reasonMethod?: string): void {
     this.revokeFiles();
     this.lease.revoke();
@@ -370,12 +411,15 @@ export class KernelExecutor {
     this.retainedStop = undefined;
     if (reasonMethod) this.unresolved.add(reasonMethod);
   }
+
   fence(): void {
     this.markUnconfirmed();
   }
+
   async forceDetachAll(): Promise<void> {
     await Promise.all([...this.attached].map((tabId) => this.detach(tabId)));
   }
+
   stop(
     requestId: string,
     timeoutMs = 12_000,
@@ -383,7 +427,7 @@ export class KernelExecutor {
   ): Promise<KernelStopEvidence> {
     if (retainAttachments && this.retainedStop?.requestId === requestId)
       return Promise.resolve(this.retainedStop);
-    this.lease.revoke(); // Synchronous fence on the very first line of stop().
+    this.lease.revoke();
     if (this.stopOperation) {
       if (this.stopOperation.id !== requestId) throw Error('KERNEL_CONTROL_PENDING');
       if (this.stopOperation.retained !== retainAttachments)
@@ -399,11 +443,11 @@ export class KernelExecutor {
       const detached = retainAttachments
         ? Promise.resolve()
         : Promise.all([...this.attached].map((tabId) => this.detach(tabId)));
-      const drain = Promise.allSettled([...this.pending]);
       const finished = await Promise.race([
-        Promise.all([detached, drain]).then(() => true),
+        Promise.all([detached, Promise.allSettled([...this.pending])]).then(() => true),
         new Promise<false>((resolve) => {
           timer = setTimeout(() => resolve(false), timeoutMs);
+          timer.unref?.();
         }),
       ]);
       if (timer) clearTimeout(timer);
@@ -417,9 +461,7 @@ export class KernelExecutor {
           ...new Set([
             ...this.unresolved,
             ...[...this.inFlightMethods.values()].filter(
-              (method) =>
-                kernelRequiresOperation(method, this.access) ||
-                /^Runtime\.(evaluate|callFunctionOn)$/.test(method),
+              (m) => kernelRequiresOperation(m, this.access) || isRuntimeEval(m),
             ),
             ...(this.cleanupFailures.size > 0 ? ['chrome.debugger.detach'] : []),
           ]),
@@ -429,13 +471,10 @@ export class KernelExecutor {
       return evidence;
     })();
     this.stopOperation = { id: requestId, retained: retainAttachments, promise };
-    void promise
-      .finally(() => {
-        this.stopOperation = undefined;
-      })
-      .catch(() => {});
+    void promise.finally(() => (this.stopOperation = undefined)).catch(() => {});
     return promise;
   }
+
   get state(): string {
     return this.phase;
   }

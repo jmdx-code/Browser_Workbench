@@ -1,12 +1,10 @@
 import type { Page } from 'playwright-core';
-
 export interface BumperReactionRead {
   state: 'active' | 'none' | 'unknown';
   reactionId?: string;
   feedbackId?: string;
   queryName?: string;
 }
-
 // Self-contained page projection: issue one existing native query, without
 // publishing into Relay's optimistic store or changing any browser page.
 export async function projectBumperReactionRead(scope: {
@@ -201,7 +199,6 @@ export async function projectBumperReactionRead(scope: {
     }
   });
 }
-
 export async function readBumperReactionFromServer(
   page: Page,
   scope: Parameters<typeof projectBumperReactionRead>[0],

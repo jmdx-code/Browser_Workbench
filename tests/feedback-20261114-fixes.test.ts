@@ -253,7 +253,7 @@ describe('Feedback 20261114-200204 Root-Cause Fixes', () => {
       hasFixtureKernelOwner: () => false,
       stop: async () => ({ accepted: true, requestId: randomUUID(), state: 'STOPPING' }),
     } as unknown as Core;
-    const bridge = new KernelBridge(coreStub, { busy: () => false } as never);
+    const bridge = new KernelBridge(coreStub);
     const fakeSession = {
       peer,
       owner: 'owner-1',
@@ -407,10 +407,7 @@ describe('Feedback 20261114-200204 Root-Cause Fixes', () => {
     );
 
     // navigateRetainedPageHome rethrows closed-page errors immediately instead of spinning 15s
-    const bridge = new KernelBridge(
-      { peers: new Map() } as unknown as Core,
-      { busy: () => false } as never,
-    );
+    const bridge = new KernelBridge({ peers: new Map() } as unknown as Core);
     const closedPage = {
       url: () => 'https://www.facebook.com/groups/111/',
       off: () => {},

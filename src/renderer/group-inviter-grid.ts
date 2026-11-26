@@ -24,19 +24,6 @@ function groupPair(line: string, normalizeId = extractGroupId): [string, string]
   return null;
 }
 
-export function isGroupGridPaste(
-  text: string,
-  column: 0 | 1,
-  normalizeId = extractGroupId,
-): boolean {
-  return (
-    /[\r\n\t]/.test(text) ||
-    text.trim().startsWith('"') ||
-    !!groupPair(text, normalizeId) ||
-    (column === 0 && normalizeId(text) !== text.trim())
-  );
-}
-
 export function parseGroupClipboard(text: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [],

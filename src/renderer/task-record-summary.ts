@@ -3,17 +3,35 @@ import { endedTask } from '../domain/task-run-records.js';
 import { taskReasonDescription } from './task-alerts.js';
 import { isMarketplaceUnavailableSkip } from '../shared/task-step-outcome.js';
 
-type Step = Pick<TaskRecord, 'type' | 'destination' | 'status' | 'progress' | 'budget' | 'outcome'>;
-export const stepName = (step: Pick<Step, 'type' | 'destination'>) =>
+type Step = Pick<
+  TaskRecord,
+  | 'type'
+  | 'destination'
+  | 'friendAction'
+  | 'feedMode'
+  | 'status'
+  | 'progress'
+  | 'budget'
+  | 'outcome'
+>;
+export const stepName = (step: Pick<Step, 'type' | 'destination' | 'friendAction' | 'feedMode'>) =>
   step.destination === 'story'
     ? '发布快拍'
-    : {
-        feed: '浏览首页',
-        video: '浏览 Reels',
-        marketplace: '浏览商城',
-        post: '发布内容',
-        friends: '接受好友',
-      }[step.type];
+    : step.type === 'friends' && step.friendAction === 'add_suggested'
+      ? '加推荐好友'
+      : step.type === 'feed' && step.feedMode === 'random_profile'
+        ? '逛他人时间线'
+        : step.type === 'feed' && step.feedMode === 'random_page'
+          ? '逛公共专页'
+          : step.type === 'feed' && step.feedMode === 'search_pages'
+            ? '搜专页逛时间线'
+            : {
+                feed: '浏览首页',
+                video: '浏览 Reels',
+                marketplace: '浏览商城',
+                post: '发布内容',
+                friends: '接受好友',
+              }[step.type];
 const minutes = (ms: number) => `${Number((ms / 60000).toFixed(1))}m`;
 export function stepResultLabel(step: Step & { planState?: string }): string {
   const name = stepName(step);

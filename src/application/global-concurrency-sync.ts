@@ -4,8 +4,10 @@ import type { GroupBumperService } from './group-bumper-service.js';
 import type { GroupInviterService } from './group-inviter-service.js';
 import type { GroupPosterService } from './group-poster-service.js';
 import type { TaskService } from './task-service.js';
+import type { Workboard } from './workboard.js';
 
 export interface GlobalConcurrencyTargets {
+  workboard?: Workboard | undefined;
   tasks?: TaskService | undefined;
   groupBumper?: GroupBumperService | undefined;
   groupPoster?: GroupPosterService | undefined;
@@ -14,44 +16,33 @@ export interface GlobalConcurrencyTargets {
   googleSheets?: GoogleSheetsService | undefined;
 }
 
+const clamp = (n: number, max: number) => Math.max(1, Math.min(max, Math.round(n)));
+
 export async function syncGlobalConcurrencyToModules(
   next: { browserConcurrency: number; bluestacksConcurrency: number },
   targets: GlobalConcurrencyTargets,
 ): Promise<void> {
-  const browserCapForTasks = Math.max(1, Math.min(100, Math.round(next.browserConcurrency)));
-  const browserCapForFeatures = Math.max(1, Math.min(50, Math.round(next.browserConcurrency)));
-  const bluestacksCap = Math.max(1, Math.min(50, Math.round(next.bluestacksConcurrency)));
+  const browserTasks = clamp(next.browserConcurrency, 100);
+  const browserFeatures = clamp(next.browserConcurrency, 50);
+  const bsCap = clamp(next.bluestacksConcurrency, 50);
 
-  targets.googleSheets?.syncMaxConcurrency(browserCapForTasks, bluestacksCap);
+  targets.workboard?.browserPermits.setLimit(browserTasks);
+  targets.workboard?.bluestacksPermits.setLimit(bsCap);
+  targets.googleSheets?.syncMaxConcurrency(browserTasks, bsCap);
 
   await Promise.allSettled([
-    (async () => {
-      if (!targets.tasks) return;
-      const cur = await targets.tasks.settings();
-      if (cur.maxConcurrentProfiles !== browserCapForTasks) {
-        await targets.tasks.setSettings({ maxConcurrentProfiles: browserCapForTasks });
-      }
-    })(),
-    (async () => {
-      if (!targets.groupBumper) return;
-      await targets.groupBumper.syncMaxConcurrency(browserCapForFeatures);
-    })(),
-    (async () => {
-      if (!targets.groupPoster) return;
-      await targets.groupPoster.syncMaxConcurrency(browserCapForFeatures);
-    })(),
-    (async () => {
-      if (!targets.groupInviter) return;
-      const st = await targets.groupInviter.state();
-      if (st.maxConcurrentProfiles !== browserCapForFeatures) {
-        await targets.groupInviter.updateSettings({
-          maxConcurrentProfiles: browserCapForFeatures,
-        });
-      }
-    })(),
-    (async () => {
-      if (!targets.bluestacks) return;
-      await targets.bluestacks.syncMaxConcurrency(bluestacksCap);
-    })(),
+    targets.tasks &&
+      targets.tasks.settings().then((cur) => {
+        if (cur.maxConcurrentProfiles !== browserTasks)
+          return targets.tasks?.setSettings({ maxConcurrentProfiles: browserTasks });
+      }),
+    targets.groupBumper?.syncMaxConcurrency(browserFeatures),
+    targets.groupPoster?.syncMaxConcurrency(browserFeatures),
+    targets.groupInviter &&
+      targets.groupInviter.state().then((st) => {
+        if (st.maxConcurrentProfiles !== browserFeatures)
+          return targets.groupInviter?.updateSettings({ maxConcurrentProfiles: browserFeatures });
+      }),
+    targets.bluestacks?.syncMaxConcurrency(bsCap),
   ]);
 }

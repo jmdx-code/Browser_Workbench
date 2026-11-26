@@ -1,413 +1,134 @@
-import { ensurePosterUsage, ensureRecordAvatars } from './record-retention-migration.js';
-import { recordAvatarURL, saveRecordAvatar } from './record-avatar-store.js';
-import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
+import type { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
+import { mediaReference } from '../domain/resource-table.js';
+import {
+  BumperIdsInput,
+  BumperTargetsInput,
+  isLocalAvatar,
+  type BumperDailyStat,
+  type BumperTarget,
+} from '../shared/group-bumper.js';
+import * as GP from '../shared/group-poster.js';
+import { sameBinding, type Binding } from '../shared/task-execution.js';
+import * as Q from './persistence/sqlite-query-helpers.js';
+import {
+  ensurePostBumpRecordsSchema,
+  syncPosterLogToPostBumpRecords,
+} from './post-bump-records-store.js';
+import { recordAvatarURL, saveRecordAvatar } from './record-avatar-store.js';
 import { transaction } from './sqlite-transaction.js';
 import {
   ensureTargetLibrarySchema,
   SqliteTargetLibraryRepository,
 } from './target-library-store.js';
-import { ensureTargetColumns } from './target-list-store.js';
-import { migrateGroupInviterSchema } from './group-inviter-store.js';
-import {
-  ensureGroupBumperDecouplingSchema,
-  migrateBumperSettingsDefault50,
-} from './group-bumper-store.js';
-import { mediaReference } from '../domain/resource-table.js';
-import { sameBinding, type Binding } from '../shared/task-execution.js';
-import { ProfileTaskResult } from '../shared/task-contracts.js';
-import {
-  BumperTargetsInput,
-  BumperIdsInput,
-  isLocalAvatar,
-  type BumperDailyStat,
-  type BumperTarget,
-} from '../shared/group-bumper.js';
-import {
-  PosterActionKind,
-  PosterOperationStatus,
-  PosterSettings,
-  PosterMaterialsInput,
-  PosterMaterialIdsInput,
-  PosterToggleMaterialsInput,
-  type PosterCacheStatus,
-  type PosterLog,
-  type PosterMaterial,
-  type PosterMaterialAiLabel,
-  type PosterMaterialBackground,
-  type PosterMediaKind,
-  type PosterOperationRecord,
-  type PosterOperationResolution,
-  type PosterPendingOperation,
-  type PosterTask,
-  type PosterTaskAccountMode,
-  type PosterTaskStatus,
-} from '../shared/group-poster.js';
-
-function formatLocalYmd(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
-function ensurePosterMaterialColumns(db: DatabaseSync): void {
-  const cols = new Set(
-    db
-      .prepare('PRAGMA table_info(group_poster_materials)')
-      .all()
-      .map((c) => String(c.name)),
-  );
-  if (!cols.has('background')) {
-    db.exec(
-      "ALTER TABLE group_poster_materials ADD COLUMN background TEXT NOT NULL DEFAULT 'plain'",
-    );
-  }
-  if (!cols.has('last_used_at')) {
-    db.exec('ALTER TABLE group_poster_materials ADD COLUMN last_used_at INTEGER DEFAULT NULL');
-  }
-  if (!cols.has('thumbnail_data_url')) {
-    db.exec('ALTER TABLE group_poster_materials ADD COLUMN thumbnail_data_url TEXT DEFAULT NULL');
-  }
-  if (!cols.has('ai_label')) {
-    db.exec(
-      "ALTER TABLE group_poster_materials ADD COLUMN ai_label TEXT NOT NULL DEFAULT 'default'",
-    );
-  }
-}
-
-export const groupPosterMigration = `
-CREATE TABLE IF NOT EXISTS group_poster_materials(
-  id TEXT PRIMARY KEY,
-  caption TEXT NOT NULL,
-  media_source TEXT NOT NULL DEFAULT '',
-  background TEXT NOT NULL DEFAULT 'plain',
-  ai_label TEXT NOT NULL DEFAULT 'default',
-  local_file_path TEXT,
-  media_kind TEXT NOT NULL DEFAULT 'none',
-  cache_status TEXT NOT NULL DEFAULT 'ready',
-  cache_error TEXT,
-  selected INTEGER NOT NULL DEFAULT 1,
-  used_count INTEGER NOT NULL DEFAULT 0,
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  last_used_at INTEGER DEFAULT NULL,
-  thumbnail_data_url TEXT DEFAULT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_group_poster_materials_sort ON group_poster_materials(sort_order, created_at, id);
-CREATE TABLE IF NOT EXISTS group_poster_logs(
-  id TEXT PRIMARY KEY,
-  profile_id TEXT NOT NULL,
-  account_id TEXT NOT NULL,
-  account_name TEXT NOT NULL DEFAULT '',
-  account_avatar TEXT,
-  identity_type TEXT NOT NULL DEFAULT 'personal',
-  group_id TEXT NOT NULL,
-  group_name TEXT NOT NULL,
-  group_avatar TEXT,
-  material_id TEXT NOT NULL,
-  caption_preview TEXT NOT NULL DEFAULT '',
-  post_id TEXT NOT NULL,
-  post_url TEXT NOT NULL,
-  posted_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_group_poster_logs_group_material ON group_poster_logs(group_id, material_id);
-CREATE INDEX IF NOT EXISTS idx_group_poster_logs_profile_time ON group_poster_logs(profile_id, posted_at DESC);
-CREATE INDEX IF NOT EXISTS idx_group_poster_logs_posted_at ON group_poster_logs(posted_at DESC);
-CREATE TABLE IF NOT EXISTS group_poster_settings(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
-INSERT OR IGNORE INTO group_poster_settings(id, body) VALUES(1, '{}');
-CREATE TABLE IF NOT EXISTS group_poster_tasks(
-  id TEXT PRIMARY KEY,
-  material_id TEXT NOT NULL,
-  caption_preview TEXT NOT NULL DEFAULT '',
-  group_ids_json TEXT NOT NULL DEFAULT '[]',
-  account_mode TEXT NOT NULL DEFAULT 'selected' CHECK(account_mode IN ('selected', 'all_online')),
-  profile_ids_json TEXT NOT NULL DEFAULT '[]',
-  scheduled_at INTEGER DEFAULT NULL,
-  status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled')),
-  total_groups INTEGER NOT NULL DEFAULT 0,
-  posted_count INTEGER NOT NULL DEFAULT 0,
-  skipped_count INTEGER NOT NULL DEFAULT 0,
-  status_reason TEXT NOT NULL DEFAULT '',
-  created_at INTEGER NOT NULL,
-  started_at INTEGER DEFAULT NULL,
-  finished_at INTEGER DEFAULT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_group_poster_tasks_created_at
-  ON group_poster_tasks(created_at DESC);
-`;
 
 export const groupPosterOperationsMigration = `
-CREATE TABLE IF NOT EXISTS group_poster_operations(
-  operation_id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  profile_id TEXT NOT NULL,
-  account_id TEXT NOT NULL,
-  connection_epoch TEXT NOT NULL,
-  lease_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  job_id TEXT NOT NULL,
-  step_id TEXT NOT NULL,
-  action_digest TEXT NOT NULL,
-  action_kind TEXT NOT NULL CHECK(action_kind IN (
-    'setup_search_group',
-    'setup_open_group',
-    'setup_browse_group',
-    'setup_join_group',
-    'setup_dismiss_welcome',
-    'setup_open_composer',
-    'setup_fill_caption',
-    'setup_fill_composer',
-    'setup_upload_media',
-    'setup_wait_media_ready',
-    'submit_post'
-  )),
-  group_id TEXT NOT NULL,
-  group_name TEXT NOT NULL,
-  material_id TEXT DEFAULT NULL,
-  post_id TEXT DEFAULT NULL,
-  post_url TEXT DEFAULT NULL,
-  log_id TEXT DEFAULT NULL,
-  resolution_id TEXT DEFAULT NULL,
-  resolution_outcome TEXT CHECK(resolution_outcome IN ('VERIFIED', 'NOT_APPLIED', 'ENDED_UNKNOWN') OR resolution_outcome IS NULL),
-  evidence_digest TEXT DEFAULT NULL,
-  status TEXT NOT NULL CHECK(status IN ('PREPARED', 'VERIFIED', 'NOT_APPLIED', 'PENDING_REVIEW')),
-  kernel_settled INTEGER NOT NULL DEFAULT 0 CHECK(kernel_settled IN (0, 1)),
-  review_reason TEXT DEFAULT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_group_poster_operations_profile_settled
-  ON group_poster_operations(profile_id, kernel_settled);
-CREATE INDEX IF NOT EXISTS idx_group_poster_operations_group_material_status
-  ON group_poster_operations(group_id, material_id, status);
+CREATE TABLE IF NOT EXISTS group_poster_operations(operation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, profile_id TEXT NOT NULL, account_id TEXT NOT NULL, connection_epoch TEXT NOT NULL, lease_id TEXT NOT NULL, generation INTEGER NOT NULL, job_id TEXT NOT NULL, step_id TEXT NOT NULL, action_digest TEXT NOT NULL, action_kind TEXT NOT NULL CHECK(action_kind IN ('setup_search_group','setup_open_group','setup_browse_group','setup_join_group','setup_dismiss_welcome','setup_open_composer','setup_fill_caption','setup_fill_composer','setup_upload_media','setup_wait_media_ready','submit_post')), group_id TEXT NOT NULL, group_name TEXT NOT NULL, material_id TEXT DEFAULT NULL, post_id TEXT DEFAULT NULL, post_url TEXT DEFAULT NULL, log_id TEXT DEFAULT NULL, resolution_id TEXT DEFAULT NULL, resolution_outcome TEXT CHECK(resolution_outcome IN ('VERIFIED', 'NOT_APPLIED', 'ENDED_UNKNOWN') OR resolution_outcome IS NULL), evidence_digest TEXT DEFAULT NULL, status TEXT NOT NULL CHECK(status IN ('PREPARED', 'VERIFIED', 'NOT_APPLIED', 'PENDING_REVIEW')), kernel_settled INTEGER NOT NULL DEFAULT 0 CHECK(kernel_settled IN (0, 1)), review_reason TEXT DEFAULT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_group_poster_operations_profile_settled ON group_poster_operations(profile_id, kernel_settled);
+CREATE INDEX IF NOT EXISTS idx_group_poster_operations_group_material_status ON group_poster_operations(group_id, material_id, status);
 `;
 
-export function rebuildGroupPosterOperationsEpochTextMigration(db: DatabaseSync): void {
-  const hasTable = db
-    .prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'group_poster_operations'",
-    )
-    .get();
-  if (!hasTable) {
-    db.exec(groupPosterOperationsMigration);
-    return;
-  }
-  db.exec(`
-    DROP TABLE IF EXISTS group_poster_operations_next;
-    CREATE TABLE group_poster_operations_next(
-      operation_id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL,
-      profile_id TEXT NOT NULL,
-      account_id TEXT NOT NULL,
-      connection_epoch TEXT NOT NULL,
-      lease_id TEXT NOT NULL,
-      generation INTEGER NOT NULL,
-      job_id TEXT NOT NULL,
-      step_id TEXT NOT NULL,
-      action_digest TEXT NOT NULL,
-      action_kind TEXT NOT NULL CHECK(action_kind IN (
-        'setup_search_group',
-        'setup_open_group',
-        'setup_browse_group',
-        'setup_join_group',
-        'setup_dismiss_welcome',
-        'setup_open_composer',
-        'setup_fill_caption',
-        'setup_fill_composer',
-        'setup_upload_media',
-        'setup_wait_media_ready',
-        'submit_post'
-      )),
-      group_id TEXT NOT NULL,
-      group_name TEXT NOT NULL,
-      material_id TEXT DEFAULT NULL,
-      post_id TEXT DEFAULT NULL,
-      post_url TEXT DEFAULT NULL,
-      log_id TEXT DEFAULT NULL,
-      resolution_id TEXT DEFAULT NULL,
-      resolution_outcome TEXT CHECK(resolution_outcome IN ('VERIFIED', 'NOT_APPLIED', 'ENDED_UNKNOWN') OR resolution_outcome IS NULL),
-      evidence_digest TEXT DEFAULT NULL,
-      status TEXT NOT NULL CHECK(status IN ('PREPARED', 'VERIFIED', 'NOT_APPLIED', 'PENDING_REVIEW')),
-      kernel_settled INTEGER NOT NULL DEFAULT 0 CHECK(kernel_settled IN (0, 1)),
-      review_reason TEXT DEFAULT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-    INSERT INTO group_poster_operations_next(
-      operation_id, run_id, profile_id, account_id, connection_epoch, lease_id, generation,
-      job_id, step_id, action_digest, action_kind, group_id, group_name, material_id,
-      post_id, post_url, log_id, resolution_id, resolution_outcome, evidence_digest,
-      status, kernel_settled, review_reason, created_at, updated_at
-    )
-    SELECT
-      operation_id, run_id, profile_id, account_id, CAST(connection_epoch AS TEXT), lease_id, generation,
-      job_id, step_id, action_digest, action_kind, group_id, group_name, material_id,
-      post_id, post_url, log_id, resolution_id, resolution_outcome, evidence_digest,
-      status, kernel_settled, review_reason, created_at, updated_at
-    FROM group_poster_operations;
-    DROP TABLE group_poster_operations;
-    ALTER TABLE group_poster_operations_next RENAME TO group_poster_operations;
-    CREATE INDEX IF NOT EXISTS idx_group_poster_operations_profile_settled
-      ON group_poster_operations(profile_id, kernel_settled);
-    CREATE INDEX IF NOT EXISTS idx_group_poster_operations_group_material_status
-      ON group_poster_operations(group_id, material_id, status);
-  `);
-}
+const asMediaKind = (v: unknown): GP.PosterMediaKind =>
+  ['none', 'image', 'video'].includes(Q.s(v)) ? (Q.s(v) as GP.PosterMediaKind) : 'none';
 
-export function stage3OperationsAndDecouplingMigration(db: DatabaseSync): void {
-  migrateGroupInviterSchema(db);
-  migrateBumperSettingsDefault50(db);
-  ensureGroupBumperDecouplingSchema(db);
-  db.exec(groupPosterMigration);
-  db.exec(groupPosterOperationsMigration);
-  ensurePosterMaterialColumns(db);
-}
-
-export function stage4MediaAndPolishMigration(db: DatabaseSync): void {
+function initGroupPosterSchema(db: DatabaseSync): void {
   ensureTargetLibrarySchema(db);
-  ensureTargetColumns(db, 'shared_facebook_groups');
-  ensureTargetColumns(db, 'group_bumper_pages');
-  migrateGroupInviterSchema(db);
-  migrateBumperSettingsDefault50(db);
-  ensureGroupBumperDecouplingSchema(db);
-  db.exec(groupPosterMigration);
-  db.exec(groupPosterOperationsMigration);
-  ensurePosterMaterialColumns(db);
+  ensurePostBumpRecordsSchema(db);
+  Q.ensureRecordAvatarSchema(db);
+  Q.ensureProfileTaskResultsSchema(db);
   db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_invited_at
-      ON group_inviter_logs(invited_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_group_bumper_logs_bumped_at
-      ON group_bumper_logs(bumped_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_group_poster_logs_posted_at
-      ON group_poster_logs(posted_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_group_poster_materials_sort
-      ON group_poster_materials(sort_order, created_at, id);
+    CREATE TABLE IF NOT EXISTS group_poster_materials(id TEXT PRIMARY KEY, caption TEXT NOT NULL, media_source TEXT NOT NULL DEFAULT '', background TEXT NOT NULL DEFAULT 'plain', ai_label TEXT NOT NULL DEFAULT 'default', local_file_path TEXT, media_kind TEXT NOT NULL DEFAULT 'none', cache_status TEXT NOT NULL DEFAULT 'ready', cache_error TEXT, selected INTEGER NOT NULL DEFAULT 1, used_count INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER DEFAULT NULL, thumbnail_data_url TEXT DEFAULT NULL);
+    CREATE INDEX IF NOT EXISTS idx_group_poster_materials_sort ON group_poster_materials(sort_order, created_at, id);
+    CREATE TABLE IF NOT EXISTS group_poster_usage(log_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, group_id TEXT NOT NULL, material_id TEXT NOT NULL, posted_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS group_poster_usage_lookup ON group_poster_usage(group_id, material_id); CREATE INDEX IF NOT EXISTS group_poster_usage_day ON group_poster_usage(profile_id, posted_at);
+    CREATE TABLE IF NOT EXISTS group_poster_settings(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL); INSERT OR IGNORE INTO group_poster_settings(id, body) VALUES(1, '{}');
+    CREATE TABLE IF NOT EXISTS group_poster_tasks(id TEXT PRIMARY KEY, material_id TEXT NOT NULL, caption_preview TEXT NOT NULL DEFAULT '', group_ids_json TEXT NOT NULL DEFAULT '[]', account_mode TEXT NOT NULL DEFAULT 'selected' CHECK(account_mode IN ('selected', 'all_online')), profile_ids_json TEXT NOT NULL DEFAULT '[]', scheduled_at INTEGER DEFAULT NULL, status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled')), total_groups INTEGER NOT NULL DEFAULT 0, posted_count INTEGER NOT NULL DEFAULT 0, skipped_count INTEGER NOT NULL DEFAULT 0, status_reason TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, started_at INTEGER DEFAULT NULL, finished_at INTEGER DEFAULT NULL);
+    CREATE INDEX IF NOT EXISTS idx_group_poster_tasks_created_at ON group_poster_tasks(created_at DESC);
   `);
+  db.exec(groupPosterOperationsMigration);
+  const sql =
+    "UPDATE group_poster_tasks SET status = CASE WHEN posted_count > 0 THEN 'partial' ELSE 'cancelled' END, status_reason = CASE WHEN posted_count > 0 THEN '部分成功 · 软件重启前已发 ' || posted_count || '/' || total_groups || ' 组' ELSE '已停止 · 软件重启中断' END, finished_at = COALESCE(finished_at, ?) WHERE status = 'running'";
+  db.prepare(sql).run(Date.now());
+}
+
+function mapOperationRow(r: Record<string, unknown>): GP.PosterOperationRecord {
+  const ro =
+    r.resolution_outcome === 'VERIFIED' ||
+    r.resolution_outcome === 'NOT_APPLIED' ||
+    r.resolution_outcome === 'ENDED_UNKNOWN'
+      ? r.resolution_outcome
+      : undefined;
+  return {
+    binding: Q.rowBinding(r),
+    runId: Q.s(r.run_id),
+    actionKind: GP.PosterActionKind.parse(Q.s(r.action_kind)),
+    groupId: Q.s(r.group_id),
+    groupName: Q.s(r.group_name),
+    materialId: Q.sn(r.material_id) ?? undefined,
+    postId: Q.sn(r.post_id) ?? undefined,
+    postUrl: Q.sn(r.post_url) ?? undefined,
+    logId: Q.sn(r.log_id) ?? undefined,
+    resolution:
+      r.resolution_id != null && ro && r.evidence_digest != null
+        ? { id: Q.s(r.resolution_id), outcome: ro, evidenceDigest: Q.s(r.evidence_digest) }
+        : undefined,
+    status: GP.PosterOperationStatus.parse(Q.s(r.status)),
+    kernelSettled: Q.b(r.kernel_settled),
+    reviewReason: Q.sn(r.review_reason) ?? undefined,
+    createdAt: Q.n(r.created_at),
+    updatedAt: Q.n(r.updated_at),
+  };
+}
+
+function mapTaskRow(r: Record<string, unknown>): GP.PosterTask {
+  const st = Q.s(r.status, 'scheduled');
+  return {
+    ...(Q.camel(r) as Omit<GP.PosterTask, 'groupIds' | 'profileIds' | 'accountMode' | 'status'>),
+    groupIds: Q.parseJsonStringArray(r.group_ids_json),
+    profileIds: Q.parseJsonStringArray(r.profile_ids_json),
+    accountMode: (Q.s(r.account_mode, 'selected') === 'all_online'
+      ? 'all_online'
+      : 'selected') as GP.PosterTaskAccountMode,
+    status: (['scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled'].includes(st)
+      ? st
+      : 'scheduled') as GP.PosterTaskStatus,
+  };
 }
 
 export class SqliteGroupPosterRepository {
   private readonly targetLibrary: SqliteTargetLibraryRepository;
-
   constructor(private readonly db: DatabaseSync) {
-    ensureTargetLibrarySchema(this.db);
-    this.db.exec(groupPosterMigration);
-    this.db.exec(groupPosterOperationsMigration);
-    ensurePosterMaterialColumns(this.db);
-    ensurePosterUsage(db);
-    ensureRecordAvatars(db);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS profile_task_results(
-        profile_id TEXT PRIMARY KEY,
-        source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper','page-bumper','group-poster')),
-        run_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')),
-        reason TEXT NOT NULL,
-        finished_at INTEGER NOT NULL,
-        failed_steps INTEGER NOT NULL DEFAULT 0,
-        skipped_steps INTEGER NOT NULL DEFAULT 0
-      );
-    `);
-    this.db
-      .prepare(
-        `UPDATE group_poster_tasks
-            SET status = CASE WHEN posted_count > 0 THEN 'partial' ELSE 'cancelled' END,
-                status_reason = CASE
-                  WHEN posted_count > 0 THEN '部分成功 · 软件重启前已发 ' || posted_count || '/' || total_groups || ' 组'
-                  ELSE '已停止 · 软件重启中断'
-                END,
-                finished_at = COALESCE(finished_at, ?)
-          WHERE status = 'running'`,
-      )
-      .run(Date.now());
+    initGroupPosterSchema(this.db);
     this.targetLibrary = new SqliteTargetLibraryRepository(this.db);
   }
-
-  private mapOperationRow(r: Record<string, unknown>): PosterOperationRecord {
-    const actionKind = PosterActionKind.parse(String(r.action_kind));
-    const status = PosterOperationStatus.parse(String(r.status));
-    const resolutionOutcome =
-      r.resolution_outcome === 'VERIFIED' ||
-      r.resolution_outcome === 'NOT_APPLIED' ||
-      r.resolution_outcome === 'ENDED_UNKNOWN'
-        ? r.resolution_outcome
-        : undefined;
-    return {
-      binding: {
-        operationId: String(r.operation_id),
-        profileId: String(r.profile_id),
-        accountId: String(r.account_id),
-        connectionEpoch: String(r.connection_epoch),
-        leaseId: String(r.lease_id),
-        generation: Number(r.generation),
-        jobId: String(r.job_id),
-        stepId: String(r.step_id),
-        actionDigest: String(r.action_digest),
-      },
-      runId: String(r.run_id),
-      actionKind,
-      groupId: String(r.group_id),
-      groupName: String(r.group_name),
-      materialId: r.material_id == null ? undefined : String(r.material_id),
-      postId: r.post_id == null ? undefined : String(r.post_id),
-      postUrl: r.post_url == null ? undefined : String(r.post_url),
-      logId: r.log_id == null ? undefined : String(r.log_id),
-      resolution:
-        r.resolution_id != null && resolutionOutcome && r.evidence_digest != null
-          ? {
-              id: String(r.resolution_id),
-              outcome: resolutionOutcome,
-              evidenceDigest: String(r.evidence_digest),
-            }
-          : undefined,
-      status,
-      kernelSettled: Number(r.kernel_settled ?? 0) === 1,
-      reviewReason: r.review_reason == null ? undefined : String(r.review_reason),
-      createdAt: Number(r.created_at),
-      updatedAt: Number(r.updated_at),
-    };
+  getOperation(operationId: string): GP.PosterOperationRecord | null {
+    const r = Q.getRow(
+      this.db,
+      'SELECT * FROM group_poster_operations WHERE operation_id = ?',
+      operationId,
+    );
+    return r ? mapOperationRow(r) : null;
   }
-
-  getOperation(operationId: string): PosterOperationRecord | null {
-    const r = this.db
-      .prepare('SELECT * FROM group_poster_operations WHERE operation_id = ?')
-      .get(operationId) as Record<string, unknown> | undefined;
-    return r ? this.mapOperationRow(r) : null;
+  listOperationsByProfile(profileId: string, includeSettled = false): GP.PosterOperationRecord[] {
+    const sql = includeSettled
+      ? 'SELECT * FROM group_poster_operations WHERE profile_id = ? ORDER BY created_at ASC'
+      : 'SELECT * FROM group_poster_operations WHERE profile_id = ? AND kernel_settled = 0 ORDER BY created_at ASC';
+    return Q.allRows(this.db, sql, profileId).map(mapOperationRow);
   }
-
-  listOperationsByProfile(profileId: string, includeSettled = false): PosterOperationRecord[] {
-    const rows = (
-      includeSettled
-        ? this.db
-            .prepare(
-              'SELECT * FROM group_poster_operations WHERE profile_id = ? ORDER BY created_at ASC',
-            )
-            .all(profileId)
-        : this.db
-            .prepare(
-              'SELECT * FROM group_poster_operations WHERE profile_id = ? AND kernel_settled = 0 ORDER BY created_at ASC',
-            )
-            .all(profileId)
-    ) as Array<Record<string, unknown>>;
-    return rows.map((r) => this.mapOperationRow(r));
-  }
-
   prepareOperation(input: {
     binding: Binding;
     runId: string;
-    actionKind: PosterActionKind;
+    actionKind: GP.PosterActionKind;
     groupId: string;
     groupName: string;
     materialId?: string | undefined;
     postId?: string | undefined;
     postUrl?: string | undefined;
     logId?: string | undefined;
-  }): PosterOperationRecord {
-    const actionKind = PosterActionKind.parse(input.actionKind);
-    const b = input.binding;
+  }): GP.PosterOperationRecord {
+    const actionKind = GP.PosterActionKind.parse(input.actionKind),
+      b = input.binding;
     return transaction(this.db, () => {
       const existing = this.getOperation(b.operationId);
       if (existing) {
@@ -416,59 +137,31 @@ export class SqliteGroupPosterRepository {
           existing.actionKind !== actionKind ||
           existing.runId !== input.runId ||
           existing.groupId !== input.groupId
-        ) {
+        )
           throw Error('POSTER_OPERATION_CONTEXT_CHANGED');
-        }
         return existing;
       }
-      const now = Date.now();
-      this.db
-        .prepare(
-          `INSERT INTO group_poster_operations(
-             operation_id, run_id, profile_id, account_id, connection_epoch, lease_id, generation,
-             job_id, step_id, action_digest, action_kind, group_id, group_name, material_id,
-             post_id, post_url, log_id, resolution_id, resolution_outcome, evidence_digest,
-             status, kernel_settled, review_reason, created_at, updated_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        )
-        .run(
-          b.operationId,
-          input.runId,
-          b.profileId,
-          b.accountId,
-          String(b.connectionEpoch),
-          b.leaseId,
-          b.generation,
-          b.jobId,
-          b.stepId,
-          b.actionDigest,
-          actionKind,
-          input.groupId,
-          input.groupName,
-          input.materialId ?? null,
-          input.postId ?? null,
-          input.postUrl ?? null,
-          input.logId ?? null,
-          null,
-          null,
-          null,
-          'PREPARED',
-          0,
-          null,
-          now,
-          now,
-        );
+      const now = Date.now(),
+        cols =
+          'operation_id,run_id,profile_id,account_id,connection_epoch,lease_id,generation,job_id,step_id,action_digest,action_kind,group_id,group_name,material_id,post_id,post_url,log_id,resolution_id,resolution_outcome,evidence_digest,status,kernel_settled,review_reason,created_at,updated_at';
+      Q.insertFrom(
+        this.db,
+        'group_poster_operations',
+        cols,
+        { ...input, ...b },
+        {
+          connection_epoch: String(b.connectionEpoch),
+          action_kind: actionKind,
+          status: 'PREPARED',
+          kernel_settled: 0,
+          created_at: now,
+          updated_at: now,
+        },
+      );
       return (
         this.getOperation(b.operationId) ?? {
-          binding: b,
-          runId: input.runId,
+          ...input,
           actionKind,
-          groupId: input.groupId,
-          groupName: input.groupName,
-          materialId: input.materialId,
-          postId: input.postId,
-          postUrl: input.postUrl,
-          logId: input.logId,
           status: 'PREPARED',
           kernelSettled: false,
           createdAt: now,
@@ -477,266 +170,164 @@ export class SqliteGroupPosterRepository {
       );
     });
   }
-
   setOperationResolution(
     operationId: string,
-    resolution: PosterOperationResolution,
-  ): PosterOperationResolution {
+    res: GP.PosterOperationResolution,
+  ): GP.PosterOperationResolution {
     return transaction(this.db, () => {
       const row = this.getOperation(operationId);
       if (!row) throw Error('POSTER_OPERATION_MISSING');
+      const apply = (next: GP.PosterOperationStatus) => {
+        const sql =
+          'UPDATE group_poster_operations SET resolution_id=?, resolution_outcome=?, evidence_digest=?, status=?, updated_at=? WHERE operation_id=?';
+        Q.run(this.db, sql, res.id, res.outcome, res.evidenceDigest, next, Date.now(), operationId);
+        return res;
+      };
       if (row.resolution) {
-        if (row.resolution.outcome === resolution.outcome) {
-          return row.resolution;
-        }
+        if (row.resolution.outcome === res.outcome) return row.resolution;
         if (
           !row.kernelSettled &&
           row.resolution.outcome === 'NOT_APPLIED' &&
-          resolution.outcome === 'ENDED_UNKNOWN'
-        ) {
-          const nextStatusOnUpgrade: PosterOperationStatus =
+          res.outcome === 'ENDED_UNKNOWN'
+        )
+          return apply(
             row.status === 'PENDING_REVIEW' || row.actionKind === 'submit_post'
               ? 'PENDING_REVIEW'
-              : 'NOT_APPLIED';
-          this.db
-            .prepare(
-              `UPDATE group_poster_operations
-                  SET resolution_id = ?,
-                      resolution_outcome = ?,
-                      evidence_digest = ?,
-                      status = ?,
-                      updated_at = ?
-                WHERE operation_id = ?`,
-            )
-            .run(
-              resolution.id,
-              resolution.outcome,
-              resolution.evidenceDigest,
-              nextStatusOnUpgrade,
-              Date.now(),
-              operationId,
-            );
-          return resolution;
-        }
+              : 'NOT_APPLIED',
+          );
         throw Error('POSTER_RESOLUTION_CONFLICT');
       }
-      const nextStatus: PosterOperationStatus =
-        resolution.outcome === 'VERIFIED'
+      return apply(
+        res.outcome === 'VERIFIED'
           ? 'VERIFIED'
           : row.status === 'PENDING_REVIEW' ||
-              (row.actionKind === 'submit_post' && resolution.outcome === 'ENDED_UNKNOWN')
+              (row.actionKind === 'submit_post' && res.outcome === 'ENDED_UNKNOWN')
             ? 'PENDING_REVIEW'
-            : 'NOT_APPLIED';
-      this.db
-        .prepare(
-          `UPDATE group_poster_operations
-              SET resolution_id = ?,
-                  resolution_outcome = ?,
-                  evidence_digest = ?,
-                  status = ?,
-                  updated_at = ?
-            WHERE operation_id = ?`,
-        )
-        .run(
-          resolution.id,
-          resolution.outcome,
-          resolution.evidenceDigest,
-          nextStatus,
-          Date.now(),
-          operationId,
-        );
-      return resolution;
+            : 'NOT_APPLIED',
+      );
     });
   }
-
   markOperationKernelSettled(operationId: string): void {
     const row = this.getOperation(operationId);
     if (!row) throw Error('POSTER_OPERATION_MISSING');
-    if (!row.kernelSettled) {
-      this.db
-        .prepare(
-          'UPDATE group_poster_operations SET kernel_settled = 1, updated_at = ? WHERE operation_id = ?',
-        )
-        .run(Date.now(), operationId);
-    }
+    const sql =
+      'UPDATE group_poster_operations SET kernel_settled=1, updated_at=? WHERE operation_id=?';
+    if (!row.kernelSettled) Q.run(this.db, sql, Date.now(), operationId);
   }
-
   markOperationReview(operationId: string, reason: string): void {
     const row = this.getOperation(operationId);
     if (!row) throw Error('POSTER_OPERATION_MISSING');
-    if (row.status === 'VERIFIED') return;
-    this.db
-      .prepare(
-        `UPDATE group_poster_operations
-            SET status = 'PENDING_REVIEW',
-                review_reason = ?,
-                updated_at = ?
-          WHERE operation_id = ?`,
-      )
-      .run(reason, Date.now(), operationId);
+    const sql =
+      "UPDATE group_poster_operations SET status='PENDING_REVIEW', review_reason=?, updated_at=? WHERE operation_id=?";
+    if (row.status !== 'VERIFIED') Q.run(this.db, sql, reason, Date.now(), operationId);
   }
-
   confirmPostSubmission(
     operationId: string,
-    record: PosterLog,
-    resolution: PosterOperationResolution,
-  ): PosterOperationResolution {
+    rec: GP.PosterLog,
+    res: GP.PosterOperationResolution,
+  ): GP.PosterOperationResolution {
     return transaction(this.db, () => {
       const row = this.getOperation(operationId);
       if (
         !row ||
         row.actionKind !== 'submit_post' ||
-        row.binding.profileId !== record.profileId ||
-        row.groupId !== record.groupId ||
-        resolution.outcome !== 'VERIFIED'
-      ) {
+        row.binding.profileId !== rec.profileId ||
+        row.groupId !== rec.groupId ||
+        res.outcome !== 'VERIFIED'
+      )
         throw Error('POSTER_RESULT_CONTEXT_CHANGED');
-      }
       if (row.resolution) {
         if (row.resolution.outcome !== 'VERIFIED') throw Error('POSTER_RESOLUTION_CONFLICT');
         return row.resolution;
       }
-      this.recordPost(record);
-      this.db
-        .prepare(
-          `UPDATE group_poster_operations
-              SET post_id = ?,
-                  post_url = ?,
-                  log_id = ?,
-                  resolution_id = ?,
-                  resolution_outcome = 'VERIFIED',
-                  evidence_digest = ?,
-                  status = 'VERIFIED',
-                  updated_at = ?
-            WHERE operation_id = ?`,
-        )
-        .run(
-          record.postId,
-          record.postUrl,
-          record.id,
-          resolution.id,
-          resolution.evidenceDigest,
-          Date.now(),
-          operationId,
-        );
-      return resolution;
+      this.recordPost(rec);
+      const sql =
+        "UPDATE group_poster_operations SET post_id=?, post_url=?, log_id=?, resolution_id=?, resolution_outcome='VERIFIED', evidence_digest=?, status='VERIFIED', updated_at=? WHERE operation_id=?";
+      Q.run(
+        this.db,
+        sql,
+        rec.postId,
+        rec.postUrl,
+        rec.id,
+        res.id,
+        res.evidenceDigest,
+        Date.now(),
+        operationId,
+      );
+      return res;
     });
   }
-
-  settings(): PosterSettings {
-    const row = this.db.prepare('SELECT body FROM group_poster_settings WHERE id=1').get() as
-      { body?: string } | undefined;
-    try {
-      return PosterSettings.parse(JSON.parse(String(row?.body ?? '{}')));
-    } catch {
-      return PosterSettings.parse({});
-    }
+  settings = () =>
+    Q.readSingletonJson(
+      this.db,
+      'group_poster_settings',
+      'body',
+      (o) => GP.PosterSettings.parse(o),
+      () => GP.PosterSettings.parse({}),
+    );
+  saveSettings(input: unknown): GP.PosterSettings {
+    const s = GP.PosterSettings.parse(input);
+    Q.run(this.db, 'UPDATE group_poster_settings SET body=? WHERE id=1', JSON.stringify(s));
+    return s;
   }
-
-  saveSettings(input: unknown): PosterSettings {
-    const settings = PosterSettings.parse(input);
-    this.db
-      .prepare('UPDATE group_poster_settings SET body=? WHERE id=1')
-      .run(JSON.stringify(settings));
-    return settings;
-  }
-
-  targets(): BumperTarget[] {
-    return this.targetLibrary.listGroups().map((row) => ({
-      id: row.groupId,
-      name: row.groupName,
-      avatarUrl: row.avatarUrl,
-      folderId: row.folderId,
-      sortOrder: row.sortOrder,
-      totalBumpedCount: row.postedCount,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
+  targets = (): BumperTarget[] =>
+    this.targetLibrary.listGroups().map((r) => ({
+      id: r.groupId,
+      name: r.groupName,
+      avatarUrl: r.avatarUrl,
+      folderId: r.folderId,
+      sortOrder: r.sortOrder,
+      totalBumpedCount: r.postedCount,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
     }));
-  }
-
   upsertTargets(input: unknown): BumperTarget[] {
-    const { items } = BumperTargetsInput.parse(input);
     this.targetLibrary.upsertGroups(
-      items.map((item) => ({
-        id: item.id,
-        name: item.name.trim() || item.id,
-        folderId: item.folderId ?? null,
+      BumperTargetsInput.parse(input).items.map((i) => ({
+        id: i.id,
+        name: i.name.trim() || i.id,
+        folderId: i.folderId ?? null,
       })),
     );
     return this.targets();
   }
-
-  deleteTargets(input: unknown): number {
-    const { ids } = BumperIdsInput.parse(input);
-    return transaction(this.db, () =>
-      Number(
-        this.db
-          .prepare(
-            'DELETE FROM shared_facebook_groups WHERE group_id IN (SELECT value FROM json_each(?))',
-          )
-          .run(JSON.stringify(ids)).changes,
+  deleteTargets = (input: unknown): number =>
+    transaction(this.db, () =>
+      Q.deleteByJsonIds(
+        this.db,
+        'shared_facebook_groups',
+        'group_id',
+        BumperIdsInput.parse(input).ids,
       ),
     );
-  }
-
-  updateAvatar(id: string, avatarUrl: string): void {
-    const trimmed = typeof avatarUrl === 'string' ? avatarUrl.trim() : '';
-    if (!trimmed) return;
-    this.targetLibrary.applyResolvedTargetMetadata('group', id, {
-      avatarUrl: trimmed,
-    });
-  }
-
-  applyResolvedTargetMetadata(
+  applyResolvedTargetMetadata = (
     originalId: string,
     resolved: { canonicalId?: string | null; name?: string | null; avatarUrl?: string | null },
-  ): boolean {
-    return this.targetLibrary.applyResolvedTargetMetadata('group', originalId, resolved);
+  ): boolean => this.targetLibrary.applyResolvedTargetMetadata('group', originalId, resolved);
+  materials(): GP.PosterMaterial[] {
+    const sql = `SELECT id, caption, media_source, background, ai_label, local_file_path, media_kind, cache_status, cache_error, selected, used_count, sort_order, created_at, updated_at, last_used_at, CASE WHEN thumbnail_data_url IS NOT NULL AND length(thumbnail_data_url) > 0 THEN 1 ELSE 0 END AS has_thumbnail FROM group_poster_materials ORDER BY sort_order, created_at, id`;
+    return Q.allRows(this.db, sql).map(
+      (r) =>
+        ({
+          ...Q.camel(r, 'selected,has_thumbnail'),
+          background:
+            Q.s(r.media_source).trim().length > 0
+              ? 'plain'
+              : Q.s(r.background) === 'color'
+                ? 'color'
+                : 'plain',
+          aiLabel: (['default', 'on', 'off'].includes(Q.s(r.ai_label))
+            ? Q.s(r.ai_label)
+            : 'default') as GP.PosterMaterialAiLabel,
+          mediaKind: asMediaKind(r.media_kind),
+          cacheStatus: (['ready', 'downloading', 'expired', 'error'].includes(Q.s(r.cache_status))
+            ? Q.s(r.cache_status)
+            : 'ready') as GP.PosterCacheStatus,
+          selected: Q.b(r.selected ?? 1),
+        }) as GP.PosterMaterial,
+    );
   }
-
-  materials(): PosterMaterial[] {
-    return this.db
-      .prepare(
-        `SELECT id, caption, media_source, background, ai_label, local_file_path, media_kind,
-                cache_status, cache_error, selected, used_count, sort_order,
-                created_at, updated_at, last_used_at,
-                CASE WHEN thumbnail_data_url IS NOT NULL AND length(thumbnail_data_url) > 0 THEN 1 ELSE 0 END AS has_thumbnail
-           FROM group_poster_materials
-          ORDER BY sort_order, created_at, id`,
-      )
-      .all()
-      .map((r) => ({
-        id: String(r.id),
-        caption: String(r.caption),
-        mediaSource: String(r.media_source ?? ''),
-        background:
-          String(r.media_source ?? '').trim().length > 0
-            ? 'plain'
-            : String(r.background) === 'color'
-              ? 'color'
-              : 'plain',
-        aiLabel: (['default', 'on', 'off'].includes(String(r.ai_label))
-          ? String(r.ai_label)
-          : 'default') as PosterMaterialAiLabel,
-        localFilePath: r.local_file_path == null ? null : String(r.local_file_path),
-        mediaKind: (['none', 'image', 'video'].includes(String(r.media_kind))
-          ? String(r.media_kind)
-          : 'none') as PosterMediaKind,
-        cacheStatus: (['ready', 'downloading', 'expired', 'error'].includes(String(r.cache_status))
-          ? String(r.cache_status)
-          : 'ready') as PosterCacheStatus,
-        cacheError: r.cache_error == null ? null : String(r.cache_error),
-        selected: Number(r.selected ?? 1) === 1,
-        usedCount: Number(r.used_count ?? 0),
-        sortOrder: Number(r.sort_order ?? 0),
-        createdAt: Number(r.created_at),
-        updatedAt: Number(r.updated_at),
-        lastUsedAt: r.last_used_at == null ? null : Number(r.last_used_at),
-        hasThumbnail: Number(r.has_thumbnail ?? 0) === 1,
-      }));
-  }
-
-  saveMaterials(input: unknown): PosterMaterial[] {
+  saveMaterials(input: unknown): GP.PosterMaterial[] {
     const rawItems =
       typeof input === 'object' &&
       input !== null &&
@@ -744,704 +335,364 @@ export class SqliteGroupPosterRepository {
       Array.isArray((input as { items?: unknown }).items)
         ? ((input as { items: unknown[] }).items as Array<Record<string, unknown>>)
         : [];
-    const { items, replaceAll } = PosterMaterialsInput.parse(input);
-    const now = Date.now();
+    const { items, replaceAll } = GP.PosterMaterialsInput.parse(input),
+      now = Date.now();
     return transaction(this.db, () => {
-      const existingById = new Map(this.materials().map((m) => [m.id, m]));
+      const cur = this.materials(),
+        byId = new Map(cur.map((m) => [m.id, m]));
       const resolved = items.map((item, idx) => ({
         item,
         raw: rawItems[idx],
-        id: item.id && item.id.trim() ? item.id.trim() : randomUUID(),
+        id: item.id?.trim() || randomUUID(),
         idx,
       }));
       if (replaceAll === true) {
-        if (resolved.length === 0) {
-          this.db.prepare('DELETE FROM group_poster_materials').run();
-        } else {
-          const keepIds = resolved.map((x) => x.id);
-          this.db
-            .prepare(
-              'DELETE FROM group_poster_materials WHERE id NOT IN (SELECT value FROM json_each(?))',
-            )
-            .run(JSON.stringify(keepIds));
+        if (!resolved.length) Q.run(this.db, 'DELETE FROM group_poster_materials');
+        else {
+          const delSql =
+            'DELETE FROM group_poster_materials WHERE id NOT IN (SELECT value FROM json_each(?))';
+          Q.run(this.db, delSql, JSON.stringify(resolved.map((x) => x.id)));
         }
       }
-      const upsert = this.db.prepare(
-        `INSERT INTO group_poster_materials(
-           id,caption,media_source,background,ai_label,local_file_path,media_kind,cache_status,cache_error,selected,used_count,sort_order,created_at,updated_at,last_used_at,thumbnail_data_url
-         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
-         ON CONFLICT(id) DO UPDATE SET
-           caption=excluded.caption,
-           media_source=excluded.media_source,
-           background=excluded.background,
-           ai_label=excluded.ai_label,
-           local_file_path=excluded.local_file_path,
-           media_kind=excluded.media_kind,
-           cache_status=excluded.cache_status,
-           cache_error=excluded.cache_error,
-           selected=excluded.selected,
-           sort_order=excluded.sort_order,
-           updated_at=excluded.updated_at,
-           thumbnail_data_url=CASE WHEN group_poster_materials.media_source = excluded.media_source THEN group_poster_materials.thumbnail_data_url ELSE NULL END`,
-      );
-      let nextOrder = this.materials().reduce((max, m) => Math.max(max, m.sortOrder), -1) + 1;
+      const sql = `INSERT INTO group_poster_materials(id,caption,media_source,background,ai_label,local_file_path,media_kind,cache_status,cache_error,selected,used_count,sort_order,created_at,updated_at,last_used_at,thumbnail_data_url) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET caption=excluded.caption, media_source=excluded.media_source, background=excluded.background, ai_label=excluded.ai_label, local_file_path=excluded.local_file_path, media_kind=excluded.media_kind, cache_status=excluded.cache_status, cache_error=excluded.cache_error, selected=excluded.selected, sort_order=excluded.sort_order, updated_at=excluded.updated_at, thumbnail_data_url=CASE WHEN group_poster_materials.media_source=excluded.media_source THEN group_poster_materials.thumbnail_data_url ELSE NULL END`;
+      const upsert = this.db.prepare(sql);
+      let nextOrder = cur.reduce((max, m) => Math.max(max, m.sortOrder), -1) + 1;
       for (const { item, raw, id, idx } of resolved) {
-        const prev = existingById.get(id);
-        const rawSource = (item.mediaSource ?? '').trim();
-        let ref: ReturnType<typeof mediaReference> | null = null;
-        if (rawSource) {
-          try {
-            ref = mediaReference(rawSource);
-          } catch {
-            ref = null;
-          }
-        }
-        const mediaSource = ref ? ref.source : rawSource;
-        const hasExplicitBg = Boolean(raw && typeof raw === 'object' && 'background' in raw);
-        const effectiveBackground: PosterMaterialBackground = mediaSource
+        const prev = byId.get(id),
+          rawSrc = (item.mediaSource ?? '').trim(),
+          ref = rawSrc ? Q.parseWithFallback(() => mediaReference(rawSrc), null) : null,
+          src = ref ? ref.source : rawSrc;
+        const hasBg = Boolean(raw && typeof raw === 'object' && 'background' in raw),
+          hasAi = Boolean(raw && typeof raw === 'object' && 'aiLabel' in raw);
+        const bg: GP.PosterMaterialBackground = src
           ? 'plain'
           : item.background === 'color'
             ? 'color'
-            : hasExplicitBg
+            : hasBg
               ? 'plain'
               : (prev?.background ?? 'plain');
-        const hasExplicitAiLabel = Boolean(raw && typeof raw === 'object' && 'aiLabel' in raw);
-        const effectiveAiLabel: PosterMaterialAiLabel = hasExplicitAiLabel
+        const ai: GP.PosterMaterialAiLabel = hasAi
           ? (item.aiLabel ?? 'default')
           : (prev?.aiLabel ?? 'default');
-        const sourceChanged = !prev || prev.mediaSource !== mediaSource;
-        const isLocalSource = ref?.kind === 'local';
-        const localFilePath = !mediaSource
-          ? null
-          : sourceChanged
-            ? isLocalSource
-              ? mediaSource
-              : null
-            : prev.localFilePath;
-        const mediaKind: PosterMediaKind = !mediaSource
+        const chg = !prev || prev.mediaSource !== src,
+          loc = ref?.kind === 'local';
+        const lp = !src ? null : chg ? (loc ? src : null) : prev.localFilePath;
+        const mk = !src
           ? 'none'
-          : sourceChanged
-            ? ref
+          : !chg
+            ? prev.mediaKind
+            : ref
               ? ref.mediaType === 'image'
                 ? 'image'
                 : 'video'
-              : /\.(?:png|jpe?g|webp|gif)$/i.test(mediaSource)
+              : /\.(?:png|jpe?g|webp|gif)$/i.test(src)
                 ? 'image'
-                : 'video'
-            : prev.mediaKind;
-        const cacheStatus: PosterCacheStatus = !mediaSource
+                : 'video';
+        const cs = !src
           ? 'ready'
-          : sourceChanged
-            ? !ref
+          : !chg
+            ? prev.cacheStatus
+            : !ref
               ? 'error'
-              : isLocalSource
+              : loc
                 ? 'ready'
-                : 'downloading'
-            : prev.cacheStatus;
-        const cacheError = !mediaSource
+                : 'downloading';
+        const ce = !src
           ? null
-          : sourceChanged
-            ? !ref
+          : !chg
+            ? prev.cacheError
+            : !ref
               ? '不支持的媒体路径或链接格式'
-              : null
-            : prev.cacheError;
-        const sortOrder = replaceAll === true ? idx : prev ? prev.sortOrder : nextOrder++;
-        upsert.run(
+              : null;
+        const ord = replaceAll === true ? idx : prev ? prev.sortOrder : nextOrder++;
+        const args = [
           id,
           item.caption.trim(),
-          mediaSource,
-          effectiveBackground,
-          effectiveAiLabel,
-          localFilePath,
-          mediaKind,
-          cacheStatus,
-          cacheError,
+          src,
+          bg,
+          ai,
+          lp,
+          mk,
+          cs,
+          ce,
           (item.selected ?? prev?.selected ?? true) ? 1 : 0,
           prev?.usedCount ?? 0,
-          sortOrder,
+          ord,
           prev?.createdAt ?? now,
           now,
           prev?.lastUsedAt ?? null,
-        );
+        ];
+        upsert.run(...args);
       }
       return this.materials();
     });
   }
-
   deleteMaterials(input: unknown): number {
-    const { ids } = PosterMaterialIdsInput.parse(input);
-    const idsJson = JSON.stringify(ids);
+    const { ids } = GP.PosterMaterialIdsInput.parse(input),
+      delSql =
+        "DELETE FROM group_poster_tasks WHERE material_id IN (SELECT value FROM json_each(?)) AND status='scheduled'";
     return transaction(this.db, () => {
-      this.db
-        .prepare(
-          "DELETE FROM group_poster_tasks WHERE material_id IN (SELECT value FROM json_each(?)) AND status = 'scheduled'",
-        )
-        .run(idsJson);
-      return Number(
-        this.db
-          .prepare(
-            'DELETE FROM group_poster_materials WHERE id IN (SELECT value FROM json_each(?))',
-          )
-          .run(idsJson).changes,
-      );
+      Q.run(this.db, delSql, JSON.stringify(ids));
+      return Q.deleteByJsonIds(this.db, 'group_poster_materials', 'id', ids);
     });
   }
-
-  toggleMaterials(input: unknown): PosterMaterial[] {
-    const { ids, selected } = PosterToggleMaterialsInput.parse(input);
-    this.db
-      .prepare(
-        'UPDATE group_poster_materials SET selected=?,updated_at=? WHERE id IN (SELECT value FROM json_each(?))',
-      )
-      .run(selected ? 1 : 0, Date.now(), JSON.stringify(ids));
-    return this.materials();
-  }
-
   updateMaterialCache(
     id: string,
-    cache: {
+    c: {
       localFilePath: string | null;
-      mediaKind: PosterMediaKind;
-      cacheStatus: PosterCacheStatus;
+      mediaKind: GP.PosterMediaKind;
+      cacheStatus: GP.PosterCacheStatus;
       cacheError: string | null;
       thumbnailDataUrl?: string | null | undefined;
     },
   ): void {
-    const now = Date.now();
-    const shouldRefreshLastUsed = cache.cacheStatus === 'ready' && Boolean(cache.localFilePath);
-    if (cache.thumbnailDataUrl !== undefined) {
-      this.db
-        .prepare(
-          'UPDATE group_poster_materials SET local_file_path=?,media_kind=?,cache_status=?,cache_error=?,thumbnail_data_url=?,updated_at=?,last_used_at=CASE WHEN ?=1 THEN ? ELSE last_used_at END WHERE id=?',
-        )
-        .run(
-          cache.localFilePath,
-          cache.mediaKind,
-          cache.cacheStatus,
-          cache.cacheError,
-          cache.thumbnailDataUrl,
-          now,
-          shouldRefreshLastUsed ? 1 : 0,
-          now,
-          id,
-        );
-      return;
-    }
-    this.db
-      .prepare(
-        'UPDATE group_poster_materials SET local_file_path=?,media_kind=?,cache_status=?,cache_error=?,updated_at=?,last_used_at=CASE WHEN ?=1 THEN ? ELSE last_used_at END WHERE id=?',
-      )
-      .run(
-        cache.localFilePath,
-        cache.mediaKind,
-        cache.cacheStatus,
-        cache.cacheError,
-        now,
-        shouldRefreshLastUsed ? 1 : 0,
-        now,
-        id,
-      );
+    const now = Date.now(),
+      sql =
+        'UPDATE group_poster_materials SET local_file_path=?,media_kind=?,cache_status=?,cache_error=?,thumbnail_data_url=CASE WHEN ?=1 THEN ? ELSE thumbnail_data_url END,updated_at=?,last_used_at=CASE WHEN ?=1 THEN ? ELSE last_used_at END WHERE id=?';
+    Q.run(
+      this.db,
+      sql,
+      c.localFilePath,
+      c.mediaKind,
+      c.cacheStatus,
+      c.cacheError,
+      c.thumbnailDataUrl !== undefined ? 1 : 0,
+      c.thumbnailDataUrl ?? null,
+      now,
+      c.cacheStatus === 'ready' && c.localFilePath ? 1 : 0,
+      now,
+      id,
+    );
   }
-
   getMaterialThumbnail(id: string): { thumbnailDataUrl: string | null; updatedAt: number } | null {
-    const row = this.db
-      .prepare('SELECT thumbnail_data_url, updated_at FROM group_poster_materials WHERE id = ?')
-      .get(id) as { thumbnail_data_url?: string | null; updated_at?: number } | undefined;
-    if (!row) return null;
-    return {
-      thumbnailDataUrl:
-        typeof row.thumbnail_data_url === 'string' && row.thumbnail_data_url.length > 0
-          ? row.thumbnail_data_url
-          : null,
-      updatedAt: Number(row.updated_at ?? 0),
-    };
+    const r = Q.getRow(
+      this.db,
+      'SELECT thumbnail_data_url, updated_at FROM group_poster_materials WHERE id=?',
+      id,
+    );
+    return r
+      ? {
+          thumbnailDataUrl:
+            typeof r.thumbnail_data_url === 'string' && r.thumbnail_data_url
+              ? r.thumbnail_data_url
+              : null,
+          updatedAt: Q.n(r.updated_at),
+        }
+      : null;
   }
-
-  saveMaterialThumbnail(id: string, thumbnailDataUrl: string): boolean {
-    const trimmed = thumbnailDataUrl.trim();
-    if (!trimmed.startsWith('data:image/') || trimmed.length > 140 * 1024) return false;
-    const res = this.db
-      .prepare(
-        'UPDATE group_poster_materials SET thumbnail_data_url = ?, updated_at = ? WHERE id = ?',
-      )
-      .run(trimmed, Date.now(), id);
-    return Number(res.changes ?? 0) > 0;
+  saveMaterialThumbnail(id: string, dataUrl: string): boolean {
+    const t = dataUrl.trim(),
+      sql = 'UPDATE group_poster_materials SET thumbnail_data_url=?, updated_at=? WHERE id=?';
+    return (
+      t.startsWith('data:image/') &&
+      t.length <= 140 * 1024 &&
+      Number(Q.run(this.db, sql, t, Date.now(), id).changes ?? 0) > 0
+    );
   }
-
   getMaterialMediaPath(
     id: string,
-  ): { localFilePath: string | null; mediaKind: PosterMediaKind } | null {
-    const row = this.db
-      .prepare('SELECT local_file_path, media_kind FROM group_poster_materials WHERE id = ?')
-      .get(id) as { local_file_path?: string | null; media_kind?: string } | undefined;
-    if (!row) return null;
-    return {
-      localFilePath:
-        typeof row.local_file_path === 'string' && row.local_file_path.trim().length > 0
-          ? row.local_file_path.trim()
-          : null,
-      mediaKind: (['none', 'image', 'video'].includes(String(row.media_kind))
-        ? String(row.media_kind)
-        : 'none') as PosterMediaKind,
-    };
+  ): { localFilePath: string | null; mediaKind: GP.PosterMediaKind } | null {
+    const r = Q.getRow(
+      this.db,
+      'SELECT local_file_path, media_kind FROM group_poster_materials WHERE id=?',
+      id,
+    );
+    return r
+      ? {
+          localFilePath: Q.nonEmptyTrimmed(r.local_file_path),
+          mediaKind: asMediaKind(r.media_kind),
+        }
+      : null;
   }
-
   listExpiredDriveMaterials(
     cutoffMs: number,
   ): Array<{ id: string; mediaSource: string; localFilePath: string }> {
-    const rows = this.db
-      .prepare(
-        `SELECT id, media_source, local_file_path
-           FROM group_poster_materials
-          WHERE local_file_path IS NOT NULL
-            AND trim(local_file_path) <> ''
-            AND COALESCE(last_used_at, updated_at) < ?`,
-      )
-      .all(cutoffMs) as Array<{
-      id?: string;
-      media_source?: string;
-      local_file_path?: string;
-    }>;
-    const result: Array<{ id: string; mediaSource: string; localFilePath: string }> = [];
-    for (const r of rows) {
-      const id = String(r.id ?? '');
-      const src = String(r.media_source ?? '').trim();
-      const localPath = String(r.local_file_path ?? '').trim();
-      if (!id || !src || !localPath) continue;
-      try {
-        const ref = mediaReference(src);
-        if (ref.kind === 'drive') {
-          result.push({ id, mediaSource: src, localFilePath: localPath });
-        }
-      } catch {
-        // Ignore invalid mediaSource
-      }
+    const out: Array<{ id: string; mediaSource: string; localFilePath: string }> = [],
+      sql =
+        "SELECT id, media_source, local_file_path FROM group_poster_materials WHERE local_file_path IS NOT NULL AND trim(local_file_path) <> '' AND COALESCE(last_used_at, updated_at) < ?";
+    for (const r of Q.allRows(this.db, sql, cutoffMs)) {
+      const id = Q.s(r.id),
+        src = Q.s(r.media_source).trim(),
+        lp = Q.s(r.local_file_path).trim();
+      if (id && src && lp && Q.parseWithFallback(() => mediaReference(src).kind === 'drive', false))
+        out.push({ id, mediaSource: src, localFilePath: lp });
     }
-    return result;
+    return out;
   }
-
-  markMaterialCacheExpired(id: string): void {
-    this.db
-      .prepare(
-        "UPDATE group_poster_materials SET local_file_path = NULL, cache_status = 'expired', cache_error = NULL, updated_at = ? WHERE id = ?",
-      )
-      .run(Date.now(), id);
-  }
-
-  hasGroupVerifiedPost(groupId: string, materialId: string): boolean {
-    if (
+  markMaterialCacheExpired = (id: string): void => {
+    const sql =
+      "UPDATE group_poster_materials SET local_file_path=NULL, cache_status='expired', cache_error=NULL, updated_at=? WHERE id=?";
+    Q.run(this.db, sql, Date.now(), id);
+  };
+  private hasGroupStatus = (groupId: string, materialId: string, pending: boolean) =>
+    Boolean(
       this.db
         .prepare('SELECT 1 FROM group_poster_usage WHERE group_id=? AND material_id=? LIMIT 1')
-        .get(groupId, materialId)
-    ) {
-      return true;
-    }
-    return Boolean(
+        .get(groupId, materialId) ||
       this.db
         .prepare(
-          "SELECT 1 FROM group_poster_operations WHERE group_id=? AND material_id=? AND status = 'VERIFIED' LIMIT 1",
+          `SELECT 1 FROM group_poster_operations WHERE group_id=? AND material_id=? AND status IN ${pending ? "('VERIFIED','PENDING_REVIEW')" : "('VERIFIED')"} LIMIT 1`,
         )
         .get(groupId, materialId),
     );
-  }
-
-  hasGroupPostedMaterial(groupId: string, materialId: string): boolean {
-    if (
-      this.db
-        .prepare('SELECT 1 FROM group_poster_usage WHERE group_id=? AND material_id=? LIMIT 1')
-        .get(groupId, materialId)
-    ) {
-      return true;
-    }
-    return Boolean(
-      this.db
-        .prepare(
-          "SELECT 1 FROM group_poster_operations WHERE group_id=? AND material_id=? AND status IN ('VERIFIED', 'PENDING_REVIEW') LIMIT 1",
-        )
-        .get(groupId, materialId),
-    );
-  }
-
+  hasGroupVerifiedPost = (g: string, m: string) => this.hasGroupStatus(g, m, false);
+  hasGroupPostedMaterial = (g: string, m: string) => this.hasGroupStatus(g, m, true);
   postedGroupIdsByMaterial(): Record<string, string[]> {
-    const rows = this.db
-      .prepare(
-        `SELECT material_id, group_id FROM group_poster_usage
-          WHERE material_id IS NOT NULL AND group_id IS NOT NULL
-         UNION
-         SELECT material_id, group_id FROM group_poster_operations
-          WHERE material_id IS NOT NULL AND group_id IS NOT NULL
-            AND status IN ('VERIFIED', 'PENDING_REVIEW')`,
-      )
-      .all() as Array<{ material_id?: string | null; group_id?: string | null }>;
-    const map: Record<string, string[]> = {};
-    for (const r of rows) {
-      const mid = String(r.material_id ?? '').trim();
-      const gid = String(r.group_id ?? '').trim();
-      if (!mid || !gid) continue;
-      const list = map[mid] ?? [];
-      list.push(gid);
-      map[mid] = list;
+    const map: Record<string, string[]> = {},
+      sql =
+        "SELECT material_id, group_id FROM group_poster_usage WHERE material_id IS NOT NULL AND group_id IS NOT NULL UNION SELECT material_id, group_id FROM group_poster_operations WHERE material_id IS NOT NULL AND group_id IS NOT NULL AND status IN ('VERIFIED','PENDING_REVIEW')";
+    for (const r of Q.allRows(this.db, sql)) {
+      const m = Q.s(r.material_id).trim(),
+        g = Q.s(r.group_id).trim();
+      if (m && g) (map[m] ??= []).push(g);
     }
     return map;
   }
-
-  private mapTaskRow(r: Record<string, unknown>): PosterTask {
-    let groupIds: string[] = [];
-    let profileIds: string[] = [];
-    try {
-      const parsed = JSON.parse(String(r.group_ids_json ?? '[]'));
-      if (Array.isArray(parsed)) groupIds = parsed.map((x) => String(x));
-    } catch {
-      groupIds = [];
-    }
-    try {
-      const parsed = JSON.parse(String(r.profile_ids_json ?? '[]'));
-      if (Array.isArray(parsed)) profileIds = parsed.map((x) => String(x));
-    } catch {
-      profileIds = [];
-    }
-    const rawMode = String(r.account_mode ?? 'selected');
-    const accountMode: PosterTaskAccountMode = rawMode === 'all_online' ? 'all_online' : 'selected';
-    const rawStatus = String(r.status ?? 'scheduled');
-    const status: PosterTaskStatus = (
-      ['scheduled', 'running', 'completed', 'partial', 'failed', 'cancelled'].includes(rawStatus)
-        ? rawStatus
-        : 'scheduled'
-    ) as PosterTaskStatus;
-    return {
-      id: String(r.id),
-      materialId: String(r.material_id),
-      captionPreview: String(r.caption_preview ?? ''),
-      groupIds,
-      accountMode,
-      profileIds,
-      scheduledAt: r.scheduled_at == null ? null : Number(r.scheduled_at),
-      status,
-      totalGroups: Number(r.total_groups ?? 0),
-      postedCount: Number(r.posted_count ?? 0),
-      skippedCount: Number(r.skipped_count ?? 0),
-      statusReason: String(r.status_reason ?? ''),
-      createdAt: Number(r.created_at ?? 0),
-      startedAt: r.started_at == null ? null : Number(r.started_at),
-      finishedAt: r.finished_at == null ? null : Number(r.finished_at),
-    };
+  listTasks = (limit = 100): GP.PosterTask[] => {
+    const sql = 'SELECT * FROM group_poster_tasks ORDER BY created_at DESC, id DESC LIMIT ?';
+    return Q.allRows(this.db, sql, Q.clampLimit(limit, 1, 500)).map(mapTaskRow);
+  };
+  saveTask(t: GP.PosterTask): GP.PosterTask {
+    const cols =
+      'id,material_id,caption_preview,group_ids_json,account_mode,profile_ids_json,scheduled_at,status,total_groups,posted_count,skipped_count,status_reason,created_at,started_at,finished_at';
+    Q.upsertFrom(this.db, 'group_poster_tasks', 'id', cols, '*', t, {
+      group_ids_json: JSON.stringify(t.groupIds),
+      profile_ids_json: JSON.stringify(t.profileIds),
+    });
+    return t;
   }
-
-  listTasks(limit = 100): PosterTask[] {
-    const rows = this.db
-      .prepare('SELECT * FROM group_poster_tasks ORDER BY created_at DESC, id DESC LIMIT ?')
-      .all(Math.max(1, Math.min(500, limit))) as Array<Record<string, unknown>>;
-    return rows.map((r) => this.mapTaskRow(r));
-  }
-
-  saveTask(task: PosterTask): PosterTask {
-    this.db
-      .prepare(
-        `INSERT INTO group_poster_tasks(
-           id, material_id, caption_preview, group_ids_json, account_mode, profile_ids_json,
-           scheduled_at, status, total_groups, posted_count, skipped_count, status_reason,
-           created_at, started_at, finished_at
-         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET
-           material_id=excluded.material_id,
-           caption_preview=excluded.caption_preview,
-           group_ids_json=excluded.group_ids_json,
-           account_mode=excluded.account_mode,
-           profile_ids_json=excluded.profile_ids_json,
-           scheduled_at=excluded.scheduled_at,
-           status=excluded.status,
-           total_groups=excluded.total_groups,
-           posted_count=excluded.posted_count,
-           skipped_count=excluded.skipped_count,
-           status_reason=excluded.status_reason,
-           created_at=excluded.created_at,
-           started_at=excluded.started_at,
-           finished_at=excluded.finished_at`,
-      )
-      .run(
-        task.id,
-        task.materialId,
-        task.captionPreview,
-        JSON.stringify(task.groupIds),
-        task.accountMode,
-        JSON.stringify(task.profileIds),
-        task.scheduledAt ?? null,
-        task.status,
-        task.totalGroups,
-        task.postedCount,
-        task.skippedCount,
-        task.statusReason,
-        task.createdAt,
-        task.startedAt ?? null,
-        task.finishedAt ?? null,
-      );
-    return task;
-  }
-
-  deleteTask(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM group_poster_tasks WHERE id = ?').run(id);
-    return Number(res.changes ?? 0) > 0;
-  }
-
-  recordPost(input: PosterLog): boolean {
+  deleteTask = (id: string): boolean =>
+    Number(Q.run(this.db, 'DELETE FROM group_poster_tasks WHERE id=?', id).changes ?? 0) > 0;
+  recordPost(input: GP.PosterLog): boolean {
     return transaction(this.db, () => {
-      const existing = this.db
-        .prepare('SELECT 1 FROM group_poster_usage WHERE log_id=? LIMIT 1')
-        .get(input.id);
-      if (existing) return false;
-      let resolvedAccountAvatar = input.accountAvatar;
-      if (input.identityType === 'personal' && !isLocalAvatar(resolvedAccountAvatar)) {
-        const hasCache = Boolean(
-          this.db
-            .prepare(
-              "SELECT 1 FROM sqlite_master WHERE type='table' AND name='profile_account_cache'",
-            )
-            .get(),
-        );
-        if (hasCache) {
-          const cachedRow = this.db
-            .prepare(
-              'SELECT avatar_url FROM profile_account_cache WHERE profile_id=? AND account_id=? LIMIT 1',
-            )
-            .get(input.profileId, input.accountId) as { avatar_url?: string | null } | undefined;
-          if (cachedRow?.avatar_url && String(cachedRow.avatar_url).trim()) {
-            resolvedAccountAvatar = String(cachedRow.avatar_url).trim();
-          }
-        }
+      if (this.db.prepare('SELECT 1 FROM group_poster_usage WHERE log_id=? LIMIT 1').get(input.id))
+        return false;
+      let avatar = input.accountAvatar;
+      if (
+        input.identityType === 'personal' &&
+        !isLocalAvatar(avatar) &&
+        Q.sqliteTableExists(this.db, 'profile_account_cache')
+      ) {
+        const sql =
+          'SELECT avatar_url FROM profile_account_cache WHERE profile_id=? AND account_id=? LIMIT 1';
+        const c = Q.getRow(this.db, sql, input.profileId, input.accountId);
+        if (c?.avatar_url && String(c.avatar_url).trim()) avatar = String(c.avatar_url).trim();
       }
       saveRecordAvatar(
         this.db,
         input.identityType === 'page' ? 'page' : 'account',
         input.accountId,
-        resolvedAccountAvatar,
+        avatar,
         input.postedAt,
       );
       saveRecordAvatar(this.db, 'group', input.groupId, input.groupAvatar, input.postedAt);
-      this.db
-        .prepare(
-          `INSERT INTO group_poster_logs(
-             id,profile_id,account_id,account_name,account_avatar,identity_type,
-             group_id,group_name,group_avatar,material_id,caption_preview,post_id,post_url,posted_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        )
-        .run(
-          input.id,
-          input.profileId,
-          input.accountId,
-          input.accountName,
-          null,
-          input.identityType,
-          input.groupId,
-          input.groupName,
-          null,
-          input.materialId,
-          input.captionPreview,
-          input.postId,
-          input.postUrl,
-          input.postedAt,
-        );
-      this.db
-        .prepare(
-          'UPDATE group_poster_materials SET used_count=used_count+1,last_used_at=?,updated_at=? WHERE id=?',
-        )
-        .run(input.postedAt, input.postedAt, input.materialId);
+      const uSql =
+        'INSERT OR IGNORE INTO group_poster_usage(log_id, profile_id, group_id, material_id, posted_at) VALUES(?,?,?,?,?)';
+      Q.run(
+        this.db,
+        uSql,
+        input.id,
+        input.profileId,
+        input.groupId,
+        input.materialId,
+        input.postedAt,
+      );
+      syncPosterLogToPostBumpRecords(this.db, input);
+      const mSql =
+        'UPDATE group_poster_materials SET used_count=used_count+1,last_used_at=?,updated_at=? WHERE id=?';
+      Q.run(this.db, mSql, input.postedAt, input.postedAt, input.materialId);
       this.targetLibrary.incrementGroupPostedCount(input.groupId, 1);
       return true;
     });
   }
-
   logs(
     search = '',
     limit = 200,
     before?: number,
     beforeId = '\uffff',
     materialId?: string,
-  ): PosterLog[] {
-    const trimmedMaterialId = materialId?.trim() ?? '';
-    return this.db
-      .prepare(
-        `SELECT * FROM group_poster_logs
-          WHERE (posted_at<? OR (posted_at=? AND id<?))
-            AND (?='' OR material_id=?)
-            AND (?='' OR instr(lower(group_name||' '||group_id||' '||account_name||' '||account_id||' '||caption_preview||' '||post_url),lower(?))>0)
-          ORDER BY posted_at DESC,id DESC LIMIT ?`,
-      )
-      .all(
-        before ?? Date.now() + 1000,
-        before ?? Date.now() + 1000,
-        beforeId,
-        trimmedMaterialId,
-        trimmedMaterialId,
-        search,
-        search,
-        Math.max(1, Math.min(1000, limit)),
-      )
-      .map((r) => ({
-        id: String(r.id),
-        profileId: String(r.profile_id),
-        accountId: String(r.account_id),
-        accountName: String(r.account_name ?? ''),
-        accountAvatar: recordAvatarURL(
-          r.identity_type === 'page' ? 'page' : 'account',
-          String(r.account_id),
-        ),
-        identityType: String(r.identity_type) === 'page' ? 'page' : 'personal',
-        groupId: String(r.group_id),
-        groupName: String(r.group_name ?? ''),
-        groupAvatar: recordAvatarURL('group', String(r.group_id)),
-        materialId: String(r.material_id),
-        captionPreview: String(r.caption_preview ?? ''),
-        postId: String(r.post_id),
-        postUrl: String(r.post_url),
-        postedAt: Number(r.posted_at),
-      }));
+  ): GP.PosterLog[] {
+    const mid = materialId?.trim() ?? '',
+      sql = `SELECT p.*, COALESCE(u.material_id, '') AS material_id FROM post_bump_records p LEFT JOIN group_poster_usage u ON u.log_id = p.source_log_id WHERE p.record_type = 'post' AND p.status = 'success' AND (p.created_at < ? OR (p.created_at = ? AND COALESCE(p.source_log_id, p.id) < ?)) AND (?='' OR u.material_id=?) AND (?='' OR instr(lower(p.group_name||' '||p.group_id||' '||p.account_name||' '||p.account_id||' '||p.caption_preview||' '||p.post_url),lower(?))>0) ORDER BY p.created_at DESC, COALESCE(p.source_log_id, p.id) DESC LIMIT ?`;
+    const args = [
+      ...Q.cursorPaginationParams(before ?? Date.now() + 1000, beforeId),
+      mid,
+      mid,
+      search,
+      search,
+      Q.clampLimit(limit, 1, 1000),
+    ];
+    return Q.allRows(this.db, sql, ...args).map((r) => ({
+      id: Q.s(r.source_log_id ?? r.id),
+      profileId: Q.s(r.profile_id),
+      accountId: Q.s(r.account_id),
+      accountName: Q.s(r.account_name),
+      accountAvatar: recordAvatarURL(r.page_id ? 'page' : 'account', Q.s(r.account_id)),
+      identityType: r.page_id ? ('page' as const) : ('personal' as const),
+      groupId: Q.s(r.group_id),
+      groupName: Q.s(r.group_name),
+      groupAvatar: recordAvatarURL('group', Q.s(r.group_id)),
+      materialId: Q.s(r.material_id),
+      postId: Q.s(r.post_id),
+      postUrl: Q.s(r.post_url),
+      captionPreview: Q.s(r.caption_preview),
+      postedAt: Q.n(r.created_at),
+    }));
   }
-
-  pendingReviewOperations(limit = 100): PosterPendingOperation[] {
-    return this.db
-      .prepare(
-        `SELECT operation_id, profile_id, account_id, group_id, group_name, material_id, review_reason, updated_at
-           FROM group_poster_operations
-          WHERE status = 'PENDING_REVIEW'
-          ORDER BY updated_at DESC, operation_id DESC
-          LIMIT ?`,
-      )
-      .all(Math.max(1, Math.min(500, limit)))
-      .map((r) => ({
-        id: String(r.operation_id),
-        profileId: String(r.profile_id),
-        accountId: String(r.account_id),
-        groupId: String(r.group_id),
-        groupName: String(r.group_name),
-        materialId: r.material_id == null ? null : String(r.material_id),
-        reason: r.review_reason == null ? null : String(r.review_reason),
-        updatedAt: Number(r.updated_at ?? 0),
-      }));
+  pendingReviewOperations(limit = 100): GP.PosterPendingOperation[] {
+    const sql =
+      "SELECT operation_id AS id, profile_id, account_id, group_id, group_name, material_id, review_reason AS reason, updated_at FROM group_poster_operations WHERE status='PENDING_REVIEW' ORDER BY updated_at DESC, operation_id DESC LIMIT ?";
+    return Q.allRows(this.db, sql, Q.clampLimit(limit, 1, 500)).map(
+      (r) => Q.camel(r) as unknown as GP.PosterPendingOperation,
+    );
   }
-
   deleteLogs(input: unknown): number {
     const { ids, all } = z
       .object({ ids: z.array(z.string()).max(1000).default([]), all: z.boolean().default(false) })
       .strict()
       .parse(input);
     return transaction(this.db, () => {
-      const usageChanges = Number(
-        this.db
-          .prepare(
-            'DELETE FROM group_poster_usage WHERE ?=1 OR log_id IN(SELECT value FROM json_each(?))',
-          )
-          .run(all ? 1 : 0, JSON.stringify(ids)).changes,
-      );
-      const changes = Number(
-        this.db
-          .prepare(
-            'DELETE FROM group_poster_logs WHERE ?=1 OR id IN (SELECT value FROM json_each(?))',
-          )
-          .run(all ? 1 : 0, JSON.stringify(ids)).changes,
-      );
-      if (changes > 0 || usageChanges > 0) {
-        this.db
-          .prepare(
-            `UPDATE shared_facebook_groups
-                SET posted_count = (
-                  SELECT COUNT(*) FROM group_poster_usage
-                   WHERE group_poster_usage.group_id = shared_facebook_groups.group_id
-                )`,
-          )
-          .run();
-        this.db
-          .prepare(
-            `UPDATE group_poster_materials
-                SET used_count = (
-                  SELECT COUNT(*) FROM group_poster_usage
-                   WHERE group_poster_usage.material_id = group_poster_materials.id
-                )`,
-          )
-          .run();
+      const idJson = JSON.stringify(ids),
+        flag = all ? 1 : 0;
+      const oSql =
+        "DELETE FROM group_poster_operations WHERE kernel_settled=1 AND status='VERIFIED' AND (?=1 OR log_id IN (SELECT value FROM json_each(?)))";
+      const uSql =
+        'DELETE FROM group_poster_usage WHERE ?=1 OR log_id IN(SELECT value FROM json_each(?))';
+      const pSql =
+        "DELETE FROM post_bump_records WHERE record_type='post' AND (?=1 OR source_log_id IN (SELECT value FROM json_each(?)) OR id IN (SELECT value FROM json_each(?)))";
+      const opsCh = Number(Q.run(this.db, oSql, flag, idJson).changes);
+      const useCh = Number(Q.run(this.db, uSql, flag, idJson).changes);
+      const ch = Number(Q.run(this.db, pSql, flag, idJson, idJson).changes);
+      if (ch > 0 || useCh > 0 || opsCh > 0) {
+        const gSql =
+          'UPDATE shared_facebook_groups SET posted_count=(SELECT COUNT(*) FROM group_poster_usage WHERE group_poster_usage.group_id=shared_facebook_groups.group_id)';
+        const mSql =
+          'UPDATE group_poster_materials SET used_count=(SELECT COUNT(*) FROM group_poster_usage WHERE group_poster_usage.material_id=group_poster_materials.id)';
+        Q.run(this.db, gSql);
+        Q.run(this.db, mSql);
       }
-      return changes;
+      return ch;
     });
   }
-
-  total(): number {
-    return Number(this.db.prepare('SELECT COUNT(*) n FROM group_poster_logs').get()?.n ?? 0);
-  }
-
-  todayCounts(): Record<string, number> {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+  total = () => {
+    const sql =
+      "SELECT COUNT(*) n FROM post_bump_records WHERE record_type='post' AND status='success'";
+    return Q.countSql(this.db, sql);
+  };
+  todayCounts = (): Record<string, number> => {
+    const sql =
+      'SELECT profile_id,COUNT(*) n FROM group_poster_usage WHERE posted_at>=? GROUP BY profile_id';
     return Object.fromEntries(
-      this.db
-        .prepare(
-          'SELECT profile_id,COUNT(*) n FROM group_poster_usage WHERE posted_at>=? GROUP BY profile_id',
-        )
-        .all(today.getTime())
-        .map((r) => [String(r.profile_id), Number(r.n)]),
+      Q.allRows(this.db, sql, Q.localDayStartMs()).map((r) => [Q.s(r.profile_id), Q.n(r.n)]),
+    );
+  };
+  weeklyDailyCounts(now = Date.now()): BumperDailyStat[] {
+    const { startMs, endMs } = Q.localWeekWindow(now),
+      sql = 'SELECT posted_at FROM group_poster_usage WHERE posted_at >= ? AND posted_at < ?';
+    return Q.collectWeeklyDailyCounts(
+      Q.allRows(this.db, sql, startMs, endMs).map((r) => Q.n(r.posted_at)),
+      now,
     );
   }
-
-  weeklyDailyCounts(now = Date.now()): BumperDailyStat[] {
-    const base = new Date(now);
-    base.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(base);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const sixDaysAgo = new Date(base);
-    sixDaysAgo.setDate(sixDaysAgo.getDate() - 6);
-    const startMs = sixDaysAgo.getTime();
-    const endMs = tomorrow.getTime();
-
-    const buckets = new Map<string, number>();
-    const days: string[] = [];
-    for (let offset = 0; offset <= 6; offset += 1) {
-      const d = new Date(base);
-      d.setDate(d.getDate() - offset);
-      const ymd = formatLocalYmd(d);
-      days.push(ymd);
-      buckets.set(ymd, 0);
-    }
-
-    const rows = this.db
-      .prepare('SELECT posted_at FROM group_poster_usage WHERE posted_at >= ? AND posted_at < ?')
-      .all(startMs, endMs);
-    for (const r of rows) {
-      const ymd = formatLocalYmd(new Date(Number(r.posted_at)));
-      if (buckets.has(ymd)) {
-        buckets.set(ymd, (buckets.get(ymd) ?? 0) + 1);
-      }
-    }
-
-    return days.map((date) => ({ date, count: buckets.get(date) ?? 0 }));
-  }
-
-  saveProfileResult(input: unknown): void {
-    const result = ProfileTaskResult.parse(input);
-    const row = this.db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='profile_task_results'")
-      .get();
-    if (!row) return;
-    this.db
-      .prepare(
-        `INSERT INTO profile_task_results VALUES(?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(profile_id) DO UPDATE SET
-           source=excluded.source,
-           run_id=excluded.run_id,
-           name=excluded.name,
-           state=excluded.state,
-           reason=excluded.reason,
-           finished_at=excluded.finished_at,
-           failed_steps=excluded.failed_steps,
-           skipped_steps=excluded.skipped_steps`,
-      )
-      .run(
-        result.profileId,
-        result.source,
-        result.runId,
-        result.name,
-        result.state,
-        result.reason,
-        result.finishedAt,
-        result.failedSteps,
-        result.skippedSteps,
-      );
-  }
+  saveProfileResult = (input: unknown) => Q.upsertProfileTaskResult(this.db, input, true);
 }

@@ -1,7 +1,11 @@
-export function toggleSet(current: ReadonlySet<string>, ids: string[], checked: boolean) {
+export function toggleSet(
+  current: ReadonlySet<string>,
+  ids: string | readonly string[],
+  checked?: boolean,
+) {
   const next = new Set(current);
-  for (const id of ids) {
-    if (checked) next.add(id);
+  for (const id of typeof ids === 'string' ? [ids] : ids) {
+    if (checked ?? !next.has(id)) next.add(id);
     else next.delete(id);
   }
   return next;

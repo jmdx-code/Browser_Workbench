@@ -1,83 +1,29 @@
-import { finderListMigration, SqliteTargetLists } from './target-list-store.js';
-import { recordRetentionMigration } from './record-retention-migration.js';
-import { taskSessionEndMigration } from './task-session-end-migration.js';
-import { marketplaceSkipMigration } from './marketplace-skip-migration.js';
-import {
-  SqliteTargetLibraryRepository,
-  unifiedTargetLibraryMigration,
-} from './target-library-store.js';
-import {
-  groupBumperOperationsMigration,
-  groupBumperMigration,
-  SqliteGroupBumperRepository,
-} from './group-bumper-store.js';
-import {
-  SqliteGroupPosterRepository,
-  rebuildGroupPosterOperationsEpochTextMigration,
-  stage3OperationsAndDecouplingMigration,
-  stage4MediaAndPolishMigration,
-} from './group-poster-store.js';
-import { profileTaskResultMigration } from './profile-task-result-migration.js';
-import { DEFAULT_CONCURRENT_PROFILES } from '../shared/task-capacity.js';
-import { groupInviterConfirmationMigration } from './group-inviter-store.js';
-import {
-  SqliteDataCleanup,
-  dataCleanupMigration,
-  physicalHistoryCleanupMigration,
-  cleanupQuotaMigration,
-  cleanupIndexesMigration,
-} from './data-cleanup-store.js';
+import { SqliteTargetLists } from './target-list-store.js';
+import { SqliteTargetLibraryRepository } from './target-library-store.js';
+import { SqliteGroupBumperRepository } from './group-bumper-store.js';
+import { SqliteGroupPosterRepository } from './group-poster-store.js';
+import { DEFAULT_CONCURRENT_PROFILES } from '../shared/task-policies.js';
+import { SqliteDataCleanup } from './data-cleanup-store.js';
 import type { SynchronousRepository } from '../domain/persistence.js';
-import { taskRecordMigration } from './task-record-migration.js';
-import { taskCapacityMigration } from './task-capacity-migration.js';
+import { SqlitePostBumpRecordsRepository } from './post-bump-records-store.js';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import { access } from 'node:fs/promises';
+import { access, readdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
-import { taskMigration } from './task-migration.js';
-import { taskExecutionMigration } from './task-execution-migration.js';
-import { taskTabMigration } from './task-tab-migration.js';
-import { settlementMigration } from './settlement-migration.js';
-import { taskControlMigration } from './task-control-migration.js';
-import { SqliteTaskControlRepository } from './task-control-store.js';
-import { browseIntentMigration } from './browse-intent-migration.js';
-import { SqliteBrowseIntentRepository } from './browse-intent-store.js';
-import { materialIndexMigration } from './material-index-migration.js';
-import { SqliteMaterialIndexRepository } from './material-index-store.js';
-import { materialPostMigration } from './material-post-migration.js';
-import { SqliteMaterialPostRepository } from './material-post-store.js';
-import { materialUploadStageMigration } from './material-upload-stage-migration.js';
-import { SqliteMaterialUploadStageRepository } from './material-upload-stage-store.js';
-import { materialCacheCleanupMigration } from './material-cache-cleanup-migration.js';
-import { SqliteMaterialCacheCleanupRepository } from './material-cache-cleanup-store.js';
-import { materialArchivePreparationMigration } from './material-archive-migration.js';
-import { SqliteMaterialArchivePreparationRepository } from './material-archive-store.js';
-import { SqliteTaskTabRepository } from './task-tab-store.js';
 import { SqliteTaskRepository } from './task-store.js';
 import { transaction } from './sqlite-transaction.js';
 import { prepareCached } from './sqlite-statement-cache.js';
-import { resourceTableMigration } from './resource-table-migration.js';
-import { taskResourceMigration } from './task-resource-migration.js';
 import { SqliteResourceTableRepository } from './resource-table-store.js';
-import { postObservationMigration } from './post-observation-migration.js';
-import { materialArchiveExecutionMigration } from './material-archive-execution-migration.js';
-import { browseActionMigration } from './browse-action-migration.js';
-import { taskEndingMigration } from './task-ending-migration.js';
-import { marketplaceTaskMigration } from './marketplace-task-migration.js';
-import { materialUsageMigration } from './material-usage-migration.js';
-import { marketplaceFilterMigration } from './marketplace-filter-migration.js';
-import { taskTimingMigration } from './task-timing-migration.js';
-import { taskStepOutcomeMigration } from './task-step-outcome-migration.js';
-import { taskPageLifecycleMigration } from './task-page-lifecycle-migration.js';
-import { storyVideoDerivationMigration } from './story-video-derivation-migration.js';
 import { SqliteMaterialUsageRepository } from './material-usage-store.js';
-import { SqliteMaterialArchiveExecutionRepository } from './material-archive-execution-store.js';
-import { assertArchiveSourcesAvailable } from './material-archive-source-protection.js';
-import { SqliteFacebookSubmissionObservationRepository } from './facebook-submission-observation-store.js';
 import { SqliteGroupInviterRepository } from './group-inviter-store.js';
 import { SqliteBluestacksRepository } from './bluestacks-store.js';
 import { SqliteAutoSchedulerRepository } from './auto-scheduler-store.js';
 import { SqliteGoogleSheetsRepository } from './google-sheets-store.js';
+import * as Q from './persistence/sqlite-query-helpers.js';
+import {
+  initializeOrMigrateWorkspaceDb,
+  workspaceSchemaVersion,
+} from './persistence/workspace-migrations.js';
 import {
   type AccountCacheUpdateInput,
   mergeAccountCacheUpdate,
@@ -104,7 +50,6 @@ import {
 } from '../shared/workspace-preferences.js';
 import {
   CombinationSchema,
-  CombinationDraftSchema,
   SavedCombinationSchema,
   type Combination,
   type Group,
@@ -112,212 +57,58 @@ import {
   type SavedCombination,
 } from '../shared/contracts.js';
 
-type MigrationSpec =
-  | string
-  | {
-      readonly run: (db: DatabaseSync) => void;
-      readonly rebuild?: boolean;
-    };
+export { workspaceSchemaVersion };
 
-const migrations: readonly MigrationSpec[] = [
-  [
-    'CREATE TABLE groups(id TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,color TEXT NOT NULL,sort_order INTEGER NOT NULL)',
-    'CREATE TABLE profile_metadata(profile_id TEXT PRIMARY KEY,group_id TEXT REFERENCES groups(id),alias TEXT)',
-    'CREATE TABLE combinations(id TEXT PRIMARY KEY,current_version INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL DEFAULT 0,draft TEXT,updated_at INTEGER NOT NULL)',
-    'CREATE TABLE combination_versions(combination_id TEXT NOT NULL REFERENCES combinations(id),version INTEGER NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(combination_id,version))',
-    "CREATE TRIGGER immutable_combination_version BEFORE UPDATE ON combination_versions BEGIN SELECT RAISE(ABORT, 'IMMUTABLE_COMBINATION_VERSION'); END",
-  ].join(';'),
-  taskMigration,
-  taskExecutionMigration,
-  taskTabMigration,
-  settlementMigration,
-  taskControlMigration,
-  browseIntentMigration,
-  materialIndexMigration,
-  materialPostMigration,
-  materialUploadStageMigration,
-  materialCacheCleanupMigration,
-  materialArchivePreparationMigration,
-  resourceTableMigration,
-  taskResourceMigration,
-  postObservationMigration,
-  materialArchiveExecutionMigration,
-  browseActionMigration,
-  taskEndingMigration,
-  marketplaceTaskMigration,
-  materialUsageMigration,
-  marketplaceFilterMigration,
-  taskTimingMigration,
-  taskStepOutcomeMigration,
-  taskPageLifecycleMigration,
-  "UPDATE workspace_execution_contracts SET version=2 WHERE name='task-page-lifecycle'",
-  "INSERT INTO workspace_execution_contracts(name,version) VALUES('post-home-preparation',1)",
-  "INSERT INTO workspace_execution_contracts(name,version) VALUES('browse-wheel-visual-anchor',2)",
-  "CREATE TABLE workspace_preferences(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL CHECK(revision>=0),default_time_zone TEXT,desktop_notifications TEXT NOT NULL CHECK(desktop_notifications IN ('off','failures','all'))); INSERT INTO workspace_preferences VALUES(1,0,NULL,'off')",
-  'ALTER TABLE workspace_preferences ADD COLUMN log_retention_days INTEGER NOT NULL DEFAULT 14 CHECK(log_retention_days BETWEEN 1 AND 90)',
-  "INSERT INTO workspace_execution_contracts(name,version) VALUES('post-native-background',1); CREATE UNIQUE INDEX one_original_post_background ON material_post_operations(attempt_id) WHERE purpose='SET_BACKGROUND'",
-  "INSERT INTO workspace_execution_contracts(name,version) VALUES('story-friends-privacy',1); CREATE UNIQUE INDEX one_original_story_friends ON material_post_operations(attempt_id) WHERE purpose='SELECT_FRIENDS'; CREATE UNIQUE INDEX one_original_story_audience_check ON material_post_operations(attempt_id) WHERE purpose='VERIFY_AUDIENCE'; CREATE UNIQUE INDEX one_original_story_audience_close ON material_post_operations(attempt_id) WHERE purpose='CLOSE_AUDIENCE'",
-  "INSERT INTO workspace_execution_contracts(name,version) VALUES('post-ai-label',1); CREATE UNIQUE INDEX one_original_post_ai_open ON material_post_operations(attempt_id) WHERE purpose='OPEN_AI_LABEL'; CREATE UNIQUE INDEX one_original_post_ai_set ON material_post_operations(attempt_id) WHERE purpose='SET_AI_LABEL'; CREATE UNIQUE INDEX one_original_post_ai_confirm ON material_post_operations(attempt_id) WHERE purpose='CONFIRM_AI_LABEL'",
-  storyVideoDerivationMigration,
-  taskRecordMigration,
-  taskCapacityMigration,
-  dataCleanupMigration,
-  'ALTER TABLE workspace_preferences ADD COLUMN window_layout TEXT',
-  profileTaskResultMigration,
-  groupInviterConfirmationMigration,
-  physicalHistoryCleanupMigration,
-  cleanupQuotaMigration,
-  cleanupIndexesMigration,
-  groupBumperMigration,
-  '-- finder-list-migration-44',
-  [
-    'CREATE INDEX IF NOT EXISTS task_settlement_notices_profile_order ON task_settlement_notices(profile_id, created_at, operation_id, kind)',
-    'CREATE INDEX IF NOT EXISTS task_settlement_delivery_state_due ON task_settlement_delivery(state, next_attempt_at, operation_id, kind)',
-  ].join(';'),
-  [
-    'CREATE INDEX IF NOT EXISTS task_plans_account_id ON task_plans(account_id)',
-    "CREATE INDEX IF NOT EXISTS task_browse_intents_like_content ON task_browse_intents(job_id, json_extract(body, '$.intent.contentId')) WHERE json_extract(body, '$.intent.kind') = 'like'",
-    "CREATE INDEX IF NOT EXISTS task_events_notification_due ON task_events(sequence, type) WHERE type IN ('FAILED', 'COMPLETED')",
-  ].join(';'),
-  groupBumperOperationsMigration,
-  {
-    rebuild: true,
-    run: (db) => {
-      db.exec(`
-        DROP TRIGGER IF EXISTS profile_task_result_terminal;
-        CREATE TABLE profile_task_results_next (
-          profile_id TEXT PRIMARY KEY,
-          source TEXT NOT NULL CHECK(source IN ('task', 'group-inviter', 'group-bumper', 'page-bumper', 'group-poster')),
-          run_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('COMPLETED', 'FAILED', 'STOPPED')),
-          reason TEXT NOT NULL,
-          finished_at INTEGER NOT NULL,
-          failed_steps INTEGER NOT NULL DEFAULT 0,
-          skipped_steps INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO profile_task_results_next
-        SELECT
-          profile_id,
-          CASE
-            WHEN source = 'group-bumper' AND name = '小组发帖' THEN 'group-poster'
-            WHEN source = 'group-bumper' AND name = '专页顶贴' THEN 'page-bumper'
-            ELSE source
-          END,
-          run_id, name, state, reason, finished_at, failed_steps, skipped_steps
-        FROM profile_task_results;
-        DROP TABLE profile_task_results;
-        ALTER TABLE profile_task_results_next RENAME TO profile_task_results;
-        CREATE TRIGGER profile_task_result_terminal AFTER INSERT ON task_events
-          WHEN NEW.type IN ('COMPLETED', 'FAILED', 'STOPPED') BEGIN
-          INSERT INTO profile_task_results
-            SELECT profile_id, 'task', id, json_extract(snapshot, '$.name'), state, reason, NEW.created_at,
-              (SELECT count(*) FROM task_steps WHERE job_id = NEW.job_id AND json_extract(outcome, '$.kind') = 'FAILED'),
-              (SELECT count(*) FROM task_steps WHERE job_id = NEW.job_id AND json_extract(outcome, '$.kind') = 'SKIPPED')
-            FROM task_plans WHERE id = NEW.job_id AND state IN ('COMPLETED', 'FAILED', 'STOPPED')
-          ON CONFLICT(profile_id) DO UPDATE SET
-            source = excluded.source, run_id = excluded.run_id, name = excluded.name,
-            state = excluded.state, reason = excluded.reason, finished_at = excluded.finished_at,
-            failed_steps = excluded.failed_steps, skipped_steps = excluded.skipped_steps;
-        END;
-      `);
-    },
-  },
-  {
-    rebuild: true,
-    run: (db) => {
-      unifiedTargetLibraryMigration(db);
-    },
-  },
-  {
-    run: (db) => {
-      stage3OperationsAndDecouplingMigration(db);
-    },
-  },
-  {
-    run: (db) => {
-      stage4MediaAndPolishMigration(db);
-    },
-  },
-  {
-    rebuild: true,
-    run: (db) => {
-      rebuildGroupPosterOperationsEpochTextMigration(db);
-    },
-  },
-  {
-    run: (db) => {
-      db.exec(taskSessionEndMigration);
-    },
-  },
-  { run: recordRetentionMigration },
-  {
-    run: (db) => {
-      db.exec(marketplaceSkipMigration);
-    },
-  },
-];
-export const workspaceSchemaVersion = migrations.length;
+const VALID_ACCOUNT_STATES = new Set([
+  'unknown',
+  'logged-in',
+  'logged-out',
+  'restricted',
+  'verification',
+]);
 
 export class WorkspaceStore implements WorkspaceRepository {
-  private stmt(sql: string) {
-    return prepareCached(this.db, sql);
-  }
-  targetFolders(kind: import('../shared/target-list.js').TargetListKind) {
-    return new SqliteTargetLists(this.db).folders(kind);
-  }
-  targetListCommand(input: unknown) {
-    return new SqliteTargetLists(this.db).command(input);
-  }
+  private stmt = (sql: string) => prepareCached(this.db, sql);
+  targetFolders = (kind: import('../shared/target-list.js').TargetListKind) =>
+    new SqliteTargetLists(this.db).folders(kind);
+  targetListCommand = (input: unknown) => new SqliteTargetLists(this.db).command(input);
   reorderGroups(ids: string[]) {
     return this.transaction(() => {
-      const known = new Set(this.groups().map((g) => g.id));
-      if (
-        ids.length !== known.size ||
-        new Set(ids).size !== known.size ||
-        ids.some((id) => !known.has(id))
-      )
-        throw new ProductError('GROUP_ORDER_INVALID', '分组列表已变化，请刷新');
+      const curIds = new Set(this.groups().map((g) => g.id));
+      Q.assertCompleteIdOrder(ids, curIds, 'GROUP_ORDER_INVALID', '分组列表已变化，请刷新');
       const stmt = this.stmt('UPDATE groups SET sort_order=? WHERE id=?');
       ids.forEach((id, i) => stmt.run(i, id));
     });
   }
   ensureProfileOrders(ids: string[]) {
+    const insSql = 'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,NULL,?)';
     this.transaction(() => {
-      let next = Number(
-        this.stmt(
-          'SELECT COALESCE(MAX(sort_order),-1)+1 n FROM profile_metadata WHERE group_id IS NULL',
-        ).get()?.n,
-      );
+      let next = Q.nextSortOrder(this.db, 'profile_metadata', 'group_id IS NULL');
       const get = this.stmt('SELECT 1 FROM profile_metadata WHERE profile_id=?'),
-        insert = this.stmt(
-          'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,NULL,?)',
-        );
-      for (const id of ids) if (!get.get(id)) insert.run(id, next++);
+        ins = this.stmt(insSql);
+      for (const id of ids) if (!get.get(id)) ins.run(id, next++);
     });
   }
   reorderProfiles(ids: string[], groupId: string | null) {
+    const insSql =
+      'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order';
+    const selSql =
+      'SELECT profile_id FROM profile_metadata WHERE group_id IS ? ORDER BY sort_order,profile_id';
     return this.transaction(() => {
       if (groupId && !this.stmt('SELECT id FROM groups WHERE id=?').get(groupId))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在', 404);
-      const stmt = this.stmt(
-        'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order',
-      );
-      const moved = [...new Set(ids)];
-      const rest = this.stmt(
-        'SELECT profile_id FROM profile_metadata WHERE group_id IS ? ORDER BY sort_order,profile_id',
-      )
+      const stmt = this.stmt(insSql),
+        moved = [...new Set(ids)];
+      const rest = this.stmt(selSql)
         .all(groupId)
-        .map((row) => String(row.profile_id))
+        .map((r) => String(r.profile_id))
         .filter((id) => !moved.includes(id));
       [...moved, ...rest].forEach((id, i) => stmt.run(id, groupId, i));
     });
   }
-
   maintenanceSettings() {
-    const row = this.stmt(
-      'SELECT revision,log_retention_days FROM workspace_preferences WHERE id=1',
-    ).get();
+    const sql = 'SELECT revision,log_retention_days FROM workspace_preferences WHERE id=1';
+    const row = this.stmt(sql).get();
     return MaintenanceSettings.parse({
       version: 1,
       revision: row?.revision,
@@ -325,12 +116,11 @@ export class WorkspaceStore implements WorkspaceRepository {
     });
   }
   updateMaintenanceSettings(input: MaintenanceUpdate) {
-    const request = UpdateMaintenanceSettings.parse(input);
+    const req = UpdateMaintenanceSettings.parse(input),
+      sql =
+        'UPDATE workspace_preferences SET revision=revision+1,log_retention_days=? WHERE id=1 AND revision=?';
     return transaction(this.db, () => {
-      const changed = this.stmt(
-        'UPDATE workspace_preferences SET revision=revision+1,log_retention_days=? WHERE id=1 AND revision=?',
-      ).run(request.logRetentionDays, request.expectedRevision);
-      if (changed.changes !== 1)
+      if (this.stmt(sql).run(req.logRetentionDays, req.expectedRevision).changes !== 1)
         throw new ProductError(
           'PREFERENCES_REVISION_CONFLICT',
           '设置已在其他窗口修改，请重新读取后保存',
@@ -339,20 +129,19 @@ export class WorkspaceStore implements WorkspaceRepository {
       return this.maintenanceSettings();
     });
   }
-  taskNotificationCursor() {
-    return Number(
+  taskNotificationCursor = () =>
+    Number(
       this.stmt('SELECT coalesce(max(sequence),0) AS sequence FROM task_events').get()?.sequence,
     );
-  }
   taskNotificationEvents(after: number) {
     if (!Number.isSafeInteger(after) || after < 0) throw Error('TASK_NOTIFICATION_CURSOR_INVALID');
-    return this.stmt(
-      "SELECT sequence,type FROM task_events WHERE sequence>? AND type IN ('FAILED','COMPLETED') ORDER BY sequence LIMIT 100",
-    )
+    const sql =
+      "SELECT sequence,type FROM task_events WHERE sequence>? AND type IN ('FAILED','COMPLETED') ORDER BY sequence LIMIT 100";
+    return this.stmt(sql)
       .all(after)
-      .map((row) => ({
-        sequence: Number(row.sequence),
-        type: row.type === 'FAILED' ? ('FAILED' as const) : ('COMPLETED' as const),
+      .map((r) => ({
+        sequence: Number(r.sequence),
+        type: r.type === 'FAILED' ? ('FAILED' as const) : ('COMPLETED' as const),
       }));
   }
   preferences() {
@@ -373,39 +162,31 @@ export class WorkspaceStore implements WorkspaceRepository {
     });
   }
   updatePreferences(input: PreferenceUpdate) {
-    const request = UpdateWorkspacePreferences.parse(input);
+    const req = UpdateWorkspacePreferences.parse(input),
+      v = req.values;
     return transaction(this.db, () => {
-      const changed =
-        request.values.combinationColors !== undefined
-          ? this.db
-              .prepare(
-                'UPDATE workspace_preferences SET revision=revision+1,default_time_zone=?,desktop_notifications=?,combination_colors=? WHERE id=1 AND revision=?',
-              )
-              .run(
-                request.values.defaultTimeZone,
-                request.values.desktopNotifications,
-                JSON.stringify(request.values.combinationColors),
-                request.expectedRevision,
-              )
-          : this.db
-              .prepare(
-                'UPDATE workspace_preferences SET revision=revision+1,default_time_zone=?,desktop_notifications=? WHERE id=1 AND revision=?',
-              )
-              .run(
-                request.values.defaultTimeZone,
-                request.values.desktopNotifications,
-                request.expectedRevision,
-              );
-      if (changed.changes !== 1)
+      const hasColors = v.combinationColors !== undefined;
+      const sql = hasColors
+        ? 'UPDATE workspace_preferences SET revision=revision+1,default_time_zone=?,desktop_notifications=?,combination_colors=? WHERE id=1 AND revision=?'
+        : 'UPDATE workspace_preferences SET revision=revision+1,default_time_zone=?,desktop_notifications=? WHERE id=1 AND revision=?';
+      const args = hasColors
+        ? [
+            v.defaultTimeZone,
+            v.desktopNotifications,
+            JSON.stringify(v.combinationColors),
+            req.expectedRevision,
+          ]
+        : [v.defaultTimeZone, v.desktopNotifications, req.expectedRevision];
+      if (this.stmt(sql).run(...args).changes !== 1)
         throw new ProductError(
           'PREFERENCES_REVISION_CONFLICT',
           '设置已在其他窗口修改，请重新读取后保存',
           409,
         );
-      if (request.values.windowLayout !== undefined)
-        this.db
-          .prepare('UPDATE workspace_preferences SET window_layout=? WHERE id=1')
-          .run(JSON.stringify(request.values.windowLayout));
+      if (v.windowLayout !== undefined)
+        this.stmt('UPDATE workspace_preferences SET window_layout=? WHERE id=1').run(
+          JSON.stringify(v.windowLayout),
+        );
       return this.preferences();
     });
   }
@@ -416,16 +197,6 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly resourceTables: SqliteResourceTableRepository;
   readonly tasks: SqliteTaskRepository;
   readonly dataCleanup: SqliteDataCleanup;
-  readonly taskTabs: SqliteTaskTabRepository;
-  readonly taskControls: SqliteTaskControlRepository;
-  readonly browseIntents: SqliteBrowseIntentRepository;
-  readonly materials: SqliteMaterialIndexRepository;
-  readonly materialPosts: SqliteMaterialPostRepository;
-  readonly uploadStages: SqliteMaterialUploadStageRepository;
-  readonly cacheCleanup: SqliteMaterialCacheCleanupRepository;
-  readonly archivePreparation: SqliteMaterialArchivePreparationRepository;
-  readonly archiveExecution: SqliteMaterialArchiveExecutionRepository;
-  readonly submissionObservations: SqliteFacebookSubmissionObservationRepository;
   readonly targetLibrary: SqliteTargetLibraryRepository;
   readonly groupInviter: SqliteGroupInviterRepository;
   readonly groupBumper: SqliteGroupBumperRepository;
@@ -433,28 +204,12 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly bluestacks: SqliteBluestacksRepository;
   readonly autoScheduler: SqliteAutoSchedulerRepository;
   readonly googleSheets: SqliteGoogleSheetsRepository;
+  readonly postBumpRecords: SqlitePostBumpRecordsRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
     this.tasks = new SqliteTaskRepository(db);
     this.dataCleanup = new SqliteDataCleanup(db, () => this.tasks.invalidateBatchTimingCache());
-    this.taskTabs = new SqliteTaskTabRepository(db, this.tasks);
-    this.taskControls = new SqliteTaskControlRepository(db, this.tasks);
-    this.browseIntents = new SqliteBrowseIntentRepository(db, this.tasks);
-    this.materials = new SqliteMaterialIndexRepository(db, this.tasks, this.taskTabs);
-    this.materialPosts = new SqliteMaterialPostRepository(db, this.tasks);
-    this.uploadStages = new SqliteMaterialUploadStageRepository(db, this.taskTabs);
-    this.cacheCleanup = new SqliteMaterialCacheCleanupRepository(
-      db,
-      this.uploadStages,
-      this.taskTabs,
-    );
-    this.archivePreparation = new SqliteMaterialArchivePreparationRepository(db);
-    this.archiveExecution = new SqliteMaterialArchiveExecutionRepository(
-      db,
-      this.archivePreparation,
-    );
-    this.submissionObservations = new SqliteFacebookSubmissionObservationRepository(db);
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
     this.groupInviter = new SqliteGroupInviterRepository(db);
     this.groupBumper = new SqliteGroupBumperRepository(db);
@@ -462,6 +217,7 @@ export class WorkspaceStore implements WorkspaceRepository {
     this.bluestacks = new SqliteBluestacksRepository(db);
     this.autoScheduler = new SqliteAutoSchedulerRepository(db);
     this.googleSheets = new SqliteGoogleSheetsRepository(db);
+    this.postBumpRecords = new SqlitePostBumpRecordsRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -474,91 +230,35 @@ export class WorkspaceStore implements WorkspaceRepository {
     const db = new DatabaseSync(file);
     try {
       db.exec('PRAGMA busy_timeout=5000');
-      const version = db.prepare('PRAGMA user_version').get()?.user_version;
-      if (typeof version !== 'number' || version > migrations.length)
-        throw new ProductError('DATABASE_VERSION_TOO_NEW', '数据库版本不兼容，已停止打开', 409);
-      if (existed && version < migrations.length) onProgress?.(0, 0);
-      if (existed && version < migrations.length)
-        await backup(db, file + '.before-v' + migrations.length + '-' + Date.now() + '.sqlite');
-      db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL');
-      try {
-        db.exec('PRAGMA wal_checkpoint(PASSIVE)');
-      } catch {}
-      for (let next = version; next < migrations.length; next++) {
-        const entry = migrations[next];
-        if (!entry) throw new Error('MIGRATION_MISSING');
-        const rebuild =
-          typeof entry === 'string'
-            ? entry === materialUsageMigration ||
-              entry === taskStepOutcomeMigration ||
-              entry === taskPageLifecycleMigration
-            : Boolean(entry.rebuild);
-        if (rebuild) db.exec('PRAGMA foreign_keys=OFF');
-        db.exec('BEGIN IMMEDIATE');
-        try {
-          if (typeof entry === 'string') {
-            if (
-              entry !== cleanupQuotaMigration ||
-              !db
-                .prepare('PRAGMA table_info(data_cleanup_settings)')
-                .all()
-                .some((column) => column.name === 'history_max_count')
-            )
-              if (next === 43) finderListMigration(db);
-              else db.exec(entry);
-          } else {
-            entry.run(db);
-          }
-          if (rebuild && db.prepare('PRAGMA foreign_key_check').all().length)
-            throw Error('MATERIAL_USAGE_MIGRATION_FOREIGN_KEY_FAILED');
-          db.exec('PRAGMA user_version=' + (next + 1));
-          db.exec('COMMIT');
-        } catch (error) {
-          db.exec('ROLLBACK');
-          throw error;
-        } finally {
-          if (rebuild) db.exec('PRAGMA foreign_keys=ON');
-        }
-      }
-      const prefColumns = db.prepare('PRAGMA table_info(workspace_preferences)').all() as {
-        name: string;
-      }[];
-      if (!prefColumns.some((col) => col.name === 'combination_colors'))
-        db.exec(
-          "ALTER TABLE workspace_preferences ADD COLUMN combination_colors TEXT NOT NULL DEFAULT '{}'",
-        );
-      const comboColumns = db.prepare('PRAGMA table_info(combinations)').all() as {
-        name: string;
-      }[];
-      if (!comboColumns.some((col) => col.name === 'deleted_at'))
-        db.exec('ALTER TABLE combinations ADD COLUMN deleted_at INTEGER DEFAULT NULL');
-      db.exec(
-        "CREATE TABLE IF NOT EXISTS profile_account_cache(profile_id TEXT PRIMARY KEY,account_state TEXT NOT NULL DEFAULT 'unknown',account_id TEXT,account_name TEXT,avatar_url TEXT,avatar_updated_at INTEGER NOT NULL DEFAULT 0)",
-      );
-      db.exec(
-        'CREATE INDEX IF NOT EXISTS record_account_avatar ON profile_account_cache(account_id)',
-      );
-      db.exec(
-        'CREATE TABLE IF NOT EXISTS profile_launch_bindings(profile_id TEXT PRIMARY KEY,browser_kind TEXT NOT NULL,executable_path TEXT NOT NULL,user_data_dir TEXT NOT NULL,profile_directory TEXT NOT NULL,browser_name TEXT NOT NULL,window_name TEXT NOT NULL,verified_at INTEGER NOT NULL DEFAULT 0)',
-      );
-      const store = new WorkspaceStore(db);
+      const version = await initializeOrMigrateWorkspaceDb(db, file, existed, onProgress),
+        store = new WorkspaceStore(db);
       store.resourceTables.pruneConsumedRows();
-      // Auto-reclaim excessive SQLite freelist bloat (>10MB and >30% empty pages) safely on startup
       if (existed && file !== ':memory:') {
         try {
-          const pageCount = Number(db.prepare('PRAGMA page_count').get()?.page_count ?? 0);
-          const freelistCount = Number(
-            db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0,
+          const pages = Number(db.prepare('PRAGMA page_count').get()?.page_count ?? 0),
+            free = Number(db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0);
+          if (
+            version < workspaceSchemaVersion ||
+            (pages > 0 && free >= 1024 && free / pages > 0.25)
+          )
+            db.exec(
+              'PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);',
+            );
+        } catch {}
+        try {
+          const dir = path.dirname(file),
+            prefix = path.basename(file) + '.before-v';
+          const entries = (await readdir(dir)).filter(
+            (n) => n.startsWith(prefix) && n.endsWith('.sqlite'),
           );
-          if (pageCount > 0 && freelistCount >= 2560 && freelistCount / pageCount > 0.3) {
-            db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
+          if (entries.length > 2) {
+            const stampOf = (n: string) => Number(/-(\d+)\.sqlite$/.exec(n)?.[1] ?? 0);
+            entries.sort((a, b) => stampOf(b) - stampOf(a) || b.localeCompare(a));
+            for (const stale of entries.slice(2))
+              await unlink(path.join(dir, stale)).catch(() => {});
           }
-        } catch {
-          // Best-effort compaction; never block startup
-        }
+        } catch {}
       }
-      // Initialize only a new database. Existing user choices survive reopen
-      // and upgrades; the running installation can be changed through Settings.
       if (version === 0)
         store.tasks.setSettings({ maxConcurrentProfiles: DEFAULT_CONCURRENT_PROFILES });
       await store.tasks.recordReader.initialize(onProgress);
@@ -569,27 +269,21 @@ export class WorkspaceStore implements WorkspaceRepository {
     }
   }
   close() {
-    this.tasks.closeCheckpoints();
     try {
       this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     } catch {}
     this.db.close();
   }
-  private transaction<T>(work: () => T): T {
-    return transaction(this.db, work);
-  }
-  groups(): Group[] {
-    return this.stmt(
-      'SELECT id,name,color,sort_order AS "order" FROM groups ORDER BY sort_order,id',
-    )
+  private transaction = <T>(work: () => T): T => transaction(this.db, work);
+  groups = (): Group[] =>
+    this.stmt('SELECT id,name,color,sort_order AS "order" FROM groups ORDER BY sort_order,id')
       .all()
-      .map((row) => ({
-        id: String(row.id),
-        name: String(row.name),
-        color: row.color as Group['color'],
-        order: Number(row.order),
+      .map((r) => ({
+        id: String(r.id),
+        name: String(r.name),
+        color: r.color as Group['color'],
+        order: Number(r.order),
       }));
-  }
   createGroup(name: string, color: Group['color']): Group {
     return this.transaction(() => {
       if (this.stmt('SELECT id FROM groups WHERE name=?').get(name))
@@ -609,12 +303,12 @@ export class WorkspaceStore implements WorkspaceRepository {
     });
   }
   deleteGroup(id: string): number {
+    const sql =
+      'SELECT profile_id FROM profile_metadata WHERE group_id=? ORDER BY sort_order,profile_id';
     return this.transaction(() => {
       if (!this.stmt('SELECT id FROM groups WHERE id=?').get(id))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在，请重新读取列表', 404);
-      const ids = this.stmt(
-        'SELECT profile_id FROM profile_metadata WHERE group_id=? ORDER BY sort_order,profile_id',
-      )
+      const ids = this.stmt(sql)
         .all(id)
         .map((r) => String(r.profile_id));
       this.moveProfiles(ids, null);
@@ -623,208 +317,138 @@ export class WorkspaceStore implements WorkspaceRepository {
     });
   }
   moveProfiles(profileIds: string[], groupId: string | null) {
+    const sql =
+      'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order';
     this.transaction(() => {
       if (groupId && !this.stmt('SELECT id FROM groups WHERE id=?').get(groupId))
         throw new ProductError('GROUP_NOT_FOUND', '分组不存在', 404);
-      const insert = this.stmt(
-        'INSERT INTO profile_metadata(profile_id,group_id,sort_order) VALUES(?,?,?) ON CONFLICT(profile_id) DO UPDATE SET group_id=excluded.group_id,sort_order=excluded.sort_order',
-      );
-      let order = Number(
-        this.stmt(
-          'SELECT COALESCE(MAX(sort_order),-1)+1 n FROM profile_metadata WHERE group_id IS ?',
-        ).get(groupId)?.n,
-      );
+      const insert = this.stmt(sql);
+      let order = Q.nextSortOrder(this.db, 'profile_metadata', 'group_id IS ?', groupId);
       for (const id of new Set(profileIds)) insert.run(id, groupId, order++);
     });
   }
-  renameProfile(id: string, alias: string) {
-    this.stmt(
-      'INSERT INTO profile_metadata(profile_id,alias) VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET alias=excluded.alias',
-    ).run(id, alias);
-  }
+  renameProfile = (id: string, alias: string) => {
+    const sql =
+      'INSERT INTO profile_metadata(profile_id,alias) VALUES(?,?) ON CONFLICT(profile_id) DO UPDATE SET alias=excluded.alias';
+    this.stmt(sql).run(id, alias);
+  };
   deleteProfiles(profileIds: string[]): number {
     return this.transaction(() => {
-      const uniqueIds = [...new Set(profileIds)];
-      for (const id of uniqueIds) {
-        const active = this.stmt(
-          "SELECT id FROM task_plans WHERE profile_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1",
-        ).get(id);
-        if (active)
+      const uniqueIds = [...new Set(profileIds)],
+        busySql =
+          "SELECT id FROM task_plans WHERE profile_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1";
+      for (const id of uniqueIds)
+        if (this.stmt(busySql).get(id))
           throw new ProductError('PROFILE_TASK_ACTIVE', '请先停止或完成该浏览器的任务再删除', 409);
-      }
-      const delMeta = this.stmt('DELETE FROM profile_metadata WHERE profile_id=?');
-      const delCache = this.stmt('DELETE FROM profile_account_cache WHERE profile_id=?');
-      const delResult = this.stmt('DELETE FROM profile_task_results WHERE profile_id=?');
-      const delBinding = this.stmt('DELETE FROM profile_launch_bindings WHERE profile_id=?');
-      for (const id of uniqueIds) {
-        delMeta.run(id);
-        delCache.run(id);
-        delResult.run(id);
-        delBinding.run(id);
+      const tables = [
+        'profile_metadata',
+        'profile_account_cache',
+        'profile_task_results',
+        'profile_launch_bindings',
+      ];
+      for (const t of tables) {
+        const st = this.stmt(`DELETE FROM ${t} WHERE profile_id=?`);
+        for (const id of uniqueIds) st.run(id);
       }
       return uniqueIds.length;
     });
   }
-  profileMetadata() {
-    return new Map(
+  profileMetadata = () =>
+    new Map(
       this.stmt('SELECT * FROM profile_metadata')
         .all()
-        .map((row) => [
-          String(row.profile_id),
-          {
-            groupId: row.group_id === null ? null : String(row.group_id),
-            alias: row.alias === null ? null : String(row.alias),
-            order: Number(row.sort_order),
-          },
+        .map((r) => [
+          Q.s(r.profile_id),
+          { groupId: Q.sn(r.group_id), alias: Q.sn(r.alias), order: Q.n(r.sort_order) },
         ]),
     );
-  }
   profileAccountCache(): Map<string, CachedProfileAccount> {
-    const validStates = new Set([
-      'unknown',
-      'logged-in',
-      'logged-out',
-      'restricted',
-      'verification',
-    ]);
     return new Map(
       this.stmt('SELECT * FROM profile_account_cache')
         .all()
         .map((row) => {
-          const rawState = String(row.account_state ?? 'unknown');
-          const state = (
-            validStates.has(rawState) ? rawState : 'unknown'
-          ) as Profile['account']['state'];
-          const rawAvatar =
-            row.avatar_url === null || row.avatar_url === undefined ? null : String(row.avatar_url);
+          const rs = Q.s(row.account_state, 'unknown'),
+            state = (VALID_ACCOUNT_STATES.has(rs) ? rs : 'unknown') as Profile['account']['state'],
+            rawAv = Q.sn(row.avatar_url);
           const avatar =
-            rawAvatar && isLocalAvatar(rawAvatar)
+            rawAv && isLocalAvatar(rawAv)
               ? state === 'logged-out'
                 ? null
-                : rawAvatar
+                : rawAv
               : ['logged-out', 'restricted', 'verification'].includes(state)
                 ? null
-                : rawAvatar;
+                : rawAv;
           return [
-            String(row.profile_id),
+            Q.s(row.profile_id),
             {
               state,
-              id:
-                row.account_id === null || row.account_id === undefined
-                  ? null
-                  : String(row.account_id),
-              name:
-                row.account_name === null || row.account_name === undefined
-                  ? null
-                  : String(row.account_name),
+              id: Q.sn(row.account_id),
+              name: Q.sn(row.account_name),
               avatar,
-              avatarUpdatedAt: Number(row.avatar_updated_at ?? 0),
+              avatarUpdatedAt: Q.nn(row.avatar_updated_at) ?? 0,
             },
           ];
         }),
     );
   }
   updateProfileAccountCache(profileId: string, update: AccountCacheUpdateInput): void {
-    const existing = this.profileAccountCache().get(profileId);
     const merged = mergeAccountCacheUpdate({
-      existing,
+      existing: this.profileAccountCache().get(profileId),
       incoming: update,
     });
-    if (!merged.changed && update.avatarUpdatedAt === undefined) {
-      return;
-    }
-    this.transaction(() => {
-      this.stmt(
-        `INSERT INTO profile_account_cache(profile_id,account_state,account_id,account_name,avatar_url,avatar_updated_at)
-           VALUES(?,?,?,?,?,?)
-           ON CONFLICT(profile_id) DO UPDATE SET
-             account_state=excluded.account_state,
-             account_id=excluded.account_id,
-             account_name=excluded.account_name,
-             avatar_url=excluded.avatar_url,
-             avatar_updated_at=excluded.avatar_updated_at`,
-      ).run(
-        profileId,
-        merged.next.state,
-        merged.next.id,
-        merged.next.name,
-        merged.next.avatar,
-        merged.next.avatarUpdatedAt,
-      );
-    });
+    if (!merged.changed && update.avatarUpdatedAt === undefined) return;
+    const cols = 'profile_id,account_state,account_id,account_name,avatar_url,avatar_updated_at';
+    this.transaction(() =>
+      Q.upsertFrom(this.db, 'profile_account_cache', 'profile_id', cols, '*', merged.next, {
+        profile_id: profileId,
+        account_state: merged.next.state,
+        account_id: merged.next.id,
+        account_name: merged.next.name,
+        avatar_url: merged.next.avatar,
+      }),
+    );
   }
-  profileLaunchBindings(): ProfileLaunchBindingValue[] {
-    const rows = this.stmt('SELECT * FROM profile_launch_bindings').all();
-    const out: ProfileLaunchBindingValue[] = [];
-    for (const row of rows) {
-      const parsed = ProfileLaunchBinding.safeParse({
-        profileId: String(row.profile_id ?? ''),
-        browserKind: String(row.browser_kind ?? ''),
-        executablePath: String(row.executable_path ?? ''),
-        userDataDir: String(row.user_data_dir ?? ''),
-        profileDirectory: String(row.profile_directory ?? ''),
-        browserName: String(row.browser_name ?? ''),
-        windowName: String(row.window_name ?? ''),
-        verifiedAt: Number(row.verified_at ?? 0),
+  profileLaunchBindings = (): ProfileLaunchBindingValue[] =>
+    this.stmt('SELECT * FROM profile_launch_bindings')
+      .all()
+      .flatMap((r) => {
+        const p = ProfileLaunchBinding.safeParse(Q.camel(r));
+        return p.success ? [p.data] : [];
       });
-      if (parsed.success) out.push(parsed.data);
-    }
-    return out;
-  }
   upsertProfileLaunchBindings(bindings: readonly ProfileLaunchBindingValue[]): void {
     if (!bindings.length) return;
+    const cols =
+      'profile_id,browser_kind,executable_path,user_data_dir,profile_directory,browser_name,window_name,verified_at';
     this.transaction(() => {
-      const stmt = this.stmt(
-        `INSERT INTO profile_launch_bindings(
-           profile_id,browser_kind,executable_path,user_data_dir,profile_directory,browser_name,window_name,verified_at
-         ) VALUES(?,?,?,?,?,?,?,?)
-         ON CONFLICT(profile_id) DO UPDATE SET
-           browser_kind=excluded.browser_kind,
-           executable_path=excluded.executable_path,
-           user_data_dir=excluded.user_data_dir,
-           profile_directory=excluded.profile_directory,
-           browser_name=excluded.browser_name,
-           window_name=excluded.window_name,
-           verified_at=excluded.verified_at`,
-      );
-      for (const item of bindings) {
-        const valid = ProfileLaunchBinding.parse(item);
-        stmt.run(
-          valid.profileId,
-          valid.browserKind,
-          valid.executablePath,
-          valid.userDataDir,
-          valid.profileDirectory,
-          valid.browserName,
-          valid.windowName,
-          valid.verifiedAt,
+      for (const item of bindings)
+        Q.upsertFrom(
+          this.db,
+          'profile_launch_bindings',
+          'profile_id',
+          cols,
+          '*',
+          ProfileLaunchBinding.parse(item),
         );
-      }
     });
   }
-  combinations() {
-    return this.stmt(
-      'SELECT id FROM combinations WHERE deleted_at IS NULL ORDER BY updated_at DESC,id',
-    )
+  combinations = () => {
+    const sql = 'SELECT id FROM combinations WHERE deleted_at IS NULL ORDER BY updated_at DESC,id';
+    return this.stmt(sql)
       .all()
-      .map((row) => this.get(String(row.id)));
-  }
+      .map((r) => this.get(String(r.id)));
+  };
   private get(id: string): SavedCombination {
     const row = this.stmt('SELECT * FROM combinations WHERE id=? AND deleted_at IS NULL').get(id);
     if (!row) throw new ProductError('COMBINATION_NOT_FOUND', '任务组合不存在', 404);
-    const version = Number(row.current_version);
-    const saved =
-      version > 0
-        ? this.stmt(
-            'SELECT body FROM combination_versions WHERE combination_id=? AND version=?',
-          ).get(id, version)
-        : null;
+    const version = Number(row.current_version),
+      sql = 'SELECT body FROM combination_versions WHERE combination_id=? AND version=?';
+    const saved = version > 0 ? this.stmt(sql).get(id, version) : null;
     return SavedCombinationSchema.parse({
       id,
       version,
       revision: Number(row.revision),
       saved: saved ? (JSON.parse(String(saved.body)) as unknown) : null,
-      draft: row.draft === null ? null : (JSON.parse(String(row.draft)) as unknown),
+      draft: null,
       updatedAt: Number(row.updated_at),
     });
   }
@@ -835,126 +459,47 @@ export class WorkspaceStore implements WorkspaceRepository {
     return row;
   }
   createCombination(value: Combination) {
-    const body = JSON.stringify(CombinationSchema.parse(value));
+    const body = JSON.stringify(CombinationSchema.parse(value)),
+      sql =
+        'INSERT INTO combinations(id,current_version,revision,draft,updated_at) VALUES(?,1,0,NULL,?)';
     return this.transaction(() => {
-      const id = randomUUID();
-      this.db
-        .prepare(
-          'INSERT INTO combinations(id,current_version,revision,draft,updated_at) VALUES(?,1,0,NULL,?)',
-        )
-        .run(id, Date.now());
-      this.db.prepare('INSERT INTO combination_versions VALUES(?,1,?,?)').run(id, body, Date.now());
+      const id = randomUUID(),
+        now = Date.now();
+      this.stmt(sql).run(id, now);
+      this.stmt('INSERT INTO combination_versions VALUES(?,1,?,?)').run(id, body, now);
       return this.get(id);
     });
   }
-  writeDraft(id: string, expectedRevision: number, value: Combination) {
-    const body = JSON.stringify(CombinationDraftSchema.parse(value));
+  saveCombination(id: string, expectedRevision: number, value: Combination) {
+    const valid = CombinationSchema.parse(value),
+      sql =
+        'UPDATE combinations SET current_version=?,draft=NULL,revision=revision+1,updated_at=? WHERE id=?';
     return this.transaction(() => {
-      this.checkRevision(id, expectedRevision);
-      this.db
-        .prepare('UPDATE combinations SET draft=?,revision=revision+1,updated_at=? WHERE id=?')
-        .run(body, Date.now(), id);
+      const version = this.checkRevision(id, expectedRevision).version + 1,
+        now = Date.now();
+      this.stmt('INSERT INTO combination_versions VALUES(?,?,?,?)').run(
+        id,
+        version,
+        JSON.stringify(valid),
+        now,
+      );
+      this.stmt(sql).run(version, now, id);
       return this.get(id);
-    });
-  }
-  publish(id: string, expectedRevision: number) {
-    return this.transaction(() => {
-      const row = this.checkRevision(id, expectedRevision);
-      if (!row.draft) return row;
-      const version = row.version + 1;
-      const valid = CombinationSchema.parse(row.draft);
-      for (const step of valid.steps)
-        if (step.type === 'post' && step.allowRepeat) {
-          const paths =
-            step.resourceMode === 'table'
-              ? this.resourceTables
-                  .read(id)
-                  .rows.flatMap((r) =>
-                    r.media.filter((m) => m.kind === 'local').map((m) => m.source),
-                  )
-              : (this.materials
-                  .current(step.resourceDirectory)
-                  ?.sources.flatMap((s) =>
-                    s.snapshot.files.map((f) => path.join(step.resourceDirectory, f.relativePath)),
-                  ) ?? []);
-          assertArchiveSourcesAvailable(this.db, paths);
-        }
-      this.db
-        .prepare('INSERT INTO combination_versions VALUES(?,?,?,?)')
-        .run(id, version, JSON.stringify(valid), Date.now());
-      this.db
-        .prepare(
-          'UPDATE combinations SET current_version=?,draft=NULL,revision=revision+1,updated_at=? WHERE id=?',
-        )
-        .run(version, Date.now(), id);
-      return this.get(id);
-    });
-  }
-  discardDraft(id: string, expectedRevision: number) {
-    return this.transaction(() => {
-      const row = this.checkRevision(id, expectedRevision);
-      if (row.version === 0)
-        throw new ProductError(
-          'NEW_DRAFT_HAS_NO_SAVED_VERSION',
-          '新组合没有保存版，不能还原；草稿已保留',
-          409,
-        );
-      this.db
-        .prepare('UPDATE combinations SET draft=NULL,revision=revision+1,updated_at=? WHERE id=?')
-        .run(Date.now(), id);
-      return this.get(id);
-    });
-  }
-  createDraft(value: Combination) {
-    const body = JSON.stringify(CombinationDraftSchema.parse(value));
-    return this.transaction(() => {
-      const id = randomUUID();
-      this.db
-        .prepare(
-          'INSERT INTO combinations(id,current_version,revision,draft,updated_at) VALUES(?,0,0,?,?)',
-        )
-        .run(id, body, Date.now());
-      return this.get(id);
-    });
-  }
-  copyCombination(id: string) {
-    return this.transaction(() => {
-      const original = this.get(id);
-      const value = original.saved ?? original.draft;
-      if (!value) throw new ProductError('COMBINATION_EMPTY', '组合没有可复制内容', 409);
-      const copied = this.createDraft({
-        ...value,
-        name: value.name.slice(0, 72) + ' 副本',
-        steps: value.steps.map((step) => ({ ...step, id: randomUUID() })),
-      });
-      const resources = this.resourceTables.read(id);
-      if (resources.revision > 0)
-        this.resourceTables.save(
-          copied.id,
-          0,
-          resources.rows.map((row) => ({ ...row, id: randomUUID() })),
-        );
-      return copied;
     });
   }
   deleteCombination(id: string) {
+    const busySql =
+      "SELECT id FROM task_plans WHERE combination_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1";
     this.transaction(() => {
       this.get(id);
-      const active = this.db
-        .prepare(
-          "SELECT id FROM task_plans WHERE combination_id=? AND state NOT IN ('STOPPED','COMPLETED','FAILED') LIMIT 1",
-        )
-        .get(id);
-      if (active)
+      if (this.stmt(busySql).get(id))
         throw new ProductError(
           'COMBINATION_IN_USE',
           '该任务组合正在被浏览器使用，请先停止相关任务再删除',
           409,
         );
       const now = Date.now();
-      this.db
-        .prepare('UPDATE combinations SET deleted_at=?,updated_at=? WHERE id=?')
-        .run(now, now, id);
+      this.stmt('UPDATE combinations SET deleted_at=?,updated_at=? WHERE id=?').run(now, now, id);
     });
   }
 }

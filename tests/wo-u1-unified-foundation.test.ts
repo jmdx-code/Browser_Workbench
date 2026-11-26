@@ -102,7 +102,15 @@ test('WO-U1: fresh DB (version=0) and v47->v48 upgrade rebuild profile_task_resu
       rawFresh.close();
     }
 
-    // 2. Simulate upgrading from v47 where profile_task_results had old 3-source CHECK and legacy rows
+    // 2. Reject pre-v59 (v47) and verify v61->v62 upgrade keeps 5 sources & cascade delete
+    const tooOldPath = join(dir, 'v47.sqlite');
+    const oldDb = new DatabaseSync(tooOldPath);
+    oldDb.exec('PRAGMA user_version=47');
+    oldDb.close();
+    await assert.rejects(() => WorkspaceStore.open(tooOldPath), {
+      code: 'DATABASE_VERSION_TOO_OLD',
+    });
+
     const upgradePath = join(dir, 'upgrade.sqlite');
     const initStore = await WorkspaceStore.open(upgradePath);
     initStore.close();
@@ -112,26 +120,11 @@ test('WO-U1: fresh DB (version=0) and v47->v48 upgrade rebuild profile_task_resu
     const pPage = randomUUID();
     const pGroup = randomUUID();
     try {
-      preUpgrade.exec(`
-        DROP TRIGGER IF EXISTS profile_task_result_terminal;
-        DROP TABLE profile_task_results;
-        CREATE TABLE profile_task_results(
-          profile_id TEXT PRIMARY KEY,
-          source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper')),
-          run_id TEXT NOT NULL,
-          name TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')),
-          reason TEXT NOT NULL,
-          finished_at INTEGER NOT NULL,
-          failed_steps INTEGER NOT NULL DEFAULT 0,
-          skipped_steps INTEGER NOT NULL DEFAULT 0
-        );
-      `);
       const ins = preUpgrade.prepare('INSERT INTO profile_task_results VALUES(?,?,?,?,?,?,?,?,?)');
-      ins.run(pPoster, 'group-bumper', 'r1', '小组发帖', 'COMPLETED', '已完成', 1000, 0, 0);
-      ins.run(pPage, 'group-bumper', 'r2', '专页顶贴', 'FAILED', '受限 · 频控', 2000, 1, 0);
+      ins.run(pPoster, 'group-poster', 'r1', '小组发帖', 'COMPLETED', '已完成', 1000, 0, 0);
+      ins.run(pPage, 'page-bumper', 'r2', '专页顶贴', 'FAILED', '受限 · 频控', 2000, 1, 0);
       ins.run(pGroup, 'group-bumper', 'r3', '小组顶贴', 'STOPPED', '已停止', 3000, 0, 0);
-      preUpgrade.exec('PRAGMA user_version=47');
+      preUpgrade.exec('PRAGMA user_version=61');
     } finally {
       preUpgrade.close();
     }

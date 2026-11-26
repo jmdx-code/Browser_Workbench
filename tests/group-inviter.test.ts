@@ -200,10 +200,10 @@ async function withStore(run: (store: WorkspaceStore) => Promise<void> | void) {
 test('group inviter repository persists groups, default 30 invitesPerGroup, and enforces global per-group friend deduplication', async () => {
   await withStore(async (store) => {
     const repo = store.groupInviter;
-    assert.equal(await repo.getInvitesPerGroup(), 30);
+    assert.equal((await repo.getSettings()).invitesPerGroup, 30);
 
-    await repo.setInvitesPerGroup({ invitesPerGroup: 45 });
-    assert.equal(await repo.getInvitesPerGroup(), 45);
+    await repo.saveSettings({ invitesPerGroup: 45 });
+    assert.equal((await repo.getSettings()).invitesPerGroup, 45);
 
     const groups = await repo.upsertGroups({
       items: [
@@ -214,7 +214,9 @@ test('group inviter repository persists groups, default 30 invitesPerGroup, and 
     assert.equal(groups.length, 2);
     assert.equal(groups[0]?.totalInvitedCount, 0);
 
-    await repo.updateGroupAvatar('3017439278594998', 'https://scontent.xx.fbcdn.net/v/group1.jpg');
+    await repo.applyResolvedGroupMetadata('3017439278594998', {
+      avatarUrl: 'https://scontent.xx.fbcdn.net/v/group1.jpg',
+    });
     const updatedGroup = (await repo.listGroups()).find((g) => g.groupId === '3017439278594998');
     assert.equal(updatedGroup?.avatarUrl, 'https://scontent.xx.fbcdn.net/v/group1.jpg');
 

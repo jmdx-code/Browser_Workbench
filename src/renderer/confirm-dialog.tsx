@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
+import { Btn, useShowModal } from './modules/shared/module-ui.js';
+import { UI_DIALOG_CARD } from './ui/primitives.js';
 
 export function ConfirmDialog({
   title,
@@ -28,9 +30,7 @@ export function ConfirmDialog({
   const busy = internalBusy || externalBusy;
   const confirmLabel = label ?? confirmText ?? '确认';
   const closeDialog = onClose ?? onCancel ?? (() => {});
-  useEffect(() => {
-    dialog.current?.showModal();
-  }, []);
+  useShowModal(dialog);
   async function confirm() {
     if (submittingRef.current || busy) return;
     submittingRef.current = true;
@@ -49,32 +49,34 @@ export function ConfirmDialog({
   return (
     <dialog
       ref={dialog}
-      className="name-dialog confirm-dialog"
+      className={`${UI_DIALOG_CARD} confirm-dialog`}
       aria-label={title}
       onCancel={(event) => {
         if (busy) event.preventDefault();
         else closeDialog();
       }}
     >
-      <h3>{title}</h3>
-      <p>{description}</p>
+      <h3 className="m-0 text-base font-semibold text-slate-900">{title}</h3>
+      <p className="mt-2 mb-3 max-h-[min(45vh,360px)] overflow-y-auto text-[13px] leading-relaxed whitespace-pre-line text-[var(--text-2)]">
+        {description}
+      </p>
       {error && (
-        <p role="alert" className="text-danger">
+        <p role="alert" className="mb-3 text-xs font-medium text-rose-600">
           {error}
         </p>
       )}
-      <footer>
-        <button type="button" autoFocus disabled={busy} onClick={closeDialog}>
+      <footer className="mt-4 flex justify-end gap-2">
+        <Btn sm={false} autoFocus disabled={busy} onClick={closeDialog}>
           取消
-        </button>
-        <button
-          type="button"
-          className={danger ? 'danger' : 'primary'}
+        </Btn>
+        <Btn
+          v={danger ? 'danger' : 'primary'}
+          sm={false}
           disabled={busy}
           onClick={() => void confirm()}
         >
           {busy ? '处理中…' : confirmLabel}
-        </button>
+        </Btn>
       </footer>
     </dialog>
   );

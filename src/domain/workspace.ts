@@ -53,11 +53,11 @@ export interface WorkspaceRepository {
   ): Awaitable<void>;
   combinations(): Awaitable<SavedCombination[]>;
   createCombination(value: Combination): Awaitable<SavedCombination>;
-  createDraft(value: Combination): Awaitable<SavedCombination>;
-  copyCombination(id: string): Awaitable<SavedCombination>;
-  writeDraft(id: string, expectedRevision: number, value: Combination): Awaitable<SavedCombination>;
-  publish(id: string, expectedRevision: number): Awaitable<SavedCombination>;
-  discardDraft(id: string, expectedRevision: number): Awaitable<SavedCombination>;
+  saveCombination?(
+    id: string,
+    expectedRevision: number,
+    value: Combination,
+  ): Awaitable<SavedCombination>;
   deleteCombination?(id: string): Awaitable<void>;
 }
 export interface BrowserProfileSource {

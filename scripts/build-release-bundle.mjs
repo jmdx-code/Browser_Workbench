@@ -9,9 +9,6 @@ import { ReleaseManifest } from '../dist/src/shared/software-update.js';
 const RELEASE_EXCLUDED_FILES = new Set([
   'config/publication-acceptance-scope.json',
   'public/sample.mp4',
-  'public/fixture.html',
-  'public/fixture.js',
-  'public/frame.html',
   'public/kernel-fixture.html',
   'public/kernel-fixture.js',
   'public/kernel-frame.html',

@@ -1,8 +1,7 @@
 import type { TaskRecord } from '../shared/task-contracts.js';
 import { isSuccessfulTaskStep } from '../shared/task-step-outcome.js';
-
 export const endedTask = (state: string) => ['COMPLETED', 'STOPPED', 'FAILED'].includes(state);
-export type TaskRunGroup = {
+type TaskRunGroup = {
   key: string;
   rows: TaskRecord[];
   sortTime: number;
@@ -23,13 +22,12 @@ export function groupTaskRecords(records: readonly TaskRecord[]): TaskRunGroup[]
     .map(([key, rows]) => {
       rows.sort((a, b) => a.position - b.position);
       const first = rows[0];
-      const completed = rows.filter((r) => r.status === 'COMPLETED').length;
       const starts = rows.flatMap((r) => (r.startedAt === null ? [] : [r.startedAt]));
       const finishes = rows.flatMap((r) => (r.finishedAt === null ? [] : [r.finishedAt]));
       return {
         key,
         rows,
-        completed,
+        completed: rows.filter((r) => r.status === 'COMPLETED').length,
         sortTime: Math.max(...rows.map((r) => r.finishedAt ?? r.startedAt ?? r.planCreatedAt)),
         startedAt: starts.length ? Math.min(...starts) : null,
         finishedAt:

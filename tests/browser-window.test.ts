@@ -24,7 +24,7 @@ test('display remains available during tasks, stopping, review and unsynced conn
     list: () => assert.fail('display must not query plans'),
   });
   try {
-    for (const phase of ['RUNNING', 'STOPPING', 'RECOVERING', 'PAUSED'] as const) {
+    for (const phase of ['RUNNING', 'PAUSED', 'OFFLINE'] as const) {
       peer.phase = phase;
       peer.synced = false;
       assert.deepEqual(await service.show(peer.profileId, 'ignored'), {
@@ -34,7 +34,7 @@ test('display remains available during tasks, stopping, review and unsynced conn
       });
       assert.equal(peer.phase, phase);
     }
-    assert.equal(messages.length, 4);
+    assert.equal(messages.length, 3);
     assert.equal(store.list().length, 0);
     await assert.rejects(service.show(randomUUID(), 'offline'), /未连接/);
   } finally {

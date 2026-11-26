@@ -69,12 +69,9 @@ test('failed bootstrap and a rejected host leave reads failed instead of bypassi
 
 test('a rejected mutation is never renewed or replayed', async () => {
   await withFetch([denied()], async (calls) => {
-    await assert.rejects(
-      api.saveTaskSettings({ maxConcurrentProfiles: 2 }, AbortSignal.timeout(1000)),
-      /ADMIN_REQUIRED/,
-    );
+    await assert.rejects(api.createGroup('分组A', 'blue'), /ADMIN_REQUIRED/);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0]?.url, '/api/workspace/tasks/settings');
+    assert.equal(calls[0]?.url, '/api/workspace/groups/create');
     assert.equal(calls[0]?.options?.method, 'POST');
   });
 });

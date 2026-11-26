@@ -1757,7 +1757,7 @@ test('parseBatchLoginText handles multi-line labeled blocks with special-char pa
     '账号,密码,2FA',
     'carol@test.io|PipePass!|MFRGGZDFMZTWQ2LK',
     'dave@test.io\tTabPass:88\tNOTE_COL\tGEZDGNBVGY3TQOJQ',
-    'eve@test.io----DashPass123----ORSXG5A=',
+    'eve@test.io----DashPass123----ORSXG5A2',
     '"frank@test.io","Csv,Pass,1","JBSWY3DPEHPK3PXP"',
     'bad@test.io|Pass1|NOT_BASE32_!!!',
     'broken_single_token',
@@ -1784,7 +1784,7 @@ test('parseBatchLoginText handles multi-line labeled blocks with special-char pa
   assert.equal(parsed.entries[3]?.password, 'TabPass:88');
   assert.equal(parsed.entries[3]?.totpSecret, 'GEZDGNBVGY3TQOJQ');
   assert.equal(parsed.entries[4]?.account, 'eve@test.io');
-  assert.equal(parsed.entries[4]?.totpSecret, 'ORSXG5A=');
+  assert.equal(parsed.entries[4]?.totpSecret, 'ORSXG5A2');
   assert.equal(parsed.entries[5]?.account, 'frank@test.io');
   assert.equal(parsed.entries[5]?.password, 'Csv,Pass,1');
 

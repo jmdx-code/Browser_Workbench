@@ -431,4 +431,88 @@ describe('route pruning and bounded historical video teardown', () => {
     projectFacebookComposerAudience();
     expect(Reflect.get(window, '__wbReactRootNodesV1')).toBe(cache);
   });
+
+  it('detects Chinese comma-separated and Burmese Reels/Feed like buttons and counts accurately', () => {
+    const setupReel = (btnLabel: string, siblingCountText?: string, ariaPressed = false) => {
+      route('/reel/1105100798957677');
+      document.body.innerHTML = `<main><div><video src="https://video.example/reel.mp4"></video><div id="rail"><div role="button" aria-label="${btnLabel}"${ariaPressed ? ' aria-pressed="true"' : ''}></div>${siblingCountText ? `<div id="cnt">${siblingCountText}</div>` : ''}</div></div></main>`;
+      const main = document.querySelector('main')!;
+      const video = document.querySelector('video')! as HTMLVideoElement;
+      const likeBtn = document.querySelector('[role="button"]')!;
+      box(main, 0, 0, 1280, 720);
+      box(video, 200, 80, 400, 600);
+      box(likeBtn, 680, 320, 44, 44);
+      const cnt = document.getElementById('cnt');
+      if (cnt) box(cnt, 680, 372, 44, 24);
+      vi.spyOn(document, 'elementFromPoint').mockImplementation((x, y) =>
+        x >= 680 && x <= 724 && y >= 320 && y <= 364 ? likeBtn : main,
+      );
+      Object.defineProperty(video, 'currentSrc', { value: 'https://video.example/reel.mp4' });
+      Object.defineProperty(video, 'readyState', { value: 4 });
+      return projectFacebookBrowsePage().likeTarget;
+    };
+
+    const zhComma = setupReel('赞，2\u00a0万个心情');
+    expect(zhComma?.css).toBe('[data-wb-browse-like="1"]');
+    expect(zhComma?.liked).toBe(false);
+    expect(zhComma?.likeCount).toBe(20_000);
+
+    const zhThousands = setupReel('赞，1,762个心情');
+    expect(zhThousands?.css).toBe('[data-wb-browse-like="1"]');
+    expect(zhThousands?.likeCount).toBe(1762);
+
+    const myPlain = setupReel('ကြိုက်သည်', '၅၂၀');
+    expect(myPlain?.css).toBe('[data-wb-browse-like="1"]');
+    expect(myPlain?.liked).toBe(false);
+    expect(myPlain?.likeCount).toBe(520);
+
+    const myThousand = setupReel('ကြိုက်သည်', '၁.၂ ထောင်');
+    expect(myThousand?.likeCount).toBe(1200);
+
+    const myTenK = setupReel('ကြိုက်သည်', '၂.၅ သောင်း');
+    expect(myTenK?.likeCount).toBe(25_000);
+
+    const myLiked = setupReel('ကြိုက်ခြင်းဖျက်', '၅၂၀', false);
+    expect(myLiked?.liked).toBe(true);
+  });
+
+  it('keeps nextReelCSS on /reels/ and isolates sponsored ads in offscreen reels from the active reel', () => {
+    route('/reels/');
+    document.body.innerHTML = `<main>
+      <div id="active-card">
+        <video src="https://video.example/active.mp4"></video>
+        <div id="rail"><div role="button" aria-label="赞，1,604个心情"></div></div>
+      </div>
+      <div id="preloaded-ad-card">
+        <video src="https://video.example/ad.mp4"></video>
+        <a href="https://www.facebook.com/ads/about/?id=1">Sponsored</a>
+      </div>
+      <div role="button" aria-label="下一条快拍"></div>
+    </main>`;
+    const main = document.querySelector('main')!;
+    const videos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+    const likeBtn = document.querySelector('[aria-label="赞，1,604个心情"]')!;
+    const nextBtn = document.querySelector('[aria-label="下一条快拍"]')!;
+    const adLink = document.querySelector('a[href*="/ads/about"]')!;
+    box(main, 0, 0, 1280, 720);
+    box(videos[0]!, 200, 80, 400, 600);
+    box(videos[1]!, 200, 960, 400, 600);
+    box(likeBtn, 680, 320, 44, 44);
+    box(nextBtn, 900, 340, 44, 44);
+    box(adLink, 220, 1020, 80, 20);
+    vi.spyOn(document, 'elementFromPoint').mockImplementation((x, y) => {
+      if (x >= 680 && x <= 724 && y >= 320 && y <= 364) return likeBtn;
+      if (x >= 900 && x <= 944 && y >= 340 && y <= 384) return nextBtn;
+      return main;
+    });
+    Object.defineProperty(videos[0]!, 'currentSrc', { value: 'https://video.example/active.mp4' });
+    Object.defineProperty(videos[0]!, 'readyState', { value: 4 });
+    Object.defineProperty(videos[1]!, 'currentSrc', { value: 'https://video.example/ad.mp4' });
+    Object.defineProperty(videos[1]!, 'readyState', { value: 4 });
+
+    const reading = projectFacebookBrowsePage();
+    expect(reading.nextReelCSS).toBe('[data-wb-reel-next="1"]');
+    expect(reading.likeTarget?.sponsored).toBe(false);
+    expect(reading.likeTarget?.likeCount).toBe(1604);
+  });
 });

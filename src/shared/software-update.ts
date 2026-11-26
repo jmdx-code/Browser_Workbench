@@ -1,42 +1,41 @@
 import { z } from 'zod';
+import { Id, NonNegInt, Sha256Hex, StrNull, boolT, strictObj } from './contracts.js';
+
+export const EXTENSION_VERSION = '0.3.92';
 const httpOrHttpsUrl = z.string().refine((value) => {
   try {
-    const parsed = new URL(value);
-    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+    const p = new URL(value).protocol;
+    return p === 'https:' || p === 'http:';
   } catch {
     return false;
   }
 }, 'URL 必须使用 HTTP 或 HTTPS 协议');
-export const UpdateConfig = z
-  .object({
-    githubRepo: z
-      .string()
-      .trim()
-      .regex(/^(?:(?!\.{1,2}\/)[A-Za-z0-9_.-]+\/(?!\.{1,2}$)[A-Za-z0-9_.-]+)?$/),
-    autoCheck: z.boolean().default(true),
-  })
-  .strict();
+export const UpdateConfig = strictObj({
+  githubRepo: z
+    .string()
+    .trim()
+    .regex(/^(?:(?!\.{1,2}\/)[A-Za-z0-9_.-]+\/(?!\.{1,2}$)[A-Za-z0-9_.-]+)?$/),
+  autoCheck: boolT,
+});
 export type UpdateConfiguration = z.infer<typeof UpdateConfig>;
-export const ReleaseManifest = z
-  .object({
-    softwareVersion: z.string(),
-    extensionVersion: z.string().nullable(),
-    zipAssetName: z.literal('workbench-hot-update.zip'),
-    sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    notes: z.string(),
-    publishedAt: z.string().nullable(),
-    engineFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-    files: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
-  })
-  .strict();
+export const ReleaseManifest = strictObj({
+  softwareVersion: z.string(),
+  extensionVersion: StrNull,
+  zipAssetName: z.literal('workbench-hot-update.zip'),
+  sha256: Sha256Hex,
+  notes: z.string(),
+  publishedAt: StrNull,
+  engineFingerprint: Sha256Hex,
+  files: z.record(z.string(), Sha256Hex),
+});
 export type Manifest = z.infer<typeof ReleaseManifest>;
 export const AvailableUpdate = z.object({
   softwareVersion: z.string(),
-  extensionVersion: z.string().nullable(),
-  publishedAt: z.string().nullable(),
+  extensionVersion: StrNull,
+  publishedAt: StrNull,
   notes: z.string(),
   downloadUrl: z.union([z.literal(''), httpOrHttpsUrl]),
-  sha256: z.string().nullable(),
+  sha256: StrNull,
   requiresInstaller: z.boolean(),
   releaseUrl: httpOrHttpsUrl,
 });
@@ -50,29 +49,22 @@ export const SoftwareUpdateStatus = z.object({
   autoCheck: z.boolean(),
   checking: z.boolean(),
   applying: z.boolean(),
-  lastCheckedAt: z.string().nullable(),
+  lastCheckedAt: StrNull,
   availableUpdate: AvailableUpdate.nullable(),
-  error: z.string().nullable(),
+  error: StrNull,
 });
 export type UpdateStatus = z.infer<typeof SoftwareUpdateStatus>;
-export const OpenAiWorkspaceResult = z
-  .object({
-    opened: z.boolean(),
-    directory: z.string(),
-  })
-  .strict();
-export const ExtensionReloadRequest = z
-  .object({ profileIds: z.array(z.uuid()).min(1).max(500).optional() })
-  .strict();
-export const ExtensionReloadResult = z
-  .object({
-    reloaded: z.number().int().nonnegative(),
-    skippedBusy: z.number().int().nonnegative(),
-    skippedOffline: z.number().int().nonnegative(),
-    extensionDir: z.string(),
-    bundledVersion: z.string(),
-  })
-  .strict();
+export const OpenAiWorkspaceResult = strictObj({ opened: z.boolean(), directory: z.string() });
+export const ExtensionReloadRequest = strictObj({
+  profileIds: z.array(Id).min(1).max(500).optional(),
+});
+export const ExtensionReloadResult = strictObj({
+  reloaded: NonNegInt,
+  skippedBusy: NonNegInt,
+  skippedOffline: NonNegInt,
+  extensionDir: z.string(),
+  bundledVersion: z.string(),
+});
 export type ReloadResult = z.infer<typeof ExtensionReloadResult>;
 export function semverCompare(a: string, b: string) {
   const parse = (s: string) => {

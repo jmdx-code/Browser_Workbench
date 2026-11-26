@@ -17,7 +17,7 @@ import {
 } from '../src/shared/group-bumper.js';
 import {
   localizeAvatarBytesToDataUrl,
-  verifyTargetAvatar,
+  fetchAndLocalizeAvatar,
 } from '../src/infrastructure/group-bumper-avatar.js';
 import { createCanvas } from '@napi-rs/canvas';
 async function fixture(run: (store: WorkspaceStore) => Promise<void>) {
@@ -200,9 +200,17 @@ test('WO54 browser resolver skips a busy first peer and reads once from the next
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () =>
     new Response(new Uint8Array(pngBytes), { headers: { 'content-type': 'image/png' } });
-  let result;
+  let result: { canonicalId: string | null; name: string | null; avatarUrl: string | null } = {
+    canonicalId: null,
+    name: null,
+    avatarUrl: null,
+  };
   try {
-    result = await adapter.resolveTargetMetadata('pages', '12345');
+    await adapter.refreshTargets('pages', [{ id: '12345', name: '12345', avatarUrl: null }], {
+      onItemResolved: async (_id, meta) => {
+        result = meta;
+      },
+    });
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -313,8 +321,14 @@ test('WO54 HTML avatar URLs are rejected and actual image responses are localize
         String(url).includes('html') ? '<html>redirect</html>' : new Uint8Array(pngBytes),
         { headers: { 'content-type': String(url).includes('html') ? 'text/html' : 'image/png' } },
       );
-    assert.equal(await verifyTargetAvatar('https://example.com/html', 1000), null);
-    const localized = await verifyTargetAvatar('https://example.com/image', 1000);
+    assert.equal(
+      await fetchAndLocalizeAvatar('https://example.com/html', AbortSignal.timeout(1000)),
+      null,
+    );
+    const localized = await fetchAndLocalizeAvatar(
+      'https://example.com/image',
+      AbortSignal.timeout(1000),
+    );
     assert.ok(localized && isLocalAvatar(localized));
     assert.ok(localized.length <= MAX_LOCAL_AVATAR_BYTES);
   } finally {
@@ -530,7 +544,9 @@ test('WO55 anti-regression prevents external URL or null from overwriting locali
     s.groupInviter.upsertGroups({
       items: [{ groupId: '12345', groupName: 'Imported Name' }],
     });
-    s.groupInviter.updateGroupAvatar('12345', 'https://scontent.xx.fbcdn.net/external.jpg');
+    s.groupInviter.applyResolvedGroupMetadata('12345', {
+      avatarUrl: 'https://scontent.xx.fbcdn.net/external.jpg',
+    });
     assert.equal(r.targets('groups')[0]?.avatarUrl, localAvatar);
   }));
 

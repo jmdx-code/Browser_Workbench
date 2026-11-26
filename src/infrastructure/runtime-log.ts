@@ -7,7 +7,6 @@ import {
   type LogRecord,
   type RuntimeLogPort,
 } from '../shared/runtime-log.js';
-
 const header = '{"format":"browser-workbench-runtime-log","version":1}\n';
 const maximumBytes = 1024 * 1024;
 export class FilesystemRuntimeLog implements RuntimeLogPort {

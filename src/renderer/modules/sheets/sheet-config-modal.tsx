@@ -1,17 +1,83 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { bluestacksDisplayTitle, type BluestacksState } from '../../../shared/bluestacks.js';
 import type { Group, Profile } from '../../../shared/contracts.js';
 import type { GoogleSheetLink } from '../../../shared/google-sheets.js';
-import { ControlledNumberInput } from '../shared/controlled-number-input.js';
+import { UI_CHECKBOX, UI_TEXTAREA } from '../../ui/primitives.js';
+import {
+  BackdropModal,
+  Chk,
+  CtrlNum,
+  DropdownPopover,
+  Fld,
+  ModalFoot,
+  ModalHeading,
+  NoticeBanner,
+  useBusyTask,
+} from '../shared/module-ui.js';
 
-/**
- * 发帖记录「顶贴配置」弹窗：严格只放顶贴相关的 3 个框（点赞概率、评论概率、评论词库），绝不堆叠无关设置。
- */
-export function RecordsBumpConfigModal({
-  link,
-  onClose,
-  onSave,
-}: {
+const optCls =
+  'flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-xs hover:bg-slate-50';
+const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(v)));
+const toggleId = (list: readonly string[], id: string) =>
+  list.includes(id) ? list.filter((x) => x !== id) : [...list, id];
+
+function useLinkedDraft<T extends object>(syncKey: string, init: T) {
+  const [sel, setSel] = useState(init);
+  const latestRef = useRef(init);
+  useEffect(() => {
+    latestRef.current = init;
+    setSel(init);
+  }, [syncKey]);
+  const update = (patch: Partial<T>): T => {
+    const next = { ...latestRef.current, ...patch };
+    latestRef.current = next;
+    setSel(next);
+    return next;
+  };
+  return { sel, latestRef, update };
+}
+
+function GsCompactModal(p: {
+  label: string;
+  busy: boolean;
+  error: string;
+  onClose: () => void;
+  onSubmit: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <BackdropModal label={p.label} modalClass="contents" busy={p.busy} onClose={p.onClose}>
+      <div className="modal flex max-h-[calc(100vh-40px)] w-[min(460px,92vw)] flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-white text-[var(--text)] shadow-2xl">
+        <ModalHeading title={p.label} disabled={p.busy} onClose={p.onClose} />
+        <div className="flex flex-col gap-3 overflow-y-auto p-4">
+          {p.error && <NoticeBanner tone="err">{p.error}</NoticeBanner>}
+          {p.children}
+        </div>
+        <ModalFoot
+          busy={p.busy}
+          okText={p.busy ? '保存中…' : '保存'}
+          onCancel={p.onClose}
+          onOk={p.onSubmit}
+        />
+      </div>
+    </BackdropModal>
+  );
+}
+
+const CountCheckbox = (p: {
+  checked: boolean;
+  onChange: () => void;
+  label: string;
+  count: number;
+}) => (
+  <label className={optCls}>
+    <input type="checkbox" className={UI_CHECKBOX} checked={p.checked} onChange={p.onChange} />
+    <span className="min-w-0 flex-1 truncate">{p.label}</span>
+    <em className="text-[11px] text-[var(--muted)] not-italic">{p.count}</em>
+  </label>
+);
+
+export function RecordsBumpConfigModal(p: {
   link: GoogleSheetLink;
   onClose: () => void;
   onSave: (patch: {
@@ -21,121 +87,71 @@ export function RecordsBumpConfigModal({
   }) => Promise<void>;
 }) {
   const [likeProb, setLikeProb] = useState(
-    link.recordsConfig?.bumperSettings.likeProbability ?? 100,
-  );
-  const [commentProb, setCommentProb] = useState(
-    link.recordsConfig?.bumperSettings.commentProbability ?? 30,
-  );
-  const [commentsText, setCommentsText] = useState(
-    (link.recordsConfig?.commentPool ?? []).join('\n'),
-  );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [busy, onClose]);
-
-  async function handleSubmit() {
-    setBusy(true);
-    setError('');
-    try {
-      await onSave({
-        likeProbability: Math.max(0, Math.min(100, Math.round(likeProb))),
-        commentProbability: Math.max(0, Math.min(100, Math.round(commentProb))),
-        commentPool: commentsText
-          .split(/\r?\n/)
-          .map((s) => s.trim())
-          .filter(Boolean),
-      });
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '保存失败');
-    } finally {
-      setBusy(false);
-    }
-  }
-
+      p.link.recordsConfig?.bumperSettings.likeProbability ?? 100,
+    ),
+    [commentProb, setCommentProb] = useState(
+      p.link.recordsConfig?.bumperSettings.commentProbability ?? 30,
+    ),
+    [commentsText, setCommentsText] = useState(
+      (p.link.recordsConfig?.commentPool ?? []).join('\n'),
+    );
+  const { busy, error, run } = useBusyTask();
   return (
-    <div
-      className="gs-modal-backdrop"
-      onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}
+    <GsCompactModal
+      label="顶贴配置"
+      busy={busy}
+      error={error}
+      onClose={p.onClose}
+      onSubmit={() =>
+        void run(
+          () =>
+            p.onSave({
+              likeProbability: clamp(likeProb, 0, 100),
+              commentProbability: clamp(commentProb, 0, 100),
+              commentPool: commentsText
+                .split(/\r?\n/)
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }),
+          '保存失败',
+          p.onClose,
+        )
+      }
     >
-      <div className="gs-modal gs-modal-compact" role="dialog" aria-label="顶贴配置">
-        <header className="gs-modal-head">
-          <h3>顶贴配置</h3>
-          <button type="button" className="btn btn-sm btn-ghost" onClick={onClose}>
-            关闭
-          </button>
-        </header>
-
-        <div className="gs-modal-body">
-          {error && <div className="gs-banner is-err">{error}</div>}
-          <div className="gs-form-grid">
-            <label className="gs-field">
-              <span>点赞概率（%）</span>
-              <ControlledNumberInput
-                ariaLabel="点赞概率"
-                min={0}
-                max={100}
-                defaultValue={100}
-                value={likeProb}
-                onChange={setLikeProb}
-              />
-            </label>
-            <label className="gs-field">
-              <span>评论概率（%）</span>
-              <ControlledNumberInput
-                ariaLabel="评论概率"
-                min={0}
-                max={100}
-                defaultValue={30}
-                value={commentProb}
-                onChange={setCommentProb}
-              />
-            </label>
-          </div>
-          <label className="gs-field">
-            <span>评论词库（每行一条，留空则只点赞不评论）</span>
-            <textarea
-              rows={5}
-              placeholder="Amen!&#10;God bless you!&#10;Thank you for sharing!"
-              value={commentsText}
-              onChange={(e) => setCommentsText(e.target.value)}
-            />
-          </label>
-        </div>
-
-        <footer className="gs-modal-foot">
-          <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={onClose}>
-            取消
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
-            disabled={busy}
-            onClick={() => void handleSubmit()}
-          >
-            {busy ? '保存中…' : '保存'}
-          </button>
-        </footer>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        <CtrlNum
+          label="点赞概率（%）"
+          aria="点赞概率"
+          min={0}
+          max={100}
+          def={100}
+          val={likeProb}
+          onChange={setLikeProb}
+        />
+        <CtrlNum
+          label="评论概率（%）"
+          aria="评论概率"
+          min={0}
+          max={100}
+          def={30}
+          val={commentProb}
+          onChange={setCommentProb}
+        />
       </div>
-    </div>
+      <Fld label="评论词库（每行一条，留空则只点赞不评论）">
+        <textarea
+          rows={5}
+          className={`${UI_TEXTAREA} min-h-[110px]`}
+          placeholder="Amen!&#10;God bless you!&#10;Thank you for sharing!"
+          value={commentsText}
+          onChange={(e) => setCommentsText(e.target.value)}
+        />
+      </Fld>
+    </GsCompactModal>
   );
 }
 
-/**
- * 发帖记录「频率限制」独立配置页：严格只放监听节奏与数量上限，绝不重复顶栏或顶贴配置项。
- */
-export function RecordsFrequencyModal({
-  link,
-  onClose,
-  onSave,
-}: {
+export function RecordsFrequencyModal(p: {
   link: GoogleSheetLink;
   onClose: () => void;
   onSave: (patch: {
@@ -147,167 +163,71 @@ export function RecordsFrequencyModal({
     maxPostAgeHours: number;
   }) => Promise<void>;
 }) {
-  const [activePollMin, setActivePollMin] = useState(link.recordsConfig?.activePollMinutes ?? 2);
-  const [idleThreshold, setIdleThreshold] = useState(
-    link.recordsConfig?.semiActiveAfterIdlePolls ?? 5,
-  );
-  const [semiActivePollMin, setSemiActivePollMin] = useState(
-    link.recordsConfig?.semiActivePollMinutes ?? 10,
-  );
-  const [maxPerPost, setMaxPerPost] = useState(
-    link.recordsConfig?.bumperSettings.maxLikesPerPost ?? 50,
-  );
-  const [dailyMax, setDailyMax] = useState(
-    link.recordsConfig?.bumperSettings.dailyMaxLikesPerAccount ?? 20,
-  );
-  const [maxAgeHours, setMaxAgeHours] = useState(
-    link.recordsConfig?.bumperSettings.maxPostAgeHours ?? 24,
-  );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [busy, onClose]);
-
-  async function handleSubmit() {
-    setBusy(true);
-    setError('');
-    try {
-      await onSave({
-        activePollMinutes: Math.max(1, Math.min(30, Math.round(activePollMin))),
-        semiActiveAfterIdlePolls: Math.max(1, Math.min(30, Math.round(idleThreshold))),
-        semiActivePollMinutes: Math.max(2, Math.min(120, Math.round(semiActivePollMin))),
-        maxLikesPerPost: Math.max(1, Math.min(500, Math.round(maxPerPost))),
-        dailyMaxLikesPerAccount: Math.max(1, Math.min(500, Math.round(dailyMax))),
-        maxPostAgeHours: Math.max(1, Math.min(720, Math.round(maxAgeHours))),
-      });
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '保存失败');
-    } finally {
-      setBusy(false);
-    }
-  }
-
+  const cfg = p.link.recordsConfig;
+  const [activePollMin, setActivePollMin] = useState(cfg?.activePollMinutes ?? 2),
+    [idleThreshold, setIdleThreshold] = useState(cfg?.semiActiveAfterIdlePolls ?? 5),
+    [semiActivePollMin, setSemiActivePollMin] = useState(cfg?.semiActivePollMinutes ?? 10),
+    [maxPerPost, setMaxPerPost] = useState(cfg?.bumperSettings.maxLikesPerPost ?? 50),
+    [dailyMax, setDailyMax] = useState(cfg?.bumperSettings.dailyMaxLikesPerAccount ?? 20),
+    [maxAgeHours, setMaxAgeHours] = useState(cfg?.bumperSettings.maxPostAgeHours ?? 24);
+  const { busy, error, run } = useBusyTask();
+  const fields = [
+    ['积极监听间隔（分钟）', '积极监听间隔', 1, 30, 2, activePollMin, setActivePollMin],
+    ['空闲几次后降频', '连续无更新次数后降频', 1, 30, 5, idleThreshold, setIdleThreshold],
+    [
+      '半积极监听间隔（分钟）',
+      '半积极监听间隔',
+      2,
+      120,
+      10,
+      semiActivePollMin,
+      setSemiActivePollMin,
+    ],
+    ['贴文顶贴时效（小时）', '贴文顶贴时效', 1, 720, 24, maxAgeHours, setMaxAgeHours],
+    ['单帖本机上限', '单帖本机上限', 1, 500, 50, maxPerPost, setMaxPerPost],
+    ['每号每日上限', '每号每日上限', 1, 500, 20, dailyMax, setDailyMax],
+  ] as const;
   return (
-    <div
-      className="gs-modal-backdrop"
-      onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}
+    <GsCompactModal
+      label="频率限制"
+      busy={busy}
+      error={error}
+      onClose={p.onClose}
+      onSubmit={() =>
+        void run(
+          () =>
+            p.onSave({
+              activePollMinutes: clamp(activePollMin, 1, 30),
+              semiActiveAfterIdlePolls: clamp(idleThreshold, 1, 30),
+              semiActivePollMinutes: clamp(semiActivePollMin, 2, 120),
+              maxLikesPerPost: clamp(maxPerPost, 1, 500),
+              dailyMaxLikesPerAccount: clamp(dailyMax, 1, 500),
+              maxPostAgeHours: clamp(maxAgeHours, 1, 720),
+            }),
+          '保存失败',
+          p.onClose,
+        )
+      }
     >
-      <div className="gs-modal gs-modal-compact" role="dialog" aria-label="频率限制">
-        <header className="gs-modal-head">
-          <h3>频率限制</h3>
-          <button type="button" className="btn btn-sm btn-ghost" onClick={onClose}>
-            关闭
-          </button>
-        </header>
-
-        <div className="gs-modal-body">
-          {error && <div className="gs-banner is-err">{error}</div>}
-          <div className="gs-form-grid">
-            <label className="gs-field">
-              <span>积极监听间隔（分钟）</span>
-              <ControlledNumberInput
-                ariaLabel="积极监听间隔"
-                min={1}
-                max={30}
-                defaultValue={2}
-                value={activePollMin}
-                onChange={setActivePollMin}
-              />
-            </label>
-            <label className="gs-field">
-              <span>空闲几次后降频</span>
-              <ControlledNumberInput
-                ariaLabel="连续无更新次数后降频"
-                min={1}
-                max={30}
-                defaultValue={5}
-                value={idleThreshold}
-                onChange={setIdleThreshold}
-              />
-            </label>
-            <label className="gs-field">
-              <span>半积极监听间隔（分钟）</span>
-              <ControlledNumberInput
-                ariaLabel="半积极监听间隔"
-                min={2}
-                max={120}
-                defaultValue={10}
-                value={semiActivePollMin}
-                onChange={setSemiActivePollMin}
-              />
-            </label>
-            <label className="gs-field">
-              <span>贴文顶贴时效（小时）</span>
-              <ControlledNumberInput
-                ariaLabel="贴文顶贴时效"
-                min={1}
-                max={720}
-                defaultValue={24}
-                value={maxAgeHours}
-                onChange={setMaxAgeHours}
-              />
-            </label>
-            <label className="gs-field">
-              <span>单帖本机上限</span>
-              <ControlledNumberInput
-                ariaLabel="单帖本机上限"
-                min={1}
-                max={500}
-                defaultValue={50}
-                value={maxPerPost}
-                onChange={setMaxPerPost}
-              />
-            </label>
-            <label className="gs-field">
-              <span>每号每日上限</span>
-              <ControlledNumberInput
-                ariaLabel="每号每日上限"
-                min={1}
-                max={500}
-                defaultValue={20}
-                value={dailyMax}
-                onChange={setDailyMax}
-              />
-            </label>
-          </div>
-        </div>
-
-        <footer className="gs-modal-foot">
-          <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={onClose}>
-            取消
-          </button>
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
-            disabled={busy}
-            onClick={() => void handleSubmit()}
-          >
-            {busy ? '保存中…' : '保存'}
-          </button>
-        </footer>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        {fields.map(([label, aria, min, max, def, val, set]) => (
+          <CtrlNum
+            key={aria}
+            label={label}
+            aria={aria}
+            min={min}
+            max={max}
+            def={def}
+            val={val}
+            onChange={set}
+          />
+        ))}
       </div>
-    </div>
+    </GsCompactModal>
   );
 }
 
-/**
- * 发帖记录顶栏「下拉选择顶贴账号组」控件：点击展开勾选 Chrome 分组 / 蓝蝶分组，勾选即刻自动保存。
- */
-export function RecordsAccountGroupDropdown({
-  link,
-  profileGroups,
-  profiles,
-  bluestacksState,
-  disabled,
-  onChange,
-}: {
+export function RecordsAccountGroupDropdown(p: {
   link: GoogleSheetLink;
   profileGroups: readonly Group[];
   profiles: readonly Profile[];
@@ -319,98 +239,31 @@ export function RecordsAccountGroupDropdown({
     bumperBluestacksIds: string[];
   }) => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [showSingleBs, setShowSingleBs] = useState(false);
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-
-  const propGroups = link.recordsConfig?.bumperProfileGroupIds ?? [];
-  const propBsFolders = link.recordsConfig?.bumperBluestacksFolderIds ?? [];
-  const propBsIds = link.recordsConfig?.bumperBluestacksIds ?? [];
-  const [selectedGroups, setSelectedGroups] = useState<string[]>(propGroups);
-  const [selectedBsFolders, setSelectedBsFolders] = useState<string[]>(propBsFolders);
-  const [selectedBsIds, setSelectedBsIds] = useState<string[]>(propBsIds);
-  const latestRef = useRef({
-    groups: propGroups,
-    bsFolders: propBsFolders,
-    bsIds: propBsIds,
-  });
-
-  const propSyncKey = JSON.stringify([link.id, propGroups, propBsFolders, propBsIds]);
-  useEffect(() => {
-    latestRef.current = { groups: propGroups, bsFolders: propBsFolders, bsIds: propBsIds };
-    setSelectedGroups(propGroups);
-    setSelectedBsFolders(propBsFolders);
-    setSelectedBsIds(propBsIds);
-  }, [propSyncKey]);
-
-  const bsFolders = bluestacksState?.folders ?? [];
-  const bsInstances = bluestacksState?.instances ?? [];
-  const browserCount = profiles.filter(
-    (p) => p.groupId !== null && selectedGroups.includes(p.groupId),
+  const rc = p.link.recordsConfig;
+  const init = {
+    groups: rc?.bumperProfileGroupIds ?? [],
+    bsFolders: rc?.bumperBluestacksFolderIds ?? [],
+    bsIds: rc?.bumperBluestacksIds ?? [],
+  };
+  const { sel, latestRef, update } = useLinkedDraft(JSON.stringify([p.link.id, init]), init);
+  const bsFolders = p.bluestacksState?.folders ?? [],
+    bsInstances = p.bluestacksState?.instances ?? [];
+  const browserCount = p.profiles.filter(
+    (pr) => pr.groupId !== null && sel.groups.includes(pr.groupId),
   ).length;
   const bsCount = bsInstances.filter(
-    (inst) =>
-      (inst.folderId !== null && selectedBsFolders.includes(inst.folderId)) ||
-      selectedBsIds.includes(inst.id),
+    (i) => (i.folderId !== null && sel.bsFolders.includes(i.folderId)) || sel.bsIds.includes(i.id),
   ).length;
   const totalSelected = browserCount + bsCount;
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('mousedown', onDocDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
-  function toggleGroup(id: string) {
-    const cur = latestRef.current;
-    const next = cur.groups.includes(id) ? cur.groups.filter((x) => x !== id) : [...cur.groups, id];
-    latestRef.current = { ...cur, groups: next };
-    setSelectedGroups(next);
-    onChange({
-      bumperProfileGroupIds: next,
-      bumperBluestacksFolderIds: cur.bsFolders,
-      bumperBluestacksIds: cur.bsIds,
+  const commit = (patch: Partial<typeof init>) => {
+    const n = update(patch);
+    p.onChange({
+      bumperProfileGroupIds: n.groups,
+      bumperBluestacksFolderIds: n.bsFolders,
+      bumperBluestacksIds: n.bsIds,
     });
-  }
-
-  function toggleBsFolder(id: string) {
-    const cur = latestRef.current;
-    const next = cur.bsFolders.includes(id)
-      ? cur.bsFolders.filter((x) => x !== id)
-      : [...cur.bsFolders, id];
-    latestRef.current = { ...cur, bsFolders: next };
-    setSelectedBsFolders(next);
-    onChange({
-      bumperProfileGroupIds: cur.groups,
-      bumperBluestacksFolderIds: next,
-      bumperBluestacksIds: cur.bsIds,
-    });
-  }
-
-  function toggleBsInst(id: string) {
-    const cur = latestRef.current;
-    const next = cur.bsIds.includes(id) ? cur.bsIds.filter((x) => x !== id) : [...cur.bsIds, id];
-    latestRef.current = { ...cur, bsIds: next };
-    setSelectedBsIds(next);
-    onChange({
-      bumperProfileGroupIds: cur.groups,
-      bumperBluestacksFolderIds: cur.bsFolders,
-      bumperBluestacksIds: next,
-    });
-  }
-
+  };
   const label =
     totalSelected === 0
       ? '选择顶贴账号组'
@@ -419,105 +272,73 @@ export function RecordsAccountGroupDropdown({
           .join(' + ');
 
   return (
-    <div className="gs-dropdown-wrap" ref={wrapRef}>
-      <button
-        type="button"
-        className={'btn btn-sm gs-dropdown-trigger' + (totalSelected === 0 ? ' is-warn' : '')}
-        disabled={disabled}
-        aria-expanded={open}
-        aria-label="下拉选择顶贴账号组"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span>{label}</span>
-        <span className="gs-caret">▾</span>
-      </button>
-
-      {open && (
-        <div className="gs-dropdown-menu" role="menu">
-          <div className="gs-dropdown-section">
-            <div className="gs-dropdown-title">Chrome 浏览器分组</div>
-            {profileGroups.length === 0 ? (
-              <div className="gs-dropdown-empty">暂无分组（可在左侧栏新建分组）</div>
-            ) : (
-              profileGroups.map((g) => {
-                const count = profiles.filter((p) => p.groupId === g.id).length;
-                return (
-                  <label key={g.id} className="gs-dropdown-option">
-                    <input
-                      type="checkbox"
-                      checked={selectedGroups.includes(g.id)}
-                      onChange={() => toggleGroup(g.id)}
-                    />
-                    <span>{g.name}</span>
-                    <em className="gs-dropdown-count">{count}</em>
-                  </label>
-                );
-              })
-            )}
+    <DropdownPopover
+      label={label}
+      ariaLabel="下拉选择顶贴账号组"
+      warn={totalSelected === 0}
+      disabled={p.disabled}
+    >
+      <div className="flex flex-col gap-1">
+        <div className="px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)]">
+          Chrome 浏览器分组
+        </div>
+        {p.profileGroups.length === 0 ? (
+          <div className="px-1.5 py-1 text-xs text-[var(--muted)]">
+            暂无分组（可在左侧栏新建分组）
           </div>
-
-          {bsInstances.length > 0 && (
-            <div className="gs-dropdown-section">
-              <div className="gs-dropdown-title-row">
-                <span className="gs-dropdown-title">蓝蝶模拟器</span>
-                <button
-                  type="button"
-                  className="gs-dropdown-link"
-                  onClick={() => setShowSingleBs((v) => !v)}
-                >
-                  {showSingleBs
-                    ? '收起单台'
-                    : `按单台 (${selectedBsIds.length}/${bsInstances.length})`}
-                </button>
-              </div>
-              {bsFolders.map((f) => {
-                const count = bsInstances.filter((i) => i.folderId === f.id).length;
-                return (
-                  <label key={f.id} className="gs-dropdown-option">
-                    <input
-                      type="checkbox"
-                      checked={selectedBsFolders.includes(f.id)}
-                      onChange={() => toggleBsFolder(f.id)}
-                    />
-                    <span>[分组] {f.name}</span>
-                    <em className="gs-dropdown-count">{count}</em>
-                  </label>
-                );
-              })}
-              {showSingleBs && (
-                <div className="gs-dropdown-subscroll">
-                  {bsInstances.slice(0, 60).map((inst) => (
-                    <label key={inst.id} className="gs-dropdown-option">
-                      <input
-                        type="checkbox"
-                        checked={selectedBsIds.includes(inst.id)}
-                        onChange={() => toggleBsInst(inst.id)}
-                      />
-                      <span>
-                        {bluestacksDisplayTitle(inst)}
-                        {inst.accountName ? ` · ${inst.accountName}` : ''}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              )}
+        ) : (
+          p.profileGroups.map((g) => (
+            <CountCheckbox
+              key={g.id}
+              checked={sel.groups.includes(g.id)}
+              label={g.name}
+              count={p.profiles.filter((pr) => pr.groupId === g.id).length}
+              onChange={() => commit({ groups: toggleId(latestRef.current.groups, g.id) })}
+            />
+          ))
+        )}
+      </div>
+      {bsInstances.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1 border-t border-[var(--line)] pt-1.5">
+          <div className="flex items-center justify-between px-1.5 py-0.5">
+            <span className="text-[11px] font-semibold text-[var(--muted)]">蓝蝶模拟器</span>
+            <button
+              type="button"
+              className="text-[11px] text-sky-700 hover:underline"
+              onClick={() => setShowSingleBs((v) => !v)}
+            >
+              {showSingleBs ? '收起单台' : `按单台 (${sel.bsIds.length}/${bsInstances.length})`}
+            </button>
+          </div>
+          {bsFolders.map((f) => (
+            <CountCheckbox
+              key={f.id}
+              checked={sel.bsFolders.includes(f.id)}
+              label={`[分组] ${f.name}`}
+              count={bsInstances.filter((i) => i.folderId === f.id).length}
+              onChange={() => commit({ bsFolders: toggleId(latestRef.current.bsFolders, f.id) })}
+            />
+          ))}
+          {showSingleBs && (
+            <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto border-t border-slate-100 pt-1">
+              {bsInstances.slice(0, 60).map((inst) => (
+                <Chk
+                  key={inst.id}
+                  className={optCls}
+                  checked={sel.bsIds.includes(inst.id)}
+                  onChange={() => commit({ bsIds: toggleId(latestRef.current.bsIds, inst.id) })}
+                  label={`${bluestacksDisplayTitle(inst)}${inst.accountName ? ` · ${inst.accountName}` : ''}`}
+                />
+              ))}
             </div>
           )}
         </div>
       )}
-    </div>
+    </DropdownPopover>
   );
 }
 
-/**
- * 排贴表在选中蓝蝶/双引擎时才显示的轻量化蓝蝶范围下拉（仅浏览器模式不占任何位置）。
- */
-export function ScheduleBluestacksDropdown({
-  link,
-  bluestacksState,
-  disabled,
-  onChange,
-}: {
+export function ScheduleBluestacksDropdown(p: {
   link: GoogleSheetLink;
   bluestacksState?: BluestacksState | null;
   disabled?: boolean;
@@ -527,113 +348,53 @@ export function ScheduleBluestacksDropdown({
     closeBluestacksOnFinish: boolean;
   }) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement | null>(null);
-  const bsFolders = bluestacksState?.folders ?? [];
-  const bsInstances = bluestacksState?.instances ?? [];
-  const propFolders = link.scheduleConfig?.bluestacksFolderIds ?? [];
-  const propIds = link.scheduleConfig?.bluestacksInstanceIds ?? [];
-  const propClose = link.scheduleConfig?.closeBluestacksOnFinish ?? true;
-  const [selectedFolders, setSelectedFolders] = useState<string[]>(propFolders);
-  const [selectedIds, setSelectedIds] = useState<string[]>(propIds);
-  const [closeOnFinish, setCloseOnFinish] = useState<boolean>(propClose);
-  const latestRef = useRef({
-    folders: propFolders,
-    ids: propIds,
-    closeOnFinish: propClose,
-  });
-  const propSyncKey = JSON.stringify([link.id, propFolders, propIds, propClose]);
-  useEffect(() => {
-    latestRef.current = { folders: propFolders, ids: propIds, closeOnFinish: propClose };
-    setSelectedFolders(propFolders);
-    setSelectedIds(propIds);
-    setCloseOnFinish(propClose);
-  }, [propSyncKey]);
-
+  const bsFolders = p.bluestacksState?.folders ?? [],
+    bsInstances = p.bluestacksState?.instances ?? [],
+    sc = p.link.scheduleConfig;
+  const init = {
+    folders: sc?.bluestacksFolderIds ?? [],
+    ids: sc?.bluestacksInstanceIds ?? [],
+    closeOnFinish: sc?.closeBluestacksOnFinish ?? true,
+  };
+  const { sel, latestRef, update } = useLinkedDraft(JSON.stringify([p.link.id, init]), init);
   const matched = bsInstances.filter(
-    (i) =>
-      (i.folderId !== null && selectedFolders.includes(i.folderId)) || selectedIds.includes(i.id),
+    (i) => (i.folderId !== null && sel.folders.includes(i.folderId)) || sel.ids.includes(i.id),
   ).length;
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocDown = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('mousedown', onDocDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
+  const commit = (patch: Partial<typeof init>) => {
+    const n = update(patch);
+    p.onChange({
+      bluestacksFolderIds: n.folders,
+      bluestacksInstanceIds: n.ids,
+      closeBluestacksOnFinish: n.closeOnFinish,
+    });
+  };
   return (
-    <div className="gs-dropdown-wrap" ref={wrapRef}>
-      <button
-        type="button"
-        className="btn btn-sm gs-dropdown-trigger"
-        disabled={disabled}
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span>{matched > 0 ? `蓝蝶范围 (${matched})` : '蓝蝶范围：全部'}</span>
-        <span className="gs-caret">▾</span>
-      </button>
-      {open && (
-        <div className="gs-dropdown-menu" role="menu">
-          <div className="gs-dropdown-section">
-            <label className="gs-dropdown-option">
-              <input
-                type="checkbox"
-                checked={closeOnFinish}
-                onChange={(e) => {
-                  const nextClose = e.target.checked;
-                  const cur = latestRef.current;
-                  latestRef.current = { ...cur, closeOnFinish: nextClose };
-                  setCloseOnFinish(nextClose);
-                  onChange({
-                    bluestacksFolderIds: cur.folders,
-                    bluestacksInstanceIds: cur.ids,
-                    closeBluestacksOnFinish: nextClose,
-                  });
-                }}
-              />
-              <span>发帖完成后自动关窗</span>
-            </label>
+    <DropdownPopover
+      label={matched > 0 ? `蓝蝶范围 (${matched})` : '蓝蝶范围：全部'}
+      disabled={p.disabled}
+    >
+      <Chk
+        className={optCls}
+        label="发帖完成后自动关窗"
+        checked={sel.closeOnFinish}
+        onChange={(c) => commit({ closeOnFinish: c })}
+      />
+      {bsFolders.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1 border-t border-[var(--line)] pt-1.5">
+          <div className="px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)]">
+            限定蓝蝶分组（不选则自动匹配全部）
           </div>
-          {bsFolders.length > 0 && (
-            <div className="gs-dropdown-section">
-              <div className="gs-dropdown-title">限定蓝蝶分组（不选则自动匹配全部）</div>
-              {bsFolders.map((f) => (
-                <label key={f.id} className="gs-dropdown-option">
-                  <input
-                    type="checkbox"
-                    checked={selectedFolders.includes(f.id)}
-                    onChange={() => {
-                      const cur = latestRef.current;
-                      const next = cur.folders.includes(f.id)
-                        ? cur.folders.filter((x) => x !== f.id)
-                        : [...cur.folders, f.id];
-                      latestRef.current = { ...cur, folders: next };
-                      setSelectedFolders(next);
-                      onChange({
-                        bluestacksFolderIds: next,
-                        bluestacksInstanceIds: cur.ids,
-                        closeBluestacksOnFinish: cur.closeOnFinish,
-                      });
-                    }}
-                  />
-                  <span>{f.name}</span>
-                </label>
-              ))}
-            </div>
-          )}
+          {bsFolders.map((f) => (
+            <Chk
+              key={f.id}
+              className={optCls}
+              label={f.name}
+              checked={sel.folders.includes(f.id)}
+              onChange={() => commit({ folders: toggleId(latestRef.current.folders, f.id) })}
+            />
+          ))}
         </div>
       )}
-    </div>
+    </DropdownPopover>
   );
 }

@@ -6,8 +6,11 @@ import path from 'node:path';
 import {
   readVideoMetadata,
   checkKnownFacebookVideo,
+  checkKnownFacebookVideoPath,
 } from '../src/infrastructure/video-metadata.js';
-import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
+import { FilesystemResourceMaterialVerifier } from '../src/infrastructure/resource-material-verifier.js';
+import { mediaReference } from '../src/domain/resource-table.js';
+import { randomUUID } from 'node:crypto';
 
 // Container-only fixtures; none represents decoded media or Facebook upload acceptance.
 function box(type: string, body: Buffer) {
@@ -107,14 +110,18 @@ test('video preflight rejects the observed undersized fixture before cataloguing
     }
   });
   await fixture(container(video(160, 90)), async (file) => {
-    const scan = await new FilesystemMaterialScanner(undefined, checkKnownFacebookVideo).scan(
-      path.dirname(file),
+    const verifier = new FilesystemResourceMaterialVerifier(
+      undefined,
+      undefined,
+      undefined,
+      checkKnownFacebookVideoPath,
     );
-    assert.equal(scan.packages.length, 0);
-    assert.ok(
-      scan.issues.some(
-        (issue) => issue.code === 'VIDEO_METADATA_INVALID' && issue.message.includes('120'),
+    await assert.rejects(
+      verifier.snapshot(
+        { id: randomUUID(), text: '', background: 'plain', media: [mediaReference(file)] },
+        () => {},
       ),
+      /至少120/,
     );
   });
 });

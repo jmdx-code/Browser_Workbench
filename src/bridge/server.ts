@@ -1,36 +1,120 @@
 import { flatMapAsync, mapAsync } from '../shared/async-collections.js';
 import http from 'node:http';
-import { readFile, mkdir, access } from 'node:fs/promises';
+import { mkdir, access, readFile } from 'node:fs/promises';
 import { DatabaseSync, backup as backupDatabase } from 'node:sqlite';
 import path from 'node:path';
-import { randomBytes, randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
-import { WebSocketServer, WebSocket } from 'ws';
+import { randomBytes } from 'node:crypto';
+import { WebSocket } from 'ws';
 import { z } from 'zod';
-import { bridgeCapabilities } from '../shared/bridge-capabilities.js';
 import { Core, type Peer } from './core.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
-export interface KernelBridgeHooks {
-  message(peer: Peer, value: unknown): Awaitable<boolean>;
-  disconnected(peer: Peer): Awaitable<void>;
-  controlStopped(peer: Peer, requestId?: string): Awaitable<void>;
-  tick(): Awaitable<void>;
-  close(): Promise<void>;
-}
 import { Store } from './store.js';
 import type { BridgeStorePort } from '../infrastructure/persistence-port.js';
 import type { Awaitable } from '../domain/persistence.js';
-import { WatchTasks } from './watch.js';
+import { ORIGIN as DEFAULT_ORIGIN, Intent, LEASE_MS, Review, VERSION } from './protocol.js';
 import {
-  ORIGIN as DEFAULT_ORIGIN,
-  LEASE_MS,
-  VERSION,
-  Intent,
-  JournalEntry,
-  Review,
-  isWrite,
-  type Reply,
-} from './protocol.js';
-export interface BridgeServerOptions {
+  attachBridgeWsGateway,
+  observeBridgeIncomingMessage,
+  rotatePeerSecret,
+  type ConnectionFailureEntry,
+  type KernelBridgeHooks,
+  type PendingRecoveryEntry,
+} from './ws-peer-gateway.js';
+export type { KernelBridgeHooks };
+export { observeBridgeIncomingMessage };
+const jsonResponse = (res: http.ServerResponse, code: number, value: unknown): void => {
+  res.writeHead(code, {
+    'Content-Type': 'application/json;charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(JSON.stringify(value));
+};
+async function readJsonBody(req: http.IncomingMessage, limit = 131072): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const part of req) {
+    const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
+    bytes += chunk.length;
+    if (bytes > limit) throw Error('BODY_TOO_LARGE');
+    chunks.push(chunk);
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+}
+const PUBLIC_FILES: Record<string, string> = {
+  '/dashboard.js': 'dashboard.js',
+  '/style.css': 'style.css',
+  '/kernel-fixture': 'kernel-fixture.html',
+  '/kernel-fixture.js': 'kernel-fixture.js',
+  '/kernel-frame': 'kernel-frame.html',
+  '/kernel-frame.js': 'kernel-frame.js',
+};
+const IDENTIFICATION_FILES: Record<string, string> = {
+  '/browser-identify.js': 'browser-identify.js',
+  '/browser-identify.css': 'browser-identify.css',
+};
+const contentTypeFor = (file: string) =>
+  file.endsWith('.js')
+    ? 'text/javascript'
+    : file.endsWith('.css')
+      ? 'text/css'
+      : 'text/html;charset=utf-8';
+const BODY_1M = new Set([
+  '/api/workspace/profiles/reorder',
+  '/api/workspace/group-bumper/groups/add',
+  '/api/workspace/group-bumper/pages/add',
+  '/api/workspace/group-bumper/comments',
+  '/api/workspace/group-bumper/page-comments',
+  '/api/workspace/group-poster/groups/add',
+  '/api/workspace/group-inviter/groups/add',
+]);
+function selectPostBodyLimit(pathname: string): number {
+  if (
+    pathname === '/api/workspace/resource-tables/save' ||
+    pathname === '/api/workspace/group-poster/materials/save'
+  )
+    return 4 * 1024 * 1024;
+  if (BODY_1M.has(pathname)) return 1024 * 1024;
+  if (pathname === '/api/workspace/google-sheets/auth/credentials') return 512 * 1024;
+  if (pathname === '/api/workspace/group-poster/materials/thumbnail') return 256 * 1024;
+  return 131072;
+}
+async function serveRangeSampleMp4(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  root: string,
+) {
+  const bytes = await readFile(path.join(root, 'public/sample.mp4'));
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  const range = req.headers.range;
+  if (!range) {
+    res.setHeader('Content-Length', bytes.length);
+    return res.end(bytes);
+  }
+  const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+  const start = m && !m[1] && m[2] ? Math.max(0, bytes.length - Number(m[2])) : Number(m?.[1] ?? 0);
+  let end = m && !m[1] && m[2] ? bytes.length - 1 : m?.[2] ? Number(m[2]) : bytes.length - 1;
+  if (
+    !m ||
+    (!m[1] && !m[2]) ||
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    start >= bytes.length ||
+    end < start
+  ) {
+    res.writeHead(416, { 'Content-Range': `bytes */${bytes.length}` });
+    return res.end();
+  }
+  end = Math.min(end, bytes.length - 1);
+  res.writeHead(206, {
+    'Content-Range': `bytes ${start}-${end}/${bytes.length}`,
+    'Content-Length': end - start + 1,
+  });
+  return res.end(bytes.subarray(start, end + 1));
+}
+interface BridgeServerOptions {
   extensionIdle?: (peer: Peer) => Awaitable<void>;
   connectionRecoveryAllowed?: (profileId: string) => Awaitable<boolean>;
   store?: BridgeStorePort;
@@ -40,17 +124,13 @@ export interface BridgeServerOptions {
   root: string;
   extensionIds: string[];
   diagnosticsEnabled?: boolean;
-  kernelHooks?: (context: {
-    core: Core;
-    store: BridgeStorePort;
-    tasks: WatchTasks;
-  }) => KernelBridgeHooks;
+  kernelHooks?: (context: { core: Core; store: BridgeStorePort }) => KernelBridgeHooks;
   boundServer?: { server: http.Server; bootstrapHandler: http.RequestListener };
   mcpHandler?: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
+  onClose?: () => Awaitable<void>;
   appRoutes?: (context: {
     core: Core;
     store: BridgeStorePort;
-    tasks: WatchTasks;
   }) => (
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -58,52 +138,8 @@ export interface BridgeServerOptions {
     input?: unknown,
   ) => Promise<boolean>;
 }
-export function observeBridgeIncomingMessage(
-  raw: unknown,
-  parsed: unknown,
-  profileId?: string,
-): { utf8Bytes: number; observed: boolean } {
-  const utf8Bytes = Buffer.isBuffer(raw)
-    ? raw.byteLength
-    : raw instanceof ArrayBuffer
-      ? raw.byteLength
-      : Array.isArray(raw)
-        ? raw.reduce((acc, buf) => acc + (Buffer.isBuffer(buf) ? buf.byteLength : 0), 0)
-        : Buffer.byteLength(String(raw ?? ''), 'utf8');
-  if (utf8Bytes > 2 * 1024 * 1024 && typeof parsed === 'object' && parsed !== null) {
-    const record = parsed as Record<string, unknown>;
-    const ev =
-      typeof record.event === 'object' && record.event !== null
-        ? (record.event as Record<string, unknown>)
-        : undefined;
-    devDiag.record({
-      level: 'WARN',
-      category: 'BRIDGE_WS',
-      event: 'BRIDGE_LARGE_MESSAGE_OBSERVED',
-      profileId,
-      reason: 'LARGE_INCOMING_MESSAGE',
-      data: {
-        bytes: utf8Bytes,
-        type: typeof record.type === 'string' ? record.type : 'UNKNOWN',
-        method:
-          typeof record.method === 'string'
-            ? record.method
-            : typeof ev?.method === 'string'
-              ? ev.method
-              : undefined,
-        commandId: typeof record.commandId === 'string' ? record.commandId : undefined,
-        requestId: typeof record.requestId === 'string' ? record.requestId : undefined,
-        entriesCount: Array.isArray(record.entries) ? record.entries.length : undefined,
-        topKeys: Object.keys(record).slice(0, 12),
-      },
-    });
-    return { utf8Bytes, observed: true };
-  }
-  return { utf8Bytes, observed: false };
-}
 export async function startBridgeServer(options: BridgeServerOptions) {
-  const root = options.root;
-  const data = options.dataDir;
+  const { root, dataDir: data, port, extensionIds } = options;
   await mkdir(data, { recursive: true });
   const databasePath = path.join(data, 'journal.sqlite');
   let existingDatabase = false;
@@ -114,114 +150,75 @@ export async function startBridgeServer(options: BridgeServerOptions) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   if (existingDatabase && !options.store) {
-    const previous = new DatabaseSync(databasePath, { readOnly: true });
+    const prev = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      previous.exec('PRAGMA busy_timeout = 5000');
-      if ((previous.prepare('PRAGMA user_version').get() as any).user_version < 3)
-        await backupDatabase(previous, path.join(data, 'before-v3-' + Date.now() + '.sqlite'));
+      prev.exec('PRAGMA busy_timeout = 5000');
+      const ver = prev.prepare('PRAGMA user_version').get() as
+        { user_version?: number } | undefined;
+      if (Number(ver?.user_version ?? 0) < 3)
+        await backupDatabase(prev, path.join(data, 'before-v3-' + Date.now() + '.sqlite'));
     } finally {
-      previous.close();
+      prev.close();
     }
   }
-  const store = options.store ?? new Store(databasePath);
-  const core = new Core(store);
-  const tasks = new WatchTasks(core);
-  const admin = randomBytes(32).toString('hex');
-  const port = options.port;
+  const store = options.store ?? new Store(databasePath),
+    core = new Core(store);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw Error('PORT_CONFIG_REJECTED');
-  const ORIGIN = port === 18767 ? DEFAULT_ORIGIN : 'http://127.0.0.1:' + port;
-  const HOST = '127.0.0.1:' + port;
-  // This ID was observed from the new extension already installed in Chrome 004.
-  // Browser-origin allowlisting is the bootstrap boundary, not authentication of other OS processes.
-  const extensionIds = options.extensionIds;
+  const ORIGIN = port === 18767 ? DEFAULT_ORIGIN : 'http://127.0.0.1:' + port,
+    HOST = '127.0.0.1:' + port;
   if (!extensionIds.length || extensionIds.some((id) => !/^[a-p]{32}$/.test(id)))
     throw Error('INVALID_EXTENSION_ID_CONFIG');
-  const kernel = options.kernelHooks?.({ core, store, tasks });
-  const appHandler = options.appRoutes?.({ core, store, tasks });
-  const connectionFailures = new Map<
-    string,
-    { profileId: string | null; code: string; fields: string[]; at: number; count: number }
-  >();
-  const pendingRecovery = new Map<
-    string,
-    {
-      id: string;
-      profileId: string;
-      extensionId: string;
-      expected: string;
-      socket: WebSocket;
-      expiresAt: number;
-      busy: boolean;
-      resolve: (secret: string) => void;
-      reject: (error: Error) => void;
-    }
-  >();
-  function equalSecret(a: string, b: string) {
-    const x = Buffer.from(a),
-      y = Buffer.from(b);
-    return x.length === y.length && timingSafeEqual(x, y);
-  }
-  async function body(req: http.IncomingMessage, limit = 131072) {
-    const chunks: Buffer[] = [];
-    let bytes = 0;
-    for await (const part of req) {
-      const chunk = Buffer.isBuffer(part) ? part : Buffer.from(part);
-      bytes += chunk.length;
-      if (bytes > limit) throw Error('BODY_TOO_LARGE');
-      chunks.push(chunk);
-    }
-    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-  }
-  function json(res: http.ServerResponse, code: number, value: unknown) {
-    res.writeHead(code, {
-      'Content-Type': 'application/json;charset=utf-8',
-      'Cache-Control': 'no-store',
-      'X-Content-Type-Options': 'nosniff',
-    });
-    res.end(JSON.stringify(value));
-  }
-  function authenticated(req: http.IncomingMessage) {
-    return (req.headers.cookie ?? '').split(';').some((c) => c.trim() === 'bridgeAdmin=' + admin);
-  }
-  async function state() {
+  const kernel = options.kernelHooks?.({ core, store }),
+    appHandler = options.appRoutes?.({ core, store }),
+    connectionFailures = new Map<string, ConnectionFailureEntry>(),
+    pendingRecovery = new Map<string, PendingRecoveryEntry>(),
+    server = options.boundServer?.server ?? http.createServer();
+  if (options.boundServer) server.removeListener('request', options.boundServer.bootstrapHandler);
+  const admin = randomBytes(32).toString('hex');
+  const adminCookie = port === 18767 ? 'bridgeAdmin' : `bridgeAdmin_${port}`;
+  const authenticated = (req: http.IncomingMessage) =>
+    (req.headers.cookie ?? '').split(';').some((c) => c.trim() === `${adminCookie}=${admin}`);
+  const parseOp = (r: { result: string | null }) => ({
+    ...r,
+    result: r.result ? JSON.parse(r.result) : null,
+  });
+  const buildDiagnosticState = async () => {
+    const profileRows = await store.profileList();
     return {
       version: VERSION,
       connection: { mode: 'automatic-local-port', port },
-      profiles: await mapAsync(await store.profileList(), async (p: any) => ({
-        ...p,
-        online: core.peers.get(p.profileId)?.online ?? false,
-        paused: core.peers.get(p.profileId)?.paused ?? true,
-        phase: core.peers.get(p.profileId)?.phase ?? 'OFFLINE',
-        synced: core.peers.get(p.profileId)?.synced ?? false,
-        error: core.peers.get(p.profileId)?.error,
-        unresolved: (await store.unresolved(p.profileId)).length,
-        extensionVersion: core.peers.get(p.profileId)?.extensionVersion,
-        capabilities: core.peers.get(p.profileId)?.capabilities,
-      })),
-      operations: (await store.list()).map((r) => ({
-        ...r,
-        result: r.result ? JSON.parse(r.result) : null,
-      })),
-      tasks: (await store.tasks()).map((r: any) => ({
-        ...r,
-        spec: JSON.parse(r.spec),
-        evidence: r.evidence ? JSON.parse(r.evidence) : null,
-      })),
-      unresolved: await mapAsync(
+      profiles: await mapAsync(profileRows, async (rawProfile) => {
+        const p = rawProfile as { profileId: string } & Record<string, unknown>,
+          peer = core.peers.get(p.profileId);
+        return {
+          ...p,
+          online: peer?.online ?? false,
+          paused: peer?.paused ?? true,
+          phase: peer?.phase ?? 'OFFLINE',
+          synced: peer?.synced ?? false,
+          error: peer?.error,
+          unresolved: (await store.unresolved(p.profileId)).length,
+          extensionVersion: peer?.extensionVersion,
+          capabilities: peer?.capabilities,
+        };
+      }),
+      operations: (await store.list()).map(parseOp),
+      unresolved: (
         await flatMapAsync(
-          await store.profileList(),
-          async (p: any) => await store.unresolved(p.profileId),
-        ),
-        (r) => ({ ...r, result: r.result ? JSON.parse(r.result) : null }),
-      ),
+          profileRows,
+          async (r) => await store.unresolved((r as { profileId: string }).profileId),
+        )
+      ).map(parseOp),
     };
-  }
-  const server = options.boundServer?.server ?? http.createServer();
-  if (options.boundServer) server.removeListener('request', options.boundServer.bootstrapHandler);
+  };
   server.on('request', async (req, res) => {
+    const sendFile = async (filePath: string, contentType: string) => {
+      res.setHeader('Content-Type', contentType);
+      return res.end(await readFile(filePath));
+    };
     try {
       if (![HOST, 'localhost:' + port].includes(req.headers.host ?? ''))
-        return json(res, 403, { error: 'HOST_REJECTED' });
+        return jsonResponse(res, 403, { error: 'HOST_REJECTED' });
       const u = new URL(req.url ?? '/', ORIGIN);
       if (u.pathname === '/mcp' && options.mcpHandler && (await options.mcpHandler(req, res)))
         return;
@@ -229,716 +226,161 @@ export async function startBridgeServer(options: BridgeServerOptions) {
         'Content-Security-Policy',
         "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob: https://*.fbcdn.net https://*.fbsbx.com https://i.gyazo.com https://*.gyazo.com https://*.googleusercontent.com https://drive.google.com; media-src 'self' blob:; frame-src 'self' http://localhost:18767; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
       );
-      if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/workbench/')) {
-        res.setHeader('Set-Cookie', `bridgeAdmin=${admin}; HttpOnly; SameSite=Strict; Path=/`);
-        res.setHeader('Content-Type', 'text/html;charset=utf-8');
-        return res.end(await readFile(path.join(root, 'web/index.html')));
-      }
-      if (req.method === 'GET' && /^\/workbench\/assets\/[A-Za-z0-9_.-]+$/.test(u.pathname)) {
-        const file = path.join(root, 'web/assets', path.basename(u.pathname));
-        res.setHeader('Content-Type', file.endsWith('.css') ? 'text/css' : 'text/javascript');
-        return res.end(await readFile(file));
-      }
-      if (req.method === 'GET' && u.pathname === '/app-icon.svg') {
-        res.setHeader('Content-Type', 'image/svg+xml');
-        return res.end(await readFile(path.join(root, 'public/app-icon.svg')));
-      }
-      if (options.diagnosticsEnabled && req.method === 'GET' && u.pathname === '/sample.mp4') {
-        const bytes = await readFile(path.join(root, 'public/sample.mp4'));
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Accept-Ranges', 'bytes');
-        const range = req.headers.range;
-        if (range) {
-          const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-          let start = Number(match?.[1] ?? 0),
-            end = match?.[2] ? Number(match[2]) : bytes.length - 1;
-          if (match && !match[1] && match[2]) {
-            start = Math.max(0, bytes.length - Number(match[2]));
-            end = bytes.length - 1;
-          }
-          if (
-            !match ||
-            (!match[1] && !match[2]) ||
-            !Number.isSafeInteger(start) ||
-            !Number.isSafeInteger(end) ||
-            start < 0 ||
-            start >= bytes.length ||
-            end < start
-          ) {
-            res.writeHead(416, { 'Content-Range': `bytes */${bytes.length}` });
-            return res.end();
-          }
-          end = Math.min(end, bytes.length - 1);
-          res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${bytes.length}`,
-            'Content-Length': end - start + 1,
-          });
-          return res.end(bytes.subarray(start, end + 1));
+      if (req.method === 'GET') {
+        if (u.pathname === '/' || u.pathname === '/workbench/') {
+          res.setHeader('Set-Cookie', `${adminCookie}=${admin}; HttpOnly; SameSite=Strict; Path=/`);
+          return await sendFile(path.join(root, 'web/index.html'), 'text/html;charset=utf-8');
         }
-        res.setHeader('Content-Length', bytes.length);
-        return res.end(bytes);
-      }
-      const publicFiles: Record<string, string> = {
-        '/dashboard.js': 'dashboard.js',
-        '/style.css': 'style.css',
-        '/fixture': 'fixture.html',
-        '/fixture.js': 'fixture.js',
-        '/frame': 'frame.html',
-        '/kernel-fixture': 'kernel-fixture.html',
-        '/kernel-fixture.js': 'kernel-fixture.js',
-        '/kernel-frame': 'kernel-frame.html',
-        '/kernel-frame.js': 'kernel-frame.js',
-      };
-      const identificationFiles: Record<string, string> = {
-        '/browser-identify.js': 'browser-identify.js',
-        '/browser-identify.css': 'browser-identify.css',
-      };
-      const identificationFile =
-        u.pathname === '/fixture' && u.searchParams.get('identify') === '1'
-          ? 'browser-identify.html'
-          : identificationFiles[u.pathname];
-      if (req.method === 'GET' && identificationFile) {
-        res.setHeader('Cache-Control', 'no-store');
-        res.setHeader(
-          'Content-Type',
-          identificationFile.endsWith('.js')
-            ? 'text/javascript'
-            : identificationFile.endsWith('.css')
-              ? 'text/css'
-              : 'text/html;charset=utf-8',
-        );
-        return res.end(await readFile(path.join(root, 'public', identificationFile)));
-      }
-      if (options.diagnosticsEnabled && req.method === 'GET' && publicFiles[u.pathname]) {
-        if (u.pathname === '/frame' || u.pathname === '/kernel-frame')
-          res.setHeader(
-            'Content-Security-Policy',
-            "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors http://127.0.0.1:18767 http://localhost:18767",
-          );
-        res.setHeader(
-          'Content-Type',
-          u.pathname.endsWith('.js')
-            ? 'text/javascript'
-            : u.pathname.endsWith('.css')
-              ? 'text/css'
-              : 'text/html;charset=utf-8',
-        );
-        return res.end(await readFile(path.join(root, 'public', publicFiles[u.pathname]!)));
+        if (/^\/workbench\/assets\/[A-Za-z0-9_.-]+$/.test(u.pathname)) {
+          const file = path.join(root, 'web/assets', path.basename(u.pathname));
+          return await sendFile(file, file.endsWith('.css') ? 'text/css' : 'text/javascript');
+        }
+        if (u.pathname === '/app-icon.svg')
+          return await sendFile(path.join(root, 'public/app-icon.svg'), 'image/svg+xml');
+        if (options.diagnosticsEnabled && u.pathname === '/sample.mp4')
+          return await serveRangeSampleMp4(req, res, root);
+        const idFile =
+          u.pathname === '/fixture' && u.searchParams.get('identify') === '1'
+            ? 'browser-identify.html'
+            : IDENTIFICATION_FILES[u.pathname];
+        if (idFile) {
+          res.setHeader('Cache-Control', 'no-store');
+          return await sendFile(path.join(root, 'public', idFile), contentTypeFor(idFile));
+        }
+        const pubFile = PUBLIC_FILES[u.pathname];
+        if (options.diagnosticsEnabled && pubFile) {
+          if (u.pathname === '/frame' || u.pathname === '/kernel-frame')
+            res.setHeader(
+              'Content-Security-Policy',
+              "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors http://127.0.0.1:18767 http://localhost:18767",
+            );
+          return await sendFile(path.join(root, 'public', pubFile), contentTypeFor(u.pathname));
+        }
       }
       if (req.headers.host !== HOST || !authenticated(req))
-        return json(res, 401, { error: 'ADMIN_REQUIRED' });
-      if (req.method === 'GET' && u.pathname === '/api/bridge-connection-health')
-        return json(res, 200, {
-          failures: [...connectionFailures.values()],
-          pending: [...pendingRecovery.values()].map(({ id, profileId, expiresAt }) => ({
-            id,
-            profileId,
-            expiresAt,
-          })),
-        });
-      if (req.method === 'GET' && appHandler && (await appHandler(req, res, u.pathname))) return;
-      if (options.diagnosticsEnabled && req.method === 'GET' && u.pathname === '/api/state')
-        return json(res, 200, await state());
+        return jsonResponse(res, 401, { error: 'ADMIN_REQUIRED' });
+      if (req.method === 'GET') {
+        if (u.pathname === '/api/bridge-connection-health')
+          return jsonResponse(res, 200, {
+            failures: [...connectionFailures.values()],
+            pending: [...pendingRecovery.values()].map(({ id, profileId, expiresAt }) => ({
+              id,
+              profileId,
+              expiresAt,
+            })),
+          });
+        if (appHandler && (await appHandler(req, res, u.pathname))) return;
+        if (options.diagnosticsEnabled && u.pathname === '/api/state')
+          return jsonResponse(res, 200, await buildDiagnosticState());
+      }
       if (req.method === 'POST') {
         if (req.headers.origin !== ORIGIN || req.headers['content-type'] !== 'application/json')
-          return json(res, 403, { error: 'ORIGIN_REJECTED' });
-        const bodyLimit =
-          u.pathname === '/api/workspace/resource-tables/save' ||
-          u.pathname === '/api/workspace/group-poster/materials/save'
-            ? 4 * 1024 * 1024
-            : u.pathname === '/api/workspace/profiles/reorder' ||
-                u.pathname === '/api/workspace/group-bumper/targets/add' ||
-                u.pathname === '/api/workspace/group-bumper/comments/save' ||
-                u.pathname === '/api/workspace/group-poster/targets/add' ||
-                u.pathname === '/api/workspace/group-inviter/groups/add'
-              ? 1024 * 1024
-              : u.pathname === '/api/workspace/google-sheets/auth/credentials'
-                ? 512 * 1024
-                : u.pathname === '/api/workspace/group-poster/materials/thumbnail'
-                  ? 256 * 1024
-                  : 131072;
-        const input = await body(req, bodyLimit);
+          return jsonResponse(res, 403, { error: 'ORIGIN_REJECTED' });
+        const input = await readJsonBody(req, selectPostBodyLimit(u.pathname));
         if (u.pathname === '/api/bridge-connections/recover') {
-          const request = z.object({ id: z.uuid(), profileId: z.uuid() }).strict().parse(input);
-          const pending = pendingRecovery.get(request.id);
-          const allowed = async () =>
-            pending &&
-            pending.profileId === request.profileId &&
-            !core.peers.get(pending.profileId)?.online &&
-            (await options.connectionRecoveryAllowed?.(pending.profileId)) === true &&
-            pending.socket.readyState === WebSocket.OPEN &&
-            Date.now() < pending.expiresAt;
+          const request = z.object({ id: z.uuid(), profileId: z.uuid() }).strict().parse(input),
+            pending = pendingRecovery.get(request.id),
+            allowed = async () =>
+              pending &&
+              pending.profileId === request.profileId &&
+              !core.peers.get(pending.profileId)?.online &&
+              (await options.connectionRecoveryAllowed?.(pending.profileId)) === true &&
+              pending.socket.readyState === WebSocket.OPEN &&
+              Date.now() < pending.expiresAt;
           if (!pending || pending.busy || !(await allowed()))
-            return json(res, 409, { error: 'CONNECTION_RECOVERY_REVOKED' });
+            return jsonResponse(res, 409, { error: 'CONNECTION_RECOVERY_REVOKED' });
           pending.busy = true;
           try {
             await store.backup(
-              path.join(data, 'journal.before-connection-recovery-' + pending.id + '.sqlite'),
+              path.join(data, `journal.before-connection-recovery-${pending.id}.sqlite`),
             );
             if (!(await allowed())) throw Error('CONNECTION_RECOVERY_REVOKED');
-            const next = randomBytes(32).toString('hex');
-            if (
-              !(await store.replaceConnectionSecret(
-                pending.profileId,
-                pending.extensionId,
-                pending.expected,
-                next,
-              ))
-            )
-              throw Error('CONNECTION_RECOVERY_CHANGED');
+            const next = await rotatePeerSecret(
+              store,
+              pending.profileId,
+              pending.extensionId,
+              pending.expected,
+            );
             pending.resolve(next);
-            return json(res, 200, { requested: true, profileId: pending.profileId });
+            return jsonResponse(res, 200, { requested: true, profileId: pending.profileId });
           } catch (error) {
             pending.reject(Error('CONNECTION_RECOVERY_FAILED'));
             throw error;
           }
         }
         if (appHandler && (await appHandler(req, res, u.pathname, input))) return;
-        if (!options.diagnosticsEnabled) return json(res, 404, { error: 'NOT_FOUND' });
-        if (u.pathname === '/api/command') {
-          const intent = Intent.parse(input);
-          if (
-            tasks.busy(intent.profileId) &&
-            isWrite(intent.action) &&
-            intent.action.kind !== 'windowState'
-          )
-            throw Error('PROFILE_TASK_BUSY');
-          return json(res, 202, await core.submit(intent));
-        }
-        if (u.pathname === '/api/watch') return json(res, 202, await tasks.start(input));
+        if (!options.diagnosticsEnabled) return jsonResponse(res, 404, { error: 'NOT_FOUND' });
+        if (u.pathname === '/api/command')
+          return jsonResponse(res, 202, await core.submit(Intent.parse(input)));
         if (u.pathname === '/api/review') {
-          const review = Review.parse(input);
-          await core.review(review.profileId, review.commandId, review.decision, review.note);
-          return json(res, 200, { reviewed: true });
+          const r = Review.parse(input);
+          await core.review(r.profileId, r.commandId, r.decision, r.note);
+          return jsonResponse(res, 200, { reviewed: true });
         }
         if (u.pathname === '/api/backup') {
-          const file = 'snapshot-' + Date.now() + '.sqlite';
+          const file = `snapshot-${Date.now()}.sqlite`;
           await store.backup(path.join(data, file));
-          return json(res, 200, { file });
+          return jsonResponse(res, 200, { file });
         }
-        const profileId = z.string().uuid().parse(input.profileId);
-        if (u.pathname === '/api/authorize-facebook') {
-          if (input.confirm !== 'AUTHORIZE_OWN_TASK_VIDEO_TABS') throw Error('CONSENT_REQUIRED');
-          if (!(await store.profile(profileId))) throw Error('PROFILE_NOT_FOUND');
-          await store.allowFacebook(profileId);
-          return json(res, 200, { authorized: true });
-        }
+        const pid = z
+          .uuid()
+          .parse(
+            (input && typeof input === 'object' ? (input as Record<string, unknown>) : {})
+              .profileId,
+          );
         if (u.pathname === '/api/sync') {
-          const peer = core.peers.get(profileId);
+          const peer = core.peers.get(pid);
           if (!peer) throw Error('OFFLINE');
-          tasks.stop(profileId);
-          return json(res, 200, await core.sync(peer));
+          return jsonResponse(res, 200, await core.sync(peer));
         }
-        if (u.pathname === '/api/retire-legacy-fixture') {
-          const rows = (await store.unresolved(profileId)).filter((r) => r.legacyFixture === 1);
-          for (const row of rows)
-            await core.review(
-              profileId,
-              row.commandId,
-              'ABANDON',
-              '结束旧版本机测试，不重放、不宣称成功',
-            );
-          return json(res, 200, { abandoned: rows.length });
-        }
-        if (u.pathname === '/api/resume') {
-          return json(res, 200, await core.resume(profileId));
-        }
-        if (u.pathname === '/api/stop') {
-          tasks.stop(profileId);
-          return json(res, 200, await core.stop(profileId));
-        }
+        if (u.pathname === '/api/resume') return jsonResponse(res, 200, await core.resume(pid));
+        if (u.pathname === '/api/stop') return jsonResponse(res, 200, await core.stop(pid));
       }
-      json(res, 404, { error: 'NOT_FOUND' });
+      jsonResponse(res, 404, { error: 'NOT_FOUND' });
     } catch (e) {
-      json(res, 400, { error: e instanceof Error ? e.message : 'ERROR' });
+      jsonResponse(res, 400, { error: e instanceof Error ? e.message : 'ERROR' });
     }
   });
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
-  server.on('upgrade', (req, socket, head) => {
-    const origin = req.headers.origin ?? '';
-    if (
-      req.headers.host !== HOST ||
-      req.url !== '/bridge' ||
-      !extensionIds.some((id) => origin === 'chrome-extension://' + id)
-    ) {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  });
-  wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
-    const extensionId = req.headers.origin!.slice('chrome-extension://'.length);
-    const challenge = randomBytes(32).toString('hex');
-    let peer: Peer | undefined;
-    let claimedProfileId: string | undefined;
-    let authenticationPending = false;
-    let recoveryId: string | undefined;
-    let lastPong = Date.now();
-    let lastLivenessCheckAt = Date.now(),
-      livenessPending = false;
-    const liveness = setInterval(() => {
-      const now = Date.now(),
-        loopGapMs = now - lastLivenessCheckAt;
-      lastLivenessCheckAt = now;
-      if (loopGapMs > 1800) return;
-      if (!peer || now - lastPong <= LEASE_MS || livenessPending) return;
-      livenessPending = true;
-      setImmediate(() => {
-        livenessPending = false;
-        if (!peer || ws.readyState !== WebSocket.OPEN || Date.now() - lastPong <= LEASE_MS) return;
-        const silentMs = Date.now() - lastPong;
-        peer.transportFailure = 'HEARTBEAT_TIMEOUT';
-        devDiag.record({
-          level: 'ERROR',
-          category: 'BRIDGE_WS',
-          event: 'WS_HEARTBEAT_TIMEOUT',
-          profileId: peer.profileId,
-          reason: 'HEARTBEAT_TIMEOUT',
-          data: { epoch: peer.epoch, silentMs, leaseMs: LEASE_MS },
-        });
-        void Promise.resolve(kernel?.disconnected(peer)).catch(() => {});
-        void core.disconnect(peer).catch(() => {});
-        ws.terminate();
-      });
-    }, 1000);
-    const authTimer = setTimeout(() => ws.close(1008, 'AUTH_TIMEOUT'), 5000);
-    ws.on('error', (error) => {
-      const code = 'code' in error ? String(error.code) : 'WS_SOCKET_ERROR';
-      if (peer) peer.transportFailure = code;
-      devDiag.record({
-        level: 'WARN',
-        category: 'BRIDGE_WS',
-        event: 'WS_SOCKET_ERROR',
-        profileId: peer?.profileId ?? claimedProfileId,
-        reason: code,
-        data: { message: error.message.slice(0, 500) },
-      });
-      // A broken/oversized frame ends this transport only. The existing close
-      // handler releases its timers, lease and kernel connection.
-      ws.terminate();
-    });
-    ws.send(
-      JSON.stringify({
-        type: 'CHALLENGE',
-        challenge,
-        version: VERSION,
-        capabilities: bridgeCapabilities,
-      }),
-    );
-    ws.on('message', async (raw) => {
-      try {
-        const m = JSON.parse(raw.toString());
-        observeBridgeIncomingMessage(raw, m, peer?.profileId ?? claimedProfileId);
-        if (peer && m && typeof m === 'object' && typeof m.type === 'string') lastPong = Date.now();
-        if (!peer) {
-          if (authenticationPending) throw Error('AUTH_IN_PROGRESS');
-          authenticationPending = true;
-          const hello = z
-            .object({
-              type: z.literal('HELLO'),
-              version: z.literal(VERSION),
-              extensionVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
-              capabilities: z
-                .array(z.enum(bridgeCapabilities))
-                .min(4)
-                .max(bridgeCapabilities.length),
-              profileId: z.string().uuid(),
-              pairingCode: z.string().optional(),
-              proof: z.string().optional(),
-            })
-            .strict()
-            .parse(m);
-          if (
-            new Set(hello.capabilities).size !== hello.capabilities.length ||
-            ![
-              'operation-journal-v2',
-              'stop-confirmation',
-              'media-observation',
-              'media-node-identity',
-            ].every((c) => hello.capabilities.includes(c as (typeof hello.capabilities)[number]))
-          )
-            throw Error('CAPABILITY_MISMATCH');
-          const existing = await store.profile(hello.profileId);
-          claimedProfileId = hello.profileId;
-          let secret = existing?.secret;
-          let recovered = false;
-          if (existing) {
-            const proof = createHmac('sha256', existing.secret).update(challenge).digest('hex');
-            if (existing.extensionId !== extensionId) throw Error('AUTH_EXTENSION_MISMATCH');
-            if (!hello.proof) throw Error('AUTH_PROOF_MISSING');
-            if (!equalSecret(hello.proof, proof)) {
-              if (
-                !/^[a-f0-9]{64}$/.test(hello.proof) ||
-                pendingRecovery.size >= 32 ||
-                core.peers.get(hello.profileId)?.online ||
-                (await options.connectionRecoveryAllowed?.(hello.profileId)) !== true
-              )
-                throw Error('AUTH_PROOF_MISMATCH');
-              if (options.autoRecoverConnections) {
-                const next = randomBytes(32).toString('hex');
-                if (
-                  !(await store.replaceConnectionSecret(
-                    hello.profileId,
-                    extensionId,
-                    existing.secret,
-                    next,
-                  ))
-                )
-                  throw Error('CONNECTION_RECOVERY_CHANGED');
-                secret = next;
-                recovered = true;
-              } else {
-                clearTimeout(authTimer);
-                recoveryId = randomUUID();
-                const id = recoveryId;
-                let timer: NodeJS.Timeout | undefined;
-                try {
-                  secret = await new Promise<string>((resolve, reject) => {
-                    timer = setTimeout(() => reject(Error('CONNECTION_RECOVERY_EXPIRED')), 60_000);
-                    pendingRecovery.set(id, {
-                      id,
-                      profileId: hello.profileId,
-                      extensionId,
-                      expected: existing.secret,
-                      socket: ws,
-                      expiresAt: Date.now() + 60_000,
-                      busy: false,
-                      resolve,
-                      reject,
-                    });
-                  });
-                  if (ws.readyState !== WebSocket.OPEN)
-                    throw Error('CONNECTION_RECOVERY_DISCONNECTED');
-                  recovered = true;
-                } finally {
-                  clearTimeout(timer);
-                  pendingRecovery.delete(id);
-                  recoveryId = undefined;
-                }
-              }
-            }
-          } else {
-            // Only the configured extension origin can reach this bootstrap path.
-            // Existing identities still require challenge/HMAC proof on every reconnect.
-            secret = randomBytes(32).toString('hex');
-          }
-          if (!existing) await store.pair(hello.profileId, secret!, extensionId);
-          if (ws.readyState !== WebSocket.OPEN) throw Error('AUTH_DISCONNECTED');
-          peer = core.connect(
-            hello.profileId,
-            (msg) => ws.send(JSON.stringify(msg)),
-            () => ws.close(),
-          );
-          peer.extensionVersion = hello.extensionVersion;
-          peer.capabilities = hello.capabilities;
-          clearTimeout(authTimer);
-          lastPong = Date.now();
-          devDiag.record({
-            level: 'INFO',
-            category: 'BRIDGE_WS',
-            event: 'WS_CONNECTED',
-            profileId: peer.profileId,
-            data: {
-              epoch: peer.epoch,
-              extensionVersion: peer.extensionVersion,
-              recovered,
-              firstPair: !existing,
-            },
-          });
-          ws.send(
-            JSON.stringify({
-              type: 'WELCOME',
-              connectionEpoch: peer.epoch,
-              secret: existing && !recovered ? undefined : secret,
-              leaseMs: LEASE_MS,
-              paused: true,
-            }),
-          );
-          await core.sync(peer);
-          return;
-        }
-        if (await kernel?.message(peer, m)) {
-          lastPong = Date.now();
-          return;
-        }
-        if (m.type === 'RESULT') {
-          const result = z
-            .object({
-              type: z.literal('RESULT'),
-              commandId: z.string().uuid(),
-              status: z.enum(['ACKNOWLEDGED', 'VERIFIED', 'FAILED', 'UNKNOWN']),
-              evidence: z.unknown().optional(),
-              error: z.string().optional(),
-            })
-            .strict()
-            .parse(m);
-          await core.reply(peer, result as Reply);
-        } else if (m.type === 'BROWSER_WINDOW_REVEALED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const reply = z
-            .object({
-              requestId: z.string().uuid(),
-              tabId: z.number().int().positive().optional(),
-              focused: z.boolean().optional(),
-              error: z.string().max(500).optional(),
-            })
-            .parse(m);
-          core.windowRevealed(peer, reply.requestId, reply);
-        } else if (m.type === 'EXTRA_TABS_CLEANED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const reply = z
-            .object({
-              requestId: z.string().uuid(),
-              keptTabId: z.number().int().positive().optional(),
-              closedTabIds: z.array(z.number().int().positive()).max(500).optional(),
-              remainingTabCount: z.number().int().positive().optional(),
-              error: z.string().max(500).optional(),
-            })
-            .parse(m);
-          core.extraTabsCleaned(peer, reply.requestId, reply);
-        } else if (m.type === 'BROWSER_WINDOW_INSPECTED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const boundsSchema = z
-            .object({
-              left: z.number().int(),
-              top: z.number().int(),
-              width: z.number().int(),
-              height: z.number().int(),
-            })
-            .strict();
-          const insetsSchema = z
-            .object({
-              left: z.number().int().nonnegative(),
-              top: z.number().int().nonnegative(),
-              right: z.number().int().nonnegative(),
-              bottom: z.number().int().nonnegative(),
-            })
-            .strict();
-          const reply = z
-            .object({
-              requestId: z.string().uuid(),
-              windowId: z.number().int().optional(),
-              tabId: z.number().int().nonnegative().optional(),
-              focused: z.boolean().optional(),
-              lastFocusedAt: z.number().int().nonnegative().optional(),
-              state: z.string().max(40).optional(),
-              bounds: boundsSchema.optional(),
-              contentInsets: insetsSchema.optional(),
-              displays: z
-                .array(
-                  z
-                    .object({
-                      id: z.string().max(80),
-                      left: z.number().int(),
-                      top: z.number().int(),
-                      width: z.number().int(),
-                      height: z.number().int(),
-                    })
-                    .strict(),
-                )
-                .max(32)
-                .optional(),
-              error: z.string().max(500).optional(),
-            })
-            .parse(m);
-          core.browserWindowInspected(peer, reply.requestId, reply);
-        } else if (m.type === 'BROWSER_WINDOW_POSITIONED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const boundsSchema = z
-            .object({
-              left: z.number().int(),
-              top: z.number().int(),
-              width: z.number().int(),
-              height: z.number().int(),
-            })
-            .strict();
-          const insetsSchema = z
-            .object({
-              left: z.number().int().nonnegative(),
-              top: z.number().int().nonnegative(),
-              right: z.number().int().nonnegative(),
-              bottom: z.number().int().nonnegative(),
-            })
-            .strict();
-          const reply = z
-            .object({
-              requestId: z.string().uuid(),
-              windowId: z.number().int().optional(),
-              tabId: z.number().int().nonnegative().optional(),
-              focused: z.boolean().optional(),
-              state: z.string().max(40).optional(),
-              bounds: boundsSchema.optional(),
-              contentInsets: insetsSchema.optional(),
-              error: z.string().max(500).optional(),
-            })
-            .parse(m);
-          core.browserWindowPositioned(peer, reply.requestId, reply);
-        } else if (m.type === 'LOCAL_STOP') {
-          await core.stop(peer.profileId);
-        } else if (['STOPPED', 'RESUMED', 'SYNC_STATE'].includes(m.type)) {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const requestId = z.string().uuid().parse(m.requestId);
-          if (m.type === 'STOPPED') {
-            if (await core.stopped(peer, requestId)) {
-              await kernel?.controlStopped(peer, requestId);
-              // A parent stop may interrupt SYNC or follow a control timeout. Retire
-              // the old SDK owner first, then reconcile; STOPPED alone grants no input.
-              if (!peer.synced) await core.sync(peer);
-            }
-          } else if (m.type === 'RESUMED') await core.resumed(peer, requestId);
-          else {
-            const synced = await core.synced(
-              peer,
-              requestId,
-              z.array(JournalEntry).max(500).parse(m.entries),
-            );
-            if (synced) await options.extensionIdle?.(peer);
-          }
-        } else if (m.type === 'STOP_UNCONFIRMED' || m.type === 'SYNC_UNCONFIRMED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const requestId = z.string().uuid().parse(m.requestId);
-          const reason =
-            typeof m.error === 'string' && m.error
-              ? m.error.slice(0, 120)
-              : 'KERNEL_STOP_UNCONFIRMED';
-          core.controlUnconfirmed(peer, requestId, reason);
-        } else if (m.type === 'EXTENSION_RELOADING') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const requestId = z.string().uuid().parse(m.requestId);
-          devDiag.record({
-            level: 'INFO',
-            category: 'BRIDGE_WS',
-            event: 'EXTENSION_RELOADING',
-            profileId: peer.profileId,
-            data: { requestId, epoch: peer.epoch },
-          });
-        } else if (m.type === 'BROWSER_WINDOWS_CLOSED') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          const reply = z
-            .object({
-              requestId: z.string().uuid(),
-              ok: z.boolean(),
-              closedCount: z.number().int().nonnegative().optional(),
-              remainingCount: z.number().int().nonnegative().optional(),
-              error: z.string().max(240).optional(),
-            })
-            .parse(m);
-          core.browserWindowsClosed(peer, reply.requestId, reply);
-        } else if (m.type === 'PONG') {
-          if (m.connectionEpoch !== peer.epoch) throw Error('EPOCH_REJECTED');
-          if (m.windowCount !== undefined)
-            peer.browserWindowCount = z.number().int().min(0).max(10000).parse(m.windowCount);
-          if (
-            typeof m.lastFocusedAt === 'number' &&
-            Number.isFinite(m.lastFocusedAt) &&
-            m.lastFocusedAt > 0
-          ) {
-            peer.focusedWindowAt = Math.max(peer.focusedWindowAt ?? 0, m.lastFocusedAt);
-          }
-          if (
-            peer.capabilities?.includes('profile-foreground-v1') &&
-            m.profileWindowFocused !== undefined
-          ) {
-            peer.profileWindowFocused = z.boolean().parse(m.profileWindowFocused);
-            if (peer.profileWindowFocused)
-              peer.focusedWindowAt = Math.max(peer.focusedWindowAt ?? 0, Date.now());
-          }
-          lastPong = Date.now();
-          await options.extensionIdle?.(peer);
-        } else throw Error('MESSAGE_REJECTED');
-      } catch (error) {
-        const profileId = peer?.profileId ?? claimedProfileId ?? null;
-        const key = profileId ?? 'unidentified';
-        const code =
-          error instanceof z.ZodError
-            ? 'SCHEMA_REJECTED'
-            : error instanceof Error &&
-                [
-                  'AUTH_FAILED',
-                  'AUTH_EXTENSION_MISMATCH',
-                  'AUTH_PROOF_MISSING',
-                  'AUTH_PROOF_MISMATCH',
-                  'CAPABILITY_MISMATCH',
-                  'DUPLICATE_PROFILE',
-                  'EPOCH_REJECTED',
-                  'MESSAGE_REJECTED',
-                ].includes(error.message)
-              ? error.message
-              : 'PROTOCOL_REJECTED';
-        const previous = connectionFailures.get(key);
-        if (!previous && connectionFailures.size >= 32) {
-          const oldest = connectionFailures.keys().next().value;
-          if (oldest) connectionFailures.delete(oldest);
-        }
-        connectionFailures.set(key, {
-          profileId,
-          code,
-          fields:
-            error instanceof z.ZodError
-              ? error.issues.map((issue) => issue.path.join('.')).slice(0, 8)
-              : [],
-          at: Date.now(),
-          count: (previous?.count ?? 0) + 1,
-        });
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'WS_PROTOCOL_REJECTED',
-          profileId: profileId ?? undefined,
-          reason: code,
-        });
-        ws.close(1008, 'AUTH_OR_PROTOCOL_REJECTED');
-      }
-    });
-    ws.on('close', async (code) => {
-      if (recoveryId)
-        pendingRecovery.get(recoveryId)?.reject(Error('CONNECTION_RECOVERY_DISCONNECTED'));
-      clearTimeout(authTimer);
-      clearInterval(liveness);
-      if (peer) {
-        peer.transportFailure ??= 'SOCKET_CLOSED_' + code;
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'WS_DISCONNECTED',
-          profileId: peer.profileId,
-          reason: peer.transportFailure,
-          data: { epoch: peer.epoch, closeCode: code },
-        });
-        await kernel?.disconnected(peer);
-        await core.disconnect(peer);
-      }
-    });
+  const wss = attachBridgeWsGateway({
+    server,
+    core,
+    store,
+    kernel,
+    host: HOST,
+    extensionIds,
+    autoRecoverConnections: options.autoRecoverConnections,
+    connectionRecoveryAllowed: options.connectionRecoveryAllowed,
+    extensionIdle: options.extensionIdle,
+    pendingRecovery,
+    connectionFailures,
   });
   let tickInFlight = false;
   const heartbeat = setInterval(() => {
-    for (const p of core.peers.values())
-      if (p.online)
+    for (const p of core.peers.values()) {
+      if (!p.online) continue;
+      try {
+        p.send({ type: 'HEARTBEAT', connectionEpoch: p.epoch, leaseMs: LEASE_MS });
+      } catch {
+        void Promise.resolve(kernel?.disconnected(p)).catch(() => {});
+        void core.disconnect(p).catch(() => {});
         try {
-          p.send({ type: 'HEARTBEAT', connectionEpoch: p.epoch, leaseMs: LEASE_MS });
-        } catch {
-          void Promise.resolve(kernel?.disconnected(p)).catch(() => {});
-          void core.disconnect(p).catch(() => {});
-          try {
-            p.close();
-          } catch {}
-        }
+          p.close();
+        } catch {}
+      }
+    }
     if (!tickInFlight) {
       tickInFlight = true;
       void Promise.resolve()
         .then(() => kernel?.tick())
-        .catch((error: unknown) => {
+        .catch((err: unknown) =>
           devDiag.record({
             level: 'WARN',
             category: 'BRIDGE_WS',
             event: 'KERNEL_TICK_ERROR',
-            reason: error instanceof Error ? error.message.slice(0, 200) : 'KERNEL_TICK_ERROR',
-          });
-        })
-        .finally(() => {
-          tickInFlight = false;
-        });
+            reason: err instanceof Error ? err.message.slice(0, 200) : 'KERNEL_TICK_ERROR',
+          }),
+        )
+        .finally(() => (tickInFlight = false));
     }
   }, 1500);
   try {
@@ -958,11 +400,10 @@ export async function startBridgeServer(options: BridgeServerOptions) {
   }
   let closing: Promise<void> | undefined;
   function close(): Promise<void> {
-    if (closing) return closing;
-    closing = (async () => {
+    return (closing ??= (async () => {
+      await Promise.resolve(options.onClose?.()).catch(() => {});
       await kernel?.close();
       clearInterval(heartbeat);
-      tasks.shutdown();
       await core.shutdown();
       await new Promise<void>((resolve, reject) => {
         for (const client of wss.clients) client.terminate();
@@ -971,8 +412,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
         server.close((error) => (error ? reject(error) : resolve()));
       });
       if (!options.store) await store.close();
-    })();
-    return closing;
+    })());
   }
-  return { core, store, tasks, kernel, origin: ORIGIN, close };
+  return { core, store, kernel, origin: ORIGIN, close };
 }

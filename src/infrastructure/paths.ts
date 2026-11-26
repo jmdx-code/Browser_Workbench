@@ -61,7 +61,6 @@ export function productDataDirectory() {
   const applicationData = process.env.APPDATA ?? path.join(homedir(), '.config');
   return path.join(applicationData, 'Browser Workbench', 'data');
 }
-
 export function defaultBackupDirectory() {
   const override = process.env.WORKBENCH_BACKUP_DIR?.trim();
   const directory = override
@@ -74,7 +73,6 @@ export function defaultBackupDirectory() {
   }
   return directory;
 }
-
 export async function canonicalDataDirectory(directory: string) {
   const resolved = path.resolve(directory);
   await mkdir(resolved, { recursive: true });

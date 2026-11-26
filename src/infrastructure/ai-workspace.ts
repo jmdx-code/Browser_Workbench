@@ -3,22 +3,18 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-
 const CODEX_MANAGED_START = '# >>> browser-workbench-mcp-start >>>';
 const CODEX_MANAGED_END = '# <<< browser-workbench-mcp-end <<<';
-
 export function productAiWorkspaceDirectory(): string {
   const override = process.env.WORKBENCH_AI_WORKSPACE_DIR?.trim();
   return override
     ? path.resolve(override)
     : path.join(homedir(), 'Documents', 'Browser Workbench', 'AI-Workspace');
 }
-
 function isPackagedWorkbenchExe(filePath: string): boolean {
   const base = path.basename(filePath);
   return Boolean(base) && !/^(?:node|electron)(?:\.exe)?$/i.test(base);
 }
-
 export function resolveAiWorkspaceMcpExecutable(explicitDesktopExe?: string): {
   command: string;
   desktopExePath: string | null;
@@ -28,13 +24,11 @@ export function resolveAiWorkspaceMcpExecutable(explicitDesktopExe?: string): {
     process.env.WORKBENCH_DESKTOP_EXE?.trim() ?? '',
     process.execPath,
   ].filter(Boolean);
-
   for (const candidate of directCandidates) {
     if (isPackagedWorkbenchExe(candidate) && existsSync(candidate)) {
       return { command: candidate, desktopExePath: candidate };
     }
   }
-
   const home = homedir();
   const localAppData = process.env.LOCALAPPDATA?.trim() ?? '';
   const installedCandidates = [
@@ -52,13 +46,11 @@ export function resolveAiWorkspaceMcpExecutable(explicitDesktopExe?: string): {
       ? path.join(localAppData, 'Programs', 'Browser Workbench', 'Browser Workbench.exe')
       : '',
   ].filter(Boolean);
-
   for (const candidate of installedCandidates) {
     if (existsSync(candidate)) {
       return { command: candidate, desktopExePath: candidate };
     }
   }
-
   const fallback =
     explicitDesktopExe?.trim() || process.env.WORKBENCH_DESKTOP_EXE?.trim() || process.execPath;
   return {
@@ -66,14 +58,12 @@ export function resolveAiWorkspaceMcpExecutable(explicitDesktopExe?: string): {
     desktopExePath: isPackagedWorkbenchExe(fallback) ? fallback : null,
   };
 }
-
 export function formatTomlString(value: string): string {
   if (!/['\r\n\x00-\x1f\x7f]/.test(value)) {
     return `'${value}'`;
   }
   return JSON.stringify(value);
 }
-
 function buildCodexManagedBlock(
   command: string,
   stdioScriptPath: string,
@@ -94,7 +84,6 @@ function buildCodexManagedBlock(
   ];
   return lines.join('\n');
 }
-
 export function mergeCodexConfigToml(existingText: string | null, managedBlock: string): string {
   if (!existingText || !existingText.trim()) {
     return `${managedBlock}\n`;
@@ -110,7 +99,6 @@ export function mergeCodexConfigToml(existingText: string | null, managedBlock: 
   const trimmed = existingText.trimEnd();
   return `${trimmed}\n\n${managedBlock}\n`;
 }
-
 function buildWorkspaceAgentsMarkdown(): string {
   return `# 浏览器工作台（Browser Workbench）AI 专属工作区
 
@@ -131,7 +119,6 @@ function buildWorkspaceAgentsMarkdown(): string {
    - 如果当前在 OpenAI Codex 中尚未看到 \`wb_*\` 工具，请提示用户将本文件夹（\`AI-Workspace\`）标记为 **受信任（Trusted）** 后重新开始对话，以加载 [\`.codex/config.toml\`](./.codex/config.toml) 中的项目级 MCP 服务。
 `;
 }
-
 function buildUsageGuideText(targetDir: string): string {
   return `======================================================================
   浏览器工作台（Browser Workbench）— AI 专属工作夹使用说明
@@ -159,7 +146,6 @@ function buildUsageGuideText(targetDir: string): string {
   - 您可以把日常发帖用的 Excel（.xlsx）/ CSV 排期表、图片、视频直接放进本文件夹（或在此新建子文件夹分类存放），在对话里直接说文件名，AI 就能自动读取并核对！
 `;
 }
-
 export async function syncProductAiWorkspaceDirectory(options: {
   rootDir: string;
   softwareVersion: string;
@@ -170,7 +156,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
   const bundledDir = path.join(options.rootDir, 'config', 'ai-workspace');
   const stdioSourcePath = path.join(bundledDir, 'workbench-mcp-stdio.mjs');
   const skillSourcePath = path.join(bundledDir, 'SKILL.md');
-
   const [stdioBytes, skillBytes] = await Promise.all([
     readFile(stdioSourcePath).catch((err: NodeJS.ErrnoException) => {
       if (err.code === 'ENOENT') return null;
@@ -181,11 +166,9 @@ export async function syncProductAiWorkspaceDirectory(options: {
       throw err;
     }),
   ]);
-
   if (!stdioBytes || !skillBytes) {
     return { directory: targetDir, synced: false, command: '' };
   }
-
   const { command, desktopExePath } = resolveAiWorkspaceMcpExecutable(options.desktopExePath);
   const targetStdioPath = path.join(
     targetDir,
@@ -194,7 +177,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
     'browser-workbench',
     'workbench-mcp-stdio.mjs',
   );
-
   const pluginManifest = {
     name: 'browser-workbench',
     version: options.softwareVersion,
@@ -219,7 +201,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
       },
     ],
   };
-
   const antigravityMcpConfig = {
     mcpServers: {
       workbench: {
@@ -232,7 +213,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
       },
     },
   };
-
   const codexTomlPath = path.join(targetDir, '.codex', 'config.toml');
   const existingCodexToml = await readFile(codexTomlPath, 'utf8').catch(
     (err: NodeJS.ErrnoException) => {
@@ -244,7 +224,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
     existingCodexToml,
     buildCodexManagedBlock(command, targetStdioPath, desktopExePath),
   );
-
   const filesToSync: { relPath: string; bytes: Buffer }[] = [
     { relPath: 'AGENTS.md', bytes: Buffer.from(buildWorkspaceAgentsMarkdown(), 'utf8') },
     {
@@ -272,7 +251,6 @@ export async function syncProductAiWorkspaceDirectory(options: {
       bytes: Buffer.from(buildUsageGuideText(targetDir).replace(/\r?\n/g, '\r\n'), 'utf8'),
     },
   ];
-
   await mkdir(targetDir, { recursive: true });
   const changed: { target: string; before: Buffer | null }[] = [];
   try {
@@ -300,6 +278,5 @@ export async function syncProductAiWorkspaceDirectory(options: {
     }
     throw err;
   }
-
   return { directory: targetDir, synced: true, command };
 }

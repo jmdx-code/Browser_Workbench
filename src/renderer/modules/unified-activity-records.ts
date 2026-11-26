@@ -1,12 +1,16 @@
-import type { Profile } from '../../shared/contracts.js';
-import type { TaskRecord } from '../../shared/task-contracts.js';
-import type { GroupInviteLogRow, GroupInviterState } from '../../shared/group-inviter.js';
-import type { BumperLog, BumperState } from '../../shared/group-bumper.js';
-import type { PosterLog, PosterState } from '../../shared/group-poster.js';
-import type { GoogleSheetsOverview } from '../../shared/google-sheets.js';
 import { endedTask, groupTaskRecords } from '../../domain/task-run-records.js';
-import { runSummary, stepResultLabel } from '../task-record-summary.js';
+import { profileDisplayName, type Profile } from '../../shared/contracts.js';
+import type { GoogleSheetsOverview } from '../../shared/google-sheets.js';
+import type { BumperLog, BumperState } from '../../shared/group-bumper.js';
+import type { GroupInviteLogRow, GroupInviterState } from '../../shared/group-inviter.js';
+import {
+  isPendingApprovalPostId,
+  type PosterLog,
+  type PosterState,
+} from '../../shared/group-poster.js';
+import type { TaskRecord } from '../../shared/task-contracts.js';
 import { taskReasonDescription } from '../../shared/task-issues.js';
+import { runSummary, stepResultLabel } from '../task-record-summary.js';
 
 export type ActivityRecordModuleId =
   | 'active-accounts'
@@ -64,186 +68,124 @@ export interface UnifiedActivityFeedResult {
   moduleCounts: Record<ActivityRecordModuleFilter, number>;
 }
 
-function resolveProfileName(byProfile: ReadonlyMap<string, Profile>, profileId: string): string {
-  const profile = byProfile.get(profileId);
-  return profile?.browserName ?? profile?.alias ?? profileId;
-}
-
-function pushBumperProfileCounts(
-  allItems: UnifiedActivityItem[],
-  byProfile: ReadonlyMap<string, Profile>,
-  counts: BumperState['profileCounts'] | undefined,
-  moduleId: 'group-bumper' | 'page-bumper',
-  moduleLabel: string,
-  now: number,
-) {
-  if (!counts) return;
-  for (const [pid, stat] of Object.entries(counts)) {
-    const statusStr = stat.status.trim();
-    const detailText = `本轮顶贴 ${stat.session} 次 · 今日累计 ${stat.today} 次`;
-    if (stat.running) {
-      allItems.push({
-        moduleId,
-        moduleLabel,
-        id: `${moduleId}-live:${pid}`,
-        profileId: pid,
-        profileName: resolveProfileName(byProfile, pid),
-        title: `${moduleLabel} · 实时任务`,
-        targetLabel: statusStr || '正在浏览与顶贴',
-        detailText,
-        status: 'running',
-        statusLabel: '顶贴中',
-        tone: 'run',
-        timestamp: now,
-      });
-    } else if (statusStr && /受限|失败|异常|拦截|频繁/.test(statusStr)) {
-      allItems.push({
-        moduleId,
-        moduleLabel,
-        id: `${moduleId}-err:${pid}`,
-        profileId: pid,
-        profileName: resolveProfileName(byProfile, pid),
-        title: `${moduleLabel} · 执行异常`,
-        targetLabel: statusStr,
-        detailText,
-        status: 'failed',
-        statusLabel: '顶贴异常',
-        tone: 'err',
-        timestamp: now - 1000,
-      });
-    } else if (statusStr && stat.session === 0 && /0\s*次|未匹配|跳过/.test(statusStr)) {
-      allItems.push({
-        moduleId,
-        moduleLabel,
-        id: `${moduleId}-warn:${pid}`,
-        profileId: pid,
-        profileName: resolveProfileName(byProfile, pid),
-        title: `${moduleLabel} · 0 次原因说明`,
-        targetLabel: statusStr,
-        detailText,
-        status: 'attention',
-        statusLabel: '需留意',
-        tone: 'warn',
-        timestamp: now - 2000,
-      });
-    }
-  }
-}
+const MODULE_LABELS: Record<ActivityRecordModuleId, string> = {
+  'active-accounts': '活跃账号',
+  'group-inviter': '小组邀请人',
+  'group-bumper': '小组顶贴',
+  'page-bumper': '专页顶贴',
+  'group-poster': '小组发帖',
+  'google-sheets': '云表协同',
+};
+const ACTIVE_STATE_META: Record<
+  string,
+  { status: ActivityRecordStatus; statusLabel: string; tone: UnifiedActivityItem['tone'] }
+> = {
+  FAILED: { status: 'failed', statusLabel: '执行异常', tone: 'err' },
+  REVIEW: { status: 'attention', statusLabel: '需处理', tone: 'warn' },
+  PAUSED: { status: 'attention', statusLabel: '已暂停', tone: 'warn' },
+  PAUSING: { status: 'attention', statusLabel: '已暂停', tone: 'warn' },
+  COMPLETED: { status: 'completed', statusLabel: '已完成', tone: 'ok' },
+  QUEUED: { status: 'running', statusLabel: '排队中', tone: 'queue' },
+  STOPPING: { status: 'running', statusLabel: '停止中', tone: 'warn' },
+};
+const emptyStatusCounts = (): Record<ActivityRecordStatusFilter, number> => ({
+  all: 0,
+  running: 0,
+  completed: 0,
+  failed: 0,
+  attention: 0,
+});
 
 export function buildUnifiedActivityFeed(
   input: UnifiedActivityFeedInput,
 ): UnifiedActivityFeedResult {
   const byProfile = new Map(input.profiles.map((p) => [p.id, p]));
+  const profName = (pid: string) => profileDisplayName(byProfile.get(pid), pid);
   const now = input.now ?? Date.now();
   const allItems: UnifiedActivityItem[] = [];
+  const push = (
+    moduleId: ActivityRecordModuleId,
+    item: Omit<UnifiedActivityItem, 'moduleId' | 'moduleLabel' | 'profileName'>,
+    explicitName?: string,
+  ) =>
+    allItems.push({
+      moduleId,
+      moduleLabel: MODULE_LABELS[moduleId],
+      profileName: explicitName ?? profName(item.profileId),
+      ...item,
+    });
+  const hasAttention = (mod: ActivityRecordModuleId, pid: string) =>
+    allItems.some((i) => i.moduleId === mod && i.profileId === pid && i.status === 'attention');
 
-  // 1. Active Accounts
   for (const group of groupTaskRecords([...(input.taskRecords ?? [])])) {
     const first = group.rows[0];
     if (!first) continue;
-    const isAttention =
-      (input.attentionPlanIds?.has(first.planId) ?? false) && !endedTask(first.planState);
-    const rawState = isAttention ? 'REVIEW' : group.state;
-
-    let status: ActivityRecordStatus = 'running';
-    let statusLabel = '执行中';
-    let tone: UnifiedActivityItem['tone'] = 'run';
-    if (rawState === 'FAILED') {
-      status = 'failed';
-      statusLabel = '执行异常';
-      tone = 'err';
-    } else if (rawState === 'REVIEW' || rawState === 'PAUSED' || rawState === 'PAUSING') {
-      status = 'attention';
-      statusLabel = rawState === 'REVIEW' ? '需处理' : '已暂停';
-      tone = 'warn';
-    } else if (rawState === 'COMPLETED') {
-      status = 'completed';
-      statusLabel = '已完成';
-      tone = 'ok';
-    } else if (rawState === 'STOPPED') {
-      status = 'completed';
-      statusLabel = `已停止 (${group.completed}/${group.rows.length})`;
-      tone = 'idle';
-    } else if (rawState === 'QUEUED') {
-      status = 'running';
-      statusLabel = '排队中';
-      tone = 'queue';
-    } else if (rawState === 'STOPPING') {
-      status = 'running';
-      statusLabel = '停止中';
-      tone = 'warn';
-    }
-
+    const rawState =
+      (input.attentionPlanIds?.has(first.planId) ?? false) && !endedTask(first.planState)
+        ? 'REVIEW'
+        : group.state;
+    const meta =
+      rawState === 'STOPPED'
+        ? {
+            status: 'completed' as const,
+            statusLabel: `已停止 (${group.completed}/${group.rows.length})`,
+            tone: 'idle' as const,
+          }
+        : (ACTIVE_STATE_META[rawState] ?? {
+            status: 'running' as const,
+            statusLabel: '执行中',
+            tone: 'run' as const,
+          });
     const reasonText = first.planReason
       ? taskReasonDescription(first.planReason)?.summary
       : undefined;
     const summaryText = runSummary(group.rows);
-    allItems.push({
-      moduleId: 'active-accounts',
-      moduleLabel: '活跃账号',
+    push('active-accounts', {
       id: `active:${group.key}`,
       profileId: first.profileId,
-      profileName: resolveProfileName(byProfile, first.profileId),
       title: first.combinationName + (first.round > 1 ? ` · 第 ${first.round} 轮` : ''),
-      targetLabel: group.rows.map((step) => stepResultLabel(step)).join(' · '),
+      targetLabel: group.rows.map(stepResultLabel).join(' · '),
       detailText:
         rawState === 'FAILED' && reasonText ? `${reasonText} · ${summaryText}` : summaryText,
-      status,
-      statusLabel,
-      tone,
+      ...meta,
       timestamp: group.finishedAt ?? group.startedAt ?? first.planUpdatedAt,
       planId: first.planId,
       round: first.round,
     });
   }
 
-  // 2. Group Inviter
   const inviterGroupNames = new Map(
     (input.inviterState?.groups ?? []).map((g) => [g.groupId, g.groupName]),
   );
-  if (input.inviterState) {
-    for (const [pid, stat] of Object.entries(input.inviterState.profileCounts)) {
-      const statusStr = stat.status?.trim() ?? '';
-      if (!statusStr) continue;
-      const isEnded = statusStr === '已完成' || statusStr === '已停止';
-      const isFailed = statusStr.startsWith('失败');
-      const isSkipped = statusStr.startsWith('跳过');
-      const isRunning =
-        (Boolean(stat.running) || input.inviterState.running) &&
-        !isEnded &&
-        !isFailed &&
-        !isSkipped;
-      const detailText = `本轮已邀请 ${stat.sessionInvited} 人 · 历史累计 ${stat.totalInvited} 人`;
-      if (isRunning || isFailed || isSkipped) {
-        allItems.push({
-          moduleId: 'group-inviter',
-          moduleLabel: '小组邀请人',
-          id: `inviter-${isRunning ? 'live' : isFailed ? 'fail' : 'skip'}:${pid}`,
-          profileId: pid,
-          profileName: resolveProfileName(byProfile, pid),
-          title: `小组邀请人 · ${isRunning ? '实时任务' : isFailed ? '执行异常' : '跳过提醒'}`,
-          targetLabel: statusStr,
-          detailText,
-          status: isRunning ? 'running' : isFailed ? 'failed' : 'attention',
-          statusLabel: isRunning ? '邀请中' : isFailed ? '邀请异常' : '已跳过',
-          tone: isRunning ? 'run' : isFailed ? 'err' : 'warn',
-          timestamp: isRunning
-            ? (input.inviterState.startedAt ?? now)
-            : (input.inviterState.finishedAt ?? input.inviterState.startedAt ?? now),
-        });
-      }
-    }
+  for (const [pid, stat] of Object.entries(input.inviterState?.profileCounts ?? {})) {
+    const s = stat.status?.trim() ?? '';
+    if (!s || s === '已完成' || s === '已停止') continue;
+    const isFailed = s.startsWith('失败'),
+      isSkipped = s.startsWith('跳过'),
+      isRunning =
+        (Boolean(stat.running) || Boolean(input.inviterState?.running)) && !isFailed && !isSkipped;
+    if (!isRunning && !isFailed && !isSkipped) continue;
+    push('group-inviter', {
+      id: `inviter-${isRunning ? 'live' : isFailed ? 'fail' : 'skip'}:${pid}`,
+      profileId: pid,
+      title: `小组邀请人 · ${isRunning ? '实时任务' : isFailed ? '执行异常' : '跳过提醒'}`,
+      targetLabel: s,
+      detailText: `本轮已邀请 ${stat.sessionInvited} 人 · 历史累计 ${stat.totalInvited} 人`,
+      status: isRunning ? 'running' : isFailed ? 'failed' : 'attention',
+      statusLabel: isRunning ? '邀请中' : isFailed ? '邀请异常' : '已跳过',
+      tone: isRunning ? 'run' : isFailed ? 'err' : 'warn',
+      timestamp: isRunning
+        ? (input.inviterState?.startedAt ?? now)
+        : (input.inviterState?.finishedAt ?? input.inviterState?.startedAt ?? now),
+    });
   }
   for (const log of input.inviterLogs ?? []) {
-    const groupName = inviterGroupNames.get(log.groupId);
-    allItems.push({
-      moduleId: 'group-inviter',
-      moduleLabel: '小组邀请人',
+    const gName = inviterGroupNames.get(log.groupId);
+    push('group-inviter', {
       id: `inviter-log:${log.id}`,
       profileId: log.profileId,
-      profileName: resolveProfileName(byProfile, log.profileId),
       title: '邀请好友加入小组',
-      targetLabel: groupName ? `${groupName} (${log.groupId})` : `小组 ${log.groupId}`,
+      targetLabel: gName ? `${gName} (${log.groupId})` : `小组 ${log.groupId}`,
       detailText: `已邀请好友 ${log.friendName || log.friendId}（执行账号 ${log.accountId}）`,
       status: 'completed',
       statusLabel: '已邀请',
@@ -252,73 +194,84 @@ export function buildUnifiedActivityFeed(
     });
   }
 
-  // 3 & 4. Group Bumper & Page Bumper
-  if (input.bumperState) {
-    pushBumperProfileCounts(
-      allItems,
-      byProfile,
-      input.bumperState.profileCounts,
-      'group-bumper',
-      '小组顶贴',
-      now,
-    );
-    pushBumperProfileCounts(
-      allItems,
-      byProfile,
-      input.bumperState.pageBumperProfileCounts,
-      'page-bumper',
-      '专页顶贴',
-      now,
-    );
-    for (const op of input.bumperState.pendingReviewOperations ?? []) {
-      const isPage = op.groupId === '-';
-      const modId: 'group-bumper' | 'page-bumper' = isPage ? 'page-bumper' : 'group-bumper';
-      const modLabel = isPage ? '专页顶贴' : '小组顶贴';
-      if (
-        allItems.some(
-          (i) => i.moduleId === modId && i.profileId === op.profileId && i.status === 'attention',
-        )
-      ) {
-        continue;
-      }
-      allItems.push({
-        moduleId: modId,
-        moduleLabel: modLabel,
-        id: `bumper-op:${op.id}`,
-        profileId: op.profileId,
-        profileName: resolveProfileName(byProfile, op.profileId),
-        title: `${modLabel} · 待核对记录`,
-        targetLabel: isPage
-          ? `${op.pageName || op.pageId}`
-          : `${op.groupName || op.groupId} · ${op.pageName || op.pageId}`,
-        detailText: `${op.actionKind === 'comment' ? '评论' : '点赞'}结果未确认（帖子 ${op.postId}${op.reason ? ` · ${op.reason}` : ''}）`,
-        status: 'attention',
-        statusLabel: '待核对',
-        tone: 'warn',
-        timestamp: op.updatedAt,
-      });
+  for (const [mod, counts] of [
+    ['group-bumper', input.bumperState?.profileCounts],
+    ['page-bumper', input.bumperState?.pageBumperProfileCounts],
+  ] as const) {
+    for (const [pid, stat] of Object.entries(counts ?? {})) {
+      const s = stat.status.trim();
+      const mode:
+        | readonly [
+            string,
+            string,
+            ActivityRecordStatus,
+            string,
+            UnifiedActivityItem['tone'],
+            number,
+            string,
+          ]
+        | null = stat.running
+        ? ['live', '实时任务', 'running', '顶贴中', 'run', now, s || '正在浏览与顶贴']
+        : s && /受限|失败|异常|拦截|频繁/.test(s)
+          ? ['err', '执行异常', 'failed', '顶贴异常', 'err', now - 1000, s]
+          : s && stat.session === 0 && /0\s*次|未匹配|跳过/.test(s)
+            ? ['warn', '0 次原因说明', 'attention', '需留意', 'warn', now - 2000, s]
+            : null;
+      if (mode)
+        push(mod, {
+          id: `${mod}-${mode[0]}:${pid}`,
+          profileId: pid,
+          title: `${MODULE_LABELS[mod]} · ${mode[1]}`,
+          targetLabel: mode[6],
+          detailText: `本轮顶贴 ${stat.session} 次 · 今日累计 ${stat.today} 次`,
+          status: mode[2],
+          statusLabel: mode[3],
+          tone: mode[4],
+          timestamp: mode[5],
+        });
     }
   }
+  for (const op of input.bumperState?.pendingReviewOperations ?? []) {
+    const isPage = op.groupId === '-',
+      mod: ActivityRecordModuleId = isPage ? 'page-bumper' : 'group-bumper';
+    if (hasAttention(mod, op.profileId)) continue;
+    const act =
+      op.actionKind === 'comment' ? '评论' : op.actionKind === 'story_share' ? '分享快拍' : '点赞';
+    push(mod, {
+      id: `bumper-op:${op.id}`,
+      profileId: op.profileId,
+      title: `${MODULE_LABELS[mod]} · 待核对记录`,
+      targetLabel: isPage
+        ? op.pageName || op.pageId
+        : `${op.groupName || op.groupId} · ${op.pageName || op.pageId}`,
+      detailText: `${act}结果未确认（帖子 ${op.postId}${op.reason ? ` · ${op.reason}` : ''}）`,
+      status: 'attention',
+      statusLabel: '待核对',
+      tone: 'warn',
+      timestamp: op.updatedAt,
+    });
+  }
   for (const log of input.bumperLogs ?? []) {
-    const isPage = log.sourceMode === 'page' || log.groupId === '-';
-    const modId: 'group-bumper' | 'page-bumper' = isPage ? 'page-bumper' : 'group-bumper';
-    const modLabel = isPage ? '专页顶贴' : '小组顶贴';
-    const actionLabel =
-      [log.liked ? '👍 点赞' : '', log.commentText ? '💬 评论' : ''].filter(Boolean).join(' + ') ||
-      modLabel;
-    allItems.push({
-      moduleId: modId,
-      moduleLabel: modLabel,
+    const isPage = log.sourceMode === 'page' || log.groupId === '-',
+      mod: ActivityRecordModuleId = isPage ? 'page-bumper' : 'group-bumper';
+    const actions = [
+      log.liked ? '👍 点赞' : '',
+      log.commentText ? '💬 评论' : '',
+      log.storyShared ? '📖 分享快拍' : '',
+    ].filter(Boolean);
+    const details = [
+      log.liked ? '已点赞' : '',
+      log.commentText ? `评论：「${log.commentText}」` : '',
+      log.storyShared ? '已分享到快拍' : '',
+    ].filter(Boolean);
+    push(mod, {
       id: `bumper-log:${log.id}`,
       profileId: log.profileId,
-      profileName: resolveProfileName(byProfile, log.profileId),
-      title: actionLabel,
+      title: actions.join(' + ') || MODULE_LABELS[mod],
       targetLabel: isPage
-        ? `${log.pageName || log.pageId}`
+        ? log.pageName || log.pageId
         : `${log.groupName || log.groupId} · ${log.pageName || log.pageId}`,
-      detailText: log.commentText
-        ? `评论：「${log.commentText}」（帖子 ${log.postId} · 账号 ${log.accountId}）`
-        : `已点赞目标贴（帖子 ${log.postId} · 账号 ${log.accountId}）`,
+      detailText: `${details.join(' · ') || '已互动目标贴'}（帖子 ${log.postId} · 账号 ${log.accountId}）`,
       status: 'completed',
       statusLabel: '已顶贴',
       tone: 'ok',
@@ -328,94 +281,68 @@ export function buildUnifiedActivityFeed(
     });
   }
 
-  // 5. Group Poster
-  if (input.posterState) {
-    for (const [pid, stat] of Object.entries(input.posterState.profileCounts)) {
-      const statusStr = stat.status.trim();
-      const isReview = Boolean(statusStr && /待核对|未确认|PENDING_REVIEW/i.test(statusStr));
-      const isErr = Boolean(statusStr && /受限|失败|异常|拦截|频繁/.test(statusStr));
-      if (stat.running || isReview || isErr) {
-        allItems.push({
-          moduleId: 'group-poster',
-          moduleLabel: '小组发帖',
-          id: `poster-${stat.running ? 'live' : isReview ? 'review' : 'err'}:${pid}`,
-          profileId: pid,
-          profileName: resolveProfileName(byProfile, pid),
-          title: `小组发帖 · ${stat.running ? '实时任务' : isReview ? '待核对记录' : '执行异常'}`,
-          targetLabel: statusStr || '正在执行小组发帖',
-          detailText: `本轮已发 ${stat.session} 贴 · 今日累计 ${stat.today} 贴`,
-          status: stat.running ? 'running' : isReview ? 'attention' : 'failed',
-          statusLabel: stat.running ? '发帖中' : isReview ? '待核对' : '发帖异常',
-          tone: stat.running ? 'run' : isReview ? 'warn' : 'err',
-          timestamp: stat.running ? now : now - (isReview ? 500 : 1000),
-        });
-      }
-    }
-    for (const op of input.posterState.pendingReviewOperations ?? []) {
-      if (
-        allItems.some(
-          (i) =>
-            i.moduleId === 'group-poster' &&
-            i.profileId === op.profileId &&
-            i.status === 'attention',
-        )
-      ) {
-        continue;
-      }
-      allItems.push({
-        moduleId: 'group-poster',
-        moduleLabel: '小组发帖',
-        id: `poster-op:${op.id}`,
-        profileId: op.profileId,
-        profileName: resolveProfileName(byProfile, op.profileId),
-        title: '小组发帖 · 待核对记录',
-        targetLabel: op.groupName || op.groupId,
-        detailText: `发帖提交结果未确认${op.reason ? `（${op.reason}）` : ''}`,
-        status: 'attention',
-        statusLabel: '待核对',
-        tone: 'warn',
-        timestamp: op.updatedAt,
-      });
-    }
+  for (const [pid, stat] of Object.entries(input.posterState?.profileCounts ?? {})) {
+    const s = stat.status.trim(),
+      isReview = Boolean(s && /待核对|未确认|PENDING_REVIEW/i.test(s)),
+      isErr = Boolean(s && /受限|失败|异常|拦截|频繁/.test(s));
+    if (!stat.running && !isReview && !isErr) continue;
+    push('group-poster', {
+      id: `poster-${stat.running ? 'live' : isReview ? 'review' : 'err'}:${pid}`,
+      profileId: pid,
+      title: `小组发帖 · ${stat.running ? '实时任务' : isReview ? '待核对记录' : '执行异常'}`,
+      targetLabel: s || '正在执行小组发帖',
+      detailText: `本轮已发 ${stat.session} 贴 · 今日累计 ${stat.today} 贴`,
+      status: stat.running ? 'running' : isReview ? 'attention' : 'failed',
+      statusLabel: stat.running ? '发帖中' : isReview ? '待核对' : '发帖异常',
+      tone: stat.running ? 'run' : isReview ? 'warn' : 'err',
+      timestamp: stat.running ? now : now - (isReview ? 500 : 1000),
+    });
+  }
+  for (const op of input.posterState?.pendingReviewOperations ?? []) {
+    if (hasAttention('group-poster', op.profileId)) continue;
+    push('group-poster', {
+      id: `poster-op:${op.id}`,
+      profileId: op.profileId,
+      title: '小组发帖 · 待核对记录',
+      targetLabel: op.groupName || op.groupId,
+      detailText: `发帖提交结果未确认${op.reason ? `（${op.reason}）` : ''}`,
+      status: 'attention',
+      statusLabel: '待核对',
+      tone: 'warn',
+      timestamp: op.updatedAt,
+    });
   }
   for (const log of input.posterLogs ?? []) {
-    const isPending = log.postId === 'pending_approval';
-    allItems.push({
-      moduleId: 'group-poster',
-      moduleLabel: '小组发帖',
+    const pending = isPendingApprovalPostId(log.postId);
+    push('group-poster', {
       id: `poster-log:${log.id}`,
       profileId: log.profileId,
-      profileName: resolveProfileName(byProfile, log.profileId),
-      title: isPending ? '小组发帖（待群管审核）' : '小组发帖',
-      targetLabel: `${log.groupName || log.groupId}`,
+      title: pending ? '小组发帖（待群管审核）' : '小组发帖',
+      targetLabel: log.groupName || log.groupId,
       detailText: `${log.captionPreview || '无文案媒体贴'}（身份 ${log.accountName || log.accountId}）`,
-      status: isPending ? 'attention' : 'completed',
-      statusLabel: isPending ? '待审核' : '已发帖',
-      tone: isPending ? 'warn' : 'ok',
+      status: pending ? 'attention' : 'completed',
+      statusLabel: pending ? '待审核' : '已发帖',
+      tone: pending ? 'warn' : 'ok',
       timestamp: log.postedAt,
       postUrl: log.postUrl,
       posterLogId: log.id,
     });
   }
 
-  // 6. Google Sheets Cloud Collaboration (live runs + sync/publish/bump logs)
   if (input.googleSheetsOverview) {
-    const linkTitleById = new Map(input.googleSheetsOverview.links.map((l) => [l.id, l.title]));
-    for (const active of input.googleSheetsOverview.activeProfiles ?? []) {
-      allItems.push({
-        moduleId: 'google-sheets',
-        moduleLabel: '云表协同',
-        id: `gs-live:${active.linkId}:${active.profileId}`,
-        profileId: active.profileId,
-        profileName: resolveProfileName(byProfile, active.profileId),
+    const linkTitles = new Map(input.googleSheetsOverview.links.map((l) => [l.id, l.title]));
+    for (const a of input.googleSheetsOverview.activeProfiles ?? []) {
+      push('google-sheets', {
+        id: `gs-live:${a.linkId}:${a.profileId}`,
+        profileId: a.profileId,
         title:
-          active.kind === 'post_schedule'
+          a.kind === 'post_schedule'
             ? '云表排贴 · 实时发布'
-            : active.kind === 'metrics'
+            : a.kind === 'metrics'
               ? '云表记录 · 采集赞评'
               : '云表顶贴 · 实时执行',
-        targetLabel: active.title || linkTitleById.get(active.linkId) || '云表协同',
-        detailText: active.status || '正在执行云表任务',
+        targetLabel: a.title || linkTitles.get(a.linkId) || '云表协同',
+        detailText: a.status || '正在执行云表任务',
         status: 'running',
         statusLabel: '执行中',
         tone: 'run',
@@ -423,52 +350,51 @@ export function buildUnifiedActivityFeed(
       });
     }
     for (const log of input.googleSheetsOverview.logs ?? []) {
-      const sheetTitle = log.linkId ? (linkTitleById.get(log.linkId) ?? '云表') : '云表全局';
-      const isErr = log.level === 'error' || /失败|异常/.test(log.summary);
-      const isWarn =
-        !isErr && (log.level === 'warn' || /部分完成|跳过|暂无|未找到|需在线/.test(log.summary));
-      const actionTitle = log.action.startsWith('schedule_')
-        ? '云表排贴'
-        : log.action.startsWith('records_')
-          ? '云表顶贴'
-          : log.action.startsWith('metrics_')
-            ? '云表采赞评'
-            : log.action.startsWith('library_')
-              ? '云表库同步'
-              : '云表协同';
-      allItems.push({
-        moduleId: 'google-sheets',
-        moduleLabel: '云表协同',
-        id: `gs-log:${log.id}`,
-        profileId: '__google_sheets__',
-        profileName: sheetTitle,
-        title: actionTitle,
-        targetLabel: sheetTitle,
-        detailText: log.summary,
-        status: isErr ? 'failed' : isWarn ? 'attention' : 'completed',
-        statusLabel: isErr ? '失败' : isWarn ? '需留意' : '已完成',
-        tone: isErr ? 'err' : isWarn ? 'warn' : 'ok',
-        timestamp: log.createdAt,
-      });
+      const sheetTitle = log.linkId ? (linkTitles.get(log.linkId) ?? '云表') : '云表全局',
+        isErr = log.level === 'error' || /失败|异常/.test(log.summary),
+        isWarn =
+          !isErr && (log.level === 'warn' || /部分完成|跳过|暂无|未找到|需在线/.test(log.summary));
+      const actionTitle =
+        (
+          [
+            ['schedule_', '云表排贴'],
+            ['records_', '云表顶贴'],
+            ['metrics_', '云表采赞评'],
+            ['library_', '云表库同步'],
+          ] as const
+        ).find(([p]) => log.action.startsWith(p))?.[1] ?? '云表协同';
+      push(
+        'google-sheets',
+        {
+          id: `gs-log:${log.id}`,
+          profileId: '__google_sheets__',
+          title: actionTitle,
+          targetLabel: sheetTitle,
+          detailText: log.summary,
+          status: isErr ? 'failed' : isWarn ? 'attention' : 'completed',
+          statusLabel: isErr ? '失败' : isWarn ? '需留意' : '已完成',
+          tone: isErr ? 'err' : isWarn ? 'warn' : 'ok',
+          timestamp: log.createdAt,
+        },
+        sheetTitle,
+      );
     }
   }
 
-  const profileFiltered = input.profileId
-    ? allItems.filter((item) => item.profileId === input.profileId)
-    : allItems;
   const q = (input.query ?? '').trim().toLowerCase();
-  const queryFiltered = q
-    ? profileFiltered.filter(
-        (item) =>
-          item.profileName.toLowerCase().includes(q) ||
-          item.profileId.toLowerCase().includes(q) ||
-          item.title.toLowerCase().includes(q) ||
-          item.targetLabel.toLowerCase().includes(q) ||
-          item.detailText.toLowerCase().includes(q) ||
-          item.moduleLabel.toLowerCase().includes(q),
-      )
-    : profileFiltered;
-
+  const queryFiltered = allItems.filter(
+    (it) =>
+      (!input.profileId || it.profileId === input.profileId) &&
+      (!q ||
+        [
+          it.profileName,
+          it.profileId,
+          it.title,
+          it.targetLabel,
+          it.detailText,
+          it.moduleLabel,
+        ].some((s) => s.toLowerCase().includes(q))),
+  );
   const moduleCounts: Record<ActivityRecordModuleFilter, number> = {
     all: queryFiltered.length,
     'active-accounts': 0,
@@ -478,46 +404,33 @@ export function buildUnifiedActivityFeed(
     'group-poster': 0,
     'google-sheets': 0,
   };
-  for (const item of queryFiltered) moduleCounts[item.moduleId] += 1;
+  for (const it of queryFiltered) moduleCounts[it.moduleId] += 1;
 
-  const moduleFilter = input.moduleFilter ?? 'all';
+  const modFilter = input.moduleFilter ?? 'all';
   const moduleFiltered =
-    moduleFilter === 'all'
-      ? queryFiltered
-      : queryFiltered.filter((item) => item.moduleId === moduleFilter);
-
-  const statusCounts: Record<ActivityRecordStatusFilter, number> = {
-    all: moduleFiltered.length,
-    running: 0,
-    completed: 0,
-    failed: 0,
-    attention: 0,
-  };
-  const nonActiveStatusCounts: Record<ActivityRecordStatusFilter, number> = {
-    all: 0,
-    running: 0,
-    completed: 0,
-    failed: 0,
-    attention: 0,
-  };
-  for (const item of moduleFiltered) {
-    statusCounts[item.status] += 1;
-    if (item.moduleId !== 'active-accounts') {
+    modFilter === 'all' ? queryFiltered : queryFiltered.filter((i) => i.moduleId === modFilter);
+  const statusCounts = { ...emptyStatusCounts(), all: moduleFiltered.length },
+    nonActiveStatusCounts = emptyStatusCounts();
+  for (const it of moduleFiltered) {
+    statusCounts[it.status] += 1;
+    if (it.moduleId !== 'active-accounts') {
       nonActiveStatusCounts.all += 1;
-      nonActiveStatusCounts[item.status] += 1;
+      nonActiveStatusCounts[it.status] += 1;
     }
   }
-
   const statusFilter = input.statusFilter ?? 'all';
-  const finalItems =
+  const items = (
     statusFilter === 'all'
       ? moduleFiltered
-      : moduleFiltered.filter((item) => item.status === statusFilter);
-  finalItems.sort((a, b) => {
-    if (a.status === 'running' && b.status !== 'running') return -1;
-    if (b.status === 'running' && a.status !== 'running') return 1;
-    return b.timestamp - a.timestamp;
-  });
-
-  return { items: finalItems, statusCounts, nonActiveStatusCounts, moduleCounts };
+      : moduleFiltered.filter((i) => i.status === statusFilter)
+  )
+    .slice()
+    .sort((a, b) =>
+      a.status === 'running' && b.status !== 'running'
+        ? -1
+        : b.status === 'running' && a.status !== 'running'
+          ? 1
+          : b.timestamp - a.timestamp,
+    );
+  return { items, statusCounts, nonActiveStatusCounts, moduleCounts };
 }

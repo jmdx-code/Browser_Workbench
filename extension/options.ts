@@ -1,4 +1,4 @@
-import { bridgeTransportDescription } from '../src/shared/bridge-connection-status.js';
+import { bridgeTransportDescription } from '../src/shared/bridge-connection-health.js';
 const status = document.querySelector('#state')!;
 const details = document.querySelector('#details')!;
 document.body.style.minWidth = '360px';

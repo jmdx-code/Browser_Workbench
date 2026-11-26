@@ -2,7 +2,6 @@ import { lstat, readFile, writeFile, realpath, rename, mkdir, rm, unlink } from 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-
 const Request = z
   .object({ version: z.literal(1), id: z.uuid(), requestedAt: z.number().int().nonnegative() })
   .strict();
@@ -18,7 +17,6 @@ export async function prepareWorkspaceReset(directory: string) {
   await writeFile(marker(root), JSON.stringify(request), { flag: 'wx' });
   return request;
 }
-
 // Startup only, before opening either DB or any writer. The sibling marker survives crashes
 // between renaming the old directory, removing its contents and recreating the empty directory.
 export async function applyPendingWorkspaceReset(directory: string): Promise<boolean> {

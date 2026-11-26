@@ -1,5 +1,4 @@
 import { KernelStamp, type KernelStamp as Stamp } from '../shared/kernel-protocol.js';
-
 // A volatile fence, not a replacement for the durable product outbox or account lock.
 export class KernelLease {
   private stamp: Stamp | undefined;
@@ -26,34 +25,33 @@ export class KernelLease {
       throw Error('KERNEL_LEASE_REJECTED:revoked_revision');
     const now = this.now();
     this.revision = Math.max(this.revision, next.generation);
-    const expiresAt = Math.min(
-      Math.max(next.expiresAt, now + 60_000, this.stamp?.expiresAt ?? 0),
-      now + this.maxLeaseMs,
-    );
     this.revoked = false;
     this.stamp = {
       ...next,
       generation: this.revision,
-      expiresAt,
+      expiresAt: Math.min(
+        Math.max(next.expiresAt, now + 60_000, this.stamp?.expiresAt ?? 0),
+        now + this.maxLeaseMs,
+      ),
     };
     return { ...this.stamp };
   }
   check(expected?: Stamp): Stamp {
-    const current = this.stamp;
+    const cur = this.stamp;
     if (
-      !current ||
+      !cur ||
       (expected &&
         (expected.profileId !== this.profileId ||
           expected.connectionEpoch !== this.connectionEpoch ||
-          expected.leaseId !== current.leaseId ||
-          expected.generation > current.generation))
+          expected.leaseId !== cur.leaseId ||
+          expected.generation > cur.generation))
     )
       throw Error('KERNEL_FENCED');
-    if (current.expiresAt <= this.now()) {
-      this.stamp = { ...current, expiresAt: this.now() + 60_000 };
+    if (cur.expiresAt <= this.now()) {
+      this.stamp = { ...cur, expiresAt: this.now() + 60_000 };
       return { ...this.stamp };
     }
-    return { ...current };
+    return { ...cur };
   }
   revoke(): void {
     this.stamp = undefined;

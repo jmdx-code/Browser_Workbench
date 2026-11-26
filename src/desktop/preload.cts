@@ -27,8 +27,6 @@ const bridge: DesktopBridge = {
       if (closeCallback === callback) closeCallback = null;
     };
   },
-  chooseMaterialDirectory: () =>
-    ipcRenderer.invoke('workbench:choose-material-directory') as Promise<string | null>,
   chooseBackupDirectory: () =>
     ipcRenderer.invoke('workbench:choose-backup-directory') as Promise<string | null>,
   chooseRestoreBackup: () =>

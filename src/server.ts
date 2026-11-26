@@ -1,121 +1,60 @@
-import { recoverBumperOperations } from './infrastructure/group-bumper-recovery.js';
-import { retireClosedKernelSession } from './infrastructure/kernel-session-retirement.js';
-import { runBoundedServerShutdown } from './infrastructure/server-shutdown.js';
-const controllerStartedAt = Date.now();
-import {
-  fetchAndLocalizeAccountAvatar,
-  scheduleStartupAccountAvatarLocalization,
-} from './infrastructure/group-bumper-avatar.js';
-import { isLocalAvatar } from './shared/group-bumper.js';
-import { GroupBumperService } from './application/group-bumper-service.js';
-import { GroupPosterService } from './application/group-poster-service.js';
-import { AutoSchedulerService } from './application/auto-scheduler-service.js';
-import { GoogleSheetsService } from './application/google-sheets-service.js';
-import { GoogleOAuthManager } from './infrastructure/google-oauth.js';
-import { startDesktopHostingMonitor } from './infrastructure/desktop-hosting-monitor.js';
-import { GoogleSheetsRestClient } from './infrastructure/google-sheets-client.js';
-import { SheetImageHostClient } from './infrastructure/sheet-image-host.js';
-import { GoogleSheetsAutomationBridge } from './infrastructure/google-sheets-automation-bridge.js';
-import { syncGlobalConcurrencyToModules } from './application/global-concurrency-sync.js';
-import {
-  FeatureExecutionRegistry,
-  ensureFeatureExecutionRegistry,
-} from './application/feature-execution-registry.js';
-import { createGlobalAccountAbnormalReporter } from './application/account-abnormal-reporter.js';
-import { GroupBumperBrowserAdapter } from './infrastructure/group-bumper-runner.js';
-import { TargetMetadataRefreshService } from './infrastructure/target-metadata-refresh.js';
-import {
-  FilesystemPosterMediaPreparer,
-  GroupPosterBrowserAdapter,
-  recoverPosterOperations,
-} from './infrastructure/group-poster-runner.js';
-import { mediaRuntimeComponent } from './infrastructure/media-runtime-component.js';
-import { SoftwareUpdateService } from './application/software-update-service.js';
-import { taskBlocksSoftwareUpdate } from './domain/software-update.js';
-import { SoftwareUpdateBackend } from './infrastructure/software-update-backend.js';
-import { ExtensionUpdates, extensionReloadTasksBusy } from './infrastructure/extension-updates.js';
-import {
-  productExtensionDirectory,
-  syncProductExtensionDirectory,
-} from './infrastructure/paths.js';
-import {
-  productAiWorkspaceDirectory,
-  syncProductAiWorkspaceDirectory,
-} from './infrastructure/ai-workspace.js';
 import { access } from 'node:fs/promises';
-import { DataCleanupService } from './application/data-cleanup.js';
-import { LogCleanup } from './infrastructure/log-cleanup.js';
-import {
-  prepareWorkspaceReset,
-  applyPendingWorkspaceReset,
-} from './infrastructure/workspace-reset.js';
-import path from 'node:path';
-import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { FilesystemRuntimeLog } from './infrastructure/runtime-log.js';
-import { WorkspaceMaintenance } from './application/workspace-maintenance.js';
-import { TaskNotificationMonitor } from './application/task-notification-monitor.js';
-import { ProductError } from './domain/workspace.js';
-const controllerLoopDelay = monitorEventLoopDelay({ resolution: 20 });
-controllerLoopDelay.enable();
-import { WorkspaceBackupService } from './application/workspace-backup-service.js';
-import { FilesystemWorkspaceBackupWriter } from './infrastructure/workspace-backup-writer.js';
-import {
-  FilesystemWorkspaceRestore,
-  applyPendingWorkspaceRestore,
-} from './infrastructure/workspace-restore.js';
-import { fileURLToPath } from 'node:url';
-import { loadServerConfig } from './infrastructure/server-config.js';
-import { startBridgeServer } from './bridge/server.js';
-import type { WorkspaceStorePort as WorkspaceStore } from './infrastructure/persistence-port.js';
-import { PersistenceClient } from './infrastructure/persistence-client.js';
-import { BridgeProfileSource } from './infrastructure/browser-source.js';
-import { WorkspaceService } from './application/workspace-service.js';
-import { workspaceApi } from './http/workspace-api.js';
-import { productDataDirectory, canonicalDataDirectory } from './infrastructure/paths.js';
-import { TaskService } from './application/task-service.js';
-import { reserveControllerPort, releaseControllerPort } from './infrastructure/controller-port.js';
-import { KernelBridge } from './infrastructure/kernel-bridge.js';
-import { MaterialPreflightService } from './application/material-preflight.js';
-import { FilesystemMaterialScanner } from './infrastructure/material-scanner.js';
-import { checkKnownFacebookVideo } from './infrastructure/video-metadata.js';
-import { FilesystemMaterialMediaReader } from './infrastructure/material-media-reader.js';
-import { FilesystemMaterialSnapshotVerifier } from './infrastructure/material-source-verifier.js';
-import { ProfileInspectionService } from './application/profile-inspection.js';
-import { ResourceTableService } from './application/resource-table-service.js';
-import { ResourceDownloadService } from './application/resource-download-service.js';
-import { PublicResourceDriveDownloader } from './infrastructure/resource-drive-downloader.js';
-import { FilesystemResourceSourceReader } from './infrastructure/resource-source-reader.js';
-import { KernelProfileInspection } from './infrastructure/kernel-profile-inspection.js';
-import { FacebookPublishingRuntime } from './infrastructure/facebook-publishing-runtime.js';
-import { ArchiveManagementService } from './application/archive-management.js';
-import { MaterialUsageService } from './application/material-usage-service.js';
-import { MaterialCacheManagement } from './application/material-cache-management.js';
-import { MaterialCacheCleanup } from './application/material-cache-cleanup.js';
-import { FilesystemMaterialCacheCleaner } from './infrastructure/material-cache-cleaner.js';
-import { NativeReviewService } from './application/native-review.js';
-import { KernelNativeReview } from './infrastructure/kernel-native-review.js';
-import { BridgeBrowserWindow } from './infrastructure/bridge-browser-window.js';
-import { LocalBrowserLabels } from './infrastructure/local-browser-labels.js';
-import { GraphAvatar } from './infrastructure/graph-avatar.js';
-import { GroupInviterService } from './application/group-inviter-service.js';
-import { GroupInviterBrowserAdapter } from './infrastructure/group-inviter-runner.js';
-import type { BluestacksService } from './application/bluestacks-service.js';
-import type { WindowsOcrClient } from './infrastructure/bluestacks-vision.js';
-import { devDiag } from './shared/dev-diagnostics.js';
-import { DevDiagnosticsFileWriter } from './infrastructure/dev-diagnostics-writer.js';
 import type http from 'node:http';
-import {
-  createDiagnosticSnapshotBuilder,
-  revealDiagnosticPackage,
-} from './infrastructure/diagnostic-package.js';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { GlobalAccountAbnormalReporter } from './application/account-abnormal-reporter.js';
+import type { AutoSchedulerService } from './application/auto-scheduler-service.js';
+import type { BluestacksService } from './application/bluestacks-service.js';
+import type { DataCleanupService } from './application/data-cleanup.js';
+import type { FeatureExecutionRegistry } from './application/feature-execution-registry.js';
+import type { GoogleSheetsService } from './application/google-sheets-service.js';
+import type { GroupBumperService } from './application/group-bumper-service.js';
+import type { GroupInviterService } from './application/group-inviter-service.js';
+import type { GroupPosterService } from './application/group-poster-service.js';
+import type { ProfileInspectionService } from './application/profile-inspection.js';
+import { TaskNotificationMonitor } from './application/task-notification-monitor.js';
+import type { WindowLayoutService } from './application/window-layout.js';
+import { Workboard } from './application/workboard.js';
+import type { WorkspaceBackupService } from './application/workspace-backup-service.js';
+import { WorkspaceEventHub } from './application/workspace-event-hub.js';
+import { workspaceApi } from './http/workspace-api.js';
+import { startBridgeServer } from './bridge/server.js';
+import type { ActiveAccountRuntime } from './infrastructure/active-account-runtime.js';
+import { syncProductAiWorkspaceDirectory } from './infrastructure/ai-workspace.js';
+import type { WindowsOcrClient } from './infrastructure/bluestacks-vision.js';
+import { releaseControllerPort, reserveControllerPort } from './infrastructure/controller-port.js';
+import { startDesktopHostingMonitor } from './infrastructure/desktop-hosting-monitor.js';
+import { DevDiagnosticsFileWriter } from './infrastructure/dev-diagnostics-writer.js';
+import type { ExtensionUpdates } from './infrastructure/extension-updates.js';
+import { GraphAvatar } from './infrastructure/graph-avatar.js';
+import { scheduleStartupAccountAvatarLocalization } from './infrastructure/group-bumper-avatar.js';
+import type { KernelBridge } from './infrastructure/kernel-bridge.js';
+import { LocalBrowserLabels } from './infrastructure/local-browser-labels.js';
 import type { AgentBrowserManager } from './infrastructure/mcp/agent-browser-manager.js';
 import {
-  createBluestacksRuntime,
-  openDesktopAiWorkspaceViaParent,
-  openDesktopExtensionDirViaParent,
-  schedulePosterDriveCacheCleanup,
-  wireLifecycleAndMcpRuntime,
-} from './infrastructure/mcp/mcp-runtime-wiring.js';
+  canonicalDataDirectory,
+  productDataDirectory,
+  syncProductExtensionDirectory,
+} from './infrastructure/paths.js';
+import { PersistenceClient } from './infrastructure/persistence-client.js';
+import type { WorkspaceStorePort as WorkspaceStore } from './infrastructure/persistence-port.js';
+import { FilesystemRuntimeLog } from './infrastructure/runtime-log.js';
+import { loadServerConfig } from './infrastructure/server-config.js';
+import { buildServerKernelHooks } from './infrastructure/server-kernel-wiring.js';
+import { buildServerAppRoutes } from './infrastructure/server-routes-wiring.js';
+import { runBoundedServerShutdown } from './infrastructure/server-shutdown.js';
+import { applyPendingWorkspaceReset } from './infrastructure/workspace-reset.js';
+import {
+  applyPendingWorkspaceRestore,
+  FilesystemWorkspaceRestore,
+} from './infrastructure/workspace-restore.js';
+import { devDiag } from './shared/dev-diagnostics.js';
+import type { ProfileLifecyclePort } from './shared/profile-lifecycle.js';
+import { LayoutDisplays } from './shared/window-layout.js';
+
+const controllerLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+controllerLoopDelay.enable();
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
@@ -133,15 +72,7 @@ for (const candidate of extensionSources) {
 }
 if (!extensionSource) throw Error('BUNDLED_EXTENSION_MISSING');
 const bundledExtension = await syncProductExtensionDirectory(extensionSource);
-let softwareUpdate: SoftwareUpdateService | undefined;
-let extensionUpdates: ExtensionUpdates | undefined;
-const {
-  softwareVersion,
-  identity,
-  executionAcceptance,
-  featureEvidence,
-  publicationAcceptanceScope,
-} = await loadServerConfig(root);
+const { softwareVersion, identity, executionAcceptance } = await loadServerConfig(root);
 if (
   Boolean(process.env.WORKBENCH_AI_WORKSPACE_DIR?.trim()) ||
   (!process.env.WORKBENCH_SMOKE_OUT && !process.env.BRIDGE_TEST_DATA_DIR)
@@ -157,10 +88,8 @@ if (
     },
   );
 }
-import { WindowLayoutService } from './application/window-layout.js';
-import { LayoutDisplays, defaultWindowLayout } from './shared/window-layout.js';
+
 let layoutDisplays = LayoutDisplays.parse(JSON.parse(process.env.WORKBENCH_DISPLAYS ?? '[]'));
-let windowLayout: WindowLayoutService | undefined;
 const dataDir = await canonicalDataDirectory(
   process.env.WORKBENCH_DATA_DIR ?? process.env.BRIDGE_TEST_DATA_DIR ?? productDataDirectory(),
 );
@@ -175,8 +104,8 @@ const browserLabels = new LocalBrowserLabels([
 ]);
 const graphAvatar = new GraphAvatar(() => process.env.WORKBENCH_GRAPH_AVATAR_TOKEN);
 const port = Number(process.env.WORKBENCH_PORT ?? process.env.BRIDGE_TEST_PORT ?? 18767);
-// Own the port before touching either database: a second process must not recover a live instance's work.
 const binding = await reserveControllerPort(port);
+
 let repository: WorkspaceStore;
 let persistence: PersistenceClient;
 let restoreRequested = false;
@@ -189,7 +118,7 @@ try {
   repository = persistence.workspace;
   const diagnosticNames = new Map<string, string>();
   const diagnosticAliases = new Map<string, string>();
-  const observeNames = (route: string, value: unknown) => {
+  persistence.observeResults((route: string, value: unknown) => {
     const target =
       route === 'workspace.profileAccountCache'
         ? diagnosticNames
@@ -208,53 +137,50 @@ try {
             : null;
       if (typeof label === 'string' && label.trim()) target.set(id, label.trim());
     }
-  };
-  persistence.observeResults(observeNames);
+  });
   await repository.profileAccountCache();
   await repository.profileMetadata();
-  devDiag.setProfileNameResolver((profileId) => {
-    return (
+  devDiag.setProfileNameResolver(
+    (profileId) =>
       diagnosticAliases.get(profileId) ||
       browserLabels.name(profileId)?.trim() ||
-      diagnosticNames.get(profileId)
-    );
-  });
+      diagnosticNames.get(profileId),
+  );
 } catch (error) {
   await releaseControllerPort(binding.server);
   throw error;
 }
-let bridge: Awaited<ReturnType<typeof startBridgeServer>>;
-let inspection: ProfileInspectionService | undefined;
-let nativeReview: NativeReviewService | undefined;
+
+const workboard = new Workboard();
+const eventHub = new WorkspaceEventHub();
+let shuttingDown = false;
+let windowLayout: WindowLayoutService | undefined;
 let mainKernel: KernelBridge | undefined;
-let publishingRuntime: FacebookPublishingRuntime | undefined;
+let inspection: ProfileInspectionService | undefined;
+let activeRuntime: ActiveAccountRuntime | undefined;
+let profileLifecycleRef: ProfileLifecyclePort | undefined;
+let accountAbnormalReporterRef: GlobalAccountAbnormalReporter | undefined;
+let extensionUpdates: ExtensionUpdates | undefined;
+let softwareUpdateRef: ReturnType<typeof Object> | undefined;
 let backups: WorkspaceBackupService | undefined;
 let dataCleanup: DataCleanupService | undefined;
 let bluestacksOcrClient: WindowsOcrClient | undefined;
 let bluestacksServiceRef: BluestacksService | undefined;
 let groupBumperServiceRef: GroupBumperService | undefined;
 let groupPosterServiceRef: GroupPosterService | undefined;
+let groupInviterServiceRef: GroupInviterService | undefined;
 let autoSchedulerServiceRef: AutoSchedulerService | undefined;
 let googleSheetsServiceRef: GoogleSheetsService | undefined;
+let scheduleOfflineHygieneRef: ((profileId: string) => void) | undefined;
 let featureExecutionRef: FeatureExecutionRegistry | undefined;
 let agentBrowserManagerRef: AgentBrowserManager | undefined;
 let autoInspectSweepRef: (() => Promise<void>) | undefined;
 let mcpHttpHandler:
   ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>) | undefined;
-const materialPreflight = new MaterialPreflightService(
-  new FilesystemMaterialScanner(undefined, checkKnownFacebookVideo),
-  () => new Date().toISOString(),
-  new FilesystemMaterialMediaReader(),
-  new FilesystemMaterialSnapshotVerifier(),
-);
+
+let bridge: Awaited<ReturnType<typeof startBridgeServer>>;
 try {
   await repository.tasks.recoverOnStartup(!restoreRequested);
-  await repository.taskTabs.recoverOnStartup();
-  await repository.tasks.settlements.recoverOnStartup();
-  await repository.uploadStages.recoverOnStartup();
-  await repository.cacheCleanup.recoverOnStartup();
-  await repository.archivePreparation.recoverOnStartup();
-  await repository.archiveExecution.recoverOnStartup();
   bridge = await startBridgeServer({
     extensionIdle: async (peer) => {
       try {
@@ -274,776 +200,186 @@ try {
     dataDir,
     port,
     boundServer: binding,
+    onClose: () => eventHub.close(),
     mcpHandler: (req, res) => (mcpHttpHandler ? mcpHttpHandler(req, res) : Promise.resolve(false)),
     autoRecoverConnections: process.env.WORKBENCH_DIAGNOSTICS !== '1',
     connectionRecoveryAllowed:
       process.env.WORKBENCH_DIAGNOSTICS === '1'
         ? undefined
         : async (profileId) =>
-            (await publishingRuntime?.canRecoverConnectionForEnding(profileId)) === true ||
-            !(await repository.tasks.hasProfilePlanInStates(profileId, [
-              'QUEUED',
-              'RUNNING',
-              'PAUSING',
-              'PAUSED',
-              'STOPPING',
-              'REVIEW',
-            ])),
+            !(await repository.tasks.hasProfilePlanInStates(profileId, ['QUEUED', 'RUNNING'])),
     diagnosticsEnabled: process.env.WORKBENCH_DIAGNOSTICS === '1',
     kernelHooks:
       port === 18767 || process.env.WORKBENCH_SMOKE_WINDOW_LAYOUT === '1'
-        ? ({ core, tasks }) => {
-            const kernel = new KernelBridge(core, tasks);
-            kernel.retireClosedSession = (peer, port, state) =>
-              retireClosedKernelSession(repository, peer, port, state, controllerStartedAt);
-            kernel.recoverBumperWorkspace = (peer, guard) =>
-              recoverBumperOperations(kernel, peer, repository.groupBumper, guard);
-            kernel.recoverPosterWorkspace = (peer, guard) =>
-              recoverPosterOperations(kernel, peer, repository.groupPoster, guard);
-            const layout = new WindowLayoutService(
-              () => layoutDisplays,
-              {
-                read: (id) => kernel.taskWindow(id),
-                move: (id, expected, rect, exposed, deadline, focus) =>
-                  kernel.taskWindow(id, expected, rect, exposed, deadline, focus),
-              },
-              async () => (await repository.preferences()).windowLayout ?? defaultWindowLayout,
-              async (value) => {
-                const saved = await repository.preferences();
-                const { version: _version, revision, ...values } = saved;
-                await repository.updatePreferences({
-                  expectedRevision: revision,
-                  values: { ...values, windowLayout: value },
-                });
-              },
-              process.env.WORKBENCH_TRACE_TIMING === '1'
-                ? (data) => console.error(JSON.stringify({ event: 'WINDOW_LAYOUT_TRIAL', data }))
-                : undefined,
-              () => {
-                let bestId: string | null = null;
-                let bestAt = 0;
-                for (const peer of core.peers.values()) {
-                  if (!peer.online) continue;
-                  const at = peer.focusedWindowAt ?? 0;
-                  if (at > bestAt) {
-                    bestAt = at;
-                    bestId = peer.profileId;
-                  }
-                }
-                return bestId;
-              },
-            );
-            kernel.setWindowLayoutHook(
-              (id, guard) => layout.arrange(id, guard),
-              () => layout.isEnabled(),
-              undefined,
-              (id, at) => layout.visible(id, at),
-            );
-            windowLayout = layout;
-            void layout.snapshot().catch(() => {});
-            const localizeAvatar = (url: string, key: string) =>
-              fetchAndLocalizeAccountAvatar(url, undefined, key).catch(() => null);
-            kernel.setAccountObserver({
-              shouldRefreshAvatar: async (profileId, accountId) => {
-                const cached = (await repository.profileAccountCache()).get(profileId);
-                return (
-                  !isLocalAvatar(cached?.avatar) ||
-                  cached?.id !== accountId ||
-                  Date.now() - (cached?.avatarUpdatedAt ?? 0) >= 6 * 3600_000
-                );
-              },
-              onObserved: async (profileId, account) => {
-                const previous = (await repository.profileAccountCache()).get(profileId);
-                let resolvedAvatar = account.avatar;
-                if (resolvedAvatar && !isLocalAvatar(resolvedAvatar)) {
-                  const localized = await localizeAvatar(
-                    resolvedAvatar,
-                    `${profileId}:${account.id ?? ''}`,
-                  );
-                  if (localized) resolvedAvatar = localized;
-                  else if (isLocalAvatar(previous?.avatar) && previous?.id === account.id)
-                    resolvedAvatar = previous?.avatar ?? null;
-                }
-                await repository.updateProfileAccountCache(profileId, {
-                  ...account,
-                  ...(resolvedAvatar !== undefined ? { avatar: resolvedAvatar } : {}),
-                });
-                const latest = (await repository.profileAccountCache()).get(profileId);
-                const effectiveAvatar =
-                  latest?.avatar ??
-                  (resolvedAvatar !== undefined
-                    ? resolvedAvatar
-                    : previous?.id === account.id
-                      ? previous?.avatar
-                      : null);
-                inspection?.syncExternalObservation(profileId, {
-                  ...account,
-                  ...(effectiveAvatar !== undefined ? { avatar: effectiveAvatar } : {}),
-                });
-                const staleAvatar =
-                  !isLocalAvatar(previous?.avatar) ||
-                  previous?.id !== account.id ||
-                  Date.now() - (previous?.avatarUpdatedAt ?? 0) >= 6 * 3600_000;
-                if (
-                  account.state === 'logged-in' &&
-                  account.id &&
-                  !isLocalAvatar(effectiveAvatar) &&
-                  staleAvatar
-                ) {
-                  const accountId = account.id;
-                  void graphAvatar
-                    .lookup(accountId)
-                    .then(async (url) => {
-                      if (!url) return;
-                      const finalAvatar =
-                        (await localizeAvatar(url, `${profileId}:${accountId}`)) ?? url;
-                      await repository.updateProfileAccountCache(profileId, {
-                        state: 'logged-in',
-                        id: accountId,
-                        avatar: finalAvatar,
-                        liveConfirmedLoggedIn: true,
-                      });
-                      inspection?.syncExternalObservation(profileId, {
-                        state: 'logged-in',
-                        id: accountId,
-                        avatar: finalAvatar,
-                      });
-                    })
-                    .catch(() => {});
-                }
-              },
-            });
-            mainKernel = kernel;
-            persistence.setFailureHandler((error) => {
-              kernel.revokeInputs('PERSISTENCE_UNAVAILABLE');
-              for (const peer of core.peers.values()) {
-                if (peer.online) void core.stop(peer.profileId).catch(() => {});
-              }
-              console.error('Persistence worker failed; input authority revoked:', error);
-            });
-            nativeReview = new NativeReviewService(
-              new KernelNativeReview(kernel, core),
-              repository.tasks,
-            );
-            inspection = new ProfileInspectionService(
-              new KernelProfileInspection(kernel, core, repository.tasks),
-              Date.now,
-              (accountId) => graphAvatar.lookup(accountId),
-              async (profileId, account) => {
-                let resolvedAvatar =
-                  account.state === 'logged-out'
-                    ? null
-                    : ['restricted', 'verification'].includes(account.state)
-                      ? undefined
-                      : account.avatar
-                        ? account.avatar
-                        : undefined;
-                if (resolvedAvatar && !isLocalAvatar(resolvedAvatar)) {
-                  const localized = await localizeAvatar(
-                    resolvedAvatar,
-                    `${profileId}:${account.id ?? ''}`,
-                  );
-                  if (localized) resolvedAvatar = localized;
-                }
-                await repository.updateProfileAccountCache(profileId, {
-                  state: account.state,
-                  ...(account.id ? { id: account.id } : {}),
-                  ...(account.name ? { name: account.name } : {}),
-                  ...(resolvedAvatar !== undefined ? { avatar: resolvedAvatar } : {}),
-                  liveConfirmedLoggedIn: account.state === 'logged-in',
-                });
-                if (resolvedAvatar && isLocalAvatar(resolvedAvatar)) {
-                  inspection?.syncExternalObservation(profileId, {
-                    state: account.state,
-                    id: account.id,
-                    name: account.name,
-                    avatar: resolvedAvatar,
-                  });
-                }
-              },
-            );
-            if (process.env.WORKBENCH_DIAGNOSTICS !== '1')
-              publishingRuntime = new FacebookPublishingRuntime(
-                kernel,
-                core,
-                repository,
-                dataDir,
-                async () =>
-                  (await new BridgeProfileSource(core, core.store, tasks).profiles()).map(
-                    (profile) => ({
-                      id: profile.id,
-                      online: profile.online,
-                      synced: profile.synced,
-                      unresolved: profile.unresolved,
-                      account: profile.account,
-                      dispatchAllowed: false,
-                    }),
-                  ),
-                {
-                  feed: () => executionAcceptance.feed,
-                  video: () => executionAcceptance.video,
-                  marketplace: () => executionAcceptance.marketplace,
-                  post: () => executionAcceptance.post,
-                  story: () => executionAcceptance.story,
-                  friends: () => executionAcceptance.friends,
+        ? ({ core }) =>
+            buildServerKernelHooks({
+              core,
+              repository,
+              persistence,
+              workboard,
+              browserLabels,
+              graphAvatar,
+              dataDir,
+              uploadCacheRoot,
+              executionAcceptance,
+              eventHub,
+              refs: {
+                getLayoutDisplays: () => layoutDisplays,
+                setWindowLayout: (v) => {
+                  windowLayout = v;
                 },
-                undefined,
-                undefined,
-                undefined,
-                undefined,
-                () => {
-                  dataCleanup?.assertNotResetting();
-                  backups?.assertIdle();
-                  softwareUpdate?.assertIdle();
+                setMainKernel: (v) => {
+                  mainKernel = v;
                 },
-                publicationAcceptanceScope,
-                uploadCacheRoot,
-                async (profileId) => {
-                  const profile = await new BridgeProfileSource(core, core.store, tasks).profile(
-                    profileId,
-                  );
-                  return profile
-                    ? {
-                        id: profile.id,
-                        online: profile.online,
-                        synced: profile.synced,
-                        unresolved: profile.unresolved,
-                        account: profile.account,
-                        dispatchAllowed: false,
-                      }
-                    : undefined;
+                setInspection: (v) => {
+                  inspection = v;
                 },
-                true,
-              );
-            return {
-              message: async (peer, value) => await kernel.message(peer, value),
-              disconnected: (peer) => kernel.disconnected(peer),
-              controlStopped: async (peer, requestId) => {
-                kernel.controlStopped(peer, requestId);
-                await publishingRuntime?.parentControlStopped(peer);
+                getInspection: () => inspection,
+                setActiveRuntime: (v) => {
+                  activeRuntime = v;
+                },
+                getActiveRuntime: () => activeRuntime,
+                getProfileLifecycle: () => profileLifecycleRef,
+                getAccountAbnormalReporter: () => accountAbnormalReporterRef,
+                getExtensionUpdates: () => extensionUpdates,
+                getFeatureExecution: () => featureExecutionRef,
+                getDataCleanup: () => dataCleanup,
+                getBackups: () => backups,
+                getSoftwareUpdate: () => softwareUpdateRef as never,
+                getScheduleOfflineHygiene: () => scheduleOfflineHygieneRef,
               },
-              tick: async () => {
-                kernel.tick();
-                void (async () => {
-                  const ids = (await core.store.profileList()).map((row) => String(row.profileId));
-                  const newlyBound = await browserLabels.refresh(ids);
-                  if (newlyBound.length > 0) {
-                    await repository.upsertProfileLaunchBindings(newlyBound);
-                  }
-                })().catch(() => {});
-                void publishingRuntime
-                  ?.tick()
-                  .catch((error) => console.error('Publishing runtime failed', error));
-              },
-              close: async () => {
-                const settling = inspection?.close();
-                await publishingRuntime?.close();
-                await kernel.close();
-                await settling;
-              },
-            };
-          }
+            })
         : undefined,
     extensionIds: process.env.BRIDGE_ALLOWED_EXTENSION_ID
       ? [process.env.BRIDGE_ALLOWED_EXTENSION_ID]
       : [identity.extensionId, 'penkjbecaaekdcpbpcfjekhikhjhoaai'],
-    appRoutes: ({ core, store, tasks }) => {
-      const featureExecution = new FeatureExecutionRegistry();
-      featureExecutionRef = featureExecution;
-      backups = new WorkspaceBackupService(
-        repository.tasks,
-        new FilesystemWorkspaceBackupWriter(
-          async (file) => repository.backup(file),
-          async (file) => store.backup(file),
-          softwareVersion,
-          dataDir,
-        ),
-        new FilesystemWorkspaceRestore(dataDir),
-        () => featureExecution.hasAnyActiveExecution(),
-      );
-      const workspaceService = new WorkspaceService(
-        repository,
-        new BridgeProfileSource(
-          core,
-          store,
-          tasks,
-          inspection,
-          browserLabels,
-          (id) => mainKernel?.presentationStatus(id) ?? null,
-        ),
-      );
-      autoInspectSweepRef = async () => {
-        if (!inspection || shuttingDown || process.env.WORKBENCH_DIAGNOSTICS === '1') return;
-        const cache = await repository.profileAccountCache();
-        const candidates: string[] = [];
-        for (const peer of core.peers.values()) {
-          if (
-            !peer.online ||
-            !peer.synced ||
-            peer.phase !== 'PAUSED' ||
-            peer.browserWindowCount === 0 ||
-            !peer.capabilities?.includes('facebook-existing-display-v1')
-          ) {
-            continue;
-          }
-          const cached = cache.get(peer.profileId);
-          // Skip profiles that already have both confirmed account ID and localized avatar
-          if (cached?.id && isLocalAvatar(cached.avatar)) continue;
-          if ((await core.store.unresolved(peer.profileId)).length > 0) continue;
-          if (await featureExecution.isProfileBusy(peer.profileId)) continue;
-          candidates.push(peer.profileId);
-        }
-        if (candidates.length > 0) {
-          inspection.observeConnections(candidates);
-        }
-      };
-      const assertSystemIdle = () => {
-        dataCleanup?.assertNotResetting();
-        backups?.assertIdle();
-        softwareUpdate?.assertIdle();
-      };
-      const taskService = new TaskService(
-        repository.tasks,
-        () => publishingRuntime,
-        assertSystemIdle,
-        () => featureEvidence,
-        () => {
-          void publishingRuntime?.tick().catch(() => {});
-        },
-      );
-      let groupBumperService: GroupBumperService | undefined;
-      featureExecution.register({
-        id: 'active-accounts',
-        label: '活跃账号',
-        isProfileRunning: async (profileId) => {
-          await repository.tasks.releaseErroredPausedPlans([profileId]);
-          return await repository.tasks.hasProfilePlanInStates(profileId, [
-            'QUEUED',
-            'RUNNING',
-            'PAUSING',
-            'PAUSED',
-            'STOPPING',
-            'REVIEW',
-          ]);
-        },
-        hasActiveExecution: () => publishingRuntime?.hasActiveExecution() === true,
-        stopProfiles: async (profileIds) => {
-          await Promise.all(profileIds.map((id) => taskService.stopActiveProfile(id)));
-        },
-      });
-      const accountAbnormalReporter = createGlobalAccountAbnormalReporter({
-        updateProfileAccountCache: (profileId, patch) =>
-          repository.updateProfileAccountCache(profileId, {
-            state: patch.state,
-            scope: patch.scope,
-            ...(patch.accountId !== undefined ? { id: patch.accountId } : {}),
-            ...(patch.name !== undefined ? { name: patch.name } : {}),
-            ...(patch.avatar !== undefined ? { avatar: patch.avatar } : {}),
-          }),
-        syncExternalObservation: (profileId, patch) => {
-          inspection?.syncExternalObservation(profileId, {
-            state: patch.state,
-            ...(patch.accountId !== undefined ? { id: patch.accountId } : {}),
-            ...(patch.name !== undefined ? { name: patch.name } : {}),
-            ...(patch.avatar !== undefined ? { avatar: patch.avatar } : {}),
-          });
-        },
-      });
-      const bumperAdapter = new GroupBumperBrowserAdapter(
-        repository.groupBumper,
-        () => mainKernel,
-        () => core,
-        (id) => featureExecution.isProfileBusy(id, ['group-bumper', 'page-bumper']),
-        1,
-        accountAbnormalReporter,
-      );
-      const targetMetadataRefresh = new TargetMetadataRefreshService(bumperAdapter);
-      const groupInviterService = new GroupInviterService(
-        repository.groupInviter,
-        new GroupInviterBrowserAdapter(
-          repository.groupInviter,
-          () => mainKernel,
-          () => core,
-          undefined,
-          (profileId) => featureExecution.isProfileBusy(profileId, 'group-inviter'),
-          targetMetadataRefresh,
-          accountAbnormalReporter,
-        ),
-        assertSystemIdle,
-        (items, options) => targetMetadataRefresh.refreshTargetBatch('groups', items, options),
-        () => targetMetadataRefresh.stopRefresh('groups'),
-      );
-      groupInviterService.setFeatureExecutionRegistry(featureExecution);
-      groupBumperService = new GroupBumperService(
-        repository.groupBumper,
-        bumperAdapter,
-        async () => ({
-          comments: await repository.groupBumper.comments(),
-          total: await repository.groupBumper.total(),
-        }),
-        assertSystemIdle,
-        (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
-        undefined,
-        (kind) => targetMetadataRefresh.stopRefresh(kind),
-      );
-      groupBumperService.setFeatureExecutionRegistry(featureExecution);
-      const mediaComponent = mediaRuntimeComponent(dataDir);
-      const posterAdapter = new GroupPosterBrowserAdapter(
-        repository.groupBumper,
-        () => mainKernel,
-        () => core,
-        (id) => featureExecution.isProfileBusy(id, 'group-poster'),
-        1,
-        repository.groupPoster,
-        accountAbnormalReporter,
-      );
-      const posterMediaPreparer = new FilesystemPosterMediaPreparer(
-        path.join(uploadCacheRoot, 'group-poster-media'),
-        fetch,
-        mediaComponent,
-      );
-      const groupPosterService = new GroupPosterService(
-        repository.groupPoster,
-        posterAdapter,
-        posterMediaPreparer,
-        featureExecution,
-        assertSystemIdle,
-        (kind, items, options) => targetMetadataRefresh.refreshTargetBatch(kind, items, options),
-        () => targetMetadataRefresh.stopRefresh('groups'),
-      );
-      const bsRuntime = createBluestacksRuntime(repository, featureExecution, (mediaSource) =>
-        posterMediaPreparer.prepare(mediaSource),
-      );
-      bluestacksOcrClient = bsRuntime.ocrClient;
-      const bluestacksService = bsRuntime.service;
-      bluestacksServiceRef = bluestacksService;
-      ensureFeatureExecutionRegistry(featureExecution, {
-        groupInviter: groupInviterService,
-        groupBumper: groupBumperService,
-        groupPoster: groupPosterService,
-        bluestacks: bluestacksService,
-      });
-      schedulePosterDriveCacheCleanup(groupPosterService);
-      const updaterBackend = new SoftwareUpdateBackend({
+    appRoutes: ({ core, store }) => {
+      const wiredRoutes = buildServerAppRoutes({
         root,
         dataDir,
-        softwareVersion,
-        extensionVersion: bundledExtension.version,
-      });
-      extensionUpdates = new ExtensionUpdates(
-        core,
-        bundledExtension.version,
-        productExtensionDirectory(),
-        async (id) =>
-          (await featureExecution.isProfileBusy(id)) ||
-          publishingRuntime?.hasExecutionOrOpening(id) === true ||
-          core.hasPendingControlOrOperation(id) ||
-          (await store.unresolved(id)).length > 0 ||
-          (await extensionReloadTasksBusy(repository.tasks, repository.tasks.settlements, id)),
-        async (peer) => {
-          await mainKernel?.releaseIdleForExtension(peer);
-          publishingRuntime?.clearStartupBackoff(peer.profileId);
-        },
-      );
-      softwareUpdate = new SoftwareUpdateService(
-        {
-          readConfig: () => updaterBackend.readConfig(),
-          saveConfig: (config) => updaterBackend.saveConfig(config),
-          check: (repo) => updaterBackend.check(repo),
-          install: async (release, guard) => {
-            await updaterBackend.install(release, guard);
-            if (release.extensionVersion) extensionUpdates?.setVersion(release.extensionVersion);
-          },
-          assertCanApply: async () => {
-            if (!process.parentPort)
-              throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中执行更新', 409);
-            const activeLabels = (await featureExecutionRef?.activeModuleLabels()) ?? [];
-            const hasLiveTaskPlan = (await repository.tasks.livePlans()).some((p) =>
-              taskBlocksSoftwareUpdate(
-                p.state,
-                core.peers.get(p.profileId)?.online === true,
-                publishingRuntime?.hasOwner(p.profileId) === true,
-              ),
-            );
-            if (activeLabels.length > 0 || hasLiveTaskPlan) {
-              const moduleSuffix = activeLabels.length > 0 ? `（${activeLabels.join('、')}）` : '';
-              throw new ProductError(
-                'UPDATE_TASKS_ACTIVE',
-                `当前有任务正在运行${moduleSuffix}，请先暂停或停止任务后再执行一键更新`,
-                409,
-              );
-            }
-            backups?.assertIdle();
-          },
-          restart: () => {
-            process.parentPort?.postMessage({ type: 'REQUEST_RESTART' });
-          },
-          reloadExtensions: (ids) => {
-            if (!extensionUpdates) throw Error('EXTENSION_UPDATE_UNAVAILABLE');
-            return extensionUpdates.reload(ids);
-          },
-          openExtensionDirectory: () => openDesktopExtensionDirViaParent(),
-          openAiWorkspaceDirectory: () => openDesktopAiWorkspaceViaParent(root, softwareVersion),
-        },
-        {
-          software: softwareVersion,
-          extension: bundledExtension.version,
-          directory: productExtensionDirectory(),
-          aiWorkspaceDirectory: productAiWorkspaceDirectory(),
-        },
-      );
-      let mutations = 0;
-      dataCleanup = new DataCleanupService(
-        repository.dataCleanup,
-        new LogCleanup(runtimeLog.directory, (work) =>
-          runtimeLog.exclusive(() => devDiagWriter.exclusive(work)),
-        ),
-        process.parentPort
-          ? {
-              directory: dataDir,
-              prepare: () => prepareWorkspaceReset(dataDir),
-              restart: () => process.parentPort?.postMessage({ type: 'REQUEST_RESET' }),
-            }
-          : undefined,
-        async () => {
-          const activeLabels = (await featureExecutionRef?.activeModuleLabels()) ?? [];
-          if (activeLabels.length > 0) {
-            throw new ProductError(
-              'RESET_TASKS_ACTIVE',
-              `请先停止当前正在执行的任务（${activeLabels.join('、')}）`,
-              409,
-            );
-          }
-        },
-        () => {
-          mediaComponent.assertIdle();
-          backups?.assertIdle();
-          if (mutations > 1)
-            throw new ProductError('DATA_WRITES_ACTIVE', '有其他操作正在保存，请稍后重试', 409);
-        },
-        persistence.bridge,
-      );
-      const captureDiagnostics = createDiagnosticSnapshotBuilder({
-        dataDir,
-        softwareVersion,
-        extensionVersion: bundledExtension.version,
-        workspaceService,
-        taskService,
-        groupInviterService,
-        getGroupBumperService: () => groupBumperService,
-        groupPosterService,
-        tasksRepository: repository.tasks,
-        taskTabsRepository: repository.taskTabs,
-        core,
-        getMainKernel: () => mainKernel,
-        controllerLoopDelay,
-        devDiagFlush: () => devDiagWriter.flush(),
-        devDiagFilePath: devDiagWriter.filePath,
-      });
-      groupBumperServiceRef = groupBumperService;
-      groupPosterServiceRef = groupPosterService;
-      const browserWindow = new BridgeBrowserWindow(
-        core,
-        repository.tasks,
-        async (profileId) => {
-          const peer = core.peers.get(profileId);
-          if (!peer || !mainKernel) return null;
-          return mainKernel.revealRegisteredFacebookPage(peer);
-        },
-        async (profileId, preferActiveTab = true) => {
-          const peer = core.peers.get(profileId);
-          if (!peer || !mainKernel)
-            throw new ProductError(
-              'WORKSPACE_CLEANUP_UNAVAILABLE',
-              '浏览器未连接或内核未就绪',
-              409,
-            );
-          return mainKernel.consolidateFacebookWorkspace(peer, preferActiveTab);
-        },
-        (profileId) => featureExecution.isProfileBusy(profileId),
-      );
-      const wired = wireLifecycleAndMcpRuntime({
-        softwareVersion,
-        extensionVersion: bundledExtension.version,
-        dataDir,
+        uploadCacheRoot,
         port,
+        softwareVersion,
+        bundledExtensionVersion: bundledExtension.version,
         core,
         store,
         repository,
+        persistence,
+        workboard,
         browserLabels,
-        getMainKernel: () => mainKernel,
-        publishingRuntime,
-        workspaceService,
-        taskService,
-        inspection,
-        featureExecution,
-        groupPosterService,
-        groupBumperService,
-        groupInviterService,
-        bluestacksService,
-        getAutoSchedulerService: () => autoSchedulerServiceRef,
-        getGoogleSheetsService: () => googleSheetsServiceRef,
-        browserWindow,
-        windowLayout,
-        captureDiagnostics,
-        devDiagFilePath: devDiagWriter.filePath,
-        reloadExtensions: (ids) => {
-          if (!extensionUpdates) throw Error('EXTENSION_UPDATE_UNAVAILABLE');
-          return extensionUpdates.reload(ids);
+        runtimeLog,
+        devDiagWriter,
+        controllerLoopDelay,
+        eventHub,
+        refs: {
+          getShuttingDown: () => shuttingDown,
+          getInspection: () => inspection,
+          getMainKernel: () => mainKernel,
+          getActiveRuntime: () => activeRuntime,
+          getWindowLayout: () => windowLayout,
+          setExtensionUpdates: (v) => {
+            extensionUpdates = v;
+          },
+          getExtensionUpdates: () => extensionUpdates,
+          setSoftwareUpdate: (v) => {
+            softwareUpdateRef = v;
+          },
+          getSoftwareUpdate: () => softwareUpdateRef as never,
+          setBackups: (v) => {
+            backups = v;
+          },
+          getBackups: () => backups,
+          setDataCleanup: (v) => {
+            dataCleanup = v;
+          },
+          getDataCleanup: () => dataCleanup,
+          setFeatureExecution: (v) => {
+            featureExecutionRef = v;
+          },
+          setAccountAbnormalReporter: (v) => {
+            accountAbnormalReporterRef = v;
+          },
+          setProfileLifecycle: (v) => {
+            profileLifecycleRef = v;
+          },
+          setScheduleOfflineHygiene: (fn) => {
+            scheduleOfflineHygieneRef = fn;
+          },
+          setAutoInspectSweep: (fn) => {
+            autoInspectSweepRef = fn;
+          },
+          setBluestacksOcrClient: (v) => {
+            bluestacksOcrClient = v;
+          },
+          setBluestacksService: (v) => {
+            bluestacksServiceRef = v;
+          },
+          setGroupBumperService: (v) => {
+            groupBumperServiceRef = v;
+          },
+          setGroupPosterService: (v) => {
+            groupPosterServiceRef = v;
+          },
+          setGroupInviterService: (v) => {
+            groupInviterServiceRef = v;
+          },
+          setAutoSchedulerService: (v) => {
+            autoSchedulerServiceRef = v;
+          },
+          getAutoSchedulerService: () => autoSchedulerServiceRef,
+          setGoogleSheetsService: (v) => {
+            googleSheetsServiceRef = v;
+          },
+          getGoogleSheetsService: () => googleSheetsServiceRef,
+          setAgentBrowserManager: (v) => {
+            agentBrowserManagerRef = v;
+          },
+          setMcpHttpHandler: (h) => {
+            mcpHttpHandler = h;
+          },
         },
-        withMutation: async (work) => {
-          dataCleanup?.assertNotResetting();
-          mutations++;
-          try {
-            return await work();
-          } finally {
-            mutations--;
-          }
-        },
       });
-      const { profileLifecycle } = wired;
-      const autoSchedulerService = new AutoSchedulerService(repository.autoScheduler, {
-        workspace: workspaceService,
-        tasks: taskService,
-        groupBumper: groupBumperService,
-        groupPoster: groupPosterService,
-        groupInviter: groupInviterService,
-        bluestacks: bluestacksService,
-        profileLifecycle,
-        featureExecution,
-        assertAllowed: () => softwareUpdate?.assertIdle(),
-        onPowerLockChange: (mode) => {
-          process.parentPort?.postMessage({ type: 'SET_POWER_LOCK', mode });
-        },
-        onConcurrencyChanged: (next) =>
-          syncGlobalConcurrencyToModules(next, {
-            tasks: taskService,
-            groupBumper: groupBumperService,
-            groupPoster: groupPosterService,
-            groupInviter: groupInviterService,
-            bluestacks: bluestacksService,
-            googleSheets: googleSheetsServiceRef,
-          }),
-      });
-      autoSchedulerServiceRef = autoSchedulerService;
-      const googleOAuthManager = new GoogleOAuthManager(repository.googleSheets);
-      const googleSheetsService = new GoogleSheetsService(repository.googleSheets, {
-        workspace: workspaceService,
-        groupBumper: groupBumperService,
-        bluestacks: bluestacksService,
-        oauth: googleOAuthManager,
-        sheetsApi: new GoogleSheetsRestClient(googleOAuthManager),
-        imageHost: new SheetImageHostClient(repository.googleSheets, googleOAuthManager),
-        automation: new GoogleSheetsAutomationBridge(
-          core,
-          () => mainKernel ?? null,
-          posterAdapter,
-          posterMediaPreparer,
-          repository.groupBumper,
-          googleOAuthManager,
-        ),
-        featureExecution,
-        profileLifecycle,
-        assertSystemIdle,
-      });
-      featureExecution.register({
-        id: 'google-sheets',
-        label: 'Google 云表协同',
-        isProfileRunning: (profileId) => googleSheetsService.isProfileRunning(profileId),
-        hasActiveExecution: () => googleSheetsService.hasActiveExecution(),
-        stopProfiles: (profileIds) => googleSheetsService.stopProfiles(profileIds),
-      });
-      googleSheetsServiceRef = googleSheetsService;
-      void posterMediaPreparer.pruneOldCachedFiles(24 * 60 * 60_000).catch(() => {});
-      void Promise.resolve(repository.autoScheduler.settings())
-        .then((s) =>
-          googleSheetsService.syncMaxConcurrency(s.browserConcurrency, s.bluestacksConcurrency),
-        )
-        .catch(() => {});
-      agentBrowserManagerRef = wired.agentBrowserManager;
-      mcpHttpHandler = wired.mcpHttpHandler;
-      const handler = workspaceApi(
-        workspaceService,
-        taskService,
-        materialPreflight,
-        inspection,
-        new ResourceTableService(
-          repository.resourceTables,
-          new FilesystemResourceSourceReader(),
-          Date.now,
-          new ResourceDownloadService(
-            repository.resourceTables,
-            new PublicResourceDriveDownloader(path.join(dataDir, 'resource-downloads')),
-          ),
-        ),
-        new ArchiveManagementService(repository.archivePreparation, () => undefined),
-        nativeReview,
-        new MaterialUsageService(repository.materialUsage),
-        backups,
-        process.parentPort
-          ? { restart: () => process.parentPort?.postMessage({ type: 'REQUEST_RESTART' }) }
-          : undefined,
-        browserWindow,
-        new MaterialCacheManagement(
-          repository.cacheCleanup,
-          new MaterialCacheCleanup(
-            repository.cacheCleanup,
-            new FilesystemMaterialCacheCleaner(repository.cacheCleanup, uploadCacheRoot),
-          ),
-        ),
-        new WorkspaceMaintenance(repository, runtimeLog, {
-          logDirectory: runtimeLog.directory,
-          cacheDirectory: uploadCacheRoot,
-        }),
-        groupInviterService,
-        captureDiagnostics,
-        dataCleanup,
-        windowLayout,
-        mediaComponent,
-        softwareUpdate,
-        groupBumperService,
-        (fileName, targetDir) => revealDiagnosticPackage(dataDir, fileName, targetDir),
-        featureExecution,
-        groupPosterService,
-        (id) => Boolean(core.peers.get(id)?.online),
-        bluestacksService,
-        profileLifecycle,
-        autoSchedulerService,
-        googleSheetsService,
-      );
-      return async (...args) => {
-        const [req] = args;
-        if (req.method !== 'POST') return handler(...args);
-        const rawPath = (req.url ?? '').split('?')[0] ?? '';
-        // Read-only grid POST compat or long-running Sheets browser tasks (already guarded via featureExecution)
-        if (
-          rawPath === '/api/workspace/google-sheets/links/grid' ||
-          rawPath === '/api/workspace/google-sheets/links/poll-schedule' ||
-          rawPath === '/api/workspace/google-sheets/links/poll-records' ||
-          rawPath === '/api/workspace/google-sheets/links/refresh-metrics' ||
-          rawPath === '/api/workspace/google-sheets/links/sync-library' ||
-          rawPath === '/api/workspace/google-sheets/links/import-library'
-        ) {
-          return handler(...args);
-        }
-        mutations++;
-        try {
-          return await handler(...args);
-        } finally {
-          mutations--;
-        }
-      };
+      return wiredRoutes.wrapHandler(workspaceApi(...wiredRoutes.apiArgs));
     },
   });
-  // Product policy: source files remain in place. Historical archive records are read-only;
-  // no archive worker, preparation, copy, source delete or movement is launched.
   await autoSchedulerServiceRef?.start();
   googleSheetsServiceRef?.start();
+  eventHub.startDigestMonitor(async () => {
+    const activeIds = (await featureExecutionRef?.activeModuleIds()) ?? [];
+    const peerSig = [...bridge.core.peers.values()]
+      .map((p) => `${p.profileId}:${p.online}:${p.phase}:${p.synced}:${p.browserWindowCount ?? 0}`)
+      .sort()
+      .join('|');
+    const plansSig = (await repository.tasks.livePlans())
+      .map((p) => `${p.id}:${p.state}:${p.position}:${p.round}`)
+      .join('|');
+    const todaySig = JSON.stringify(await repository.postBumpRecords.todayStats());
+    const activeSig = [...activeIds].sort().join(',');
+    return {
+      workspace: peerSig,
+      'runtime-summary': activeSig,
+      tasks: plansSig,
+      ...(activeIds.includes('group-bumper') || activeIds.includes('page-bumper')
+        ? { 'group-bumper': `${activeSig}:${todaySig}` }
+        : {}),
+      ...(activeIds.includes('group-poster') ? { 'group-poster': `${activeSig}:${todaySig}` } : {}),
+      ...(activeIds.includes('group-inviter') ? { 'group-inviter': activeSig } : {}),
+      ...(activeIds.some((id) => id.startsWith('bluestacks-'))
+        ? { bluestacks: `${activeSig}:${todaySig}` }
+        : {}),
+      ...(activeIds.includes('auto-scheduler') ? { 'auto-scheduler': activeSig } : {}),
+      ...(activeIds.includes('google-sheets')
+        ? { 'google-sheets': `${activeSig}:${todaySig}` }
+        : {}),
+    };
+  }, 1000);
 } catch (error) {
+  eventHub.close();
   await persistence.close();
   await releaseControllerPort(binding.server);
   throw error;
 }
+
 const notifications = await TaskNotificationMonitor.open(
   repository,
   async () => await repository.preferences(),
@@ -1072,13 +408,9 @@ devDiag.record({
   level: 'INFO',
   category: 'SYSTEM',
   event: 'SOFTWARE_STARTED',
-  data: {
-    softwareVersion,
-    port,
-    logFilePath: devDiagWriter.filePath,
-  },
+  data: { softwareVersion, port, logFilePath: devDiagWriter.filePath },
 });
-let shuttingDown = false;
+
 const cleanupTimer = setInterval(() => {
   void dataCleanup?.automatic().catch(() => {});
 }, 60000);
@@ -1110,9 +442,7 @@ const stopHostingMonitor = process.parentPort
 const notificationTimer = setInterval(async () => {
   try {
     await notifications.tick();
-  } catch {
-    /* Notification failures never alter task execution. */
-  }
+  } catch {}
 }, 1000);
 console.log('Browser Workbench dashboard: ' + bridge.origin);
 process.parentPort?.postMessage({ type: 'READY', origin: bridge.origin });
@@ -1122,6 +452,7 @@ const startupAvatarLocalization = scheduleStartupAccountAvatarLocalization({
   isShuttingDown: () => shuttingDown,
   graphAvatarLookup: (accountId) => graphAvatar.lookup(accountId),
 });
+
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -1129,7 +460,7 @@ async function shutdown() {
     stopTimers: () => {
       startupAvatarLocalization.cancel();
       controllerLoopDelay.disable();
-      if (notificationTimer) clearInterval(notificationTimer);
+      clearInterval(notificationTimer);
       clearTimeout(autoInspectInitialTimer);
       clearInterval(autoInspectTimer);
       stopHostingMonitor();
@@ -1137,10 +468,12 @@ async function shutdown() {
     },
     stopServices: async () => {
       await Promise.allSettled([
+        activeRuntime?.close(),
         autoSchedulerServiceRef?.shutdown(),
         googleSheetsServiceRef?.shutdown(),
         groupBumperServiceRef?.shutdown(),
         groupPosterServiceRef?.shutdown(),
+        groupInviterServiceRef?.stop(),
         agentBrowserManagerRef?.closeAll(),
         bluestacksServiceRef?.stopAllForInstances(),
       ]);

@@ -1,8 +1,7 @@
 import type { Awaitable } from '../domain/persistence.js';
-import type { ResourceDriveDownloader } from '../domain/resource-download.js';
+import type { ResourceDriveDownloader } from '../domain/resource-material-rules.js';
 import { mediaReference } from '../domain/resource-table.js';
 import { PublicDriveDownloader } from './public-drive-download.js';
-
 // Reuse the original public downloader's complete SHA, ready manifest, file proof and
 // cancellation. Saved local references then enter the same source verifier/claim/archive chain.
 export class PublicResourceDriveDownloader implements ResourceDriveDownloader {

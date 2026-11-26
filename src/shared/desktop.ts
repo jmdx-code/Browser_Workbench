@@ -1,11 +1,9 @@
 import { z } from 'zod';
-export const FileLocationResult = z
-  .object({ ok: z.boolean(), error: z.string().max(300) })
-  .strict();
-export const LocalFileLocationRequest = z.object({ source: z.string().min(1).max(4096) }).strict();
+import { sMax, sReq, strictObj } from './contracts.js';
+export const FileLocationResult = strictObj({ ok: z.boolean(), error: sMax(300) });
+export const LocalFileLocationRequest = strictObj({ source: sReq(4096) });
 export interface DesktopBridge {
   onBeforeClose(callback: () => Promise<boolean>): () => void;
-  chooseMaterialDirectory(): Promise<string | null>;
   chooseBackupDirectory(): Promise<string | null>;
   chooseRestoreBackup(): Promise<string | null>;
   chooseFeedbackDirectory?(): Promise<string | null>;

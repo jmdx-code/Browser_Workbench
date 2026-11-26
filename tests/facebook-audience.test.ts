@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { audienceTarget } from '../src/domain/facebook-audience.js';
+import { audienceTarget } from '../src/domain/facebook-content-rules.js';
 import {
   ComposerAudienceReading,
   privacyTargets,
   clearAudienceDefaultTarget,
   type ComposerAudience,
-} from '../src/shared/facebook-audience.js';
+} from '../src/shared/facebook-post-options.js';
 
 const reading = (patch: Partial<ComposerAudience> = {}): ComposerAudience =>
   ComposerAudienceReading.parse({

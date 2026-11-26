@@ -23,7 +23,7 @@ import {
 } from '../src/infrastructure/runtime-installation.js';
 import { syncProductExtensionDirectory } from '../src/infrastructure/paths.js';
 import { semverCompare, UpdateConfig, type UpdateRelease } from '../src/shared/software-update.js';
-import type { SoftwareUpdatePort } from '../src/domain/software-update.js';
+import type { SoftwareUpdatePort } from '../src/domain/system-ports.js';
 
 async function fixture(
   run: (f: {

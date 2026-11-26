@@ -4,7 +4,6 @@ import type { Peer } from '../bridge/core.js';
 import type { KernelBridge } from './kernel-bridge.js';
 import { kernelOperationPending, type TabProof } from '../shared/kernel-state.js';
 import { sameTabProof } from '../domain/task-tabs.js';
-
 export const invitationDigest = (label: string, accountId: string, operationId: string) =>
   createHash('sha256')
     .update(JSON.stringify({ purpose: 'group-inviter', label, accountId, operationId }))
@@ -18,7 +17,6 @@ const setupLabels = [
   'join-group',
   ...Array.from({ length: 200 }, (_, i) => `check-friend-${i + 1}`),
 ];
-
 export async function endInvitationSetupOperations(
   kernel: KernelBridge,
   peer: Peer,
@@ -80,7 +78,6 @@ export async function endInvitationSetupOperations(
   }
   return inventory;
 }
-
 // Reuse the native main whenever possible. Only the existing cleanup RPC may
 // rebind its group and close unowned user tabs; no extension protocol is added.
 export async function prepareFacebookWorkspace(

@@ -5,9 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
-import { dropReleasePolishSchema } from './fixtures/workspace-schema.js';
 
-test('schema36 migrates layout preference once, preserves other preferences and reloads it durably', async () => {
+test('v61->v62 upgrade keeps preferences and reloads windowLayout durably', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-layout-'));
   const file = path.join(directory, 'workspace.sqlite');
   let store: WorkspaceStore | undefined;
@@ -20,10 +19,7 @@ test('schema36 migrates layout preference once, preserves other preferences and 
     store.close();
     store = undefined;
     const db = new DatabaseSync(file);
-    db.exec(
-      dropReleasePolishSchema +
-        'ALTER TABLE workspace_preferences DROP COLUMN window_layout; PRAGMA user_version=36',
-    );
+    db.exec('PRAGMA user_version=61');
     db.close();
     store = await WorkspaceStore.open(file);
     assert.equal(store.preferences().defaultTimeZone, 'Asia/Taipei');

@@ -1,4 +1,4 @@
-import type { SessionClosePort, NativeStopReceipt } from '../domain/session-close.js';
+import type { SessionClosePort, NativeStopReceipt } from '../domain/system-ports.js';
 import { Id } from '../shared/contracts.js';
 
 // A failed attempt remains cached until an explicit retry of the same original request.
@@ -29,6 +29,7 @@ export class SessionCloser {
         work,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(Error(reason)), milliseconds);
+          timer.unref?.();
         }),
       ]);
     } finally {

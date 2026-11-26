@@ -1,7 +1,17 @@
-import type { TargetListKind, TargetListCommand, TargetFolder } from '../shared/target-list.js';
-import type { BumperState, BumperLog } from '../shared/group-bumper.js';
-import type { BluestacksState } from '../shared/bluestacks.js';
 import type { AutoSchedulerState } from '../shared/auto-scheduler.js';
+import type { BluestacksState } from '../shared/bluestacks.js';
+import {
+  BridgeConnectionHealth,
+  BridgeConnectionRecoveryResult,
+} from '../shared/bridge-connection-health.js';
+import { CleanupProfileTabsResult, ShowBrowserResult } from '../shared/browser-window.js';
+import {
+  RuntimeSummarySchema,
+  SavedCombinationSchema,
+  WorkspaceSchema,
+  type Combination,
+} from '../shared/contracts.js';
+import { CleanupPreview, CleanupResult, CleanupSettings } from '../shared/data-cleanup.js';
 import type {
   GoogleAuthStatus,
   GoogleSheetLink,
@@ -11,98 +21,84 @@ import type {
   SheetImageHostStatus,
   SpreadsheetMeta,
 } from '../shared/google-sheets.js';
-import type { PosterState, PosterLog } from '../shared/group-poster.js';
+import type { BumperState } from '../shared/group-bumper.js';
+import {
+  GroupInviterState,
+  type AddInviterGroupsRequest,
+  type DeleteInviterGroupsRequest,
+  type GroupInviteLogRow,
+  type StartGroupInviterRequest,
+  type StopGroupInviterProfilesRequest,
+  type UpdateGroupInviterSettingsRequest,
+} from '../shared/group-inviter.js';
+import type { PosterLog, PosterState } from '../shared/group-poster.js';
+import {
+  MaterialCacheCleanResult,
+  MaterialCacheOverview,
+} from '../shared/material-cache-management.js';
+import {
+  ClearedMaterialUsage,
+  MaterialUsageSnapshot,
+  type MaterialUsageClearRequest,
+} from '../shared/material-usage.js';
+import { materialMediaPreviewLimits } from '../shared/materials.js';
 import { MediaComponentStatus } from '../shared/media-component.js';
 import {
-  SoftwareUpdateStatus,
-  ExtensionReloadResult,
-  OpenAiWorkspaceResult,
-  type UpdateConfiguration,
-} from '../shared/software-update.js';
-import { CleanupPreview, CleanupResult, CleanupSettings } from '../shared/data-cleanup.js';
+  PostBumpRecordsResponseSchema,
+  type PostBumpRecordQuery,
+  type PostBumpRecordQueryTypeValue,
+} from '../shared/post-bump-records.js';
+import { INSPECTION_DISPLAY_HEADER, ProfileInspections } from '../shared/profile-inspection.js';
+import type { ResourceDownloadProgressValue } from '../shared/resource-download.js';
 import {
-  WorkspaceBackupResult,
-  WorkspaceBackupStatus,
-  WorkspaceRestoreInspection,
-  WorkspaceRestoreStatus,
-} from '../shared/workspace-backup.js';
-import { TASK_CAPACITY_HEADER, TASK_CAPACITY_VERSION } from '../shared/task-capacity.js';
-import { SavedCombinationSchema, WorkspaceSchema, StopResultsSchema } from '../shared/contracts.js';
-import type { Combination } from '../shared/contracts.js';
+  ResourceSourceReport,
+  type ResourceCheckProgressValue,
+} from '../shared/resource-source.js';
 import {
-  TaskOverview,
-  TaskHistory,
-  TaskRecords,
-  TaskRuntimeOverview,
-  TaskCapabilities,
-  TaskStartResult,
-  TaskCommandResult,
-  SchedulerSettings,
-  type Settings,
-  type TaskCommand,
-  type Assignment,
-} from '../shared/task-contracts.js';
-import { TaskFeatureOverviewV2, FEATURE_CONTRACT_HEADER } from '../shared/task-features.js';
-import { TaskTestResult, type TestRequest } from '../shared/task-tests.js';
-import { ShowBrowserResult, CleanupProfileTabsResult } from '../shared/browser-window.js';
-import {
-  WindowLayoutOverview,
-  windowLayoutMessage,
-  WindowLayoutCommand,
-} from '../shared/window-layout.js';
-import { WorkspacePreferences, type PreferenceUpdate } from '../shared/workspace-preferences.js';
+  RESOURCE_SUMMARY_HEADER,
+  ResourceTable,
+  ResourceUsageSummaries,
+  type ResourceRowValue,
+} from '../shared/resource-table.js';
 import {
   MaintenanceOverview,
   RuntimeLogExport,
   type MaintenanceUpdate,
 } from '../shared/runtime-log.js';
 import {
-  MaterialCacheOverview,
-  MaterialCacheCleanResult,
-} from '../shared/material-cache-management.js';
+  ExtensionReloadResult,
+  OpenAiWorkspaceResult,
+  SoftwareUpdateStatus,
+  type UpdateConfiguration,
+} from '../shared/software-update.js';
+import type { TargetFolder, TargetListCommand, TargetListKind } from '../shared/target-list.js';
 import {
-  MaterialPreviewScan,
-  MaterialPackagePreview,
-  MATERIAL_PREVIEW_HEADER,
-  type PackagePreview,
-  materialMediaPreviewLimits,
-  MaterialPublishingReview,
-} from '../shared/materials.js';
-import { ProfileInspections, INSPECTION_DISPLAY_HEADER } from '../shared/profile-inspection.js';
-import { NativeReviewReport, NativeReleaseResult } from '../shared/native-review.js';
+  TaskCapabilities,
+  TaskCommandResult,
+  TaskHistory,
+  TaskRecords,
+  TaskRuntimeOverview,
+  TaskStartResult,
+  type Assignment,
+  type TaskCommand,
+} from '../shared/task-contracts.js';
+import { TASK_CAPACITY_HEADER, TASK_CAPACITY_VERSION } from '../shared/task-policies.js';
+import { TaskTestResult, type TestRequest } from '../shared/task-tests.js';
 import {
-  BridgeConnectionHealth,
-  BridgeConnectionRecoveryResult,
-} from '../shared/bridge-connection-health.js';
-import { MaterialArrangement, type ArrangementRequest } from '../shared/material-arrangement.js';
+  WindowLayoutCommand,
+  WindowLayoutOverview,
+  windowLayoutMessage,
+} from '../shared/window-layout.js';
 import {
-  ResourceTable,
-  ResourceUsageSummaries,
-  RESOURCE_SUMMARY_HEADER,
-  type ResourceRowValue,
-} from '../shared/resource-table.js';
-import {
-  ResourceSourceReport,
-  type ResourceCheckProgressValue,
-} from '../shared/resource-source.js';
-import { readResourceCheckStream } from './resource-source-stream.js';
+  WorkspaceBackupResult,
+  WorkspaceBackupStatus,
+  WorkspaceRestoreInspection,
+  WorkspaceRestoreStatus,
+} from '../shared/workspace-backup.js';
+import { WorkspacePreferences, type PreferenceUpdate } from '../shared/workspace-preferences.js';
 import { readResourceDownloadStream } from './resource-download-stream.js';
-import type { ResourceDownloadProgressValue } from '../shared/resource-download.js';
-import {
-  MaterialUsageSnapshot,
-  ClearedMaterialUsage,
-  type MaterialUsageClearRequest,
-} from '../shared/material-usage.js';
-import { ArchiveManagementList } from '../shared/archive-management.js';
-import {
-  GroupInviterState,
-  type AddInviterGroupsRequest,
-  type DeleteInviterGroupsRequest,
-  type StartGroupInviterRequest,
-  type StopGroupInviterProfilesRequest,
-  type UpdateGroupInviterSettingsRequest,
-  type GroupInviteLogRow,
-} from '../shared/group-inviter.js';
+import { readResourceCheckStream } from './resource-source-stream.js';
+
 export class ApiError extends Error {
   constructor(
     readonly code: string,
@@ -111,174 +107,189 @@ export class ApiError extends Error {
     super(message);
   }
 }
-function combineTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
-  const timeout = AbortSignal.timeout(timeoutMs);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
-}
 
-async function parseJsonSafe(response: Response): Promise<unknown> {
-  const text = await response.text();
+const combineTimeout = (sig: AbortSignal | undefined, ms: number): AbortSignal =>
+  sig ? AbortSignal.any([sig, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+
+async function parseJsonSafe(res: Response): Promise<unknown> {
+  const text = await res.text();
   if (!text) return null;
   try {
     return JSON.parse(text) as unknown;
   } catch {
-    return { error: response.ok ? '服务返回格式异常' : `请求失败（HTTP ${response.status}）` };
+    return { error: res.ok ? '服务返回格式异常' : `请求失败（HTTP ${res.status}）` };
   }
 }
 
-async function request(
+export async function request(
   route: string,
   input?: unknown,
   signal?: AbortSignal,
   root = '/api/workspace',
 ): Promise<unknown> {
-  const headers: Record<string, string> = {};
-  headers['x-workbench-workspace-contract'] = '6';
-  headers[TASK_CAPACITY_HEADER] = TASK_CAPACITY_VERSION;
-  if (route === '/tasks' || route.startsWith('/tasks/')) headers['x-workbench-task-contract'] = '5';
-  if (route === '/tasks/records') headers['x-workbench-records-contract'] = '1';
-  if (route.startsWith('/tasks/runtime')) headers['x-workbench-runtime-contract'] = '2';
-  if (route === '/tasks/features') headers[FEATURE_CONTRACT_HEADER] = '2';
-  if (input !== undefined) headers['content-type'] = 'application/json';
+  const h: Record<string, string> = {
+    'x-workbench-workspace-contract': '6',
+    [TASK_CAPACITY_HEADER]: TASK_CAPACITY_VERSION,
+  };
+  if (route.startsWith('/tasks/')) h['x-workbench-task-contract'] = '5';
+  if (route === '/tasks/records') h['x-workbench-records-contract'] = '1';
+  if (route.startsWith('/tasks/runtime')) h['x-workbench-runtime-contract'] = '2';
+  if (input !== undefined) h['content-type'] = 'application/json';
   if (route === '/profiles/inspect' || route === '/profiles/inspection')
-    headers[INSPECTION_DISPLAY_HEADER] = '2';
-  if (route === '/profiles/native-review') headers['x-workbench-native-review-contract'] = '2';
-  if (route === '/materials/preflight') headers[MATERIAL_PREVIEW_HEADER] = '1';
-  if (route === '/resource-tables/summaries') headers[RESOURCE_SUMMARY_HEADER] = '2';
-  const options: RequestInit =
+    h[INSPECTION_DISPLAY_HEADER] = '2';
+  if (route === '/resource-tables/summaries') h[RESOURCE_SUMMARY_HEADER] = '2';
+  const opts: RequestInit =
     input === undefined
-      ? { cache: 'no-store', signal, headers }
-      : {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(input),
-          signal,
-        };
-  let response = await fetch(root + route, options);
-  let result: unknown = await parseJsonSafe(response);
+      ? { cache: 'no-store', signal, headers: h }
+      : { method: 'POST', headers: h, body: JSON.stringify(input), signal };
+  let res = await fetch(root + route, opts);
+  let body: unknown = await parseJsonSafe(res);
   if (
-    response.status === 401 &&
+    res.status === 401 &&
     root === '/api/workspace' &&
     route === '' &&
     input === undefined &&
-    typeof result === 'object' &&
-    result !== null &&
-    'error' in result &&
-    result.error === 'ADMIN_REQUIRED'
+    typeof body === 'object' &&
+    body !== null &&
+    'error' in body &&
+    body.error === 'ADMIN_REQUIRED'
   ) {
-    // Restore only the normal same-origin bootstrap cookie. Never replay a command.
-    const bootstrap = await fetch('/workbench/', {
+    const boot = await fetch('/workbench/', {
       cache: 'no-store',
       credentials: 'same-origin',
       redirect: 'error',
       signal,
     });
-    if (bootstrap.ok) {
-      response = await fetch(root + route, options);
-      result = await parseJsonSafe(response);
+    if (boot.ok) {
+      res = await fetch(root + route, opts);
+      body = await parseJsonSafe(res);
     }
   }
-  if (!response.ok) {
-    const error =
-      typeof result === 'object' && result !== null
-        ? (result as { code?: unknown; error?: unknown })
+  if (!res.ok) {
+    const e =
+      typeof body === 'object' && body !== null
+        ? (body as { code?: unknown; error?: unknown })
         : {};
     throw new ApiError(
-      typeof error.code === 'string' && error.code ? error.code : 'REQUEST_FAILED',
-      typeof error.error === 'string' && error.error
-        ? error.error
-        : `请求失败（HTTP ${response.status}）`,
+      typeof e.code === 'string' && e.code ? e.code : 'REQUEST_FAILED',
+      typeof e.error === 'string' && e.error ? e.error : `请求失败（HTTP ${res.status}）`,
     );
   }
-  return result;
+  return body;
 }
-export const api = {
-  bumperState: async (signal?: AbortSignal) =>
-    (await request(
-      '/group-bumper/state',
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as BumperState,
-  bumperAction: async (action: string, input: unknown = {}) =>
-    (await request('/group-bumper/' + action, input, AbortSignal.timeout(60_000))) as BumperState,
-  bumperLogs: async (
-    search = '',
-    before?: number,
-    beforeId?: string,
-    sourceMode?: 'group' | 'page',
-    signal?: AbortSignal,
-  ) =>
-    (await request(
-      '/group-bumper/logs?' +
-        new URLSearchParams({
-          search,
-          ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
-          ...(sourceMode ? { sourceMode } : {}),
-        }),
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as BumperLog[],
-  posterState: async (signal?: AbortSignal) =>
-    (await request(
-      '/group-poster/state',
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as PosterState,
-  posterAction: async (action: string, input: unknown = {}) =>
-    (await request('/group-poster/' + action, input, AbortSignal.timeout(60_000))) as PosterState,
-  posterLogs: async (
-    search = '',
-    before?: number,
-    beforeId?: string,
-    materialId?: string,
-    signal?: AbortSignal,
-  ) =>
-    (await request(
-      '/group-poster/logs?' +
-        new URLSearchParams({
-          search,
-          ...(before ? { before: String(before), beforeId: beforeId ?? '' } : {}),
-          ...(materialId ? { materialId } : {}),
-        }),
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as PosterLog[],
-  savePosterMaterialThumbnail: async (id: string, thumbnailDataUrl: string) =>
-    (await request('/group-poster/materials/thumbnail', { id, thumbnailDataUrl })) as {
-      saved: boolean;
-    },
 
-  softwareUpdateStatus: async () => SoftwareUpdateStatus.parse(await request('/update/status')),
-  checkSoftwareUpdate: async () => SoftwareUpdateStatus.parse(await request('/update/check', {})),
-  configureSoftwareUpdate: async (config: UpdateConfiguration) =>
-    SoftwareUpdateStatus.parse(await request('/update/config', config)),
+async function requestNdjsonStream(
+  route: string,
+  body: unknown,
+  timeoutMs: number,
+  signal: AbortSignal,
+  fallbackCode: string,
+  fallbackMessage: string,
+  mismatchMessage: string,
+): Promise<ReadableStream<Uint8Array>> {
+  const res = await fetch('/api/workspace' + route, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
+    body: JSON.stringify(body),
+    cache: 'no-store',
+    signal: combineTimeout(signal, timeoutMs),
+  });
+  if (!res.ok) {
+    const v = (await res.json()) as { code?: string; error?: string };
+    throw new ApiError(v.code ?? fallbackCode, v.error ?? fallbackMessage);
+  }
+  if (!res.body || res.headers.get('content-type') !== 'application/x-ndjson')
+    throw Error(mismatchMessage);
+  return res.body;
+}
+
+type Sig = AbortSignal;
+type Fail = Array<{ profileId: string; errorCode: string; reason: string }>;
+type Schema<T> = { parse: (v: unknown) => T };
+type DiagSnap = {
+  recorded: boolean;
+  filePath: string;
+  fileName: string;
+  sizeBytes: number;
+  entryId: number;
+  at: string;
+};
+type RecFilter = {
+  groupBy?: 'run';
+  profileId?: string;
+  status?: 'all' | 'running' | 'completed' | 'failed' | 'review';
+  query?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+const j = <T>(r: string, b?: unknown, ms?: number, sig?: Sig, root?: string) =>
+  request(r, b, ms ? combineTimeout(sig, ms) : sig, root) as Promise<T>;
+const p = async <T>(r: string, s: Schema<T>, b?: unknown, ms?: number, sig?: Sig, root?: string) =>
+  s.parse(await request(r, b, ms ? combineTimeout(sig, ms) : sig, root));
+const gs = <T>(r: string, b?: unknown, ms = 15_000, sig?: Sig) =>
+  j<T>('/google-sheets' + r, b, ms, sig);
+const inv = (r: string, b?: unknown, ms = 15_000, sig?: Sig) =>
+  p('/group-inviter' + r, GroupInviterState, b, ms, sig);
+const qs = (params: Record<string, string | number | undefined>) => {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== undefined) sp.set(k, String(v));
+  const s = sp.toString();
+  return s ? '?' + s : '';
+};
+
+export const api = {
+  bumperState: (sig?: Sig) => j<BumperState>('/group-bumper/state', undefined, 15_000, sig),
+  bumperAction: (a: string, b: unknown = {}) => j<BumperState>('/group-bumper/' + a, b, 60_000),
+  posterState: (sig?: Sig) => j<PosterState>('/group-poster/state', undefined, 15_000, sig),
+  posterAction: (a: string, b: unknown = {}) => j<PosterState>('/group-poster/' + a, b, 60_000),
+  posterLogs: (search = '', before?: number, beforeId?: string, materialId?: string, sig?: Sig) =>
+    j<PosterLog[]>(
+      '/group-poster/logs' +
+        qs({ search, ...(before ? { before, beforeId: beforeId ?? '' } : {}), materialId }),
+      undefined,
+      15_000,
+      sig,
+    ),
+  savePosterMaterialThumbnail: (id: string, thumbnailDataUrl: string) =>
+    j<{ saved: boolean }>('/group-poster/materials/thumbnail', { id, thumbnailDataUrl }),
+  softwareUpdateStatus: () => p('/update/status', SoftwareUpdateStatus),
+  checkSoftwareUpdate: () => p('/update/check', SoftwareUpdateStatus, {}),
+  configureSoftwareUpdate: (c: UpdateConfiguration) => p('/update/config', SoftwareUpdateStatus, c),
   applySoftwareUpdate: () => request('/update/apply', {}),
-  reloadExtensions: async (profileIds?: string[]) =>
-    ExtensionReloadResult.parse(
-      await request('/extensions/reload', profileIds ? { profileIds } : {}),
-    ),
+  reloadExtensions: (ids?: string[]) =>
+    p('/extensions/reload', ExtensionReloadResult, ids ? { profileIds: ids } : {}),
   openExtensionDirectory: () => request('/extensions/open-dir', {}),
-  openAiWorkspaceDirectory: async () =>
-    OpenAiWorkspaceResult.parse(await request('/ai-workspace/open-dir', {})),
-  cleanupProfileTabs: async (profileIds: string[], preferActiveTab = false) =>
-    CleanupProfileTabsResult.parse(
-      await request('/profiles/cleanup-tabs', { profileIds, preferActiveTab }),
+  openAiWorkspaceDirectory: () => p('/ai-workspace/open-dir', OpenAiWorkspaceResult, {}),
+  cleanupProfileTabs: (profileIds: string[], preferActiveTab = false) =>
+    p('/profiles/cleanup-tabs', CleanupProfileTabsResult, { profileIds, preferActiveTab }),
+  launchProfiles: (profileIds: string[]) =>
+    j<{ requestedIds: string[]; readyIds: string[]; launchedIds: string[]; failed: Fail }>(
+      '/profiles/launch',
+      { profileIds },
+      90_000,
     ),
-  mediaComponent: async (action?: 'install' | 'cancel', signal?: AbortSignal) =>
-    MediaComponentStatus.parse(
-      await request(
-        '/media-component',
-        action ? { action } : undefined,
-        signal ?? AbortSignal.timeout(15_000),
-      ),
+  closeProfiles: (profileIds: string[]) =>
+    j<{ requestedIds: string[]; closedIds: string[]; failed: Fail }>(
+      '/profiles/close',
+      { profileIds },
+      45_000,
+    ),
+  mediaComponent: (a?: 'install' | 'cancel', sig?: Sig) =>
+    p(
+      '/media-component',
+      MediaComponentStatus,
+      a ? { action: a } : undefined,
+      sig ? undefined : 15_000,
+      sig,
     ),
   windowLayout: async (input?: unknown) => {
     try {
       return WindowLayoutOverview.parse(
-        await request(
+        await j(
           '/window-layout',
           input === undefined ? undefined : WindowLayoutCommand.parse(input),
-          AbortSignal.timeout(60000),
+          60_000,
         ),
       );
     } catch (e) {
@@ -291,160 +302,168 @@ export const api = {
       );
     }
   },
-  cleanupProgress: async (signal?: AbortSignal) =>
-    request('/data-cleanup/progress', undefined, combineTimeout(signal, 10_000)) as Promise<{
-      running: boolean;
-      current: number;
-      total: number;
-    }>,
-  cleanupPreview: async (input: unknown, signal?: AbortSignal) =>
-    CleanupPreview.parse(await request('/data-cleanup/preview', input, signal)),
-  cleanupExecute: async (token: string) =>
-    CleanupResult.parse(
-      await request('/data-cleanup/execute', { token, confirm: true }, AbortSignal.timeout(300000)),
+  cleanupProgress: (sig?: Sig) =>
+    j<{ running: boolean; current: number; total: number }>(
+      '/data-cleanup/progress',
+      undefined,
+      10_000,
+      sig,
     ),
-  cleanupSettings: async (signal?: AbortSignal) =>
-    CleanupSettings.parse(await request('/data-cleanup/settings', undefined, signal)),
-  saveCleanupSettings: async (input: unknown) =>
-    CleanupSettings.parse(
-      await request('/data-cleanup/settings', input, AbortSignal.timeout(10000)),
+  cleanupPreview: (b: unknown, sig?: Sig) =>
+    p('/data-cleanup/preview', CleanupPreview, b, undefined, sig),
+  cleanupExecute: (token: string) =>
+    p('/data-cleanup/execute', CleanupResult, { token, confirm: true }, 300_000),
+  cleanupSettings: (sig?: Sig) =>
+    p('/data-cleanup/settings', CleanupSettings, undefined, undefined, sig),
+  saveCleanupSettings: (b: unknown) => p('/data-cleanup/settings', CleanupSettings, b, 10_000),
+  resetStatus: (sig?: Sig) =>
+    j<{ available: boolean; reason: string; dataDirectory: string }>(
+      '/data-cleanup/reset-status',
+      undefined,
+      undefined,
+      sig,
     ),
-  resetStatus: async (signal?: AbortSignal) =>
-    (await request('/data-cleanup/reset-status', undefined, signal)) as {
-      available: boolean;
-      reason: string;
-      dataDirectory: string;
-    },
-  resetWorkspace: async (input: unknown) =>
-    request('/data-cleanup/reset', input, AbortSignal.timeout(15000)),
-  compactData: async () => request('/data-cleanup/compact', {}, AbortSignal.timeout(300000)),
-  maintenance: async (signal: AbortSignal) =>
-    MaintenanceOverview.parse(await request('/maintenance', undefined, signal)),
-  saveMaintenance: async (input: MaintenanceUpdate, signal: AbortSignal) =>
-    MaintenanceOverview.parse(await request('/maintenance/settings', input, signal)),
-  runtimeLogs: async (signal: AbortSignal) =>
-    RuntimeLogExport.parse(await request('/maintenance/logs', undefined, signal)),
-  workspacePreferences: async (signal?: AbortSignal) =>
-    WorkspacePreferences.parse(await request('/preferences', undefined, signal)),
-  saveWorkspacePreferences: async (input: PreferenceUpdate, signal?: AbortSignal) =>
-    WorkspacePreferences.parse(await request('/preferences', input, signal)),
-  bridgeConnectionHealth: async (signal: AbortSignal) =>
-    BridgeConnectionHealth.parse(
-      await request('/bridge-connection-health', undefined, signal, '/api'),
+  resetWorkspace: (b: unknown) => j('/data-cleanup/reset', b, 15_000),
+  compactData: () => j('/data-cleanup/compact', {}, 300_000),
+  maintenance: (sig: Sig) => p('/maintenance', MaintenanceOverview, undefined, undefined, sig),
+  saveMaintenance: (b: MaintenanceUpdate, sig: Sig) =>
+    p('/maintenance/settings', MaintenanceOverview, b, undefined, sig),
+  runtimeLogs: (sig: Sig) => p('/maintenance/logs', RuntimeLogExport, undefined, undefined, sig),
+  workspacePreferences: (sig?: Sig) =>
+    p('/preferences', WorkspacePreferences, undefined, undefined, sig),
+  saveWorkspacePreferences: (b: PreferenceUpdate, sig?: Sig) =>
+    p('/preferences', WorkspacePreferences, b, undefined, sig),
+  bridgeConnectionHealth: (sig: Sig) =>
+    p('/bridge-connection-health', BridgeConnectionHealth, undefined, undefined, sig, '/api'),
+  recoverBridgeConnection: (b: { id: string; profileId: string }) =>
+    p('/bridge-connections/recover', BridgeConnectionRecoveryResult, b, 20_000, undefined, '/api'),
+  showBrowser: (profileId: string) => p('/profiles/show', ShowBrowserResult, { profileId }, 55_000),
+  restartSoftware: () => j('/software/restart', {}, 10_000),
+  backupStatus: (sig: Sig) =>
+    p('/backups/status', WorkspaceBackupStatus, undefined, undefined, sig),
+  createBackup: (directory: string, redact = false) =>
+    p(
+      '/backups/create',
+      WorkspaceBackupResult,
+      { directory, ...(redact ? { redactSecrets: true } : {}) },
+      310_000,
     ),
-  recoverBridgeConnection: async (input: { id: string; profileId: string }) =>
-    BridgeConnectionRecoveryResult.parse(
-      await request('/bridge-connections/recover', input, AbortSignal.timeout(20_000), '/api'),
+  restoreStatus: (sig: Sig) =>
+    p('/backups/restore-status', WorkspaceRestoreStatus, undefined, undefined, sig),
+  inspectRestore: (directory: string) =>
+    p('/backups/inspect-restore', WorkspaceRestoreInspection, { directory }, 310_000),
+  prepareRestore: (directory: string) =>
+    p('/backups/prepare-restore', WorkspaceRestoreStatus, { directory }, 310_000),
+  inspectProfiles: (profileIds: string[]) =>
+    p('/profiles/inspect', ProfileInspections, { profileIds }, 20_000),
+  profileInspections: (sig?: Sig) =>
+    p('/profiles/inspection', ProfileInspections, undefined, 10_000, sig),
+  snapshot: (sig?: Sig) => p('', WorkspaceSchema, undefined, sig ? undefined : 10_000, sig),
+  targetFolders: (k: TargetListKind) => j<TargetFolder[]>('/target-lists/folders?listKind=' + k),
+  targetListCommand: (cmd: TargetListCommand) => request('/target-lists/command', cmd),
+  reorderProfiles: (groupId: string | null, orderedProfileIds: string[]) =>
+    request('/profiles/reorder', { groupId, orderedProfileIds }),
+  reorderGroups: (orderedGroupIds: string[]) => request('/groups/reorder', { orderedGroupIds }),
+  createGroup: (name: string, color: string) => request('/groups/create', { name, color }),
+  renameGroup: (groupId: string, name: string) => request('/groups/rename', { groupId, name }),
+  deleteGroup: (groupId: string) => request('/groups/delete', { groupId }),
+  rename: (profileId: string, alias: string) => request('/profiles/rename', { profileId, alias }),
+  deleteProfiles: (profileIds: string[]) => j('/profiles/delete', { profileIds }, 15_000),
+  recordDiagnosticSnapshot: (
+    b?: string | { note?: string; uiContext?: string; targetDir?: string; reveal?: boolean },
+  ) =>
+    j<DiagSnap>('/diagnostics/snapshot', typeof b === 'string' ? { note: b } : (b ?? {}), 30_000),
+  revealDiagnosticPackage: (fileName?: string, targetDir?: string) =>
+    j<{ revealed: boolean; filePath: string; fileName: string }>(
+      '/diagnostics/reveal',
+      { ...(fileName ? { fileName } : {}), ...(targetDir ? { targetDir } : {}) },
+      10_000,
     ),
-  showBrowser: async (profileId: string) =>
-    ShowBrowserResult.parse(
-      await request('/profiles/show', { profileId }, AbortSignal.timeout(55000)),
+  bluestacksState: (refresh = false, sig?: Sig) =>
+    j<BluestacksState>('/bluestacks/state' + (refresh ? '?refresh=1' : ''), undefined, 15_000, sig),
+  bluestacksAction: (act: string, b: unknown = {}) =>
+    j<BluestacksState>('/bluestacks/' + act, b, 90_000),
+  autoSchedulerState: (sig?: Sig) =>
+    j<AutoSchedulerState>('/auto-scheduler/state', undefined, 15_000, sig),
+  autoSchedulerAction: (act: string, b: unknown = {}) =>
+    j<AutoSchedulerState>('/auto-scheduler/' + act, b, 30_000),
+  postBumpRecords: (q: PostBumpRecordQuery = {}, sig?: Sig) =>
+    p(
+      '/post-bump-records' +
+        qs({
+          recordType: q.recordType && q.recordType !== 'all' ? q.recordType : undefined,
+          carrier: q.carrier && q.carrier !== 'all' ? q.carrier : undefined,
+          status: q.status && q.status !== 'all' ? q.status : undefined,
+          search: q.search?.trim() || undefined,
+          from: q.from,
+          to: q.to,
+          limit: q.limit,
+          offset: q.offset,
+        }),
+      PostBumpRecordsResponseSchema,
+      undefined,
+      15_000,
+      sig,
     ),
-  restartSoftware: async () => request('/software/restart', {}, AbortSignal.timeout(10000)),
-  releaseIdlePages: async (profileId: string) => {
-    const result = await request(
-      '/profiles/release-idle-pages',
-      { profileId },
-      AbortSignal.timeout(60000),
-    );
-    if (
-      typeof result !== 'object' ||
-      result === null ||
-      !('released' in result) ||
-      typeof result.released !== 'number'
-    )
-      throw Error('占用处理回执无效');
-    return NativeReleaseResult.parse(result);
-  },
-  testTask: async (input: TestRequest) =>
-    TaskTestResult.parse(await request('/tasks/test', input, AbortSignal.timeout(65_000))),
-  backupStatus: async (signal: AbortSignal) =>
-    WorkspaceBackupStatus.parse(await request('/backups/status', undefined, signal)),
-  createBackup: async (directory: string, redactSecrets = false) =>
-    WorkspaceBackupResult.parse(
-      await request(
-        '/backups/create',
-        { directory, ...(redactSecrets ? { redactSecrets: true } : {}) },
-        AbortSignal.timeout(310_000),
-      ),
+  deletePostBumpRecords: (b: {
+    ids?: string[];
+    clearAll?: boolean;
+    recordType?: PostBumpRecordQueryTypeValue;
+  }) => j<{ deleted: number }>('/post-bump-records/delete', b, 20_000),
+  runtimeSummary: (sig?: Sig) => p('/runtime-summary', RuntimeSummarySchema, undefined, 8_000, sig),
+  testTask: (b: TestRequest) => p('/tasks/test', TaskTestResult, b, 65_000),
+  taskCapabilities: (sig: Sig) =>
+    p('/tasks/capabilities', TaskCapabilities, undefined, undefined, sig),
+  taskRuntime: (sig: Sig, cursor?: string) =>
+    p(
+      '/tasks/runtime' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : ''),
+      TaskRuntimeOverview,
+      undefined,
+      undefined,
+      sig,
     ),
-  restoreStatus: async (signal: AbortSignal) =>
-    WorkspaceRestoreStatus.parse(await request('/backups/restore-status', undefined, signal)),
-  inspectRestore: async (directory: string) =>
-    WorkspaceRestoreInspection.parse(
-      await request('/backups/inspect-restore', { directory }, AbortSignal.timeout(310_000)),
+  startTasks: (b: Assignment) => p('/tasks/start', TaskStartResult, b, 65_000),
+  commandTasks: (b: TaskCommand) => p('/tasks/command', TaskCommandResult, b, 45_000),
+  taskHistory: (profileId: string, planId: string | null, sig: Sig, round?: number) =>
+    p(
+      '/tasks/history',
+      TaskHistory,
+      { profileId, ...(planId ? { planId } : {}), ...(round ? { round } : {}) },
+      10_000,
+      sig,
     ),
-  prepareRestore: async (directory: string) =>
-    WorkspaceRestoreStatus.parse(
-      await request('/backups/prepare-restore', { directory }, AbortSignal.timeout(310_000)),
-    ),
-  taskFeatures: async (signal: AbortSignal) =>
-    TaskFeatureOverviewV2.parse(await request('/tasks/features', undefined, signal)),
-  saveTaskSettings: async (input: Settings, signal: AbortSignal) =>
-    SchedulerSettings.parse(await request('/tasks/settings', input, signal)),
-  nativeReview: async (profileId: string, signal: AbortSignal) =>
-    NativeReviewReport.parse(
-      await request(
-        '/profiles/native-review',
-        { profileId },
-        AbortSignal.any([signal, AbortSignal.timeout(40_000)]),
-      ),
-    ),
-  taskCapabilities: async (signal: AbortSignal) =>
-    TaskCapabilities.parse(await request('/tasks/capabilities', undefined, signal)),
-  taskRuntime: async (signal: AbortSignal, cursor?: string) =>
-    TaskRuntimeOverview.parse(
-      await request(
-        '/tasks/runtime' + (cursor ? '?cursor=' + encodeURIComponent(cursor) : ''),
-        undefined,
-        signal,
-      ),
-    ),
-  startTasks: async (input: Assignment) =>
-    TaskStartResult.parse(await request('/tasks/start', input, AbortSignal.timeout(65_000))),
-  commandTasks: async (input: TaskCommand) =>
-    TaskCommandResult.parse(await request('/tasks/command', input, AbortSignal.timeout(45_000))),
-  archives: async (profileId: string, planId: string, signal: AbortSignal) =>
-    ArchiveManagementList.parse(
-      await request(
-        '/archives/list',
-        { profileId, planId },
-        AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
-      ),
-    ),
-  materialUsage: async (signal: AbortSignal) =>
-    MaterialUsageSnapshot.parse(await request('/materials/usage', undefined, signal)),
-  materialCache: async (signal: AbortSignal) =>
-    MaterialCacheOverview.parse(await request('/materials/cache', undefined, signal)),
-  cleanMaterialCache: async (stageIds: string[]) =>
-    MaterialCacheCleanResult.parse(
-      await request('/materials/cache/clean', { stageIds }, AbortSignal.timeout(120_000)),
-    ),
-  clearMaterialUsage: async (input: MaterialUsageClearRequest) =>
-    ClearedMaterialUsage.parse(
-      await request('/materials/usage/clear', input, AbortSignal.timeout(15_000)),
-    ),
+  taskRecords: (b: RecFilter, sig?: Sig) => p('/tasks/records', TaskRecords, b, 10_000, sig),
+  create: (value: Combination) => p('/combinations/create', SavedCombinationSchema, { value }),
+  saveCombination: (id: string, expectedRevision: number, value: Combination) =>
+    p('/combinations/save', SavedCombinationSchema, { id, expectedRevision, value }, 10_000),
+  deleteCombination: (id: string) => j('/combinations/delete', { id }, 15_000),
+  materialUsage: (sig: Sig) =>
+    p('/materials/usage', MaterialUsageSnapshot, undefined, undefined, sig),
+  materialCache: (sig: Sig) =>
+    p('/materials/cache', MaterialCacheOverview, undefined, undefined, sig),
+  cleanMaterialCache: (stageIds: string[]) =>
+    p('/materials/cache/clean', MaterialCacheCleanResult, { stageIds }, 120_000),
+  clearMaterialUsage: (b: MaterialUsageClearRequest) =>
+    p('/materials/usage/clear', ClearedMaterialUsage, b, 15_000),
   downloadResourceSources: async (
     combinationId: string,
     expectedRevision: number,
-    signal: AbortSignal,
+    sig: Sig,
     rowIds: string[] | undefined,
-    onProgress: (value: ResourceDownloadProgressValue) => void,
+    onProgress: (v: ResourceDownloadProgressValue) => void,
   ) => {
-    const response = await fetch('/api/workspace/resource-tables/download', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
-      body: JSON.stringify({ combinationId, expectedRevision, ...(rowIds ? { rowIds } : {}) }),
-      cache: 'no-store',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(31 * 60_000)]),
-    });
-    if (!response.ok) {
-      const value = (await response.json()) as { code?: string; error?: string };
-      throw new ApiError(value.code ?? 'RESOURCE_DOWNLOAD_FAILED', value.error ?? '下载未完成');
-    }
-    if (!response.body || response.headers.get('content-type') !== 'application/x-ndjson')
-      throw Error('下载响应不一致，请更新软件');
-    const report = await readResourceDownloadStream(response.body, onProgress);
+    const report = await readResourceDownloadStream(
+      await requestNdjsonStream(
+        '/resource-tables/download',
+        { combinationId, expectedRevision, ...(rowIds ? { rowIds } : {}) },
+        31 * 60_000,
+        sig,
+        'RESOURCE_DOWNLOAD_FAILED',
+        '下载未完成',
+        '下载响应不一致，请更新软件',
+      ),
+      onProgress,
+    );
     if (report.combinationId !== combinationId || report.expectedRevision !== expectedRevision)
       throw Error('下载结果与资源表不匹配');
     return report;
@@ -452,64 +471,49 @@ export const api = {
   checkResourceSources: async (
     combinationId: string,
     expectedRevision: number,
-    signal: AbortSignal,
+    sig: Sig,
     rowIds?: string[],
-    onProgress?: (value: ResourceCheckProgressValue) => void,
+    onProgress?: (v: ResourceCheckProgressValue) => void,
   ) => {
-    if (onProgress) {
-      const response = await fetch('/api/workspace/resource-tables/check', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
-        body: JSON.stringify({ combinationId, expectedRevision, ...(rowIds ? { rowIds } : {}) }),
-        cache: 'no-store',
-        signal: AbortSignal.any([signal, AbortSignal.timeout(40000)]),
-      });
-      if (!response.ok) {
-        const value = (await response.json()) as { code?: string; error?: string };
-        throw new ApiError(value.code ?? 'RESOURCE_CHECK_FAILED', value.error ?? '资源检查未完成');
-      }
-      if (!response.body || response.headers.get('content-type') !== 'application/x-ndjson')
-        throw Error('资源检查响应不一致，请更新软件');
-      return readResourceCheckStream(response.body, onProgress);
-    }
-    return ResourceSourceReport.parse(
-      await request(
-        '/resource-tables/check',
-        { combinationId, expectedRevision, ...(rowIds ? { rowIds } : {}) },
-        AbortSignal.any([signal, AbortSignal.timeout(40_000)]),
-      ),
-    );
+    const payload = { combinationId, expectedRevision, ...(rowIds ? { rowIds } : {}) };
+    return onProgress
+      ? readResourceCheckStream(
+          await requestNdjsonStream(
+            '/resource-tables/check',
+            payload,
+            40_000,
+            sig,
+            'RESOURCE_CHECK_FAILED',
+            '资源检查未完成',
+            '资源检查响应不一致，请更新软件',
+          ),
+          onProgress,
+        )
+      : p('/resource-tables/check', ResourceSourceReport, payload, 40_000, sig);
   },
-  copyCombination: async (id: string) =>
-    SavedCombinationSchema.parse(await request('/combinations/copy', { id })),
-  resourceTable: async (combinationId: string) =>
-    ResourceTable.parse(
-      await request('/resource-tables/read', { combinationId }, AbortSignal.timeout(10_000)),
-    ),
+  resourceTable: (combinationId: string) =>
+    p('/resource-tables/read', ResourceTable, { combinationId }, 10_000),
   resourceMedia: async (
     combinationId: string,
     expectedRevision: number,
     rowId: string,
     fileIndex: number,
-    signal: AbortSignal,
+    sig: Sig,
   ) => {
-    const response = await fetch('/api/workspace/resource-tables/media', {
+    const res = await fetch('/api/workspace/resource-tables/media', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ combinationId, expectedRevision, rowId, fileIndex }),
       cache: 'no-store',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(40000)]),
+      signal: combineTimeout(sig, 40_000),
     });
-    if (!response.ok) {
-      const result = (await response.json()) as { code?: string; error?: string };
-      throw new ApiError(
-        result.code ?? 'RESOURCE_PREVIEW_FAILED',
-        result.error ?? '媒体预览未完成',
-      );
+    if (!res.ok) {
+      const r = (await res.json()) as { code?: string; error?: string };
+      throw new ApiError(r.code ?? 'RESOURCE_PREVIEW_FAILED', r.error ?? '媒体预览未完成');
     }
-    const type = response.headers.get('content-type');
-    const length = Number(response.headers.get('content-length'));
-    const role = type?.startsWith('image/') ? 'image' : 'video';
+    const type = res.headers.get('content-type'),
+      length = Number(res.headers.get('content-length')),
+      role = type?.startsWith('image/') ? 'image' : 'video';
     if (
       !type ||
       !['image/png', 'image/jpeg', 'image/webp', 'video/mp4', 'video/quicktime'].includes(type) ||
@@ -518,376 +522,74 @@ export const api = {
       length > materialMediaPreviewLimits[role]
     )
       throw Error('RESOURCE_PREVIEW_RESPONSE_MISMATCH');
-    const blob = await response.blob();
+    const blob = await res.blob();
     if (blob.size !== length || blob.type !== type)
       throw Error('RESOURCE_PREVIEW_RESPONSE_MISMATCH');
     return blob;
   },
-  resourceSummaries: async () =>
-    ResourceUsageSummaries.parse(
-      await request('/resource-tables/summaries', undefined, AbortSignal.timeout(10_000)),
-    ),
-  saveResourceTable: async (
-    combinationId: string,
-    expectedRevision: number,
-    rows: ResourceRowValue[],
-  ) =>
-    ResourceTable.parse(
-      await request(
-        '/resource-tables/save',
-        { combinationId, expectedRevision, rows },
-        AbortSignal.timeout(15_000),
-      ),
-    ),
-  materialArrangement: async (input: ArrangementRequest, signal: AbortSignal) =>
-    MaterialArrangement.parse(
-      await request(
-        '/materials/arrangement',
-        input,
-        AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
-      ),
-    ),
-  materialReview: async (
-    scanId: string,
-    source: string,
-    profileIds: string[],
-    signal: AbortSignal,
-  ) =>
-    MaterialPublishingReview.parse(
-      await request(
-        '/materials/review',
-        { scanId, source, profileIds },
-        AbortSignal.any([signal, AbortSignal.timeout(40_000)]),
-      ),
-    ),
-  materialMedia: async (preview: PackagePreview, fileIndex: number, signal: AbortSignal) => {
-    const file = preview.files[fileIndex];
-    if (!file || file.role === 'text' || file.bytes > materialMediaPreviewLimits[file.role])
-      throw new ApiError('MATERIAL_PREVIEW_MEDIA_LIMIT', '媒体超过预览范围');
-    const response = await fetch('/api/workspace/materials/media', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ scanId: preview.scanId, source: preview.source, fileIndex }),
-      cache: 'no-store',
-      signal: AbortSignal.any([signal, AbortSignal.timeout(40_000)]),
-    });
-    if (!response.ok) {
-      const result: unknown = await response.json();
-      const error = result as { code?: string };
-      throw new ApiError(error.code ?? 'REQUEST_FAILED', '媒体预览未完成');
-    }
-    const types =
-      file.role === 'image'
-        ? ['image/png', 'image/jpeg', 'image/webp']
-        : ['video/mp4', 'video/quicktime'];
-    const type = response.headers.get('content-type');
-    if (
-      !type ||
-      !types.includes(type) ||
-      response.headers.get('content-length') !== String(file.bytes)
-    )
-      throw Error('MATERIAL_MEDIA_MISMATCH');
-    const blob = await response.blob();
-    if (blob.size !== file.bytes || blob.type !== type) throw Error('MATERIAL_MEDIA_MISMATCH');
-    return blob;
-  },
-  inspectProfiles: async (profileIds: string[]) =>
-    ProfileInspections.parse(
-      await request('/profiles/inspect', { profileIds }, AbortSignal.timeout(20_000)),
-    ),
-  profileInspections: async (signal?: AbortSignal) =>
-    ProfileInspections.parse(
-      await request('/profiles/inspection', undefined, combineTimeout(signal, 10_000)),
-    ),
-  materialPreflight: async (directory: string) =>
-    MaterialPreviewScan.parse(
-      await request('/materials/preflight', { directory }, AbortSignal.timeout(40_000)),
-    ),
-  materialPreview: async (scanId: string, source: string) =>
-    MaterialPackagePreview.parse(
-      await request('/materials/preview', { scanId, source }, AbortSignal.timeout(10_000)),
-    ),
-  taskOverview: async (signal?: AbortSignal) =>
-    TaskOverview.parse(await request('/tasks', undefined, signal)),
-  taskHistory: async (
-    profileId: string,
-    planId: string | null,
-    signal: AbortSignal,
-    round?: number,
-  ) =>
-    TaskHistory.parse(
-      await request(
-        '/tasks/history',
-        { profileId, ...(planId ? { planId } : {}), ...(round ? { round } : {}) },
-        AbortSignal.any([signal, AbortSignal.timeout(10000)]),
-      ),
-    ),
-  taskRecords: async (
-    input: {
-      groupBy?: 'run';
-      profileId?: string;
-      status?: 'all' | 'running' | 'completed' | 'failed' | 'review';
-      query?: string;
-      cursor?: string;
-      limit?: number;
-    },
-    signal?: AbortSignal,
-  ) =>
-    TaskRecords.parse(
-      await request(
-        '/tasks/records',
-        input,
-        signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
-          : AbortSignal.timeout(10_000),
-      ),
-    ),
-  snapshot: async (signal?: AbortSignal) =>
-    WorkspaceSchema.parse(await request('', undefined, signal ?? AbortSignal.timeout(10_000))),
-  targetFolders: (listKind: TargetListKind) =>
-    request('/target-lists/folders?listKind=' + listKind) as Promise<TargetFolder[]>,
-  targetListCommand: (command: TargetListCommand) => request('/target-lists/command', command),
-  reorderProfiles: (groupId: string | null, orderedProfileIds: string[]) =>
-    request('/profiles/reorder', { groupId, orderedProfileIds }),
-  reorderGroups: (orderedGroupIds: string[]) => request('/groups/reorder', { orderedGroupIds }),
-  createGroup: (name: string, color: string) => request('/groups/create', { name, color }),
-  renameGroup: (groupId: string, name: string) => request('/groups/rename', { groupId, name }),
-  deleteGroup: (groupId: string) => request('/groups/delete', { groupId }),
-  move: (profileIds: string[], groupId: string | null) =>
-    request('/profiles/move', { profileIds, groupId }),
-  rename: (profileId: string, alias: string) => request('/profiles/rename', { profileId, alias }),
-  deleteProfiles: (profileIds: string[]) =>
-    request('/profiles/delete', { profileIds }, AbortSignal.timeout(15_000)),
-  stop: async (profileIds: string[]) =>
-    StopResultsSchema.parse(await request('/profiles/stop', { profileIds })),
-  create: async (value: Combination) =>
-    SavedCombinationSchema.parse(await request('/combinations/create', { value })),
-  deleteCombination: (id: string) =>
-    request('/combinations/delete', { id }, AbortSignal.timeout(15_000)),
-  createDraft: async (value: Combination) =>
-    SavedCombinationSchema.parse(await request('/combinations/create-draft', { value })),
-
-  draft: async (id: string, expectedRevision: number, value: Combination) =>
-    SavedCombinationSchema.parse(
-      await request(
-        '/combinations/draft',
-        { id, expectedRevision, value },
-        AbortSignal.timeout(10_000),
-      ),
-    ),
-  publish: async (id: string, expectedRevision: number) =>
-    SavedCombinationSchema.parse(await request('/combinations/publish', { id, expectedRevision })),
-  discard: async (id: string, expectedRevision: number) =>
-    SavedCombinationSchema.parse(await request('/combinations/discard', { id, expectedRevision })),
-  start: (id: string, version: number, profileIds: string[]) =>
-    request('/combinations/start', { id, version, profileIds }),
-  groupInviterState: async (signal?: AbortSignal) =>
-    GroupInviterState.parse(
-      await request(
-        '/group-inviter/state',
-        undefined,
-        signal
-          ? AbortSignal.any([signal, AbortSignal.timeout(10_000)])
-          : AbortSignal.timeout(10_000),
-      ),
-    ),
-  addInviterGroups: async (input: AddInviterGroupsRequest) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/groups/add', input, AbortSignal.timeout(15_000)),
-    ),
-  deleteInviterGroups: async (input: DeleteInviterGroupsRequest) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/groups/delete', input, AbortSignal.timeout(15_000)),
-    ),
-  refreshGroupInviterGroups: async (input: { ids?: string[] } = {}) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/groups/refresh', input, AbortSignal.timeout(60_000)),
-    ),
-  stopRefreshGroupInviterGroups: async () =>
-    GroupInviterState.parse(
-      await request('/group-inviter/groups/refresh-stop', {}, AbortSignal.timeout(10_000)),
-    ),
-  saveGroupInviterSettings: async (input: UpdateGroupInviterSettingsRequest) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/settings', input, AbortSignal.timeout(10_000)),
-    ),
-  startGroupInviter: async (input: StartGroupInviterRequest) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/start', input, AbortSignal.timeout(65_000)),
-    ),
-  stopGroupInviter: async () =>
-    GroupInviterState.parse(await request('/group-inviter/stop', {}, AbortSignal.timeout(10_000))),
-  stopGroupInviterProfiles: async (input: StopGroupInviterProfilesRequest) =>
-    GroupInviterState.parse(
-      await request('/group-inviter/stop-profiles', input, AbortSignal.timeout(10_000)),
-    ),
-  groupInviterLogs: async (search = '', before?: number) =>
-    (await request(
-      '/group-inviter/logs?' +
-        new URLSearchParams({
-          search,
-          ...(before ? { before: String(before) } : {}),
-        }),
+  resourceSummaries: () =>
+    p('/resource-tables/summaries', ResourceUsageSummaries, undefined, 10_000),
+  saveResourceTable: (combinationId: string, expectedRevision: number, rows: ResourceRowValue[]) =>
+    p('/resource-tables/save', ResourceTable, { combinationId, expectedRevision, rows }, 15_000),
+  groupInviterState: (sig?: Sig) => inv('/state', undefined, 10_000, sig),
+  addInviterGroups: (b: AddInviterGroupsRequest) => inv('/groups/add', b),
+  deleteInviterGroups: (b: DeleteInviterGroupsRequest) => inv('/groups/delete', b),
+  refreshGroupInviterGroups: (b: { ids?: string[] } = {}) => inv('/groups/refresh', b, 60_000),
+  stopRefreshGroupInviterGroups: () => inv('/groups/refresh-stop', {}, 10_000),
+  saveGroupInviterSettings: (b: UpdateGroupInviterSettingsRequest) => inv('/settings', b, 10_000),
+  startGroupInviter: (b: StartGroupInviterRequest) => inv('/start', b, 65_000),
+  stopGroupInviter: () => inv('/stop', {}, 10_000),
+  stopGroupInviterProfiles: (b: StopGroupInviterProfilesRequest) =>
+    inv('/stop-profiles', b, 10_000),
+  groupInviterLogs: (search = '', before?: number, beforeId?: string) =>
+    j<GroupInviteLogRow[]>(
+      '/group-inviter/logs' + qs({ search, ...(before ? { before, beforeId } : {}) }),
       undefined,
-      AbortSignal.timeout(10_000),
-    )) as GroupInviteLogRow[],
-  recordDiagnosticSnapshot: async (
-    input?: string | { note?: string; uiContext?: string; targetDir?: string; reveal?: boolean },
-  ) =>
-    (await request(
-      '/diagnostics/snapshot',
-      typeof input === 'string' ? { note: input } : (input ?? {}),
-      AbortSignal.timeout(30_000),
-    )) as {
-      recorded: boolean;
-      filePath: string;
-      fileName: string;
-      sizeBytes: number;
-      entryId: number;
-      at: string;
-    },
-  revealDiagnosticPackage: async (fileName?: string, targetDir?: string) =>
-    (await request(
-      '/diagnostics/reveal',
-      {
-        ...(fileName ? { fileName } : {}),
-        ...(targetDir ? { targetDir } : {}),
-      },
-      AbortSignal.timeout(10_000),
-    )) as {
-      revealed: boolean;
-      filePath: string;
-      fileName: string;
-    },
-  bluestacksState: async (refresh = false, signal?: AbortSignal) =>
-    (await request(
-      '/bluestacks/state' + (refresh ? '?refresh=1' : ''),
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as BluestacksState,
-  bluestacksAction: async (action: string, body: unknown = {}) =>
-    (await request('/bluestacks/' + action, body, AbortSignal.timeout(90_000))) as BluestacksState,
-  autoSchedulerState: async (signal?: AbortSignal) =>
-    (await request(
-      '/auto-scheduler/state',
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as AutoSchedulerState,
-  autoSchedulerAction: async (action: string, body: unknown = {}) =>
-    (await request(
-      '/auto-scheduler/' + action,
-      body,
-      AbortSignal.timeout(30_000),
-    )) as AutoSchedulerState,
-  googleSheetsOverview: async (signal?: AbortSignal) =>
-    (await request(
-      '/google-sheets',
-      undefined,
-      combineTimeout(signal, 15_000),
-    )) as GoogleSheetsOverview,
-  googleSheetsImportCredentials: async (rawJson: string) =>
-    (await request(
-      '/google-sheets/auth/credentials',
-      { rawJson },
-      AbortSignal.timeout(15_000),
-    )) as GoogleAuthStatus,
-  googleSheetsStartAuth: async () =>
-    (await request('/google-sheets/auth/start', {}, AbortSignal.timeout(15_000))) as {
-      authUrl: string;
-      status: GoogleAuthStatus;
-    },
-  googleSheetsCompleteManualAuth: async (codeOrUrl: string) =>
-    (await request(
-      '/google-sheets/auth/manual',
-      { codeOrUrl },
-      AbortSignal.timeout(30_000),
-    )) as GoogleAuthStatus,
-  googleSheetsRevokeAuth: async () =>
-    (await request(
-      '/google-sheets/auth/revoke',
-      {},
-      AbortSignal.timeout(15_000),
-    )) as GoogleAuthStatus,
-  googleSheetsImageHostTokens: async () =>
-    (await request('/google-sheets/image-host/tokens', undefined, AbortSignal.timeout(15_000))) as {
-      tokens: string[];
-    },
-  googleSheetsSaveImageHost: async (body: unknown) =>
-    (await request(
-      '/google-sheets/image-host',
-      body,
-      AbortSignal.timeout(15_000),
-    )) as SheetImageHostStatus,
-  googleSheetsTestImageHost: async () =>
-    (await request('/google-sheets/image-host/test', {}, AbortSignal.timeout(45_000))) as {
+      10_000,
+    ),
+  googleSheetsOverview: (sig?: Sig) => gs<GoogleSheetsOverview>('', undefined, 15_000, sig),
+  googleSheetsImportCredentials: (rawJson: string) =>
+    gs<GoogleAuthStatus>('/auth/credentials', { rawJson }),
+  googleSheetsStartAuth: () => gs<{ authUrl: string; status: GoogleAuthStatus }>('/auth/start', {}),
+  googleSheetsCompleteManualAuth: (codeOrUrl: string) =>
+    gs<GoogleAuthStatus>('/auth/manual', { codeOrUrl }, 30_000),
+  googleSheetsRevokeAuth: () => gs<GoogleAuthStatus>('/auth/revoke', {}),
+  googleSheetsImageHostTokens: () => gs<{ tokens: string[] }>('/image-host/tokens'),
+  googleSheetsSaveImageHost: (b: unknown) => gs<SheetImageHostStatus>('/image-host', b),
+  googleSheetsTestImageHost: () =>
+    gs<{
       remoteUrl: string;
       host: 'gyazo' | 'drive';
       tokenIndex?: number;
       tokenCount?: number;
       fallbackFromGyazo?: boolean;
-    },
-  googleSheetsInspect: async (urlOrId: string) =>
-    (await request(
-      '/google-sheets/inspect',
-      { urlOrId },
-      AbortSignal.timeout(30_000),
-    )) as SpreadsheetMeta & { suggestedGid: number | null },
-  googleSheetsCreateLink: async (body: unknown) =>
-    (await request(
-      '/google-sheets/links/create',
-      body,
-      AbortSignal.timeout(30_000),
-    )) as GoogleSheetLink,
-  googleSheetsUpdateLink: async (body: unknown) =>
-    (await request(
-      '/google-sheets/links/update',
-      body,
-      AbortSignal.timeout(20_000),
-    )) as GoogleSheetLink,
-  googleSheetsDeleteLink: async (id: string) =>
-    (await request('/google-sheets/links/delete', { id }, AbortSignal.timeout(15_000))) as {
-      deleted: boolean;
-    },
-  googleSheetsReadGrid: async (id: string, force = false) =>
-    (await request(
-      `/google-sheets/links/grid?id=${encodeURIComponent(id)}${force ? '&force=1' : ''}`,
+    }>('/image-host/test', {}, 45_000),
+  googleSheetsInspect: (urlOrId: string) =>
+    gs<SpreadsheetMeta & { suggestedGid: number | null }>('/inspect', { urlOrId }, 30_000),
+  googleSheetsCreateLink: (b: unknown) => gs<GoogleSheetLink>('/links/create', b, 30_000),
+  googleSheetsUpdateLink: (b: unknown) => gs<GoogleSheetLink>('/links/update', b, 20_000),
+  googleSheetsDeleteLink: (id: string) => gs<{ deleted: boolean }>('/links/delete', { id }),
+  googleSheetsReadGrid: (id: string, force = false) =>
+    gs<SheetGridSnapshot>(
+      `/links/grid?id=${encodeURIComponent(id)}${force ? '&force=1' : ''}`,
       undefined,
-      AbortSignal.timeout(30_000),
-    )) as SheetGridSnapshot,
-  googleSheetsImportLibrary: async (id: string, mode: 'incremental' | 'overwrite') =>
-    (await request(
-      '/google-sheets/links/import-library',
-      { id, mode },
-      AbortSignal.timeout(60_000),
-    )) as LibrarySyncSummary,
-  googleSheetsSyncLibrary: async (id: string) =>
-    (await request(
-      '/google-sheets/links/sync-library',
+      30_000,
+    ),
+  googleSheetsImportLibrary: (id: string, mode: 'incremental' | 'overwrite') =>
+    gs<LibrarySyncSummary>('/links/import-library', { id, mode }, 60_000),
+  googleSheetsSyncLibrary: (id: string) =>
+    gs<LibrarySyncSummary>('/links/sync-library', { id }, 180_000),
+  googleSheetsPollSchedule: (id: string) =>
+    gs<{ summary: string }>('/links/poll-schedule', { id }, 180_000),
+  googleSheetsPollRecords: (id: string) =>
+    gs<{ summary: string }>('/links/poll-records', { id }, 180_000),
+  googleSheetsRefreshMetrics: (id: string) =>
+    gs<{ updated: number; failed: number; summary: string }>(
+      '/links/refresh-metrics',
       { id },
-      AbortSignal.timeout(180_000),
-    )) as LibrarySyncSummary,
-  googleSheetsPollSchedule: async (id: string) =>
-    (await request('/google-sheets/links/poll-schedule', { id }, AbortSignal.timeout(180_000))) as {
-      summary: string;
-    },
-  googleSheetsPollRecords: async (id: string) =>
-    (await request('/google-sheets/links/poll-records', { id }, AbortSignal.timeout(180_000))) as {
-      summary: string;
-    },
-  googleSheetsRefreshMetrics: async (id: string) =>
-    (await request(
-      '/google-sheets/links/refresh-metrics',
-      { id },
-      AbortSignal.timeout(180_000),
-    )) as { updated: number; failed: number; summary: string },
-  googleSheetsStopLink: async (id: string) =>
-    (await request('/google-sheets/links/stop', { id }, AbortSignal.timeout(15_000))) as {
-      stopped: boolean;
-    },
-  googleSheetsStopProfiles: async (profileIds: string[]) =>
-    (await request(
-      '/google-sheets/stop-profiles',
-      { profileIds },
-      AbortSignal.timeout(15_000),
-    )) as GoogleSheetsOverview,
+      180_000,
+    ),
+  googleSheetsStopLink: (id: string) => gs<{ stopped: boolean }>('/links/stop', { id }),
+  googleSheetsStopProfiles: (profileIds: string[]) =>
+    gs<GoogleSheetsOverview>('/stop-profiles', { profileIds }),
 };

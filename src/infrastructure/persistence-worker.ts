@@ -7,7 +7,6 @@ import { WorkspaceStore } from './workspace-store.js';
 import { Store } from '../bridge/store.js';
 import { persistenceError } from './persistence-error.js';
 import { persistenceRoutes } from './persistence-routes.js';
-
 if (!parentPort) throw Error('PERSISTENCE_WORKER_PORT_REQUIRED');
 const port = parentPort;
 const config: unknown = workerData;

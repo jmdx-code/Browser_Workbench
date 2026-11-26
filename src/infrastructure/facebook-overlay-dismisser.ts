@@ -1,15 +1,12 @@
 import type { Page } from 'playwright-core';
-
 export interface DismissOverlaysOptions {
   /** 保留不关的当前业务工作弹窗选择器（如发帖框 '[data-wb-poster-dialog="1"]' 或邀请成员窗 '[role="checkbox"]'） */
   keepSelector?: string;
 }
-
 export interface DismissOverlaysResult {
   dismissed: number;
   labels: string[];
 }
-
 function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
   if (
     typeof location !== 'undefined' &&
@@ -44,14 +41,12 @@ function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
     }
     return false;
   };
-
   const keep = typeof keepSelector === 'string' ? keepSelector.trim() : '';
   const allDialogs = Array.from(
     document.querySelectorAll<HTMLElement>(
       '[role="dialog"], [role="alertdialog"], [aria-modal="true"]',
     ),
   ).reverse();
-
   const closeAriaRx =
     /^(?:Close|关闭|關閉|ပိတ်ရန်|ပိတ်မည်|ပိတ်ပါ|Đóng|ปิด|Tutup|Dismiss|Not\s*now|以后再说|稍后再说|暫時不要)$/i;
   const closeTextRx =
@@ -59,10 +54,8 @@ function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
   const securityTextRx =
     /账号已被锁定|帳號已被鎖定|Account locked|Confirm your identity|确认你的身份|確認你的身分|输入安全码|輸入安全碼/i;
   const menuExcludeRx = /Actions|操作|更多|More|Menu|菜单|選單/i;
-
   let dismissed = 0;
   const labels: string[] = [];
-
   for (const d of allDialogs) {
     if (dismissed >= 4 || !isVis(d, 24)) continue;
     if (
@@ -93,12 +86,10 @@ function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
         // ignore invalid selector
       }
     }
-
     const dRect = d.getBoundingClientRect();
     const buttons = Array.from(d.querySelectorAll<HTMLElement>('[role="button"], button')).filter(
       (b) => isVis(b, 12) && b.getAttribute('aria-disabled') !== 'true',
     );
-
     let targetBtn = buttons.find((b) =>
       closeAriaRx.test((b.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim()),
     );
@@ -122,7 +113,6 @@ function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
         return hasCircleButtonFiber(b);
       });
     }
-
     targetBtn?.click();
     const escInit: KeyboardEventInit = {
       key: 'Escape',
@@ -142,10 +132,8 @@ function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
       'dialog';
     labels.push(rawLabel.replace(/\s+/g, ' ').trim().slice(0, 60));
   }
-
   return { dismissed, labels };
 }
-
 export async function dismissUnexpectedFacebookOverlays(
   page: Page | null | undefined,
   options?: DismissOverlaysOptions,

@@ -1,22 +1,83 @@
-import { useEffect, useRef, useState } from 'react';
-import type { Profile } from '../../shared/contracts.js';
-import type {
-  PosterActiveGroupItem,
-  PosterLog,
-  PosterState,
-  PosterTask,
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { profileDisplayName, type Profile } from '../../shared/contracts.js';
+import {
+  isPendingApprovalPostId,
+  type PosterLog,
+  type PosterState,
 } from '../../shared/group-poster.js';
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
 import { collectAllPaginatedLogs, formatPosterLogsAsTsv } from '../../shared/log-table-copy.js';
 import { api } from '../api.js';
 import { copyTextToClipboard } from '../clipboard.js';
+import { toggleSet } from '../selection.js';
 import {
-  formatCreatedDate,
-  PosterMaterialCardPreview,
+  PosterMaterialSummaryBox,
   PosterMediaPreviewModal,
+  posterRowBadge,
   taskStatusBadge,
 } from './poster-material-modals.js';
-import { posterRowBadge } from './poster-material-thumbnail-cell.js';
+import { BackdropModal, Btn, DataTbl, errMsg, ModalHeading } from './shared/module-ui.js';
+import { UI_CARD, UI_CHECKBOX, UI_INPUT_SM } from '../ui/primitives.js';
+
+function LogAvatarCell({
+  avatar,
+  title,
+  sub,
+  tag,
+}: {
+  avatar: string | null | undefined;
+  title: string;
+  sub: string;
+  tag?: { text: string; cls: string };
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      {avatar && (
+        <img
+          src={avatar}
+          alt=""
+          className="h-6 w-6 rounded-full object-cover"
+          referrerPolicy="no-referrer"
+        />
+      )}
+      <div className="flex flex-col">
+        <div className="flex items-center gap-1">
+          <strong>{title}</strong>
+          {tag && (
+            <span className={`rounded px-1 text-[10px] font-semibold ${tag.cls}`}>{tag.text}</span>
+          )}
+        </div>
+        <small className="text-[var(--text-3)]">{sub}</small>
+      </div>
+    </div>
+  );
+}
+
+const SectionCard = ({
+  title,
+  right,
+  children,
+}: {
+  title: string;
+  right?: ReactNode;
+  children: ReactNode;
+}) => (
+  <div className={`${UI_CARD} flex flex-col gap-2 p-3`}>
+    {right ? (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <strong className="text-xs font-semibold text-slate-900">{title}</strong>
+        {right}
+      </div>
+    ) : (
+      <strong className="text-xs font-semibold text-slate-900">{title}</strong>
+    )}
+    {children}
+  </div>
+);
+
+const EmptyMsg = ({ text }: { text: string }) => (
+  <div className="py-3 text-center text-xs text-[var(--text-3)]">{text}</div>
+);
 
 export function PosterMaterialDetailModal({
   material,
@@ -40,32 +101,32 @@ export function PosterMaterialDetailModal({
   const [logs, setLogs] = useState<PosterLog[]>([]);
   const [hasMoreLogs, setHasMoreLogs] = useState(false);
   const [search, setSearch] = useState('');
-  const searchRef = useRef('');
-  searchRef.current = search;
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [selectedLogIds, setSelectedLogIds] = useState<Set<string>>(new Set());
   const [copyingLogs, setCopyingLogs] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const searchRef = useRef('');
+  const logsReqSeqRef = useRef(0);
+  const loadedSearchRef = useRef('');
+  const lastTotalRef = useRef<number | undefined>(state?.total);
+  searchRef.current = search;
 
-  const activeGroups: PosterActiveGroupItem[] = state?.activeGroupsByMaterial?.[material.id] ?? [];
-  const materialTasks: PosterTask[] = (state?.tasks ?? []).filter(
-    (t) => t.materialId === material.id,
-  );
+  const activeGroups = state?.activeGroupsByMaterial?.[material.id] ?? [];
+  const materialTasks = (state?.tasks ?? []).filter((t) => t.materialId === material.id);
   const postedGroupIds = state?.postedGroupIdsByMaterial?.[material.id] ?? [];
 
-  const logsReqSeqRef = useRef(0);
   const loadMaterialLogs = async (q = searchRef.current, before?: number, beforeId?: string) => {
     const reqSeq = ++logsReqSeqRef.current;
     if (!before) setLoadingLogs(true);
     try {
       const rows = await api.posterLogs(q, before, beforeId, material.id);
       if (logsReqSeqRef.current !== reqSeq) return;
+      loadedSearchRef.current = q;
       setHasMoreLogs(rows.length >= 200);
       setLogs((prev) => (before ? [...prev, ...rows] : rows));
       if (!before) setSelectedLogIds(new Set());
     } catch (e) {
-      if (logsReqSeqRef.current !== reqSeq) return;
-      onMessage(e instanceof Error ? e.message : String(e));
+      if (logsReqSeqRef.current === reqSeq) onMessage(errMsg(e, String(e)));
     } finally {
       if (!before && logsReqSeqRef.current === reqSeq) setLoadingLogs(false);
     }
@@ -75,30 +136,30 @@ export function PosterMaterialDetailModal({
     if (copyingLogs) return;
     setCopyingLogs(true);
     try {
-      const targetRows =
-        selectedLogIds.size > 0
-          ? logs.filter((r) => selectedLogIds.has(r.id))
-          : await collectAllPaginatedLogs({
-              initialRows:
-                logs.length > 0
-                  ? logs
-                  : await api.posterLogs(search, undefined, undefined, material.id),
-              getTimestamp: (r) => r.postedAt,
-              fetchPage: (before, beforeId) =>
-                api.posterLogs(search, before, beforeId, material.id),
-            });
-      if (!targetRows.length) {
-        onMessage('当前没有可复制的发帖记录');
-        return;
+      let targetRows: PosterLog[];
+      if (selectedLogIds.size > 0) targetRows = logs.filter((r) => selectedLogIds.has(r.id));
+      else {
+        const seedRows =
+          logs.length > 0 && loadedSearchRef.current === search
+            ? logs
+            : await api.posterLogs(search, undefined, undefined, material.id);
+        if (loadedSearchRef.current !== search) {
+          loadedSearchRef.current = search;
+          setLogs(seedRows);
+        }
+        targetRows = await collectAllPaginatedLogs({
+          initialRows: seedRows,
+          getTimestamp: (r) => r.postedAt,
+          fetchPage: (b, bid) => api.posterLogs(search, b, bid, material.id),
+        });
       }
+      if (!targetRows.length) return onMessage('当前没有可复制的发帖记录');
       await copyTextToClipboard(formatPosterLogsAsTsv(targetRows, profiles));
       onMessage(
-        selectedLogIds.size > 0
-          ? `已批量复制已选 ${targetRows.length} 条发帖记录，可直接粘贴到表格`
-          : `已批量复制该贴文全部 ${targetRows.length} 条发帖记录，可直接粘贴到表格`,
+        `已批量复制${selectedLogIds.size > 0 ? '已选' : '该贴文全部'} ${targetRows.length} 条发帖记录，可直接粘贴到表格`,
       );
     } catch (e) {
-      onMessage(e instanceof Error ? e.message : String(e));
+      onMessage(errMsg(e, String(e)));
     } finally {
       setCopyingLogs(false);
     }
@@ -107,200 +168,145 @@ export function PosterMaterialDetailModal({
   useEffect(() => {
     setSearch('');
     searchRef.current = '';
+    lastTotalRef.current = state?.total;
     void loadMaterialLogs('');
   }, [material.id]);
-
   useEffect(() => {
-    if (state?.total !== undefined) {
+    if (state?.total !== undefined && state.total !== lastTotalRef.current) {
+      lastTotalRef.current = state.total;
       void loadMaterialLogs(searchRef.current);
     }
   }, [state?.total]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !previewOpen) onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [previewOpen, onClose]);
-
   return (
-    <div
-      className="modal-backdrop"
-      role="dialog"
-      aria-modal="true"
-      aria-label="贴文发帖详情与记录"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="modal bumper-modal poster-detail-modal">
-        <div className="bumper-modal-heading">
-          <h2>贴文发帖详情（正在发小组 · 已发小组 · 发帖链接 · 定时任务）</h2>
-          <button type="button" className="btn" aria-label="关闭弹窗" onClick={onClose}>
-            ×
-          </button>
-        </div>
-
-        <div className="poster-dispatch-post-summary">
-          <div className="poster-dispatch-post-thumb">
-            <PosterMaterialCardPreview row={material} onPreview={() => setPreviewOpen(true)} />
-          </div>
-          <div className="poster-dispatch-post-info">
-            <div className="poster-dispatch-post-badges">
-              <span className={'poster-cache-badge ' + posterRowBadge(material).cls}>
-                {posterRowBadge(material).text}
-              </span>
-              <span className="poster-dispatch-meta-item">
+    <>
+      <BackdropModal
+        label="贴文发帖详情与记录"
+        modalClass="!gap-0 !p-0 flex max-h-[88vh] w-[min(960px,95vw)] flex-col overflow-hidden"
+        blockEscape={previewOpen}
+        onClose={onClose}
+      >
+        <ModalHeading
+          title="贴文发帖详情（正在发小组 · 已发小组 · 发帖链接 · 定时任务）"
+          closeText="×"
+          onClose={onClose}
+        />
+        <PosterMaterialSummaryBox
+          row={material}
+          badge={posterRowBadge(material)}
+          onPreview={() => setPreviewOpen(true)}
+          className="flex gap-3 border-b border-[var(--line)] bg-slate-50/70 px-4 py-3"
+          metaRow={
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span>
                 已发小组数：<strong>{postedGroupIds.length}</strong> 个
               </span>
-              <span className="poster-dispatch-meta-item">
+              <span>
                 正在发/排队：<strong>{activeGroups.length}</strong> 个
               </span>
-              <span className="poster-dispatch-meta-item">
-                创建日期：{formatCreatedDate(material.createdAt)}
-              </span>
             </div>
-            <div className="poster-dispatch-post-caption">
-              {material.caption.trim() || '（无文字文案，仅发送图片/视频媒体）'}
-            </div>
-          </div>
-        </div>
-
-        <div className="poster-detail-scroll">
-          <div className="poster-detail-block">
-            <div className="poster-detail-block-header">
-              <strong>正在发 / 排队中的小组 ({activeGroups.length})</strong>
-            </div>
-            {activeGroups.length === 0 ? (
-              <div className="poster-detail-empty">当前没有正在发送或排队中的小组</div>
+          }
+        />
+        <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+          <SectionCard title={`正在发 / 排队中的小组 (${activeGroups.length})`}>
+            {!activeGroups.length ? (
+              <EmptyMsg text="当前没有正在发送或排队中的小组" />
             ) : (
-              <div className="poster-active-groups-grid">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 {activeGroups.map((item) => {
-                  const p = profiles.find((prof) => prof.id === item.profileId);
-                  const accountLabel = p
-                    ? p.browserName || p.alias || p.account.name || p.id
+                  const prof = profiles.find((pr) => pr.id === item.profileId);
+                  const acct = prof
+                    ? profileDisplayName(prof, prof.account.name || prof.id)
                     : (item.profileId ?? '等待空闲账号领取');
                   return (
                     <div
                       key={item.groupId}
-                      className={
-                        'poster-active-group-chip ' +
-                        (item.state === 'posting' ? 'is-posting' : 'is-queued')
-                      }
+                      className={`flex flex-col gap-1 rounded-lg border p-2 text-xs ${item.state === 'posting' ? 'border-blue-200 bg-blue-50/60' : 'border-amber-200 bg-amber-50/50'}`}
                     >
-                      <div className="poster-active-group-top">
-                        <span className="poster-group-state-tag">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="rounded bg-white px-1.5 py-0.5 text-[10px] font-semibold">
                           {item.state === 'posting' ? '▶ 正在发帖' : '⏳ 排队待发'}
                         </span>
                         <strong>{item.groupName}</strong>
-                        <small>({item.groupId})</small>
+                        <small className="text-[var(--text-3)]">({item.groupId})</small>
                       </div>
-                      <div className="poster-active-group-sub">
-                        <span>执行账号：{accountLabel}</span>
-                        {item.statusText && <span> · {item.statusText}</span>}
+                      <div className="text-[11px] text-[var(--text-2)]">
+                        执行账号：{acct}
+                        {item.statusText ? ` · ${item.statusText}` : ''}
                       </div>
                     </div>
                   );
                 })}
               </div>
             )}
-          </div>
-
-          <div className="poster-detail-block">
-            <div className="poster-detail-block-header">
-              <strong>该贴文的任务与定时记录 ({materialTasks.length})</strong>
-            </div>
-            {materialTasks.length === 0 ? (
-              <div className="poster-detail-empty">暂无该贴文的任务记录</div>
+          </SectionCard>
+          <SectionCard title={`该贴文的任务与定时记录 (${materialTasks.length})`}>
+            {!materialTasks.length ? (
+              <EmptyMsg text="暂无该贴文的任务记录" />
             ) : (
-              <table className="bumper-table">
-                <thead>
-                  <tr>
-                    <th>状态</th>
-                    <th>执行时间</th>
-                    <th>账号模式</th>
-                    <th>完成进度</th>
-                    <th>状态说明</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {materialTasks.map((t) => {
-                    const badge = taskStatusBadge(t.status);
-                    return (
-                      <tr key={t.id}>
-                        <td>
-                          <span className={'poster-task-badge ' + badge.cls}>{badge.label}</span>
-                        </td>
-                        <td>
-                          {t.scheduledAt
-                            ? `定时：${new Date(t.scheduledAt).toLocaleString()}`
-                            : `立即：${new Date(t.createdAt).toLocaleString()}`}
-                        </td>
-                        <td>
-                          {t.accountMode === 'all_online'
-                            ? '🌐 全部在线账号'
-                            : `👤 指定 ${t.profileIds.length} 个账号`}
-                        </td>
-                        <td>
-                          已发 <strong>{t.postedCount}</strong> / {t.totalGroups} 组
-                          {t.skippedCount > 0 ? `（跳过 ${t.skippedCount} 组）` : ''}
-                        </td>
-                        <td>{t.statusReason}</td>
-                        <td>
-                          {t.status === 'scheduled' || t.status === 'running' ? (
-                            <button
-                              type="button"
-                              className="btn btn-sm btn-danger"
-                              disabled={busy}
-                              onClick={() => void onCancelTask(t.id)}
-                            >
-                              {t.status === 'scheduled' ? '取消定时' : '停止任务'}
-                            </button>
-                          ) : (
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              disabled={busy}
-                              onClick={() => void onDeleteTask(t.id)}
-                            >
-                              删除记录
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <DataTbl
+                headers={['状态', '执行时间', '账号模式', '完成进度', '状态说明', '操作']}
+                rows={materialTasks}
+                empty="暂无任务记录"
+                renderRow={(t) => {
+                  const tb = taskStatusBadge(t.status);
+                  return (
+                    <tr key={t.id}>
+                      <td className="px-2.5 py-2 align-middle">
+                        <span
+                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${tb.cls}`}
+                        >
+                          {tb.label}
+                        </span>
+                      </td>
+                      <td className="px-2.5 py-2 align-middle">
+                        {t.scheduledAt
+                          ? `定时：${new Date(t.scheduledAt).toLocaleString()}`
+                          : `立即：${new Date(t.createdAt).toLocaleString()}`}
+                      </td>
+                      <td className="px-2.5 py-2 align-middle">
+                        {t.accountMode === 'all_online'
+                          ? '🌐 全部在线账号'
+                          : `👤 指定 ${t.profileIds.length} 个账号`}
+                      </td>
+                      <td className="px-2.5 py-2 align-middle">
+                        已发 <strong>{t.postedCount}</strong> / {t.totalGroups} 组
+                        {t.skippedCount > 0 ? `（跳过 ${t.skippedCount} 组）` : ''}
+                      </td>
+                      <td className="px-2.5 py-2 align-middle">{t.statusReason}</td>
+                      <td className="px-2.5 py-2 align-middle">
+                        {t.status === 'scheduled' || t.status === 'running' ? (
+                          <Btn v="danger" disabled={busy} onClick={() => void onCancelTask(t.id)}>
+                            {t.status === 'scheduled' ? '取消定时' : '停止任务'}
+                          </Btn>
+                        ) : (
+                          <Btn disabled={busy} onClick={() => void onDeleteTask(t.id)}>
+                            删除记录
+                          </Btn>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                }}
+              />
             )}
-          </div>
-
-          <div className="poster-detail-block">
-            <div className="poster-detail-block-header">
-              <strong>已发小组明细 · 发帖账号 · 发帖链接 ({logs.length} 条记录)</strong>
-              <div className="poster-detail-search">
+          </SectionCard>
+          <SectionCard
+            title={`已发小组明细 · 发帖账号 · 发帖链接 (${logs.length} 条记录)`}
+            right={
+              <div className="flex flex-wrap items-center gap-1.5">
                 <input
                   type="search"
+                  className={`${UI_INPUT_SM} w-52`}
                   placeholder="搜索已发小组、发帖账号或链接…"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void loadMaterialLogs(search);
-                  }}
+                  onKeyDown={(e) => e.key === 'Enter' && void loadMaterialLogs(search)}
                 />
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void loadMaterialLogs(search)}
-                >
-                  搜索
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm btn-primary"
-                  disabled={copyingLogs || loadingLogs || logs.length === 0}
+                <Btn onClick={() => void loadMaterialLogs(search)}>搜索</Btn>
+                <Btn
+                  v="primary"
+                  disabled={copyingLogs || loadingLogs || !logs.length}
                   onClick={() => void copyMaterialLogs()}
                 >
                   {copyingLogs
@@ -308,150 +314,139 @@ export function PosterMaterialDetailModal({
                     : selectedLogIds.size > 0
                       ? `批量复制已选 (${selectedLogIds.size})`
                       : `批量复制全部 (${logs.length})`}
-                </button>
+                </Btn>
               </div>
-            </div>
-
+            }
+          >
             {loadingLogs ? (
-              <div className="poster-detail-empty">正在读取已发记录…</div>
-            ) : logs.length === 0 ? (
-              <div className="poster-detail-empty">该贴文暂无已发小组记录</div>
+              <EmptyMsg text="正在读取已发记录…" />
+            ) : !logs.length ? (
+              <EmptyMsg text="该贴文暂无已发小组记录" />
             ) : (
-              <div className="bumper-table-scroll">
-                <table className="bumper-table">
-                  <thead>
-                    <tr>
-                      <th>
-                        <input
-                          type="checkbox"
-                          aria-label="全选该贴文已发记录"
-                          checked={logs.length > 0 && logs.every((l) => selectedLogIds.has(l.id))}
-                          onChange={(e) =>
-                            setSelectedLogIds(
-                              e.target.checked ? new Set(logs.map((l) => l.id)) : new Set(),
-                            )
-                          }
-                        />
-                      </th>
-                      <th>发帖时间</th>
-                      <th>目标小组</th>
-                      <th>发帖账号 / 专页</th>
-                      <th>发帖链接</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {logs.map((row) => {
-                      const p = profiles.find((item) => item.id === row.profileId);
-                      const profileTitle = p
-                        ? p.browserName || p.alias || p.account.name || row.profileId
-                        : row.profileId;
-                      const effectiveAccountAvatar =
-                        (p?.account.id === row.accountId && p?.account.avatar
-                          ? p.account.avatar
-                          : null) ?? row.accountAvatar;
-                      return (
-                        <tr key={row.id}>
-                          <td>
-                            <input
-                              type="checkbox"
-                              checked={selectedLogIds.has(row.id)}
-                              onChange={() =>
-                                setSelectedLogIds((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(row.id)) next.delete(row.id);
-                                  else next.add(row.id);
-                                  return next;
-                                })
-                              }
-                            />
-                          </td>
-                          <td>{new Date(row.postedAt).toLocaleString()}</td>
-                          <td>
-                            <div className="poster-log-entity">
-                              {row.groupAvatar && (
-                                <img
-                                  src={row.groupAvatar}
-                                  alt=""
-                                  className="poster-log-avatar"
-                                  referrerPolicy="no-referrer"
-                                />
-                              )}
-                              <div>
-                                <strong>{row.groupName}</strong>
-                                <small>{row.groupId}</small>
-                              </div>
-                            </div>
-                          </td>
-                          <td>
-                            <div className="poster-log-entity">
-                              {effectiveAccountAvatar && (
-                                <img
-                                  src={effectiveAccountAvatar}
-                                  alt=""
-                                  className="poster-log-avatar"
-                                  referrerPolicy="no-referrer"
-                                />
-                              )}
-                              <div>
-                                <strong>{row.accountName || profileTitle}</strong>
-                                <span className={'poster-identity-badge is-' + row.identityType}>
-                                  {row.identityType === 'page' ? '专页' : '个人'}
-                                </span>
-                                <small>{row.accountId}</small>
-                              </div>
-                            </div>
-                          </td>
-                          <td>
-                            {row.postId === 'pending_approval' && (
-                              <span className="poster-identity-badge is-page">
-                                已提交待群管审核
-                              </span>
-                            )}{' '}
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              title={row.postUrl}
-                              onClick={() =>
-                                void copyTextToClipboard(row.postUrl)
-                                  .then(() => onMessage('已复制发帖链接'))
-                                  .catch((e) => onMessage(String(e)))
-                              }
+              <>
+                <DataTbl
+                  wrapClass="max-h-72 overflow-auto rounded-lg border border-[var(--line)] bg-white"
+                  headers={[
+                    <input
+                      key="all"
+                      type="checkbox"
+                      className={UI_CHECKBOX}
+                      aria-label="全选该贴文已发记录"
+                      checked={logs.length > 0 && logs.every((l) => selectedLogIds.has(l.id))}
+                      onChange={(e) =>
+                        setSelectedLogIds(
+                          e.target.checked ? new Set(logs.map((l) => l.id)) : new Set(),
+                        )
+                      }
+                    />,
+                    '发帖时间',
+                    '目标小组',
+                    '发帖账号 / 专页',
+                    '发帖链接',
+                  ]}
+                  rows={logs}
+                  empty="暂无记录"
+                  renderRow={(row) => {
+                    const prof = profiles.find((item) => item.id === row.profileId);
+                    const profileTitle = prof
+                      ? profileDisplayName(prof, prof.account.name || row.profileId)
+                      : row.profileId;
+                    const avatar =
+                      (prof?.account.id === row.accountId && prof?.account.avatar
+                        ? prof.account.avatar
+                        : null) ?? row.accountAvatar;
+                    return (
+                      <tr key={row.id}>
+                        <td className="px-2.5 py-2 align-middle">
+                          <input
+                            type="checkbox"
+                            className={UI_CHECKBOX}
+                            checked={selectedLogIds.has(row.id)}
+                            onChange={() => setSelectedLogIds((prev) => toggleSet(prev, row.id))}
+                          />
+                        </td>
+                        <td className="px-2.5 py-2 align-middle">
+                          {new Date(row.postedAt).toLocaleString()}
+                        </td>
+                        <td className="px-2.5 py-2 align-middle">
+                          <LogAvatarCell
+                            avatar={row.groupAvatar}
+                            title={row.groupName}
+                            sub={row.groupId}
+                          />
+                        </td>
+                        <td className="px-2.5 py-2 align-middle">
+                          <LogAvatarCell
+                            avatar={avatar}
+                            title={row.accountName || profileTitle}
+                            sub={row.accountId}
+                            tag={{
+                              text: row.identityType === 'page' ? '专页' : '个人',
+                              cls:
+                                row.identityType === 'page'
+                                  ? 'bg-amber-100 text-amber-800'
+                                  : 'bg-slate-100 text-slate-700',
+                            }}
+                          />
+                        </td>
+                        <td className="px-2.5 py-2 align-middle">
+                          {isPendingApprovalPostId(row.postId) && (
+                            <span className="mr-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                              已提交待群管审核
+                            </span>
+                          )}
+                          {/^https?:\/\//i.test(row.postUrl) ? (
+                            <span className="inline-flex items-center gap-1.5">
+                              <Btn
+                                title={row.postUrl}
+                                onClick={() =>
+                                  void copyTextToClipboard(row.postUrl)
+                                    .then(() => onMessage('已复制发帖链接'))
+                                    .catch((e) => onMessage(String(e)))
+                                }
+                              >
+                                复制链接
+                              </Btn>
+                              <a
+                                href={row.postUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex h-7 shrink-0 items-center justify-center rounded-md border border-[var(--line-strong)] bg-white px-2.5 text-xs font-medium whitespace-nowrap text-[var(--text)] no-underline transition-colors hover:border-slate-300 hover:bg-slate-100"
+                              >
+                                打开链接
+                              </a>
+                            </span>
+                          ) : (
+                            <span
+                              className="text-xs text-[var(--text-3)]"
+                              title="移动端发帖不返回直链"
                             >
-                              复制链接
-                            </button>{' '}
-                            <a
-                              href={row.postUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="btn btn-sm"
-                            >
-                              打开链接
-                            </a>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                              无直链
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  }}
+                />
                 {hasMoreLogs && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
+                  <Btn
+                    className="mt-1 self-start"
                     onClick={() =>
                       void loadMaterialLogs(search, logs.at(-1)?.postedAt, logs.at(-1)?.id)
                     }
                   >
                     加载更多
-                  </button>
+                  </Btn>
                 )}
-              </div>
+              </>
             )}
-          </div>
+          </SectionCard>
         </div>
-      </div>
+      </BackdropModal>
       {previewOpen && (
         <PosterMediaPreviewModal row={material} onClose={() => setPreviewOpen(false)} />
       )}
-    </div>
+    </>
   );
 }

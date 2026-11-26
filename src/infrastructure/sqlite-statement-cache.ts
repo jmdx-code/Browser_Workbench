@@ -1,8 +1,6 @@
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
-
 const MAX_CACHED_STATEMENTS_PER_DB = 256;
 const statementCaches = new WeakMap<DatabaseSync, Map<string, StatementSync>>();
-
 export function prepareCached(db: DatabaseSync, sql: string): StatementSync {
   let cache = statementCaches.get(db);
   if (!cache) {

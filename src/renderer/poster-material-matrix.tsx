@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type Ref,
+} from 'react';
 import {
   createEmptyMaterialDraft,
   fillPosterMaterialFiles,
@@ -8,23 +17,24 @@ import {
   toMaterialDraft,
   type MaterialDraft,
 } from '../domain/poster-material-table.js';
-import { hasPosterMaterialContent } from '../shared/group-poster.js';
-import { mediaReference } from '../domain/resource-table.js';
-import { copyTextToClipboard } from './clipboard.js';
 import {
-  PosterMaterialContextMenu,
-  PosterMediaPreviewModal,
-  type PosterContextMenuState,
-} from './modules/poster-material-modals.js';
+  computeGridBounds,
+  expandFillDownTsv,
+  getSelectedRowIndices,
+  isCellInGridBounds,
+  isRowInGridBounds,
+  MatrixDataCell,
+  parseElectronFilePaths,
+  useSpreadsheetGrid,
+} from './matrix-grid.js';
 import {
-  DEFAULT_POSTER_COL_WIDTHS,
-  loadPosterColWidths,
   PosterMaterialThumbnailCell,
+  PosterMediaPreviewModal,
   posterRowBadge,
-  savePosterColWidths,
   useSerialVideoThumbnailGenerator,
-  type PosterResizableColKey,
-} from './modules/poster-material-thumbnail-cell.js';
+} from './modules/poster-material-modals.js';
+import { Btn, errMsg } from './modules/shared/module-ui.js';
+import { UI_CHECKBOX } from './ui/primitives.js';
 
 export {
   createEmptyMaterialDraft,
@@ -35,11 +45,57 @@ export {
   toMaterialDraft,
   type MaterialDraft,
 };
-
 export interface PosterMaterialMatrixHandle {
   commitPendingEdit(): MaterialDraft[];
   isEditing(): boolean;
 }
+
+type ColKey = 'thumb' | 'caption' | 'media' | 'background' | 'aiLabel' | 'status';
+const COL_WIDTHS_KEY = 'wb_poster_material_col_widths_v1';
+const DEFAULT_WIDTHS: Record<ColKey, number> = {
+  thumb: 136,
+  caption: 280,
+  media: 220,
+  background: 112,
+  aiLabel: 100,
+  status: 132,
+};
+const loadWidths = (): Record<ColKey, number> => {
+  try {
+    const parsed = JSON.parse(globalThis.localStorage?.getItem(COL_WIDTHS_KEY) || '{}') as Partial<
+      Record<ColKey, unknown>
+    >;
+    const next = { ...DEFAULT_WIDTHS };
+    for (const k of Object.keys(DEFAULT_WIDTHS) as ColKey[]) {
+      const v = Number(parsed[k]);
+      if (Number.isFinite(v) && v >= 72 && v <= 900) next[k] = Math.round(v);
+    }
+    return next;
+  } catch {
+    return { ...DEFAULT_WIDTHS };
+  }
+};
+const saveWidths = (w: Record<ColKey, number>) => {
+  try {
+    globalThis.localStorage?.setItem(COL_WIDTHS_KEY, JSON.stringify(w));
+  } catch {
+    /* ignore */
+  }
+};
+
+const optList = (vals: readonly string[]) => vals.map((v) => ({ value: v, label: v }));
+const BG_OPTIONS = optList(['普通文字', '彩贴']);
+const AI_OPTIONS = optList(['默认', '开启', '关闭']);
+const COL_HEADERS: ReadonlyArray<[ColKey, string]> = [
+  ['thumb', '缩略图'],
+  ['caption', 'A 文案'],
+  ['media', 'B 媒体路径/链接'],
+  ['background', 'C 背景'],
+  ['aiLabel', 'D AI 声明'],
+  ['status', '状态'],
+];
+const createId = () => globalThis.crypto.randomUUID();
+const isSelectCol = (col: number) => col === 2 || col === 3;
 
 export function PosterMaterialMatrix({
   rows,
@@ -57,1087 +113,390 @@ export function PosterMaterialMatrix({
   ref,
 }: {
   rows: MaterialDraft[];
-  onChange: (next: MaterialDraft[]) => void;
-  onSave: (itemsToSave: MaterialDraft[]) => Promise<unknown>;
-  onDeleteSelected?: ((ids: string[]) => void) | undefined;
+  onChange: (rows: MaterialDraft[]) => void;
+  onSave: (rowsOverride?: MaterialDraft[]) => Promise<unknown> | void;
+  onDeleteSelected: (ids: string[]) => Promise<unknown> | void;
   dirty: boolean;
   busy: boolean;
-  isFullscreen?: boolean | undefined;
-  onToggleFullscreen?: (() => void) | undefined;
-  onError?: ((msg: string) => void) | undefined;
-  onThumbnailSaved?: ((id: string) => void) | undefined;
-  persistedIds?: ReadonlySet<string> | undefined;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
+  onError: (msg: string) => void;
+  onThumbnailSaved: (id: string) => void;
+  persistedIds?: ReadonlySet<string>;
   pauseThumbnailGeneration?: boolean | undefined;
-  ref?: Ref<PosterMaterialMatrixHandle> | undefined;
+  ref?: Ref<PosterMaterialMatrixHandle>;
 }) {
-  const [undo, setUndo] = useState<MaterialDraft[][]>([]);
-  const [redo, setRedo] = useState<MaterialDraft[][]>([]);
-  const [range, setRange] = useState({ r1: 0, c1: 0, r2: 0, c2: 0 });
-  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
-  const [editing, setEditing] = useState<{ r: number; c: number; value: string } | null>(null);
-  const editingRef = useRef<typeof editing>(null);
-  const [query, setQuery] = useState('');
-  const [localError, setLocalError] = useState('');
-  const [colWidths, setColWidths] = useState<Record<PosterResizableColKey, number>>(() =>
-    loadPosterColWidths(),
-  );
-  const [contextMenu, setContextMenu] = useState<PosterContextMenuState | null>(null);
+  const [colWidths, setColWidths] = useState<Record<ColKey, number>>(loadWidths);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [previewRow, setPreviewRow] = useState<MaterialDraft | null>(null);
+  const [filePickerRow, setFilePickerRow] = useState<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const grid = useRef<HTMLDivElement>(null);
-  const filesInput = useRef<HTMLInputElement>(null);
-  const drag = useRef<'cells' | 'rows' | 'fill' | null>(null);
-  const anchor = useRef({ r: 0, c: 0 });
-  const fillTarget = useRef(0);
-  const finishDrag = useRef(() => {});
-  const resizingRef = useRef<{
-    col: PosterResizableColKey;
-    startX: number;
-    startWidth: number;
-  } | null>(null);
-
-  const effectiveRows = rows.length > 0 ? rows : [createEmptyMaterialDraft()];
-  const bounds = {
-    minRow: Math.min(range.r1, range.r2, Math.max(0, effectiveRows.length - 1)),
-    maxRow: Math.min(
-      range.r1 === range.r2 ? range.r1 : Math.max(range.r1, range.r2),
-      Math.max(0, effectiveRows.length - 1),
-    ),
-    minCol: Math.min(range.c1, range.c2),
-    maxCol: Math.min(3, Math.max(range.c1, range.c2)),
-  };
-  const selectedRangeIds = new Set(
-    effectiveRows.slice(bounds.minRow, bounds.maxRow + 1).map((r) => r.id),
-  );
-  const activeCheckedIds = new Set(
-    effectiveRows.filter((r) => checkedIds.has(r.id)).map((r) => r.id),
-  );
-  const targetBatchIds = activeCheckedIds.size > 0 ? activeCheckedIds : selectedRangeIds;
-
-  const handleVideoThumbSaved = useCallback(
-    (id: string) => {
-      onThumbnailSaved?.(id);
-    },
-    [onThumbnailSaved],
-  );
-  useSerialVideoThumbnailGenerator(effectiveRows, handleVideoThumbSaved, {
+  useSerialVideoThumbnailGenerator(rows, onThumbnailSaved, {
     persistedIds,
-    paused: pauseThumbnailGeneration,
+    paused: pauseThumbnailGeneration || busy,
   });
 
-  useEffect(() => {
-    const up = () => {
-      finishDrag.current();
-      resizingRef.current = null;
-    };
-    const move = (e: PointerEvent) => {
-      const activeResize = resizingRef.current;
-      if (!activeResize) return;
-      const nextW = Math.max(
-        72,
-        Math.min(900, Math.round(activeResize.startWidth + (e.clientX - activeResize.startX))),
-      );
-      setColWidths((prev) => {
-        const updated = { ...prev, [activeResize.col]: nextW };
-        savePosterColWidths(updated);
-        window.dispatchEvent(new CustomEvent('wb:poster-col-widths'));
-        return updated;
-      });
-    };
-    const syncColWidths = () => setColWidths(loadPosterColWidths());
-    const closeMenu = () => setContextMenu(null);
-    window.addEventListener('pointerup', up);
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerdown', closeMenu);
-    window.addEventListener('wb:poster-col-widths', syncColWidths);
-    return () => {
-      window.removeEventListener('pointerup', up);
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerdown', closeMenu);
-      window.removeEventListener('wb:poster-col-widths', syncColWidths);
-    };
-  }, []);
-
-  const createId = () => globalThis.crypto.randomUUID();
-  const quoteCell = (value: string) => '"' + value.replace(/"/g, '""') + '"';
-
-  function reportError(msg: string) {
-    setLocalError(msg);
-    onError?.(msg);
-  }
-
-  function applyEdit(next: MaterialDraft[], remember = true) {
-    if (remember) {
-      setUndo((history) => [...history.slice(-19), effectiveRows]);
-      setRedo([]);
-    }
-    setLocalError('');
-    onChange(next.length > 0 ? next : [createEmptyMaterialDraft(createId())]);
-  }
-
-  function preparedRows(): MaterialDraft[] {
-    const e = editingRef.current;
-    if (!e) return effectiveRows;
-    return pastePosterMaterialCells(
-      effectiveRows,
-      e.r,
-      e.c,
-      quoteCell(e.value),
-      createId,
-      e.r,
-      e.c,
-    );
-  }
-
-  function commitPendingEdit(): MaterialDraft[] {
-    const e = editingRef.current;
-    if (!e) return effectiveRows;
-    try {
-      const next = preparedRows();
-      editingRef.current = null;
-      setEditing(null);
-      applyEdit(next);
-      return next;
-    } catch (failure) {
-      reportError(failure instanceof Error ? failure.message : '单元格格式不正确');
-      return effectiveRows;
-    }
-  }
-
-  useImperativeHandle(ref, () => ({
-    commitPendingEdit,
-    isEditing: () => editingRef.current !== null,
-  }));
-
-  function attempt(work: () => MaterialDraft[]) {
-    try {
-      const next = work();
-      editingRef.current = null;
-      setEditing(null);
-      applyEdit(next);
-    } catch (failure) {
-      reportError(failure instanceof Error ? failure.message : '本次修改未生效');
-    }
-  }
-
-  function undoEdit() {
-    const previous = undo.at(-1);
-    if (previous) {
-      setUndo((h) => h.slice(0, -1));
-      setRedo((r) => [...r.slice(-19), effectiveRows]);
-      editingRef.current = null;
-      setEditing(null);
-      applyEdit(previous, false);
-    }
-  }
-
-  function redoEdit() {
-    const nextState = redo.at(-1);
-    if (nextState) {
-      setRedo((r) => r.slice(0, -1));
-      setUndo((h) => [...h.slice(-19), effectiveRows]);
-      editingRef.current = null;
-      setEditing(null);
-      applyEdit(nextState, false);
-    }
-  }
-
-  function startEdit(r: number, c: number, initialValue?: string) {
-    if (busy) return;
-    const row = effectiveRows[r];
-    if (!row) return;
-    if (c === 2 && row.mediaSource.trim().length > 0) return;
-    const next = { r, c, value: initialValue ?? posterCellValue(row, c) };
-    editingRef.current = next;
-    setEditing(next);
-  }
-
-  function commitEditAndAdvance(dr = 0, dc = 0) {
-    const currentEdit = editingRef.current;
-    const baseRow = currentEdit ? currentEdit.r : range.r1;
-    const baseCol = currentEdit ? currentEdit.c : range.c1;
-    let nextRows = commitPendingEdit();
-    let targetRow = baseRow + dr;
-    let targetCol = baseCol + dc;
-    if (dc !== 0) {
-      if (targetCol > 3) {
-        targetCol = 0;
-        targetRow += 1;
-      } else if (targetCol < 0) {
-        targetCol = 3;
-        targetRow = Math.max(0, targetRow - 1);
+  const applySingleCellEdit = useCallback(
+    (current: MaterialDraft[], rowIdx: number, col: number, value: string): MaterialDraft[] => {
+      try {
+        return pastePosterMaterialCells(current, rowIdx, col, value, createId, rowIdx, col);
+      } catch (e) {
+        onError(errMsg(e, '单元格输入无效'));
+        return current;
       }
-    }
-    if (targetRow >= nextRows.length && nextRows.length < 500) {
-      nextRows = [...nextRows, createEmptyMaterialDraft(createId())];
-      applyEdit(nextRows);
-    }
-    const clampedRow = Math.max(0, Math.min(nextRows.length - 1, targetRow));
-    const clampedCol = Math.max(0, Math.min(3, targetCol));
-    setRange({ r1: clampedRow, c1: clampedCol, r2: clampedRow, c2: clampedCol });
-    requestAnimationFrame(() => {
-      grid.current?.focus();
-      grid.current
-        ?.querySelector(`[data-r="${clampedRow}"][data-c="${clampedCol}"]`)
-        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    });
-  }
+    },
+    [onError],
+  );
 
-  function pasteText(text: string) {
-    if (!text) return;
-    attempt(() =>
+  const grid = useSpreadsheetGrid<MaterialDraft>({
+    rows,
+    colCount: 4,
+    disabled: busy,
+    onRowsChange: onChange,
+    getCellValue: posterCellValue,
+    applyCellEdit: applySingleCellEdit,
+    isSelectCol,
+    isEditableCell: (r, c) => !(c === 2 && rows[r]?.mediaSource.trim().length),
+    copyRangeText: (cur, b) =>
+      formatPosterCellsForClipboard(cur, b.minRow, b.maxRow, b.minCol, b.maxCol),
+    fillDown: (cur, b, endRow) =>
       pastePosterMaterialCells(
-        preparedRows(),
-        bounds.minRow,
-        bounds.minCol,
-        text,
+        cur,
+        b.maxRow + 1,
+        b.minCol,
+        expandFillDownTsv(cur, b, endRow, posterCellValue),
         createId,
-        bounds.maxRow,
-        bounds.maxCol,
+        endRow,
+        b.maxCol,
       ),
-    );
-  }
+    pasteTsv: (cur, b, text) =>
+      pastePosterMaterialCells(cur, b.minRow, b.minCol, text, createId, b.maxRow, b.maxCol),
+    onError,
+    createEmptyRow: () => createEmptyMaterialDraft(createId()),
+  });
 
-  function pasteAppendAtEnd(text: string) {
-    if (!text) return;
-    attempt(() => {
-      const current = preparedRows();
-      let startIdx = current.length;
-      while (
-        startIdx > 0 &&
-        !hasPosterMaterialContent(current[startIdx - 1] ?? { caption: '', mediaSource: '' })
-      ) {
-        startIdx--;
-      }
-      const next = pastePosterMaterialCells(current, startIdx, 0, text, createId, startIdx, 0);
-      setRange({ r1: startIdx, c1: 0, r2: Math.max(startIdx, next.length - 1), c2: 0 });
-      requestAnimationFrame(() => {
-        grid.current?.focus();
-        grid.current
-          ?.querySelector(`[data-r="${startIdx}"][data-c="0"]`)
-          ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      });
-      return next;
-    });
-  }
+  useImperativeHandle(
+    ref,
+    () => ({ commitPendingEdit: () => grid.commitEdit(), isEditing: () => Boolean(grid.editing) }),
+    [grid],
+  );
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
+  }, [menu]);
 
-  function paste(event: React.ClipboardEvent) {
-    if (editingRef.current || busy) return;
-    event.preventDefault();
-    pasteText(event.clipboardData.getData('text/plain'));
-  }
-
-  function copy(event: React.ClipboardEvent) {
-    if (editingRef.current) return;
-    if (!effectiveRows.length) {
-      event.preventDefault();
-      return;
-    }
-    event.preventDefault();
-    event.clipboardData.setData(
-      'text/plain',
-      formatPosterCellsForClipboard(
-        preparedRows(),
-        bounds.minRow,
-        bounds.maxRow,
-        bounds.minCol,
-        bounds.maxCol,
-      ),
-    );
-  }
-
-  function copySelectionToClipboard() {
-    const current = commitPendingEdit();
-    void copyTextToClipboard(
-      formatPosterCellsForClipboard(
-        current,
-        bounds.minRow,
-        bounds.maxRow,
-        bounds.minCol,
-        bounds.maxCol,
-      ),
-    ).catch(() => reportError('复制失败，请框选后按 Ctrl/Cmd+C'));
-  }
-
-  function clearRange() {
-    attempt(() => {
-      const next = structuredClone(preparedRows());
-      for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
-        const target = next[r];
-        if (!target) continue;
-        for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-          if (c === 0) {
-            target.caption = '';
-          } else if (c === 1) {
-            target.mediaSource = '';
-            target.localFilePath = null;
-            target.mediaKind = 'none';
-            target.cacheStatus = 'ready';
-            target.cacheError = null;
-            target.hasThumbnail = false;
-          } else if (c === 2) {
-            target.background = 'plain';
-          } else if (c === 3) {
-            target.aiLabel = 'default';
-          }
-        }
-        if (target.mediaSource.trim().length > 0) {
-          target.background = 'plain';
-        }
-      }
-      return next;
-    });
-  }
-
-  function deleteTargetRows(idsToRemove = targetBatchIds) {
-    const current = commitPendingEdit();
-    const removedIds = current.filter((r) => idsToRemove.has(r.id)).map((r) => r.id);
-    const remaining = current.filter((r) => !idsToRemove.has(r.id));
-    applyEdit(remaining.length > 0 ? remaining : [createEmptyMaterialDraft(createId())]);
-    setCheckedIds((prev) => {
-      const next = new Set(prev);
-      for (const id of removedIds) next.delete(id);
-      return next;
-    });
-    const nextRow = Math.max(0, Math.min(bounds.minRow, remaining.length - 1));
-    setRange({ r1: nextRow, c1: 0, r2: nextRow, c2: 0 });
-    if (removedIds.length > 0) {
-      onDeleteSelected?.(removedIds);
-    }
-  }
-
-  function insertRowAt(index: number) {
-    if (busy || effectiveRows.length >= 500) return;
-    const current = commitPendingEdit();
-    const clamped = Math.max(0, Math.min(current.length, index));
-    const next = [
-      ...current.slice(0, clamped),
-      createEmptyMaterialDraft(createId()),
-      ...current.slice(clamped),
-    ];
-    applyEdit(next);
-    setRange({ r1: clamped, c1: 0, r2: clamped, c2: 0 });
-  }
-
-  function appendRowsAtEnd(count = 1) {
-    if (busy || effectiveRows.length >= 500) return;
-    const current = commitPendingEdit();
-    const allowed = Math.max(1, Math.min(count, 500 - current.length));
-    const added = Array.from({ length: allowed }, () => createEmptyMaterialDraft(createId()));
-    const firstNewIdx = current.length;
-    const next = [...current, ...added];
-    applyEdit(next);
-    setRange({ r1: firstNewIdx, c1: 0, r2: firstNewIdx, c2: 0 });
-    requestAnimationFrame(() => {
-      grid.current?.focus();
-      grid.current
-        ?.querySelector(`[data-r="${firstNewIdx}"][data-c="0"]`)
-        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    });
-  }
-
-  function toggleRangeSelection(checked?: boolean) {
-    const current = preparedRows();
-    const rangeIds = [...selectedRangeIds];
-    const targetChecked = checked ?? !rangeIds.every((id) => checkedIds.has(id));
-    setCheckedIds((prev) => {
-      const next = new Set(prev);
-      for (const id of rangeIds) {
-        if (targetChecked) next.add(id);
-        else next.delete(id);
-      }
-      return next;
-    });
-    void current;
-  }
-
-  function beginRange(r: number, c: number, shift: boolean, kind: 'cells' | 'rows' = 'cells') {
+  const appendRows = (count: number) => {
     if (busy) return;
-    if (editingRef.current) commitPendingEdit();
-    grid.current?.focus();
-    drag.current = kind;
-    if (!shift) anchor.current = { r, c };
-    const from = shift ? { r: range.r1, c: range.c1 } : anchor.current;
-    anchor.current = from;
-    setRange({
-      r1: from.r,
-      c1: kind === 'rows' ? 0 : from.c,
-      r2: r,
-      c2: kind === 'rows' ? 3 : c,
-    });
-  }
-
-  function extendRange(r: number, c: number) {
-    if (drag.current === 'fill') {
-      fillTarget.current = r;
-      setRange({ ...range, r2: Math.max(r, bounds.maxRow) });
-    } else if (drag.current) {
-      setRange({
-        r1: anchor.current.r,
-        c1: drag.current === 'rows' ? 0 : anchor.current.c,
-        r2: r,
-        c2: drag.current === 'rows' ? 3 : c,
-      });
+    if (rows.length + count > 500) return onError('最多支持 500 条素材');
+    grid.commitRows(
+      [...rows, ...Array.from({ length: count }, () => createEmptyMaterialDraft(createId()))],
+      true,
+    );
+  };
+  const insertRowRelative = (offset: number) => {
+    if (busy || rows.length >= 500) return;
+    const next = [...rows];
+    next.splice(
+      Math.max(0, (grid.bounds?.minRow ?? rows.length - 1) + offset),
+      0,
+      createEmptyMaterialDraft(createId()),
+    );
+    grid.commitRows(next, true);
+  };
+  const checkedIds = useMemo(() => rows.filter((r) => r.selected).map((r) => r.id), [rows]);
+  const allChecked = rows.length > 0 && checkedIds.length === rows.length;
+  const fillLocalFiles = (startRow: number, files: FileList | null) => {
+    if (!files?.length || busy) return;
+    const paths = parseElectronFilePaths(files);
+    if (!paths.length) return onError('未能获取本地文件路径，请复制文件路径粘贴或拖入文件');
+    try {
+      grid.commitRows(fillPosterMaterialFiles(rows, startRow, paths, createId), true);
+    } catch (e) {
+      onError(errMsg(e, '填充本地媒体失败'));
     }
-  }
-
-  finishDrag.current = () => {
-    if (busy) {
-      drag.current = null;
-      return;
-    }
-    if (drag.current === 'fill') {
-      const end = fillTarget.current;
-      const first = effectiveRows[bounds.minRow];
-      if (first && end > bounds.minRow) {
-        attempt(() => {
-          const next = structuredClone(preparedRows());
-          for (let r = bounds.minRow + 1; r <= end; r++) {
-            const target = next[r];
-            if (!target) continue;
-            for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
-              if (c === 0) {
-                target.caption = first.caption;
-              } else if (c === 1) {
-                if (target.mediaSource !== first.mediaSource) {
-                  target.mediaSource = first.mediaSource;
-                  target.localFilePath = first.localFilePath;
-                  target.mediaKind = first.mediaKind;
-                  target.cacheStatus = first.cacheStatus;
-                  target.cacheError = first.cacheError;
-                  target.hasThumbnail = first.hasThumbnail;
-                }
-              } else if (c === 2) {
-                target.background = first.background;
-              } else if (c === 3) {
-                target.aiLabel = first.aiLabel;
-              }
-            }
-            if (target.mediaSource.trim().length > 0) {
-              target.background = 'plain';
-            }
-          }
-          return next;
-        });
-      }
-    }
-    drag.current = null;
   };
 
-  function gridKeys(event: React.KeyboardEvent) {
-    if (editingRef.current || busy || !effectiveRows.length) return;
-    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
-    const mod = event.ctrlKey || event.metaKey;
-    const keyLower = event.key.toLowerCase();
-    if (mod && keyLower === 'z') {
-      event.preventDefault();
-      if (event.shiftKey) redoEdit();
-      else undoEdit();
-      return;
-    }
-    if (mod && keyLower === 'y') {
-      event.preventDefault();
-      redoEdit();
-      return;
-    }
-    if (mod && keyLower === 'x') {
-      event.preventDefault();
-      copySelectionToClipboard();
-      clearRange();
-      return;
-    }
-    if (['Delete', 'Backspace'].includes(event.key)) {
-      event.preventDefault();
-      clearRange();
-      return;
-    }
-    if (event.key === 'F2') {
-      event.preventDefault();
-      startEdit(range.r1, range.c1);
-      return;
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      if (event.shiftKey) {
-        startEdit(range.r1, range.c1);
-      } else {
-        commitEditAndAdvance(1, 0);
-      }
-      return;
-    }
-    if (event.key === 'Tab') {
-      event.preventDefault();
-      commitEditAndAdvance(0, event.shiftKey ? -1 : 1);
-      return;
-    }
-    if (event.key === ' ') {
-      event.preventDefault();
-      toggleRangeSelection();
-      return;
-    }
-    const delta: Record<string, [number, number]> = {
-      ArrowUp: [-1, 0],
-      ArrowDown: [1, 0],
-      ArrowLeft: [0, -1],
-      ArrowRight: [0, 1],
-    };
-    const movement = delta[event.key];
-    if (movement) {
-      event.preventDefault();
-      const [dr, dc] = movement;
-      const r = Math.max(
-        0,
-        Math.min(effectiveRows.length - 1, (event.shiftKey ? range.r2 : range.r1) + dr),
-      );
-      const c = Math.max(0, Math.min(3, (event.shiftKey ? range.c2 : range.c1) + dc));
-      setRange(event.shiftKey ? { ...range, r2: r, c2: c } : { r1: r, c1: c, r2: r, c2: c });
-      grid.current
-        ?.querySelector(`[data-r="${r}"][data-c="${c}"]`)
-        ?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      return;
-    }
-    if (event.key.length === 1 && !mod && !event.altKey) {
-      event.preventDefault();
-      startEdit(range.r1, range.c1, event.key);
-    }
-  }
-
-  function addFiles(list: FileList | null, targetRow?: number) {
-    if (!list?.length) return;
-    attempt(() => {
-      const desktop = window.workbenchDesktop;
-      const sources = Array.from(list).map((file) => {
-        const source =
-          desktop?.materialFilePath(file) || ((file as File & { path?: string }).path ?? '').trim();
-        if (!source) {
-          throw Error(
-            '完整本机文件路径仅桌面端可用；或在 B 列粘贴本机绝对路径 / Google Drive 链接',
-          );
-        }
-        return mediaReference(source).source;
+  const startResize = (key: ColKey, startX: number) => {
+    const initial = colWidths[key] ?? DEFAULT_WIDTHS[key];
+    const onMove = (ev: MouseEvent) =>
+      setColWidths((prev) => {
+        const next = {
+          ...prev,
+          [key]: Math.max(72, Math.min(900, Math.round(initial + (ev.clientX - startX)))),
+        };
+        saveWidths(next);
+        return next;
       });
-      const current = preparedRows();
-      if (targetRow !== undefined) {
-        return pastePosterMaterialCells(
-          current,
-          targetRow,
-          1,
-          sources.map((s) => quoteCell(s)).join('\n'),
-          createId,
-        );
-      }
-      const firstEmpty = current.findIndex((r) => !r.mediaSource.trim());
-      return fillPosterMaterialFiles(
-        current,
-        firstEmpty < 0 ? current.length : firstEmpty,
-        sources,
-        createId,
-      );
-    });
-  }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
 
-  const normalizedQuery = query.trim().toLowerCase();
-  const entries = effectiveRows
-    .map((row, index) => ({ row, index }))
-    .filter(({ row, index }) => {
-      if (!normalizedQuery) return true;
-      return (
-        String(index + 1).includes(normalizedQuery) ||
-        row.caption.toLowerCase().includes(normalizedQuery) ||
-        row.mediaSource.toLowerCase().includes(normalizedQuery)
-      );
-    });
+  const toolbarButtons: ReadonlyArray<[string, () => void, boolean?, 'danger'?]> = [
+    ['+ 添加一行', () => appendRows(1)],
+    ['+5 行', () => appendRows(5)],
+    [
+      '选择本地媒体',
+      () => {
+        setFilePickerRow(grid.bounds?.minRow ?? 0);
+        fileInputRef.current?.click();
+      },
+    ],
+    [
+      `删除勾选 (${checkedIds.length})`,
+      () => void onDeleteSelected(checkedIds),
+      busy || !checkedIds.length,
+      'danger',
+    ],
+    ['清空选区', () => grid.clearBounds(grid.bounds), busy || !grid.bounds],
+    ['撤销', grid.handleUndo, busy || !grid.canUndo],
+    ['重做', grid.handleRedo, busy || !grid.canRedo],
+  ];
 
-  function renderResizeHandle(colKey: PosterResizableColKey) {
-    return (
-      <span
-        className="poster-col-resizer"
-        role="separator"
-        aria-orientation="vertical"
-        title="拖拽调整列宽，双击恢复默认宽度"
-        onPointerDown={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          resizingRef.current = {
-            col: colKey,
-            startX: e.clientX,
-            startWidth: colWidths[colKey],
-          };
-        }}
-        onDoubleClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setColWidths((prev) => {
-            const reset = { ...prev, [colKey]: DEFAULT_POSTER_COL_WIDTHS[colKey] };
-            savePosterColWidths(reset);
-            return reset;
-          });
-        }}
-      />
-    );
-  }
+  const toggleCheckedInRange = (checked: boolean) => {
+    const indices = new Set(getSelectedRowIndices(grid.bounds, rows.length));
+    if (indices.size)
+      grid.commitRows(
+        rows.map((r, i) => (indices.has(i) ? { ...r, selected: checked } : r)),
+        true,
+      );
+  };
+
+  const menuItems: Array<[string, () => void, boolean?]> = [
+    ['上方插入 1 行', () => insertRowRelative(0)],
+    ['下方插入 1 行', () => insertRowRelative(1)],
+    ['勾选所涉行', () => toggleCheckedInRange(true)],
+    ['取消勾选所涉行', () => toggleCheckedInRange(false)],
+    [
+      '复制',
+      () => {
+        const b = computeGridBounds(grid.selection);
+        if (b) void grid.doCopy(b, false);
+      },
+    ],
+    [
+      '粘贴',
+      () =>
+        void navigator.clipboard.readText().then(
+          (t) => t && grid.applyPastedText(t),
+          () => onError('无法读取系统剪贴板，请直接按 Ctrl+V 粘贴'),
+        ),
+    ],
+    ['清空选区', () => grid.clearBounds(grid.bounds)],
+    [
+      '删除所涉整行',
+      () => {
+        const indices = getSelectedRowIndices(grid.bounds, rows.length);
+        if (!indices.length) return;
+        const set = new Set(indices);
+        const ids = indices.map((i) => rows[i]?.id).filter((x): x is string => Boolean(x));
+        const kept = rows.filter((_, i) => !set.has(i));
+        grid.commitRows(kept.length ? kept : [createEmptyMaterialDraft(createId())], true);
+        if (ids.length) void onDeleteSelected(ids);
+      },
+      true,
+    ],
+  ];
 
   return (
-    <div
-      className={'poster-material-matrix-wrap' + (isFullscreen ? ' is-fullscreen' : '')}
-      style={{ position: 'relative' }}
-    >
-      <div className="resource-toolbar resource-main-toolbar poster-matrix-toolbar poster-compact-toolbar">
-        <div className="resource-toolbar-actions">
-          <button
-            type="button"
-            disabled={busy || effectiveRows.length >= 500}
-            onClick={() => appendRowsAtEnd(1)}
-            title="在表格末尾新增 1 行空行"
-          >
-            ＋ 新增一行
-          </button>
-          <button
-            type="button"
-            disabled={busy || effectiveRows.length >= 500}
-            onClick={() => appendRowsAtEnd(10)}
-            title="在表格末尾批量新增 10 行空行，方便批量粘贴或填写"
-          >
-            ＋ 批量新增 10 行
-          </button>
-          <button
-            type="button"
-            disabled={busy || effectiveRows.length >= 500}
-            onClick={() => {
-              void navigator.clipboard
-                ?.readText()
-                .then((text) => {
-                  if (!text.trim()) {
-                    reportError('剪贴板为空，请先复制文案或 Excel 表格内容');
-                    return;
-                  }
-                  pasteAppendAtEnd(text);
-                })
-                .catch(() => reportError('请点击目标单元格后按 Ctrl/Cmd+V 粘贴'));
-            }}
-            title="读取剪贴板中的多行文案或 Excel 内容，自动追加到表格末尾新行"
-          >
-            📋 粘贴追加新行
-          </button>
-          <button type="button" disabled={busy} onClick={() => filesInput.current?.click()}>
-            ＋ 添加本机图片/视频
-          </button>
-          <button type="button" disabled={busy || !undo.length} onClick={undoEdit}>
-            撤销 (Ctrl+Z)
-          </button>
-          <input
-            ref={filesInput}
-            type="file"
-            accept=".mp4,.mov,.png,.jpg,.jpeg,.webp"
-            multiple
-            hidden
-            onChange={(event) => {
-              addFiles(event.target.files);
-              event.target.value = '';
-            }}
-          />
+    <div className="poster-matrix-shell relative flex min-h-0 flex-1 flex-col gap-2.5 p-4">
+      <div className="poster-matrix-toolbar flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface-2)] px-3 py-2">
+        <div className="poster-matrix-toolbar-left flex flex-wrap items-center gap-1.5">
+          {toolbarButtons.map(([label, onClick, dis, v]) => (
+            <Btn key={label} v={v ?? 'default'} disabled={dis ?? busy} onClick={onClick}>
+              {label}
+            </Btn>
+          ))}
         </div>
-        <div className="resource-toolbar-actions resource-search">
-          <input
-            aria-label="搜索发帖素材"
-            placeholder="搜索文案、媒体或行号"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <select
-            aria-label="一键填充选区选项"
-            value=""
-            disabled={busy}
-            onChange={(e) => {
-              const [column, value] = e.target.value.split(':');
-              if (!column || !value) return;
-              const colNum = Number(column);
-              attempt(() => {
-                const current = structuredClone(preparedRows());
-                for (const row of current) {
-                  if (!targetBatchIds.has(row.id)) continue;
-                  if (colNum === 2) {
-                    row.background = row.mediaSource.trim()
-                      ? 'plain'
-                      : value === 'color'
-                        ? 'color'
-                        : 'plain';
-                  } else if (colNum === 3) {
-                    row.aiLabel = value === 'on' ? 'on' : value === 'off' ? 'off' : 'default';
-                  }
-                }
-                return current;
-              });
-            }}
-          >
-            <option value="">
-              批量设置（
-              {activeCheckedIds.size > 0
-                ? `已勾选 ${activeCheckedIds.size} 行`
-                : `选区 ${selectedRangeIds.size} 行`}
-              ）…
-            </option>
-            <optgroup label="C列 · 文字背景">
-              <option value="2:color">设为：彩贴</option>
-              <option value="2:plain">设为：普通文字</option>
-            </optgroup>
-            <optgroup label="D列 · AI 声明标签">
-              <option value="3:default">AI 声明：默认</option>
-              <option value="3:on">AI 声明：开启</option>
-              <option value="3:off">AI 声明：关闭</option>
-            </optgroup>
-          </select>
-          <button
-            type="button"
-            className="btn-danger"
-            disabled={busy || targetBatchIds.size === 0}
-            onClick={() => deleteTargetRows(targetBatchIds)}
-            title="删除勾选的行或当前框选的行"
-          >
-            删除
-            {activeCheckedIds.size > 0
-              ? `已勾选 (${activeCheckedIds.size})`
-              : `所选行 (${selectedRangeIds.size})`}
-          </button>
-          {onToggleFullscreen && (
-            <button type="button" onClick={onToggleFullscreen}>
-              {isFullscreen ? '退出全屏' : '全屏编辑'}
-            </button>
+        <div className="poster-matrix-toolbar-right flex flex-wrap items-center gap-2">
+          {dirty && (
+            <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-800">
+              有未保存修改
+            </span>
           )}
-          <button
-            type="button"
-            className="btn-primary"
-            disabled={busy}
-            onClick={() => {
-              const latest = commitPendingEdit();
-              void onSave(latest);
-            }}
-          >
-            {busy ? '保存中…' : dirty ? '保存素材 *' : '保存素材'}
-          </button>
+          {onToggleFullscreen && (
+            <Btn onClick={onToggleFullscreen}>{isFullscreen ? '退出全屏' : '放大表格'}</Btn>
+          )}
+          <Btn v="primary" disabled={busy} onClick={() => void onSave(grid.commitEdit())}>
+            保存素材
+          </Btn>
         </div>
       </div>
 
-      {localError && (
-        <p className="resource-error" role="alert">
-          {localError}
-        </p>
-      )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept="image/*,video/*"
+        className="hidden"
+        onChange={(e) => {
+          fillLocalFiles(filePickerRow ?? 0, e.target.files);
+          e.target.value = '';
+        }}
+      />
 
       <div
-        className="resource-grid-scroll poster-grid-scroll"
-        ref={grid}
+        ref={grid.wrapRef}
+        className="poster-matrix-scroll relative min-h-0 flex-1 overflow-auto rounded-xl border border-[#e0e5ec] bg-white focus:outline-none"
         tabIndex={0}
-        onKeyDown={gridKeys}
-        onPaste={paste}
-        onCopy={copy}
-        aria-label="小组发帖素材矩阵"
+        onKeyDown={grid.handleGridKeyDown}
+        onPaste={grid.handlePaste}
       >
-        <table
-          className="resource-grid resource-matrix poster-material-matrix"
-          role="grid"
-          aria-rowcount={effectiveRows.length + 1}
-          aria-colcount={8}
-          style={{ tableLayout: 'fixed' }}
-        >
-          <colgroup>
-            <col style={{ width: 40 }} />
-            <col style={{ width: 44 }} />
-            <col style={{ width: colWidths.thumb }} />
-            <col style={{ width: colWidths.caption }} />
-            <col style={{ width: colWidths.media }} />
-            <col style={{ width: colWidths.background }} />
-            <col style={{ width: colWidths.aiLabel }} />
-            <col style={{ width: colWidths.status }} />
-          </colgroup>
+        <table className="resource-matrix poster-matrix-table w-full border-collapse table-fixed text-xs">
           <thead>
             <tr>
-              <th className="poster-check-col">
-                <input
-                  type="checkbox"
-                  aria-label="全选发帖素材"
-                  checked={entries.length > 0 && entries.every(({ row }) => checkedIds.has(row.id))}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setCheckedIds((prev) => {
-                      const next = new Set(prev);
-                      for (const { row } of entries) {
-                        if (checked) next.add(row.id);
-                        else next.delete(row.id);
-                      }
-                      return next;
-                    });
-                  }}
-                />
-              </th>
-              <th className="poster-num-col">
-                <button
-                  type="button"
-                  aria-label="选择整表"
-                  onClick={() =>
-                    setRange({
-                      r1: 0,
-                      c1: 0,
-                      r2: Math.max(0, effectiveRows.length - 1),
-                      c2: 3,
-                    })
-                  }
-                >
-                  #
-                </button>
-              </th>
-              <th className="poster-thumb-col" style={{ position: 'relative' }}>
-                <span>缩略图</span>
-                {renderResizeHandle('thumb')}
-              </th>
-              {(
-                [
-                  ['A · 发帖文案', 'caption', 0],
-                  ['B · 本机媒体 / 网盘链接', 'media', 1],
-                  ['C · 文字背景', 'background', 2],
-                  ['D · AI 声明', 'aiLabel', 3],
-                ] as const
-              ).map(([title, colKey, c]) => (
-                <th key={title} style={{ position: 'relative' }}>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setRange({
-                        r1: 0,
-                        c1: c,
-                        r2: Math.max(0, effectiveRows.length - 1),
-                        c2: c,
-                      })
+              <th className="sticky top-0 z-[2] w-[68px] border border-[#e0e5ec] bg-slate-50 px-2 py-2 text-center text-[11px] font-semibold text-[var(--text-2)] select-none">
+                <label className="poster-row-check-all inline-flex cursor-pointer items-center justify-center gap-1.5 text-[11px] font-semibold text-[var(--text-2)]">
+                  <input
+                    type="checkbox"
+                    className={UI_CHECKBOX}
+                    checked={allChecked}
+                    aria-label="全选所有素材"
+                    onChange={(e) =>
+                      grid.commitRows(
+                        rows.map((r) => ({ ...r, selected: e.target.checked })),
+                        true,
+                      )
                     }
-                  >
-                    {title}
-                  </button>
-                  {renderResizeHandle(colKey)}
+                  />
+                  <span>#</span>
+                </label>
+              </th>
+              {COL_HEADERS.map(([key, label]) => (
+                <th
+                  key={key}
+                  style={{ width: colWidths[key] }}
+                  className="sticky top-0 z-[2] border border-[#e0e5ec] bg-slate-50 px-2 py-2 text-left text-[11px] font-semibold text-[var(--text-2)] select-none"
+                >
+                  <div className="poster-th-inner relative flex items-center justify-between gap-1 pr-2">
+                    <span className="truncate">{label}</span>
+                    <span
+                      className="poster-col-resizer absolute top-0 -right-2 bottom-0 z-[3] w-2.5 cursor-col-resize select-none after:absolute after:inset-y-1 after:left-1/2 after:w-[2px] after:-translate-x-1/2 after:rounded-full after:bg-transparent hover:after:bg-[var(--brand)]"
+                      role="separator"
+                      aria-orientation="vertical"
+                      title="拖拽调整列宽，双击恢复默认宽度"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        startResize(key, e.clientX);
+                      }}
+                      onDoubleClick={() => {
+                        const next = { ...colWidths, [key]: DEFAULT_WIDTHS[key] };
+                        saveWidths(next);
+                        setColWidths(next);
+                      }}
+                    />
+                  </div>
                 </th>
               ))}
-              <th style={{ position: 'relative' }}>
-                <span>状态 / 统计</span>
-                {renderResizeHandle('status')}
-              </th>
             </tr>
           </thead>
           <tbody>
-            {entries.map(({ row, index: r }) => {
+            {rows.map((row, rIdx) => {
               const badge = posterRowBadge(row);
-              const isRowChecked = checkedIds.has(row.id);
+              const cols = [
+                { col: 0, placeholder: '输入贴文文案' },
+                {
+                  col: 1,
+                  placeholder: '拖入或粘贴图片/视频/Drive链接',
+                  className:
+                    row.cacheStatus === 'error'
+                      ? 'max-w-[180px] overflow-hidden text-ellipsis text-[11px] text-[var(--err)]'
+                      : '',
+                },
+                { col: 2, opts: BG_OPTIONS, placeholder: '普通文字' },
+                { col: 3, opts: AI_OPTIONS, placeholder: '默认' },
+              ] as const;
               return (
                 <tr
                   key={row.id}
-                  className={isRowChecked ? 'is-selected-row' : ''}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    if (r < bounds.minRow || r > bounds.maxRow) {
-                      setRange({ r1: r, c1: 0, r2: r, c2: 3 });
+                  className={
+                    isRowInGridBounds(grid.bounds, rIdx, 4)
+                      ? 'row-selected bg-[#f3f7ff]'
+                      : 'hover:bg-slate-50/50'
+                  }
+                  onDragOver={(e) => {
+                    if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+                  }}
+                  onDrop={(e: ReactDragEvent) => {
+                    if (e.dataTransfer.files.length) {
+                      e.preventDefault();
+                      fillLocalFiles(rIdx, e.dataTransfer.files);
                     }
-                    setContextMenu({ x: e.clientX, y: e.clientY });
                   }}
                 >
-                  <td className="poster-check-col">
-                    <input
-                      type="checkbox"
-                      aria-label={`勾选素材#${r + 1}`}
-                      checked={isRowChecked}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setCheckedIds((prev) => {
-                          const next = new Set(prev);
-                          if (checked) next.add(row.id);
-                          else next.delete(row.id);
-                          return next;
-                        });
-                      }}
-                    />
-                  </td>
-                  <th
-                    className="resource-row-number"
-                    onPointerDown={(e) => {
-                      if (e.button !== 0) return;
+                  <td
+                    className="resource-row-number w-[68px] cursor-cell border border-[#e0e5ec] bg-[var(--surface-2)] px-2 py-1.5 text-center align-middle font-mono text-[11px] text-[var(--text-3)] select-none"
+                    onMouseDown={(e) => grid.beginRowMouseDown(e, rIdx)}
+                    onMouseEnter={() => grid.handleCellMouseEnter(rIdx, 0)}
+                    onContextMenu={(e) => {
                       e.preventDefault();
-                      beginRange(r, 0, e.shiftKey, 'rows');
+                      setMenu({ x: e.clientX, y: e.clientY });
                     }}
-                    onPointerEnter={() => extendRange(r, 3)}
                   >
-                    {r + 1}
-                  </th>
-                  <td className="poster-thumb-cell" style={{ textAlign: 'center' }}>
+                    <div className="inline-flex items-center justify-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        className={UI_CHECKBOX}
+                        checked={row.selected}
+                        aria-label={`勾选第 ${rIdx + 1} 条素材`}
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onChange={(e) =>
+                          grid.commitRows(
+                            rows.map((item, idx) =>
+                              idx === rIdx ? { ...item, selected: e.target.checked } : item,
+                            ),
+                            true,
+                          )
+                        }
+                      />
+                      <span>{rIdx + 1}</span>
+                    </div>
+                  </td>
+                  <td className="h-16 border border-[#e0e5ec] px-1.5 py-1 text-center align-middle">
                     <PosterMaterialThumbnailCell row={row} onPreview={setPreviewRow} />
                   </td>
-                  {[0, 1, 2, 3].map((c) => {
-                    const inRange =
-                      r >= bounds.minRow &&
-                      r <= bounds.maxRow &&
-                      c >= bounds.minCol &&
-                      c <= bounds.maxCol;
-                    const active = r === range.r1 && c === range.c1;
-                    const isEditing = editing?.r === r && editing.c === c;
-                    const hasMedia = row.mediaSource.trim().length > 0;
+                  {cols.map((c) => {
+                    const isSel = isCellInGridBounds(grid.bounds, rIdx, c.col);
+                    const opts = 'opts' in c ? c.opts : undefined;
                     return (
-                      <td
-                        key={c}
-                        data-r={r}
-                        data-c={c}
-                        role="gridcell"
-                        aria-selected={inRange}
-                        className={`${inRange ? 'in-range ' : ''}${active ? 'active-anchor ' : ''}${isEditing ? 'editing-cell' : ''}`}
-                        onPointerDown={(e) => {
-                          if (isEditing || e.button !== 0) return;
+                      <MatrixDataCell
+                        key={c.col}
+                        {...grid.getCellProps(rIdx, c.col)}
+                        className={'className' in c ? c.className : undefined}
+                        showArrow={Boolean(opts)}
+                        valueText={posterCellValue(row, c.col)}
+                        placeholder={c.placeholder}
+                        selectOptions={opts}
+                        onContextMenu={(e) => {
                           e.preventDefault();
-                          beginRange(r, c, e.shiftKey);
+                          if (!isSel)
+                            grid.setSelection({
+                              startRow: rIdx,
+                              startCol: c.col,
+                              endRow: rIdx,
+                              endCol: c.col,
+                            });
+                          setMenu({ x: e.clientX, y: e.clientY });
                         }}
-                        onPointerEnter={() => extendRange(r, c)}
-                        onDoubleClick={() => startEdit(r, c)}
-                        onDragOver={(e) => {
-                          if (c === 1) e.preventDefault();
-                        }}
-                        onDrop={(e) => {
-                          if (c === 1) {
-                            e.preventDefault();
-                            addFiles(e.dataTransfer.files, r);
-                          }
-                        }}
-                      >
-                        {isEditing ? (
-                          c < 2 ? (
-                            <textarea
-                              autoFocus
-                              aria-label={
-                                c === 0 ? `素材#${r + 1}文案` : `素材#${r + 1}媒体链接或路径`
-                              }
-                              value={editing.value}
-                              onChange={(e) => {
-                                const next = { ...editing, value: e.target.value };
-                                editingRef.current = next;
-                                setEditing(next);
-                              }}
-                              onPaste={(e) => {
-                                const text = e.clipboardData.getData('text/plain');
-                                const html = e.clipboardData.getData('text/html');
-                                if (
-                                  text.includes('\t') ||
-                                  html.includes('<table') ||
-                                  (c === 1 && text.includes('\n'))
-                                ) {
-                                  e.preventDefault();
-                                  editingRef.current = null;
-                                  setEditing(null);
-                                  attempt(() =>
-                                    pastePosterMaterialCells(
-                                      effectiveRows,
-                                      r,
-                                      c,
-                                      text,
-                                      createId,
-                                      r,
-                                      c,
-                                    ),
-                                  );
-                                }
-                              }}
-                              onBlur={() => commitPendingEdit()}
-                              onKeyDown={(e) => {
-                                e.stopPropagation();
-                                if (e.key === 'Enter' && !e.shiftKey) {
-                                  e.preventDefault();
-                                  commitEditAndAdvance(1, 0);
-                                } else if (e.key === 'Tab') {
-                                  e.preventDefault();
-                                  commitEditAndAdvance(0, e.shiftKey ? -1 : 1);
-                                } else if (e.key === 'Escape') {
-                                  editingRef.current = null;
-                                  setEditing(null);
-                                  grid.current?.focus();
-                                }
-                              }}
-                            />
-                          ) : (
-                            <select
-                              autoFocus
-                              aria-label={c === 2 ? `素材#${r + 1}文字背景` : `素材#${r + 1}AI声明`}
-                              value={editing.value}
-                              onChange={(e) => {
-                                editingRef.current = { ...editing, value: e.target.value };
-                                commitPendingEdit();
-                                grid.current?.focus();
-                              }}
-                              onBlur={() => commitPendingEdit()}
-                              onKeyDown={(e) => {
-                                e.stopPropagation();
-                                if (e.key === 'Escape') {
-                                  editingRef.current = null;
-                                  setEditing(null);
-                                } else if (e.key === 'Enter') {
-                                  e.preventDefault();
-                                  commitEditAndAdvance(1, 0);
-                                } else if (e.key === 'Tab') {
-                                  e.preventDefault();
-                                  commitEditAndAdvance(0, e.shiftKey ? -1 : 1);
-                                }
-                              }}
-                            >
-                              {(c === 2 ? ['彩贴', '普通文字'] : ['默认', '开启', '关闭']).map(
-                                (v) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ),
-                              )}
-                            </select>
-                          )
-                        ) : (
-                          <>
-                            <span
-                              className={`resource-cell-value${c === 2 && hasMedia ? ' media-background-readonly' : ''}`}
-                              title={posterCellValue(row, c)}
-                            >
-                              {posterCellValue(row, c) || '\u00a0'}
-                            </span>
-                            {(c === 3 || (c === 2 && !hasMedia)) && (
-                              <button
-                                type="button"
-                                className="cell-arrow"
-                                aria-label={`编辑${String.fromCharCode(65 + c)}${r + 1}`}
-                                onPointerDown={(e) => e.stopPropagation()}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setRange({ r1: r, c1: c, r2: r, c2: c });
-                                  startEdit(r, c);
-                                }}
-                              >
-                                ▾
-                              </button>
-                            )}
-                          </>
-                        )}
-                        {!editing && r === bounds.maxRow && c === bounds.maxCol && (
-                          <span
-                            className="fill-handle"
-                            aria-label="向下填充选区"
-                            onPointerDown={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              drag.current = 'fill';
-                              fillTarget.current = bounds.maxRow;
-                            }}
-                          />
-                        )}
-                      </td>
+                      />
                     );
                   })}
-                  <td className="resource-status poster-row-status">
-                    <span className={'poster-cache-badge ' + badge.cls} title={badge.title}>
+                  <td
+                    className="resource-status border border-[#e0e5ec] px-2 py-1.5 align-middle"
+                    title={badge.title}
+                  >
+                    <span
+                      className={`poster-status-badge inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${badge.cls}`}
+                    >
                       {badge.text}
                     </span>
-                    <small className="poster-used-count">已发 {row.usedCount} 次</small>
-                    {row.cacheError && (
-                      <small className="poster-cell-error" title={row.cacheError}>
-                        {row.cacheError}
-                      </small>
-                    )}
                   </td>
                 </tr>
               );
@@ -1148,32 +507,46 @@ export function PosterMaterialMatrix({
 
       <button
         type="button"
-        className="poster-floating-add-row-btn"
+        className="poster-floating-add-row-btn absolute right-5 bottom-4 z-[5] flex h-9 w-9 items-center justify-center rounded-full bg-[var(--brand)] text-base font-bold text-white shadow-lg transition-colors hover:not-disabled:bg-[var(--brand-hover)] disabled:cursor-not-allowed disabled:opacity-45"
         aria-label="新增一行"
         title="在表格末尾新增一行"
-        disabled={busy || effectiveRows.length >= 500}
-        onClick={() => appendRowsAtEnd(1)}
+        disabled={busy || rows.length >= 500}
+        onClick={() => appendRows(1)}
       >
         ＋
       </button>
 
-      <PosterMaterialContextMenu
-        menu={contextMenu}
-        onClose={() => setContextMenu(null)}
-        onInsertAbove={() => insertRowAt(bounds.minRow)}
-        onInsertBelow={() => insertRowAt(bounds.maxRow + 1)}
-        onToggleSelected={(checked) => toggleRangeSelection(checked)}
-        onCopy={copySelectionToClipboard}
-        onPaste={() => {
-          void navigator.clipboard
-            ?.readText()
-            .then((text) => pasteText(text))
-            .catch(() => reportError('请直接按 Ctrl/Cmd+V 粘贴'));
-        }}
-        onClearRange={clearRange}
-        onDeleteRows={() => deleteTargetRows(selectedRangeIds)}
-      />
-
+      {menu && (
+        <div
+          className="popover-menu flex min-w-[168px] flex-col gap-0.5 rounded-xl border border-[var(--line)] bg-white p-1.5 shadow-xl"
+          role="menu"
+          aria-label="素材表格右键菜单"
+          style={{
+            position: 'fixed',
+            left: Math.min(menu.x, (globalThis.innerWidth || 1200) - 200),
+            top: Math.min(menu.y, (globalThis.innerHeight || 800) - 260),
+            zIndex: 1200,
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {menuItems.map(([label, act, danger]) => (
+            <button
+              key={label}
+              type="button"
+              role="menuitem"
+              className={`w-full rounded-lg px-2.5 py-1.5 text-left text-xs font-medium transition-colors ${
+                danger ? 'text-rose-600 hover:bg-rose-50' : 'text-[var(--text)] hover:bg-slate-100'
+              }`}
+              onClick={() => {
+                act();
+                setMenu(null);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
       <PosterMediaPreviewModal row={previewRow} onClose={() => setPreviewRow(null)} />
     </div>
   );

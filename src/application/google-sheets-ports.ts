@@ -93,18 +93,18 @@ export interface GoogleSheetsRepositoryPort {
     sheetId: number;
     sheetName: string;
     spreadsheetUrl: string;
-    scheduleConfig?: Partial<PostScheduleSheetConfig> | undefined;
-    recordsConfig?: Partial<PostRecordsSheetConfig> | undefined;
+    scheduleConfig?: Partial<PostScheduleSheetConfig>;
+    recordsConfig?: Partial<PostRecordsSheetConfig>;
   }): GoogleSheetLink;
   updateLink(input: {
     id: string;
-    title?: string | undefined;
-    sheetId?: number | undefined;
-    sheetName?: string | undefined;
-    spreadsheetTitle?: string | undefined;
-    enabled?: boolean | undefined;
-    scheduleConfig?: Partial<PostScheduleSheetConfig> | undefined;
-    recordsConfig?: Partial<PostRecordsSheetConfig> | undefined;
+    title?: string;
+    sheetId?: number;
+    sheetName?: string;
+    spreadsheetTitle?: string;
+    enabled?: boolean;
+    scheduleConfig?: Partial<PostScheduleSheetConfig>;
+    recordsConfig?: Partial<PostRecordsSheetConfig>;
   }): GoogleSheetLink;
   updateLinkRuntime(id: string, patch: Partial<GoogleSheetLinkRuntime>): GoogleSheetLink | null;
   deleteLink(id: string): boolean;
@@ -112,13 +112,12 @@ export interface GoogleSheetsRepositoryPort {
   saveImageCache(record: SheetImageCachePortRecord): void;
   countImageCache(): number;
   getScheduleItem(linkId: string, resourceCode: string): SheetScheduleItemPortRecord | null;
-  listScheduleItems(linkId: string, limit?: number): SheetScheduleItemPortRecord[];
   upsertScheduleItem(item: SheetScheduleItemPortRecord): SheetScheduleItemPortRecord;
   getRecordPost(linkId: string, postCode: string): SheetRecordPostPortRecord | null;
   listRecordPosts(linkId: string, limit?: number): SheetRecordPostPortRecord[];
   upsertRecordPost(record: SheetRecordPostPortRecord): SheetRecordPostPortRecord;
   appendLog(input: {
-    linkId?: string | null | undefined;
+    linkId?: string | null;
     level: 'info' | 'warn' | 'error';
     action: string;
     summary: string;
@@ -173,16 +172,17 @@ export interface GoogleSheetsApiPort {
 export interface SheetImageHostTestResult {
   remoteUrl: string;
   host: 'gyazo' | 'drive';
-  tokenIndex?: number | undefined;
-  tokenCount?: number | undefined;
-  fallbackFromGyazo?: boolean | undefined;
+  tokenIndex?: number;
+  tokenCount?: number;
+  fallbackFromGyazo?: boolean;
 }
 
 export interface SheetImageHostPort {
-  uploadDataUrlOrUrl(input: {
-    source: string;
-    filenameHint: string;
-  }): Promise<{ remoteUrl: string; host: 'gyazo' | 'drive'; cached: boolean } | null>;
+  uploadDataUrlOrUrl(input: { source: string; filenameHint: string }): Promise<{
+    remoteUrl: string;
+    host: 'gyazo' | 'drive';
+    cached: boolean;
+  } | null>;
   testUpload(): Promise<SheetImageHostTestResult>;
 }
 
@@ -202,7 +202,7 @@ export interface DirectPostBumpResult {
   bumped: boolean;
   liked: boolean;
   commented: boolean;
-  skippedReason?: string | undefined;
+  skippedReason?: string;
 }
 
 export interface ScrapedPostMetrics {
@@ -210,12 +210,11 @@ export interface ScrapedPostMetrics {
   postUrl: string;
   likes: number | null;
   comments: number | null;
-  needsAuthFallback?: boolean | undefined;
-  error?: string | undefined;
+  needsAuthFallback?: boolean;
+  error?: string;
 }
 
 export interface SheetAutomationBridgePort {
-  /** Execute a single scheduled material publish run on a specific browser profile (timeline + groups). */
   publishScheduledMaterial(input: {
     profileId: string;
     material: PosterMaterial;
@@ -223,36 +222,31 @@ export interface SheetAutomationBridgePort {
     onPosted: (log: PosterLog, isTimeline: boolean) => Promise<void>;
     onStatus: (text: string) => void;
     cancelled: () => boolean;
-  }): Promise<{ postedCount: number; timelinePosted: boolean; error?: string | undefined }>;
-  /** Prepare media (download Drive link / resolve local file) and generate thumbnail data URL. */
+  }): Promise<{ postedCount: number; timelinePosted: boolean; error?: string }>;
   prepareMaterialMedia(mediaSource: string): Promise<{
     localFilePath: string;
     mediaKind: 'image' | 'video';
     thumbnailDataUrl: string | null;
-    isTemporaryCache?: boolean | undefined;
+    isTemporaryCache?: boolean;
   }>;
-  /** Clean up temporary Drive-downloaded media file after publish finishes (never removes user local files). */
   cleanupPreparedMedia?(localFilePath: string): Promise<void>;
-  /** Execute direct-URL bumping on one browser profile for a batch of post URLs. */
   bumpDirectPosts(input: {
     profileId: string;
     posts: DirectPostBumpItem[];
     settings: BumperSettings;
     commentPool: string[];
     onPostBumped: (result: DirectPostBumpResult) => Promise<void>;
-    onCommentConsumed?: ((comment: string) => Promise<void>) | undefined;
+    onCommentConsumed?: (comment: string) => Promise<void>;
     onStatus: (text: string) => void;
     cancelled: () => boolean;
   }): Promise<DirectPostBumpResult[]>;
-  /** Account-free anonymous HTTP scraping for public Facebook posts/Reels/public groups (0 account risk). */
   scrapePublicPostMetrics?(input: {
     posts: Array<{ postCode: string; postUrl: string }>;
-    signal?: AbortSignal | undefined;
+    signal?: AbortSignal;
   }): Promise<ScrapedPostMetrics[]>;
-  /** Scrape engagement metrics (likes & comments) for a batch of post URLs using a logged-in browser (private-group fallback). */
   scrapePostMetrics(input: {
     profileId: string;
     posts: Array<{ postCode: string; postUrl: string }>;
-    signal?: AbortSignal | undefined;
+    signal?: AbortSignal;
   }): Promise<ScrapedPostMetrics[]>;
 }

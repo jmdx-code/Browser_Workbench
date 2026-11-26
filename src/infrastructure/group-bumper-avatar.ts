@@ -1,8 +1,15 @@
 import { MAX_ACCOUNT_AVATAR_BYTES } from '../shared/account-state-policy.js';
 import { isLocalAvatar, MAX_LOCAL_AVATAR_BYTES } from '../shared/group-bumper.js';
-
 export const MAX_AVATAR_DOWNLOAD_BYTES = 4 * 1024 * 1024; // 4MB
-
+const HTML_ENTITIES: Record<string, string> = {
+  quot: '"',
+  apos: "'",
+  '#039': "'",
+  lt: '<',
+  gt: '>',
+  nbsp: ' ',
+  amp: '&',
+};
 export function decodeHtmlEntities(raw: string): string {
   const decoded = raw
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => {
@@ -13,25 +20,10 @@ export function decodeHtmlEntities(raw: string): string {
       const code = Number.parseInt(dec, 10);
       return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : '';
     })
-    .replace(/&(quot|apos|#039|lt|gt|nbsp|amp);/gi, (full, entity: string) => {
-      switch (entity.toLowerCase()) {
-        case 'quot':
-          return '"';
-        case 'apos':
-        case '#039':
-          return "'";
-        case 'lt':
-          return '<';
-        case 'gt':
-          return '>';
-        case 'nbsp':
-          return ' ';
-        case 'amp':
-          return '&';
-        default:
-          return full;
-      }
-    })
+    .replace(
+      /&(quot|apos|#039|lt|gt|nbsp|amp);/gi,
+      (full, entity: string) => HTML_ENTITIES[entity.toLowerCase()] ?? full,
+    )
     .replace(/\s+/g, ' ')
     .replace(/^\(\d+\+?\)\s*/, '')
     .replace(/\s*[|-]\s*Facebook\s*$/i, '')
@@ -46,13 +38,11 @@ export function decodeHtmlEntities(raw: string): string {
   }
   return decoded;
 }
-
 export interface ResolvedTargetMetadata {
   canonicalId: string | null;
   name: string | null;
   avatarUrl: string | null;
 }
-
 export function parseTargetMetadataFromHtml(
   html: string,
   kind: 'groups' | 'pages',
@@ -61,13 +51,10 @@ export function parseTargetMetadataFromHtml(
   let canonicalId: string | null = null;
   let name: string | null = null;
   let avatarUrl: string | null = null;
-
-  const tags = html.match(/<meta\b[^>]*>/gi) ?? [];
-  for (const tag of tags) {
+  for (const tag of html.match(/<meta\b[^>]*>/gi) ?? []) {
     const prop = /(?:property|name)=["']([^"']+)["']/i.exec(tag)?.[1]?.toLowerCase() ?? '';
     const rawContent = /content=["']([^"']+)["']/i.exec(tag)?.[1] ?? '';
     if (!prop || !rawContent) continue;
-
     if (prop === 'al:android:url' || prop === 'al:ios:url') {
       const match =
         kind === 'pages'
@@ -84,7 +71,6 @@ export function parseTargetMetadataFromHtml(
       }
     }
   }
-
   if (!name) {
     const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
     if (titleMatch) {
@@ -92,9 +78,8 @@ export function parseTargetMetadataFromHtml(
       if (cleaned) name = cleaned;
     }
   }
-
-  const entities: Record<string, unknown>[] = [],
-    records = new Map<string, Record<string, unknown>>();
+  const entities: Record<string, unknown>[] = [];
+  const records = new Map<string, Record<string, unknown>>();
   let budget = 100000;
   const collect = (value: unknown, depth = 0) => {
     if (!value || typeof value !== 'object' || depth > 40 || --budget < 0) return;
@@ -120,16 +105,14 @@ export function parseTargetMetadataFromHtml(
     if (!value || typeof value !== 'object' || depth > 8) return null;
     const row = value as Record<string, unknown>;
     for (const key of ['uri', 'url']) {
-      const value = row[key];
+      const val = row[key];
       if (
-        typeof value === 'string' &&
-        /^https:\/\//.test(value) &&
-        !/^https:\/\/(?:www\.)?facebook\.com\//i.test(value) &&
-        !/static\.xx\.fbcdn\.net\/rsrc\.php/.test(value) &&
-        !/\/rsrc\.php\//i.test(value) &&
-        !/\/emoji\.php\//i.test(value)
+        typeof val === 'string' &&
+        /^https:\/\//.test(val) &&
+        !/^https:\/\/(?:www\.)?facebook\.com\//i.test(val) &&
+        !/static\.xx\.fbcdn\.net\/rsrc\.php|\/rsrc\.php\/|\/emoji\.php\//i.test(val)
       )
-        return value;
+        return val;
     }
     if (typeof row.__ref === 'string') return picture(records.get(row.__ref), depth + 1);
     for (const key of [
@@ -197,11 +180,14 @@ export function parseTargetMetadataFromHtml(
     });
     for (const [, value] of fields) entityAvatar ||= picture(value);
   }
-
   return { canonicalId, name, avatarUrl: entityAvatar ?? avatarUrl };
 }
-
-export async function localizeAvatarBytesToDataUrl(bytes: Uint8Array): Promise<string | null> {
+async function encodeAvatarBytesWithBudget(
+  bytes: Uint8Array,
+  maxDims: readonly number[],
+  qualities: readonly number[],
+  maxBytes: number,
+): Promise<string | null> {
   if (!bytes || bytes.byteLength < 16 || bytes.byteLength > MAX_AVATAR_DOWNLOAD_BYTES) return null;
   try {
     const { createCanvas, loadImage } = await import('@napi-rs/canvas');
@@ -210,29 +196,22 @@ export async function localizeAvatarBytesToDataUrl(bytes: Uint8Array): Promise<s
     const height = Number(image.height);
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 16 || height < 16)
       return null;
-
-    for (const maxDim of [256, 160, 128]) {
+    for (const maxDim of maxDims) {
       const scale = Math.min(1, maxDim / Math.max(width, height));
       const targetW = Math.max(1, Math.round(width * scale));
       const targetH = Math.max(1, Math.round(height * scale));
       const canvas = createCanvas(targetW, targetH);
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(image, 0, 0, targetW, targetH);
-
+      canvas.getContext('2d').drawImage(image, 0, 0, targetW, targetH);
       for (const mime of ['image/webp', 'image/jpeg'] as const) {
-        for (const quality of [80, 60]) {
+        for (const quality of qualities) {
           try {
             const encoded =
               mime === 'image/webp'
                 ? canvas.toBuffer('image/webp', quality)
                 : canvas.toBuffer('image/jpeg', quality);
             const dataUrl = `data:${mime};base64,${Buffer.from(encoded).toString('base64')}`;
-            if (isLocalAvatar(dataUrl) && dataUrl.length <= MAX_LOCAL_AVATAR_BYTES) {
-              return dataUrl;
-            }
-          } catch {
-            /* Try next format or quality */
-          }
+            if (isLocalAvatar(dataUrl) && dataUrl.length <= maxBytes) return dataUrl;
+          } catch {}
         }
       }
     }
@@ -241,42 +220,30 @@ export async function localizeAvatarBytesToDataUrl(bytes: Uint8Array): Promise<s
     return null;
   }
 }
-
+export const localizeAvatarBytesToDataUrl = (bytes: Uint8Array): Promise<string | null> =>
+  encodeAvatarBytesWithBudget(bytes, [256, 160, 128], [80, 60], MAX_LOCAL_AVATAR_BYTES);
+export const localizeAccountAvatarBytesToDataUrl = (bytes: Uint8Array): Promise<string | null> =>
+  encodeAvatarBytesWithBudget(bytes, [96, 80, 64], [80, 65], MAX_ACCOUNT_AVATAR_BYTES);
 const EXTERNAL_HIT_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
 const BROWSER_FALLBACK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
-
 async function readBoundedImageStream(
   response: Response,
   signal: AbortSignal,
 ): Promise<Uint8Array | null> {
-  if (!response.ok) {
+  const drop = async () => {
     await response.body?.cancel().catch(() => {});
     return null;
-  }
+  };
   if (
-    response.url &&
-    (/\/rsrc\.php\//i.test(response.url) ||
-      /\/emoji\.php\//i.test(response.url) ||
-      /\/login\b/i.test(response.url))
-  ) {
-    await response.body?.cancel().catch(() => {});
-    return null;
-  }
+    !response.ok ||
+    (response.url && /\/rsrc\.php\/|\/emoji\.php\/|\/login\b/i.test(response.url))
+  )
+    return drop();
   const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
-  if (!contentType.startsWith('image/') || contentType.startsWith('image/svg')) {
-    await response.body?.cancel().catch(() => {});
-    return null;
-  }
-  const contentLengthHeader = response.headers.get('content-length');
-  if (contentLengthHeader) {
-    const contentLength = Number.parseInt(contentLengthHeader, 10);
-    if (Number.isFinite(contentLength) && contentLength > MAX_AVATAR_DOWNLOAD_BYTES) {
-      await response.body?.cancel().catch(() => {});
-      return null;
-    }
-  }
-  if (!response.body) return null;
+  if (!contentType.startsWith('image/') || contentType.startsWith('image/svg')) return drop();
+  const cl = Number.parseInt(response.headers.get('content-length') ?? '', 10);
+  if ((Number.isFinite(cl) && cl > MAX_AVATAR_DOWNLOAD_BYTES) || !response.body) return drop();
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -300,34 +267,25 @@ async function readBoundedImageStream(
   } finally {
     reader.releaseLock();
   }
-  if (total < 16) return null;
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return merged;
+  return total < 16 ? null : Buffer.concat(chunks, total);
 }
-
-export async function fetchAndLocalizeAvatar(
+async function fetchLocalizedAvatarWithBudget(
   avatarUrl: string | null | undefined,
-  signal?: AbortSignal,
+  opts: {
+    timeoutMs: number;
+    signal?: AbortSignal;
+    encode: (bytes: Uint8Array) => Promise<string | null>;
+  },
 ): Promise<string | null> {
   if (typeof avatarUrl !== 'string') return null;
   const trimmed = avatarUrl.trim();
   if (!trimmed) return null;
   if (isLocalAvatar(trimmed)) return trimmed;
-  if (
-    !/^https?:\/\//i.test(trimmed) ||
-    /\/rsrc\.php\//i.test(trimmed) ||
-    /\/emoji\.php\//i.test(trimmed)
-  )
-    return null;
-
-  const timeoutSignal = AbortSignal.timeout(8_000);
-  const effectiveSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-
+  if (!/^https?:\/\//i.test(trimmed) || /\/rsrc\.php\/|\/emoji\.php\//i.test(trimmed)) return null;
+  const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+  const effectiveSignal = opts.signal
+    ? AbortSignal.any([opts.signal, timeoutSignal])
+    : timeoutSignal;
   for (const ua of [EXTERNAL_HIT_UA, BROWSER_FALLBACK_UA]) {
     if (effectiveSignal.aborted) return null;
     try {
@@ -340,61 +298,23 @@ export async function fetchAndLocalizeAvatar(
       });
       const bytes = await readBoundedImageStream(response, effectiveSignal);
       if (bytes) {
-        const localized = await localizeAvatarBytesToDataUrl(bytes);
+        const localized = await opts.encode(bytes);
         if (localized) return localized;
       }
-    } catch {
-      /* Try fallback UA or return null */
-    }
+    } catch {}
   }
   return null;
 }
-
+export const fetchAndLocalizeAvatar = (
+  avatarUrl: string | null | undefined,
+  signal?: AbortSignal,
+): Promise<string | null> =>
+  fetchLocalizedAvatarWithBudget(avatarUrl, {
+    timeoutMs: 8_000,
+    signal,
+    encode: localizeAvatarBytesToDataUrl,
+  });
 const accountAvatarSingleflight = new Map<string, Promise<string | null>>();
-
-export async function localizeAccountAvatarBytesToDataUrl(
-  bytes: Uint8Array,
-): Promise<string | null> {
-  if (!bytes || bytes.byteLength < 16 || bytes.byteLength > MAX_AVATAR_DOWNLOAD_BYTES) return null;
-  try {
-    const { createCanvas, loadImage } = await import('@napi-rs/canvas');
-    const image = await loadImage(Buffer.from(bytes));
-    const width = Number(image.width);
-    const height = Number(image.height);
-    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 16 || height < 16)
-      return null;
-
-    for (const maxDim of [96, 80, 64]) {
-      const scale = Math.min(1, maxDim / Math.max(width, height));
-      const targetW = Math.max(1, Math.round(width * scale));
-      const targetH = Math.max(1, Math.round(height * scale));
-      const canvas = createCanvas(targetW, targetH);
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(image, 0, 0, targetW, targetH);
-
-      for (const mime of ['image/webp', 'image/jpeg'] as const) {
-        for (const quality of [80, 65]) {
-          try {
-            const encoded =
-              mime === 'image/webp'
-                ? canvas.toBuffer('image/webp', quality)
-                : canvas.toBuffer('image/jpeg', quality);
-            const dataUrl = `data:${mime};base64,${Buffer.from(encoded).toString('base64')}`;
-            if (isLocalAvatar(dataUrl) && dataUrl.length <= MAX_ACCOUNT_AVATAR_BYTES) {
-              return dataUrl;
-            }
-          } catch {
-            /* Try next format or quality */
-          }
-        }
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 export async function fetchAndLocalizeAccountAvatar(
   avatarUrl: string | null | undefined,
   signal?: AbortSignal,
@@ -404,62 +324,20 @@ export async function fetchAndLocalizeAccountAvatar(
   const trimmed = avatarUrl.trim();
   if (!trimmed) return null;
   if (isLocalAvatar(trimmed)) return trimmed;
-  if (
-    !/^https?:\/\//i.test(trimmed) ||
-    /\/rsrc\.php\//i.test(trimmed) ||
-    /\/emoji\.php\//i.test(trimmed)
-  )
-    return null;
-
+  if (!/^https?:\/\//i.test(trimmed) || /\/rsrc\.php\/|\/emoji\.php\//i.test(trimmed)) return null;
   const key = singleflightKey ? `${singleflightKey}|${trimmed}` : trimmed;
   const existing = accountAvatarSingleflight.get(key);
   if (existing) return existing;
-
-  const task = (async (): Promise<string | null> => {
-    const timeoutSignal = AbortSignal.timeout(6_000);
-    const effectiveSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-    for (const ua of [EXTERNAL_HIT_UA, BROWSER_FALLBACK_UA]) {
-      if (effectiveSignal.aborted) return null;
-      try {
-        const response = await fetch(trimmed, {
-          signal: effectiveSignal,
-          headers: {
-            'User-Agent': ua,
-            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-          },
-        });
-        const bytes = await readBoundedImageStream(response, effectiveSignal);
-        if (bytes) {
-          const localized = await localizeAccountAvatarBytesToDataUrl(bytes);
-          if (localized) return localized;
-        }
-      } catch {
-        /* Try fallback UA or return null */
-      }
-    }
-    return null;
-  })().finally(() => {
+  const task = fetchLocalizedAvatarWithBudget(trimmed, {
+    timeoutMs: 6_000,
+    signal,
+    encode: localizeAccountAvatarBytesToDataUrl,
+  }).finally(() => {
     accountAvatarSingleflight.delete(key);
   });
-
   accountAvatarSingleflight.set(key, task);
   return task;
 }
-
-export async function verifyTargetAvatar(
-  url: string | null,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  if (!url || timeoutMs <= 0) return null;
-  if (isLocalAvatar(url)) return url.trim();
-  const timeoutSignal = AbortSignal.timeout(Math.max(1, timeoutMs));
-  const effectiveSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-  const localized = await fetchAndLocalizeAvatar(url, effectiveSignal);
-  if (localized) return localized;
-  return null;
-}
-
 export async function resolveBumperTargetMetadata(
   kind: 'groups' | 'pages',
   rawId: string,
@@ -473,44 +351,33 @@ export async function resolveBumperTargetMetadata(
       : /^\d+$/.test(id)
         ? `https://www.facebook.com/profile.php?id=${encodeURIComponent(id)}`
         : `https://www.facebook.com/${encodeURIComponent(id)}`;
-
   let canonicalId: string | null = null;
   let name: string | null = null;
   let rawAvatarUrl: string | null = null;
   const deadline = Date.now() + 8000;
-
   try {
     const htmlSignal = signal
       ? AbortSignal.any([signal, AbortSignal.timeout(6000)])
       : AbortSignal.timeout(6000);
     const response = await fetch(url, {
       signal: htmlSignal,
-      headers: {
-        'User-Agent': EXTERNAL_HIT_UA,
-        Accept: 'text/html,application/xhtml+xml',
-      },
+      headers: { 'User-Agent': EXTERNAL_HIT_UA, Accept: 'text/html,application/xhtml+xml' },
     });
     if (response.ok && !/\/login\b/i.test(response.url)) {
-      const html = await response.text();
-      const parsed = parseTargetMetadataFromHtml(html, kind, id);
+      const parsed = parseTargetMetadataFromHtml(await response.text(), kind, id);
       canonicalId = parsed.canonicalId;
       name = parsed.name;
       rawAvatarUrl = parsed.avatarUrl;
     }
-  } catch {
-    /* Network failure does not block target persistence */
-  }
-
+  } catch {}
   const graphTargetId = canonicalId && /^\d+$/.test(canonicalId) ? canonicalId : id;
   if (kind === 'pages' && (!rawAvatarUrl || !canonicalId) && /^\d+$/.test(graphTargetId)) {
     try {
-      const graphSignal = signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(Math.max(500, deadline - Date.now()))])
-        : AbortSignal.timeout(Math.max(500, deadline - Date.now()));
+      const timeout = AbortSignal.timeout(Math.max(500, deadline - Date.now()));
       const graphRes = await fetch(
         `https://graph.facebook.com/${encodeURIComponent(graphTargetId)}/picture?type=large&redirect=false`,
         {
-          signal: graphSignal,
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
           headers: { 'User-Agent': EXTERNAL_HIT_UA },
         },
       );
@@ -518,28 +385,17 @@ export async function resolveBumperTargetMetadata(
         const payload = (await graphRes.json()) as {
           data?: { url?: string; is_silhouette?: boolean };
         };
-        const picUrl = payload.data?.url;
-        if (picUrl?.startsWith('https://') && !payload.data?.is_silhouette) {
-          rawAvatarUrl ??= picUrl;
-        }
+        if (payload.data?.url?.startsWith('https://') && !payload.data?.is_silhouette)
+          rawAvatarUrl ??= payload.data.url;
       }
-    } catch {
-      /* Graph fallback is optional */
-    }
+    } catch {}
   }
-
-  const avatarUrl = rawAvatarUrl ? await fetchAndLocalizeAvatar(rawAvatarUrl, signal) : null;
-  return { canonicalId, name, avatarUrl };
+  return {
+    canonicalId,
+    name,
+    avatarUrl: rawAvatarUrl ? await fetchAndLocalizeAvatar(rawAvatarUrl, signal) : null,
+  };
 }
-
-export async function fetchBumperAvatar(
-  kind: 'groups' | 'pages',
-  id: string,
-): Promise<string | null> {
-  const resolved = await resolveBumperTargetMetadata(kind, id);
-  return resolved.avatarUrl;
-}
-
 export interface StartupAccountAvatarLocalizationDeps {
   repository: {
     profileAccountCache():
@@ -561,12 +417,7 @@ export interface StartupAccountAvatarLocalizationDeps {
   inspection?: {
     syncExternalObservation(
       profileId: string,
-      observed: {
-        state: 'logged-in';
-        id?: string | null;
-        name?: string | null;
-        avatar: string;
-      },
+      observed: { state: 'logged-in'; id?: string | null; name?: string | null; avatar: string },
     ): void;
   };
   graphAvatarLookup?: (accountId: string) => Promise<string | null>;
@@ -574,11 +425,9 @@ export interface StartupAccountAvatarLocalizationDeps {
   forceInTests?: boolean;
   isShuttingDown: () => boolean;
 }
-
 export interface StartupAccountAvatarLocalizationHandle {
   cancel(): void;
 }
-
 export function scheduleStartupAccountAvatarLocalization(
   deps: StartupAccountAvatarLocalizationDeps,
 ): StartupAccountAvatarLocalizationHandle {
@@ -624,9 +473,8 @@ export function scheduleStartupAccountAvatarLocalization(
               deps.graphAvatarLookup
             ) {
               const graphResult = await deps.graphAvatarLookup(row.id.trim()).catch(() => null);
-              if (graphResult && isLocalAvatar(graphResult)) {
-                localized = graphResult;
-              } else if (graphResult && graphResult.startsWith('https://')) {
+              if (graphResult && isLocalAvatar(graphResult)) localized = graphResult;
+              else if (graphResult && graphResult.startsWith('https://')) {
                 localized = await fetchAndLocalizeAccountAvatar(
                   graphResult,
                   abortController.signal,
@@ -656,9 +504,7 @@ export function scheduleStartupAccountAvatarLocalization(
           }
         };
         await Promise.all(Array.from({ length: Math.min(3, entries.length) }, () => worker()));
-      } catch {
-        // Silent background localization; preserve existing remote avatar on any error.
-      }
+      } catch {}
     })();
   }, deps.delayMs ?? 5_000);
   timer.unref();

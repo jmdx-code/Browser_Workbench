@@ -1,190 +1,67 @@
 import type { SynchronousRepository } from '../domain/persistence.js';
 import { TaskRecordReader } from './task-record-reader.js';
-import { CheckpointCommitQueue } from './checkpoint-commit-queue.js';
-import { classifySqliteInertAuxiliaryBrowseOperation } from './inert-browse-operation.js';
-import type { DatabaseSync } from 'node:sqlite';
-import { createHash, randomUUID } from 'node:crypto';
-import { z } from 'zod';
-import { Action, canonicalAction, isWrite } from '../shared/browser-actions.js';
-import {
-  BrowsePendingDiagnostic,
-  BrowseOperationIntent,
-  isRecoverableBrowseFault,
-  type PendingDiagnostic,
-} from '../shared/browse-execution.js';
-import { validateBrowseIntent } from '../domain/browse-policy.js';
-import { FACEBOOK_REEL_NEXT_CSS } from '../shared/facebook-browse-route.js';
-import { OwnedTabProof } from '../shared/kernel-state.js';
-import { TaskChildPageLifecycle } from '../shared/task-child-page.js';
-import { sameTabProof } from '../domain/task-tabs.js';
-import {
-  BoundReceipt,
-  DispatchBinding,
-  ExecutionContext,
-  sameBinding,
-  sameExecution,
-  type Binding,
-  type ExecutionReceipt,
-  type ExecutionSession,
-} from '../shared/task-execution.js';
-import { CombinationSchema, type Step } from '../shared/contracts.js';
-import { TaskStepV2 } from '../shared/task-step-instance.js';
-import {
-  AssignTasks,
-  ProfileTaskResult,
-  SchedulerSettings,
-  TaskEvent,
-  TaskOperation,
-  TaskPlan,
-  TaskProgress,
-  TaskRuntimeEvent,
-  type Assignment,
-  type Operation,
-  type Plan,
-  type Progress,
-  type RuntimeEvent,
-  type RuntimeRequest,
-  type Settings,
-  type StepInstance,
-} from '../shared/task-contracts.js';
-import {
-  TaskStepFailure,
-  TaskStepSkip,
-  isMarketplaceUnavailableSkip,
-} from '../shared/task-step-outcome.js';
-import {
-  emptyProgress,
-  orderedSteps,
-  stepComplete,
-  terminal,
-  validateProgress,
-  type RuntimeProfile,
-  type RuntimeSnapshotResult,
-  TaskRepository as CompatibleTaskRepository,
-} from '../domain/tasks.js';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
+import { TaskStepV2 } from '../shared/task-policies.js';
+import * as TC from '../shared/task-contracts.js';
+import * as DT from '../domain/tasks.js';
 import { ProductError } from '../domain/workspace.js';
-import { needsResourceTable } from '../domain/task-resources.js';
 import { SqliteTaskResourceRepository } from './task-resource-store.js';
-import { isUncommittedTransaction, readSnapshot, transaction } from './sqlite-transaction.js';
+import { isUncommittedTransaction, transaction } from './sqlite-transaction.js';
 import { prepareCached } from './sqlite-statement-cache.js';
+import * as Q from './persistence/sqlite-query-helpers.js';
 import { TaskTiming } from '../shared/task-timing.js';
-import { taskTimingEligibility } from '../domain/task-timing.js';
-import { cancelNeverDispatchedPost } from './material-post-cancellation.js';
-import { endPostWithoutSubmit } from './material-post-cancellation.js';
-import {
-  CurrentStopReceipt,
-  OperationDisposition,
-  type CurrentStop,
-} from '../shared/task-ending.js';
-import { SqliteSettlementRepository } from './settlement-store.js';
-import {
-  assertPostPreparation,
-  assertPostDispatch,
-  assertPostSettlement,
-  postLink,
-} from './material-post-guards.js';
-import { isErroredPausedPlan } from '../shared/task-issues.js';
+import { taskTimingEligibility } from '../domain/system-ports.js';
+import * as Ops from './stores/task-store-operations.js';
 
-type Dependencies = { id(): string; now(): number; random(): number };
-type RuntimeAnchor = { seq: number; jobId: string; createdAt: number };
-type RuntimeCursorPayload = {
-  v: 4;
-  epoch: string;
-  seq: number;
-  anchor: RuntimeAnchor | null;
-  first: RuntimeAnchor | null;
-};
-function classifyRuntimeEvent(type: string): RuntimeEvent['category'] {
-  if (type === 'STOPPED' || type === 'COMPLETED' || type === 'FAILED') return 'PLAN_TERMINAL';
-  if (type.startsWith('STEP_') || type === 'ROUND_CREATED' || type === 'CHECKPOINT')
-    return 'STEP_EVENT';
-  if (type.startsWith('OPERATION_') || type.startsWith('CHILD_PAGE_') || type.startsWith('BROWSE_'))
-    return 'OPERATION_EVENT';
-  return 'PLAN_STATE';
-}
-function encodeRuntimeCursor(payload: RuntimeCursorPayload): string {
-  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-}
-function decodeRuntimeCursor(raw: string): RuntimeCursorPayload | null {
-  try {
-    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as unknown;
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    const obj = parsed as Record<string, unknown>;
-    if (
-      obj.v !== 4 ||
-      typeof obj.epoch !== 'string' ||
-      typeof obj.seq !== 'number' ||
-      !Number.isInteger(obj.seq) ||
-      obj.seq < 0
-    )
-      return null;
-    const checkAnchor = (val: unknown): RuntimeAnchor | null | undefined => {
-      if (val === null) return null;
-      if (typeof val !== 'object' || val === null) return undefined;
-      const a = val as Record<string, unknown>;
-      if (
-        typeof a.seq === 'number' &&
-        Number.isInteger(a.seq) &&
-        a.seq > 0 &&
-        typeof a.jobId === 'string' &&
-        typeof a.createdAt === 'number'
-      )
-        return { seq: a.seq, jobId: a.jobId, createdAt: a.createdAt };
-      return undefined;
-    };
-    const anchor = checkAnchor(obj.anchor);
-    const first = checkAnchor(obj.first);
-    if (anchor === undefined || first === undefined) return null;
-    return { v: 4, epoch: obj.epoch, seq: obj.seq, anchor, first };
-  } catch {
-    return null;
+const mapStepRow = (row: Record<string, unknown>): TC.StepInstance =>
+  TaskStepV2.parse(Q.camel(row, '', 'spec,progress,outcome', 'outcome'));
+
+const lruGet = <T>(map: Map<string, T>, key: string): T | undefined => {
+  const val = map.get(key);
+  if (val !== undefined) {
+    map.delete(key);
+    map.set(key, val);
   }
-}
-const CancelledBrowseReceipt = z
-  .object({ binding: DispatchBinding, reason: z.literal('USER_STOP') })
-  .strict();
+  return val;
+};
+const lruSet = <T>(map: Map<string, T>, key: string, val: T): void => {
+  map.set(key, val);
+  if (map.size > 1024) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+};
+
 export class SqliteTaskRepository implements TaskRepository {
   readonly recordReader: TaskRecordReader;
-  finalRecords(id: string, round: number) {
-    const row = this.db
-      .prepare(
-        'SELECT records FROM task_run_summaries WHERE job_id=? AND round=? AND details_pruned=1',
-      )
-      .get(id, round);
-    return row
-      ? (JSON.parse(String(row.records)) as import('../shared/task-contracts.js').TaskRecord[])
-      : null;
-  }
-  private stmt(sql: string) {
-    return prepareCached(this.db, sql);
-  }
-  hiddenRecordIds() {
-    return this.stmt("SELECT name FROM sqlite_master WHERE name='task_record_deletions'").get()
-      ? this.stmt('SELECT step_id FROM task_record_deletions')
-          .all()
-          .map((r) => String(r.step_id))
-      : [];
-  }
-  recordsPage(
-    input: unknown,
-    profiles: readonly import('../domain/task-record-projection.js').RecordProfile[],
-  ) {
-    return this.recordReader.page(input, profiles);
-  }
-  readonly settlements: SqliteSettlementRepository;
   readonly resources: SqliteTaskResourceRepository;
   private readonly instanceEpoch = randomUUID().slice(0, 8);
-  private readonly checkpointQueue: CheckpointCommitQueue;
+  private hasCloseBrowserColumnCache: boolean | null = null;
+  private readonly planRowCache = new Map<string, { key: string; plan: TC.Plan }>();
+  private readonly batchTimingCache = new Map<
+    string,
+    {
+      body: string | null;
+      parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
+      timingReleased: boolean;
+    }
+  >();
+
   constructor(
     private readonly db: DatabaseSync,
-    private readonly dependencies: Dependencies = {
+    private readonly dependencies: Ops.TaskStoreDependencies = {
       id: randomUUID,
       now: Date.now,
       random: Math.random,
     },
   ) {
-    this.checkpointQueue = new CheckpointCommitQueue(db);
-    this.settlements = new SqliteSettlementRepository(db, dependencies);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS task_account_likes( account_id TEXT NOT NULL, target_key TEXT NOT NULL, liked_at INTEGER NOT NULL, PRIMARY KEY(account_id, target_key) );
+      CREATE INDEX IF NOT EXISTS task_account_likes_time ON task_account_likes(liked_at);
+      CREATE TABLE IF NOT EXISTS direct_material_publications( id TEXT PRIMARY KEY, job_id TEXT NOT NULL, step_id TEXT NOT NULL, account_id TEXT NOT NULL, combination_id TEXT NOT NULL, fingerprint TEXT NOT NULL, post_id TEXT NOT NULL, usage_generation INTEGER NOT NULL DEFAULT 0, usage_source_key TEXT NOT NULL, allow_repeat INTEGER NOT NULL DEFAULT 0, resource_origin TEXT, created_at INTEGER NOT NULL );
+      CREATE INDEX IF NOT EXISTS direct_pub_source ON direct_material_publications(usage_source_key, usage_generation); CREATE INDEX IF NOT EXISTS direct_pub_account_fp ON direct_material_publications(account_id, fingerprint);
+    `);
     this.resources = new SqliteTaskResourceRepository(db);
     this.recordReader = new TaskRecordReader(
       db,
@@ -193,14 +70,59 @@ export class SqliteTaskRepository implements TaskRepository {
       () => this.cacheStateToken(),
     );
   }
-  private event(id: string, type: string, detail: Operation['receipt'] = null) {
+
+  private ctx(): Ops.TaskStoreContext {
+    return {
+      db: this.db,
+      dependencies: this.dependencies,
+      instanceEpoch: this.instanceEpoch,
+      resources: this.resources,
+      stmt: this.stmt,
+      getPlan: (id) => this.get(id),
+      livePlans: this.livePlans,
+      plansForBatch: this.plansForBatch,
+      plansForProfile: (p, s) => this.plansForProfile(p, s),
+      currentStepForPlan: (id, r, pos) => this.currentStepForPlan(id, r, pos),
+      currentStep: (p, sid) => this.currentStep(p, sid),
+      steps: (id, r) => this.steps(id, r),
+      createRound: (p, r) => this.createRound(p, r),
+      state: (id, s, r) => this.state(id, s, r),
+      event: (id, t, d) => this.event(id, t, d),
+      unlock: this.unlock,
+      settings: this.settings,
+      invalidateBatchTimingCache: (b) => this.invalidateBatchTimingCache(b),
+      hasCloseBrowserColumn: this.hasCloseBrowserColumn,
+    };
+  }
+  finalRecords(id: string, round: number) {
+    const row = this.db
+      .prepare(
+        'SELECT records FROM task_run_summaries WHERE job_id=? AND round=? AND details_pruned=1',
+      )
+      .get(id, round);
+    return row ? (JSON.parse(String(row.records)) as TC.TaskRecord[]) : null;
+  }
+  private stmt = (sql: string) => prepareCached(this.db, sql);
+  hiddenRecordIds = () =>
+    Q.sqliteTableExists(this.db, 'task_record_deletions')
+      ? this.stmt('SELECT step_id FROM task_record_deletions')
+          .all()
+          .map((r) => String(r.step_id))
+      : [];
+  recordsPage = (
+    input: unknown,
+    profiles: readonly import('../domain/task-record-projection.js').RecordProfile[],
+  ) => this.recordReader.page(input, profiles);
+  private hasCloseBrowserColumn = (): boolean =>
+    (this.hasCloseBrowserColumnCache ??= Q.tableColumns(this.db, 'task_plans').has(
+      'close_browser_on_finish',
+    ));
+  private event(id: string, type: string, detail: TC.Operation['receipt'] = null) {
     if (type === 'SCHEDULE_RELEASED') {
-      // Release affects every plan of this batch only; other batches keep their caches.
       const batchId =
         this.planRowCache.get(id)?.plan.batchId ??
         this.stmt('SELECT batch_id FROM task_plans WHERE id=?').get(id)?.batch_id;
-      if (typeof batchId === 'string') this.invalidateBatchTimingCache(batchId);
-      else this.invalidateBatchTimingCache();
+      this.invalidateBatchTimingCache(typeof batchId === 'string' ? batchId : undefined);
     }
     this.stmt('INSERT INTO task_events(job_id,type,detail,created_at) VALUES(?,?,?,?)').run(
       id,
@@ -221,58 +143,7 @@ export class SqliteTaskRepository implements TaskRepository {
       if (plan.state === 'RUNNING' && plan.reason !== bounded) this.state(id, 'RUNNING', bounded);
     });
   }
-  retainedTaskPage(profileId: string) {
-    const row = this.stmt(
-      "SELECT o.proof FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE s.profile_id=? AND s.state='RELEASED' AND s.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1",
-    ).get(profileId);
-    return row ? OwnedTabProof.parse(JSON.parse(String(row.proof))) : null;
-  }
-  canRestartStoryPage(jobId: string, input: import('../shared/kernel-state.js').TabProof): boolean {
-    const proof = OwnedTabProof.parse(input),
-      plan = this.get(jobId);
-    if (plan.profileId !== proof.profileId || !plan.accountId || plan.state !== 'RUNNING')
-      return false;
-    // Read only the most recent prior owner of this exact page; never scan profile history
-    // or fall back to an older safe attempt past a newer, unresolved one.
-    const previous = this.stmt(
-      `SELECT o.job_id,o.account_id,o.proof,p.state
-      FROM task_tab_ownership o JOIN task_tab_state t USING(ownership_id,job_id)
-      JOIN task_plans p ON p.id=o.job_id
-      WHERE o.ownership_id=? AND o.job_id<>? AND t.state='RELEASED'
-      AND t.release_receipt IS NOT NULL ORDER BY o.created_at DESC,o.job_id DESC LIMIT 1`,
-    ).get(proof.ownershipId, jobId);
-    if (
-      !previous ||
-      previous.state !== 'FAILED' ||
-      previous.account_id !== plan.accountId ||
-      !sameTabProof(OwnedTabProof.parse(JSON.parse(String(previous.proof))), proof)
-    )
-      return false;
-    const step = this.stmt(
-      `SELECT id,spec,outcome FROM task_steps WHERE job_id=?
-      AND status='FAILED' ORDER BY round DESC,position DESC LIMIT 1`,
-    ).get(String(previous.job_id));
-    if (!step) return false;
-    const spec = JSON.parse(String(step.spec)) as { type?: string; destination?: string };
-    const outcome = TaskStepFailure.safeParse(
-      step.outcome ? JSON.parse(String(step.outcome)) : null,
-    );
-    if (
-      spec.type !== 'post' ||
-      spec.destination !== 'story' ||
-      !outcome.success ||
-      outcome.data.submissionPhase !== 'BEFORE_SUBMIT' ||
-      outcome.data.businessResult !== 'NOT_PUBLISHED'
-    )
-      return false;
-    const attempt = this.stmt(
-      `SELECT i.attempt_id,v.outcome FROM material_post_intents i
-      LEFT JOIN material_attempt_verdicts v USING(attempt_id) WHERE i.job_id=? AND i.step_id=?
-      ORDER BY i.created_at DESC,i.attempt_id DESC LIMIT 1`,
-    ).get(String(previous.job_id), String(step.id));
-    return !attempt || attempt.outcome === 'NOT_PUBLISHED';
-  }
-  private state(id: string, state: Plan['state'], reason: string) {
+  private state(id: string, state: TC.Plan['state'], reason: string) {
     this.stmt('UPDATE task_plans SET state=?,reason=?,updated_at=? WHERE id=?').run(
       state,
       reason,
@@ -281,18 +152,9 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     this.event(id, state, { reason });
   }
-  private unlock(id: string) {
+  private unlock = (id: string) => {
     this.stmt('DELETE FROM task_account_locks WHERE job_id=?').run(id);
-  }
-  private readonly planRowCache = new Map<string, { key: string; plan: Plan }>();
-  private readonly batchTimingCache = new Map<
-    string,
-    {
-      body: string | null;
-      parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
-      timingReleased: boolean;
-    }
-  >();
+  };
   invalidateBatchTimingCache(batchId?: string) {
     if (batchId === undefined) {
       this.batchTimingCache.clear();
@@ -304,101 +166,91 @@ export class SqliteTaskRepository implements TaskRepository {
       if (entry.plan.batchId === batchId) this.planRowCache.delete(id);
   }
   ensurePlanExists(id: string): void {
-    const row = this.stmt('SELECT 1 FROM task_plans WHERE id=?').get(id);
-    if (!row) {
+    if (!this.stmt('SELECT 1 FROM task_plans WHERE id=?').get(id)) {
       this.planRowCache.delete(id);
       throw new ProductError('TASK_NOT_FOUND', '任务计划不存在', 404);
     }
   }
-  private resolveBatchTiming(batchId: string): {
-    body: string | null;
-    parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
-    timingReleased: boolean;
-  } {
+  private resolveBatchTiming(batchId: string) {
     const inWriteTx = isUncommittedTransaction(this.db);
-    if (inWriteTx) {
-      this.batchTimingCache.delete(batchId);
-    } else {
-      const cached = this.batchTimingCache.get(batchId);
-      if (cached !== undefined) {
-        this.batchTimingCache.delete(batchId);
-        this.batchTimingCache.set(batchId, cached);
-        return cached;
-      }
+    if (inWriteTx) this.batchTimingCache.delete(batchId);
+    else {
+      const cached = lruGet(this.batchTimingCache, batchId);
+      if (cached !== undefined) return cached;
     }
-    const timingRow = this.stmt('SELECT body FROM task_batch_timing WHERE batch_id=?').get(batchId);
-    const body = timingRow ? String(timingRow.body) : null;
+    const timingRow = this.stmt('SELECT body FROM task_batch_timing WHERE batch_id=?').get(batchId),
+      body = timingRow ? String(timingRow.body) : null;
     const parsedTiming = body !== null ? TaskTiming.parse(JSON.parse(body)) : undefined;
-    const timingReleased =
-      body !== null
-        ? Boolean(
-            this.stmt(
-              "SELECT e.sequence FROM task_events e JOIN task_plans p ON p.id=e.job_id WHERE p.batch_id=? AND e.type='SCHEDULE_RELEASED' LIMIT 1",
-            ).get(batchId),
-          )
-        : false;
-    const entry = { body, parsedTiming, timingReleased };
-    if (!inWriteTx) {
-      this.batchTimingCache.set(batchId, entry);
-      while (this.batchTimingCache.size > 1024) {
-        const oldest = this.batchTimingCache.keys().next().value;
-        if (oldest === undefined) break;
-        this.batchTimingCache.delete(oldest);
-      }
-    }
+    const relSql =
+      "SELECT e.sequence FROM task_events e JOIN task_plans p ON p.id=e.job_id WHERE p.batch_id=? AND e.type='SCHEDULE_RELEASED' LIMIT 1";
+    const entry = {
+      body,
+      parsedTiming,
+      timingReleased: body !== null && Boolean(this.stmt(relSql).get(batchId)),
+    };
+    if (!inWriteTx) lruSet(this.batchTimingCache, batchId, entry);
     return entry;
   }
-  private parsePlanRow(row: Record<string, unknown>): Plan {
-    const id = String(row.id);
-    const batchId = String(row.batch_id);
-    const inWriteTx = isUncommittedTransaction(this.db);
-    if (inWriteTx) {
-      this.planRowCache.delete(id);
-    }
-    const timingInfo = this.resolveBatchTiming(batchId);
-    const cacheKey = `${String(row.state)}:${String(row.updated_at)}:${String(row.reason)}:${String(row.control_mode)}:${String(row.control_request_id ?? '')}:${String(row.control_confirmed)}:${String(row.round)}:${String(row.position)}:${timingInfo.body ?? ''}:${String(timingInfo.timingReleased)}`;
+  private parsePlanRow(row: Record<string, unknown>): TC.Plan {
+    const id = String(row.id),
+      inWriteTx = isUncommittedTransaction(this.db);
+    if (inWriteTx) this.planRowCache.delete(id);
+    const timingInfo = this.resolveBatchTiming(String(row.batch_id)),
+      closeBrowserOnFinish = row.close_browser_on_finish === 1;
+    const cacheKey = [
+      row.state,
+      row.updated_at,
+      row.reason,
+      row.control_mode,
+      row.control_request_id ?? '',
+      row.control_confirmed,
+      row.round,
+      row.position,
+      timingInfo.body ?? '',
+      timingInfo.timingReleased,
+      closeBrowserOnFinish ? '1' : '0',
+    ]
+      .map(String)
+      .join(':');
     if (!inWriteTx) {
       const cached = this.planRowCache.get(id);
-      if (cached?.key === cacheKey) {
-        this.planRowCache.delete(id);
-        this.planRowCache.set(id, cached);
-        return cached.plan;
-      }
+      if (cached?.key === cacheKey) return lruGet(this.planRowCache, id)?.plan ?? cached.plan;
     }
-    const plan = TaskPlan.parse({
-      id: row.id,
+    const rs = String(row.state),
+      mappedState: TC.Plan['state'] =
+        rs === 'QUEUED' ||
+        rs === 'RUNNING' ||
+        rs === 'STOPPED' ||
+        rs === 'COMPLETED' ||
+        rs === 'FAILED'
+          ? rs
+          : 'STOPPED';
+    const plan = TC.TaskPlan.parse({
+      id,
       batchId: row.batch_id,
       profileId: row.profile_id,
       combinationId: row.combination_id,
       version: row.version,
       accountId: row.account_id,
       snapshot: JSON.parse(String(row.snapshot)) as unknown,
-      state: row.state,
+      state: mappedState,
       reason: row.reason,
       controlMode: row.control_mode,
       controlRequestId: row.control_request_id,
-      controlConfirmed: row.control_confirmed === 1,
+      controlConfirmed: Q.b(row.control_confirmed),
       round: row.round,
       position: row.position,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       ...(timingInfo.parsedTiming !== undefined
-        ? {
-            timing: timingInfo.parsedTiming,
-            timingReleased: timingInfo.timingReleased,
-          }
+        ? { timing: timingInfo.parsedTiming, timingReleased: timingInfo.timingReleased }
         : {}),
+      ...(closeBrowserOnFinish ? { closeBrowserOnFinish: true } : {}),
     });
-    if (!inWriteTx) {
-      this.planRowCache.set(id, { key: cacheKey, plan });
-      if (this.planRowCache.size > 1024) {
-        const oldest = this.planRowCache.keys().next().value;
-        if (oldest !== undefined) this.planRowCache.delete(oldest);
-      }
-    }
+    if (!inWriteTx) lruSet(this.planRowCache, id, { key: cacheKey, plan });
     return plan;
   }
-  get(id: string): Plan {
+  get(id: string): TC.Plan {
     const row = this.stmt('SELECT * FROM task_plans WHERE id=?').get(id);
     if (!row) {
       this.planRowCache.delete(id);
@@ -406,282 +258,121 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     return this.parsePlanRow(row);
   }
-  batchExists(batchId: string): boolean {
-    return Boolean(
+  batchExists = (batchId: string): boolean =>
+    Boolean(
       this.stmt(
         'SELECT 1 FROM task_batches WHERE id=? UNION ALL SELECT 1 FROM task_plans WHERE batch_id=? LIMIT 1',
       ).get(batchId, batchId),
     );
-  }
-  plansForBatch(batchId: string): Plan[] {
-    return this.stmt('SELECT * FROM task_plans WHERE batch_id=? ORDER BY created_at,rowid')
+  plansForBatch = (batchId: string): TC.Plan[] =>
+    this.stmt('SELECT * FROM task_plans WHERE batch_id=? ORDER BY created_at,rowid')
       .all(batchId)
-      .map((row) => this.parsePlanRow(row));
-  }
-  plansForProfile(profileId: string, states?: readonly Plan['state'][]): Plan[] {
+      .map((r) => this.parsePlanRow(r));
+  plansForProfile(profileId: string, states?: readonly TC.Plan['state'][]): TC.Plan[] {
     if (states !== undefined) {
-      if (states.length === 0) return [];
-      const placeholders = states.map(() => '?').join(',');
+      if (!states.length) return [];
+      const sql = `SELECT * FROM task_plans WHERE profile_id=? AND state IN (${states.map(() => '?').join(',')}) ORDER BY created_at,rowid`;
       return this.db
-        .prepare(
-          `SELECT * FROM task_plans WHERE profile_id=? AND state IN (${placeholders}) ORDER BY created_at,rowid`,
-        )
+        .prepare(sql)
         .all(profileId, ...states)
-        .map((row) => this.parsePlanRow(row));
+        .map((r) => this.parsePlanRow(r));
     }
     return this.stmt('SELECT * FROM task_plans WHERE profile_id=? ORDER BY created_at,rowid')
       .all(profileId)
-      .map((row) => this.parsePlanRow(row));
+      .map((r) => this.parsePlanRow(r));
   }
-  historyPlans(profileId: string, selectedId?: string): Plan[] {
-    const rows = this.db
-      .prepare(
-        `SELECT p.* FROM task_plans p WHERE p.profile_id=? AND
-      (p.state NOT IN ('STOPPED','COMPLETED','FAILED') OR NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round)
-       OR EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id)))
-      ORDER BY p.created_at DESC,p.id DESC LIMIT 51`,
-      )
-      .all(profileId);
+  historyPlans(profileId: string, selectedId?: string): TC.Plan[] {
+    const sql = `SELECT p.* FROM task_plans p WHERE p.profile_id=? AND (p.state NOT IN ('STOPPED','COMPLETED','FAILED') OR NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round) OR EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id))) ORDER BY p.created_at DESC,p.id DESC LIMIT 51`;
+    const rows = this.db.prepare(sql).all(profileId);
     if (selectedId && !rows.some((r) => r.id === selectedId)) {
       const row = this.db
         .prepare('SELECT * FROM task_plans WHERE id=? AND profile_id=?')
         .get(selectedId, profileId);
       if (row) {
-        const visible =
-          !['STOPPED', 'COMPLETED', 'FAILED'].includes(String(row.state)) ||
-          !this.db
-            .prepare('SELECT 1 FROM task_steps WHERE job_id=? AND round=? LIMIT 1')
-            .get(selectedId, Number(row.round)) ||
-          !!this.db
-            .prepare(
-              'SELECT 1 FROM task_steps s WHERE s.job_id=? AND s.round=? AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id) LIMIT 1',
-            )
-            .get(selectedId, Number(row.round));
-        if (visible || rows.length === 0) rows.push(row);
+        const visSql =
+          'SELECT 1 FROM task_steps s WHERE s.job_id=? AND s.round=? AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id) LIMIT 1';
+        const round = Number(row.round),
+          visible =
+            !['STOPPED', 'COMPLETED', 'FAILED'].includes(String(row.state)) ||
+            !this.db
+              .prepare('SELECT 1 FROM task_steps WHERE job_id=? AND round=? LIMIT 1')
+              .get(selectedId, round) ||
+            Boolean(this.db.prepare(visSql).get(selectedId, round));
+        if (visible || !rows.length) rows.push(row);
       }
     }
     return rows.map((r) => this.parsePlanRow(r));
   }
-  hasProfilePlanInStates(profileId: string, states: readonly Plan['state'][]): boolean {
-    if (states.length === 0) return false;
-    const placeholders = states.map(() => '?').join(',');
-    return Boolean(
-      this.db
-        .prepare(
-          `SELECT 1 FROM task_plans WHERE profile_id=? AND state IN (${placeholders}) LIMIT 1`,
-        )
-        .get(profileId, ...states),
-    );
-  }
-  hasPlanOrOperation(jobId: string, operationId: string): boolean {
-    return Boolean(
-      this.stmt(
-        'SELECT 1 FROM task_plans WHERE id=? UNION ALL SELECT 1 FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.id=? LIMIT 1',
-      ).get(jobId, operationId),
-    );
-  }
-  list() {
-    return this.stmt('SELECT * FROM task_plans ORDER BY created_at,rowid')
+  hasProfilePlanInStates = (profileId: string, states: readonly TC.Plan['state'][]): boolean => {
+    const sql = `SELECT 1 FROM task_plans WHERE profile_id=? AND state IN (${states.map(() => '?').join(',')}) LIMIT 1`;
+    return states.length > 0 && Boolean(this.db.prepare(sql).get(profileId, ...states));
+  };
+  hasPlanOrOperation = (jobId: string, operationId: string): boolean => {
+    const sql =
+      'SELECT 1 FROM task_plans WHERE id=? UNION ALL SELECT 1 FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.id=? LIMIT 1';
+    return Boolean(this.stmt(sql).get(jobId, operationId));
+  };
+  list = () =>
+    this.stmt('SELECT * FROM task_plans ORDER BY created_at,rowid')
       .all()
-      .map((row) => this.parsePlanRow(row));
-  }
+      .map((r) => this.parsePlanRow(r));
   releaseScheduled() {
-    // Read-only prefilter: no write transaction (and no cache invalidation) unless at least
-    // one queued timed plan is due to open or has missed its window.
     const candidates = this.livePlans().filter(
-      (row) =>
-        row.state === 'QUEUED' &&
-        row.timing &&
-        !row.timingReleased &&
-        taskTimingEligibility(row.timing, this.dependencies.now()) !== 'WAIT',
+      (r) =>
+        r.state === 'QUEUED' &&
+        r.timing &&
+        !r.timingReleased &&
+        taskTimingEligibility(r.timing, this.dependencies.now()) !== 'WAIT',
     );
     if (!candidates.length) return;
     transaction(this.db, () => {
       for (const plan of candidates) {
-        // The activation marker is an append-only original task event. After release,
-        // concurrency/offline queueing does not turn the other 49 plans into missed jobs.
-        const current = this.get(plan.id);
-        if (current.state !== 'QUEUED' || !current.timing || current.timingReleased) continue;
-        const eligibility = taskTimingEligibility(current.timing, this.dependencies.now());
-        if (eligibility === 'OPEN') {
-          this.event(current.id, 'SCHEDULE_RELEASED');
-          this.invalidateBatchTimingCache(current.batchId);
-        } else if (eligibility === 'MISSED') {
-          this.state(current.id, 'FAILED', 'SCHEDULE_MISSED');
-          this.invalidateBatchTimingCache(current.batchId);
+        const cur = this.get(plan.id);
+        if (cur.state !== 'QUEUED' || !cur.timing || cur.timingReleased) continue;
+        const el = taskTimingEligibility(cur.timing, this.dependencies.now());
+        if (el === 'OPEN') {
+          this.event(cur.id, 'SCHEDULE_RELEASED');
+          this.invalidateBatchTimingCache(cur.batchId);
+        } else if (el === 'MISSED') {
+          this.state(cur.id, 'FAILED', 'SCHEDULE_MISSED');
+          this.invalidateBatchTimingCache(cur.batchId);
         }
       }
     });
   }
-  livePlans() {
-    return this.stmt(
-      "SELECT * FROM task_plans WHERE state NOT IN ('STOPPED','COMPLETED','FAILED') ORDER BY created_at,rowid",
-    )
+  livePlans = () => {
+    const sql =
+      "SELECT * FROM task_plans WHERE state NOT IN ('STOPPED','COMPLETED','FAILED') ORDER BY created_at,rowid";
+    return this.stmt(sql)
       .all()
-      .map((row) => this.parsePlanRow(row));
+      .map((r) => this.parsePlanRow(r));
+  };
+  cacheStateToken = (): string | null =>
+    this.db.isTransaction
+      ? null
+      : `${this.instanceEpoch}:${String(this.stmt('PRAGMA data_version').get()?.data_version)}:${String(this.stmt('SELECT total_changes() AS n').get()?.n)}`;
+  currentStepForPlan(id: string, round: number, position: number): TC.StepInstance | null {
+    const sql = 'SELECT * FROM task_steps WHERE job_id=? AND round=? AND position=?';
+    const row = this.stmt(sql).get(id, round, position);
+    return row ? mapStepRow(row) : null;
   }
-  cacheStateToken(): string | null {
-    if (this.db.isTransaction) return null;
-    return `${this.instanceEpoch}:${String(this.stmt('PRAGMA data_version').get()?.data_version)}:${String(this.stmt('SELECT total_changes() AS n').get()?.n)}`;
-  }
-  currentStepForPlan(id: string, round: number, position: number): StepInstance | null {
-    const row = this.stmt('SELECT * FROM task_steps WHERE job_id=? AND round=? AND position=?').get(
-      id,
-      round,
-      position,
-    );
-    return row
-      ? TaskStepV2.parse({
-          id: row.id,
-          jobId: row.job_id,
-          round: row.round,
-          position: row.position,
-          spec: JSON.parse(String(row.spec)),
-          status: row.status,
-          progress: JSON.parse(String(row.progress)),
-          ...(row.outcome ? { outcome: JSON.parse(String(row.outcome)) } : {}),
-        })
-      : null;
-  }
-  runtimeSnapshot(options: RuntimeRequest = {}): RuntimeSnapshotResult {
-    return readSnapshot(this.db, () => {
-      const high = Number(
-        this.stmt('SELECT coalesce(max(sequence),0) AS n FROM task_events').get()?.n ?? 0,
-      );
-      const anchor = (seq: number): RuntimeAnchor | null => {
-        const row = this.stmt(
-          'SELECT sequence,job_id,created_at FROM task_events WHERE sequence=?',
-        ).get(seq);
-        return row
-          ? {
-              seq: Number(row.sequence),
-              jobId: String(row.job_id),
-              createdAt: Number(row.created_at),
-            }
-          : null;
-      };
-      const firstRow = this.stmt(
-        'SELECT sequence FROM task_events ORDER BY sequence LIMIT 1',
-      ).get();
-      const first = firstRow ? anchor(Number(firstRow.sequence)) : null;
-      const previous = options.cursor ? decodeRuntimeCursor(options.cursor) : null;
-      const resetRequired = Boolean(
-        options.cursor &&
-        (!previous ||
-          previous.epoch !== this.instanceEpoch ||
-          previous.seq > high ||
-          JSON.stringify(previous.first) !== JSON.stringify(first) ||
-          JSON.stringify(previous.anchor) !== JSON.stringify(anchor(previous.seq))),
-      );
-      // A new reader replays from zero, including terminal events; the UI drains bounded pages.
-      const after = resetRequired ? 0 : (previous?.seq ?? options.afterSequence ?? 0);
-      if (after > high)
-        throw new ProductError('RUNTIME_CURSOR_INVALID', '任务游标已失效，请重新读取', 409);
-      const rows = this.stmt(
-        'SELECT sequence,job_id,type,created_at FROM task_events WHERE sequence>? ORDER BY sequence LIMIT ?',
-      ).all(after, options.limit ?? 100);
-      const events: RuntimeEvent[] = [];
-      let bytes = 2,
-        scanned = after;
-      for (const row of rows) {
-        // UI replay carries identities/categories, never large receipts or arbitrary event detail.
-        const event = TaskRuntimeEvent.parse({
-          sequence: row.sequence,
-          jobId: row.job_id,
-          type: row.type,
-          detail: null,
-          createdAt: row.created_at,
-          category: classifyRuntimeEvent(String(row.type)),
-        });
-        const size = Buffer.byteLength(JSON.stringify(event)) + 1;
-        if (bytes + size > (options.maxBytes ?? 65536)) {
-          if (!events.length)
-            throw new ProductError('RUNTIME_EVENT_TOO_LARGE', '事件摘要超过本页预算', 413);
-          break;
-        }
-        events.push(event);
-        bytes += size;
-        scanned = event.sequence;
-      }
-      const plans = this.livePlans();
-      const terminalIds = [
-        ...new Set(events.filter((e) => e.category === 'PLAN_TERMINAL').map((e) => e.jobId)),
-      ];
-      const recentTerminalPlans = terminalIds
-        .map((id) => this.get(id))
-        .filter((plan) => terminal(plan.state));
-      return {
-        settings: this.settings(),
-        plans,
-        currentSteps: plans.flatMap((plan) => {
-          const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
-          return step ? [step] : [];
-        }),
-        recentTerminalPlans,
-        profileResults: this.stmt(
-          `SELECT profile_id AS profileId,source,run_id AS runId,
-          name,state,reason,finished_at AS finishedAt,failed_steps AS failedSteps,skipped_steps AS skippedSteps FROM profile_task_results`,
-        )
-          .all()
-          .map((row) => ProfileTaskResult.parse(row)),
-        events,
-        lastEventSequence: high,
-        lastScannedSequence: scanned,
-        hasMore: scanned < high,
-        resetRequired,
-        visibleTerminalFloorSequence: 0,
-        epoch: this.instanceEpoch,
-        cursor: encodeRuntimeCursor({
-          v: 4,
-          epoch: this.instanceEpoch,
-          seq: scanned,
-          anchor: anchor(scanned),
-          first,
-        }),
-      };
+  runtimeSnapshot = (options: TC.RuntimeRequest = {}): DT.RuntimeSnapshotResult =>
+    Ops.buildTaskRuntimeSnapshot(this.ctx(), options);
+  settings = () => {
+    const sql = 'SELECT max_concurrent_profiles FROM scheduler_settings WHERE id=1';
+    return TC.SchedulerSettings.parse({
+      maxConcurrentProfiles: this.stmt(sql).get()?.max_concurrent_profiles,
     });
-  }
-  releaseErroredPausedPlans(profileIds: readonly string[]): number {
-    const targetIds = new Set(profileIds);
-    if (!targetIds.size) return 0;
-    return transaction(this.db, () => {
-      let released = 0;
-      for (const plan of this.livePlans()) {
-        if (!targetIds.has(plan.profileId)) continue;
-        if (isErroredPausedPlan(plan) && !this.unresolved(plan.id)) {
-          this.state(plan.id, 'STOPPED', plan.reason);
-          this.unlock(plan.id);
-          released += 1;
-        }
-      }
-      return released;
-    });
-  }
-  settings() {
-    const row = this.stmt(
-      'SELECT max_concurrent_profiles FROM scheduler_settings WHERE id=1',
-    ).get();
-    return SchedulerSettings.parse({ maxConcurrentProfiles: row?.max_concurrent_profiles });
-  }
-  setSettings(value: Settings) {
-    const parsed = SchedulerSettings.parse(value);
-    this.stmt('UPDATE scheduler_settings SET max_concurrent_profiles=? WHERE id=1').run(
-      parsed.maxConcurrentProfiles,
-    );
-  }
+  };
+  setSettings = (value: TC.Settings) => {
+    const n = TC.SchedulerSettings.parse(value).maxConcurrentProfiles;
+    this.stmt('UPDATE scheduler_settings SET max_concurrent_profiles=? WHERE id=1').run(n);
+  };
   events(id: string) {
     this.ensurePlanExists(id);
     return this.stmt('SELECT * FROM task_events WHERE job_id=? ORDER BY sequence')
       .all(id)
-      .map((row) =>
-        TaskEvent.parse({
-          sequence: row.sequence,
-          jobId: row.job_id,
-          type: row.type,
-          detail: JSON.parse(String(row.detail)) as unknown,
-          createdAt: row.created_at,
-        }),
-      );
+      .map((r) => TC.TaskEvent.parse(Q.camel(r, '', 'detail')));
   }
   steps(id: string, round?: number) {
     this.ensurePlanExists(id);
@@ -692,1617 +383,140 @@ export class SqliteTaskRepository implements TaskRepository {
             id,
             round,
           );
-    return rows.map((row) =>
-      TaskStepV2.parse({
-        id: row.id,
-        jobId: row.job_id,
-        round: row.round,
-        position: row.position,
-        spec: JSON.parse(String(row.spec)) as unknown,
-        status: row.status,
-        progress: JSON.parse(String(row.progress)) as unknown,
-        ...(row.outcome ? { outcome: JSON.parse(String(row.outcome)) as unknown } : {}),
-      }),
-    );
+    return rows.map(mapStepRow);
   }
-  private currentStep(plan: Plan, stepId?: string) {
+  private currentStep(plan: TC.Plan, stepId?: string) {
     const step = this.steps(plan.id, plan.round).find((item) => item.position === plan.position);
     if (!step || (stepId && step.id !== stepId))
       throw new ProductError('STALE_STEP', '子任务已变化', 409);
     return step;
   }
-  private createRound(plan: Plan, round: number) {
-    const order = orderedSteps(
+  private createRound(plan: TC.Plan, round: number) {
+    const order = DT.orderedSteps(
       plan.snapshot.steps,
       plan.snapshot.randomOrder,
       this.dependencies.random,
     );
-    for (const [position, spec] of order.entries())
-      this.stmt(
-        'INSERT INTO task_steps(id,job_id,round,position,spec,status,progress) VALUES(?,?,?,?,?,?,?)',
-      ).run(
-        this.dependencies.id(),
-        plan.id,
-        round,
-        position,
-        JSON.stringify(spec),
-        'PENDING',
-        JSON.stringify(emptyProgress()),
-      );
+    const ins = this.stmt(
+      'INSERT INTO task_steps(id,job_id,round,position,spec,status,progress) VALUES(?,?,?,?,?,?,?)',
+    );
+    const empty = JSON.stringify(DT.emptyProgress());
+    for (const [pos, spec] of order.entries())
+      ins.run(this.dependencies.id(), plan.id, round, pos, JSON.stringify(spec), 'PENDING', empty);
     this.event(plan.id, 'ROUND_CREATED', { round, stepIds: order.map((step) => step.id) });
   }
-  assign(input: Assignment, profiles: RuntimeProfile[]) {
-    const request = AssignTasks.parse(input);
-    request.profileIds = [...new Set(request.profileIds)].sort();
-    const serialized = JSON.stringify(request);
-    const runtime = new Map(profiles.map((profile) => [profile.id, profile]));
-    return transaction(this.db, () => {
-      const previous = this.stmt('SELECT request FROM task_batches WHERE id=?').get(
-        request.requestId,
+  assign = (input: TC.Assignment, profiles: DT.RuntimeProfile[]) =>
+    Ops.assignTaskBatch(this.ctx(), input, profiles);
+  claimPlanForProfile = (profileId: string, accountId: string | null): TC.Plan | null =>
+    Ops.claimTaskPlanForProfile(this.ctx(), profileId, accountId, () => this.releaseScheduled());
+  bindPlanAccount = (id: string, accountId: string): TC.Plan =>
+    Ops.bindTaskPlanAccount(this.ctx(), id, accountId);
+  updateStepProgress = (id: string, stepId: string, progress: TC.Progress): void => {
+    Ops.updateTaskStepProgress(this.ctx(), id, stepId, progress);
+  };
+  completeStepDirect = (id: string, stepId: string, finalProgress?: TC.Progress): TC.Plan =>
+    Ops.completeTaskStepDirect(this.ctx(), id, stepId, finalProgress);
+  skipStepDirect = (
+    id: string,
+    stepId: string,
+    reason:
+      | 'DEPENDENCY_FAILED'
+      | 'RESOURCE_EXHAUSTED'
+      | 'FEATURE_UNAVAILABLE'
+      | 'MARKETPLACE_UNAVAILABLE',
+    dependencyStepId?: string,
+  ): TC.Plan => Ops.skipTaskStepDirect(this.ctx(), id, stepId, reason, dependencyStepId);
+  failStepDirect = (
+    id: string,
+    stepId: string,
+    reason: string,
+    businessResult: 'NOT_APPLICABLE' | 'PUBLISHED' | 'NOT_PUBLISHED' | 'UNKNOWN' = 'NOT_APPLICABLE',
+  ): TC.Plan => Ops.failTaskStepDirect(this.ctx(), id, stepId, reason, businessResult);
+  stopPlanDirect = (id: string, reason = 'USER_STOP'): TC.Plan =>
+    Ops.stopTaskPlanDirect(this.ctx(), id, reason);
+  failPlanDirect = (id: string, reason: string): TC.Plan =>
+    Ops.failTaskPlanDirect(this.ctx(), id, reason);
+  recordAccountLike = (accountId: string, targetKey: string): void => {
+    this.stmt('INSERT OR IGNORE INTO task_account_likes VALUES(?,?,?)').run(
+      accountId,
+      targetKey,
+      this.dependencies.now(),
+    );
+  };
+  hasAccountLiked = (accountId: string, targetKey: string): boolean =>
+    Boolean(
+      this.stmt('SELECT 1 FROM task_account_likes WHERE account_id=? AND target_key=? LIMIT 1').get(
+        accountId,
+        targetKey,
+      ),
+    );
+  recordDirectPublication(input: DT.DirectPublicationInput): void {
+    transaction(this.db, () => {
+      const gen = Number(
+        this.stmt('SELECT generation FROM material_usage_policy WHERE id=1').get()?.generation ?? 0,
       );
-      if (previous) {
-        if (previous.request !== serialized)
-          throw new ProductError('BATCH_ID_CONFLICT', '提交标识对应的参数不同', 409);
-        return this.plansForBatch(request.requestId);
-      }
-      if (request.profileIds.some((id) => !runtime.has(id)))
-        throw new ProductError('PROFILE_NOT_FOUND', '分配中包含不存在的资料', 404);
-      const saved = this.stmt(
-        'SELECT body FROM combination_versions WHERE combination_id=? AND version=?',
-      ).get(request.combinationId, request.version);
-      if (!saved) throw new ProductError('COMBINATION_VERSION_NOT_FOUND', '保存版本不存在', 404);
-      const snapshot = CombinationSchema.parse(JSON.parse(String(saved.body)) as unknown);
-      const resourceRevision = this.resources.assertAssignment(request, snapshot);
-      if (
-        this.livePlans().some(
-          (plan) => request.profileIds.includes(plan.profileId) && !terminal(plan.state),
-        )
-      )
-        throw new ProductError('PROFILE_PLAN_BUSY', '部分资料已有未结束计划，请先停止原计划', 409);
-      this.stmt('INSERT INTO task_batches VALUES(?,?,?)').run(
-        request.requestId,
-        serialized,
-        this.dependencies.now(),
-      );
-      this.invalidateBatchTimingCache(request.requestId);
-      if (request.timing) {
-        if (request.timing.mode === 'at' && request.timing.startAt < this.dependencies.now())
-          throw new ProductError('SCHEDULE_PAST_TIME', '请选择未来的启动时间', 409);
-        this.stmt('INSERT INTO task_batch_timing VALUES(?,?)').run(
-          request.requestId,
-          JSON.stringify(request.timing),
-        );
-      }
-      return request.profileIds.map((profileId) => {
-        const profile = runtime.get(profileId);
-        if (!profile) throw new ProductError('PROFILE_NOT_FOUND', '资料不存在', 404);
-        const accountId = profile.account.state === 'logged-in' ? profile.account.id : null;
-        const id = this.dependencies.id(),
-          now = this.dependencies.now();
-        this.stmt(
-          "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?)",
-        ).run(
-          id,
-          request.requestId,
-          profileId,
-          request.combinationId,
-          request.version,
-          accountId,
-          JSON.stringify(snapshot),
-          now,
-          now,
-        );
-        const plan = this.get(id);
-        if (resourceRevision !== null) this.resources.insert(plan, resourceRevision);
-        this.createRound(plan, 1);
-        this.event(id, 'ASSIGNED', {
-          version: plan.version,
-          ...(resourceRevision !== null ? { resourceRevision } : {}),
-        });
-        return plan;
+      const cols =
+        'id,job_id,step_id,account_id,combination_id,fingerprint,post_id,usage_generation,usage_source_key,allow_repeat,resource_origin,created_at';
+      Q.insertFrom(this.db, 'direct_material_publications', cols, input, {
+        id: input.id ?? this.dependencies.id(),
+        usage_generation: gen,
+        resource_origin: input.resourceOrigin ? JSON.stringify(input.resourceOrigin) : null,
+        created_at: this.dependencies.now(),
       });
     });
   }
-  private waitingReason(
-    plan: Plan,
-    profile: RuntimeProfile | undefined,
-    supported: ReadonlySet<Step['type']>,
-    sourceCapabilities?: { resourceTables: boolean },
-  ) {
-    if (!profile?.online) return 'OFFLINE';
-    if (!profile.synced || profile.unresolved) return 'RECONCILIATION_REQUIRED';
-    if (profile.account.state !== 'logged-in' || !profile.account.id) return 'IDENTITY_REQUIRED';
-    if (needsResourceTable(plan.snapshot)) {
-      if (!this.resources.binding(plan.id)) return 'RESOURCE_BINDING_REQUIRED';
-      if (!sourceCapabilities?.resourceTables) return 'RESOURCE_TABLE_EXECUTOR_REQUIRED';
-    }
-    if (!plan.snapshot.steps.every((step) => supported.has(step.type))) return 'EXECUTOR_REQUIRED';
-    if (!profile.dispatchAllowed) return 'CHANNEL_NOT_READY';
-    return '';
+  private hasPublication(where: string, ...args: SQLInputValue[]): boolean {
+    const gen = '(SELECT generation FROM material_usage_policy WHERE id=1)';
+    const sql = `SELECT 1 FROM direct_material_publications WHERE ${where} AND usage_generation=${gen} UNION ALL SELECT 1 FROM material_publications WHERE ${where} AND usage_generation=${gen} LIMIT 1`;
+    return Boolean(this.stmt(sql).get(...args, ...args));
   }
-  claimNext(
-    profiles: RuntimeProfile[],
-    supported: ReadonlySet<Step['type']>,
-    sourceCapabilities?: { resourceTables: boolean; profileId?: string },
-  ) {
-    this.releaseScheduled();
-    return transaction(this.db, () => {
-      const runtime = new Map(profiles.map((profile) => [profile.id, profile]));
-      const active = Number(
-        this.db
-          .prepare(
-            "SELECT count(*) AS count FROM task_plans WHERE state IN ('RUNNING','PAUSING','STOPPING') OR (state='REVIEW' AND control_confirmed=0)",
-          )
-          .get()?.count,
-      );
-      for (const plan of this.livePlans().filter((row) => row.state === 'QUEUED')) {
-        // A per-profile runner may claim only its own plan. Keep the full runtime inventory
-        // for account/transport checks without changing other queued profiles' reasons.
-        if (sourceCapabilities?.profileId && plan.profileId !== sourceCapabilities.profileId)
-          continue;
-        const timing = taskTimingEligibility(
-          plan.timing,
-          this.dependencies.now(),
-          plan.timingReleased === true,
-          // Queued members of an already released batch keep their original queue position.
-        );
-        if (timing !== 'OPEN') {
-          const reason = timing === 'MISSED' ? 'SCHEDULE_MISSED' : 'SCHEDULE_WAITING';
-          if (plan.reason !== reason)
-            this.state(plan.id, timing === 'MISSED' ? 'FAILED' : 'QUEUED', reason);
-          continue;
-        }
-        const profile = runtime.get(plan.profileId);
-        if (
-          plan.accountId &&
-          profile?.account.state === 'logged-in' &&
-          profile.account.id &&
-          profile.account.id !== plan.accountId
-        ) {
-          this.state(plan.id, 'STOPPED', 'ACCOUNT_CHANGED');
-          this.unlock(plan.id);
-          continue;
-        }
-        let reason = this.waitingReason(plan, profile, supported, sourceCapabilities);
-        if (!reason && active >= this.settings().maxConcurrentProfiles)
-          reason = 'CONCURRENCY_LIMIT';
-        const accountId = profile?.account.id;
-        if (
-          !reason &&
-          accountId &&
-          this.db.prepare('SELECT job_id FROM task_account_locks WHERE account_id=?').get(accountId)
-        )
-          reason = 'ACCOUNT_BUSY';
-        if (reason) {
-          if (plan.reason !== reason) this.state(plan.id, 'QUEUED', reason);
-          continue;
-        }
-        if (!accountId) throw new ProductError('IDENTITY_REQUIRED', '需要确认账号身份', 409);
-        this.db.prepare('INSERT INTO task_account_locks VALUES(?,?)').run(accountId, plan.id);
-        this.db
-          .prepare(
-            'UPDATE task_plans SET account_id=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
-          )
-          .run(accountId, plan.id);
-        const step = this.currentStep(plan);
-        this.db.prepare("UPDATE task_steps SET status='ACTIVE' WHERE id=?").run(step.id);
-        this.state(plan.id, 'RUNNING', '');
-        return this.get(plan.id);
-      }
-      return null;
-    });
-  }
-  reviewFailedAdmission(id: string, expectedAccountId: string, reason: string) {
-    return transaction(this.db, () => {
-      const plan = this.get(id);
-      // A competing stop/identity change owns its existing state. Admission failure is
-      // not proof that a native owner stopped or that an unknown creation never happened.
-      if (plan.state !== 'RUNNING' || plan.accountId !== expectedAccountId) return plan;
-      if (this.blockingOperations(id).length)
-        throw Error('ADMISSION_FAILURE_OPERATION_ALREADY_EXISTS');
-      this.state(id, 'REVIEW', ('INITIAL_SESSION_FAILED:' + reason).slice(0, 200));
-      return this.get(id); // Keep the original account lock and all native tab evidence.
-    });
-  }
-  unresolved(id: string) {
-    return (
-      Boolean(
-        this.db
-          .prepare(
-            "SELECT attempt_id FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
-          )
-          .get(id),
-      ) ||
-      this.blockingOperations(id).some((op) =>
-        ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status),
-      )
-    );
-  }
-  // Material verdicts can resolve a stopped attempt without a dispatched final submit operation.
-  finishResolvedPostControl(id: string) {
-    transaction(this.db, () => {
-      const plan = this.get(id);
-      if (plan.state === 'REVIEW' && plan.controlConfirmed && !this.unresolved(id))
-        this.finishControl(plan);
-    });
-  }
-  private cancelPrepared(id: string) {
-    this.db
-      .prepare(
-        "UPDATE task_outbox SET status='CANCELLED',updated_at=? WHERE job_id=? AND status='PREPARED'",
-      )
-      .run(this.dependencies.now(), id);
-  }
-  private control(id: string, mode: 'pause' | 'stop', reason: string) {
-    const plan = this.get(id);
-    if (terminal(plan.state)) return plan;
-    if (plan.state === 'STOPPING' || (plan.state === 'PAUSING' && mode === 'pause')) return plan;
-    this.cancelPrepared(id);
-    // Cancel only fresh local reservations with no dispatch history. Historical REVIEW
-    // and every bound operation remain untouched; physical stop still needs its receipt.
-    const operations = this.operations(id);
-    for (const row of this.db
-      .prepare("SELECT attempt_id FROM material_reservations WHERE job_id=? AND state='RESERVED'")
-      .all(id))
-      cancelNeverDispatchedPost(this.db, String(row.attempt_id), operations);
-    this.db
-      .prepare(
-        "UPDATE material_reservations SET state='REVIEW',reason='CONTROL_REQUESTED',updated_at=? WHERE job_id=? AND state='RESERVED'",
-      )
-      .run(this.dependencies.now(), id);
-    this.db.prepare('UPDATE task_plans SET control_mode=? WHERE id=?').run(mode, id);
-    if (plan.state === 'REVIEW' && plan.controlConfirmed) {
-      // The native owner already stopped. Changing desired disposition needs no new input/stop;
-      // unresolved side effects still hold REVIEW and the account lock until independent verdict.
-      this.finishControl(this.get(id));
-      return this.get(id);
-    }
-    if (['QUEUED', 'PAUSED'].includes(plan.state) && !this.unresolved(id)) {
-      this.state(id, mode === 'stop' ? 'STOPPED' : 'PAUSED', reason);
-      this.unlock(id);
-    } else {
-      this.db
-        .prepare('UPDATE task_plans SET control_request_id=?,control_confirmed=0 WHERE id=?')
-        .run(this.dependencies.id(), id);
-      this.state(id, mode === 'stop' ? 'STOPPING' : 'PAUSING', reason);
-    }
-    return this.get(id);
-  }
-  requestControl(id: string, mode: 'pause' | 'stop', reason = 'USER_REQUEST') {
-    return transaction(this.db, () => this.control(id, mode, reason));
-  }
-  private finishControl(plan: Plan) {
-    if (this.unresolved(plan.id)) {
-      const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
-      const pending = this.blockingOperations(plan.id);
-      if (
-        step &&
-        step.spec.type !== 'post' &&
-        pending.length > 0 &&
-        pending.every((op) => op.status !== 'UNKNOWN' && this.isInertAuxiliaryBrowseOperation(op))
-      ) {
-        this.settleTransientBrowseOperations(plan.id, plan.reason || 'CONTROL_CONFIRMED');
-      }
-    }
-    if (this.unresolved(plan.id)) {
-      this.state(plan.id, 'REVIEW', 'UNRESOLVED_OPERATION');
-      return;
-    }
-    this.state(plan.id, plan.controlMode === 'stop' ? 'STOPPED' : 'PAUSED', plan.reason);
-    if (!this.stepEnding(plan.id)) this.unlock(plan.id);
-  }
-  confirmControl(id: string, requestId: string) {
-    return transaction(this.db, () => {
-      const plan = this.get(id);
-      if (!['PAUSING', 'STOPPING'].includes(plan.state))
-        throw new ProductError('CONTROL_NOT_PENDING', '没有待确认的停止控制', 409);
-      if (requestId !== plan.controlRequestId)
-        throw new ProductError('STALE_CONTROL_CONFIRMATION', '停止回执已过期', 409);
-      this.db.prepare('UPDATE task_plans SET control_confirmed=1 WHERE id=?').run(id);
-      this.event(id, 'CONTROL_CONFIRMED');
-      this.finishControl(this.get(id));
-      return this.get(id);
-    });
-  }
-  resume(id: string) {
-    return transaction(this.db, () => {
-      const plan = this.get(id);
-      if (plan.state !== 'PAUSED' || this.unresolved(id))
-        throw new ProductError('TASK_RESUME_REJECTED', '任务需先核对或不能继续', 409);
-      this.db
-        .prepare(
-          'UPDATE task_plans SET control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
-        )
-        .run(id);
-      this.state(id, 'QUEUED', 'USER_RESUMED');
-      return this.get(id);
-    });
-  }
-  reconcileProfileRuntime(profile: RuntimeProfile) {
-    this.reconcileRuntime([profile], profile.id);
-  }
-  reconcileRuntime(profiles: RuntimeProfile[], onlyProfileId?: string) {
-    transaction(this.db, () => {
-      const runtime = new Map(profiles.map((profile) => [profile.id, profile]));
-      const plans =
-        onlyProfileId === undefined
-          ? this.livePlans().filter((row) => row.state === 'RUNNING')
-          : this.plansForProfile(onlyProfileId, ['RUNNING']);
-      for (const plan of plans) {
-        const profile = runtime.get(plan.profileId);
-        if (
-          profile?.account.state === 'logged-in' &&
-          profile.account.id &&
-          profile.account.id !== plan.accountId
-        ) {
-          this.control(plan.id, 'stop', 'ACCOUNT_CHANGED');
-          continue;
-        }
-        const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
-        const isBrowseStep = step !== null && step.spec.type !== 'post';
-        if (
-          isBrowseStep &&
-          profile?.online === true &&
-          !['logged-out', 'restricted', 'verification'].includes(profile.account.state)
-        ) {
-          if (
-            (profile.unresolved > 0 ||
-              ((profile.openingPlanId === plan.id || !profile.dispatchAllowed) &&
-                this.blockingOperations(plan.id).length > 0)) &&
-            this.settleTransientBrowseOperations(plan.id, 'RUNTIME_RECONCILE_TRANSIENT_BROWSE')
-          ) {
-            profile.unresolved = 0;
-          }
-          if (profile.openingPlanId === plan.id) {
-            continue;
-          }
-        }
-        if (
-          profile?.openingPlanId === plan.id &&
-          profile.online &&
-          profile.synced &&
-          !profile.unresolved &&
-          this.blockingOperations(plan.id).length === 0
-        )
-          continue; // The bounded startup read has no registered actor or input permission yet.
-        else if (
-          !profile?.online ||
-          !profile.synced ||
-          profile.unresolved ||
-          profile.account.state !== 'logged-in' ||
-          !profile.account.id ||
-          !profile.dispatchAllowed
-        )
-          this.control(
-            plan.id,
-            'pause',
-            profile?.unreadyReason?.slice(0, 200) || 'RUNTIME_NOT_READY',
-          );
-      }
-    });
-  }
+  hasAccountPublishedFingerprint = (accountId: string, fingerprint: string): boolean =>
+    this.hasPublication('account_id=? AND fingerprint=?', accountId, fingerprint);
+  isMaterialSourceUsed = (usageSourceKey: string): boolean =>
+    this.hasPublication('usage_source_key=?', usageSourceKey);
   recoverOnStartup(preserveFutureSchedules = true) {
     this.invalidateBatchTimingCache();
     transaction(this.db, () => {
+      const now = this.dependencies.now();
       for (const plan of this.livePlans()) {
-        this.cancelStepContinuation(plan.id); // Boot may finish stopping, never automatically resume business.
         if (
           preserveFutureSchedules &&
           plan.state === 'QUEUED' &&
           plan.timing &&
-          !plan.timingReleased &&
-          this.operations(plan.id).length === 0
+          !plan.timingReleased
         ) {
-          const timing = taskTimingEligibility(plan.timing, this.dependencies.now());
-          if (timing === 'WAIT') continue; // Future scheduled work has never been admitted.
-          if (this.stopOfflineBrowse(plan.id, 'SCHEDULE_MISSED_ON_RESTART')) continue;
-        }
-        const restartReason =
-          this.blockingOperations(plan.id).some((op) => op.status !== 'PREPARED') ||
-          ['STOPPING', 'PAUSING'].includes(plan.state) ||
-          ['SOFTWARE_RESTART_UNCERTAIN', 'STOP_CONFIRMATION_REQUIRED'].includes(plan.reason)
-            ? 'SOFTWARE_RESTART_BROWSE_CANCELLED'
-            : 'SOFTWARE_RESTART_STOPPED';
-        if (this.stopOfflineBrowse(plan.id, restartReason)) continue;
-        this.db
-          .prepare(
-            "UPDATE material_reservations SET state='REVIEW',reason='SOFTWARE_RESTART',updated_at=? WHERE job_id=? AND state='RESERVED'",
-          )
-          .run(this.dependencies.now(), plan.id);
-        this.cancelPrepared(plan.id);
-        this.db
-          .prepare(
-            "UPDATE task_outbox SET status='UNKNOWN',updated_at=? WHERE job_id=? AND status IN ('DISPATCHING','ACKNOWLEDGED')",
-          )
-          .run(this.dependencies.now(), plan.id);
-        if (this.unresolved(plan.id)) {
-          this.db
-            .prepare(
-              "UPDATE task_plans SET control_mode=coalesce(control_mode,'pause'),control_request_id=NULL,control_confirmed=0 WHERE id=?",
-            )
-            .run(plan.id);
-          this.state(plan.id, 'REVIEW', 'SOFTWARE_RESTART_UNCERTAIN');
-        } else if (
-          ['STOPPING', 'PAUSING'].includes(plan.state) ||
-          (plan.state === 'REVIEW' && !plan.controlConfirmed)
-        ) {
-          this.db.prepare('UPDATE task_plans SET control_request_id=NULL WHERE id=?').run(plan.id);
-          this.state(plan.id, 'REVIEW', 'STOP_CONFIRMATION_REQUIRED');
-        } else {
-          this.db
-            .prepare(
-              "UPDATE task_plans SET control_mode='pause',control_request_id=NULL,control_confirmed=0 WHERE id=?",
-            )
-            .run(plan.id);
-          this.state(plan.id, 'PAUSED', 'SOFTWARE_RESTART');
-          this.unlock(plan.id);
-        }
-      }
-    });
-  }
-  stopOfflineBrowse(
-    id: string,
-    reason = 'OFFLINE_BROWSE_CANCELLED',
-    options?: { expectedUpdatedAt?: number; reviewIfBlocked?: boolean },
-  ): Plan | null {
-    const inspect = () => {
-      const plan = this.get(id);
-      const pending = this.blockingOperations(id).filter((op) => op.status !== 'PREPARED');
-      const blocked =
-        Boolean(
-          this.db
-            .prepare(
-              "SELECT 1 FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
-            )
-            .get(id),
-        ) || pending.some((op) => !this.isInertAuxiliaryBrowseOperation(op));
-      return { plan, pending, blocked };
-    };
-    const stale = (plan: Plan) =>
-      options?.expectedUpdatedAt !== undefined && plan.updatedAt !== options.expectedUpdatedAt;
-    const before = inspect();
-    if (terminal(before.plan.state)) return before.plan;
-    if (stale(before.plan)) return null;
-    // Keep already-reviewed/offline plans read-only, including avoiding an empty write transaction.
-    if (before.blocked && (!options?.reviewIfBlocked || !this.offlineReviewNeeded(before.plan)))
-      return null;
-    return transaction(this.db, () => {
-      const { plan, pending, blocked } = inspect();
-      if (terminal(plan.state)) return plan;
-      if (stale(plan)) return null;
-      if (blocked) {
-        if (options?.reviewIfBlocked) this.reviewBlockedOffline(plan, reason);
-        return null;
-      }
-      this.cancelStepContinuation(id);
-      this.cancelPrepared(id);
-      for (const op of pending) {
-        const info = this.classifyInertAuxiliaryBrowseOperation(op);
-        if (!info.ok) {
-          if (options?.reviewIfBlocked) this.reviewBlockedOffline(plan, reason);
-          return null;
-        }
-        const evidence = {
-          reason,
-          offlineBrowseCancelled: true,
-          inertAuxiliaryBrowse: true,
-          actionKind: op.action.kind,
-          ...(info.purpose ? { intentKind: 'auxiliary', intentPurpose: info.purpose } : {}),
-        };
-        // Cancellation concerns inert browsing only, not proof that scrolling never happened.
-        // Reuse NOT_APPLIED delivery so a later reconnect can retire the original journal entry.
-        if (op.binding) {
-          const receipt = {
-            binding: op.binding,
-            evidence,
-          };
-          this.settle(op.id, 'NOT_APPLIED', receipt);
-          this.settlements.ensureSettled(op.binding, 'NOT_APPLIED', receipt);
-        } else this.settle(op.id, 'NOT_APPLIED', evidence);
-      }
-      this.db
-        .prepare(
-          "UPDATE task_plans SET control_mode='stop',control_request_id=NULL,control_confirmed=1 WHERE id=?",
-        )
-        .run(id);
-      this.db
-        .prepare(
-          "UPDATE task_tab_state SET state='LOST',context=NULL,reason='ENDED_OWNERSHIP_RELEASED',revision=revision+1,updated_at=? WHERE job_id=? AND state NOT IN ('CLOSED','RELEASED','LOST')",
-        )
-        .run(this.dependencies.now(), id);
-      this.state(id, 'STOPPED', reason);
-      this.unlock(id);
-      this.event(id, 'OFFLINE_BROWSE_CANCELLED', { operations: pending.map((op) => op.id) });
-      return this.get(id);
-    });
-  }
-  private offlineReviewNeeded(plan: Plan): boolean {
-    return (
-      plan.state !== 'REVIEW' ||
-      plan.controlMode === null ||
-      plan.controlConfirmed ||
-      Boolean(
-        this.db
-          .prepare(
-            "SELECT 1 FROM material_reservations WHERE job_id=? AND state='RESERVED' AND control_ended=0 LIMIT 1",
-          )
-          .get(plan.id),
-      ) ||
-      this.blockingOperations(plan.id).some((op) =>
-        ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED'].includes(op.status),
-      )
-    );
-  }
-  private reviewBlockedOffline(plan: Plan, reason: string): void {
-    if (!this.offlineReviewNeeded(plan)) return;
-    const now = this.dependencies.now();
-    this.db
-      .prepare(
-        "UPDATE material_reservations SET state='REVIEW',reason=?,updated_at=? WHERE job_id=? AND state='RESERVED' AND control_ended=0",
-      )
-      .run(reason.slice(0, 200), now, plan.id);
-    this.cancelPrepared(plan.id);
-    this.db
-      .prepare(
-        "UPDATE task_outbox SET status='UNKNOWN',updated_at=? WHERE job_id=? AND status IN ('DISPATCHING','ACKNOWLEDGED')",
-      )
-      .run(now, plan.id);
-    if (this.unresolved(plan.id)) {
-      if (plan.controlMode === null || plan.controlConfirmed)
-        this.db
-          .prepare(
-            "UPDATE task_plans SET control_mode=coalesce(control_mode,'pause'),control_confirmed=0 WHERE id=?",
-          )
-          .run(plan.id);
-      if (plan.state !== 'REVIEW') this.state(plan.id, 'REVIEW', 'UNRESOLVED_OPERATION');
-    }
-  }
-  private operation(id: string): Operation {
-    const row = this.stmt(
-      'SELECT o.*,b.body AS binding FROM task_outbox o LEFT JOIN task_dispatch_bindings b ON b.operation_id=o.id WHERE o.id=?',
-    ).get(id);
-    if (!row) throw new ProductError('OPERATION_NOT_FOUND', '任务指令不存在', 404);
-    const action = Action.parse(JSON.parse(String(row.action)) as unknown);
-    const binding =
-      row.binding === null
-        ? null
-        : DispatchBinding.parse(JSON.parse(String(row.binding)) as unknown);
-    const receipt = row.receipt === null ? null : (JSON.parse(String(row.receipt)) as unknown);
-    let inertBrowseProof: Operation['inertBrowseProof'];
-    if (
-      row.status === 'FAILED' &&
-      row.disposition === null &&
-      binding !== null &&
-      receipt &&
-      typeof receipt === 'object' &&
-      !Array.isArray(receipt)
-    ) {
-      const ev = (receipt as Record<string, unknown>).evidence;
-      if (
-        ev &&
-        typeof ev === 'object' &&
-        !Array.isArray(ev) &&
-        ((ev as Record<string, unknown>).transientBrowseSettled === true ||
-          (ev as Record<string, unknown>).offlineBrowseCancelled === true)
-      ) {
-        const info = classifySqliteInertAuxiliaryBrowseOperation(this.db, {
-          id: String(row.id),
-          jobId: String(row.job_id),
-          stepId: String(row.step_id),
-          action,
-          binding,
-        });
-        if (info.ok) {
-          const planRow = this.stmt(
-            'SELECT state, control_confirmed FROM task_plans WHERE id=?',
-          ).get(String(row.job_id));
-          inertBrowseProof = {
-            verified: true,
-            ...(info.purpose ? { purpose: info.purpose } : {}),
-            planConfirmedStopped: planRow?.state === 'STOPPED' && planRow?.control_confirmed === 1,
-          };
-        }
-      }
-    }
-    return TaskOperation.parse({
-      id: row.id,
-      jobId: row.job_id,
-      stepId: row.step_id,
-      action,
-      binding,
-      status: row.status,
-      receipt,
-      checkpointApplied: row.checkpoint_applied === 1,
-      ...(row.disposition ? { disposition: JSON.parse(String(row.disposition)) as unknown } : {}),
-      ...(inertBrowseProof ? { inertBrowseProof } : {}),
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    });
-  }
-  operations(id: string) {
-    return this.stmt('SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at,rowid')
-      .all(id)
-      .map((row) => this.operation(String(row.id)));
-  }
-  recentOperations(id: string, limit: number) {
-    return this.stmt(
-      'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?',
-    )
-      .all(id, Math.max(1, Math.min(100, limit)))
-      .reverse()
-      .map((row) => this.operation(String(row.id)));
-  }
-  findOperation(jobId: string, operationId: string): Operation | null {
-    const row = this.stmt('SELECT id FROM task_outbox WHERE id=? AND job_id=?').get(
-      operationId,
-      jobId,
-    );
-    return row ? this.operation(String(row.id)) : null;
-  }
-  blockingOperations(id: string) {
-    return this.stmt(
-      "SELECT id FROM task_outbox WHERE job_id=? AND (status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED') OR (status='UNKNOWN' AND control_ended=0)) ORDER BY created_at,rowid",
-    )
-      .all(id)
-      .map((row) => this.operation(String(row.id)));
-  }
-  noteStepFailure(id: string, stepId: string, reason: string): void {
-    transaction(this.db, () => {
-      const plan = this.get(id),
-        step = this.currentStep(plan, stepId);
-      if (
-        step.status !== 'ACTIVE' ||
-        terminal(plan.state) ||
-        plan.controlMode === 'stop' ||
-        plan.reason.startsWith('USER_')
-      )
-        return;
-      if (this.endingId(id)) return;
-      this.stmt('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?').run(
-        stepId,
-        reason.slice(0, 200),
-        id,
-      );
-      this.event(
-        id,
-        step.spec.type === 'marketplace' && reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE'
-          ? 'STEP_SKIP_INTENT'
-          : 'STEP_FAILURE_INTENT',
-        { stepId, reason },
-      );
-    });
-  }
-  requestStepEnd(id: string, stepId: string, reason: string): string {
-    return transaction(this.db, () => {
-      const plan = this.get(id),
-        step = this.currentStep(plan, stepId);
-      if (
-        step.status !== 'ACTIVE' ||
-        (plan.controlMode !== 'pause' &&
-          !(
-            plan.controlMode === null &&
-            plan.state === 'REVIEW' &&
-            plan.reason.startsWith('INITIAL_SESSION_FAILED:')
-          )) ||
-        (plan.reason !== reason && this.stepEnding(id)?.reason !== reason) ||
-        !['PAUSING', 'PAUSED', 'REVIEW'].includes(plan.state)
-      )
-        throw Error('STEP_END_SCOPE_CHANGED');
-      const previous = this.stepEnding(id);
-      if (previous && previous.stepId !== stepId) throw Error('STEP_END_ALREADY_PENDING');
-      const endingId = this.requestEnd(id);
-      this.stmt('UPDATE task_plans SET ending_step_id=?,ending_step_reason=? WHERE id=?').run(
-        stepId,
-        reason.slice(0, 200),
-        id,
-      );
-      this.event(id, 'STEP_END_REQUESTED', { stepId, endingId, reason });
-      return endingId;
-    });
-  }
-  stepEnding(id: string): { stepId: string; reason: string; finished: boolean } | null {
-    const row = this.stmt(
-      'SELECT ending_step_id,ending_step_reason,ending_finished FROM task_plans WHERE id=?',
-    ).get(id);
-    return row?.ending_step_id
-      ? {
-          stepId: String(row.ending_step_id),
-          reason: String(row.ending_step_reason),
-          finished: row.ending_finished === 1,
-        }
-      : null;
-  }
-  cancelStepContinuation(id: string): void {
-    transaction(this.db, () => {
-      if (!this.stepEnding(id)) return;
-      this.stmt('UPDATE task_plans SET ending_step_id=NULL,ending_step_reason=NULL WHERE id=?').run(
-        id,
-      );
-      this.event(id, 'STEP_CONTINUATION_CANCELLED', {});
-    });
-  }
-  endingId(id: string): string | null {
-    this.ensurePlanExists(id);
-    const row = this.stmt('SELECT ending_id FROM task_plans WHERE id=?').get(id);
-    return row?.ending_id ? String(row.ending_id) : null;
-  }
-  pendingEndings(): Plan[] {
-    return this.livePlans().filter((plan) => this.endingId(plan.id) !== null);
-  }
-  requestEnd(id: string): string {
-    return transaction(this.db, () => {
-      const plan = this.get(id),
-        previous = this.endingId(id);
-      if (previous) return previous;
-      if (
-        terminal(plan.state) ||
-        (!['REVIEW', 'PAUSING', 'STOPPING'].includes(plan.state) &&
-          !(plan.state === 'PAUSED' && this.stepEnding(id)))
-      )
-        throw Error('TASK_END_REQUIRES_STOPPING_OR_REVIEW');
-      const endingId = this.dependencies.id();
-      this.cancelPrepared(id);
-      this.db.prepare('UPDATE task_plans SET ending_id=? WHERE id=?').run(endingId, id);
-      this.state(id, 'STOPPING', 'ENDING_UNCONFIRMED_TASK');
-      this.event(id, 'END_REQUESTED', { endingId });
-      return endingId;
-    });
-  }
-  prepareEnd(id: string, input: CurrentStop): void {
-    const stop = CurrentStopReceipt.parse(input);
-    transaction(this.db, () => {
-      const plan = this.get(id),
-        endingId = this.endingId(id);
-      if (
-        !endingId ||
-        stop.requestId !== endingId ||
-        stop.profileId !== plan.profileId ||
-        terminal(plan.state)
-      )
-        throw Error('TASK_END_STOP_BINDING_REJECTED');
-      this.db
-        .prepare('UPDATE task_plans SET ending_stop=? WHERE id=?')
-        .run(JSON.stringify(stop), id);
-      this.db
-        .prepare(
-          "UPDATE task_outbox SET status='UNKNOWN',updated_at=? WHERE job_id=? AND status IN ('DISPATCHING','ACKNOWLEDGED')",
-        )
-        .run(this.dependencies.now(), id);
-      for (const op of this.blockingOperations(id).filter((op) => op.status === 'UNKNOWN')) {
-        if (!op.binding) throw Error('TASK_END_ORIGINAL_BINDING_REQUIRED');
-        const evidenceDigest = createHash('sha256')
-          .update(JSON.stringify({ endingId, binding: op.binding }))
-          .digest('hex');
-        this.settlements.ensureEnded(op.binding, {
-          id: this.dependencies.id(),
-          outcome: 'ENDED_UNKNOWN',
-          evidenceDigest,
-        });
-      }
-    });
-  }
-  private classifyInertAuxiliaryBrowseOperation(op: Operation) {
-    return classifySqliteInertAuxiliaryBrowseOperation(this.db, op);
-  }
-  private isInertAuxiliaryBrowseOperation(op: Operation): boolean {
-    return this.classifyInertAuxiliaryBrowseOperation(op).ok;
-  }
-  private isRegisteredBrowseOperation(op: Operation): boolean {
-    if (!op.binding) return false;
-    try {
-      const row = this.db
-        .prepare(
-          'SELECT body FROM task_browse_intents WHERE operation_id=? AND job_id=? AND step_id=?',
-        )
-        .get(op.id, op.binding.jobId, op.binding.stepId);
-      if (!row) return false;
-      const registered = BrowseOperationIntent.parse(JSON.parse(String(row.body)) as unknown);
-      const step = this.steps(op.binding.jobId).find((item) => item.id === op.binding?.stepId);
-      if (
-        !step ||
-        step.spec.type === 'post' ||
-        registered.operationId !== op.id ||
-        registered.jobId !== op.binding.jobId ||
-        registered.stepId !== op.binding.stepId ||
-        registered.intent.proof.profileId !== op.binding.profileId
-      )
-        return false;
-      validateBrowseIntent(step, op.action, registered.intent);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  private isRegisteredReelAdvance(op: Operation): boolean {
-    if (
-      op.action.kind !== 'click' ||
-      op.action.target.css !== FACEBOOK_REEL_NEXT_CSS ||
-      op.action.target.scope !== undefined ||
-      op.action.target.text !== undefined ||
-      !op.binding
-    )
-      return false;
-    try {
-      const row = this.db
-        .prepare(
-          'SELECT body FROM task_browse_intents WHERE operation_id=? AND job_id=? AND step_id=?',
-        )
-        .get(op.id, op.binding.jobId, op.binding.stepId);
-      if (!row) return false;
-      const registered = BrowseOperationIntent.parse(JSON.parse(String(row.body)) as unknown);
-      const step = this.steps(op.binding.jobId).find((item) => item.id === op.binding?.stepId);
-      if (
-        !step ||
-        registered.operationId !== op.id ||
-        registered.jobId !== op.binding.jobId ||
-        registered.stepId !== op.binding.stepId ||
-        registered.intent.kind !== 'auxiliary' ||
-        registered.intent.purpose !== 'advance' ||
-        registered.intent.proof.profileId !== op.binding.profileId
-      )
-        return false;
-      validateBrowseIntent(step, op.action, registered.intent);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  finishEnd(id: string, input: CurrentStop): Plan {
-    const stop = CurrentStopReceipt.parse(input);
-    return transaction(this.db, () => {
-      const plan = this.get(id),
-        endingId = this.endingId(id);
-      if (!endingId || stop.requestId !== endingId || stop.profileId !== plan.profileId)
-        throw Error('TASK_END_STOP_BINDING_REJECTED');
-      if (terminal(plan.state)) return plan;
-      if (this.stepEnding(id)?.finished) return plan;
-      const savedStop = this.db
-        .prepare('SELECT ending_stop FROM task_plans WHERE id=?')
-        .get(id)?.ending_stop;
-      if (!savedStop) throw Error('TASK_END_PREPARED_STOP_REQUIRED');
-      const preparedStop = CurrentStopReceipt.parse(JSON.parse(String(savedStop)) as unknown);
-      if (preparedStop.requestId !== endingId || preparedStop.profileId !== plan.profileId)
-        throw Error('TASK_END_STOP_BINDING_REJECTED');
-      const notices = this.settlements.list(plan.profileId);
-      for (const op of this.blockingOperations(id)) {
-        if (['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED'].includes(op.status))
-          throw Error('TASK_END_INPUT_NOT_DRAINED');
-        if (op.status !== 'UNKNOWN') continue;
-        const notice = notices.find(
-          (n) => n.binding.operationId === op.id && n.resolution.outcome === 'ENDED_UNKNOWN',
-        );
-        if (
-          !notice ||
-          notice.state !== 'DELIVERED' ||
-          !op.binding ||
-          !sameBinding(op.binding, notice.binding)
-        )
-          throw Error('TASK_END_NOTICE_PENDING');
-        const disposition = OperationDisposition.parse(notice.resolution);
-        if (op.disposition && JSON.stringify(op.disposition) !== JSON.stringify(disposition))
-          throw Error('TASK_END_DISPOSITION_CONFLICT');
-        this.db
-          .prepare('UPDATE task_outbox SET disposition=? WHERE id=?')
-          .run(JSON.stringify(disposition), op.id);
-      }
-      const operations = this.operations(id);
-      let possiblePublication = false;
-      for (const row of this.db
-        .prepare(
-          "SELECT attempt_id FROM material_reservations WHERE job_id=? AND state IN ('RESERVED','REVIEW') AND control_ended=0",
-        )
-        .all(id)) {
-        const attemptId = String(row.attempt_id);
-        if (!endPostWithoutSubmit(this.db, attemptId, operations, endingId)) {
-          possiblePublication = true;
-          this.db
-            .prepare(
-              "UPDATE material_reservations SET state='REVIEW',reason='ENDED_SUBMISSION_UNCONFIRMED',updated_at=? WHERE attempt_id=?",
-            )
-            .run(this.dependencies.now(), attemptId);
-        }
-      }
-      this.db
-        .prepare('UPDATE task_plans SET ending_stop=? WHERE id=?')
-        .run(JSON.stringify(stop), id);
-      this.event(id, 'END_CONFIRMED', { endingId, stop, possiblePublication });
-      const scope = this.stepEnding(id);
-      if (scope) {
-        const step = this.currentStep(plan, scope.stepId);
-        const post = step.spec.type === 'post';
-        const marketplaceUnavailable =
-          step.spec.type === 'marketplace' && scope.reason === 'FACEBOOK_MARKETPLACE_UNAVAILABLE';
-        const skipped =
-          marketplaceUnavailable ||
-          (scope.reason === 'MATERIAL_NO_ELIGIBLE_RESOURCE' &&
-            step.progress.published === 0 &&
-            !this.operations(id).some((op) => op.stepId === step.id));
-        const outcome = skipped
-          ? TaskStepSkip.parse({
-              version: 1,
-              kind: 'SKIPPED',
-              reason: marketplaceUnavailable ? 'MARKETPLACE_UNAVAILABLE' : 'RESOURCE_EXHAUSTED',
-              endedAt: this.dependencies.now(),
-              ...(marketplaceUnavailable ? { endingId, currentStop: stop } : {}),
-            })
-          : TaskStepFailure.parse({
-              version: 1,
-              kind: 'FAILED',
-              reason:
-                scope.reason === 'MATERIAL_NO_ELIGIBLE_RESOURCE'
-                  ? 'RESOURCE_EXHAUSTED'
-                  : scope.reason,
-              endedAt: this.dependencies.now(),
-              endingId,
-              currentStop: stop,
-              submissionPhase: post
-                ? possiblePublication
-                  ? 'UNKNOWN'
-                  : 'BEFORE_SUBMIT'
-                : 'NOT_APPLICABLE',
-              businessResult: post
-                ? possiblePublication
-                  ? 'UNKNOWN'
-                  : 'NOT_PUBLISHED'
-                : 'NOT_APPLICABLE',
-            });
-        this.db
-          .prepare("UPDATE task_steps SET status=?,outcome=? WHERE id=? AND status='ACTIVE'")
-          .run(outcome.kind, JSON.stringify(outcome), step.id);
-        this.db.prepare('UPDATE task_plans SET ending_finished=1 WHERE id=?').run(id);
-        this.db
-          .prepare(
-            "UPDATE task_outbox SET control_ended=1 WHERE job_id=? AND step_id=? AND status='UNKNOWN' AND control_ended=0",
-          )
-          .run(id, step.id);
-        this.db
-          .prepare(
-            "UPDATE material_reservations SET control_ended=1 WHERE job_id=? AND state='REVIEW' AND control_ended=0 AND attempt_id IN (SELECT attempt_id FROM material_post_intents WHERE step_id=?)",
-          )
-          .run(id, step.id);
-        this.event(id, skipped ? 'STEP_SKIPPED' : 'STEP_FAILED', { stepId: step.id, outcome });
-        return this.get(id); // STOPPING retains the account lock until page ownership is settled.
-      }
-      const unknown = operations.filter((op) => op.status === 'UNKNOWN');
-      const cancelledDraft =
-        plan.controlMode === 'stop' &&
-        plan.controlConfirmed &&
-        !possiblePublication &&
-        plan.snapshot.steps.some((step) => step.type === 'post') &&
-        this.steps(id).every((step) => step.status !== 'FAILED') &&
-        operations.every((op) => ['VERIFIED', 'CANCELLED'].includes(op.status)) &&
-        !this.db
-          .prepare(
-            "SELECT 1 FROM material_post_operations m JOIN task_outbox o ON o.id=m.operation_id WHERE o.job_id=? AND m.purpose='SUBMIT' LIMIT 1",
-          )
-          .get(id);
-      const cancelledBrowse =
-        plan.controlMode === 'stop' &&
-        plan.controlConfirmed &&
-        !possiblePublication &&
-        operations.every((op) =>
-          ['VERIFIED', 'CANCELLED', 'FAILED', 'UNKNOWN'].includes(op.status),
-        ) &&
-        ((unknown.length === 0 &&
-          this.steps(id).every((step) => step.status !== 'FAILED') &&
-          !this.db
-            .prepare(
-              "SELECT 1 FROM material_post_operations m JOIN task_outbox o ON o.id=m.operation_id WHERE o.job_id=? AND m.purpose='SUBMIT' LIMIT 1",
-            )
-            .get(id)) ||
-          (unknown.length > 0 &&
-            unknown.every((op) => {
-              if (
-                op.disposition?.outcome !== 'ENDED_UNKNOWN' ||
-                !op.binding ||
-                postLink(this.db, op.id)
-              )
-                return false;
-              if (this.isRegisteredBrowseOperation(op) || op.action.kind === 'browseNavigate') {
-                const step = this.steps(id).find((item) => item.id === op.stepId);
-                return step !== undefined && step.spec.type !== 'post';
-              }
-              const cancelled = CancelledBrowseReceipt.safeParse(op.receipt);
-              return (
-                plan.snapshot.steps.every(
-                  (step) =>
-                    ['feed', 'video', 'marketplace'].includes(step.type) &&
-                    'maxLikes' in step &&
-                    step.maxLikes === 0,
-                ) &&
-                (op.action.kind === 'browseScroll' || this.isRegisteredReelAdvance(op)) &&
-                cancelled.success &&
-                sameBinding(op.binding, cancelled.data.binding)
-              );
-            })));
-      // A verified, never-submitted draft can stop normally. Unknown inputs keep their
-      // original UNKNOWN/disposition; only registered, non-interactive browse cancellation applies.
-      const cancelled = cancelledBrowse || cancelledDraft;
-      const pausedBrowse =
-        !cancelled &&
-        !possiblePublication &&
-        plan.controlMode !== 'stop' &&
-        this.steps(id).every((step) => step.status !== 'FAILED') &&
-        unknown.length > 0 &&
-        unknown.every((op) => {
-          if (postLink(this.db, op.id) || !this.isRegisteredBrowseOperation(op)) return false;
-          const step = this.steps(id).find((item) => item.id === op.stepId);
-          if (!step || step.spec.type === 'post') return false;
-          const receiptReason =
-            op.receipt &&
-            typeof op.receipt === 'object' &&
-            !Array.isArray(op.receipt) &&
-            typeof (op.receipt as Record<string, unknown>).reason === 'string'
-              ? String((op.receipt as Record<string, unknown>).reason)
-              : '';
-          return isRecoverableBrowseFault(receiptReason);
-        });
-      const preservedReason =
-        !cancelled &&
-        !possiblePublication &&
-        (unknown.length === 0 || pausedBrowse) &&
-        plan.controlMode !== 'stop'
-          ? (() => {
-              const eventReasons = this.events(id)
-                .map((item) => {
-                  const detail = item.detail;
-                  if (
-                    detail &&
-                    typeof detail === 'object' &&
-                    !Array.isArray(detail) &&
-                    typeof (detail as Record<string, unknown>).reason === 'string'
-                  ) {
-                    return String((detail as Record<string, unknown>).reason).trim();
-                  }
-                  return '';
-                })
-                .filter(
-                  (r) =>
-                    r !== '' &&
-                    r !== 'ENDING_UNCONFIRMED_TASK' &&
-                    r !== 'OPERATION_RESULT_UNCONFIRMED' &&
-                    !r.startsWith('USER_'),
-                );
-              return (
-                eventReasons.find((r) => r.startsWith('INITIAL_SESSION_FAILED:')) ??
-                eventReasons.at(-1) ??
-                null
-              );
-            })()
-          : null;
-      if (pausedBrowse) {
-        this.db
-          .prepare(
-            "UPDATE task_outbox SET status='FAILED',updated_at=? WHERE job_id=? AND status='UNKNOWN'",
-          )
-          .run(this.dependencies.now(), id);
-        this.state(
-          id,
-          'PAUSED',
-          preservedReason ??
-            (plan.reason &&
-            plan.reason !== 'ENDING_UNCONFIRMED_TASK' &&
-            plan.reason !== 'UNRESOLVED_OPERATION'
-              ? plan.reason
-              : 'BROWSE_TRANSIENT_PAUSED'),
-        );
-        this.unlock(id);
-        return this.get(id);
-      }
-      this.state(
-        id,
-        cancelled ? 'STOPPED' : 'FAILED',
-        cancelled
-          ? 'USER_STOP'
-          : possiblePublication ||
-              this.steps(id).some(
-                (step) =>
-                  step.outcome?.kind === 'FAILED' && step.outcome.businessResult === 'UNKNOWN',
-              )
-            ? 'PUBLISH_RESULT_UNCONFIRMED'
-            : (preservedReason ?? 'OPERATION_RESULT_UNCONFIRMED'),
-      );
-      this.unlock(id);
-      // The execution has a confirmed stop and durable end notices. Keep any
-      // original UNKNOWN business result, but release its account-wide control.
-      this.db
-        .prepare(
-          "UPDATE task_outbox SET control_ended=1 WHERE job_id=? AND status='UNKNOWN' AND disposition IS NOT NULL",
-        )
-        .run(id);
-      this.db
-        .prepare(
-          "UPDATE material_reservations SET control_ended=1 WHERE job_id=? AND state='REVIEW'",
-        )
-        .run(id);
-      return this.get(id);
-    });
-  }
-  finishStepContinuation(id: string): Plan {
-    return transaction(this.db, () => {
-      const plan = this.get(id),
-        scope = this.stepEnding(id);
-      if (!scope?.finished || plan.state !== 'STOPPING') throw Error('STEP_END_NOT_CONFIRMED');
-      if (
-        this.db
-          .prepare(
-            "SELECT s.ownership_id FROM task_tab_state s JOIN task_tab_ownership o USING(ownership_id,job_id) WHERE o.job_id=? AND s.state IN ('READY','RECHECK_REQUIRED')",
-          )
-          .get(id)
-      )
-        throw Error('STEP_END_TAB_OWNERSHIP_PENDING');
-      if (this.blockingOperations(id).length) throw Error('STEP_END_OPERATION_PENDING');
-      this.db
-        .prepare(
-          'UPDATE task_plans SET ending_id=NULL,ending_stop=NULL,ending_step_id=NULL,ending_step_reason=NULL,ending_finished=0,control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
-        )
-        .run(id);
-      this.unlock(id); // Physical end and page disposition are complete; normal admission reacquires.
-      this.advanceStepPosition(plan, true);
-      this.event(id, 'STEP_CONTINUATION_READY', { stepId: scope.stepId });
-      return this.get(id);
-    });
-  }
-  prepareOperation(id: string, stepId: string, operationId: string, action: Action) {
-    const parsed = Action.parse(action),
-      body = JSON.stringify(parsed);
-    return transaction(this.db, () => {
-      const existing = this.db
-        .prepare('SELECT id,job_id,step_id,action FROM task_outbox WHERE id=?')
-        .get(operationId);
-      if (existing) {
-        if (existing.job_id !== id || existing.step_id !== stepId || existing.action !== body)
-          throw new ProductError('OPERATION_ID_CONFLICT', '指令标识对应的内容不同', 409);
-        return this.operation(operationId);
-      }
-      const plan = this.get(id);
-      if (plan.state !== 'RUNNING')
-        throw new ProductError('TASK_NOT_RUNNING', '任务没有执行权限', 409);
-      const step = this.currentStep(plan, stepId);
-      if (step.spec.type === 'post')
-        assertPostPreparation(this.db, id, stepId, operationId, parsed);
-      if (
-        (step.spec.type !== 'post' && this.unresolved(id)) ||
-        this.blockingOperations(id).some((op) =>
-          ['PREPARED', 'DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(op.status),
-        )
-      )
-        throw new ProductError('OPERATION_PENDING', '上一指令尚未结算', 409);
-      const now = this.dependencies.now();
-      this.db
-        .prepare(
-          "INSERT INTO task_outbox(id,job_id,step_id,action,status,created_at,updated_at) VALUES(?,?,?,?,'PREPARED',?,?)",
-        )
-        .run(operationId, id, stepId, body, now, now);
-      this.event(id, 'OPERATION_PREPARED', { operationId });
-      return this.operation(operationId);
-    });
-  }
-  takeOperation() {
-    return transaction(this.db, () => {
-      const row = this.db
-        .prepare(
-          "SELECT o.id FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.status='PREPARED' AND p.state='RUNNING' ORDER BY o.created_at,o.rowid LIMIT 1",
-        )
-        .get();
-      if (!row) return null;
-      const id = String(row.id);
-      if (postLink(this.db, id)) throw Error('POST_BOUND_DISPATCH_REQUIRED');
-      this.db
-        .prepare("UPDATE task_outbox SET status='DISPATCHING',updated_at=? WHERE id=?")
-        .run(this.dependencies.now(), id);
-      const operation = this.operation(id);
-      this.event(operation.jobId, 'OPERATION_DISPATCHING', { operationId: id });
-      return operation;
-    });
-  }
-  takeBoundOperation(input: ExecutionSession) {
-    const context = ExecutionContext.parse(input);
-    return transaction(this.db, () => {
-      const row = this.db
-        .prepare(
-          "SELECT o.id FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.status='PREPARED' AND p.state='RUNNING' AND p.profile_id=? AND p.account_id=? ORDER BY o.created_at,o.rowid LIMIT 1",
-        )
-        .get(context.profileId, context.accountId);
-      if (!row) return null;
-      const operation = this.operation(String(row.id));
-      const plan = this.get(operation.jobId);
-      const step = this.currentStep(plan, operation.stepId);
-      if (step.spec.type === 'post') assertPostDispatch(this.db, operation.id, context);
-      const binding = DispatchBinding.parse({
-        ...context,
-        operationId: operation.id,
-        jobId: operation.jobId,
-        stepId: operation.stepId,
-        actionDigest: createHash('sha256').update(canonicalAction(operation.action)).digest('hex'),
-      });
-      // Binding and dispatch state commit together, before any browser call.
-      this.db
-        .prepare('INSERT INTO task_dispatch_bindings VALUES(?,?,?)')
-        .run(operation.id, JSON.stringify(binding), this.dependencies.now());
-      this.db
-        .prepare("UPDATE task_outbox SET status='DISPATCHING',updated_at=? WHERE id=?")
-        .run(this.dependencies.now(), operation.id);
-      this.event(plan.id, 'OPERATION_BOUND', binding);
-      return this.operation(operation.id);
-    });
-  }
-  private requireBinding(input: Binding) {
-    const binding = DispatchBinding.parse(input);
-    const operation = this.operation(binding.operationId);
-    if (!operation.binding || !sameBinding(operation.binding, binding))
-      throw new ProductError('DISPATCH_BINDING_MISMATCH', '执行回执与派发上下文不一致', 409);
-    return operation;
-  }
-  acknowledgeBound(input: ExecutionReceipt) {
-    const receipt = BoundReceipt.parse(input);
-    transaction(this.db, () => {
-      this.requireBinding(receipt.binding);
-      this.acknowledge(receipt.binding.operationId, receipt);
-    });
-  }
-  markBoundUnknown(binding: Binding, reason: string, observation?: ExecutionReceipt) {
-    const observed = observation === undefined ? undefined : BoundReceipt.parse(observation);
-    if (observed && !sameBinding(binding, observed.binding))
-      throw Error('BUSINESS_VERDICT_BINDING_MISMATCH');
-    transaction(this.db, () => {
-      this.requireBinding(binding);
-      this.settle(binding.operationId, 'UNKNOWN', {
-        binding,
-        reason,
-        ...(observed ? { observation: observed.evidence } : {}),
-      });
-    });
-  }
-  noteChildPageLifecycle(input: Binding, value: unknown) {
-    const binding = DispatchBinding.parse(input),
-      lifecycle = TaskChildPageLifecycle.parse(value);
-    transaction(this.db, () => {
-      const operation = this.requireBinding(binding),
-        plan = this.get(binding.jobId);
-      const parent = this.db
-        .prepare(
-          'SELECT o.proof,s.state,s.context FROM task_tab_ownership o JOIN task_tab_state s USING(ownership_id,job_id) WHERE o.job_id=? AND o.ownership_id=?',
-        )
-        .get(binding.jobId, lifecycle.parent.ownershipId);
-      if (
-        plan.state !== 'RUNNING' ||
-        operation.status !== 'ACKNOWLEDGED' ||
-        lifecycle.parent.profileId !== binding.profileId ||
-        parent?.state !== 'READY' ||
-        parent.context === null ||
-        !sameExecution(ExecutionContext.parse(JSON.parse(String(parent.context))), binding) ||
-        !sameTabProof(OwnedTabProof.parse(JSON.parse(String(parent.proof))), lifecycle.parent)
-      )
-        throw Error('TASK_CHILD_PAGE_ORIGINAL_CONTEXT_REQUIRED');
-      this.event(binding.jobId, 'CHILD_PAGE_' + lifecycle.state, {
-        binding,
-        lifecycle,
-      });
-    });
-  }
-  noteBrowseReadFailure(
-    jobId: string,
-    stepId: string,
-    input: ExecutionSession,
-    reason: string,
-    value: PendingDiagnostic,
-    kind: 'timeout' | 'input-fence' = 'timeout',
-  ) {
-    const context = ExecutionContext.parse(input),
-      pending = BrowsePendingDiagnostic.parse(value);
-    transaction(this.db, () => {
-      const plan = this.get(jobId),
-        step = this.currentStep(plan, stepId);
-      if (
-        plan.state !== 'RUNNING' ||
-        step.status !== 'ACTIVE' ||
-        plan.profileId !== context.profileId ||
-        plan.accountId !== context.accountId
-      )
-        throw Error('BROWSE_DIAGNOSTIC_OWNER_CHANGED');
-      this.event(jobId, kind === 'input-fence' ? 'BROWSE_INPUT_FENCE' : 'BROWSE_READ_TIMEOUT', {
-        version: 1,
-        stepId,
-        reason,
-        pending,
-      });
-    });
-  }
-  releaseBrowseControl(input: ExecutionReceipt) {
-    const receipt = BoundReceipt.parse(input);
-    transaction(this.db, () => {
-      const op = this.requireBinding(receipt.binding);
-      if (op.status !== 'ACKNOWLEDGED' || postLink(this.db, op.id))
-        throw Error('BROWSE_CONTROL_RELEASE_REJECTED');
-      this.db
-        .prepare("UPDATE task_outbox SET status='CANCELLED',receipt=?,updated_at=? WHERE id=?")
-        .run(JSON.stringify(receipt), this.dependencies.now(), op.id);
-      this.settlements.ensureSettled(receipt.binding, 'CONTROL_RELEASED', receipt);
-      this.event(op.jobId, 'BROWSE_CONTROL_RELEASED', { operationId: op.id });
-    });
-  }
-  settleTransientBrowseOperations(id: string, reason: string): boolean {
-    return transaction(this.db, () => {
-      const plan = this.get(id);
-      if (terminal(plan.state)) return false;
-      const step = this.currentStepForPlan(plan.id, plan.round, plan.position);
-      if (!step || step.spec.type === 'post') return false;
-      const pending = this.blockingOperations(id);
-      let settledAny = false;
-      if (pending.some((op) => op.status === 'PREPARED')) {
-        this.cancelPrepared(id);
-        settledAny = true;
-      }
-      for (const op of pending) {
-        if (op.status === 'PREPARED') continue;
-        const info = this.classifyInertAuxiliaryBrowseOperation(op);
-        if (!info.ok) continue;
-        const evidence = {
-          reason,
-          transientBrowseSettled: true,
-          inertAuxiliaryBrowse: true,
-          actionKind: op.action.kind,
-          ...(info.purpose ? { intentKind: 'auxiliary', intentPurpose: info.purpose } : {}),
-        };
-        if (op.binding) {
-          const receipt = {
-            binding: op.binding,
-            evidence,
-          };
-          this.settle(op.id, 'NOT_APPLIED', receipt);
-          this.settlements.ensureSettled(op.binding, 'NOT_APPLIED', receipt);
-        } else {
-          this.settle(op.id, 'NOT_APPLIED', evidence);
-        }
-        settledAny = true;
-      }
-      const updated = this.get(id);
-      if (
-        updated.state === 'REVIEW' &&
-        updated.reason === 'UNRESOLVED_OPERATION' &&
-        !this.unresolved(id)
-      ) {
-        if (updated.controlMode === 'stop' || updated.controlRequestId !== null) {
-          if (updated.controlConfirmed) {
-            this.finishControl(updated);
-          } else {
-            this.state(
-              id,
-              updated.controlMode === 'stop' ? 'STOPPING' : 'PAUSING',
-              updated.controlMode === 'stop' ? 'USER_STOP' : updated.reason,
-            );
+          const timing = taskTimingEligibility(plan.timing, now);
+          if (timing === 'WAIT') continue;
+          if (timing === 'MISSED') {
+            this.state(plan.id, 'FAILED', 'SCHEDULE_MISSED_ON_RESTART');
+            this.unlock(plan.id);
+            continue;
           }
-        } else {
-          this.db
-            .prepare(
-              "UPDATE task_plans SET state='RUNNING',reason=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0,updated_at=? WHERE id=?",
-            )
-            .run(reason, this.dependencies.now(), id);
         }
-        settledAny = true;
-      } else if (
-        updated.state === 'PAUSING' &&
-        updated.controlMode === 'pause' &&
-        !updated.controlConfirmed &&
-        !updated.reason.startsWith('USER_') &&
-        updated.reason !== 'SCHEDULE_WINDOW_CLOSED' &&
-        isRecoverableBrowseFault(reason) &&
-        !this.unresolved(id)
-      ) {
-        this.db
-          .prepare(
-            "UPDATE task_plans SET state='RUNNING',reason=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0,updated_at=? WHERE id=?",
-          )
-          .run(reason, this.dependencies.now(), id);
-        settledAny = true;
+        this.stmt(
+          'UPDATE task_plans SET control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
+        ).run(plan.id);
+        this.state(plan.id, 'STOPPED', 'SOFTWARE_RESTART_STOPPED');
+        this.unlock(plan.id);
       }
-      return settledAny;
     });
   }
-  settleBound(input: ExecutionReceipt, outcome: 'VERIFIED' | 'NOT_APPLIED', progress?: Progress) {
-    const receipt = BoundReceipt.parse(input);
-    transaction(this.db, () => {
-      const operation = this.requireBinding(receipt.binding);
-      if (operation.status === 'UNKNOWN')
-        throw new ProductError(
-          'EXPLICIT_RECONCILIATION_REQUIRED',
-          '未知结果需独立核对，不能接受迟到的成功回执',
-          409,
-        );
-      this.settle(operation.id, outcome, receipt, progress);
-      this.settlements.ensureSettled(receipt.binding, outcome, receipt);
-    });
-  }
-  reconcileBound(
-    input: ExecutionReceipt,
-    outcome: 'VERIFIED' | 'NOT_APPLIED',
-    progress?: Progress,
-  ) {
-    const receipt = BoundReceipt.parse(input);
-    transaction(this.db, () => {
-      const operation = this.requireBinding(receipt.binding);
-      if (operation.status !== 'UNKNOWN')
-        throw new ProductError('RECONCILIATION_NOT_REQUIRED', '仅未知指令可进入独立核对', 409);
-      if (
-        this.db.prepare('SELECT control_ended FROM task_outbox WHERE id=?').get(operation.id)
-          ?.control_ended === 1
-      )
-        throw new ProductError(
-          'ENDED_OPERATION_REVIEW_REQUIRED',
-          '已结束步骤的业务未知保留，不能推进后继步骤进度',
-          409,
-        );
-      this.settle(operation.id, outcome, receipt, progress);
-      this.settlements.ensureSettled(receipt.binding, outcome, receipt);
-      this.event(operation.jobId, 'OPERATION_RECONCILED', { operationId: operation.id });
-    });
-  }
-  markAcknowledged(operationId: string, receipt: Operation['receipt']) {
-    transaction(this.db, () => {
-      const operation = this.operation(operationId);
-      if (operation.binding)
-        throw new ProductError('BOUND_RECEIPT_REQUIRED', '已绑定指令需要完整执行回执', 409);
-      this.acknowledge(operationId, receipt);
-    });
-  }
-  private acknowledge(operationId: string, receipt: Operation['receipt']) {
-    const operation = this.operation(operationId);
-    if (operation.status !== 'DISPATCHING') return; // Late ACK cannot undo UNKNOWN or VERIFIED.
-    this.db
-      .prepare("UPDATE task_outbox SET status='ACKNOWLEDGED',receipt=?,updated_at=? WHERE id=?")
-      .run(JSON.stringify(receipt), this.dependencies.now(), operationId);
-    this.event(operation.jobId, 'OPERATION_ACKNOWLEDGED', { operationId });
-  }
-  private writeProgress(plan: Plan, stepId: string, expectedRevision: number, next: Progress) {
-    const step = this.currentStep(plan, stepId),
-      progress = TaskProgress.parse(next);
-    if (step.progress.revision !== expectedRevision)
-      throw new ProductError('CHECKPOINT_CONFLICT', '执行进度已变化', 409);
-    validateProgress(step.spec, step.progress, progress);
-    this.db
-      .prepare('UPDATE task_steps SET progress=? WHERE id=?')
-      .run(JSON.stringify(progress), stepId);
-    this.event(plan.id, 'CHECKPOINT', { stepId, revision: progress.revision });
-  }
-  checkpoint(id: string, stepId: string, expectedRevision: number, progress: Progress) {
-    transaction(this.db, () => {
-      const plan = this.get(id);
-      if (plan.state !== 'RUNNING' || this.unresolved(id))
-        throw new ProductError('CHECKPOINT_NOT_READY', '存在未决指令或任务未运行', 409);
-      const step = this.currentStep(plan, stepId);
-      if (progress.likes !== step.progress.likes || progress.published !== step.progress.published)
-        throw new ProductError(
-          'SIDE_EFFECT_EVIDENCE_REQUIRED',
-          '副作用计数必须关联已核验指令',
-          409,
-        );
-      this.writeProgress(plan, stepId, expectedRevision, progress);
-    });
-  }
-  checkpointAsync(
-    id: string,
-    stepId: string,
-    expectedRevision: number,
-    progress: Progress,
-  ): Promise<void> {
-    const frozen = structuredClone(progress);
-    return this.checkpointQueue.enqueue(() =>
-      this.checkpoint(id, stepId, expectedRevision, frozen),
+  operations = (id: string) =>
+    Ops.listTaskOperationsBySql(
+      this.ctx(),
+      'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at,rowid',
+      id,
     );
-  }
-  checkpointCommitStatus() {
-    return this.checkpointQueue.status();
-  }
-  closeCheckpoints() {
-    this.checkpointQueue.close();
-  }
-  settleOperation(
-    operationId: string,
-    outcome: 'VERIFIED' | 'NOT_APPLIED' | 'UNKNOWN',
-    evidence: Operation['receipt'],
-    progress?: Progress,
-  ) {
-    transaction(this.db, () => {
-      if (this.operation(operationId).binding)
-        throw new ProductError('BOUND_RECEIPT_REQUIRED', '已绑定指令需要完整执行回执', 409);
-      this.settle(operationId, outcome, evidence, progress);
-    });
-  }
-  private settle(
-    operationId: string,
-    outcome: 'VERIFIED' | 'NOT_APPLIED' | 'UNKNOWN',
-    evidence: Operation['receipt'],
-    progress?: Progress,
-  ) {
-    const operation = this.operation(operationId),
-      plan = this.get(operation.jobId);
-    if (outcome !== 'UNKNOWN' && postLink(this.db, operationId)) {
-      if (!operation.binding) throw Error('POST_BOUND_RECEIPT_REQUIRED');
-      assertPostSettlement(this.db, BoundReceipt.parse(evidence), outcome);
-    }
-    if (['VERIFIED', 'FAILED', 'CANCELLED'].includes(operation.status)) return;
-    if (operation.status === 'UNKNOWN' && outcome === 'UNKNOWN') return;
-    if (!['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN'].includes(operation.status))
-      throw new ProductError('OPERATION_NOT_DISPATCHED', '指令尚未派发', 409);
-    if (outcome === 'VERIFIED') {
-      if (isWrite(operation.action) && !progress)
-        throw new ProductError('CHECKPOINT_REQUIRED', '写操作核验必须同时提交执行进度', 409);
-      if (progress) this.writeProgress(plan, operation.stepId, progress.revision - 1, progress);
-    } else if (progress)
-      throw new ProductError('UNVERIFIED_CHECKPOINT', '未核验不能推进业务进度', 409);
-    const status = outcome === 'NOT_APPLIED' ? 'FAILED' : outcome;
-    this.db
-      .prepare(
-        'UPDATE task_outbox SET status=?,receipt=?,checkpoint_applied=?,updated_at=? WHERE id=?',
-      )
-      .run(
-        status,
-        JSON.stringify(evidence),
-        outcome === 'VERIFIED' && progress ? 1 : 0,
-        this.dependencies.now(),
-        operationId,
-      );
-    this.event(plan.id, 'OPERATION_' + status, { operationId });
-    if (status === 'UNKNOWN') {
-      this.db
-        .prepare(
-          "UPDATE material_reservations SET state='REVIEW',reason='OPERATION_UNKNOWN',updated_at=? WHERE job_id=? AND state='RESERVED'",
-        )
-        .run(this.dependencies.now(), plan.id);
-      this.cancelPrepared(plan.id);
-      this.db
-        .prepare(
-          "UPDATE task_plans SET control_mode=coalesce(control_mode,'pause'),control_confirmed=0 WHERE id=?",
-        )
-        .run(plan.id);
-      if (['PAUSING', 'STOPPING'].includes(plan.state) && plan.controlRequestId) {
-        this.event(plan.id, 'OPERATION_REVIEW_PENDING_CONTROL', { operationId });
-      } else this.state(plan.id, 'REVIEW', 'UNRESOLVED_OPERATION');
-    } else if (plan.state === 'REVIEW' && plan.controlConfirmed) this.finishControl(plan);
-  }
-  completeStep(id: string, stepId: string) {
-    return transaction(this.db, () => {
-      const plan = this.get(id);
-      if (plan.state !== 'RUNNING' || this.unresolved(id))
-        throw new ProductError('TASK_NOT_READY', '任务未运行或指令未结算', 409);
-      const step = this.currentStep(plan, stepId);
-      if (!stepComplete(step.spec, step.progress))
-        throw new ProductError('STEP_INCOMPLETE', '子任务没有达到完成条件', 409);
-      this.db.prepare("UPDATE task_steps SET status='COMPLETED' WHERE id=?").run(step.id);
-      this.event(id, 'STEP_COMPLETED', { stepId });
-      this.advanceStepPosition(plan, false);
-      return this.get(id);
-    });
-  }
-  private advanceStepPosition(plan: Plan, readmit: boolean) {
-    const id = plan.id;
-    if (plan.position + 1 < plan.snapshot.steps.length) {
-      this.db
-        .prepare('UPDATE task_plans SET position=position+1,updated_at=? WHERE id=?')
-        .run(this.dependencies.now(), id);
-      const next = this.currentStep(this.get(id));
-      this.db.prepare("UPDATE task_steps SET status='ACTIVE' WHERE id=?").run(next.id);
-      if (readmit) this.state(id, 'QUEUED', 'NEXT_STEP_REQUIRES_ADMISSION');
-    } else if (plan.snapshot.loop.mode === 'finite' && plan.round >= plan.snapshot.loop.rounds) {
-      const failed = this.steps(id).some(
-        (step) =>
-          step.status === 'FAILED' ||
-          (step.status === 'SKIPPED' &&
-            !isMarketplaceUnavailableSkip(step.spec.type, step.status, step.outcome)),
-      );
-      this.state(id, failed ? 'FAILED' : 'COMPLETED', failed ? 'PARTIAL_STEP_FAILURE' : '');
-      this.unlock(id);
-    } else {
-      this.createRound(plan, plan.round + 1);
-      this.db
-        .prepare('UPDATE task_plans SET round=round+1,position=0,updated_at=? WHERE id=?')
-        .run(this.dependencies.now(), id);
-      const next = this.currentStep(this.get(id));
-      this.db.prepare("UPDATE task_steps SET status='ACTIVE' WHERE id=?").run(next.id);
-      if (readmit) this.state(id, 'QUEUED', 'NEXT_STEP_REQUIRES_ADMISSION');
-    }
-  }
+  recentOperations = (id: string, limit: number) =>
+    Ops.listRecentTaskOperations(this.ctx(), id, limit);
+  findOperation = (jobId: string, operationId: string): TC.Operation | null =>
+    Ops.findTaskOperation(this.ctx(), jobId, operationId);
+  blockingOperations = (id: string) =>
+    Ops.listTaskOperationsBySql(
+      this.ctx(),
+      "SELECT id FROM task_outbox WHERE job_id=? AND (status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED') OR (status='UNKNOWN' AND control_ended=0)) ORDER BY created_at,rowid",
+      id,
+    );
 }
 
-type TaskRepository = SynchronousRepository<CompatibleTaskRepository>;
+type TaskRepository = SynchronousRepository<DT.TaskRepository>;

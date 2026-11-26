@@ -1,97 +1,86 @@
 import { z } from 'zod';
+import {
+  Id,
+  NonNegInt,
+  OperationDisposition,
+  PosInt,
+  Sha256Hex,
+  addIssue,
+  sMax,
+  sReq,
+  strictObj,
+} from './contracts.js';
 import { DispatchBinding } from './task-execution.js';
-import { OperationDisposition } from './task-ending.js';
-
-export const OwnedTabProof = z
-  .object({
-    ownershipId: z.uuid(),
-    profileId: z.uuid(),
-    browserSessionEpoch: z.uuid(),
-    tabId: z.number().int().positive(),
-    targetId: z.string().min(1).max(200),
-  })
-  .strict();
-export const OwnedTabRecord = z
-  .object({
-    ownershipId: z.uuid(),
-    url: z.string().max(4096),
-    state: z.enum(['CREATING', 'READY', 'UNKNOWN', 'LOST', 'CLOSED']),
-    proof: OwnedTabProof.nullable(),
-    reason: z.string().max(200),
-  })
-  .strict();
-export const KernelOperationRecord = z
-  .object({
-    binding: DispatchBinding,
-    operationSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
-    executionEnded: z.literal(true).optional(),
-    state: z.enum(['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN', 'RECONCILED']),
-    reason: z.string().max(200),
-    disposition: OperationDisposition.optional(),
-    resolution: z
-      .object({
-        id: z.uuid(),
-        outcome: z.enum(['VERIFIED', 'NOT_APPLIED', 'CONTROL_RELEASED']),
-        evidenceDigest: z.string().regex(/^[a-f0-9]{64}$/),
-      })
-      .strict()
-      .nullable(),
-  })
-  .strict();
-export const KernelPersistentState = z
-  .object({
-    version: z.union([z.literal(1), z.literal(2)]),
-    profileId: z.uuid(),
-    browserSessionEpoch: z.uuid(),
-    operations: z.array(KernelOperationRecord).max(3000),
-    tabs: z.array(OwnedTabRecord).max(500),
-    workspaceMain: OwnedTabProof.optional(),
-    operationHighWater: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    previousBrowserSessionEpoch: z.uuid().optional(),
-    browserSessionStartedAt: z.number().int().nonnegative().optional(),
-  })
-  .strict()
-  .superRefine((value, context) => {
-    if (
-      value.workspaceMain &&
-      !value.tabs.some(
-        (tab) =>
-          tab.state === 'READY' &&
-          tab.proof &&
-          JSON.stringify(tab.proof) === JSON.stringify(value.workspaceMain),
-      )
+export const OwnedTabProof = strictObj({
+  ownershipId: Id,
+  profileId: Id,
+  browserSessionEpoch: Id,
+  tabId: PosInt,
+  targetId: sReq(200),
+});
+export const OwnedTabRecord = strictObj({
+  ownershipId: Id,
+  url: sMax(4096),
+  state: z.enum(['CREATING', 'READY', 'UNKNOWN', 'LOST', 'CLOSED']),
+  proof: OwnedTabProof.nullable(),
+  reason: sMax(200),
+});
+export const KernelOperationRecord = strictObj({
+  binding: DispatchBinding,
+  operationSequence: PosInt.max(Number.MAX_SAFE_INTEGER).optional(),
+  executionEnded: z.literal(true).optional(),
+  state: z.enum(['DISPATCHING', 'ACKNOWLEDGED', 'UNKNOWN', 'RECONCILED']),
+  reason: sMax(200),
+  disposition: OperationDisposition.optional(),
+  resolution: strictObj({
+    id: Id,
+    outcome: z.enum(['VERIFIED', 'NOT_APPLIED', 'CONTROL_RELEASED']),
+    evidenceDigest: Sha256Hex,
+  }).nullable(),
+});
+export const KernelPersistentState = strictObj({
+  version: z.union([z.literal(1), z.literal(2)]),
+  profileId: Id,
+  browserSessionEpoch: Id,
+  operations: z.array(KernelOperationRecord).max(3000),
+  tabs: z.array(OwnedTabRecord).max(500),
+  workspaceMain: OwnedTabProof.optional(),
+  operationHighWater: NonNegInt.max(Number.MAX_SAFE_INTEGER).optional(),
+  previousBrowserSessionEpoch: Id.optional(),
+  browserSessionStartedAt: NonNegInt.optional(),
+}).superRefine((v, ctx) => {
+  if (
+    v.workspaceMain &&
+    !v.tabs.some(
+      (t) =>
+        t.state === 'READY' &&
+        t.proof &&
+        JSON.stringify(t.proof) === JSON.stringify(v.workspaceMain),
     )
-      context.addIssue({ code: 'custom', message: 'KERNEL_WORKSPACE_MAIN_UNCONFIRMED' });
-    if (
-      value.operations.some(
-        (row) =>
-          (row.state === 'RECONCILED') !== (row.resolution !== null) ||
-          (row.disposition !== undefined &&
-            !['DISPATCHING', 'UNKNOWN', 'ACKNOWLEDGED', 'RECONCILED'].includes(row.state)),
-      ) ||
-      value.tabs.some(
-        (row) =>
-          row.state === 'READY' &&
-          (!row.proof || row.proof.browserSessionEpoch !== value.browserSessionEpoch),
-      )
+  )
+    addIssue(ctx, 'KERNEL_WORKSPACE_MAIN_UNCONFIRMED');
+  if (
+    v.operations.some((r) => (r.state === 'RECONCILED') !== (r.resolution !== null)) ||
+    v.tabs.some(
+      (r) =>
+        r.state === 'READY' && (!r.proof || r.proof.browserSessionEpoch !== v.browserSessionEpoch),
     )
-      context.addIssue({ code: 'custom', message: 'KERNEL_STATE_INVALID_PHASE' });
-    if (
-      new Set(value.operations.map((row) => row.binding.operationId)).size !==
-        value.operations.length ||
-      new Set(value.tabs.map((row) => row.ownershipId)).size !== value.tabs.length
+  )
+    addIssue(ctx, 'KERNEL_STATE_INVALID_PHASE');
+  if (
+    new Set(v.operations.map((r) => r.binding.operationId)).size !== v.operations.length ||
+    new Set(v.tabs.map((r) => r.ownershipId)).size !== v.tabs.length
+  )
+    addIssue(ctx, 'KERNEL_STATE_DUPLICATE_ID');
+  if (
+    v.operations.some((r) => r.binding.profileId !== v.profileId) ||
+    v.tabs.some(
+      (r) =>
+        r.proof && (r.proof.profileId !== v.profileId || r.proof.ownershipId !== r.ownershipId),
     )
-      context.addIssue({ code: 'custom', message: 'KERNEL_STATE_DUPLICATE_ID' });
-    if (
-      value.operations.some((row) => row.binding.profileId !== value.profileId) ||
-      value.tabs.some(
-        (row) =>
-          row.proof &&
-          (row.proof.profileId !== value.profileId || row.proof.ownershipId !== row.ownershipId),
-      )
-    )
-      context.addIssue({ code: 'custom', message: 'KERNEL_STATE_PROFILE_MISMATCH' });
-  });
+  )
+    addIssue(ctx, 'KERNEL_STATE_PROFILE_MISMATCH');
+});
 export type TabProof = z.infer<typeof OwnedTabProof>;
 export type TabRecord = z.infer<typeof OwnedTabRecord>;
 export type KernelRecord = z.infer<typeof KernelOperationRecord>;

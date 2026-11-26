@@ -1,14 +1,12 @@
 import { z } from 'zod';
-
-export const MediaComponentStatus = z
-  .object({
-    supported: z.boolean(),
-    installed: z.boolean(),
-    busy: z.boolean(),
-    platform: z.string(),
-    phase: z.enum(['idle', 'downloading', 'verifying', 'installing']),
-    receivedBytes: z.number().nonnegative(),
-    totalBytes: z.number().nonnegative(),
-    error: z.string(),
-  })
-  .strict();
+import { NonNegFinite, strictObj } from './contracts.js';
+export const MediaComponentStatus = strictObj({
+  supported: z.boolean(),
+  installed: z.boolean(),
+  busy: z.boolean(),
+  platform: z.string(),
+  phase: z.enum(['idle', 'downloading', 'verifying', 'installing']),
+  receivedBytes: NonNegFinite,
+  totalBytes: NonNegFinite,
+  error: z.string(),
+});

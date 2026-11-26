@@ -1,7 +1,7 @@
 import type { TaskRepository } from '../domain/tasks.js';
-import type { WorkspaceBackupWriter, WorkspaceRestorePort } from '../domain/workspace-backup.js';
+import type { WorkspaceBackupWriter, WorkspaceRestorePort } from '../domain/system-ports.js';
 import { ProductError } from '../domain/workspace.js';
-import { taskTimingEligibility } from '../domain/task-timing.js';
+import { taskTimingEligibility } from '../domain/system-ports.js';
 import {
   CreateWorkspaceBackup,
   WorkspaceBackupResult,
@@ -34,15 +34,14 @@ export class WorkspaceBackupService {
       ? await this.active()
       : (await this.tasks.livePlans()).some(
           (plan) =>
-            ['RUNNING', 'PAUSING', 'STOPPING'].includes(plan.state) ||
+            plan.state === 'RUNNING' ||
             (plan.state === 'QUEUED' &&
               (!plan.timing ||
                 plan.timingReleased ||
-                taskTimingEligibility(plan.timing, Date.now()) !== 'WAIT')) ||
-            (plan.state === 'REVIEW' && !plan.controlConfirmed),
+                taskTimingEligibility(plan.timing, Date.now()) !== 'WAIT')),
         );
     if (active)
-      throw new ProductError('BACKUP_TASKS_ACTIVE', '请先暂停或停止任务，确认停止后再备份', 409);
+      throw new ProductError('BACKUP_TASKS_ACTIVE', '请先停止运行中的任务，再进行数据备份', 409);
   }
   async status() {
     const defaultDirectory = this.writer.defaultDirectory?.() ?? '';

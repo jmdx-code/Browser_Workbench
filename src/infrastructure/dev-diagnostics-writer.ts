@@ -1,9 +1,7 @@
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { devDiag, type DevDiagEntry } from '../shared/dev-diagnostics.js';
-
 const DEFAULT_MAX_LOG_BYTES = 20 * 1024 * 1024; // 20 MB
-
 export class DevDiagnosticsFileWriter {
   readonly filePath: string;
   private readonly prevFilePath: string;
@@ -22,7 +20,6 @@ export class DevDiagnosticsFileWriter {
       void this.flush();
     }
   }
-
   constructor(
     readonly directory: string,
     private readonly maxLogBytes = DEFAULT_MAX_LOG_BYTES,
@@ -30,13 +27,11 @@ export class DevDiagnosticsFileWriter {
     this.filePath = path.join(directory, 'dev-diagnostics.jsonl');
     this.prevFilePath = path.join(directory, 'dev-diagnostics.prev.jsonl');
   }
-
   install(): void {
     devDiag.setSink((entry) => {
       this.enqueue(entry);
     }, this.filePath);
   }
-
   enqueue(entry: DevDiagEntry): void {
     if (this.queue.length >= 2000) {
       this.queue.shift();
@@ -46,7 +41,6 @@ export class DevDiagnosticsFileWriter {
       void this.flush();
     }
   }
-
   async flush(): Promise<void> {
     if (this.activeFlush) {
       await this.activeFlush;
@@ -62,7 +56,6 @@ export class DevDiagnosticsFileWriter {
       }
     }
   }
-
   private async drain(): Promise<void> {
     try {
       if (!this.readyDir) {
@@ -83,7 +76,6 @@ export class DevDiagnosticsFileWriter {
       // Never propagate diagnostic I/O errors.
     }
   }
-
   private async rotateIfNeeded(): Promise<void> {
     try {
       const info = await stat(this.filePath);

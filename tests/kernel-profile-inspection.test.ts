@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { Store } from '../src/bridge/store.js';
 import { Core } from '../src/bridge/core.js';
-import { WatchTasks } from '../src/bridge/watch.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { KernelBridge } from '../src/infrastructure/kernel-bridge.js';
 import { KernelProfileInspection } from '../src/infrastructure/kernel-profile-inspection.js';
@@ -27,9 +26,8 @@ async function fixture(
 ) {
   const store = new Store(':memory:');
   const core = new Core(store);
-  const tasks = new WatchTasks(core);
   const workspace = await WorkspaceStore.open(':memory:');
-  const kernel = new KernelBridge(core, tasks);
+  const kernel = new KernelBridge(core);
   const id = randomUUID();
   const inventory: KernelState = {
     version: 1,
@@ -159,12 +157,14 @@ async function fixture(
             })),
           };
           break;
-        case 'remove':
+        case 'remove': {
           if (!wrongClose) {
-            const row = inventory.tabs[0];
+            const row =
+              inventory.tabs.find((t) => t.proof?.tabId === request.tabId) ?? inventory.tabs[0];
             if (row) row.state = 'CLOSED';
           }
           break;
+        }
         case 'stop':
           value = { state: 'stopped', requestId: request.requestId };
           break;
@@ -602,7 +602,7 @@ test('private queued bootstrap admits only its original untouched queue; public 
       );
       let calls = 0;
       const guard = () => {
-        if (revoke && ++calls === 2) f.workspace.tasks.requestControl(plan.id, 'stop');
+        if (revoke && ++calls === 2) void f.workspace.tasks.stopPlanDirect(plan.id, 'USER_STOP');
       };
       const work = f.adapter.readQueuedNativeActor(plan.id, connection, guard);
       if (revoke) await assert.rejects(work, /QUEUED_BOOTSTRAP_REVOKED/);
@@ -682,26 +682,24 @@ test('private native identity refuses a changed document and cannot bypass retai
   } finally {
     await changed.close();
   }
-  const retained = await fixture({ native: true });
+  const recovered = await fixture({ native: true });
   try {
-    retained.inventory.tabs.push({
+    recovered.inventory.tabs.push({
       ownershipId: randomUUID(),
       proof: null,
       state: 'UNKNOWN',
       url: 'https://www.facebook.com/',
       reason: 'CREATE_RESULT_UNKNOWN',
     });
-    await assert.rejects(
-      retained.adapter.readNativeActor(
-        { profileId: retained.id, connectionEpoch: retained.peer.epoch },
-        () => {},
-      ),
-      /INSPECTION_NATIVE_REVIEW_REQUIRED/,
+    const res = await recovered.adapter.readNativeActor(
+      { profileId: recovered.id, connectionEpoch: recovered.peer.epoch },
+      () => {},
     );
-    assert.equal(retained.requests.includes('observeFacebookIdentity'), false);
-    assert.equal(retained.requests.includes('create'), false);
+    assert.equal(res?.actor.accountId, '10000000000001');
+    assert.equal(recovered.requests.includes('observeFacebookIdentity'), true);
+    assert.equal(recovered.requests.includes('create'), true);
   } finally {
-    await retained.close();
+    await recovered.close();
   }
 });
 
@@ -718,7 +716,7 @@ test('production capability gate refuses old extension without opening native se
   }
 });
 
-test('unknown native ownership is retained and blocks new page creation without automatic adoption or close', async () => {
+test('stale unknown native tab does not freeze inspection and proceeds to temporary tab read', async () => {
   const f = await fixture();
   try {
     f.inventory.tabs.push({
@@ -730,9 +728,9 @@ test('unknown native ownership is retained and blocks new page creation without 
     });
     f.service.request([f.id]);
     const result = await completed(f.service, f.id);
-    assert.equal(result.reason, 'INSPECTION_NATIVE_REVIEW_REQUIRED');
-    assert.deepEqual(f.requests, ['open', 'inventory', 'stop']);
-    assert.equal(f.inventory.tabs[0]?.state, 'UNKNOWN');
+    assert.equal(result.state, 'OBSERVED');
+    assert.equal(result.account.state, 'logged-out');
+    assert.equal(f.requests.includes('create'), true);
   } finally {
     await f.close();
   }

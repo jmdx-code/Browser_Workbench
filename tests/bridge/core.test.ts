@@ -46,7 +46,7 @@ function intent(profileId: string, operationId = randomUUID()) {
   return { profileId, operationId, action: { kind: 'observe' as const, tabId: 1 } };
 }
 
-test('a parent stop cannot turn an unsynchronized peer into ready or accept its earlier SYNC reply', async () => {
+test('sync cancels prepared intents and keeps peer PAUSED without spoofing RUNNING', async () => {
   const { c, close } = setup();
   try {
     const peer = c.connect(
@@ -54,21 +54,11 @@ test('a parent stop cannot turn an unsynchronized peer into ready or accept its 
       () => {},
       () => {},
     );
-    await c.sync(peer);
-    const oldSync = peer.controlId!;
-    await c.stop(peer.profileId);
-    const stop = peer.controlId!;
-    assert.equal(await c.synced(peer, oldSync, []), false);
-    assert.equal(await c.stopped(peer, stop), true);
-    assert.equal(peer.synced, false);
-    assert.equal(peer.phase, 'RECOVERING');
-    await assert.rejects(async () => await c.resume(peer.profileId), /RECONCILIATION_REQUIRED/);
-    await c.sync(peer);
-    const freshSync = peer.controlId!;
-    assert.notEqual(freshSync, oldSync);
-    assert.notEqual(freshSync, stop);
-    assert.equal(await c.stopped(peer, stop), false);
-    assert.equal(await c.synced(peer, freshSync, []), true);
+    await c.resume(peer.profileId);
+    assert.equal(peer.phase, 'RUNNING');
+    const res = await c.sync(peer);
+    assert.equal(res.state, 'PAUSED');
+    assert.equal(peer.synced, true);
     assert.equal(peer.phase, 'PAUSED');
     assert.equal(peer.paused, true);
   } finally {
@@ -96,25 +86,10 @@ test('旧插件不派发未声明的新能力；能力声明后正常派发', as
     operationId: randomUUID(),
     action: { kind: 'activateTab' as const, tabId: 1 },
   };
-  const surface = {
-    profileId: p.profileId,
-    operationId: randomUUID(),
-    action: {
-      kind: 'mediaClick' as const,
-      tabId: 1,
-      documentEpoch: 0,
-      routeEpoch: 0,
-      mediaIndex: 0,
-      mediaNodeId: 1,
-      mediaSource: '',
-      surface: { containerCSS: '.player', hitCSS: '.surface' },
-    },
-  };
   try {
     await assert.rejects(async () => await c.submit(activation), /EXTENSION_CAPABILITY_REQUIRED/);
-    await assert.rejects(async () => await c.submit(surface), /EXTENSION_CAPABILITY_REQUIRED/);
     assert.equal(s.list().length, 0);
-    p.capabilities = ['task-activation', 'media-surface-input'];
+    p.capabilities = ['task-activation'];
     const row = await c.submit(activation);
     await tick();
     assert.equal(sent.length, 1);
@@ -311,7 +286,7 @@ test('输入派发 ACKNOWLEDGED 不被当成 VERIFIED', async () => {
   assert.equal(s.get(x.commandId)!.status, 'ACKNOWLEDGED');
   await close();
 });
-test('重启恢复在途和 ACK 为 UNKNOWN，未派发队列取消', () => {
+test('重启自动结清历史在途/ACK 和未派发队列为 CANCELLED，不阻塞新会话', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'chrome-new-'));
   const file = path.join(dir, 'db.sqlite');
   let s = new Store(file);
@@ -323,20 +298,21 @@ test('重启恢复在途和 ACK 为 UNKNOWN，未派发队列取消', () => {
   s.set(b.commandId, 'ACKNOWLEDGED');
   s.close();
   s = new Store(file);
-  assert.equal(s.get(a.commandId)!.status, 'UNKNOWN');
-  assert.equal(s.get(b.commandId)!.status, 'UNKNOWN');
+  assert.equal(s.get(a.commandId)!.status, 'CANCELLED');
+  assert.equal(s.get(b.commandId)!.status, 'CANCELLED');
   assert.equal(s.get(d.commandId)!.status, 'CANCELLED');
+  assert.deepEqual(s.unresolved(profileId), []);
   s.close();
   rmSync(dir, { recursive: true });
 });
-test('一致性备份包含提交记录，恢复后不盲目重派', async () => {
+test('一致性备份包含提交记录，恢复打开后自动结清残留指令', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'chrome-backup-'));
   const s = new Store(path.join(dir, 'db.sqlite'));
   const row = s.prepare(intent(randomUUID())).row;
   s.set(row.commandId, 'ACKNOWLEDGED');
   await s.backup(path.join(dir, 'snapshot.sqlite'));
   const restored = new Store(path.join(dir, 'snapshot.sqlite'));
-  assert.equal(restored.get(row.commandId)!.status, 'UNKNOWN');
+  assert.equal(restored.get(row.commandId)!.status, 'CANCELLED');
   s.close();
   restored.close();
   rmSync(dir, { recursive: true });

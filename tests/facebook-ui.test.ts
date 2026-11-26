@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { FACEBOOK_UI_COPY, matchFacebookHomeCopy } from '../src/shared/facebook-ui.js';
-import { observeFacebookHomeName } from '../src/domain/facebook-name-analysis.js';
-import { observeFacebookHomeAvatar } from '../src/domain/facebook-avatar-analysis.js';
+import { observeFacebookHomeName } from '../src/domain/facebook-content-rules.js';
+import { observeFacebookHomeAvatar } from '../src/domain/facebook-content-rules.js';
 import { observeFacebookComposerSurface } from '../src/domain/facebook-composer-analysis.js';
 import { readFacebookPostPage } from '../src/infrastructure/facebook-post-page-reader.js';
 import { projectFacebookReviewContent } from '../src/infrastructure/facebook-review-reader.js';
@@ -114,7 +114,9 @@ test('Unicode display names remain exact, including complex scripts and punctuat
 test('localized avatars keep original origin restrictions and remain display only', () => {
   for (const copy of FACEBOOK_UI_COPY) {
     const p = page(facebookDisplayInspectionProjection);
-    row(p, 'ownProfileControls').nodes.push(element('div', { 'aria-label': copy.profile[0] }));
+    row(p, 'ownProfileControls').nodes.push(
+      element('div', { 'aria-label': copy.profile[0] ?? '' }),
+    );
     row(p, 'ownProfileImages').nodes.push(
       element('image', { href: 'https://example.fbcdn.net/avatar.jpg' }),
     );
@@ -124,7 +126,7 @@ test('localized avatars keep original origin restrictions and remain display onl
       false,
     );
     row(p, 'ownProfileControls').nodes.push(
-      element('div', { 'aria-label': copy.profile[0] }, false),
+      element('div', { 'aria-label': copy.profile[0] ?? '' }, false),
     );
     assert.equal(observeFacebookHomeAvatar(p), null);
   }

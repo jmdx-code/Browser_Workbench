@@ -9,10 +9,8 @@ import {
   facebookMarketplaceUnavailableURL,
   facebookPostStoryLandingURL,
 } from '../shared/facebook-browse-route.js';
-
 export const FACEBOOK_TASK_DOCUMENT_READ =
   'JSON.stringify({url:location.href,ready:document.readyState})';
-
 export function missingFacebookDefaultContext(error: unknown) {
   if (!(error instanceof Error)) return false;
   try {
@@ -27,7 +25,6 @@ export function missingFacebookDefaultContext(error: unknown) {
     return false;
   }
 }
-
 // A new native tab may still have no default JS context immediately after debugger attach.
 // Repeat only this fixed read and that exact observed CDP error; never repeat setup or input.
 export async function awaitFacebookTaskDocument(
@@ -45,6 +42,7 @@ export async function awaitFacebookTaskDocument(
     expectedUrl?: string;
     retainedPage?: boolean;
     allowTargetBrowseUrl?: boolean;
+    allowStuckLoadingStop?: boolean;
   } = {},
 ) {
   const now = options.now ?? Date.now,
@@ -71,6 +69,8 @@ export async function awaitFacebookTaskDocument(
   )
     throw Error('FACEBOOK_TASK_INITIAL_ROUTE_REJECTED');
   let homeSeen = false;
+  let homeLoadingSince: number | null = null;
+  let stopLoadingSentAt: number | null = null;
   // Initial network navigation can exceed eight seconds. This bounded read does
   // not replay navigation or input; business readiness is still checked by the reader.
   for (let n = 0; n < 151; n++) {
@@ -110,17 +110,34 @@ export async function awaitFacebookTaskDocument(
         url: currentUrl,
       });
       if (scope === 'other') {
+        if (/^chrome-error:\/\//i.test(currentUrl))
+          throw Error('FACEBOOK_TASK_DOCUMENT_ERROR_PAGE');
         const abnormal = classifyFacebookAbnormalUrl(currentUrl);
         if (abnormal) throw Error(abnormal);
         throw Error('FACEBOOK_TASK_DOCUMENT_SCOPE_CHANGED');
       }
-
       if (scope === 'home') homeSeen = true;
       // The SDK needs a parsed document, not every third-party subresource's load event.
       // Fresh actor, visible controls and business readiness are checked after attachment.
       if (scope === 'home' && ['interactive', 'complete'].includes(String(document.ready))) return;
       if (!['loading', 'interactive', 'complete'].includes(String(document.ready)))
         throw Error('FACEBOOK_TASK_DOCUMENT_READ_FAILED');
+      if (
+        options.allowStuckLoadingStop === true &&
+        options.retainedPage === true &&
+        scope === 'home' &&
+        String(document.ready) === 'loading'
+      ) {
+        const at = now();
+        if (homeLoadingSince === null) homeLoadingSince = at;
+        if (stopLoadingSentAt === null && at - homeLoadingSince >= 15_000) {
+          stopLoadingSentAt = at;
+          await executor.send({ tabId }, 'Page.stopLoading', {}).catch(() => {});
+          await assertCurrent();
+        } else if (stopLoadingSentAt !== null && at - stopLoadingSentAt >= 5_000) {
+          throw Error('FACEBOOK_TASK_DOCUMENT_TIMEOUT');
+        }
+      }
     } catch (error) {
       if (
         !missingFacebookDefaultContext(error) &&

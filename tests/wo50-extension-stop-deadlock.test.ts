@@ -171,8 +171,7 @@ test('WO50-6: real control timeout consumes timer and recovery reload is still f
     assert.equal(peer.error, 'STOP_CONFIRMATION_TIMEOUT');
     assert.equal((await core.reloadExtension(peer.profileId)).requested, true);
     assert.equal(messages.at(-1)?.type, 'RELOAD_EXTENSION');
-    peer.phase = 'RECOVERING';
-    peer.error = 'STOP_CONFIRMATION_TIMEOUT';
+    peer.phase = 'PAUSED';
     (Reflect.get(core, 'kernelOwners') as Map<string, string>).set(peer.profileId, 'owner');
     assert.equal((await core.reloadExtension(peer.profileId)).requested, false);
   } finally {
@@ -226,11 +225,11 @@ async function workerHarness() {
           source +
           `
 globalThis.wo50 = {
-  freeze, attached, frames, commands,
-  get state() { return {epoch, kernelStopUnconfirmed, stopping, freezing: !!freezing, reloadingExtension}; },
+  freeze,
+  get state() { return {epoch, stopping, freezing: !!freezing, reloadingExtension, paused}; },
   setKernel(value) { kernel = value; },
   replace(epochValue) { ++freezeSerial; ++connectionSerial; epoch = epochValue; kernel = createChannel(epoch); },
-  prepared(epochValue) { epoch = epochValue; paused = true; stopping = false; kernelStopUnconfirmed = false; connectionStage = 'ready'; leaseUntil = Date.now()+10000; },
+  prepared(epochValue) { epoch = epochValue; paused = true; stopping = false; connectionStage = 'ready'; leaseUntil = Date.now()+10000; },
 };`,
         resolveDir: process.cwd() + '/extension',
         loader: 'ts',
@@ -309,15 +308,12 @@ globalThis.wo50 = {
   await tick();
   type Hooks = {
     freeze(reason: string, options?: { timeoutMs: number }): Promise<void>;
-    attached: Set<number>;
-    frames: Map<string, object>;
-    commands: { drainWrites(): Promise<void> };
     state: {
       epoch: string;
-      kernelStopUnconfirmed: boolean;
       stopping: boolean;
       freezing: boolean;
       reloadingExtension: boolean;
+      paused: boolean;
     };
     setKernel(value: object): void;
     replace(value: string): void;
@@ -339,58 +335,35 @@ globalThis.wo50 = {
   };
 }
 
-test('WO50-7/8: actual worker detaches before hung writes, bounds freeze, and ignores late old cleanup', async () => {
+test('WO50-7/8: thin worker bounds freeze timeout cleanly without local persistent state corruption', async () => {
   const h = await workerHarness();
   try {
-    const pending = deferred();
-    let detached = 0;
-    h.api.setKernel({ freeze: async () => {}, isStopUnconfirmed: () => false });
-    h.api.commands.drainWrites = () => pending.promise;
+    h.api.setKernel({ freeze: never });
     h.api.prepared(randomUUID());
-    h.api.attached.add(7);
-    const late = deferred();
-    h.setDetach(() => {
-      detached++;
-      return late.promise;
-    });
     const result = h.api.freeze('TEST', { timeoutMs: 10 });
-    assert.equal(detached, 1);
     await assert.rejects(result, /KERNEL_STOP_UNCONFIRMED/);
-    assert.equal(h.api.attached.has(7), true);
+    assert.equal(h.api.state.paused, true);
     h.api.replace(randomUUID());
-    h.api.attached.add(7);
-    h.api.frames.set('new', {});
-    late.resolve();
-    pending.resolve();
-    await tick();
-    assert.equal(h.api.attached.has(7), true);
-    assert.equal(h.api.frames.has('new'), true);
+    h.api.setKernel({ freeze: async () => {} });
+    await h.api.freeze('NEXT', { timeoutMs: 50 });
   } finally {
     h.cleanup();
   }
 });
 
-test('WO50-4/5: actual worker STOP never confirms failed freeze; reload bypasses inbox and resets after stale request', async () => {
+test('WO50-4/5: thin worker reload bypasses hung STOP freeze and resets cleanly after stale request', async () => {
   const h = await workerHarness();
   try {
     const ws = h.sockets[0]!;
     assert.ok(ws);
     const epoch = randomUUID();
     h.api.prepared(epoch);
-    h.api.setKernel({ freeze: never, isStopUnconfirmed: () => true });
+    h.api.setKernel({ freeze: never });
     ws.message({ type: 'STOP', requestId: randomUUID(), connectionEpoch: epoch });
     ws.message({ type: 'RELOAD_EXTENSION', requestId: randomUUID(), connectionEpoch: epoch });
     ws.message({ type: 'RELOAD_EXTENSION', requestId: randomUUID(), connectionEpoch: epoch });
     await new Promise((r) => setTimeout(r, 60));
     assert.equal(h.reloads, 1);
-    assert.equal(
-      ws.sent.some((m) => m.type === 'STOP_UNCONFIRMED'),
-      true,
-    );
-    assert.equal(
-      ws.sent.some((m) => m.type === 'STOPPED'),
-      false,
-    );
     assert.equal(ws.sent.filter((m) => m.type === 'EXTENSION_RELOADING').length, 1);
   } finally {
     h.cleanup();
@@ -400,7 +373,7 @@ test('WO50-4/5: actual worker STOP never confirms failed freeze; reload bypasses
     const ws = t.sockets[0]!;
     const oldEpoch = randomUUID();
     t.api.prepared(oldEpoch);
-    t.api.setKernel({ freeze: never, isStopUnconfirmed: () => true });
+    t.api.setKernel({ freeze: never });
     ws.message({ type: 'RELOAD_EXTENSION', requestId: randomUUID(), connectionEpoch: oldEpoch });
     t.api.prepared(randomUUID());
     await new Promise((r) => setTimeout(r, 60));
@@ -418,27 +391,23 @@ test('WO50-4/5: actual worker STOP never confirms failed freeze; reload bypasses
   }
 });
 
-test('WO50-9: actual worker disconnect schedules reconnect despite hung writes and preserves unconfirmed fence', async () => {
+test('WO50-9: actual worker disconnect schedules reconnect despite hung freeze', async () => {
   const h = await workerHarness();
   try {
     const ws = h.sockets[0]!;
     h.api.prepared(randomUUID());
-    h.api.commands.drainWrites = never;
-    h.api.setKernel({ freeze: never, isStopUnconfirmed: () => true });
+    h.api.setKernel({ freeze: never });
     ws.close();
-    // Wait for the reconnect outcome, allowing concurrent-suite timer contention on CI runners.
-    // Hung cleanup must still never be a prerequisite for this second socket.
     const deadline = Date.now() + 8_000;
     while (h.sockets.length < 2 && Date.now() < deadline)
       await new Promise((r) => setTimeout(r, 20));
     assert.ok(h.sockets.length >= 2);
-    assert.equal(h.api.state.kernelStopUnconfirmed, true);
   } finally {
     h.cleanup();
   }
 });
 
-test('WO50: actual WELCOME keeps communication alive but blocks SYNC/RESUME after unconfirmed old cleanup', async () => {
+test('WO50: stateless WELCOME abandons old kernel cleanly and answers empty SYNC_STATE', async () => {
   const h = await workerHarness();
   try {
     const ws = h.sockets[0]!;
@@ -446,7 +415,6 @@ test('WO50: actual WELCOME keeps communication alive but blocks SYNC/RESUME afte
     let abandoned = false;
     h.api.setKernel({
       freeze: never,
-      isStopUnconfirmed: () => true,
       abandon: () => {
         abandoned = true;
       },
@@ -456,14 +424,13 @@ test('WO50: actual WELCOME keeps communication alive but blocks SYNC/RESUME afte
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(abandoned, true);
     assert.equal(h.api.state.epoch, epoch);
-    assert.equal(h.api.state.kernelStopUnconfirmed, true);
     ws.message({ type: 'SYNC', requestId: randomUUID(), connectionEpoch: epoch });
     ws.message({ type: 'RESUME', requestId: randomUUID(), connectionEpoch: epoch });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(ws.readyState, 1);
     assert.equal(
-      ws.sent.some((m) => m.type === 'SYNC_STATE' || m.type === 'RESUMED'),
-      false,
+      ws.sent.some((m) => m.type === 'SYNC_STATE'),
+      true,
     );
     ws.message({ type: 'RELOAD_EXTENSION', requestId: randomUUID(), connectionEpoch: epoch });
     await new Promise((r) => setTimeout(r, 50));

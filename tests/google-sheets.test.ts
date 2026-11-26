@@ -2955,4 +2955,205 @@ describe('GoogleSheetsService end-to-end orchestration (M1–M4)', () => {
       await rm(cacheRoot, { recursive: true, force: true });
     }
   });
+
+  it('Cycle4: 24h/72h metrics scraper sorts newest first and applies failure backoff so 35 dead posts never starve newer posts', async () => {
+    const db = new DatabaseSync(':memory:');
+    const repo = new SqliteGoogleSheetsRepository(db);
+    let nowMs = Date.UTC(2026, 10, 22, 12, 0, 0);
+    const fmt = (ms: number) => {
+      const d = new Date(ms + 8 * 3_600_000);
+      const p = (n: number) => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+    };
+
+    // Build 35 unreachable older posts (2-5 days old) + 2 healthy newer posts (26h old)
+    const rawRows: string[][] = [
+      [
+        '贴文编号',
+        '资源号',
+        '发帖时间',
+        '小组ID',
+        '小组名',
+        '专页ID',
+        '专页名',
+        '贴文链接',
+        '点赞',
+        '留言',
+      ],
+    ];
+    for (let i = 1; i <= 35; i++) {
+      const code = `DEAD-${String(i).padStart(2, '0')}`;
+      const ts = fmt(nowMs - (72 + i) * 3_600_000);
+      rawRows.push([
+        code,
+        'RES',
+        ts,
+        '100',
+        'G',
+        '200',
+        'P',
+        `https://www.facebook.com/groups/100/posts/${100000 + i}`,
+        '',
+        '',
+      ]);
+    }
+    const fresh1Ts = fmt(nowMs - 26 * 3_600_000);
+    const fresh2Ts = fmt(nowMs - 27 * 3_600_000);
+    rawRows.push([
+      'FRESH-1',
+      'RES',
+      fresh1Ts,
+      '100',
+      'G',
+      '200',
+      'P',
+      'https://www.facebook.com/groups/100/posts/999001',
+      '',
+      '',
+    ]);
+    rawRows.push([
+      'FRESH-2',
+      'RES',
+      fresh2Ts,
+      '100',
+      'G',
+      '200',
+      'P',
+      'https://www.facebook.com/groups/100/posts/999002',
+      '',
+      '',
+    ]);
+
+    const scrapedBatches: string[][] = [];
+    const writebacks: Array<Array<{ rowNumber: number; colIndex: number; value: string }>> = [];
+    const service = new GoogleSheetsService(repo, {
+      workspace: {
+        snapshot: async () => ({ profiles: [] }),
+      } as unknown as WorkspaceService,
+      groupBumper: {
+        state: async () => ({ groups: [], pages: [] }),
+      } as unknown as GroupBumperService,
+      oauth: {
+        status: async () => ({
+          hasCredentials: true,
+          clientIdHint: 'c',
+          authorized: true,
+          authorizedEmail: 'a@b.com',
+          scopes: [],
+          pendingAuthUrl: null,
+          pendingAuthStartedAt: null,
+          lastError: null,
+        }),
+        importCredentialsJson: async () => {
+          throw new Error('unused');
+        },
+        startAuthSession: async () => {
+          throw new Error('unused');
+        },
+        completeManualAuth: async () => {
+          throw new Error('unused');
+        },
+        revokeAuth: async () => {
+          throw new Error('unused');
+        },
+        getValidAccessToken: async () => 'tok',
+        shutdown: async () => {},
+      },
+      sheetsApi: {
+        getSpreadsheetMeta: async () => ({
+          spreadsheetId: 'sp-metrics-backoff-test',
+          title: 'M',
+          sheets: [],
+        }),
+        readSheetValues: async () => ({
+          formulaRows: rawRows.map((r) => [...r]),
+          formattedRows: rawRows.map((r) => [...r]),
+        }),
+        readColumnValues: async (_sp, _sn, colIndex) => rawRows.map((r) => r[colIndex] ?? ''),
+        appendRows: async () => {},
+        batchUpdateCells: async (_sp, _sn, updates) => {
+          writebacks.push(updates);
+        },
+        deleteRowsDescending: async () => {},
+        ensureHeaderColumn: async () => 0,
+      },
+      imageHost: {
+        status: async () => ({
+          preferredHost: 'auto',
+          hasGyazoToken: false,
+          gyazoTokenPreview: null,
+          gyazoTokenCount: 0,
+          gyazoTokenPreviews: [],
+          driveFolderId: null,
+          defaultMachineName: '电脑1号',
+          cachedImageCount: 0,
+        }),
+        saveConfig: async () => {
+          throw new Error('unused');
+        },
+        testConnection: async () => ({ ok: true, host: 'drive', summary: 'ok' }),
+        uploadDataUrlOrUrl: async () => null,
+      },
+      automation: {
+        prepareMaterialMedia: async () => ({
+          localFilePath: null,
+          mediaKind: 'none',
+          thumbnailDataUrl: null,
+        }),
+        publishScheduledMaterial: async () => ({ postedCount: 0, timelinePosted: false }),
+        bumpDirectPosts: async () => [],
+        scrapePublicPostMetrics: async ({ posts }) => {
+          scrapedBatches.push(posts.map((t) => t.postCode));
+          return posts.map((t) =>
+            t.postCode.startsWith('FRESH-')
+              ? { postCode: t.postCode, postUrl: t.postUrl, likes: 12, comments: 3 }
+              : {
+                  postCode: t.postCode,
+                  postUrl: t.postUrl,
+                  likes: null,
+                  comments: null,
+                  error: 'DELETED',
+                },
+          );
+        },
+        scrapePostMetrics: async () => [],
+      },
+      now: () => nowMs,
+    });
+
+    const link = repo.createLink({
+      kind: 'post_records',
+      title: '指标防饿死测试',
+      spreadsheetId: 'sp-metrics-backoff-test',
+      spreadsheetTitle: 'M',
+      sheetId: 1,
+      sheetName: '发帖记录',
+      spreadsheetUrl: 'https://docs.google.com/spreadsheets/d/sp-metrics-backoff-test/edit#gid=1',
+      recordsConfig: {
+        enabled: true,
+        machineName: '电脑1号',
+        collectMetricsOnThisPc: true,
+      },
+    });
+
+    // Run 1: FRESH-1 and FRESH-2 are sorted to the FRONT of the 30-item batch (never starved by 35 DEAD rows!),
+    // while the 28 dead posts attempted in batch 1 enter 30-min failure backoff!
+    const res1 = await service.collectDueMetricsForLink(link.id, false);
+    expect(res1.updated).toBe(2);
+    expect(scrapedBatches[0]?.slice(0, 2)).toEqual(['FRESH-1', 'FRESH-2']);
+    expect(writebacks.length).toBe(1);
+
+    // Run 2 (5 minutes later): the 28 dead posts from Run 1 are in backoff, so Run 2 moves straight to the remaining 7 DEAD posts!
+    nowMs += 5 * 60_000;
+    await service.collectDueMetricsForLink(link.id, false);
+    expect(scrapedBatches[1]?.length).toBe(7);
+
+    // Run 3 (5 minutes later): all 35 dead posts are in backoff -> 0 wasted HTTP requests!
+    nowMs += 5 * 60_000;
+    const res3 = await service.collectDueMetricsForLink(link.id, false);
+    expect(res3.updated).toBe(0);
+    expect(scrapedBatches.length).toBe(2);
+
+    db.close();
+  });
 });

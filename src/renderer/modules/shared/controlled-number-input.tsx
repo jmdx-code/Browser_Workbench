@@ -7,6 +7,8 @@ import {
   type Ref,
 } from 'react';
 
+import { UI_INPUT_SM } from '../../ui/primitives.js';
+
 export interface ControlledNumberInputHandle {
   flush(): Promise<number>;
 }
@@ -18,7 +20,7 @@ export function ControlledNumberInput({
   defaultValue,
   ariaLabel,
   disabled,
-  className,
+  className = UI_INPUT_SM,
   style,
   debounceMs = 300,
   onChange,

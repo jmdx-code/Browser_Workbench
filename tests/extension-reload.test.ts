@@ -62,19 +62,14 @@ test(
         }),
       );
       assert.equal((await next()).type, 'WELCOME');
-      const sync = await next();
-      assert.equal(sync.type, 'SYNC');
-      ws.send(
-        JSON.stringify({
-          type: 'SYNC_STATE',
-          connectionEpoch: sync.connectionEpoch,
-          requestId: sync.requestId,
-          entries: [],
-        }),
-      );
-      let reload = await next();
-      while (reload.type === 'HEARTBEAT') reload = await next();
-      assert.equal(reload.type, 'RELOAD_EXTENSION');
+      let msg = await next();
+      if (msg.type === 'HEARTBEAT') {
+        ws.send(JSON.stringify({ type: 'PONG', connectionEpoch: msg.connectionEpoch }));
+        msg = await next();
+      }
+      while (msg.type === 'HEARTBEAT') msg = await next();
+      assert.equal(msg.type, 'RELOAD_EXTENSION');
+      const reload = msg;
       ws.send(
         JSON.stringify({
           type: 'EXTENSION_RELOADING',

@@ -9,7 +9,6 @@ import {
   displayForRect,
   normalizeTaskWindowSize,
   gridCascadeSlotRect,
-  arrangeTaskWindowsInOrder,
 } from '../src/domain/window-layout.js';
 import {
   defaultWindowLayout,
@@ -469,7 +468,7 @@ test('normal task startup arranges without focusing; actual hidden recovery requ
   assert.deepEqual(focuses, [false, true]);
 });
 
-test('gridCascadeSlotRect and arrangeTaskWindowsInOrder produce uniform sizes and fixed offsets on the active display', async () => {
+test('gridCascadeSlotRect produces uniform sizes and fixed offsets on the active display', async () => {
   const f = fixture(5);
   const primary: LayoutScreen = {
     id: 'primary',
@@ -483,13 +482,10 @@ test('gridCascadeSlotRect and arrangeTaskWindowsInOrder produce uniform sizes an
   assert.equal(displayForRect(f.windows.get(f.ids[2]!)!.rect, [primary, screen])?.id, 'secondary');
 
   const size = normalizeTaskWindowSize(screen, f.windows.get(f.ids[2]!)!.rect);
-  const arranged = arrangeTaskWindowsInOrder(f.ids, screen, 8, f.windows.get(f.ids[2]!)!.rect);
-  assert.equal(arranged.size, 5);
-  for (const [idx, id] of f.ids.entries()) {
-    const r = arranged.get(id)!;
+  for (let idx = 0; idx < f.ids.length; idx++) {
+    const r = gridCascadeSlotRect(idx, size, screen, 8);
     assert.equal(r.width, size.width);
     assert.equal(r.height, size.height);
-    assert.deepEqual(r, gridCascadeSlotRect(idx, size, screen, 8));
     assert.ok(r.x >= screen.workArea.x + 12);
     assert.ok(r.y >= screen.workArea.y + 12);
   }

@@ -3,7 +3,7 @@ import { FilesystemWorkspaceBackupWriter } from '../src/infrastructure/workspace
 import { FilesystemWorkspaceRestore } from '../src/infrastructure/workspace-restore.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -11,11 +11,6 @@ import { startBridgeServer } from '../src/bridge/server.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { WorkspaceService } from '../src/application/workspace-service.js';
 import { TaskService } from '../src/application/task-service.js';
-import {
-  TaskFeatureOverview,
-  TaskFeatureOverviewV2,
-  FEATURE_CONTRACT_HEADER,
-} from '../src/shared/task-features.js';
 import {
   TaskOverview,
   TaskHistory,
@@ -26,31 +21,19 @@ import { BridgeProfileSource } from '../src/infrastructure/browser-source.js';
 import { workspaceApi } from '../src/http/workspace-api.js';
 import { GroupSchema, SavedCombinationSchema, WorkspaceSchema } from '../src/shared/contracts.js';
 import { WorkspacePreferences } from '../src/shared/workspace-preferences.js';
-import { WorkspaceMaintenance } from '../src/application/workspace-maintenance.js';
+import { WorkspaceMaintenance } from '../src/application/workspace-media-maintenance.js';
 import { FilesystemRuntimeLog } from '../src/infrastructure/runtime-log.js';
 import { MaintenanceOverview, RuntimeLogExport } from '../src/shared/runtime-log.js';
 import { createServer } from 'node:net';
-import { MaterialPreflightService } from '../src/application/material-preflight.js';
-import { MaterialArrangement } from '../src/shared/material-arrangement.js';
-import { FilesystemMaterialScanner } from '../src/infrastructure/material-scanner.js';
-import { FilesystemMaterialMediaReader } from '../src/infrastructure/material-media-reader.js';
-import { FilesystemMaterialSnapshotVerifier } from '../src/infrastructure/material-source-verifier.js';
-import {
-  MaterialPreflightReport,
-  MaterialPreviewScan,
-  MaterialPackagePreview,
-  MaterialPublishingReview,
-} from '../src/shared/materials.js';
 import { ProfileInspectionService } from '../src/application/profile-inspection.js';
 import { ProfileInspections } from '../src/shared/profile-inspection.js';
 import { ResourceTableService } from '../src/application/resource-table-service.js';
-import { ArchiveManagementService } from '../src/application/archive-management.js';
 import {
   ResourceSummaries,
   ResourceUsageSummaries,
   RESOURCE_SUMMARY_HEADER,
 } from '../src/shared/resource-table.js';
-test('real HTTP workspace preserves auth boundary, public schema, bulk move and draft lifecycle', async () => {
+test('real HTTP workspace preserves auth boundary, public schema, reorder and save lifecycle', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workspace-http-'));
   const probe = createServer();
   await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
@@ -61,19 +44,6 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
   const repo = await WorkspaceStore.open(path.join(dir, 'workspace.sqlite'));
   // Also exercise legacy clients without the >50 capacity header.
   repo.tasks.setSettings({ maxConcurrentProfiles: 2 });
-  const scanner = new FilesystemMaterialScanner();
-  let materialScans = 0;
-  const materials = new MaterialPreflightService(
-    {
-      scan: async (directory) => {
-        materialScans++;
-        return scanner.scan(directory);
-      },
-    },
-    () => new Date().toISOString(),
-    new FilesystemMaterialMediaReader(),
-    new FilesystemMaterialSnapshotVerifier(),
-  );
   let inspectCalls = 0;
   const inspection = new ProfileInspectionService(
     {
@@ -92,7 +62,7 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
     dataDir: dir,
     port,
     extensionIds: ['a'.repeat(32)],
-    appRoutes: ({ core, store, tasks }) => {
+    appRoutes: ({ core, store }) => {
       const backups = new WorkspaceBackupService(
         repo.tasks,
         new FilesystemWorkspaceBackupWriter(
@@ -103,13 +73,10 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
         new FilesystemWorkspaceRestore(dir),
       );
       return workspaceApi(
-        new WorkspaceService(repo, new BridgeProfileSource(core, store, tasks, inspection)),
+        new WorkspaceService(repo, new BridgeProfileSource(core, store, inspection)),
         new TaskService(repo.tasks, undefined, () => backups.assertIdle()),
-        materials,
         inspection,
         new ResourceTableService(repo.resourceTables),
-        new ArchiveManagementService(repo.archivePreparation, () => undefined),
-        undefined,
         undefined,
         backups,
         undefined,
@@ -216,10 +183,10 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
       (await fetch(summaryUrl, { headers: { [RESOURCE_SUMMARY_HEADER]: '2' } })).status,
       401,
     );
-    const resourceCombination = repo.createDraft({
+    const resourceCombination = repo.createCombination({
       name: '生成资源摘要HTTP测试',
       note: '',
-      steps: [],
+      steps: [{ id: randomUUID(), type: 'feed', durationMinutes: 1, maxLikes: 0, minLikeCount: 0 }],
       randomOrder: false,
       loop: { mode: 'finite', rounds: 1 },
     });
@@ -328,33 +295,6 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
       100,
     );
     await post('/tasks/settings', { maxConcurrentProfiles: 4 });
-    const featureResponse = await fetch(server.origin + '/api/workspace/tasks/features', {
-      headers: { cookie },
-    });
-    assert.equal(featureResponse.status, 200);
-    const featureState = (await featureResponse.json()) as {
-      controllerAvailable: boolean;
-      features: { id: string; status: string }[];
-    };
-    assert.equal(featureState.controllerAvailable, false);
-    assert.equal(featureState.features.length, 5);
-    TaskFeatureOverview.parse(featureState);
-    const featureV2 = await fetch(server.origin + '/api/workspace/tasks/features', {
-      headers: { cookie, [FEATURE_CONTRACT_HEADER]: '2' },
-    });
-    assert.equal(featureV2.status, 200);
-    const detailed = TaskFeatureOverviewV2.parse(await featureV2.json());
-    assert.ok(
-      detailed.features.every((feature) => !feature.enabled && feature.verification === 'pending'),
-    );
-    assert.equal(
-      featureState.features.find((row) => row.id === 'marketplace')?.status,
-      'verification-pending',
-    );
-    assert.equal(
-      featureState.features.find((row) => row.id === 'feed')?.status,
-      'verification-pending',
-    );
     await post('/tasks/settings', { maxConcurrentProfiles: 2 });
     const taskRuntime = TaskRuntimeOverview.parse(
       await (
@@ -445,12 +385,12 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
     assert.equal(
       (
         await post('/tasks/command', {
-          command: 'resume',
+          command: 'stop',
           plans: [
             {
               profileId: randomUUID(),
               planId: randomUUID(),
-              expectedState: 'PAUSED',
+              expectedState: 'RUNNING',
               expectedUpdatedAt: 0,
             },
           ],
@@ -490,34 +430,6 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
     assert.equal(history.selectedPlanId, null);
     assert.deepEqual(history.operations, []);
     assert.equal(repo.tasks.list().length, 0);
-    const missingPlan = { profileId: profileIds[0], planId: randomUUID() };
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/archives/list', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify(missingPlan),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/archives/list', missingPlan, 'https://attacker.example')).status,
-      403,
-    );
-    assert.equal(
-      (await post('/archives/list', { ...missingPlan, resolveUnknown: true })).status,
-      400,
-    );
-    assert.equal((await post('/archives/list', missingPlan)).status, 409);
-    const unavailableArchive = await post('/archives/resume', {
-      ...missingPlan,
-      attemptId: randomUUID(),
-      expectedRevision: 0,
-      expectedPreparationRevision: 0,
-    });
-    assert.equal(unavailableArchive.status, 409);
-    assert.equal((await unavailableArchive.json()).code, 'ARCHIVE_EXECUTION_UNAVAILABLE');
     assert.equal((await fetch(server.origin + '/api/workspace/profiles/inspection')).status, 401);
     assert.equal(
       (await post('/profiles/inspect', { profileIds, url: 'https://evil.test/' })).status,
@@ -556,225 +468,6 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
     assert.equal(inspectCalls, 0);
     const materialDirectory = path.join(dir, 'materials');
     await mkdir(materialDirectory);
-    await writeFile(path.join(materialDirectory, 'body.txt'), 'private test body');
-    const image = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jBz8AAAAASUVORK5CYII=',
-      'base64',
-    );
-    await writeFile(path.join(materialDirectory, 'image.png'), image);
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/materials/preflight', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify({ directory: materialDirectory }),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (
-        await post(
-          '/materials/preflight',
-          { directory: materialDirectory },
-          'https://attacker.example',
-        )
-      ).status,
-      403,
-    );
-    assert.equal(
-      (await post('/materials/preflight', { directory: materialDirectory, script: 'invalid' }))
-        .status,
-      400,
-    );
-    assert.equal(
-      (await fetch(server.origin + '/api/workspace/materials/preflight', { headers: { cookie } }))
-        .status,
-      405,
-    );
-    assert.equal(materialScans, 0);
-    const materialReport = MaterialPreflightReport.parse(
-      await (await post('/materials/preflight', { directory: materialDirectory })).json(),
-    );
-    assert.equal(materialScans, 1);
-    assert.equal(materialReport.complete, true);
-    assert.equal(materialReport.packages.length, 2);
-    assert.equal(materialReport.publishingReady, false);
-    assert.equal(JSON.stringify(materialReport).includes('private test body'), false);
-    const previewRequest = await fetch(server.origin + '/api/workspace/materials/preflight', {
-      method: 'POST',
-      headers: {
-        cookie,
-        origin: server.origin,
-        'content-type': 'application/json',
-        'x-workbench-material-preview': '1',
-      },
-      body: JSON.stringify({ directory: materialDirectory }),
-    });
-    const previewScan = MaterialPreviewScan.parse(await previewRequest.json());
-    assert.equal(JSON.stringify(previewScan).includes('private test body'), false);
-    assert.equal(materialScans, 2);
-    const mediaSelection = { scanId: previewScan.scanId, source: 'image.png', fileIndex: 0 };
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/materials/media', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify(mediaSelection),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/materials/media', mediaSelection, 'https://attacker.example')).status,
-      403,
-    );
-    assert.equal(
-      (await fetch(server.origin + '/api/workspace/materials/media', { headers: { cookie } }))
-        .status,
-      405,
-    );
-    assert.equal(
-      (await post('/materials/media', { ...mediaSelection, filePath: '/private.png' })).status,
-      400,
-    );
-    assert.equal(
-      (await post('/materials/media', { ...mediaSelection, source: '../private.png' })).status,
-      404,
-    );
-    const binary = await post('/materials/media', mediaSelection);
-    assert.equal(binary.status, 200);
-    assert.equal(binary.headers.get('content-type'), 'image/png');
-    assert.equal(binary.headers.get('x-content-type-options'), 'nosniff');
-    assert.equal(binary.headers.get('cache-control'), 'no-store');
-    assert.equal(binary.headers.get('content-length'), String(image.length));
-    assert.deepEqual(Buffer.from(await binary.arrayBuffer()), image);
-    await writeFile(
-      path.join(materialDirectory, 'image.png'),
-      Buffer.concat([image, Buffer.from('changed')]),
-    );
-    const changedMedia = await post('/materials/media', mediaSelection);
-    assert.equal(changedMedia.status, 409);
-    assert.equal(
-      ((await changedMedia.json()) as { code: string }).code,
-      'MATERIAL_PREVIEW_MEDIA_CHANGED',
-    );
-    assert.equal(materialScans, 2);
-    const selection = { scanId: previewScan.scanId, source: 'body.txt' };
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/materials/preview', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify(selection),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/materials/preview', selection, 'https://attacker.example')).status,
-      403,
-    );
-    assert.equal(
-      (await post('/materials/preview', { ...selection, source: '../private.txt' })).status,
-      404,
-    );
-    assert.equal(
-      (await post('/materials/preview', { ...selection, directory: materialDirectory })).status,
-      400,
-    );
-    const preview = MaterialPackagePreview.parse(
-      await (await post('/materials/preview', selection)).json(),
-    );
-    assert.equal(preview.text, 'private test body');
-    const reviewSelection = { ...selection, profileIds: profileIds.slice(0, 2) };
-    const arrangementRequest = {
-      scanId: selection.scanId,
-      profileIds,
-      count: 1,
-      allowRepeat: false,
-    };
-    assert.equal(
-      (await post('/materials/arrangement', arrangementRequest, 'https://attacker.example')).status,
-      403,
-    );
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/materials/arrangement', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify(arrangementRequest),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/materials/arrangement', { ...arrangementRequest, profileIds: [randomUUID()] }))
-        .status,
-      404,
-    );
-    assert.equal(
-      (await post('/materials/arrangement', { ...arrangementRequest, queue: true })).status,
-      400,
-    );
-    const arranged = MaterialArrangement.parse(
-      await (await post('/materials/arrangement', arrangementRequest)).json(),
-    );
-    assert.equal(arranged.rows.length, 29);
-    assert.equal(arranged.publishingReady, false);
-    assert.ok(arranged.missing > 0);
-    const row = arranged.rows[0];
-    assert.ok(row);
-    assert.equal(
-      (
-        await post('/materials/arrangement', {
-          ...arrangementRequest,
-          overrides: [{ profileId: randomUUID(), ordinal: row.ordinal, sourceIndex: 0 }],
-        })
-      ).status,
-      400,
-    );
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace/materials/review', {
-          method: 'POST',
-          headers: { origin: server.origin, 'content-type': 'application/json' },
-          body: JSON.stringify(reviewSelection),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/materials/review', reviewSelection, 'https://attacker.example')).status,
-      403,
-    );
-    assert.equal(
-      (await post('/materials/review', { ...reviewSelection, profileIds: [randomUUID()] })).status,
-      404,
-    );
-    assert.equal(
-      (await post('/materials/review', { ...reviewSelection, publishingReady: true })).status,
-      400,
-    );
-    const reviewed = MaterialPublishingReview.parse(
-      await (await post('/materials/review', reviewSelection)).json(),
-    );
-    assert.equal(reviewed.text, preview.text);
-    assert.equal(reviewed.publishingReady, false);
-    assert.deepEqual(
-      reviewed.targets.map((target) => target.profileId),
-      reviewSelection.profileIds,
-    );
-    assert.equal(JSON.stringify(reviewed).includes('mtimeNs'), false);
-    await writeFile(path.join(materialDirectory, 'body.txt'), 'source changed');
-    const changedReview = await post('/materials/review', reviewSelection);
-    assert.equal(changedReview.status, 409);
-    assert.equal(
-      ((await changedReview.json()) as { code: string }).code,
-      'MATERIAL_REVIEW_SOURCE_CHANGED',
-    );
-    assert.equal(preview.publishingReady, false);
-    assert.equal(materialScans, 2);
     assert.equal(
       (await post('/groups/create', { name: 'A', color: 'blue' }, 'https://example.com')).status,
       403,
@@ -782,34 +475,38 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
     const group = GroupSchema.parse(
       await (await post('/groups/create', { name: '主力', color: 'green' })).json(),
     );
-    assert.equal((await post('/profiles/move', { profileIds, groupId: group.id })).status, 200);
     assert.equal(
-      (await post('/profiles/move', { profileIds: [randomUUID()], groupId: group.id })).status,
-      404,
+      (await post('/profiles/reorder', { orderedProfileIds: profileIds, groupId: group.id }))
+        .status,
+      200,
     );
-    const draft = SavedCombinationSchema.parse(
+    const created = SavedCombinationSchema.parse(
       await (
-        await post('/combinations/create-draft', {
+        await post('/combinations/create', {
           value: {
-            name: '',
+            name: '视频10',
             note: '',
-            steps: [],
+            steps: [
+              {
+                id: randomUUID(),
+                type: 'video',
+                durationMinutes: 10,
+                maxLikes: 2,
+                minLikeCount: 500,
+              },
+            ],
             randomOrder: false,
             loop: { mode: 'finite', rounds: 1 },
           },
         })
       ).json(),
     );
-    assert.equal(draft.version, 0);
-    assert.equal(
-      (await post('/combinations/publish', { id: draft.id, expectedRevision: 0 })).status,
-      400,
-    );
+    assert.equal(created.version, 1);
     const saved = SavedCombinationSchema.parse(
       await (
-        await post('/combinations/draft', {
-          id: draft.id,
-          expectedRevision: 0,
+        await post('/combinations/save', {
+          id: created.id,
+          expectedRevision: created.revision,
           value: {
             name: '视频15',
             note: '',
@@ -828,15 +525,8 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
         })
       ).json(),
     );
-    assert.equal(
-      (await post('/combinations/publish', { id: saved.id, expectedRevision: saved.revision }))
-        .status,
-      200,
-    );
-    assert.equal(
-      (await post('/combinations/start', { id: saved.id, version: 1, profileIds })).status,
-      409,
-    );
+    assert.equal(saved.version, 2);
+    assert.equal(saved.draft, null);
     const response = await fetch(server.origin + '/api/workspace', { headers: { cookie } });
     const serialized = await response.text();
     const snapshot = WorkspaceSchema.parse(JSON.parse(serialized) as unknown);
@@ -895,7 +585,7 @@ test('real HTTP workspace preserves auth boundary, public schema, bulk move and 
       loop: { mode: 'finite', rounds: 1 },
     };
     const storyRequest = (contract: string) =>
-      fetch(server.origin + '/api/workspace/combinations/create-draft', {
+      fetch(server.origin + '/api/workspace/combinations/create', {
         method: 'POST',
         headers: {
           cookie,

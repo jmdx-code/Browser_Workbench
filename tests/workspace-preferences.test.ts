@@ -13,10 +13,7 @@ import {
   type Preferences,
 } from '../src/shared/workspace-preferences.js';
 import { TaskNotificationMonitor } from '../src/application/task-notification-monitor.js';
-import {
-  latestMigrationBackupMarker,
-  dropStoryPrivacySchema,
-} from './fixtures/workspace-schema.js';
+import { latestMigrationBackupMarker } from './fixtures/workspace-schema.js';
 
 test('preferences persist with revision conflicts and reject invalid values before mutation', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'workbench-preferences-'));
@@ -81,10 +78,7 @@ test('schema27 adds default-off preferences with backup while preserving task ev
     const initial = await WorkspaceStore.open(file);
     initial.close();
     const previous = new DatabaseSync(file);
-    previous.exec(
-      dropStoryPrivacySchema +
-        "DROP INDEX one_original_post_background; DELETE FROM workspace_execution_contracts WHERE name='post-native-background'; DROP TABLE workspace_preferences; PRAGMA user_version=27",
-    );
+    previous.exec('PRAGMA user_version=61');
     previous.close();
     const migrated = await WorkspaceStore.open(file);
     try {

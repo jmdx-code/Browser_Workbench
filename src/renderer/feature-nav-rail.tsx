@@ -1,458 +1,256 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState } from 'react';
+import {
+  Award,
+  CalendarClock,
+  ClipboardList,
+  LayoutGrid,
+  Send,
+  Sparkles,
+  Table2,
+  ThumbsUp,
+  UserPlus,
+  type LucideIcon,
+} from 'lucide-react';
+import { IconBack, IconChevron, IconChevronDown } from './icons.js';
 import type { FeatureModuleId, FeatureNavItem } from './modules/module-contracts.js';
-import { IconBack, IconCheckList, IconChevron, IconChevronDown, IconLayers } from './icons.js';
 
-const RAIL_COLLAPSED_STORAGE_KEY = 'workbench.nav-rail-collapsed.v1';
-const RAIL_CLOSED_GROUPS_STORAGE_KEY = 'workbench.nav-rail-closed-groups.v1';
+const RAIL_COLLAPSED_KEY = 'workbench.nav-rail-collapsed.v1';
+const RAIL_CLOSED_KEY = 'workbench.nav-rail-closed-groups.v1';
 
-function readInitialCollapsed(): boolean {
-  try {
-    return window.localStorage.getItem(RAIL_COLLAPSED_STORAGE_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
+const ICON_MAP: Record<FeatureNavItem['icon'], LucideIcon> = {
+  'auto-scheduler': CalendarClock,
+  records: ClipboardList,
+  'window-layout': LayoutGrid,
+  'active-accounts': Sparkles,
+  'bluestacks-active': Sparkles,
+  'group-poster': Send,
+  'bluestacks-group-poster': Send,
+  'group-bumper': ThumbsUp,
+  'bluestacks-group-bumper': ThumbsUp,
+  'page-bumper': Award,
+  'bluestacks-page-bumper': Award,
+  'group-inviter': UserPlus,
+  'bluestacks-group-inviter': UserPlus,
+  'sheets-groups': Table2,
+  'sheets-pages': Table2,
+  'sheets-schedule': Table2,
+  'sheets-records': Table2,
+};
 
 function readInitialClosedGroups(): Set<string> {
   try {
-    const raw = window.localStorage.getItem(RAIL_CLOSED_GROUPS_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((item): item is string => typeof item === 'string'));
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(RAIL_CLOSED_KEY) || '[]');
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((item): item is string => typeof item === 'string'))
+      : new Set();
   } catch {
     return new Set();
   }
 }
 
-function renderNavIcon(icon: FeatureNavItem['icon']): ReactNode {
-  switch (icon) {
-    case 'auto-scheduler':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <circle cx="12" cy="13" r="8" />
-          <path d="M12 9v4l2.8 2" />
-          <path d="M5 3 2 6M22 6l-3-3" />
-        </svg>
-      );
-    case 'active-accounts':
-      return <IconLayers size={16} />;
-    case 'group-inviter':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <circle cx="9" cy="8" r="3.5" />
-          <path d="M3.5 19c0-3 2.5-5.2 5.5-5.2s5.5 2.2 5.5 5.2" />
-          <path d="M19 8v6M16 11h6" />
-        </svg>
-      );
-    case 'group-bumper':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z" />
-          <path d="M12 8v6M9 11l3-3 3 3" />
-        </svg>
-      );
-    case 'page-bumper':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <path d="M5 21V4h11l-1.5 4L16 12H5" />
-          <path d="M12 20v-5M9.5 17.5 12 15l2.5 2.5" />
-        </svg>
-      );
-    case 'group-poster':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <path d="M12 20h9" />
-          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-        </svg>
-      );
-    case 'sheets-groups':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="3" y="4" width="18" height="16" rx="2" />
-          <path d="M3 10h18M9 4v16" />
-        </svg>
-      );
-    case 'sheets-pages':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="3" y="4" width="18" height="16" rx="2" />
-          <path d="M3 10h18M15 4v16" />
-        </svg>
-      );
-    case 'sheets-schedule':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="3" y="4" width="18" height="17" rx="2" />
-          <path d="M8 2v4M16 2v4M3 10h18" />
-          <path d="M8 14h3M8 17h7" />
-        </svg>
-      );
-    case 'sheets-records':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <path d="M4 5h16M4 12h16M4 19h10" />
-          <path d="M18 16v6M15 19l3-3 3 3" />
-        </svg>
-      );
-    case 'bluestacks-active':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
-          <path d="M10 18.5h4" />
-          <path d="M9 10.5h2l1.5-3 2 6 1.5-3h1" />
-        </svg>
-      );
-    case 'bluestacks-group-poster':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
-          <path d="M10 18.5h4" />
-          <path d="M9 13.5 14.5 8l1.5 1.5L10.5 15H9v-1.5z" />
-        </svg>
-      );
-    case 'bluestacks-group-inviter':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
-          <path d="M10 18.5h4" />
-          <circle cx="11" cy="9.5" r="2" />
-          <path d="M8.5 14.5c0-1.4 1.1-2.4 2.5-2.4s2.5 1 2.5 2.4M15.5 9.5v3M14 11h3" />
-        </svg>
-      );
-    case 'bluestacks-group-bumper':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
-          <path d="M10 18.5h4" />
-          <path d="M12 13v-5M9.5 10.5 12 8l2.5 2.5" />
-        </svg>
-      );
-    case 'bluestacks-page-bumper':
-      return (
-        <svg
-          width={16}
-          height={16}
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.8}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <rect x="5" y="2.5" width="14" height="19" rx="2.5" />
-          <path d="M10 18.5h4" />
-          <path d="M9.5 13.5V7l5 2.2-5 2.2" />
-        </svg>
-      );
-    case 'records':
-      return <IconCheckList size={16} />;
-  }
-}
+const BADGE_TONE = {
+  run: 'text-[#8ab4ff] bg-[rgba(47,111,237,0.32)]',
+  err: 'text-white bg-[var(--err)]',
+  warn: 'text-[#1f242c] bg-[var(--warn-dot)]',
+  ok: 'text-[#6ee7a8] bg-[rgba(60,207,127,0.24)]',
+} as const;
+const MINI_DOT_TONE = {
+  run: 'bg-[var(--run)]',
+  err: 'bg-[var(--err)]',
+  warn: 'bg-[var(--warn-dot)]',
+  ok: 'bg-[#3ccf7f]',
+} as const;
+const GRP_PILL =
+  'h-4 min-w-4 px-1.5 rounded-full text-[10px] font-bold inline-flex items-center justify-center shrink-0 ';
 
 export function FeatureNavRail({
   activeModule,
+  carrier = 'browser',
   items,
   onSelectModule,
 }: {
   activeModule: FeatureModuleId;
+  carrier?: 'browser' | 'bluestacks' | undefined;
   items: readonly FeatureNavItem[];
   onSelectModule: (moduleId: FeatureModuleId) => void;
 }) {
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
   const [closedGroups, setClosedGroups] = useState<Set<string>>(readInitialClosedGroups);
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(RAIL_COLLAPSED_STORAGE_KEY, collapsed ? '1' : '0');
-    } catch {
-      // Ignore storage write errors in restricted contexts.
-    }
+      window.localStorage.setItem(RAIL_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch {}
   }, [collapsed]);
-
   useEffect(() => {
     try {
-      window.localStorage.setItem(
-        RAIL_CLOSED_GROUPS_STORAGE_KEY,
-        JSON.stringify([...closedGroups].sort()),
-      );
-    } catch {
-      // Ignore storage write errors in restricted contexts.
-    }
+      window.localStorage.setItem(RAIL_CLOSED_KEY, JSON.stringify([...closedGroups].sort()));
+    } catch {}
   }, [closedGroups]);
 
-  const controlItems = items.filter((item) => item.group === 'control' || item.group === 'monitor');
-  const automationItems = items.filter((item) => item.group === 'automation');
-  const bluestacksItems = items.filter((item) => item.group === 'bluestacks');
-  const sheetsItems = items.filter((item) => item.group === 'sheets');
+  const navGroups = (
+    [
+      [
+        'control',
+        '调度与监控',
+        (i: FeatureNavItem) => i.group === 'control' || i.group === 'monitor',
+      ],
+      ['automation', '核心功能', (i: FeatureNavItem) => i.group === 'automation'],
+      ['bluestacks', '蓝蝶模拟器', (i: FeatureNavItem) => i.group === 'bluestacks'],
+      ['sheets', '云表协同', (i: FeatureNavItem) => i.group === 'sheets'],
+    ] as const
+  )
+    .map(([key, label, pred]) => ({ key, label, items: items.filter(pred) }))
+    .filter((g) => g.items.length > 0);
 
-  const navGroups: Array<{ key: string; label: string; items: readonly FeatureNavItem[] }> = [
-    { key: 'control', label: '调度与监控', items: controlItems },
-    { key: 'automation', label: '浏览器自动化', items: automationItems },
-    { key: 'bluestacks', label: '蓝蝶模拟器', items: bluestacksItems },
-    { key: 'sheets', label: '云表协同', items: sheetsItems },
-  ].filter((group) => group.items.length > 0);
-
-  function toggleGroup(groupKey: string) {
+  const toggleGroup = (key: string) =>
     setClosedGroups((prev) => {
       const next = new Set(prev);
-      if (next.has(groupKey)) next.delete(groupKey);
-      else next.add(groupKey);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
-  }
-
-  function renderItem(item: FeatureNavItem) {
-    const isActive = activeModule === item.id;
-    const runningCount = item.runningCount ?? 0;
-    const badgeCount = item.badgeCount ?? 0;
-    const showRunning = runningCount > 0;
-    const showBadge = badgeCount > 0;
-    const isHealthyBadge = item.badgeTone === 'ok';
-    const badgeDesc = isHealthyBadge ? `${badgeCount} 项已启用` : `${badgeCount} 项需要处理`;
-    return (
-      <button
-        key={item.id}
-        type="button"
-        className={'nav-rail-item' + (isActive ? ' active' : '')}
-        aria-current={isActive ? 'page' : undefined}
-        title={
-          (item.tooltip ?? item.title) +
-          (showRunning ? `（${runningCount} 运行中）` : '') +
-          (showBadge ? `（${badgeDesc}）` : '')
-        }
-        onClick={() => onSelectModule(item.id)}
-      >
-        <span className="nav-rail-icon">
-          {renderNavIcon(item.icon)}
-          {collapsed && (showRunning || showBadge) && (
-            <i
-              className={
-                'nav-rail-mini-dot ' +
-                (showBadge ? 'tone-' + (item.badgeTone ?? 'err') : 'tone-run')
-              }
-            />
-          )}
-        </span>
-        {!collapsed && <span className="nav-rail-label">{item.title}</span>}
-        {!collapsed && showRunning && (
-          <span
-            className="nav-rail-badge tone-run"
-            title={`${runningCount} 个任务正在运行${item.title}`}
-          >
-            {runningCount > 1 ? `${runningCount}运行` : '运行中'}
-          </span>
-        )}
-        {!collapsed && !showRunning && showBadge && (
-          <span className={'nav-rail-badge tone-' + (item.badgeTone ?? 'err')} title={badgeDesc}>
-            {badgeCount}
-          </span>
-        )}
-      </button>
-    );
-  }
 
   return (
     <nav
-      className={'feature-nav-rail' + (collapsed ? ' is-collapsed' : '')}
+      className={`feature-nav-rail flex min-h-0 shrink-0 flex-col border-r border-white/[0.06] bg-[#1f242c] text-[#c8d0dc] select-none transition-[width] duration-150 ${
+        collapsed ? 'is-collapsed w-[50px]' : 'w-[172px] max-[860px]:w-[152px]'
+      }`}
       aria-label="功能模块导航"
     >
-      <div className="nav-rail-header">
-        {!collapsed && <span className="nav-rail-heading">功能导航</span>}
+      <div
+        className={`flex h-11 shrink-0 items-center border-b border-white/[0.06] ${collapsed ? 'justify-center p-0' : 'justify-between pl-3 pr-2'}`}
+      >
+        {!collapsed && (
+          <span className="text-[11px] font-bold tracking-wider whitespace-nowrap text-[#8b95a5]">
+            功能导航
+          </span>
+        )}
         <button
           type="button"
-          className="nav-rail-collapse-btn"
+          className="inline-grid h-7 w-7 place-content-center rounded-md border-0 bg-transparent p-0 text-[#9ba5b4] hover:bg-white/[0.08] hover:text-white"
           aria-label={collapsed ? '展开功能导航' : '折叠功能导航'}
           title={collapsed ? '展开功能导航栏' : '折叠功能导航栏'}
-          onClick={() => setCollapsed((prev) => !prev)}
+          onClick={() => setCollapsed((p) => !p)}
         >
           {collapsed ? <IconChevron size={15} /> : <IconBack size={15} />}
         </button>
       </div>
-
-      <div className="nav-rail-groups">
+      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-x-hidden overflow-y-auto px-1.5 pt-1.5 pb-2.5">
         {navGroups.map((group, idx) => {
-          const isClosed = closedGroups.has(group.key);
-          const groupRunning = group.items.reduce((sum, it) => sum + (it.runningCount ?? 0), 0);
-          const groupAlert = group.items.reduce(
-            (sum, it) => sum + (it.badgeTone !== 'ok' ? (it.badgeCount ?? 0) : 0),
-            0,
-          );
-          const groupEnabled = group.items.reduce(
-            (sum, it) => sum + (it.badgeTone === 'ok' ? (it.badgeCount ?? 0) : 0),
-            0,
-          );
+          const isClosed = closedGroups.has(group.key),
+            groupRunning = group.items.reduce((s, it) => s + (it.runningCount ?? 0), 0),
+            groupAlert = group.items.reduce(
+              (s, it) => s + (it.badgeTone !== 'ok' ? (it.badgeCount ?? 0) : 0),
+              0,
+            ),
+            groupEnabled = group.items.reduce(
+              (s, it) => s + (it.badgeTone === 'ok' ? (it.badgeCount ?? 0) : 0),
+              0,
+            );
           return (
-            <div key={group.key} className="nav-rail-group-wrap">
-              {idx > 0 && <div className="nav-rail-divider" role="separator" />}
-              <div className="nav-rail-group">
+            <div key={group.key} className="flex flex-col gap-1">
+              {idx > 0 && <div className="mx-1 my-0.5 h-px bg-white/[0.07]" role="separator" />}
+              <div className="nav-rail-group flex flex-col gap-0.5">
                 {!collapsed && (
                   <button
                     type="button"
-                    className={'nav-rail-group-title' + (isClosed ? ' is-closed' : '')}
+                    className={`nav-rail-group-title flex h-[22px] w-full items-center gap-1 rounded-[5px] border-0 bg-transparent px-1.5 text-left text-[11px] font-bold text-[#7f8a9a] hover:bg-white/5 hover:text-[#b7c0ce]${isClosed ? ' is-closed' : ''}`}
                     aria-expanded={!isClosed}
                     onClick={() => toggleGroup(group.key)}
                   >
-                    <IconChevronDown size={12} />
-                    <span className="nav-rail-group-title-text">{group.label}</span>
-                    {isClosed && groupRunning > 0 && (
-                      <span className="nav-rail-group-pill tone-run">{groupRunning}运行</span>
+                    <IconChevronDown
+                      size={12}
+                      className={`shrink-0 transition-transform ${isClosed ? '-rotate-90' : ''}`}
+                    />
+                    <span className="nav-rail-group-title-text min-w-0 flex-1 truncate">
+                      {group.label}
+                    </span>
+                    {group.key === 'automation' && !isClosed && (
+                      <span
+                        className={GRP_PILL + 'bg-white/10 font-semibold text-[#cbd5e1]'}
+                        title={`当前核心功能载体：${carrier === 'bluestacks' ? '蓝蝶模拟器' : 'Chrome 浏览器'}`}
+                      >
+                        {carrier === 'bluestacks' ? '蓝蝶' : '浏览器'}
+                      </span>
                     )}
-                    {isClosed && groupRunning === 0 && groupAlert > 0 && (
-                      <span className="nav-rail-group-pill tone-err">{groupAlert}</span>
-                    )}
-                    {isClosed && groupRunning === 0 && groupAlert === 0 && groupEnabled > 0 && (
-                      <span className="nav-rail-group-pill tone-ok">{groupEnabled}</span>
-                    )}
+                    {isClosed &&
+                      (groupRunning > 0 ? (
+                        <span className={GRP_PILL + 'bg-[rgba(47,111,237,0.28)] text-[#93b8ff]'}>
+                          {groupRunning}运行
+                        </span>
+                      ) : groupAlert > 0 ? (
+                        <span className={GRP_PILL + 'bg-[rgba(235,87,87,0.25)] text-[#ff9c9c]'}>
+                          {groupAlert}
+                        </span>
+                      ) : groupEnabled > 0 ? (
+                        <span className={GRP_PILL + 'bg-[rgba(60,207,127,0.2)] text-[#7ee3ad]'}>
+                          {groupEnabled}
+                        </span>
+                      ) : null)}
                   </button>
                 )}
                 {(collapsed || !isClosed) && (
-                  <div className="nav-rail-list">{group.items.map(renderItem)}</div>
+                  <div className="flex flex-col gap-0.5">
+                    {group.items.map((item) => {
+                      const isActive =
+                          item.group === 'sheets'
+                            ? activeModule.startsWith('sheets-')
+                            : activeModule === item.id,
+                        running = item.runningCount ?? 0,
+                        badge = item.badgeCount ?? 0,
+                        badgeDesc =
+                          item.badgeTone === 'ok' ? `${badge} 项已启用` : `${badge} 项需要处理`,
+                        Icon = ICON_MAP[item.icon],
+                        tone = item.badgeTone ?? 'err';
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className={`nav-rail-item relative flex h-[31px] min-w-0 items-center gap-2 rounded-[7px] border-0 bg-transparent text-left text-[13px] font-semibold transition-colors ${
+                            collapsed ? 'justify-center p-0' : 'px-2'
+                          } ${
+                            isActive
+                              ? 'active bg-[rgba(47,111,237,0.22)] text-white shadow-[inset_3px_0_0_var(--brand)]'
+                              : 'text-[#b8c2d0] hover:bg-white/[0.07] hover:text-white'
+                          }`}
+                          aria-current={isActive ? 'page' : undefined}
+                          title={`${item.tooltip ?? item.title}${running > 0 ? `（${running} 运行中）` : ''}${badge > 0 ? `（${badgeDesc}）` : ''}`}
+                          onClick={() => onSelectModule(item.id)}
+                        >
+                          <span className="relative inline-grid h-5 w-5 shrink-0 place-content-center">
+                            <Icon size={16} strokeWidth={1.8} aria-hidden="true" />
+                            {collapsed && (running > 0 || badge > 0) && (
+                              <i
+                                className={`absolute -top-px -right-px h-[7px] w-[7px] rounded-full border-[1.5px] border-[#1f242c] ${MINI_DOT_TONE[badge > 0 ? tone : 'run']}`}
+                              />
+                            )}
+                          </span>
+                          {!collapsed && (
+                            <span className="nav-rail-label min-w-0 flex-1 truncate">
+                              {item.title}
+                            </span>
+                          )}
+                          {!collapsed && (running > 0 || badge > 0) && (
+                            <span
+                              className={`h-[18px] min-w-[18px] shrink-0 rounded-full px-[5px] text-center text-[10px] leading-[18px] font-bold tabular-nums ${BADGE_TONE[running > 0 ? 'run' : tone]}`}
+                              title={
+                                running > 0 ? `${running} 个任务正在运行${item.title}` : badgeDesc
+                              }
+                            >
+                              {running > 0 ? (running > 1 ? `${running}运行` : '运行中') : badge}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
                 )}
               </div>
             </div>

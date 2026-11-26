@@ -12,8 +12,10 @@ import { PosterSettings } from '../src/shared/group-poster.js';
 import { normalizeTargetToken } from '../src/renderer/select-by-ids-dialog.js';
 import { Sidebar } from '../src/renderer/sidebar.js';
 import { FeatureNavRail } from '../src/renderer/feature-nav-rail.js';
-import { CombinationList } from '../src/renderer/combination-list.js';
+import { CombinationList, parseImportedCombination } from '../src/renderer/combination-list.js';
 import { TaskRecordsPage } from '../src/renderer/task-records.js';
+import { PostBumpRecordsPage } from '../src/renderer/modules/post-bump-records-page.js';
+import { UNIFIED_POST_BUMP_11_HEADERS } from '../src/shared/log-table-copy.js';
 import {
   buildFeatureNavItems,
   buildWorkbenchProjection,
@@ -25,8 +27,15 @@ import {
   rangeFinderSelection,
 } from '../src/renderer/finder-list-model.js';
 import { api } from '../src/renderer/api.js';
-import { newCombination, normalizeCombinationResources } from '../src/renderer/editor.js';
-import { CombinationSchema } from '../src/shared/contracts.js';
+import { Editor, newCombination, normalizeCombinationResources } from '../src/renderer/editor.js';
+import { AutoSchedulerPage } from '../src/renderer/auto-scheduler-page.js';
+import { AutoSchedulerEditorModal } from '../src/renderer/auto-scheduler-editor-modal.js';
+import { ActiveAccountsPage } from '../src/renderer/active-accounts-page.js';
+import { buildLiveRunCards, LiveRunsDrawer } from '../src/renderer/modules/live-runs-drawer.js';
+import { mapProfilesToScopeOptions } from '../src/renderer/modules/shared/target-scope-bar.js';
+import { getTargetProfileIds } from '../src/renderer/modules/window-layout-preview-canvas.js';
+import { relativePostAge } from '../src/shared/bluestacks.js';
+import { CombinationSchema, profileDisplayName } from '../src/shared/contracts.js';
 
 it('new Story defaults to the native current audience while explicit saved Friends stays unchanged', () => {
   const fresh = newCombination('story');
@@ -41,6 +50,8 @@ it('new Story defaults to the native current audience while explicit saved Frien
 vi.mock('../src/renderer/api.js', () => ({
   api: {
     taskRecords: vi.fn(),
+    postBumpRecords: vi.fn(),
+    deletePostBumpRecords: vi.fn(),
     groupInviterLogs: vi.fn(),
     cleanupSettings: vi.fn(),
     targetFolders: vi.fn(),
@@ -50,19 +61,22 @@ vi.mock('../src/renderer/api.js', () => ({
     cleanupProfileTabs: vi.fn(),
     bumperAction: vi.fn(),
     bumperState: vi.fn(),
-    bumperLogs: vi.fn(),
     bluestacksAction: vi.fn(),
     bluestacksState: vi.fn(),
     posterAction: vi.fn(),
     posterState: vi.fn(),
     posterLogs: vi.fn(),
     refreshGroupInviterGroups: vi.fn(),
+    create: vi.fn(),
+    saveCombination: vi.fn(),
+    autoSchedulerAction: vi.fn(),
+    runtimeSummary: vi.fn(),
   },
 }));
 let root: Root;
 let host: HTMLDivElement;
 const id = 'f0000000-0000-4000-8000-000000000001';
-it('simplifying an edited marketplace removes invisible filters from the new draft without mutating the saved version', () => {
+it('editing a marketplace step preserves its visible filters without mutating the saved version', () => {
   const saved = CombinationSchema.parse({
     ...newCombination(),
     steps: [
@@ -82,14 +96,7 @@ it('simplifying an edited marketplace removes invisible filters from the new dra
   const original = structuredClone(saved);
   const edited = normalizeCombinationResources(saved);
   expect(saved).toEqual(original);
-  expect(edited.steps[0]).toEqual({
-    id,
-    type: 'marketplace',
-    durationMinutes: 7,
-    keyword: '',
-    maxLikes: 0,
-    minLikeCount: 0,
-  });
+  expect(edited.steps[0]).toEqual(original.steps[0]);
 });
 const rows = [1, 2, 3].map((n) => ({
   id: String(n),
@@ -259,7 +266,7 @@ describe('shared Finder UI', () => {
     getSelectionSpy.mockRestore();
   });
 });
-it('Sidebar has one compact move/cleanup/stop toolbar and stops all three task kinds', async () => {
+it('Sidebar has the 5-action compact toolbar (启动/停止/关闭/清理标签/整理窗口) and stops all task kinds', async () => {
   const selected = new Set(['00000000-0000-4000-8000-000000000001']);
   const onStop = vi.fn();
   const profile = {
@@ -307,19 +314,27 @@ it('Sidebar has one compact move/cleanup/stop toolbar and stops all three task k
         onCheck={() => {}}
         bumperRunningIds={[profile.id ?? '']}
         groupInviterRunningIds={[profile.id ?? '']}
-        onStopGroupInviterProfiles={onStop}
+        onStopModules={onStop}
       />,
     ),
   );
-  expect(host.querySelector('.selection-bar.compact-selection')).toBeTruthy();
+  const bar = host.querySelector('.selection-bar.compact-selection');
+  expect(bar).toBeTruthy();
   expect(host.querySelector('.selection-bar-actions')).toBeNull();
+  const actionButtons = [...(bar?.querySelectorAll('button.btn') ?? [])];
+  const actionLabels = actionButtons.map((b) => b.textContent?.trim());
+  expect(actionLabels).toEqual(['启动', '停止', '关闭', '清理标签', '整理窗口']);
+  for (const btn of actionButtons) {
+    expect(btn.className).not.toContain('btn-ghost');
+    expect(btn.className).not.toContain('bg-transparent');
+    expect(btn.className).not.toContain('text-[var(--text-2)]');
+  }
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent === '清理标签') ?? null,
   );
   expect(api.cleanupProfileTabs).toHaveBeenCalledWith([...selected]);
   await click([...host.querySelectorAll('button')].find((b) => b.textContent === '停止') ?? null);
   expect(onStop).toHaveBeenCalledWith([...selected]);
-  expect(host.querySelector('[aria-label="移到分组"]')).toBeTruthy();
 });
 it('model keeps filtered selection and stable multi drag/nudge order', () => {
   expect(insertFinderIds(['a', 'b', 'c'], ['x', 'y'], 'b', true)).toEqual([
@@ -505,7 +520,7 @@ it('bumper add page grid submits the chosen folder', async () => {
   });
 });
 
-it('Sidebar direct arrows support repeated nudge and empty unfiled drop with child highlight preserved', async () => {
+it('Sidebar row menu supports repeated nudge and empty unfiled drop with child highlight preserved', async () => {
   const ids = [
     '00000000-0000-4000-8000-000000000011',
     '00000000-0000-4000-8000-000000000012',
@@ -561,10 +576,17 @@ it('Sidebar direct arrows support repeated nudge and empty unfiled drop with chi
     );
   }
   await act(async () => root.render(<Render />));
-  await click(host.querySelector('[aria-label="上移"]'));
+  const openMenuAndClick = async (rowLabel: string, itemText: string) => {
+    await click(host.querySelector(`[aria-label="更多 · ${rowLabel}"]`));
+    const item = [...host.querySelectorAll('[role="menuitem"]')].find((b) =>
+      b.textContent?.includes(itemText),
+    );
+    await click(item ?? null);
+  };
+  await openMenuAndClick('浏览器1', '↑ 上移');
   expect(api.reorderProfiles).toHaveBeenLastCalledWith(id, [ids[1], ids[0], ids[2]]);
-  await click(host.querySelector('[aria-label="下移"]'));
-  await click(host.querySelector('[aria-label="下移"]'));
+  await openMenuAndClick('浏览器1', '↓ 下移');
+  await openMenuAndClick('浏览器1', '↓ 下移');
   expect(api.reorderProfiles).toHaveBeenLastCalledWith(id, [ids[0], ids[2], ids[1]]);
   const start = new Event('dragstart', { bubbles: true });
   Object.defineProperty(start, 'dataTransfer', {
@@ -1071,7 +1093,6 @@ it('CombinationList uses unified isProfileBusy to disable start and schedule whe
         onCopy={() => {}}
         onResources={() => {}}
         onStart={() => {}}
-        onSchedule={() => {}}
       />,
     ),
   );
@@ -1089,8 +1110,7 @@ it('CombinationList uses unified isProfileBusy to disable start and schedule whe
   const scheduleBtn = [...host.querySelectorAll<HTMLButtonElement>('button')].find((b) =>
     b.textContent?.includes('定时启动'),
   );
-  expect(scheduleBtn?.disabled).toBe(true);
-  expect(scheduleBtn?.getAttribute('title')).toContain('3 份资料已有任务');
+  expect(scheduleBtn).toBeUndefined();
 });
 
 it('GroupBumperPage supports ID-only paste without name and collapses low-frequency settings into 高级参数 popover', async () => {
@@ -1114,7 +1134,7 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
     profileCounts: {},
     dailyStats,
   });
-  vi.mocked(api.bumperLogs).mockResolvedValue([]);
+  const onOpenRecords = vi.fn();
   await act(async () =>
     root.render(
       <GroupBumperPage
@@ -1131,6 +1151,7 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
         }}
         selected={new Set()}
         onState={() => {}}
+        onOpenRecords={onOpenRecords}
         onMessage={() => {}}
       />,
     ),
@@ -1161,17 +1182,11 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
   expect(groups[0]?.querySelector('input[aria-label="commentProbability"]')).toBeTruthy();
   expect(groups[1]?.querySelector('input[aria-label="maxPostsPerGroupPage"]')).toBeTruthy();
 
-  // Open 顶贴记录 modal and check right-side 7-day stats sidebar
+  // Click 顶贴记录 delegates directly to unified PostBumpRecordsPage
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('顶贴记录')) ?? null,
   );
-  const statsAside = host.querySelector('aside.bumper-logs-stats[aria-label="顶贴统计"]');
-  expect(statsAside?.textContent).toContain('顶贴统计（最近7天）');
-  const statRows = statsAside?.querySelectorAll('tbody tr') ?? [];
-  expect(statRows.length).toBe(7);
-  expect(statRows[0]?.textContent).toContain('2026-11-01');
-  expect(statRows[0]?.textContent).toContain('5');
-  await click(host.querySelector('button[aria-label="关闭弹窗"]'));
+  expect(onOpenRecords).toHaveBeenCalledTimes(1);
 
   // Add page with URL only (no name)
   await click(
@@ -1195,11 +1210,12 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
   });
 });
 
-for (const [activeCount, pausedCount] of [
-  [15, 6],
-  [0, 2],
+for (const [runningCount, queuedCount] of [
+  [10, 5],
+  [0, 0],
 ]) {
-  it(`WO51: combination shows ${activeCount} active and ${pausedCount} paused while retaining delete protection`, async () => {
+  const totalActive = runningCount + queuedCount;
+  it(`WO51: combination shows ${runningCount} running and ${queuedCount} queued with accurate delete protection`, async () => {
     type Props = React.ComponentProps<typeof CombinationList>;
     const comboId = '40000000-0000-4000-8000-000000000001';
     const saved = {
@@ -1228,33 +1244,40 @@ for (const [activeCount, pausedCount] of [
       onResources: vi.fn(),
       resourceSummaries: [],
       runtime: {
-        plans: Array.from({ length: activeCount + pausedCount }, (_, i) => ({
-          id: `plan-${i}`,
-          combinationId: comboId,
-          profileId: `profile-${i}`,
-          state: i < activeCount ? (i % 2 ? 'QUEUED' : 'RUNNING') : 'PAUSED',
-        })),
+        plans: [
+          ...Array.from({ length: runningCount }, (_, i) => ({
+            id: `plan-r-${i}`,
+            combinationId: comboId,
+            profileId: `profile-r-${i}`,
+            state: 'RUNNING' as const,
+          })),
+          ...Array.from({ length: queuedCount }, (_, i) => ({
+            id: `plan-q-${i}`,
+            combinationId: comboId,
+            profileId: `profile-q-${i}`,
+            state: 'QUEUED' as const,
+          })),
+        ],
       } as Props['runtime'],
     };
     await act(async () => root.render(<CombinationList {...props} />));
     expect(host.querySelector('.combo-stat:not(.resource-count)')?.textContent).toContain(
-      `执行/排队 ${activeCount} · 暂停 ${pausedCount}`,
+      `${totalActive}使用中浏览器`,
     );
-    // Open actual card menu and retain its deletion guard.
     const more = host.querySelector('button[aria-label="更多操作"]');
     await click(more);
     const deletion = [...document.querySelectorAll('button')].find(
-      (el) => el.textContent?.trim() === '删除组合',
+      (el) => el.textContent?.trim() === '删除',
     );
     expect(deletion).toBeTruthy();
-    expect(deletion?.disabled).toBe(true);
+    expect(deletion?.disabled).toBe(totalActive > 0);
     const manage = [...host.querySelectorAll('button')].find(
       (el) => el.textContent?.trim() === '批量管理',
     );
     await click(manage!);
     expect(
       host.querySelector<HTMLInputElement>('input[aria-label="选择组合 WO51组合"]')?.disabled,
-    ).toBe(true);
+    ).toBe(totalActive > 0);
   });
 }
 
@@ -1374,10 +1397,10 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
   await click(refreshAvatarBtn ?? null);
   expect(api.posterAction).toHaveBeenCalledWith('groups/refresh', { ids: ['3017439278594998'] });
 
-  // Close dispatch modal and open table editor ("表格批量新增 / Excel粘贴")
+  // Close dispatch modal and open table editor ("表格编辑")
   await click(host.querySelector('.poster-dispatch-right-head button[aria-label="关闭弹窗"]'));
   const tableBtn = [...host.querySelectorAll('.poster-cards-toolbar button')].find((b) =>
-    b.textContent?.includes('Excel粘贴'),
+    b.textContent?.includes('表格编辑'),
   );
   await click(tableBtn ?? null);
 
@@ -1431,7 +1454,6 @@ it('marketplace unavailable skip renders a green completed run and follows compl
   }));
   vi.mocked(api.groupInviterLogs).mockResolvedValue([]);
   vi.mocked(api.cleanupSettings).mockRejectedValue(Error('not needed by this UI scenario'));
-  vi.mocked(api.bumperLogs).mockResolvedValue([]);
   vi.mocked(api.posterLogs).mockResolvedValue([]);
   await act(async () =>
     root.render(
@@ -1517,9 +1539,9 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
   };
 
   vi.mocked(api.posterLogs).mockResolvedValue([samplePosterLog]);
-  vi.mocked(api.bumperLogs).mockResolvedValue([sampleBumperLog]);
 
-  // 1. GroupPosterPage 发帖记录弹窗 + 单条贴文详情弹窗
+  // 1. GroupPosterPage 发帖记录跳转 + 单条贴文详情弹窗
+  const onOpenPosterRecords = vi.fn();
   const posterMessages: string[] = [];
   await act(async () =>
     root.render(
@@ -1559,29 +1581,18 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
         selected={new Set()}
         profiles={[profile]}
         onState={() => {}}
+        onOpenRecords={onOpenPosterRecords}
         onMessage={(m) => posterMessages.push(m)}
       />,
     ),
   );
 
-  // Open 发帖记录 modal and click 批量复制全部
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('发帖记录')) ?? null,
   );
-  const copyAllPosterBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('批量复制全部'),
-  );
-  expect(copyAllPosterBtn).toBeTruthy();
-  await click(copyAllPosterBtn ?? null);
-  expect(writeText).toHaveBeenCalledTimes(1);
-  expect(writeText.mock.calls[0]?.[0]).toContain('发帖时间\t浏览器\t发帖身份');
-  expect(writeText.mock.calls[0]?.[0]).toContain('第一行文案 第二行文案');
-  expect(writeText.mock.calls[0]?.[0]).toContain(
-    'https://www.facebook.com/groups/88001/posts/99001122/',
-  );
+  expect(onOpenPosterRecords).toHaveBeenCalledTimes(1);
 
-  // Close modal and open 详情 modal on the material card
-  await click(host.querySelector('[aria-label="关闭弹窗"]'));
+  // Open 详情 modal on the material card and click 批量复制全部
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('详情')) ?? null,
   );
@@ -1590,9 +1601,15 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
   );
   expect(detailCopyBtn).toBeTruthy();
   await click(detailCopyBtn ?? null);
-  expect(writeText).toHaveBeenCalledTimes(2);
+  expect(writeText).toHaveBeenCalledTimes(1);
+  expect(writeText.mock.calls[0]?.[0]).toContain('第一行文案 第二行文案');
+  expect(writeText.mock.calls[0]?.[0]).toContain(
+    'https://www.facebook.com/groups/88001/posts/99001122/',
+  );
+  await click(host.querySelector('[aria-label="关闭弹窗"]'));
 
-  // 2. GroupBumperPage 顶贴记录弹窗
+  // 2. GroupBumperPage 顶贴记录跳转
+  const onOpenBumperRecords = vi.fn();
   await act(async () =>
     root.render(
       <GroupBumperPage
@@ -1614,11 +1631,11 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
           profileCounts: {},
           pageBumperProfileCounts: {},
           pendingReviewOperations: [],
-          scheduledTasks: [],
         }}
         selected={new Set()}
         profiles={[profile]}
         onState={() => {}}
+        onOpenRecords={onOpenBumperRecords}
         onMessage={() => {}}
       />,
     ),
@@ -1626,16 +1643,80 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('顶贴记录')) ?? null,
   );
-  const copyAllBumperBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('批量复制全部'),
-  );
-  expect(copyAllBumperBtn).toBeTruthy();
-  await click(copyAllBumperBtn ?? null);
-  expect(writeText).toHaveBeenCalledTimes(3);
-  expect(writeText.mock.calls[2]?.[0]).toContain('顶贴时间\t模块类型\t浏览器/窗口');
-  expect(writeText.mock.calls[2]?.[0]).toContain('顶贴支持 赞');
+  expect(onOpenBumperRecords).toHaveBeenCalledTimes(1);
 
-  // 3. TaskRecordsPage 执行记录页面批量复制
+  // 2b. PostBumpRecordsPage 统一账本 11 列复制 + 清空确认弹窗
+  vi.mocked(api.postBumpRecords).mockResolvedValue({
+    records: [
+      {
+        id: 'pbr-post-1',
+        recordType: 'post',
+        carrier: 'browser',
+        status: 'success',
+        profileId: id,
+        accountId: samplePosterLog.accountId,
+        accountName: samplePosterLog.accountName,
+        groupId: samplePosterLog.groupId,
+        groupName: samplePosterLog.groupName,
+        pageId: '',
+        pageName: '',
+        postId: samplePosterLog.postId,
+        postUrl: samplePosterLog.postUrl,
+        liked: false,
+        commentText: null,
+        storyShared: false,
+        captionPreview: samplePosterLog.captionPreview,
+        errorReason: '',
+        sourceLogId: samplePosterLog.id,
+        createdAt: samplePosterLog.postedAt,
+      },
+      {
+        id: 'pbr-bump-1',
+        recordType: 'group_bump',
+        carrier: 'browser',
+        status: 'success',
+        profileId: id,
+        accountId: sampleBumperLog.accountId,
+        accountName: 'Zhang',
+        groupId: sampleBumperLog.groupId,
+        groupName: sampleBumperLog.groupName,
+        pageId: sampleBumperLog.pageId,
+        pageName: sampleBumperLog.pageName,
+        postId: sampleBumperLog.postId,
+        postUrl: sampleBumperLog.postUrl,
+        liked: true,
+        commentText: sampleBumperLog.commentText,
+        storyShared: false,
+        captionPreview: '',
+        errorReason: '',
+        sourceLogId: sampleBumperLog.id,
+        createdAt: sampleBumperLog.bumpedAt,
+      },
+    ],
+    total: 2,
+    hasMore: false,
+    dailyStats: [{ dateKey: '2026-11-12', label: '11-12', posts: 1, bumps: 1, failures: 0 }],
+  });
+  await act(async () => root.render(<PostBumpRecordsPage onNotify={() => {}} />));
+  const copyLedgerBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('复制表格'),
+  );
+  expect(copyLedgerBtn).toBeTruthy();
+  await click(copyLedgerBtn ?? null);
+  expect(writeText).toHaveBeenCalledTimes(2);
+  expect(writeText.mock.calls[1]?.[0]).toContain(UNIFIED_POST_BUMP_11_HEADERS.join('\t'));
+  const clearBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '清空',
+  );
+  expect(clearBtn).toBeTruthy();
+  await click(clearBtn ?? null);
+  expect(host.querySelector('dialog')).toBeTruthy();
+  expect(host.textContent).toContain('清空「全部记录」');
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === '取消') ?? null,
+  );
+
+  // 3. TaskRecordsPage 执行记录页面专注于活跃账号/云表/邀人模块
   vi.mocked(api.taskRecords).mockResolvedValue({
     records: [],
     total: 0,
@@ -1658,16 +1739,61 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
       />,
     ),
   );
-  const copyUnifiedBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('批量复制贴文记录'),
-  );
-  expect(copyUnifiedBtn).toBeTruthy();
-  await click(copyUnifiedBtn ?? null);
-  expect(writeText).toHaveBeenCalledTimes(4);
-  expect(writeText.mock.calls[3]?.[0]).toContain('执行时间\t模块类型\t浏览器/窗口');
+  expect(host.querySelectorAll('.module-switch-btn')).toHaveLength(4);
+  expect(
+    [...host.querySelectorAll('button')].some((b) => b.textContent?.includes('批量复制贴文记录')),
+  ).toBe(false);
 });
 
-it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时任务 defaults accountMode to selected for offline auto-launch', async () => {
+it('Sidebar header collapse button triggers onHideSidebar', async () => {
+  const onHideSidebar = vi.fn();
+  const profile = {
+    id,
+    browserName: '用户8',
+    alias: '浏览器8',
+    order: 0,
+    groupId: null,
+    online: true,
+    phase: 'PAUSED' as const,
+    synced: true,
+    unresolved: 0,
+    extensionVersion: '0.3.82',
+    capabilities: [],
+    account: { state: 'logged_in' as const, id: '100088', name: 'Zhang', avatar: null },
+  };
+  await act(async () =>
+    root.render(
+      <Sidebar
+        workspace={
+          {
+            schemaVersion: 1,
+            groups: [],
+            profiles: [profile],
+            combinations: [],
+            records: [],
+            support: {},
+          } as never
+        }
+        selected={new Set()}
+        onSelect={() => {}}
+        onInspect={() => {}}
+        mutate={async (work) => {
+          await work();
+        }}
+        inspections={[]}
+        inspectionAvailable={true}
+        inspectionError=""
+        busy={false}
+        onCheck={() => {}}
+        onHideSidebar={onHideSidebar}
+      />,
+    ),
+  );
+  await click(host.querySelector('[aria-label="收起设备栏"]'));
+  expect(onHideSidebar).toHaveBeenCalledTimes(1);
+});
+
+it('PosterMaterialCardGrid renders all 5 action buttons and ⏱ 加入排班 triggers unified quick schedule seed', async () => {
   const profile = {
     id,
     browserName: '用户8',
@@ -1682,6 +1808,7 @@ it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时�
     capabilities: [],
     account: { state: 'logged_in' as const, id: '61593615564708', name: '用户8', avatar: null },
   };
+  const onQuickSchedule = vi.fn();
   await act(async () =>
     root.render(
       <GroupPosterPage
@@ -1728,9 +1855,10 @@ it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时�
           postedGroupIdsByMaterial: {},
           activeGroupsByMaterial: {},
         }}
-        selected={new Set()}
+        selected={new Set([id])}
         profiles={[profile]}
         onState={() => {}}
+        onQuickSchedule={onQuickSchedule}
         onMessage={() => {}}
       />,
     ),
@@ -1739,19 +1867,29 @@ it('PosterMaterialCardGrid renders all 5 action buttons and opening ⏰ 定时�
   const actionBtns = [...host.querySelectorAll('.poster-rect-card-actions > button')].map((b) =>
     b.textContent?.trim(),
   );
-  expect(actionBtns).toEqual(['▶ 发帖', '⏰ 定时任务', '详情 (2)', '编辑', '删除']);
+  expect(actionBtns).toEqual(['发帖', '加入排班', '详情 (2)', '编辑', '删除']);
 
   const schedBtn = host.querySelector<HTMLButtonElement>('.poster-card-schedule-btn');
   await click(schedBtn);
-
-  const selectedModeBtn = [...host.querySelectorAll('.poster-mode-btn')].find((b) =>
-    b.textContent?.includes('指定勾选账号 (1)'),
+  expect(onQuickSchedule).toHaveBeenCalledTimes(1);
+  expect(onQuickSchedule).toHaveBeenCalledWith(
+    expect.objectContaining({
+      carrier: 'browser',
+      targetIds: [id],
+      steps: [
+        expect.objectContaining({
+          type: 'group-poster',
+          materialIds: ['mat-card-sched'],
+          groupIds: ['3017439278594998'],
+        }),
+      ],
+    }),
   );
-  expect(selectedModeBtn?.classList.contains('is-active')).toBe(true);
 });
 
 it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dispatches page-settings + bumper/start-page', async () => {
   const navItems = buildFeatureNavItems({
+    carrier: 'bluestacks',
     activeAccountRunningCount: 0,
     groupInviterRunning: false,
     inviterRunningCount: 0,
@@ -1763,13 +1901,13 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
     bluestacksPageBumperRunningCount: 2,
     attentionCount: 0,
   });
-  const bsItems = navItems.filter((item) => item.group === 'bluestacks');
+  const bsItems = navItems.filter((item) => item.group === 'automation');
   expect(bsItems.map((i) => ({ id: i.id, title: i.title, runningCount: i.runningCount }))).toEqual([
-    { id: 'bluestacks-active', title: '蓝蝶活跃账号', runningCount: 0 },
-    { id: 'bluestacks-group-poster', title: '蓝蝶小组发帖', runningCount: 0 },
-    { id: 'bluestacks-group-bumper', title: '蓝蝶小组顶贴', runningCount: 1 },
-    { id: 'bluestacks-page-bumper', title: '蓝蝶专页顶贴', runningCount: 2 },
-    { id: 'bluestacks-group-inviter', title: '蓝蝶小组邀请人', runningCount: 0 },
+    { id: 'bluestacks-active', title: '活跃账号', runningCount: 0 },
+    { id: 'bluestacks-group-poster', title: '小组发帖', runningCount: 0 },
+    { id: 'bluestacks-group-bumper', title: '小组顶贴', runningCount: 1 },
+    { id: 'bluestacks-page-bumper', title: '专页顶贴', runningCount: 2 },
+    { id: 'bluestacks-group-inviter', title: '小组邀请人', runningCount: 0 },
   ]);
 
   const clickedNav: string[] = [];
@@ -1783,7 +1921,7 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
     ),
   );
   const pageNavBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('蓝蝶专页顶贴'),
+    b.textContent?.includes('专页顶贴'),
   );
   expect(pageNavBtn).toBeTruthy();
   await click(pageNavBtn ?? null);
@@ -1893,7 +2031,7 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
   await click(pageCheckbox);
 
   const startBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('▶ 开始运行 (已选1窗 × 1专页)'),
+    b.textContent?.includes('运行 (1窗 · 1专页)'),
   );
   expect(startBtn).toBeTruthy();
   expect((startBtn as HTMLButtonElement | undefined)?.disabled).toBe(false);
@@ -1978,7 +2116,7 @@ it('PopoverMenu flips to align-start when trigger is near the left edge of .work
   expect(panel?.classList.contains('align-end')).toBe(false);
 });
 
-it('FeatureNavRail organizes 4 groups (调度与监控 → 浏览器自动化 → 蓝蝶模拟器 → 云表协同), persists folded groups, and projects live Google Sheets browser badges', async () => {
+it('FeatureNavRail organizes 3 condensed groups (8 items total with unified 云表协同), persists folded groups, and projects live Google Sheets browser badges', async () => {
   window.localStorage.removeItem('workbench.nav-rail-collapsed.v1');
   window.localStorage.removeItem('workbench.nav-rail-closed-groups.v1');
 
@@ -2080,41 +2218,34 @@ it('FeatureNavRail organizes 4 groups (调度与监控 → 浏览器自动化 �
     ),
   );
 
-  // Verify 4-group visual order (Chrome & BlueStacks adjacent, 云表协同 below both)
+  // Verify 3-group condensed 8-item visual order
   const groupTitles = [...host.querySelectorAll('.nav-rail-group-title-text')].map(
     (el) => el.textContent,
   );
-  expect(groupTitles).toEqual(['调度与监控', '浏览器自动化', '蓝蝶模拟器', '云表协同']);
+  expect(groupTitles).toEqual(['调度与监控', '核心功能', '云表协同']);
 
-  // Verify item ordering inside groups
+  // Verify condensed 9-item labels inside groups
   const itemLabels = [...host.querySelectorAll('.nav-rail-label')].map((el) => el.textContent);
   expect(itemLabels).toEqual([
     '定时排班',
-    '执行记录',
+    '发帖顶贴记录',
+    '窗口排版',
     '活跃账号',
     '小组发帖',
     '小组顶贴',
     '专页顶贴',
     '小组邀请人',
-    '蓝蝶活跃账号',
-    '蓝蝶小组发帖',
-    '蓝蝶小组顶贴',
-    '蓝蝶专页顶贴',
-    '蓝蝶小组邀请人',
-    '排贴表',
-    '发帖记录',
-    '小组表',
-    '专页表',
+    '云表协同',
   ]);
 
-  // Fold 云表协同 -> persists to localStorage and surfaces running pill on header
+  // Fold 云表协同 -> persists to localStorage and surfaces combined running pill (sched=1 + rec=1 = 2) on header
   const sheetsGroupBtn = [...host.querySelectorAll('.nav-rail-group-title')].find((b) =>
     b.textContent?.includes('云表协同'),
   );
   await click(sheetsGroupBtn ?? null);
   expect(window.localStorage.getItem('workbench.nav-rail-closed-groups.v1')).toBe('["sheets"]');
   expect(sheetsGroupBtn?.textContent).toContain('2运行');
-  expect(host.textContent).not.toContain('排贴表');
+  expect(host.querySelectorAll('.nav-rail-item')).toHaveLength(8);
 
   // Re-mount should remember folded group
   await act(async () => root.render(<div />));
@@ -2127,6 +2258,1157 @@ it('FeatureNavRail organizes 4 groups (调度与监控 → 浏览器自动化 �
       />,
     ),
   );
-  expect(host.textContent).not.toContain('排贴表');
+  expect(host.querySelectorAll('.nav-rail-item')).toHaveLength(8);
   window.localStorage.removeItem('workbench.nav-rail-closed-groups.v1');
+});
+
+it('CombinationList hides version numbers, rounds, and draft ribbon; Editor removes draft autosave and loop controls', async () => {
+  const comboId = '40000000-0000-4000-8000-000000000099';
+  const saved = {
+    name: '日常',
+    note: '',
+    randomOrder: true,
+    loop: { mode: 'finite' as const, rounds: 1 },
+    steps: [
+      {
+        id: '30000000-0000-4000-8000-000000000099',
+        type: 'video' as const,
+        durationMinutes: 15,
+        maxLikes: 2,
+        minLikeCount: 500,
+      },
+    ],
+  };
+  const legacyRow = {
+    id: comboId,
+    version: 7,
+    revision: 33,
+    updatedAt: 1000,
+    saved,
+    draft: null,
+  };
+
+  await act(async () =>
+    root.render(
+      <CombinationList
+        rows={[legacyRow]}
+        selectedCount={0}
+        onEdit={vi.fn()}
+        onNew={vi.fn()}
+        onCopy={vi.fn()}
+        onResources={vi.fn()}
+        resourceSummaries={[]}
+      />,
+    ),
+  );
+  expect(host.querySelector('.combo-ribbon')).toBeNull();
+  expect(host.querySelector('.combo-meta')?.textContent?.trim()).toBe('随机顺序');
+  expect(host.textContent).not.toContain('v7');
+  expect(host.textContent).not.toContain('1 轮');
+  expect(host.textContent).not.toContain('草稿');
+
+  // Imported legacy multi-round JSON normalizes cleanly to 1 round and rejects empty drafts.
+  const imported = parseImportedCombination(
+    JSON.stringify({
+      format: 'wb-combination-v1',
+      combination: { ...saved, loop: { mode: 'until-stopped' } },
+    }),
+    new Set(),
+  );
+  expect(imported.value.loop).toEqual({ mode: 'finite', rounds: 1 });
+  expect(() =>
+    parseImportedCombination(
+      JSON.stringify({ format: 'wb-combination-v1', combination: { ...saved, steps: [] } }),
+      new Set(),
+    ),
+  ).toThrow();
+
+  // Editor loads saved (ignoring stale draft), hides loop/round/version controls, and saves via saveCombination.
+  const onSaved = vi.fn().mockResolvedValue(undefined);
+  const onClose = vi.fn();
+  const notify = vi.fn();
+  vi.mocked(api.saveCombination).mockResolvedValueOnce({
+    ...legacyRow,
+    version: 8,
+    revision: 34,
+    draft: null,
+  });
+
+  await act(async () =>
+    root.render(
+      <Editor
+        initial={legacyRow}
+        selectedProfiles={[]}
+        onResources={vi.fn()}
+        resourceUsage={null}
+        resourceUsageLoaded={true}
+        onSaved={onSaved}
+        onClose={onClose}
+        notify={notify}
+      />,
+    ),
+  );
+  const nameInput = host.querySelector<HTMLInputElement>('.combination-fields input');
+  expect(nameInput?.value).toBe('日常');
+  expect(host.textContent).not.toContain('已保存 v7');
+  expect(host.textContent).not.toContain('指定总轮数');
+  expect(host.textContent).not.toContain('直到手动停止');
+  expect(host.textContent).not.toContain('总轮数');
+  expect(host.textContent).not.toContain('直接返回将放弃未保存修改');
+
+  const saveBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '保存组合',
+  );
+  expect(saveBtn).toBeTruthy();
+  await click(saveBtn ?? null);
+  expect(api.saveCombination).toHaveBeenCalledTimes(1);
+  expect(api.saveCombination).toHaveBeenCalledWith(
+    comboId,
+    33,
+    expect.objectContaining({ name: '日常', loop: { mode: 'finite', rounds: 1 } }),
+  );
+  expect(notify).toHaveBeenCalledWith('已保存');
+  expect(onClose).toHaveBeenCalledTimes(1);
+
+  // New unsaved combination does NOT create any DB row when returning without saving.
+  vi.mocked(api.create).mockClear();
+  const onCloseNew = vi.fn();
+  await act(async () =>
+    root.render(
+      <Editor
+        initial={null}
+        selectedProfiles={[]}
+        onResources={vi.fn()}
+        resourceUsage={null}
+        resourceUsageLoaded={true}
+        onSaved={onSaved}
+        onClose={onCloseNew}
+        notify={notify}
+      />,
+    ),
+  );
+  const backBtn = host.querySelector<HTMLButtonElement>('button.back');
+  await click(backBtn);
+  expect(api.create).not.toHaveBeenCalled();
+  expect(onCloseNew).toHaveBeenCalledTimes(1);
+});
+
+it('Active Accounts toolbar integrates close-on-finish toggle and Editor shares marketplace filters via StepConfigFields', async () => {
+  const comboId = '40000000-0000-4000-8000-000000000101';
+  const onToggleClose = vi.fn();
+  const row = {
+    id: comboId,
+    version: 1,
+    revision: 1,
+    updatedAt: 1000,
+    saved: {
+      name: '商城养号',
+      note: '',
+      randomOrder: false,
+      loop: { mode: 'finite' as const, rounds: 1 },
+      steps: [
+        {
+          id: '30000000-0000-4000-8000-000000000101',
+          type: 'marketplace' as const,
+          durationMinutes: 4,
+          keyword: 'sofa',
+          maxLikes: 0,
+          minLikeCount: 0,
+        },
+      ],
+    },
+    draft: null,
+  };
+
+  await act(async () =>
+    root.render(
+      <CombinationList
+        rows={[row]}
+        selectedCount={1}
+        closeBrowserOnFinish={false}
+        onCloseBrowserOnFinishChange={onToggleClose}
+        onEdit={vi.fn()}
+        onNew={vi.fn()}
+        onCopy={vi.fn()}
+        onResources={vi.fn()}
+        resourceSummaries={[]}
+      />,
+    ),
+  );
+  expect(host.querySelector('.combo-finish-bar')).toBeNull();
+  expect(host.querySelector('.combo-new')).toBeNull();
+  const toggleInput = host.querySelector<HTMLElement>(
+    '.toolbar-toggle [aria-label="活跃完毕关闭浏览器"]',
+  );
+  expect(toggleInput).toBeTruthy();
+  await click(toggleInput);
+  expect(onToggleClose).toHaveBeenCalledWith(true);
+
+  await act(async () =>
+    root.render(
+      <Editor
+        initial={row}
+        selectedProfiles={[]}
+        onResources={vi.fn()}
+        resourceUsage={null}
+        resourceUsageLoaded={true}
+        onSaved={vi.fn().mockResolvedValue(undefined)}
+        onClose={vi.fn()}
+        notify={vi.fn()}
+      />,
+    ),
+  );
+  const kwInput = host.querySelector<HTMLInputElement>('input[placeholder="留空浏览推荐"]');
+  expect(kwInput?.value).toBe('sofa');
+});
+
+it('AutoSchedulerPage renders minimalist alarm cards and table-driven editor saves smart defaults without prewarm/advanced clutter', async () => {
+  const groupId = '10000000-0000-4000-8000-000000000001';
+  const comboId = '20000000-0000-4000-8000-000000000001';
+  const profileId = '30000000-0000-4000-8000-000000000001';
+  const onState = vi.fn();
+  const onMessage = vi.fn();
+  const initialState = {
+    settings: {
+      browserConcurrency: 15,
+      bluestacksConcurrency: 5,
+      launchStaggerSeconds: 3,
+      idleWatchdogMinutes: 5,
+      preventSystemSleep: true,
+    },
+    powerLockMode: 'none' as const,
+    activeBrowserWorkers: 0,
+    queuedBrowserTargets: 0,
+    activeBluestacksWorkers: 0,
+    queuedBluestacksTargets: 0,
+    schedules: [],
+    activeRuns: [],
+    recentRuns: [],
+  };
+  vi.mocked(api.autoSchedulerAction).mockResolvedValueOnce(initialState);
+
+  await act(async () =>
+    root.render(
+      <AutoSchedulerPage
+        state={initialState}
+        onState={onState}
+        profiles={[
+          {
+            id: profileId,
+            alias: '用户1',
+            order: 0,
+            groupId,
+            online: false,
+            phase: 'OFFLINE',
+            synced: false,
+            unresolved: 0,
+            extensionVersion: null,
+            capabilities: [],
+            account: { state: 'unknown', id: null, name: null, avatar: null },
+          },
+        ]}
+        profileGroups={[{ id: groupId, name: '养号组', order: 0 }]}
+        selectedProfileIds={new Set([profileId])}
+        combinations={[
+          {
+            id: comboId,
+            version: 1,
+            revision: 1,
+            updatedAt: 1000,
+            saved: {
+              name: '日常',
+              note: '',
+              randomOrder: true,
+              loop: { mode: 'finite', rounds: 1 },
+              steps: [
+                {
+                  id: '40000000-0000-4000-8000-000000000001',
+                  type: 'feed',
+                  durationMinutes: 5,
+                  maxLikes: 0,
+                  minLikeCount: 0,
+                },
+              ],
+            },
+            draft: null,
+          },
+        ]}
+        bumperState={null}
+        posterState={null}
+        bluestacksState={null}
+        onMessage={onMessage}
+      />,
+    ),
+  );
+
+  const createBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('新建排班'),
+  );
+  await click(createBtn ?? null);
+  expect(host.textContent).not.toContain('提前独立预热');
+  expect(host.textContent).not.toContain('高级选项');
+  expect(host.textContent).toContain('跑完自动关窗');
+
+  const saveBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '保存',
+  );
+  await click(saveBtn ?? null);
+  expect(api.autoSchedulerAction).toHaveBeenCalledWith(
+    'schedules/save',
+    expect.objectContaining({
+      carrier: 'browser',
+      closeWindowOnFinish: true,
+      maxSafetyMinutesPerTarget: null,
+      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
+      trigger: expect.objectContaining({ jitterMinutes: 0, misfireGraceMinutes: 120 }),
+    }),
+  );
+});
+
+it('v0.1.262: LiveRunsDrawer shows queued items + BS show, PostBumpRecordsPage supports 7-day filter & drill-down, CombinationList shows direct material button', async () => {
+  // 1. LiveRunsDrawer renders both running + queued scheduler items & BlueStacks 显示窗口
+  const bsRunId = '50000000-0000-4000-8000-000000000001';
+  const bsTargetRunning = '50000000-0000-4000-8000-000000000011';
+  const bsTargetQueued = '50000000-0000-4000-8000-000000000012';
+  const cards = buildLiveRunCards({
+    profiles: [],
+    runtime: null,
+    combinations: [],
+    autoScheduler: {
+      running: true,
+      nextSchedule: null,
+      schedules: [
+        {
+          id: 'sched-bs-1',
+          name: '蓝蝶排班',
+          enabled: true,
+          carrier: 'bluestacks',
+          targetIds: [bsTargetRunning, bsTargetQueued],
+          concurrency: 1,
+          closeWindowOnFinish: true,
+          maxSafetyMinutesPerTarget: null,
+          prewarm: { enabled: false, leadMinutes: 90, steps: [] },
+          trigger: {
+            kind: 'daily',
+            times: ['09:00'],
+            weekdays: [1, 2, 3, 4, 5, 6, 7],
+            intervalMinutes: 120,
+            runAt: null,
+            jitterMinutes: 0,
+            misfireGraceMinutes: 120,
+          },
+          steps: [
+            {
+              id: '50000000-0000-4000-8000-000000000099',
+              type: 'bluestacks-group-poster',
+              maxGroups: 2,
+              postTimeline: false,
+            },
+          ],
+          createdAt: 1000,
+          updatedAt: 1000,
+        },
+      ],
+      activeRuns: [
+        {
+          runId: bsRunId,
+          scheduleId: 'sched-bs-1',
+          scheduleName: '蓝蝶排班',
+          carrier: 'bluestacks',
+          status: 'running',
+          startedAt: 1000,
+          finishedAt: null,
+          concurrency: 1,
+          stopReason: '',
+          items: [
+            {
+              targetId: bsTargetRunning,
+              targetName: 'BS Instance 1',
+              status: 'running',
+              currentStep: '蓝蝶发帖',
+              summary: '正在发送第 1 组',
+              startedAt: 1000,
+              finishedAt: null,
+              error: '',
+            },
+            {
+              targetId: bsTargetQueued,
+              targetName: 'BS Instance 2',
+              status: 'queued',
+              currentStep: '',
+              summary: '',
+              startedAt: null,
+              finishedAt: null,
+              error: '',
+            },
+          ],
+        },
+      ],
+      history: [],
+      guardSettings: {
+        preventSystemSleep: false,
+        defaultConcurrency: 1,
+        closeWindowOnFinish: true,
+        updatedAt: 1000,
+      },
+    },
+    groupBumper: null,
+    groupPoster: null,
+    groupInviter: null,
+    googleSheets: null,
+    bluestacks: null,
+  });
+  expect(cards).toHaveLength(2);
+  expect(cards[0]?.statusText).not.toBe('等待并发槽位');
+  expect(cards[1]?.statusText).toBe('等待并发槽位');
+
+  const onShowBluestacks = vi.fn();
+  await act(async () =>
+    root.render(
+      <LiveRunsDrawer
+        open={true}
+        onClose={() => {}}
+        cards={cards}
+        busy={false}
+        onShowBrowser={() => {}}
+        onShowBluestacks={onShowBluestacks}
+        onStopCard={() => {}}
+        onStopAll={() => {}}
+      />,
+    ),
+  );
+  expect(host.textContent).toContain('等待并发槽位');
+  const showBsBtns = [...host.querySelectorAll('button')].filter((b) =>
+    b.textContent?.includes('显示窗口'),
+  );
+  expect(showBsBtns.length).toBeGreaterThanOrEqual(2);
+  await click(showBsBtns[0] ?? null);
+  expect(onShowBluestacks).toHaveBeenCalledWith(bsTargetRunning);
+
+  // 2. PostBumpRecordsPage statusCounts + 7-day trend date toggle + cell drill-down + 重置筛选
+  vi.mocked(api.postBumpRecords).mockClear();
+  vi.mocked(api.postBumpRecords).mockResolvedValue({
+    records: [
+      {
+        id: 'pbr-v262-1',
+        recordType: 'post',
+        carrier: 'browser',
+        status: 'success',
+        profileId: id,
+        accountId: 'acc-991',
+        accountName: 'Alpha Account',
+        groupId: 'grp-881',
+        groupName: 'Alpha Group',
+        pageId: 'page-771',
+        pageName: 'Alpha Page',
+        postId: 'post-661',
+        postUrl: 'https://www.facebook.com/groups/grp-881/posts/post-661/',
+        liked: false,
+        commentText: '',
+        storyShared: false,
+        captionPreview: '测试文案',
+        errorReason: '',
+        sourceLogId: null,
+        createdAt: 1700000000000,
+      },
+    ],
+    total: 3,
+    hasMore: false,
+    dailyStats: [{ dateKey: '2026-11-25', label: '11-25', posts: 2, bumps: 1, failures: 0 }],
+    statusCounts: { total: 3, confirmed: 1, pending: 1, failed: 1 },
+  });
+  await act(async () => root.render(<PostBumpRecordsPage onNotify={() => {}} />));
+  expect(host.textContent).toContain('已确认');
+  expect(host.textContent).toContain('待审核');
+  expect(host.textContent).toContain('失败');
+
+  const dayBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.includes('11-25') && b.hasAttribute('aria-pressed'),
+  );
+  expect(dayBtn).toBeTruthy();
+  await click(dayBtn ?? null);
+  expect(dayBtn?.getAttribute('aria-pressed')).toBe('true');
+  const expectedStart = new Date(2026, 10, 25, 0, 0, 0, 0).getTime();
+  const expectedEnd = new Date(2026, 10, 25, 23, 59, 59, 999).getTime();
+  expect(api.postBumpRecords).toHaveBeenLastCalledWith(
+    expect.objectContaining({ from: expectedStart, to: expectedEnd }),
+  );
+
+  const accCellBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.getAttribute('title') === '点击按该账号筛选',
+  );
+  expect(accCellBtn).toBeTruthy();
+  await click(accCellBtn ?? null);
+  const resetBtn = [...host.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '重置筛选',
+  );
+  expect(resetBtn).toBeTruthy();
+  await click(resetBtn ?? null);
+  expect(dayBtn?.getAttribute('aria-pressed')).toBe('false');
+
+  // 3. CombinationList renders direct 素材 (N) button when combo includes table post step
+  const comboPostId = '60000000-0000-4000-8000-000000000001';
+  await act(async () =>
+    root.render(
+      <CombinationList
+        rows={[
+          {
+            id: comboPostId,
+            version: 1,
+            revision: 1,
+            updatedAt: 1000,
+            saved: {
+              name: '表格发帖组合',
+              note: '',
+              randomOrder: false,
+              loop: { mode: 'finite', rounds: 1 },
+              steps: [
+                {
+                  id: '60000000-0000-4000-8000-000000000002',
+                  type: 'post',
+                  destination: 'post',
+                  count: 1,
+                  resourceMode: 'table',
+                  resourceDirectory: '',
+                  allowRepeat: false,
+                  forbidSameAccountRepeat: true,
+                  archivePublished: false,
+                  audience: 'preserve-current',
+                },
+              ],
+            },
+            draft: null,
+          },
+        ]}
+        selectedCount={0}
+        onEdit={() => {}}
+        onNew={() => {}}
+        onCopy={() => {}}
+        onResources={() => {}}
+        resourceSummaries={[
+          {
+            combinationId: comboPostId,
+            kind: 'post_content',
+            total: 4,
+            remaining: 4,
+            exhausted: 0,
+            invalid: 0,
+          },
+        ]}
+      />,
+    ),
+  );
+  const directMatBtn = [...host.querySelectorAll('.combo-foot button')].find((b) =>
+    b.textContent?.includes('素材 (4)'),
+  );
+  expect(directMatBtn).toBeTruthy();
+});
+
+it('v0.1.267: LiveRunsDrawer shows shuffled roundSteps & BS steps, ActiveAccountsPage unifies bluestacks, relativePostAge parses multi-locale times', async () => {
+  const pid = '70000000-0000-4000-8000-000000000001';
+  const planId = '70000000-0000-4000-8000-000000000002';
+  const comboId = '70000000-0000-4000-8000-000000000003';
+  const bsId = '70000000-0000-4000-8000-000000000004';
+  const s1 = '70000000-0000-4000-8000-000000000011';
+  const s2 = '70000000-0000-4000-8000-000000000012';
+  const s3 = '70000000-0000-4000-8000-000000000013';
+
+  const cards = buildLiveRunCards({
+    profiles: [
+      {
+        id: pid,
+        alias: 'Browser1',
+        browserName: '用户9',
+        groupId: null,
+        order: 0,
+        online: true,
+        phase: 'PAUSED',
+        synced: true,
+        unresolved: 0,
+        extensionVersion: '0.3.92',
+        account: { state: 'logged-in', id: '123', name: 'A', avatar: null },
+      },
+    ],
+    runtime: {
+      plans: [
+        {
+          id: planId,
+          profileId: pid,
+          combinationId: comboId,
+          version: 1,
+          name: '随机养号',
+          accountId: '123',
+          state: 'RUNNING',
+          reason: '',
+          controlConfirmed: false,
+          round: 1,
+          position: 0,
+          snapshot: {
+            name: '随机养号',
+            note: '',
+            randomOrder: true,
+            loop: { mode: 'finite', rounds: 1 },
+            steps: [
+              { id: s1, type: 'video', durationMinutes: 15, maxLikes: 2, minLikeCount: 0 },
+              {
+                id: s2,
+                type: 'marketplace',
+                durationMinutes: 4,
+                keyword: '',
+                maxLikes: 0,
+                minLikeCount: 0,
+              },
+              { id: s3, type: 'feed', durationMinutes: 8, maxLikes: 2, minLikeCount: 0 },
+            ],
+          },
+          createdAt: 1000,
+          updatedAt: 1000,
+        },
+      ],
+      currentSteps: [
+        {
+          id: s2,
+          jobId: planId,
+          round: 1,
+          position: 0,
+          type: 'marketplace',
+          status: 'ACTIVE',
+          budget: { kind: 'time', milliseconds: 240_000 },
+          progress: { revision: 1, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
+        },
+      ],
+      roundSteps: [
+        {
+          id: s3,
+          jobId: planId,
+          round: 1,
+          position: 2,
+          type: 'feed',
+          status: 'PENDING',
+          budget: { kind: 'time', milliseconds: 480_000 },
+          maxLikes: 2,
+          progress: { revision: 0, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
+        },
+        {
+          id: s2,
+          jobId: planId,
+          round: 1,
+          position: 0,
+          type: 'marketplace',
+          status: 'ACTIVE',
+          budget: { kind: 'time', milliseconds: 240_000 },
+          progress: { revision: 1, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
+        },
+        {
+          id: s1,
+          jobId: planId,
+          round: 1,
+          position: 1,
+          type: 'video',
+          status: 'PENDING',
+          budget: { kind: 'time', milliseconds: 900_000 },
+          maxLikes: 2,
+          progress: { revision: 0, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
+        },
+      ],
+      settings: { maxConcurrentProfiles: 5 },
+    },
+    combinations: [
+      {
+        id: comboId,
+        version: 1,
+        revision: 1,
+        updatedAt: 1000,
+        saved: {
+          name: '随机养号',
+          note: '',
+          randomOrder: true,
+          loop: { mode: 'finite', rounds: 1 },
+          steps: [
+            { id: s1, type: 'video', durationMinutes: 15, maxLikes: 2, minLikeCount: 0 },
+            {
+              id: s2,
+              type: 'marketplace',
+              durationMinutes: 4,
+              keyword: '',
+              maxLikes: 0,
+              minLikeCount: 0,
+            },
+            { id: s3, type: 'feed', durationMinutes: 8, maxLikes: 2, minLikeCount: 0 },
+          ],
+        },
+        draft: null,
+      },
+    ],
+    autoScheduler: null,
+    groupBumper: null,
+    groupPoster: null,
+    groupInviter: null,
+    googleSheets: null,
+    bluestacks: {
+      running: false,
+      pageBumperRunning: false,
+      activeRunning: true,
+      posterRunning: false,
+      inviterRunning: false,
+      statusText: '',
+      pageBumperStatusText: '',
+      activeStatusText: '运行中',
+      posterStatusText: '',
+      inviterStatusText: '',
+      launchingIds: [],
+      closingIds: [],
+      inspectingIds: [],
+      installingIds: [],
+      loggingInIds: [],
+      switchingIds: [],
+      config: {
+        installDir: null,
+        confPath: null,
+        detectedInstallDir: null,
+        detectedConfPath: null,
+        adbReady: true,
+        playerReady: true,
+        apkPath: null,
+        detectedApkPath: null,
+      },
+      bumperSettings: BumperSettings.parse({}),
+      pageBumperSettings: BumperSettings.parse({}),
+      riskLimitSettings: {
+        dailyMaxTotalActions: 60,
+        dailyMaxBumps: 30,
+        dailyMaxPosts: 10,
+        dailyMaxInvites: 20,
+        dailyMaxActiveLikes: 25,
+        enabled: true,
+        perInstanceOverrides: {},
+      },
+      dailyUsage: {
+        dateYmd: '2026-11-26',
+        totalGroupBumps: 0,
+        totalPageBumps: 0,
+        totalPosts: 0,
+        totalInvites: 0,
+        totalActiveLikes: 0,
+        totalActions: 0,
+        reachedLimitInstances: 0,
+        perInstance: {},
+      },
+      total: 0,
+      pageTotal: 0,
+      commentsCount: 0,
+      pageCommentsCount: 0,
+      healthCheck: null,
+      batchLogin: null,
+      profileCounts: {},
+      pageBumperProfileCounts: {},
+      activeProfileCounts: {
+        [bsId]: {
+          running: true,
+          status: '执行第 1 步',
+          session: 0,
+          today: 0,
+          steps: [
+            { label: '浏览 Reels (15分)', state: 'running' },
+            { label: '浏览首页 (8分)', state: 'pending' },
+          ],
+        },
+      },
+      posterProfileCounts: {},
+      inviterProfileCounts: {},
+      folders: [],
+      instances: [
+        {
+          id: bsId,
+          instanceKey: 'Pie64_1',
+          displayName: 'p023',
+          alias: null,
+          folderId: null,
+          order: 0,
+          adbPort: 5555,
+          fbWidth: 720,
+          fbHeight: 1280,
+          fbLiteInstalled: true,
+          online: true,
+          accountState: 'logged-in',
+          accountId: '999',
+          accountName: 'BS Acc',
+          avatar: null,
+          lastStatus: null,
+          identityType: 'personal',
+          numericAccountId: '999',
+          managedIdentities: [],
+          updatedAt: 1000,
+        },
+      ],
+    },
+  });
+
+  const browserCard = cards.find((c) => c.key === `plan:${planId}`);
+  expect(browserCard?.subtitle).toContain('随机顺序');
+  expect(browserCard?.steps.map((s) => s.label)).toEqual([
+    '浏览商城 (4分)',
+    '浏览 Reels (15分)',
+    '浏览首页 (8分)',
+  ]);
+  const bsCard = cards.find((c) => c.key === `bs:active/stop:${bsId}`);
+  expect(bsCard?.steps.map((s) => s.label)).toEqual(['浏览 Reels (15分)', '浏览首页 (8分)']);
+
+  // Unified capability-driven ActiveAccountsPage on BlueStacks carrier (no bottom progress panel)
+  const mixedComboId = '70000000-0000-4000-8000-000000000021';
+  await act(async () =>
+    root.render(
+      <ActiveAccountsPage
+        carrier="bluestacks"
+        workspace={{
+          version: 1,
+          groups: [],
+          profiles: [],
+          combinations: [
+            {
+              id: mixedComboId,
+              version: 1,
+              revision: 1,
+              updatedAt: 1000,
+              saved: {
+                name: '混合组合',
+                note: '',
+                randomOrder: false,
+                loop: { mode: 'finite', rounds: 1 },
+                steps: [
+                  {
+                    id: '70000000-0000-4000-8000-000000000031',
+                    type: 'feed',
+                    feedMode: 'random_profile',
+                    detourDwellSeconds: 25,
+                    durationMinutes: 5,
+                    maxLikes: 1,
+                    minLikeCount: 0,
+                  },
+                  {
+                    id: '70000000-0000-4000-8000-000000000032',
+                    type: 'post',
+                    destination: 'post',
+                    count: 1,
+                    resourceMode: 'table',
+                    resourceDirectory: '',
+                    allowRepeat: false,
+                    forbidSameAccountRepeat: true,
+                    archivePublished: false,
+                    audience: 'preserve-current',
+                  },
+                ],
+              },
+              draft: null,
+            },
+          ],
+        }}
+        selected={new Set()}
+        tasks={
+          {
+            capabilities: {
+              types: ['feed', 'video', 'marketplace', 'friends', 'post'],
+              combinations: [],
+            },
+            runtime: { plans: [], currentSteps: [], settings: { maxConcurrentProfiles: 5 } },
+            command: vi.fn(),
+            start: vi.fn(),
+            refresh: vi.fn(),
+          } as unknown as Parameters<typeof ActiveAccountsPage>[0]['tasks']
+        }
+        cardColors={
+          {
+            colorOf: () => 'graphite',
+            setColor: vi.fn(),
+            supported: true,
+          } as unknown as Parameters<typeof ActiveAccountsPage>[0]['cardColors']
+        }
+        busy={false}
+        resourceSummaries={null}
+        selectionControls={
+          {
+            stoppableTargets: [],
+            stoppableModuleProfileIds: [],
+            totalStoppableCount: 0,
+            isProfileBusy: () => false,
+          } as unknown as Parameters<typeof ActiveAccountsPage>[0]['selectionControls']
+        }
+        bluestacksState={{
+          running: false,
+          pageBumperRunning: false,
+          activeRunning: true,
+          posterRunning: false,
+          inviterRunning: false,
+          statusText: '',
+          pageBumperStatusText: '',
+          activeStatusText: '运行中',
+          posterStatusText: '',
+          inviterStatusText: '',
+          launchingIds: [],
+          closingIds: [],
+          inspectingIds: [],
+          installingIds: [],
+          loggingInIds: [],
+          switchingIds: [],
+          config: {
+            installDir: null,
+            confPath: null,
+            detectedInstallDir: null,
+            detectedConfPath: null,
+            adbReady: true,
+            playerReady: true,
+            apkPath: null,
+            detectedApkPath: null,
+          },
+          bumperSettings: BumperSettings.parse({}),
+          pageBumperSettings: BumperSettings.parse({}),
+          riskLimitSettings: {
+            dailyMaxTotalActions: 60,
+            dailyMaxBumps: 30,
+            dailyMaxPosts: 10,
+            dailyMaxInvites: 20,
+            dailyMaxActiveLikes: 25,
+            enabled: true,
+            perInstanceOverrides: {},
+          },
+          dailyUsage: {
+            dateYmd: '2026-11-26',
+            totalGroupBumps: 0,
+            totalPageBumps: 0,
+            totalPosts: 0,
+            totalInvites: 0,
+            totalActiveLikes: 0,
+            totalActions: 0,
+            reachedLimitInstances: 0,
+            perInstance: {},
+          },
+          total: 0,
+          pageTotal: 0,
+          commentsCount: 0,
+          pageCommentsCount: 0,
+          healthCheck: null,
+          batchLogin: null,
+          profileCounts: {},
+          pageBumperProfileCounts: {},
+          activeProfileCounts: {
+            [bsId]: { running: true, status: '执行中', session: 0, today: 0 },
+          },
+          posterProfileCounts: {},
+          inviterProfileCounts: {},
+          folders: [],
+          instances: [],
+        }}
+        selectedBluestacks={new Set([bsId])}
+        onSelectBluestacks={() => {}}
+        onSetResourceSummaries={() => {}}
+        onOpenResources={() => {}}
+        onEditCombination={() => {}}
+        onNewCombination={() => {}}
+        onOpenLiveRuns={() => {}}
+        onRefreshWorkspace={async () => {}}
+        onRefreshResources={async () => {}}
+        onMutate={async () => {}}
+        onNotify={() => {}}
+      />,
+    ),
+  );
+  for (const label of [
+    '浏览首页',
+    '浏览 Reels',
+    '浏览商城',
+    '接受好友',
+    '发时间线',
+    '发布快拍',
+    '新建组合',
+    '导入',
+    '批量管理',
+    '完毕关窗',
+    '按首页',
+    '仅浏览器',
+    '查看队列',
+  ]) {
+    expect(host.textContent).toContain(label);
+  }
+  expect(host.querySelector('.active-progress')).toBeNull();
+
+  expect(relativePostAge('၂ နာရီ')).toBe(2);
+  expect(relativePostAge('3 giờ')).toBe(3);
+  expect(relativePostAge('45 นาที')).toBeCloseTo(0.75, 4);
+  expect(host.querySelector('[aria-label="今日战报"]')).toBeNull();
+  expect(host.textContent).not.toContain('今日战报');
+});
+
+it('v0.1.268: unifies browser display names across LiveRunsDrawer, scope bar, layout sort, and scheduler modal', async () => {
+  const pid1 = '1a761215-0000-4000-8000-000000000001';
+  const pid2 = '9bfb6b7f-0000-4000-8000-000000000002';
+  const profiles = [
+    {
+      id: pid1,
+      alias: 'Chrome 1a761215',
+      browserName: '用户9',
+      groupId: null,
+      order: 0,
+      online: true,
+      phase: 'PAUSED',
+      synced: true,
+      unresolved: 0,
+      extensionVersion: '0.3.92',
+      capabilities: [],
+      account: { state: 'logged-in' as const, id: '1001', name: 'FB 9', avatar: null },
+    },
+    {
+      id: pid2,
+      alias: 'Chrome 9bfb6b7f',
+      browserName: 'p017',
+      groupId: null,
+      order: 1,
+      online: true,
+      phase: 'PAUSED',
+      synced: true,
+      unresolved: 0,
+      extensionVersion: '0.3.92',
+      capabilities: [],
+      account: { state: 'logged-in' as const, id: '1002', name: 'FB 17', avatar: null },
+    },
+  ];
+  expect(profiles.map((pr) => profileDisplayName(pr))).toEqual(['用户9', 'p017']);
+  expect(mapProfilesToScopeOptions(profiles).map((o) => o.label)).toEqual(['用户9', 'p017']);
+  const [p1, p2] = profiles;
+  if (!p1 || !p2) throw Error('missing fixture profiles');
+  expect(
+    getTargetProfileIds(
+      [
+        { ...p1, browserName: 'B组-用户9' },
+        { ...p2, browserName: 'A组-p017' },
+      ],
+      new Set([pid1, pid2]),
+      'selected',
+      'name',
+    ),
+  ).toEqual([pid2, pid1]);
+  const liveCards = buildLiveRunCards({
+    profiles,
+    runtime: {
+      schemaVersion: 1,
+      plans: [
+        {
+          id: 'plan-u9',
+          profileId: pid1,
+          combinationId: 'combo-1',
+          combinationVersion: 1,
+          state: 'RUNNING',
+          position: 0,
+          round: 1,
+          reason: null,
+          closeBrowserOnFinish: false,
+          snapshot: {
+            name: '日常',
+            note: '',
+            randomOrder: false,
+            loop: { mode: 'finite', rounds: 1 },
+            steps: [{ id: 's1', type: 'feed', feedMode: 'home', durationMinutes: 5, maxLikes: 1 }],
+          },
+          createdAt: 1000,
+          updatedAt: 2000,
+        },
+      ],
+      currentSteps: [],
+      roundSteps: [],
+    },
+    combinations: [],
+    autoScheduler: {
+      settings: {
+        browserConcurrency: 15,
+        bluestacksConcurrency: 5,
+        launchStaggerSeconds: 3,
+        idleWatchdogMinutes: 5,
+        preventSystemSleep: true,
+      },
+      running: true,
+      powerLockMode: 'none',
+      activeBrowserWorkers: 1,
+      queuedBrowserTargets: 0,
+      activeBluestacksWorkers: 0,
+      queuedBluestacksTargets: 0,
+      schedules: [],
+      activeRuns: [
+        {
+          id: 'run-p17',
+          scheduleId: 'sched-1',
+          scheduleName: '晨间排班',
+          carrier: 'browser',
+          phase: 'main',
+          slotKey: 'k1',
+          triggerMode: 'manual',
+          status: 'running',
+          statusReason: '',
+          totalTargets: 1,
+          completedCount: 0,
+          softIssueCount: 0,
+          hardBlockedCount: 0,
+          watchdogTimeoutCount: 0,
+          skippedCount: 0,
+          scheduledFor: 1000,
+          startedAt: 1000,
+          finishedAt: null,
+          items: [
+            {
+              runId: 'run-p17',
+              targetId: pid2,
+              targetName: 'Chrome 9bfb6b7f',
+              status: 'running',
+              currentStep: '浏览首页',
+              summary: '运行中',
+              bumpedCount: 0,
+              postedCount: 0,
+              softIssues: 0,
+              hardBlockReason: null,
+              seamlessHandoff: false,
+              startedAt: 1000,
+              finishedAt: null,
+              updatedAt: 2000,
+            },
+          ],
+        },
+      ],
+      recentRuns: [],
+    },
+    groupBumper: null,
+    groupPoster: null,
+    groupInviter: null,
+    googleSheets: null,
+    bluestacks: null,
+  });
+  expect(liveCards.map((c) => c.targetName)).toEqual(['p017', '用户9']);
+
+  await act(async () =>
+    root.render(
+      <AutoSchedulerEditorModal
+        initial={null}
+        browserConcurrency={15}
+        bluestacksConcurrency={5}
+        profiles={profiles}
+        profileGroups={[]}
+        selectedProfileIds={new Set([pid1])}
+        combinations={[]}
+        sharedGroups={[]}
+        sharedPages={[]}
+        posterMaterials={[]}
+        inviterGroups={[]}
+        bluestacksState={null}
+        onSave={async () => {}}
+        onClose={() => {}}
+      />,
+    ),
+  );
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === '手动选') ?? null,
+  );
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('勾选')) ?? null,
+  );
+  expect(host.textContent).toContain('1. 用户9');
+  expect(host.textContent).toContain('2. p017');
+  expect(host.textContent).not.toContain('Chrome 1a761215');
+  expect(host.textContent).not.toContain('Chrome 9bfb6b7f');
 });

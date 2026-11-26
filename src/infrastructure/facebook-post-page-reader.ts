@@ -6,7 +6,7 @@ import {
 } from './facebook-read-adapter.js';
 import { PageReadRequest, validateProjection } from '../shared/page-read.js';
 import { projectPage } from '../shared/page-projection.js';
-import { observeFacebookHomeName } from '../domain/facebook-name-analysis.js';
+import { observeFacebookHomeName } from '../domain/facebook-content-rules.js';
 import { observeFacebookComposerSurface } from '../domain/facebook-composer-analysis.js';
 import {
   FACEBOOK_UI_COPY,
@@ -17,7 +17,6 @@ import { z } from 'zod';
 import { readFacebookReviewContent } from './facebook-review-reader.js';
 import { readFacebookReelContent } from './facebook-reel-reader.js';
 import { readFacebookBackground } from './facebook-background-reader.js';
-
 const request = PageReadRequest.parse({
   queries: [
     ...facebookDisplayInspectionProjection.queries,
@@ -27,7 +26,6 @@ const request = PageReadRequest.parse({
 const textResult = z
   .object({ url: z.string(), timeOrigin: z.number().finite(), text: z.string().max(100_000) })
   .strict();
-
 // Reads the existing owned SDK page only. No navigation, menu click, page adoption or input.
 export async function readFacebookPostPage(
   page: Page,
