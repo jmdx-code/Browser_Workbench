@@ -61,14 +61,20 @@ test('WO-U4.1: fresh DB (0 -> 51) and legacy DB upgrade reach user_version = 51 
     assert.equal(posterRepo.settings().maxConcurrentProfiles, 4);
     mem.close();
 
-    // Legacy v61 -> v62 upgrade path and pre-v59 rejection
+    // Legacy v61 -> v62 upgrade path and pre-v59 v50 rebuild path
     const oldV50Path = path.join(dir, 'too-old-v50.sqlite');
     const rawV50 = new DatabaseSync(oldV50Path);
     rawV50.exec('PRAGMA user_version = 50');
     rawV50.close();
-    await assert.rejects(() => WorkspaceStore.open(oldV50Path), {
-      code: 'DATABASE_VERSION_TOO_OLD',
-    });
+    const rebuilt50 = await WorkspaceStore.open(oldV50Path);
+    rebuilt50.close();
+    const check50 = new DatabaseSync(oldV50Path, { readOnly: true });
+    assert.equal(
+      (check50.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+      workspaceSchemaVersion,
+    );
+    assert.equal(check50.prepare('PRAGMA foreign_key_check').all().length, 0);
+    check50.close();
 
     const legacyPath = path.join(dir, 'legacy-v61.sqlite');
     const storeLegacy = await WorkspaceStore.open(legacyPath);

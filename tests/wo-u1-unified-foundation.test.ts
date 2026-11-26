@@ -102,14 +102,20 @@ test('WO-U1: fresh DB (version=0) and v47->v48 upgrade rebuild profile_task_resu
       rawFresh.close();
     }
 
-    // 2. Reject pre-v59 (v47) and verify v61->v62 upgrade keeps 5 sources & cascade delete
+    // 2. Rebuild pre-v59 (v47) cleanly and verify v61->v62 upgrade keeps 5 sources & cascade delete
     const tooOldPath = join(dir, 'v47.sqlite');
     const oldDb = new DatabaseSync(tooOldPath);
     oldDb.exec('PRAGMA user_version=47');
     oldDb.close();
-    await assert.rejects(() => WorkspaceStore.open(tooOldPath), {
-      code: 'DATABASE_VERSION_TOO_OLD',
-    });
+    const rebuilt47 = await WorkspaceStore.open(tooOldPath);
+    rebuilt47.close();
+    const check47 = new DatabaseSync(tooOldPath, { readOnly: true });
+    assert.equal(
+      check47.prepare('PRAGMA user_version').get()?.user_version,
+      workspaceSchemaVersion,
+    );
+    assert.deepEqual(check47.prepare('PRAGMA foreign_key_check').all(), []);
+    check47.close();
 
     const upgradePath = join(dir, 'upgrade.sqlite');
     const initStore = await WorkspaceStore.open(upgradePath);

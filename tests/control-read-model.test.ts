@@ -592,7 +592,7 @@ test('quotas count rounds, respect a profile scope, and purge only the affected 
   });
 });
 
-test('v61->v62 preserves data_cleanup_settings while rejecting pre-v59 v40 DBs', async () => {
+test('v61->v62 preserves data_cleanup_settings while rebuilding pre-v59 v40 DBs to v62', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-quota-upgrade-'));
   const file = path.join(dir, 'workspace.sqlite');
   const oldFile = path.join(dir, 'v40.sqlite');
@@ -600,7 +600,15 @@ test('v61->v62 preserves data_cleanup_settings while rejecting pre-v59 v40 DBs',
     const oldDb = new DatabaseSync(oldFile);
     oldDb.exec('PRAGMA user_version=40');
     oldDb.close();
-    await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+    const rebuilt = await WorkspaceStore.open(oldFile);
+    rebuilt.close();
+    const rebuiltCheck = new DatabaseSync(oldFile, { readOnly: true });
+    assert.equal(
+      rebuiltCheck.prepare('PRAGMA user_version').get()?.user_version,
+      workspaceSchemaVersion,
+    );
+    assert.deepEqual(rebuiltCheck.prepare('PRAGMA foreign_key_check').all(), []);
+    rebuiltCheck.close();
 
     const store = await WorkspaceStore.open(file);
     store.dataCleanup.saveSettings({
@@ -659,7 +667,7 @@ test('automatic retention drains excess history across multiple 100-step batches
   });
 });
 
-test('v62 schema installs all job indexes and the resource cleanup guard while rejecting v41', async () => {
+test('v62 schema installs all job indexes and rebuilds v41 DBs cleanly', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-cleanup62-'));
   const file = path.join(dir, 'workspace.sqlite');
   const oldFile = path.join(dir, 'v41.sqlite');
@@ -675,7 +683,15 @@ test('v62 schema installs all job indexes and the resource cleanup guard while r
     const oldDb = new DatabaseSync(oldFile);
     oldDb.exec('PRAGMA user_version=41');
     oldDb.close();
-    await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+    const rebuilt = await WorkspaceStore.open(oldFile);
+    rebuilt.close();
+    const rebuiltCheck = new DatabaseSync(oldFile, { readOnly: true });
+    assert.equal(
+      rebuiltCheck.prepare('PRAGMA user_version').get()?.user_version,
+      workspaceSchemaVersion,
+    );
+    assert.deepEqual(rebuiltCheck.prepare('PRAGMA foreign_key_check').all(), []);
+    rebuiltCheck.close();
 
     const fresh = await WorkspaceStore.open(file);
     fresh.close();

@@ -26,14 +26,22 @@ async function fixture(work: (s: WorkspaceStore, file: string) => Promise<void>)
     await rm(dir, { recursive: true, force: true });
   }
 }
-test('v61->v62 preserves profiles, target rows and folders while rejecting pre-v59 user_version=43', async () => {
+test('v61->v62 preserves profiles, target rows and folders and rebuilds pre-v59 user_version=43', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'finder-migration-'));
   const file = path.join(dir, 'workspace.sqlite');
   const oldFile = path.join(dir, 'v43.sqlite');
   const oldDb = new DatabaseSync(oldFile);
   oldDb.exec('PRAGMA user_version=43');
   oldDb.close();
-  await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+  const rebuilt = await WorkspaceStore.open(oldFile);
+  rebuilt.close();
+  const rebuiltCheck = new DatabaseSync(oldFile, { readOnly: true });
+  assert.equal(
+    rebuiltCheck.prepare('PRAGMA user_version').get()?.user_version,
+    workspaceSchemaVersion,
+  );
+  assert.deepEqual(rebuiltCheck.prepare('PRAGMA foreign_key_check').all(), []);
+  rebuiltCheck.close();
 
   let store = await WorkspaceStore.open(file);
   const group = store.createGroup('保留组', 'blue');

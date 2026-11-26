@@ -12,7 +12,7 @@ import {
   reserveControllerPort,
   releaseControllerPort,
 } from '../src/infrastructure/controller-port.js';
-import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
+import { WorkspaceStore, workspaceSchemaVersion } from '../src/infrastructure/workspace-store.js';
 import { TaskService } from '../src/application/task-service.js';
 import { SqliteTaskRepository } from '../src/infrastructure/task-store.js';
 import { orderedSteps, validateProgress, type RuntimeProfile } from '../src/domain/tasks.js';
@@ -415,14 +415,28 @@ test('a second controller fails on occupied port before recovering or creating e
   });
 });
 
-test('v61->v62 migration backs up and preserves existing data while rejecting pre-v59 DBs; SQLite prevents snapshot/order edits', async () => {
+test('v61->v62 migration backs up and preserves data and rebuilds pre-v59 DBs cleanly; SQLite prevents snapshot/order edits', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'workbench-migration-')),
     file = path.join(dir, 'workspace.sqlite'),
     oldFile = path.join(dir, 'too-old.sqlite');
   const legacyTooOld = new DatabaseSync(oldFile);
   legacyTooOld.exec('CREATE TABLE sentinel(v TEXT); PRAGMA user_version=1');
   legacyTooOld.close();
-  await assert.rejects(() => WorkspaceStore.open(oldFile), { code: 'DATABASE_VERSION_TOO_OLD' });
+  const rebuilt = await WorkspaceStore.open(oldFile);
+  rebuilt.close();
+  const rebuiltCheck = new DatabaseSync(oldFile, { readOnly: true });
+  assert.equal(
+    rebuiltCheck.prepare('PRAGMA user_version').get()?.user_version,
+    workspaceSchemaVersion,
+  );
+  assert.equal(
+    rebuiltCheck
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sentinel'")
+      .get(),
+    undefined,
+  );
+  assert.deepEqual(rebuiltCheck.prepare('PRAGMA foreign_key_check').all(), []);
+  rebuiltCheck.close();
 
   const initial = await WorkspaceStore.open(file);
   initial.createGroup('保留组', 'blue');
