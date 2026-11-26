@@ -2961,9 +2961,9 @@ describe('GoogleSheetsService end-to-end orchestration (M1–M4)', () => {
     const repo = new SqliteGoogleSheetsRepository(db);
     let nowMs = Date.UTC(2026, 10, 22, 12, 0, 0);
     const fmt = (ms: number) => {
-      const d = new Date(ms + 8 * 3_600_000);
+      const d = new Date(ms);
       const p = (n: number) => String(n).padStart(2, '0');
-      return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
     };
 
     // Build 35 unreachable older posts (2-5 days old) + 2 healthy newer posts (26h old)
