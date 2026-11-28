@@ -1,5 +1,5 @@
 import type { CompatibleRepository } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import {
   CreateSheetLinkInput,
   parseGoogleSpreadsheetUrl,
@@ -16,6 +16,8 @@ import {
   type SheetImageHostStatus,
   type SpreadsheetMeta,
 } from '../shared/google-sheets.js';
+import { BumperSettings } from '../shared/group-bumper.js';
+import type { CheckDailyRiskLimitFn } from '../shared/daily-risk-limits.js';
 import type {
   GoogleSheetsRepositoryPort,
   SheetImageHostTestResult,
@@ -32,45 +34,83 @@ import {
 } from './google-sheets/gs-context-and-library.js';
 import { collectDueMetricsForLink as runCollectDueMetricsForLink } from './google-sheets/gs-metrics-collector.js';
 import { runRecordsPoll } from './google-sheets/gs-records-poller.js';
+import { resetStuckRowsForLink } from './google-sheets/gs-schedule-helpers.js';
 import { runSchedulePoll } from './google-sheets/gs-schedule-poller.js';
 import { ignoreError, sleepMs } from './module-worker-pool.js';
-
+import { Workboard } from './workboard.js';
 export type { GoogleSheetsServiceDeps };
-
 const DEFAULT_TAB_PATTERNS: Record<GoogleSheetKind, RegExp> = {
   group_library: /小组表|小組表|group/i,
   page_library: /专页表|專頁表|page/i,
   post_schedule: /排贴|排貼|schedule/i,
   post_records: /发帖记录|發帖記錄|顶贴|頂貼|record/i,
 };
-
 export class GoogleSheetsService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private readonly ctx: GoogleSheetsContext;
-
+  private explicitWorkboard: Workboard | null = null;
+  private readonly fallbackWorkboard = new Workboard({
+    browserConcurrency: 100,
+    bluestacksConcurrency: 50,
+  });
   constructor(
     private readonly repo: CompatibleRepository<GoogleSheetsRepositoryPort>,
     private readonly deps: GoogleSheetsServiceDeps,
   ) {
+    if (deps.workboard) this.explicitWorkboard = deps.workboard;
     this.ctx = createGoogleSheetsContext(repo, deps, (id, r) =>
       this.wakeRecordsLinkToActive(id, r),
     );
   }
-
-  syncMaxConcurrency(limit: number, bluestacksLimit?: number): void {
-    this.ctx.concurrency.maxProfiles = Math.max(1, Math.min(50, Math.round(limit)));
-    if (typeof bluestacksLimit === 'number' && Number.isFinite(bluestacksLimit))
-      this.ctx.concurrency.maxBluestacks = Math.max(1, Math.min(30, Math.round(bluestacksLimit)));
+  setWorkboard = (workboard: Workboard) => void (this.explicitWorkboard = workboard);
+  setCheckDailyRiskLimit = (fn: CheckDailyRiskLimitFn) =>
+    void (this.ctx.deps.checkDailyRiskLimit = fn);
+  getWorkboard = (): Workboard =>
+    this.explicitWorkboard ?? this.deps.bluestacks?.getWorkboard?.() ?? this.fallbackWorkboard;
+  async syncMaxConcurrency(limit: number, bluestacksLimit?: number): Promise<void> {
+    const wb = this.getWorkboard();
+    const browserCap = Math.max(1, Math.min(50, Math.round(limit)));
+    this.ctx.concurrency.maxProfiles = browserCap;
+    wb.browserPermits.setLimit(browserCap);
+    let bsCap = this.ctx.concurrency.maxBluestacks;
+    if (typeof bluestacksLimit === 'number' && Number.isFinite(bluestacksLimit)) {
+      bsCap = Math.max(1, Math.min(30, Math.round(bluestacksLimit)));
+      this.ctx.concurrency.maxBluestacks = bsCap;
+      wb.bluestacksPermits.setLimit(bsCap);
+    }
+    const links = await Promise.resolve(this.repo.listLinks('post_records')).catch(() => []);
+    for (const link of links) {
+      const rc = link.recordsConfig;
+      const isBsOnly = Boolean(
+        rc &&
+        (rc.bumperBluestacksIds.length > 0 || rc.bumperBluestacksFolderIds.length > 0) &&
+        rc.bumperProfileIds.length === 0 &&
+        rc.bumperProfileGroupIds.length === 0,
+      );
+      const targetCap = isBsOnly ? bsCap : browserCap;
+      if (rc?.bumperSettings.maxConcurrentProfiles !== targetCap) {
+        await ignoreError(
+          this.repo.updateLink({
+            id: link.id,
+            recordsConfig: {
+              bumperSettings: BumperSettings.parse({
+                ...(rc?.bumperSettings ?? {}),
+                maxConcurrentProfiles: targetCap,
+              }),
+            },
+          }),
+        );
+      }
+    }
   }
-
-  isProfileRunning = (profileId: string) => this.ctx.activeProfiles.has(profileId);
+  isProfileRunning = (profileId: string) =>
+    this.ctx.activeProfiles.has(profileId) || this.ctx.claimingProfiles.has(profileId);
   hasActiveExecution = () => this.isRunningAny() || this.ctx.activeProfiles.size > 0;
   isRunningAny = () =>
     this.ctx.runningScheduleLinks.size > 0 ||
     this.ctx.runningRecordLinks.size > 0 ||
     this.ctx.runningMetricsLinks.size > 0;
-
   async countEnabledMonitors(): Promise<{ scheduleEnabled: number; recordsEnabled: number }> {
     let scheduleEnabled = 0;
     let recordsEnabled = 0;
@@ -81,7 +121,6 @@ export class GoogleSheetsService {
     }
     return { scheduleEnabled, recordsEnabled };
   }
-
   async stopProfiles(profileIds?: readonly string[]): Promise<void> {
     if (!profileIds?.length) return this.stopAll();
     const idSet = new Set(profileIds);
@@ -92,7 +131,6 @@ export class GoogleSheetsService {
       this.ctx.activeBluestacksAborts.get(pid)?.abort();
     }
   }
-
   async stopAll(): Promise<void> {
     for (const ctrl of this.ctx.metricsAbortByLink.values()) ctrl.abort();
     for (const ctrl of this.ctx.activeBluestacksAborts.values()) ctrl.abort();
@@ -104,13 +142,28 @@ export class GoogleSheetsService {
       this.ctx.cancelledLinks.add(id);
     for (const pid of this.ctx.activeProfiles.keys()) this.ctx.cancelledProfiles.add(pid);
   }
-
   start(): void {
-    if (this.pollTimer) return;
-    this.pollTimer = setInterval(() => void this.tickAll(), 15_000);
-    this.pollTimer.unref?.();
+    if (!this.pollTimer) {
+      this.pollTimer = setInterval(() => void this.tickAll(), 15_000);
+      this.pollTimer.unref?.();
+    }
+    void this.recoverStuckRowsOnStartup().catch(() => {});
   }
-
+  async recoverStuckRowsOnStartup(): Promise<number> {
+    if (!(await this.deps.oauth.status()).authorized) return 0;
+    let totalReset = 0;
+    for (const link of await this.repo.listLinks('post_schedule')) {
+      if (this.ctx.recoveredStuckLinks.has(link.id)) continue;
+      this.ctx.recoveredStuckLinks.add(link.id);
+      const res = await resetStuckRowsForLink(this.ctx, link.id, { onlyThisMachine: true }).catch(
+        () => null,
+      );
+      if (res) totalReset += res.resetCount;
+    }
+    return totalReset;
+  }
+  resetStuckRows = (linkId: string) =>
+    resetStuckRowsForLink(this.ctx, linkId, { onlyThisMachine: false });
   async shutdown(): Promise<void> {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
@@ -130,7 +183,6 @@ export class GoogleSheetsService {
       await Promise.race([Promise.allSettled(flushPromises), sleepMs(5_000)]);
     await this.deps.oauth.shutdown();
   }
-
   async overview(): Promise<GoogleSheetsOverview> {
     const [auth, imgCfg, imgCount, links, logs] = await Promise.all([
       this.deps.oauth.status(),
@@ -161,7 +213,6 @@ export class GoogleSheetsService {
       })),
     };
   }
-
   async importCredentials(rawJson: string): Promise<GoogleAuthStatus> {
     const status = await this.deps.oauth.importCredentialsJson(rawJson);
     this.invalidateGridCache();
@@ -178,7 +229,6 @@ export class GoogleSheetsService {
   getEditableGyazoTokens = async (): Promise<{ tokens: string[] }> => ({
     tokens: resolveEffectiveGyazoTokens(await this.repo.getImageHostConfig()),
   });
-
   async saveImageHostConfig(input: unknown): Promise<SheetImageHostStatus> {
     const parsed = SaveSheetImageHostInput.parse(input);
     const current = await this.repo.getImageHostConfig();
@@ -196,7 +246,6 @@ export class GoogleSheetsService {
     });
     return buildImageHostStatus(saved, await this.repo.countImageCache());
   }
-
   async testImageHost(): Promise<SheetImageHostTestResult> {
     const res = await this.deps.imageHost.testUpload();
     const hostDesc =
@@ -214,32 +263,22 @@ export class GoogleSheetsService {
     });
     return res;
   }
-
   async inspectSpreadsheet(
     urlOrId: string,
   ): Promise<SpreadsheetMeta & { suggestedGid: number | null }> {
     const parsed = parseGoogleSpreadsheetUrl(urlOrId);
     if (!parsed)
-      throw new ProductError(
-        'GOOGLE_SPREADSHEET_URL_INVALID',
-        '请粘贴有效的 Google 表格链接或表格 ID',
-        400,
-      );
+      failError('GOOGLE_SPREADSHEET_URL_INVALID', '请粘贴有效的 Google 表格链接或表格 ID', 400);
     return {
       ...(await this.deps.sheetsApi.getSpreadsheetMeta(parsed.spreadsheetId)),
       suggestedGid: parsed.gid,
     };
   }
-
   async createLink(input: unknown): Promise<GoogleSheetLink> {
     const parsed = CreateSheetLinkInput.parse(input);
     const urlParts = parseGoogleSpreadsheetUrl(parsed.spreadsheetUrlOrId);
     if (!urlParts)
-      throw new ProductError(
-        'GOOGLE_SPREADSHEET_URL_INVALID',
-        '请粘贴有效的 Google 表格链接或 ID',
-        400,
-      );
+      failError('GOOGLE_SPREADSHEET_URL_INVALID', '请粘贴有效的 Google 表格链接或 ID', 400);
     const meta = await this.deps.sheetsApi.getSpreadsheetMeta(urlParts.spreadsheetId);
     const selectedTab =
       (parsed.sheetName ? meta.tabs.find((t) => t.title === parsed.sheetName) : undefined) ??
@@ -256,12 +295,24 @@ export class GoogleSheetsService {
         (i) => i.spreadsheetId === meta.spreadsheetId && i.sheetId === selectedTab.sheetId,
       );
       if (dup)
-        throw new ProductError(
+        failError(
           'GOOGLE_SHEET_DUPLICATE_LINK',
           `工作表「${selectedTab.title}」已连接（当前标签名：${dup.title}），请换选其他工作表或粘贴新表格链接`,
           409,
         );
     }
+    const recordsConfig =
+      parsed.kind === 'post_records' && this.ctx.concurrency.maxProfiles !== null
+        ? {
+            ...(parsed.recordsConfig ?? {}),
+            bumperSettings: BumperSettings.parse({
+              ...(parsed.recordsConfig?.bumperSettings ?? {}),
+              maxConcurrentProfiles:
+                parsed.recordsConfig?.bumperSettings?.maxConcurrentProfiles ??
+                this.ctx.concurrency.maxProfiles,
+            }),
+          }
+        : parsed.recordsConfig;
     const link = await this.repo.createLink({
       kind: parsed.kind,
       title: parsed.title?.trim() || selectedTab.title,
@@ -271,7 +322,7 @@ export class GoogleSheetsService {
       sheetName: selectedTab.title,
       spreadsheetUrl: `${meta.url}#gid=${selectedTab.sheetId}`,
       scheduleConfig: parsed.scheduleConfig,
-      recordsConfig: parsed.recordsConfig,
+      recordsConfig,
     });
     this.invalidateGridCache(link.id);
     await this.repo.appendLog({
@@ -282,7 +333,6 @@ export class GoogleSheetsService {
     });
     return link;
   }
-
   async updateLink(input: unknown): Promise<GoogleSheetLink> {
     const p = UpdateSheetLinkInput.parse(input);
     const updated = await this.repo.updateLink(p);
@@ -299,7 +349,6 @@ export class GoogleSheetsService {
       });
     return (await this.repo.getLink(updated.id)) ?? updated;
   }
-
   async deleteLink(id: string): Promise<{ deleted: boolean }> {
     this.ctx.cancelledLinks.add(id);
     this.ctx.metricsAbortByLink.get(id)?.abort();
@@ -322,7 +371,6 @@ export class GoogleSheetsService {
     }
     return { deleted };
   }
-
   invalidateGridCache = (linkId?: string) => runInvalidateGridCache(this.ctx, linkId);
   readGrid = (
     linkId: string,
@@ -332,7 +380,6 @@ export class GoogleSheetsService {
     runImportLibraryFromSheet(this.ctx, linkId, rawMode);
   syncLibraryToSheet = (linkId: string): Promise<LibrarySyncSummary> =>
     runSyncLibraryToSheet(this.ctx, linkId);
-
   async tickAll(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
@@ -356,31 +403,29 @@ export class GoogleSheetsService {
           await this.repo.updateLinkRuntime(link.id, {
             nextPollAt: now + Math.max(1, link.scheduleConfig.pollIntervalMinutes) * 60_000,
           });
-          void runSchedulePoll(this.ctx, link.id).catch(() => {});
+          void runSchedulePoll(this.ctx, link.id, false, this.getWorkboard()).catch(() => {});
         } else if (
           link.kind === 'post_records' &&
           link.recordsConfig?.enabled &&
           !this.ctx.runningRecordLinks.has(link.id)
         ) {
-          void runRecordsPoll(this.ctx, link.id).catch(() => {});
+          void runRecordsPoll(this.ctx, link.id, this.getWorkboard()).catch(() => {});
         }
       }
     } finally {
       this.ticking = false;
     }
   }
-
   triggerSchedulePoll(linkId: string): Promise<{ summary: string }> {
     if (this.ctx.runningScheduleLinks.has(linkId))
       throw new ProductError('SHEET_SCHEDULE_BUSY', '该排贴表正在执行检查或发帖中，请稍候', 409);
-    return runSchedulePoll(this.ctx, linkId, true);
+    return runSchedulePoll(this.ctx, linkId, true, this.getWorkboard());
   }
   triggerRecordsPoll(linkId: string): Promise<{ summary: string }> {
     if (this.ctx.runningRecordLinks.has(linkId))
       throw new ProductError('SHEET_RECORDS_BUSY', '该发帖记录表正在执行顶贴检查中，请稍候', 409);
-    return runRecordsPoll(this.ctx, linkId);
+    return runRecordsPoll(this.ctx, linkId, this.getWorkboard());
   }
-
   async wakeRecordsLinkToActive(linkId: string, reason: string): Promise<void> {
     const link = await this.repo.getLink(linkId);
     if (!link || link.kind !== 'post_records') return;
@@ -397,9 +442,8 @@ export class GoogleSheetsService {
       summary: `${reason} → 已切入积极监听模式（每 ${link.recordsConfig?.activePollMinutes ?? 2} 分钟）`,
     });
     if (link.recordsConfig?.enabled && !this.ctx.runningRecordLinks.has(link.id))
-      void runRecordsPoll(this.ctx, link.id).catch(() => {});
+      void runRecordsPoll(this.ctx, link.id, this.getWorkboard()).catch(() => {});
   }
-
   async stopLinkWork(linkId: string): Promise<void> {
     this.ctx.cancelledLinks.add(linkId);
     this.ctx.metricsAbortByLink.get(linkId)?.abort();
@@ -407,7 +451,6 @@ export class GoogleSheetsService {
       if (entry.linkId === linkId) this.ctx.activeBluestacksAborts.get(pid)?.abort();
     await this.repo.updateLinkRuntime(linkId, { activeJobText: '正在停止…' });
   }
-
   refreshRecordMetrics = (linkId: string) => runCollectDueMetricsForLink(this.ctx, linkId, true);
   collectDueMetricsForLink = (linkId: string, forceAllEligible: boolean) =>
     runCollectDueMetricsForLink(this.ctx, linkId, forceAllEligible);

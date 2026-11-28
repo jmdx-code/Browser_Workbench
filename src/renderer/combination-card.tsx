@@ -5,7 +5,6 @@ import {
   type SavedCombination,
   type Step,
 } from '../shared/contracts.js';
-import { marketplaceCategories } from '../shared/marketplace-categories.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 import type { TaskCapabilities, TaskRuntimeOverview } from '../shared/task-contracts.js';
 import {
@@ -22,21 +21,13 @@ import {
   IconMore,
   IconPlay,
 } from './icons.js';
+import { mi } from './accounts-sidebar-shell.js';
 import { Btn } from './modules/shared/module-ui.js';
 import { PopoverMenu } from './popover-menu.js';
-import { UI_CHECKBOX } from './ui/primitives.js';
-
+import { UI_CHECKBOX, UI_HINT } from './ui/primitives.js';
 export const COMBINATION_CLIPBOARD_FORMAT = 'wb-combination-v1';
-export const LIVE_COMBINATION_STATES = [
-  'QUEUED',
-  'RUNNING',
-  'PAUSING',
-  'PAUSED',
-  'STOPPING',
-  'REVIEW',
-];
-const ACTIVE_OR_QUEUED_STATES = ['QUEUED', 'RUNNING', 'PAUSING', 'STOPPING', 'REVIEW'];
-
+export const LIVE_COMBINATION_STATES = ['QUEUED', 'RUNNING', 'STOPPING', 'REVIEW'];
+const ACTIVE_OR_QUEUED_STATES = ['QUEUED', 'RUNNING', 'STOPPING', 'REVIEW'];
 const CARD_HEADER_TONE: Record<CardColor, string> = {
   graphite: 'from-[#262b33] to-[#3a424e]',
   blue: 'from-[#2563eb] to-[#1d4ed8]',
@@ -47,7 +38,6 @@ const CARD_HEADER_TONE: Record<CardColor, string> = {
   red: 'from-[#dc2626] to-[#b91c1c]',
   violet: 'from-[#7c3aed] to-[#6d28d9]',
 };
-
 const STEP_DOT_COLOR: Record<Step['type'], string> = {
   feed: 'bg-emerald-500',
   video: 'bg-violet-500',
@@ -55,7 +45,6 @@ const STEP_DOT_COLOR: Record<Step['type'], string> = {
   friends: 'bg-sky-500',
   post: 'bg-pink-500',
 };
-
 export function formatCombinationForClipboard(row: SavedCombination): string {
   const source = row.saved;
   if (!source) throw Error('该任务组合尚无配置内容可复制');
@@ -67,7 +56,7 @@ export function formatCombinationForClipboard(row: SavedCombination): string {
         name: source.name,
         note: source.note,
         randomOrder: source.randomOrder,
-        loop: { mode: 'finite', rounds: 1 },
+        loop: source.loop,
         steps: source.steps,
       },
     },
@@ -75,7 +64,6 @@ export function formatCombinationForClipboard(row: SavedCombination): string {
     2,
   );
 }
-
 export function parseImportedCombination(
   rawText: string,
   existingNames: ReadonlySet<string>,
@@ -127,7 +115,7 @@ export function parseImportedCombination(
     name: finalName,
     note: typeof rawCombo.note === 'string' ? rawCombo.note.trim().slice(0, 300) : '',
     randomOrder: Boolean(rawCombo.randomOrder),
-    loop: { mode: 'finite' as const, rounds: 1 },
+    loop: rawCombo.loop ?? { mode: 'finite' as const, rounds: 1 },
     steps: rawCombo.steps.map((step) => {
       if (!step || typeof step !== 'object' || Array.isArray(step))
         throw Error('子任务项格式不正确');
@@ -137,27 +125,14 @@ export function parseImportedCombination(
   if (full.success) return { value: full.data };
   throw Error('组合数据校验未通过：' + (full.error.issues[0]?.message ?? '字段不符合规范'));
 }
-
 const FEED_NAMES: Record<string, string> = {
   random_profile: '逛他人时间线',
   random_page: '逛公共专页',
   search_pages: '搜专页逛时间线',
   home: '浏览首页',
 };
-
 export function stepSummary(step: Step) {
-  if (step.type === 'marketplace') {
-    return (
-      `商城 ${step.durationMinutes} 分钟 · ` +
-      (step.keyword ? `搜索「${step.keyword}」` : step.categoryId ? '分类商品' : '推荐商品') +
-      (step.categoryId
-        ? ' · ' + (marketplaceCategories.find(([id]) => id === step.categoryId)?.[1] ?? '指定分类')
-        : '') +
-      (step.minPrice !== undefined || step.maxPrice !== undefined
-        ? ` · 价格 ${step.minPrice ?? '不限'}～${step.maxPrice ?? '不限'}`
-        : '')
-    );
-  }
+  if (step.type === 'marketplace') return `浏览商城 ${step.durationMinutes} 分钟`;
   if (step.type === 'friends') {
     return step.friendAction === 'add_suggested'
       ? `加推荐好友 · 最多 ${step.maxAccepts} 人 · 最长 ${step.durationMinutes} 分钟`
@@ -188,7 +163,6 @@ export function stepSummary(step: Step) {
   }
   return `Reels ${step.durationMinutes} 分钟 · ${likeTag}`;
 }
-
 function stepShort(step: Step) {
   if (step.type === 'post')
     return [step.destination === 'story' ? '发布快拍' : '发布帖子', step.count + ' 条'];
@@ -210,7 +184,6 @@ function stepShort(step: Step) {
         : `${step.durationMinutes} 分钟`;
   return [name, detail];
 }
-
 const RESOURCE_USAGE_TITLE =
   '剩余是当前保存表中尚未标记已使用的行数，包含执行中及待核对项；原文件位置不变。任务允许重复，或手动清空使用记录后，可再次取用已使用资源。不同资源行不会因内容相同被强制拦截。';
 const resourceUsageLabel = (s: ResourceUsageSummaryValue | null, loaded: boolean) =>
@@ -228,7 +201,6 @@ const resourceUsageLabel = (s: ResourceUsageSummaryValue | null, loaded: boolean
         ]
           .filter(Boolean)
           .join(' · ');
-
 interface CombinationCardProps {
   carrier?: 'browser' | 'bluestacks' | undefined;
   row: SavedCombination;
@@ -242,6 +214,7 @@ interface CombinationCardProps {
   resourceSummaries: ResourceUsageSummaryValue[] | null;
   capabilities?: z.infer<typeof TaskCapabilities> | null;
   runtime?: z.infer<typeof TaskRuntimeOverview> | null;
+  bluestacksUsingCount?: number | undefined;
   color: CardColor;
   colorSupported?: boolean;
   onToggleRow: (id: string) => void;
@@ -254,7 +227,6 @@ interface CombinationCardProps {
   onStart?: (row: SavedCombination) => void;
   onColor?: (row: SavedCombination, color: CardColor) => void;
 }
-
 export function CombinationCard(p: CombinationCardProps) {
   const {
     carrier = 'browser',
@@ -304,9 +276,10 @@ export function CombinationCard(p: CombinationCardProps) {
     runtime?.plans.filter(
       (pl) => pl.combinationId === row.id && LIVE_COMBINATION_STATES.includes(pl.state),
     ) ?? [];
-  const using = isBs ? 0 : new Set(comboPlans.map((pl) => pl.profileId)).size;
+  const bsUsing = p.bluestacksUsingCount ?? 0;
+  const using = new Set(comboPlans.map((pl) => pl.profileId)).size + bsUsing;
   const activeUsing = isBs
-    ? 0
+    ? bsUsing
     : new Set(
         comboPlans
           .filter((pl) => ACTIVE_OR_QUEUED_STATES.includes(pl.state))
@@ -329,7 +302,6 @@ export function CombinationCard(p: CombinationCardProps) {
             ? `启动 ${eligibleImmediateCount} 个${offlineHint}，跳过 ${busySelected} 个运行中`
             : `启动 ${eligibleImmediateCount} 个${unitLabel}${offlineHint}`);
   const extra = saved.steps.length - 5;
-
   return (
     <article
       className={
@@ -372,9 +344,20 @@ export function CombinationCard(p: CombinationCardProps) {
           <h3 className="m-0 truncate text-sm leading-snug font-semibold text-white" title={name}>
             {name}
           </h3>
-          <span className="combo-meta mt-0.5 inline-block text-[11px] font-medium text-white/80">
-            {saved.randomOrder ? '随机顺序' : '按顺序'}
-          </span>
+          <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+            <span className="combo-meta inline-block text-[11px] font-medium text-white/80">
+              {saved.randomOrder ? '随机顺序' : '按顺序'}
+            </span>
+            {saved.loop.mode === 'until-stopped' ? (
+              <span className="rounded bg-white/20 px-1.5 py-px text-[10.5px] font-semibold text-white">
+                持续循环
+              </span>
+            ) : saved.loop.rounds > 1 ? (
+              <span className="rounded bg-white/20 px-1.5 py-px text-[10.5px] font-semibold text-white tabular-nums">
+                循环 {saved.loop.rounds} 轮
+              </span>
+            ) : null}
+          </div>
         </header>
         <ol className="m-0 flex min-h-0 flex-1 list-none flex-col gap-1.5 px-3.5 pt-3.5 pb-2">
           {saved.steps.slice(0, 5).map((step) => {
@@ -429,7 +412,7 @@ export function CombinationCard(p: CombinationCardProps) {
             <strong className="text-sm font-bold text-[var(--text)] tabular-nums">
               {remaining}
             </strong>
-            <span className="text-[11px] text-[var(--text-3)]">剩余资源</span>
+            <span className={UI_HINT}>剩余资源</span>
           </div>
         )}
         <div
@@ -453,9 +436,7 @@ export function CombinationCard(p: CombinationCardProps) {
           >
             {isBs ? `${bsEval?.supportedCount ?? 0}/${bsEval?.totalCount ?? 0}` : activeUsing}
           </strong>
-          <span className="text-[11px] text-[var(--text-3)]">
-            {isBs ? '可执行步骤' : '使用中浏览器'}
-          </span>
+          <span className={UI_HINT}>{isBs ? '可执行步骤' : '使用中浏览器'}</span>
         </div>
       </div>
       {effectiveReason && (
@@ -514,21 +495,17 @@ export function CombinationCard(p: CombinationCardProps) {
             label="更多操作"
             trigger={<IconMore />}
             items={[
-              { label: '编辑', icon: <IconEdit />, onSelect: () => onEdit(row) },
-              ...(!isBs
-                ? [{ label: '发帖资源', icon: <IconLayers />, onSelect: () => onResources(row) }]
-                : []),
-              { label: '复制', icon: <IconCopy />, onSelect: () => onCopy(row) },
+              mi('编辑', () => onEdit(row), { icon: <IconEdit /> }),
+              ...(!isBs ? [mi('发帖资源', () => onResources(row), { icon: <IconLayers /> })] : []),
+              mi('复制', () => onCopy(row), { icon: <IconCopy /> }),
               ...(onDelete
                 ? [
-                    {
-                      label: '删除',
+                    mi('删除', () => onRequestDelete(row), {
                       icon: <IconClose />,
                       danger: true,
                       disabled: busy || using > 0,
                       title: using > 0 ? '运行中无法删除' : '删除此任务组合',
-                      onSelect: () => onRequestDelete(row),
-                    },
+                    }),
                   ]
                 : []),
             ]}

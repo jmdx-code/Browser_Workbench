@@ -1,4 +1,5 @@
 import { isFacebookAvatarURL } from './account-display.js';
+import { isExpiredFbCdnUrl } from './activity-stats.js';
 import type { Profile } from './contracts.js';
 import { isLocalAvatar } from './group-bumper.js';
 export const MAX_ACCOUNT_AVATAR_BYTES = 24_576;
@@ -22,7 +23,7 @@ export interface AccountCacheUpdateInput {
 export const isRenderableAccountAvatar = (value: string | null | undefined): value is string =>
   typeof value === 'string' &&
   value.trim().length > 0 &&
-  (isLocalAvatar(value) || isFacebookAvatarURL(value));
+  (isLocalAvatar(value) || (isFacebookAvatarURL(value) && !isExpiredFbCdnUrl(value)));
 export function isGlobalAbnormalRouteUrl(
   rawUrl: string | null | undefined,
   hasCUserCookie = true,
@@ -58,10 +59,7 @@ export function mergeAccountCacheUpdate(input: {
   existing: CachedAccountRecord | undefined;
   incoming: AccountCacheUpdateInput;
   nowMs?: number;
-}): {
-  next: CachedAccountRecord;
-  changed: boolean;
-} {
+}): { next: CachedAccountRecord; changed: boolean } {
   const nowMs = input.nowMs ?? Date.now(),
     { existing, incoming } = input;
   if (

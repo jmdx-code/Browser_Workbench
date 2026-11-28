@@ -18,6 +18,9 @@ export class ProductError extends Error {
     super(message);
   }
 }
+export function failError(code: string, message: string, status = 400): never {
+  throw new ProductError(code, message, status);
+}
 export interface WorkspaceRepository {
   preferences?(): Awaitable<Preferences>;
   updatePreferences?(input: PreferenceUpdate): Awaitable<Preferences>;

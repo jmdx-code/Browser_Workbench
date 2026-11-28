@@ -1,49 +1,47 @@
 import { z } from 'zod';
-import { Id, NonNegInt, StrNull, intRange, optBool, strictObj } from './contracts.js';
+import {
+  Id,
+  NonNegInt,
+  StrNull,
+  intRange,
+  optBool,
+  strictObj,
+  trimMax,
+  trimReq,
+} from './contracts.js';
 import { extractFacebookGroupId, extractFacebookPageId } from './facebook-target-id.js';
 import { AVATAR_URL_MAX_LENGTH, GroupIdString, GroupNameString } from './group-inviter.js';
-export { AVATAR_URL_MAX_LENGTH };
+import { stripAnsi } from './relative-post-age.js';
+export { AVATAR_URL_MAX_LENGTH, stripAnsi };
 export const BumperReactionType = z.enum(['like', 'love', 'care', 'haha', 'wow', 'sad', 'angry']);
 export type BumperReactionType = z.infer<typeof BumperReactionType>;
 const max50 = intRange(1, 50),
   max500 = intRange(1, 500),
   pct = intRange(0, 100);
-const bumperSettingsShape = {
-  searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']),
-  maxPostAgeHours: intRange(1, 720),
-  maxPostsPerGroupPage: max50,
-  maxPostsPerPage: max50,
-  maxConcurrentProfiles: max50,
-  dailyMaxLikesPerAccount: max500,
-  maxLikesPerPost: max500,
-  likeProbability: pct,
-  commentProbability: pct,
-  shareToStoryProbability: pct,
-  consumeCommentOnUse: z.boolean(),
-  enableSound: z.boolean(),
-  useLongPressReaction: z.boolean(),
-  reactionTypes: z.array(BumperReactionType).min(1).max(7),
-};
 export const BumperSettings = strictObj({
-  searchMode: bumperSettingsShape.searchMode.default('time_sort'),
-  maxPostAgeHours: bumperSettingsShape.maxPostAgeHours.default(24),
-  maxPostsPerGroupPage: bumperSettingsShape.maxPostsPerGroupPage.default(5),
-  maxPostsPerPage: bumperSettingsShape.maxPostsPerPage.default(3),
-  maxConcurrentProfiles: bumperSettingsShape.maxConcurrentProfiles.default(8),
-  dailyMaxLikesPerAccount: bumperSettingsShape.dailyMaxLikesPerAccount.default(20),
-  maxLikesPerPost: bumperSettingsShape.maxLikesPerPost.default(50),
-  likeProbability: bumperSettingsShape.likeProbability.default(100),
-  commentProbability: bumperSettingsShape.commentProbability.default(30),
-  shareToStoryProbability: bumperSettingsShape.shareToStoryProbability.default(0),
-  consumeCommentOnUse: bumperSettingsShape.consumeCommentOnUse.default(false),
-  enableSound: bumperSettingsShape.enableSound.default(false),
-  useLongPressReaction: bumperSettingsShape.useLongPressReaction.default(false),
-  reactionTypes: bumperSettingsShape.reactionTypes.default(['care', 'love', 'like']),
+  searchMode: z.enum(['time_sort', 'page_group_feed', 'random_browse']).default('time_sort'),
+  maxPostAgeHours: intRange(1, 720).default(24),
+  maxPostsPerGroupPage: max50.default(5),
+  maxPostsPerPage: max50.default(3),
+  maxConcurrentProfiles: max50.default(8),
+  dailyMaxLikesPerAccount: max500.default(20),
+  maxLikesPerPost: max500.default(50),
+  likeProbability: pct.default(100),
+  commentProbability: pct.default(30),
+  shareToStoryProbability: pct.default(0),
+  consumeCommentOnUse: z.boolean().default(false),
+  enableSound: z.boolean().default(false),
+  useLongPressReaction: z.boolean().default(false),
+  reactionTypes: z.array(BumperReactionType).min(1).max(7).default(['care', 'love', 'like']),
+  closeBrowserOnFinish: z.boolean().default(false),
 });
-export const PartialBumperSettings = strictObj(bumperSettingsShape).partial();
 export type BumperSettings = Omit<
   z.infer<typeof BumperSettings>,
-  'shareToStoryProbability' | 'enableSound' | 'useLongPressReaction' | 'reactionTypes'
+  | 'shareToStoryProbability'
+  | 'enableSound'
+  | 'useLongPressReaction'
+  | 'reactionTypes'
+  | 'closeBrowserOnFinish'
 > & {
   shareToStoryProbability?: number;
   enableSound?: boolean;
@@ -157,17 +155,27 @@ export const StartBumper = strictObj({
   profileIds: profileList,
   groupIds: targetList,
   pageIds: targetList,
+  closeBrowserOnFinish: z.boolean().optional().default(false),
 });
-export const StartPageBumper = strictObj({ profileIds: profileList, pageIds: targetList });
+export const StartPageBumper = strictObj({
+  profileIds: profileList,
+  pageIds: targetList,
+  closeBrowserOnFinish: z.boolean().optional().default(false),
+});
+export const PendingOperationResolution = z.enum(['not_applied', 'confirmed']);
+export type PendingOperationResolution = z.infer<typeof PendingOperationResolution>;
+export const ResolvePendingOperationInput = strictObj({
+  operationId: trimReq(120),
+  resolution: PendingOperationResolution,
+  note: trimMax(500).optional(),
+  reason: trimMax(500).optional(),
+});
+export type ResolvePendingOperationInput = z.infer<typeof ResolvePendingOperationInput>;
 export interface BumperProfileStat {
   today: number;
   session: number;
   status: string;
   running: boolean;
-}
-export interface BumperDailyStat {
-  date: string;
-  count: number;
 }
 export interface BumperPendingOperation extends BumperRecordBase {
   actionKind: 'like' | 'comment' | 'story_share';
@@ -186,8 +194,6 @@ export interface BumperState {
   running: boolean;
   statusText: string;
   profileCounts: Record<string, BumperProfileStat>;
-  dailyStats?: BumperDailyStat[];
-  pageDailyStats?: BumperDailyStat[];
   pageBumperRunning?: boolean;
   pageBumperStatusText?: string;
   pageBumperProfileCounts?: Record<string, BumperProfileStat>;

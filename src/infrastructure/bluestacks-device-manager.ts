@@ -1,5 +1,5 @@
 import type { CompatibleRepository } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import type { BluestacksInstance } from '../shared/bluestacks.js';
 import {
   classifyAbnormalScreenText,
@@ -11,7 +11,7 @@ import {
   type LiteXmlNode,
   type OcrRecognizer,
 } from './bluestacks-vision.js';
-import { generateTotpCode } from './bluestacks-win32.js';
+import { disposeBlueStacksWin32Helper, generateTotpCode } from './bluestacks-win32.js';
 import * as idInspect from './bluestacks-device/device-identity-and-inspect.js';
 import * as lifecycle from './bluestacks-device/device-instance-lifecycle.js';
 import {
@@ -82,7 +82,7 @@ async function loginAccountDetailed(
       return false;
     },
     throwAbnormal = (kind: 'verification' | 'restricted', suffix = ''): never => {
-      throw new ProductError(
+      failError(
         kind === 'restricted' ? 'BLUESTACKS_ACCOUNT_RESTRICTED' : 'BLUESTACKS_ACCOUNT_CHECKPOINT',
         (kind === 'restricted'
           ? '账号已被 Facebook 停用或封禁'
@@ -108,6 +108,23 @@ async function loginAccountDetailed(
       await abortableWait(500, signal);
       await uiMedia.launchFbLitePackage(ctx, serial, signal);
       await abortableWait(4500, signal);
+    },
+    clickCands = (t: LiteXmlNode | null, minW: number, minY = 0, minH = 38, maxH = 150) =>
+      flattenLiteNodes(t)
+        .filter(
+          (n) =>
+            n.clickable &&
+            n.bounds.w >= minW &&
+            n.bounds.y1 >= minY &&
+            n.bounds.h >= minH &&
+            n.bounds.h <= maxH,
+        )
+        .sort((a, b) => a.bounds.y1 - b.bounds.y1),
+    openHomeDeepLink = async (waitMs = 2500) => {
+      await uiMedia
+        .openDeepLink(ctx, serial, 'https://www.facebook.com/', sw, sh, signal)
+        .catch(() => null);
+      await abortableWait(waitMs, signal);
     };
   onProgress?.('正在启动 FB Lite 进入登录界面…');
   await launchFbLiteFresh(false);
@@ -165,16 +182,7 @@ async function loginAccountDetailed(
           );
         credSubmitted = true;
         const [filledPng, filledTree] = await snapAndDump(),
-          btnCands = flattenLiteNodes(filledTree)
-            .filter(
-              (n) =>
-                n.clickable &&
-                n.bounds.w >= 420 &&
-                n.bounds.y1 > passInput.bounds.y2 &&
-                n.bounds.h >= 38 &&
-                n.bounds.h <= 125,
-            )
-            .sort((a, b) => a.bounds.y1 - b.bounds.y1);
+          btnCands = clickCands(filledTree, 420, passInput.bounds.y2 + 1, 38, 125);
         onProgress?.('正在提交登录请求…');
         if (!(await tapFirstBlue(filledPng, btnCands, 7000)))
           await tapWait(450, passInput.bounds.y2 + 68, 7000);
@@ -250,16 +258,7 @@ async function loginAccountDetailed(
         compact,
       )
     ) {
-      const btns = flattenLiteNodes(tree)
-          .filter(
-            (n) =>
-              n.clickable &&
-              n.bounds.w >= 220 &&
-              n.bounds.y1 >= 200 &&
-              n.bounds.h >= 40 &&
-              n.bounds.h <= 260,
-          )
-          .sort((a, b) => a.bounds.y1 - b.bounds.y1),
+      const btns = clickCands(tree, 220, 200, 40, 260),
         authApp = await findOcrNode(
           ctx.ocr,
           png,
@@ -270,13 +269,7 @@ async function loginAccountDetailed(
         onProgress?.('正在选择身份验证器 (2FA)…');
         await tapWait(authApp.node.bounds.cx, authApp.node.bounds.cy, 1600);
         const [selPng, selTree] = await snapAndDump();
-        await tapFirstBlue(
-          selPng,
-          flattenLiteNodes(selTree).filter(
-            (n) => n.clickable && n.bounds.w >= 360 && n.bounds.h >= 42 && n.bounds.h <= 125,
-          ),
-          5000,
-        );
+        await tapFirstBlue(selPng, clickCands(selTree, 360, 0, 42, 125), 5000);
         continue;
       }
       const otherWay = await findOcrNode(
@@ -296,13 +289,13 @@ async function loginAccountDetailed(
       /验证|code|authenticator|双重|two-factor|安全码|6位数|验证码|身份验证/i.test(compact)
     ) {
       if (!credentials.totpSecret?.trim())
-        throw new ProductError(
+        failError(
           'BLUESTACKS_2FA_SECRET_REQUIRED',
           '该账号已开启双重验证 (2FA)，请提供 2FA Base32 密钥',
           400,
         );
       if (totpAttempts >= 2)
-        throw new ProductError(
+        failError(
           'BLUESTACKS_2FA_FAILED',
           '2FA 动态验证码校验未通过，请确认 2FA 密钥正确且系统时间准确',
           400,
@@ -324,16 +317,7 @@ async function loginAccountDetailed(
           signal,
         );
         const [afterPng, afterTree] = await snapAndDump(),
-          blueCands = flattenLiteNodes(afterTree)
-            .filter(
-              (n) =>
-                n.clickable &&
-                n.bounds.w >= 360 &&
-                n.bounds.h >= 42 &&
-                n.bounds.h <= 125 &&
-                n.bounds.y1 > codeInput.bounds.y2,
-            )
-            .sort((a, b) => a.bounds.y1 - b.bounds.y1);
+          blueCands = clickCands(afterTree, 360, codeInput.bounds.y2 + 1, 42, 125);
         if (!(await tapFirstBlue(afterPng, blueCands, 6500))) {
           await uiMedia.keyevent(ctx, serial, 66, signal);
           await abortableWait(6500, signal);
@@ -343,9 +327,7 @@ async function loginAccountDetailed(
     }
     if (credSubmitted) {
       if (/设置语言|试用中文|try中文/i.test(compact)) {
-        const blueBtns = flattenLiteNodes(tree).filter(
-          (n) => n.clickable && n.bounds.w >= 360 && n.bounds.y1 >= 1100 && n.bounds.h >= 42,
-        );
+        const blueBtns = clickCands(tree, 360, 1100, 42, 999);
         onProgress?.('正在确认语言设置…');
         if (await tapFirstBlue(png, blueBtns, 4000)) continue;
       }
@@ -355,22 +337,10 @@ async function loginAccountDetailed(
         if (saveInfoAttempts >= 3) {
           await uiMedia.keyevent(ctx, serial, 4, signal).catch(() => null);
           await abortableWait(1200, signal);
-          await uiMedia
-            .openDeepLink(ctx, serial, 'https://www.facebook.com/', sw, sh, signal)
-            .catch(() => null);
-          await abortableWait(2500, signal);
+          await openHomeDeepLink(2500);
           continue;
         }
-        const saveCands = flattenLiteNodes(tree)
-            .filter(
-              (n) =>
-                n.clickable &&
-                n.bounds.w >= 120 &&
-                n.bounds.y1 >= 800 &&
-                n.bounds.h >= 34 &&
-                n.bounds.h <= 140,
-            )
-            .sort((a, b) => a.bounds.y1 - b.bounds.y1),
+        const saveCands = clickCands(tree, 120, 800, 34, 140),
           wantSave = credentials.saveLoginInfo !== false,
           saveMatch = await findOcrNode(
             ctx.ocr,
@@ -378,9 +348,8 @@ async function loginAccountDetailed(
             saveCands,
             wantSave ? /^保存$|^save$|^确定$|^ok$/i : /^以后再说$|^notnow$|^跳过$|^skip$|^暂不$/i,
           );
-        if (saveMatch) {
-          await tapWait(saveMatch.node.bounds.cx, saveMatch.node.bounds.cy, 3500);
-        } else {
+        if (saveMatch) await tapWait(saveMatch.node.bounds.cx, saveMatch.node.bounds.cy, 3500);
+        else {
           let blueBandY: number | null = null;
           for (let y = 960; y <= 1480; y += 28)
             if (await isSolidBlueButton(png, makeCanonicalRect(80, y, 820, y + 48))) {
@@ -428,16 +397,13 @@ async function loginAccountDetailed(
       postLoginIdleSteps++;
       if (postLoginIdleSteps === 3 || postLoginIdleSteps === 6) {
         onProgress?.('正在跳转进入 FB Lite 首页…');
-        await uiMedia
-          .openDeepLink(ctx, serial, 'https://www.facebook.com/', sw, sh, signal)
-          .catch(() => null);
-        await abortableWait(2500, signal);
+        await openHomeDeepLink(2500);
         continue;
       }
     }
     await abortableWait(3000, signal);
   }
-  throw new ProductError(
+  failError(
     'BLUESTACKS_LOGIN_TIMEOUT',
     '自动登录流程超时，未能进入 FB Lite 首页（请点击“显示窗口”查看模拟器当前界面）',
     504,
@@ -469,7 +435,7 @@ async function ensureReadyAndLoggedIn(
   if (
     inst.accountState !== 'logged-in' ||
     !inst.accountName ||
-    inst.accountName === inst.displayName
+    idInspect.isPlaceholderAccountString(inst.accountName, inst.displayName, inst.serial)
   ) {
     const inspected = await idInspect.inspectAccount(ctx, inst.id, signal);
     assertState(inspected.accountState);
@@ -520,4 +486,7 @@ export class BluestacksDeviceManager {
   switchIdentity = this.bind(idInspect.switchIdentity);
   loginAccountDetailed = this.bind(loginAccountDetailed);
   ensureReadyAndLoggedIn = this.bind(ensureReadyAndLoggedIn);
+  dispose = (): void => {
+    disposeBlueStacksWin32Helper();
+  };
 }

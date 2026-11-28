@@ -16,8 +16,20 @@ import type { GroupInviterService } from '../application/group-inviter-service.j
 import type { GroupBumperService } from '../application/group-bumper-service.js';
 import type { GroupPosterService } from '../application/group-poster-service.js';
 import type { BluestacksService } from '../application/bluestacks-service.js';
+import type { WindowLayoutService } from '../application/window-layout.js';
+import type { AutoSchedulerService } from '../application/auto-scheduler-service.js';
+import type { GoogleSheetsService } from '../application/google-sheets-service.js';
 import type { PostBumpRecordsPort } from '../shared/post-bump-records.js';
 type ZipEntryInput = { name: string; data: Buffer | string };
+const pickFields = <T extends object>(src: T, keys: string): Record<string, unknown> => {
+  const rec = src as Record<string, unknown>,
+    out: Record<string, unknown> = {};
+  for (const k of keys.split(' ')) if (k) out[k] = rec[k];
+  return out;
+};
+const invalidPkg = (msg: string, code = 'DIAGNOSTIC_PACKAGE_INVALID', status = 400): never => {
+  throw new ProductError(code, msg, status);
+};
 export function createZipArchive(entries: readonly ZipEntryInput[]): Buffer {
   const localParts: Buffer[] = [],
     centralParts: Buffer[] = [],
@@ -111,7 +123,7 @@ async function readTailBuffer(
 async function collectRecentRuntimeLogs(logsDir: string, maxDays = 3): Promise<Buffer> {
   try {
     const runtimeFiles = (await readdir(logsDir))
-      .filter((name) => /^runtime-\d{4}-\d{2}-\d{2}\.ndjson$/.test(name))
+      .filter((n) => /^runtime-\d{4}-\d{2}-\d{2}\.ndjson$/.test(n))
       .sort((a, b) => b.localeCompare(a))
       .slice(0, maxDays)
       .reverse();
@@ -140,10 +152,19 @@ async function listZipPackagesDesc(dir: string) {
   }
   return items.sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
 }
+const generatedCustomDiagnosticDirs = new Set<string>();
+const generatedCustomDiagnosticFiles = new Set<string>();
+const normalizeCmpPath = (p: string) =>
+  process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p);
+function isWithinResolvedDir(candidate: string, allowedDir: string): boolean {
+  const base = normalizeCmpPath(allowedDir),
+    target = normalizeCmpPath(candidate);
+  return target.startsWith(base.endsWith(path.sep) ? base : base + path.sep);
+}
 function assertSafeDir(dir: string | undefined): string {
   const clean = dir?.trim() || '';
   if (clean && (!path.isAbsolute(clean) || clean.includes('..')))
-    throw new ProductError('DIAGNOSTIC_PACKAGE_INVALID', '无效的反馈包保存目录', 400);
+    invalidPkg('无效的反馈包保存目录');
   return clean;
 }
 export async function revealDiagnosticPackage(
@@ -151,14 +172,35 @@ export async function revealDiagnosticPackage(
   fileName?: string,
   targetDir?: string,
 ): Promise<{ filePath: string; fileName: string }> {
-  const feedbackDir = assertSafeDir(targetDir) || path.join(dataDir, 'logs', 'feedback');
+  const defaultFeedbackDir = path.resolve(dataDir, 'logs', 'feedback'),
+    requestedDir = assertSafeDir(targetDir),
+    resolvedRequestedDir = requestedDir ? path.resolve(requestedDir) : '';
+  if (
+    resolvedRequestedDir &&
+    !isWithinResolvedDir(resolvedRequestedDir, defaultFeedbackDir) &&
+    normalizeCmpPath(resolvedRequestedDir) !== normalizeCmpPath(defaultFeedbackDir) &&
+    !generatedCustomDiagnosticDirs.has(normalizeCmpPath(resolvedRequestedDir))
+  )
+    invalidPkg('反馈包目录超出允许范围');
+  const feedbackDir = resolvedRequestedDir || defaultFeedbackDir;
   let targetName = fileName?.trim() || '',
     zipPath = '';
   if (targetName && path.isAbsolute(targetName)) {
-    if (targetName.includes('..') || !targetName.toLowerCase().endsWith('.zip'))
-      throw new ProductError('DIAGNOSTIC_PACKAGE_INVALID', '无效的反馈包文件路径', 400);
-    zipPath = targetName;
-    targetName = path.basename(targetName);
+    const resolvedTarget = path.resolve(targetName),
+      inAllowedDir =
+        isWithinResolvedDir(resolvedTarget, defaultFeedbackDir) ||
+        (resolvedRequestedDir
+          ? isWithinResolvedDir(resolvedTarget, resolvedRequestedDir) &&
+            generatedCustomDiagnosticFiles.has(normalizeCmpPath(resolvedTarget))
+          : generatedCustomDiagnosticFiles.has(normalizeCmpPath(resolvedTarget)));
+    if (
+      targetName.includes('..') ||
+      !resolvedTarget.toLowerCase().endsWith('.zip') ||
+      !inAllowedDir
+    )
+      invalidPkg('无效的反馈包文件路径');
+    zipPath = resolvedTarget;
+    targetName = path.basename(resolvedTarget);
   } else {
     if (targetName) {
       if (
@@ -166,23 +208,27 @@ export async function revealDiagnosticPackage(
         targetName.includes('..') ||
         !targetName.toLowerCase().endsWith('.zip')
       )
-        throw new ProductError('DIAGNOSTIC_PACKAGE_INVALID', '无效的反馈包文件名', 400);
+        invalidPkg('无效的反馈包文件名');
     } else
       targetName = await listZipPackagesDesc(feedbackDir).then(
         (items) => items[0]?.name ?? '',
         () => '',
       );
-    if (!targetName)
-      throw new ProductError('DIAGNOSTIC_PACKAGE_NOT_FOUND', '未找到已生成的诊断反馈包', 404);
-    zipPath = path.join(feedbackDir, targetName);
+    if (!targetName) invalidPkg('未找到已生成的诊断反馈包', 'DIAGNOSTIC_PACKAGE_NOT_FOUND', 404);
+    zipPath = path.resolve(feedbackDir, targetName);
+    if (
+      !isWithinResolvedDir(zipPath, feedbackDir) ||
+      (!isWithinResolvedDir(zipPath, defaultFeedbackDir) &&
+        !generatedCustomDiagnosticFiles.has(normalizeCmpPath(zipPath)))
+    )
+      invalidPkg('反馈包路径超出允许范围');
   }
   if (!(await stat(zipPath).catch(() => null))?.isFile())
-    throw new ProductError('DIAGNOSTIC_PACKAGE_NOT_FOUND', '反馈包文件不存在或已被清理', 404);
-  if (process.parentPort)
-    return (
-      process.parentPort.postMessage({ type: 'REVEAL_DIAGNOSTIC_PACKAGE', filePath: zipPath }),
-      { filePath: zipPath, fileName: targetName }
-    );
+    invalidPkg('反馈包文件不存在或已被清理', 'DIAGNOSTIC_PACKAGE_NOT_FOUND', 404);
+  if (process.parentPort) {
+    process.parentPort.postMessage({ type: 'REVEAL_DIAGNOSTIC_PACKAGE', filePath: zipPath });
+    return { filePath: zipPath, fileName: targetName };
+  }
   if (
     process.platform === 'win32' &&
     !process.env.NODE_TEST_CONTEXT &&
@@ -213,6 +259,9 @@ export function createDiagnosticSnapshotBuilder(deps: {
   getGroupBumperService: () => GroupBumperService | undefined;
   groupPosterService: GroupPosterService;
   getBluestacksService?: (() => BluestacksService | undefined) | undefined;
+  getWindowLayout?: (() => WindowLayoutService | undefined) | undefined;
+  getAutoSchedulerService?: (() => AutoSchedulerService | undefined) | undefined;
+  getGoogleSheetsService?: (() => GoogleSheetsService | undefined) | undefined;
   postBumpRecords?: PostBumpRecordsPort | undefined;
   tasksRepository: TaskRepository;
   core: Core;
@@ -230,181 +279,185 @@ export function createDiagnosticSnapshotBuilder(deps: {
     const { note, uiContext, targetDir, reveal } = diagInput ?? {},
       groupBumperService = deps.getGroupBumperService(),
       bluestacksService = deps.getBluestacksService?.(),
+      windowLayoutService = deps.getWindowLayout?.(),
+      autoSchedulerService = deps.getAutoSchedulerService?.(),
+      googleSheetsService = deps.getGoogleSheetsService?.(),
       mainKernel = deps.getMainKernel(),
-      [
-        wsSnapshot,
-        runtime,
-        inviterState,
-        inviterLogs,
-        posterState,
-        posterLogs,
-        bumperState,
-        bumperLogs,
-        bsState,
-        recentRecords,
-      ] = await Promise.all([
-        deps.workspaceService.snapshot(),
-        deps.taskService.runtimeOverview(),
-        deps.groupInviterService.state(),
-        deps.groupInviterService.logs('', undefined, 300),
-        deps.groupPosterService.state(),
-        deps.groupPosterService.logs('', undefined, undefined),
-        groupBumperService ? groupBumperService.state() : Promise.resolve(null),
-        groupBumperService
-          ? groupBumperService.logs('', undefined, undefined, 300)
-          : Promise.resolve([]),
-        bluestacksService
-          ? bluestacksService.state(false).catch(() => null)
-          : Promise.resolve(null),
-        deps.postBumpRecords
-          ? Promise.resolve(deps.postBumpRecords.list({ limit: 100 })).catch(() => null)
-          : Promise.resolve(null),
-      ]),
-      sanitizedBluestacks = bsState
-        ? {
-            running: bsState.running,
-            pageBumperRunning: bsState.pageBumperRunning,
-            activeRunning: bsState.activeRunning,
-            posterRunning: bsState.posterRunning,
-            inviterRunning: bsState.inviterRunning,
-            statusText: bsState.statusText,
-            pageBumperStatusText: bsState.pageBumperStatusText,
-            activeStatusText: bsState.activeStatusText,
-            posterStatusText: bsState.posterStatusText,
-            inviterStatusText: bsState.inviterStatusText,
-            bumperSettings: bsState.bumperSettings,
-            pageBumperSettings: bsState.pageBumperSettings,
-            riskLimitSettings: bsState.riskLimitSettings,
-            dailyUsage: bsState.dailyUsage,
-            total: bsState.total,
-            pageTotal: bsState.pageTotal,
-            profileCounts: bsState.profileCounts,
-            pageBumperProfileCounts: bsState.pageBumperProfileCounts,
-            activeProfileCounts: bsState.activeProfileCounts,
-            posterProfileCounts: bsState.posterProfileCounts,
-            inviterProfileCounts: bsState.inviterProfileCounts,
-            instances: bsState.instances.map((i) => ({
-              id: i.id,
-              instanceKey: i.instanceKey,
-              displayName: i.displayName,
-              alias: i.alias,
-              online: i.online,
-              fbWidth: i.fbWidth,
-              fbHeight: i.fbHeight,
-              fbLiteInstalled: i.fbLiteInstalled,
-              accountState: i.accountState,
-              accountId: i.accountId,
-              accountName: i.accountName,
-              identityType: i.identityType,
-              lastStatus: i.lastStatus,
-            })),
-          }
-        : null,
-      activePlans = await mapAsync(runtime.plans.slice(-16), async (plan) => {
-        const [activeStep, rawOps] = await Promise.all([
-            deps.tasksRepository.currentStepForPlan?.(plan.id, plan.round, plan.position),
-            deps.tasksRepository.recentOperations
-              ? deps.tasksRepository.recentOperations(plan.id, 6)
-              : Promise.resolve([]),
-          ]),
-          matched = wsSnapshot.profiles.find((p) => p.id === plan.profileId);
-        return {
-          id: plan.id,
-          profileId: plan.profileId,
-          profileName: profileDisplayName(matched, plan.profileId.slice(0, 8)),
-          combinationName: plan.snapshot.name,
-          state: plan.state,
-          reason: plan.reason,
-          round: plan.round,
-          position: plan.position,
-          activeStep: activeStep
-            ? {
-                id: activeStep.id,
-                type: activeStep.spec.type,
-                status: activeStep.status,
-                progress: activeStep.progress,
-              }
-            : null,
-          recentOps: rawOps.map((op) => ({
-            id: op.id,
-            kind: op.action.kind,
-            status: op.status,
-            disposition: op.disposition ?? null,
-            updatedAt: op.updatedAt,
+      safe = <T>(p: Promise<T> | undefined, fb: T): Promise<T> =>
+        p ? p.catch(() => fb) : Promise.resolve(fb);
+    const [
+      wsSnapshot,
+      runtime,
+      inviterState,
+      inviterLogs,
+      posterState,
+      posterLogs,
+      bumperState,
+      bumperLogs,
+      bsState,
+      recentRecords,
+      windowLayoutSnapshot,
+      autoSchedulerState,
+      googleSheetsOverview,
+    ] = await Promise.all([
+      deps.workspaceService.snapshot(),
+      deps.taskService.runtimeOverview(),
+      deps.groupInviterService.state(),
+      deps.groupInviterService.logs('', undefined, 300),
+      deps.groupPosterService.state(),
+      deps.groupPosterService.logs('', undefined, undefined),
+      groupBumperService ? groupBumperService.state() : Promise.resolve(null),
+      groupBumperService
+        ? groupBumperService.logs('', undefined, undefined, 300)
+        : Promise.resolve([]),
+      safe(bluestacksService?.state(false), null),
+      deps.postBumpRecords
+        ? safe(Promise.resolve(deps.postBumpRecords.list({ limit: 100 })), null)
+        : Promise.resolve(null),
+      safe(windowLayoutService?.snapshot(), null),
+      safe(autoSchedulerService?.state(), null),
+      safe(googleSheetsService?.overview(), null),
+    ]);
+    const pickRun = (r: NonNullable<typeof autoSchedulerState>['activeRuns'][number]) =>
+      pickFields(
+        r,
+        'id scheduleId scheduleName carrier status statusReason totalTargets completedCount softIssueCount hardBlockedCount startedAt finishedAt',
+      );
+    const sanitizedAutoScheduler = autoSchedulerState
+      ? {
+          ...pickFields(
+            autoSchedulerState,
+            'settings running powerLockMode activeBrowserWorkers queuedBrowserTargets activeBluestacksWorkers queuedBluestacksTargets',
+          ),
+          scheduleCount: autoSchedulerState.schedules.length,
+          enabledScheduleCount: autoSchedulerState.schedules.filter((s) => s.enabled).length,
+          activeRuns: autoSchedulerState.activeRuns.map(pickRun),
+          recentRuns: autoSchedulerState.recentRuns.slice(0, 10).map(pickRun),
+        }
+      : null;
+    const sanitizedGoogleSheets = googleSheetsOverview
+      ? {
+          auth: {
+            ...pickFields(
+              googleSheetsOverview.auth,
+              'hasCredentials clientIdHint authorized scopes pendingAuthStartedAt lastError',
+            ),
+            hasPendingAuth: Boolean(googleSheetsOverview.auth.pendingAuthUrl),
+          },
+          imageHost: pickFields(
+            googleSheetsOverview.imageHost,
+            'preferredHost hasGyazoToken gyazoTokenCount gyazoTokenPreviews driveFolderId defaultMachineName cachedImageCount',
+          ),
+          ...pickFields(
+            googleSheetsOverview,
+            'runningScheduleCount runningRecordsCount activeProfiles',
+          ),
+          links: googleSheetsOverview.links.map((l) => ({
+            ...pickFields(
+              l,
+              'id kind title spreadsheetId sheetId sheetName enabled scheduleConfig runtime',
+            ),
+            recordsConfig: l.recordsConfig
+              ? { ...l.recordsConfig, commentPool: `[${l.recordsConfig.commentPool.length}]` }
+              : undefined,
           })),
-        };
-      }),
-      profileSummaries = wsSnapshot.profiles.map((p) => {
-        const peer = deps.core.peers.get(p.id);
-        return {
-          id: p.id,
-          name: profileDisplayName(p),
-          alias: p.alias ?? '',
-          browserName: p.browserName ?? '',
-          online: p.online,
-          phase: p.phase,
-          synced: p.synced,
-          unresolved: p.unresolved,
-          extensionVersion: peer?.extensionVersion ?? null,
-          accountState: p.account.state,
-          accountId: p.account.id ?? null,
-          accountName: p.account.name ?? null,
-          profileWindowFocused: peer?.profileWindowFocused ?? null,
-          focusedWindowAt: peer?.focusedWindowAt ?? null,
-          presentationRecoverySupported:
-            peer?.capabilities?.includes('task-presentation-recovery-v1') ?? false,
-          kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-50) : [],
-        };
-      }),
-      loopDelaySummary = {
-        resolutionMs: 20,
-        samples: deps.controllerLoopDelay.count,
-        maxSampleIntervalMs: deps.controllerLoopDelay.count
-          ? deps.controllerLoopDelay.max / 1e6
+          logs: googleSheetsOverview.logs.slice(0, 30),
+        }
+      : null;
+    const sanitizedBluestacks = bsState
+      ? {
+          ...pickFields(
+            bsState,
+            'running pageBumperRunning activeRunning posterRunning inviterRunning statusText pageBumperStatusText activeStatusText posterStatusText inviterStatusText bumperSettings pageBumperSettings riskLimitSettings dailyUsage total pageTotal profileCounts pageBumperProfileCounts activeProfileCounts posterProfileCounts inviterProfileCounts',
+          ),
+          instances: bsState.instances.map((i) =>
+            pickFields(
+              i,
+              'id instanceKey displayName alias online fbWidth fbHeight fbLiteInstalled accountState accountId accountName identityType lastStatus',
+            ),
+          ),
+        }
+      : null;
+    const activePlans = await mapAsync(runtime.plans.slice(-16), async (plan) => {
+      const activeStep = await deps.tasksRepository.currentStepForPlan?.(
+          plan.id,
+          plan.round,
+          plan.position,
+        ),
+        matched = wsSnapshot.profiles.find((p) => p.id === plan.profileId);
+      return {
+        ...pickFields(plan, 'id profileId state reason round position'),
+        profileName: profileDisplayName(matched, plan.profileId.slice(0, 8)),
+        combinationName: plan.snapshot.name,
+        activeStep: activeStep
+          ? {
+              id: activeStep.id,
+              type: activeStep.spec.type,
+              status: activeStep.status,
+              progress: activeStep.progress,
+            }
           : null,
-        p99SampleIntervalMs: deps.controllerLoopDelay.count
-          ? deps.controllerLoopDelay.percentile(99) / 1e6
+        recentOps: [],
+      };
+    });
+    const profileSummaries = wsSnapshot.profiles.map((p) => {
+      const peer = deps.core.peers.get(p.id);
+      return {
+        id: p.id,
+        name: profileDisplayName(p),
+        alias: p.alias ?? '',
+        browserName: p.browserName ?? '',
+        online: p.online,
+        phase: p.phase,
+        synced: p.synced,
+        unresolved: p.unresolved,
+        extensionVersion: peer?.extensionVersion ?? null,
+        accountState: p.account.state,
+        accountId: p.account.id ?? null,
+        accountName: p.account.name ?? null,
+        profileWindowFocused: peer?.profileWindowFocused ?? null,
+        focusedWindowAt: peer?.focusedWindowAt ?? null,
+        presentationRecoverySupported:
+          peer?.capabilities?.includes('task-presentation-recovery-v1') ?? false,
+        kernelTraceTail: mainKernel ? mainKernel.diagnostics(p.id).slice(-50) : [],
+      };
+    });
+    const loopDelaySummary = {
+      resolutionMs: 20,
+      samples: deps.controllerLoopDelay.count,
+      maxSampleIntervalMs: deps.controllerLoopDelay.count
+        ? deps.controllerLoopDelay.max / 1e6
+        : null,
+      p99SampleIntervalMs: deps.controllerLoopDelay.count
+        ? deps.controllerLoopDelay.percentile(99) / 1e6
+        : null,
+    };
+    const entry = devDiag.emit('SNAPSHOT', 'SNAPSHOT', 'USER_MANUAL_SNAPSHOT', {
+      reason: note?.trim() || uiContext?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
+      data: {
+        softwareVersion: deps.softwareVersion,
+        uiContext: uiContext?.trim() || '',
+        controllerLoopDelay: loopDelaySummary,
+        controllerMemory: process.memoryUsage(),
+        settings: runtime.settings,
+        profiles: profileSummaries,
+        plans: activePlans,
+        plansTruncated: runtime.plans.length > activePlans.length,
+        groupInviter: pickFields(inviterState, 'running runId statusText profileCounts'),
+        groupBumper: bumperState
+          ? pickFields(
+              bumperState,
+              'running pageBumperRunning statusText pageBumperStatusText profileCounts pageBumperProfileCounts',
+            )
           : null,
+        groupPoster: pickFields(posterState, 'running statusText profileCounts'),
+        ...(sanitizedBluestacks ? { bluestacks: sanitizedBluestacks } : {}),
+        ...(windowLayoutSnapshot ? { windowLayout: windowLayoutSnapshot } : {}),
+        ...(sanitizedAutoScheduler ? { autoScheduler: sanitizedAutoScheduler } : {}),
+        ...(sanitizedGoogleSheets ? { googleSheets: sanitizedGoogleSheets } : {}),
       },
-      entry = devDiag.record({
-        level: 'SNAPSHOT',
-        category: 'SNAPSHOT',
-        event: 'USER_MANUAL_SNAPSHOT',
-        reason: note?.trim() || uiContext?.trim() || 'USER_CLICKED_SNAPSHOT_BUTTON',
-        data: {
-          softwareVersion: deps.softwareVersion,
-          uiContext: uiContext?.trim() || '',
-          controllerLoopDelay: loopDelaySummary,
-          controllerMemory: process.memoryUsage(),
-          settings: runtime.settings,
-          profiles: profileSummaries,
-          plans: activePlans,
-          plansTruncated: runtime.plans.length > activePlans.length,
-          groupInviter: {
-            running: inviterState.running,
-            runId: inviterState.runId,
-            statusText: inviterState.statusText,
-            profileCounts: inviterState.profileCounts,
-          },
-          groupBumper: bumperState
-            ? {
-                running: bumperState.running,
-                pageBumperRunning: bumperState.pageBumperRunning,
-                statusText: bumperState.statusText,
-                pageBumperStatusText: bumperState.pageBumperStatusText,
-                profileCounts: bumperState.profileCounts,
-                pageBumperProfileCounts: bumperState.pageBumperProfileCounts,
-              }
-            : null,
-          groupPoster: {
-            running: posterState.running,
-            statusText: posterState.statusText,
-            profileCounts: posterState.profileCounts,
-          },
-          ...(sanitizedBluestacks ? { bluestacks: sanitizedBluestacks } : {}),
-        },
-      }),
-      now = new Date(),
+    });
+    const now = new Date(),
       { fileStamp, readable } = formatLocalTimestamp(now),
       feedbackDir = path.join(deps.dataDir, 'logs', 'feedback');
     await mkdir(feedbackDir, { recursive: true });
@@ -413,46 +466,23 @@ export function createDiagnosticSnapshotBuilder(deps: {
       ),
       ledgerPlans = await Promise.all(
         allPlans.slice(0, 30).map(async (plan) => {
-          const [steps, operations, events] = await Promise.all([
+          const [steps, events] = await Promise.all([
             deps.tasksRepository.steps(plan.id),
-            deps.tasksRepository.operations(plan.id),
             deps.tasksRepository.events(plan.id),
           ]);
           return {
             plan: {
-              id: plan.id,
-              batchId: plan.batchId,
-              profileId: plan.profileId,
-              combinationId: plan.combinationId,
+              ...pickFields(
+                plan,
+                'id batchId profileId combinationId version round position state reason controlMode controlRequestId createdAt updatedAt',
+              ),
               combinationName: plan.snapshot.name,
-              version: plan.version,
-              round: plan.round,
-              position: plan.position,
-              state: plan.state,
-              reason: plan.reason,
-              controlMode: plan.controlMode,
-              controlRequestId: plan.controlRequestId,
-              timing: plan.timing,
-              createdAt: plan.createdAt,
-              updatedAt: plan.updatedAt,
             },
             steps,
-            operations: operations.slice(-100).map((op) => ({
-              id: op.id,
-              stepId: op.stepId,
-              action: op.action,
-              status: op.status,
-              disposition: op.disposition ?? null,
-              receipt: op.receipt ?? null,
-              createdAt: op.createdAt,
-              updatedAt: op.updatedAt,
-            })),
-            events: events.slice(-120).map((ev) => ({
-              sequence: ev.sequence,
-              type: ev.type,
-              detail: ev.detail,
-              createdAt: ev.createdAt,
-            })),
+            operations: [],
+            events: events
+              .slice(-120)
+              .map((ev) => pickFields(ev, 'sequence type detail createdAt')),
             tabs: [],
           };
         }),
@@ -483,24 +513,16 @@ export function createDiagnosticSnapshotBuilder(deps: {
               },
               profiles: profileSummaries,
               combinations: wsSnapshot.combinations.map((row) => ({
-                id: row.id,
-                version: row.version,
-                revision: row.revision,
-                updatedAt: row.updatedAt,
-                saved: row.saved
-                  ? {
-                      name: row.saved.name,
-                      note: row.saved.note,
-                      randomOrder: row.saved.randomOrder,
-                      loop: row.saved.loop,
-                      steps: row.saved.steps,
-                    }
-                  : null,
+                ...pickFields(row, 'id version revision updatedAt'),
+                saved: row.saved ? pickFields(row.saved, 'name note randomOrder loop steps') : null,
               })),
               groupInviter: { state: inviterState, logs: inviterLogs },
               groupBumper: bumperState ? { state: bumperState, logs: bumperLogs } : null,
               groupPoster: { state: posterState, logs: posterLogs.slice(0, 50) },
               bluestacks: sanitizedBluestacks,
+              windowLayout: windowLayoutSnapshot,
+              autoScheduler: sanitizedAutoScheduler,
+              googleSheets: sanitizedGoogleSheets,
               recentPostBumpRecords: recentRecords
                 ? { total: recentRecords.total, records: recentRecords.records }
                 : null,
@@ -549,9 +571,14 @@ export function createDiagnosticSnapshotBuilder(deps: {
       zipPath = path.join(outputDir, fileName);
     }
     await writeFile(zipPath, zipBuffer);
+    if (customTargetDir) {
+      generatedCustomDiagnosticDirs.add(normalizeCmpPath(outputDir));
+      generatedCustomDiagnosticFiles.add(normalizeCmpPath(zipPath));
+    }
     for (const stale of (await listZipPackagesDesc(feedbackDir).catch(() => [])).slice(10))
       await unlink(stale.fullPath).catch(() => {});
-    if (reveal !== false) await revealDiagnosticPackage(deps.dataDir, zipPath);
+    if (reveal !== false)
+      await revealDiagnosticPackage(deps.dataDir, zipPath, customTargetDir || undefined);
     return {
       filePath: zipPath,
       fileName,

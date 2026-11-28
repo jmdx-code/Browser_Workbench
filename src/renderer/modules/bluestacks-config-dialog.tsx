@@ -1,9 +1,10 @@
 import { useState } from 'react';
-import type {
-  BluestacksInstance,
-  BluestacksLoginExistingPolicy,
-  BluestacksRuntimeConfig,
-  BluestacksState,
+import {
+  isValidTotpSecret,
+  type BluestacksInstance,
+  type BluestacksLoginExistingPolicy,
+  type BluestacksRuntimeConfig,
+  type BluestacksState,
 } from '../../shared/bluestacks.js';
 import { api } from '../api.js';
 import { ConfirmDialog } from '../confirm-dialog.js';
@@ -12,7 +13,6 @@ import { SelectByIdsDialog, type SelectByIdsCandidate } from '../select-by-ids-d
 import { toggleSet } from '../selection.js';
 import { UI_INPUT_SM, UI_SELECT_SM } from '../ui/primitives.js';
 import { Btn, Chk, InFld, NativeFormDialog, SelFld, useBusyTask } from './shared/module-ui.js';
-
 export type BluestacksRowDialog =
   | { kind: 'ids' }
   | { kind: 'config' }
@@ -21,7 +21,6 @@ export type BluestacksRowDialog =
   | { kind: 'login'; instance: BluestacksInstance }
   | { kind: 'switch'; instance: BluestacksInstance }
   | null;
-
 const buildSelectCandidates = (instances: readonly BluestacksInstance[]): SelectByIdsCandidate[] =>
   instances.map((i) => ({
     id: i.id,
@@ -43,7 +42,6 @@ const buildSelectCandidates = (instances: readonly BluestacksInstance[]): Select
       ),
     ],
   }));
-
 function BluestacksConfigDialog(p: {
   config: BluestacksRuntimeConfig;
   onSave: (input: {
@@ -53,29 +51,28 @@ function BluestacksConfigDialog(p: {
   }) => Promise<void>;
   onClose: () => void;
 }) {
-  const [installDir, setInstallDir] = useState(p.config.installDir ?? '');
-  const [confPath, setConfPath] = useState(p.config.confPath ?? '');
-  const [apkPath, setApkPath] = useState(p.config.apkPath ?? '');
+  const [s, setS] = useState({
+    installDir: p.config.installDir ?? '',
+    confPath: p.config.confPath ?? '',
+    apkPath: p.config.apkPath ?? '',
+  });
   const { busy, error, run } = useBusyTask();
   const fields = [
     [
+      'installDir',
       'BlueStacks 安装目录（含 HD-Adb.exe / HD-Player.exe）',
-      installDir,
-      setInstallDir,
       p.config.detectedInstallDir ?? 'C:\\Program Files\\BlueStacks_nxt',
       500,
     ],
     [
+      'confPath',
       'bluestacks.conf 配置文件路径',
-      confPath,
-      setConfPath,
       p.config.detectedConfPath ?? 'D:\\BlueStacks_nxt\\bluestacks.conf',
       500,
     ],
     [
+      'apkPath',
       'FB Lite 安装包（.apk）路径（留空自动探测本机 APK）',
-      apkPath,
-      setApkPath,
       p.config.detectedApkPath ?? '例如：D:\\...\\com.facebook.lite_x86_64.apk',
       600,
     ],
@@ -92,23 +89,23 @@ function BluestacksConfigDialog(p: {
         void run(
           () =>
             p.onSave({
-              installDir: installDir.trim() || null,
-              confPath: confPath.trim() || null,
-              apkPath: apkPath.trim() || null,
+              installDir: s.installDir.trim() || null,
+              confPath: s.confPath.trim() || null,
+              apkPath: s.apkPath.trim() || null,
             }),
           '保存路径失败',
           p.onClose,
         )
       }
     >
-      {fields.map(([label, val, setVal, ph, maxLength]) => (
+      {fields.map(([k, label, ph, maxLength]) => (
         <InFld
-          key={label}
+          key={k}
           label={label}
           wrapClass="mb-1"
           className={`${UI_INPUT_SM} w-full`}
-          value={val}
-          onVal={setVal}
+          value={s[k]}
+          onVal={(v) => setS((prev) => ({ ...prev, [k]: v }))}
           placeholder={ph}
           maxLength={maxLength}
         />
@@ -116,7 +113,6 @@ function BluestacksConfigDialog(p: {
     </NativeFormDialog>
   );
 }
-
 function BluestacksLoginDialog(p: {
   instance: BluestacksInstance;
   onClose: () => void;
@@ -129,13 +125,13 @@ function BluestacksLoginDialog(p: {
     ifAlreadyLoggedIn: BluestacksLoginExistingPolicy;
   }) => Promise<void>;
 }) {
-  const [account, setAccount] = useState('');
-  const [password, setPassword] = useState('');
-  const [totpSecret, setTotpSecret] = useState('');
-  const [saveLoginInfo, setSaveLoginInfo] = useState(true);
-  const [ifAlreadyLoggedIn, setIfAlreadyLoggedIn] = useState<BluestacksLoginExistingPolicy>(
-    p.instance.accountState === 'logged-in' ? 'clear-and-relogin' : 'skip',
-  );
+  const [account, setAccount] = useState(''),
+    [password, setPassword] = useState(''),
+    [totpSecret, setTotpSecret] = useState(''),
+    [saveLoginInfo, setSaveLoginInfo] = useState(true),
+    [ifAlreadyLoggedIn, setIfAlreadyLoggedIn] = useState<BluestacksLoginExistingPolicy>(
+      p.instance.accountState === 'logged-in' ? 'clear-and-relogin' : 'skip',
+    );
   const { busy, error, setError, run } = useBusyTask();
   const inputs = [
     ['邮箱 / 手机号 / ID', account, setAccount, 'example@domain.com', true, 'text', 'off'],
@@ -168,6 +164,8 @@ function BluestacksLoginDialog(p: {
       onClose={p.onClose}
       onSubmit={() => {
         if (!account.trim() || !password) return setError('请填写账号和密码');
+        if (totpSecret.trim() && !isValidTotpSecret(totpSecret))
+          return setError('2FA 密钥格式无效（需为至少 8 位 Base32 字符 A-Z / 2-7）');
         void run(
           () =>
             p.onSubmit({
@@ -217,7 +215,6 @@ function BluestacksLoginDialog(p: {
     </NativeFormDialog>
   );
 }
-
 function BluestacksSwitchIdentityDialog(p: {
   instance: BluestacksInstance;
   onSwitch: (payload: {
@@ -291,7 +288,6 @@ function BluestacksSwitchIdentityDialog(p: {
     </NativeFormDialog>
   );
 }
-
 export function BluestacksSidebarDialogs(p: {
   state: BluestacksState | null;
   onChange: (next: BluestacksState) => void;
@@ -302,77 +298,68 @@ export function BluestacksSidebarDialogs(p: {
 }) {
   const { dialog, onClose } = p;
   if (!dialog) return null;
-  if (dialog.kind === 'ids') {
-    return (
-      <SelectByIdsDialog
-        title="按名称 / 端口批量选中蓝蝶窗口"
-        kind="profiles"
-        description="支持粘贴多个蓝蝶窗口名（如 p023、kf7）、实例名（Pie64_1）、端口号（5565）或 FB 账号 ID，每行一个，也支持逗号、顿号或空格分隔。"
-        candidates={buildSelectCandidates(p.state?.instances ?? [])}
-        placeholder="每行或空格分隔输入窗口名（如 p023、kf7）、实例名（Pie64_1）或端口号（5565）"
-        onClose={onClose}
-        onApply={(ids, mode) =>
-          p.onSelect(mode === 'replace' ? new Set(ids) : new Set([...p.selected, ...ids]))
-        }
-      />
-    );
+  const act = async (action: string, payload: unknown) =>
+    p.onChange(await api.bluestacksAction(action, payload));
+  switch (dialog.kind) {
+    case 'ids':
+      return (
+        <SelectByIdsDialog
+          title="按名称 / 端口批量选中蓝蝶窗口"
+          kind="profiles"
+          description="支持粘贴多个蓝蝶窗口名（如 p023、kf7）、实例名（Pie64_1）、端口号（5565）或 FB 账号 ID，每行一个，也支持逗号、顿号或空格分隔。"
+          candidates={buildSelectCandidates(p.state?.instances ?? [])}
+          placeholder="每行或空格分隔输入窗口名（如 p023、kf7）、实例名（Pie64_1）或端口号（5565）"
+          onClose={onClose}
+          onApply={(ids, mode) =>
+            p.onSelect(mode === 'replace' ? new Set(ids) : new Set([...p.selected, ...ids]))
+          }
+        />
+      );
+    case 'config':
+      return p.state ? (
+        <BluestacksConfigDialog
+          config={p.state.config}
+          onClose={onClose}
+          onSave={(payload) => act('paths', payload)}
+        />
+      ) : null;
+    case 'rename':
+      return (
+        <NameDialog
+          title="修改窗口备注别名"
+          initial={dialog.alias}
+          onClose={onClose}
+          onSubmit={(alias) => act('instances/rename', { id: dialog.id, alias })}
+        />
+      );
+    case 'delete':
+      return (
+        <ConfirmDialog
+          title="移除窗口记录"
+          description={`确定移除「${dialog.label}」的本地记录吗？（如果仍在多开器中，下次刷新会重新探测显示）`}
+          label="移除"
+          onClose={onClose}
+          onConfirm={async () => {
+            await act('instances/delete', { instanceIds: dialog.ids });
+            p.onSelect(toggleSet(p.selected, dialog.ids, false));
+          }}
+        />
+      );
+    case 'login':
+      return (
+        <BluestacksLoginDialog
+          instance={dialog.instance}
+          onClose={onClose}
+          onSubmit={(payload) => act('instances/login', payload)}
+        />
+      );
+    case 'switch':
+      return (
+        <BluestacksSwitchIdentityDialog
+          instance={dialog.instance}
+          onClose={onClose}
+          onSwitch={(payload) => act('instances/switch-identity', payload)}
+        />
+      );
   }
-  if (dialog.kind === 'config' && p.state) {
-    return (
-      <BluestacksConfigDialog
-        config={p.state.config}
-        onClose={onClose}
-        onSave={async (payload) => p.onChange(await api.bluestacksAction('paths', payload))}
-      />
-    );
-  }
-  if (dialog.kind === 'rename') {
-    return (
-      <NameDialog
-        title="修改窗口备注别名"
-        initial={dialog.alias}
-        onClose={onClose}
-        onSubmit={async (name) =>
-          p.onChange(await api.bluestacksAction('instances/rename', { id: dialog.id, alias: name }))
-        }
-      />
-    );
-  }
-  if (dialog.kind === 'delete') {
-    return (
-      <ConfirmDialog
-        title="移除窗口记录"
-        description={`确定移除「${dialog.label}」的本地记录吗？（如果仍在多开器中，下次刷新会重新探测显示）`}
-        label="移除"
-        onClose={onClose}
-        onConfirm={async () => {
-          p.onChange(await api.bluestacksAction('instances/delete', { instanceIds: dialog.ids }));
-          p.onSelect(toggleSet(p.selected, dialog.ids, false));
-        }}
-      />
-    );
-  }
-  if (dialog.kind === 'login') {
-    return (
-      <BluestacksLoginDialog
-        instance={dialog.instance}
-        onClose={onClose}
-        onSubmit={async (payload) =>
-          p.onChange(await api.bluestacksAction('instances/login', payload))
-        }
-      />
-    );
-  }
-  if (dialog.kind === 'switch') {
-    return (
-      <BluestacksSwitchIdentityDialog
-        instance={dialog.instance}
-        onClose={onClose}
-        onSwitch={async (payload) =>
-          p.onChange(await api.bluestacksAction('instances/switch-identity', payload))
-        }
-      />
-    );
-  }
-  return null;
 }

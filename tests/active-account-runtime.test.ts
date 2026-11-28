@@ -7,6 +7,7 @@ import { Core } from '../src/bridge/core.js';
 import { Store } from '../src/bridge/store.js';
 import type { KernelBridge } from '../src/infrastructure/kernel-bridge.js';
 import type { ProfileLifecyclePort } from '../src/shared/profile-lifecycle.js';
+import { TaskCommandRequest } from '../src/shared/task-contracts.js';
 import { emptyResourceRow } from '../src/domain/resource-table.js';
 import { makeRuntimeProfiles, workspaceFixture } from './fixtures/workspace-fixture.js';
 
@@ -141,12 +142,8 @@ test('ActiveAccountRuntime starts batch in <1s without blocking on slow or offli
       const planP2 = plans.find((p) => p.profileId === p2.id)!;
       assert.ok(planP1 && planP2);
 
-      // commandPlan('resume') rejects cleanly; commandPlan('stop') aborts immediately
-      await assert.rejects(
-        () => runtime.commandPlan(planP1.id, 'resume'),
-        (err: unknown) =>
-          err instanceof Error && 'code' in err && err.code === 'TASK_RESUME_REMOVED',
-      );
+      // TaskCommandRequest rejects removed 'resume'; commandPlan('stop') aborts immediately
+      assert.equal(TaskCommandRequest.safeParse({ command: 'resume', plans: [] }).success, false);
       const stopped = await runtime.commandPlan(planP1.id, 'stop');
       assert.equal(stopped.state, 'STOPPED');
       await workboard.waitUntilCarrierIdle(p2.id, 1000);

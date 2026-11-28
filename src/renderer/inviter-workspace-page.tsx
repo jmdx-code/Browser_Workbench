@@ -3,20 +3,22 @@ import type { QuickScheduleSeed } from '../shared/auto-scheduler.js';
 import { bluestacksDisplayTitle, type BluestacksState } from '../shared/bluestacks.js';
 import type { BumperTarget } from '../shared/group-bumper.js';
 import type { GroupInviterState } from '../shared/group-inviter.js';
-import type { TargetFolder } from '../shared/target-list.js';
 import { api } from './api.js';
-import { FinderTargetList, orderedFinderItems } from './finder-target-list.js';
-import { extractGroupId, type DraftGroupEntry } from './group-inviter-grid.js';
-import { IconClock, IconPlay, IconStop } from './icons.js';
+import {
+  FinderTargetList,
+  orderedFinderItems,
+  refreshAvatarMenuItem,
+} from './finder-target-list.js';
+import { extractGroupId } from './group-inviter-grid.js';
+import { IconClock, IconPlay, IconRefresh, IconStop } from './icons.js';
 import {
   ControlledNumberInput,
   type ControlledNumberInputHandle,
 } from './modules/shared/controlled-number-input.js';
-import { Btn, errMsg } from './modules/shared/module-ui.js';
+import { Btn, DataTbl, RunStatusPill, errMsg } from './modules/shared/module-ui.js';
 import { TargetScopeBar, type TargetScopeOption } from './modules/shared/target-scope-bar.js';
-import { makeDraftRow, TargetAddModal } from './target-add-modal.js';
-import { UI_INPUT_SM, UiSwitch } from './ui/primitives.js';
-
+import { collectTargetDraftItems, TargetAddModal, useTargetWorkspace } from './target-add-modal.js';
+import { SlideDrawer, UI_INPUT_SM, UiSwitch } from './ui/primitives.js';
 export interface InviterWorkspaceProps {
   carrier: 'browser' | 'bluestacks';
   state: GroupInviterState | null;
@@ -41,7 +43,19 @@ export interface InviterWorkspaceProps {
   onOpenLiveRuns?: (() => void) | undefined;
   onMessage?: ((msg: string) => void) | undefined;
 }
-
+const OUTCOME_BADGE: Record<'invited' | 'skipped' | 'failed', { label: string; cls: string }> = {
+  invited: { label: '完成', cls: 'bg-[var(--ok-soft)] text-[var(--ok)]' },
+  skipped: { label: '跳过', cls: 'bg-amber-50 text-amber-700' },
+  failed: { label: '失败', cls: 'bg-rose-50 text-rose-700' },
+};
+const BS_INVITER_CLOSE_STORAGE_KEY = 'wb.bluestacksInviter.closeWindowOnFinish';
+function readStoredBsInviterClose(): boolean {
+  try {
+    return window.localStorage.getItem(BS_INVITER_CLOSE_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 export function InviterWorkspacePage(p: InviterWorkspaceProps) {
   const {
     carrier,
@@ -56,61 +70,58 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
     onQuickSchedule,
     onMessage,
   } = p;
-  const isBs = carrier === 'bluestacks';
-  const defaultInvites = isBs ? 5 : 30;
-  const maxInvites = isBs ? 50 : 200;
+  const isBs = carrier === 'bluestacks',
+    defaultInvites = isBs ? 5 : 30,
+    maxInvites = isBs ? 50 : 200;
   const [localBusy, setLocalBusy] = useState(false);
   const busy = externalBusy || localBusy;
-  const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
-  const [folders, setFolders] = useState<TargetFolder[]>([]);
-  const [addFolder, setAddFolder] = useState<string | null>(null);
   const [invitesInput, setInvitesInput] = useState<number>(
     isBs ? 5 : (state?.invitesPerGroup ?? 30),
   );
+  const [bsCloseWindow, setBsCloseWindow] = useState(readStoredBsInviterClose);
+  const updateBsCloseWindow = (next: boolean) => {
+    setBsCloseWindow(next);
+    try {
+      window.localStorage.setItem(BS_INVITER_CLOSE_STORAGE_KEY, next ? '1' : '0');
+    } catch {}
+  };
   const invitesInputRef = useRef<ControlledNumberInputHandle>(null);
-  const [addingModalOpen, setAddingModalOpen] = useState(false);
-  const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
-    Array.from({ length: 5 }, () => makeDraftRow()),
-  );
-  const [formError, setFormError] = useState('');
-  const [submittingAdd, setSubmittingAdd] = useState(false);
-  const [refreshingAvatars, setRefreshingAvatars] = useState(false);
-
+  const [summaryOpen, setSummaryOpen] = useState(false);
   useEffect(() => {
     if (!isBs && state?.invitesPerGroup !== undefined) setInvitesInput(state.invitesPerGroup);
   }, [isBs, state?.invitesPerGroup]);
-
-  const finderItems = useMemo(
-    () =>
-      state?.groups && (!isBs || state.groups.length > 0)
-        ? state.groups.map((g) => ({
-            id: g.groupId,
-            name: g.groupName,
-            folderId: g.folderId,
-            sortOrder: g.sortOrder,
-            avatarUrl: g.avatarUrl,
-            count: g.totalInvitedCount,
-          }))
-        : fallbackGroups.map((g) => ({
-            id: g.id,
-            name: g.name,
-            folderId: g.folderId,
-            sortOrder: g.sortOrder,
-            avatarUrl: g.avatarUrl,
-            count: 0,
-          })),
-    [state?.groups, fallbackGroups, isBs],
-  );
-
-  useEffect(() => {
-    if (!state) return;
-    const validIds = new Set(finderItems.map((i) => i.id));
-    setSelectedGroups((prev) => {
-      const next = new Set([...prev].filter((id) => validIds.has(id)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [state, finderItems]);
-
+  const finderItems = useMemo(() => {
+    if (state?.groups && (!isBs || state.groups.length > 0))
+      return state.groups.map((g) => ({
+        id: g.groupId,
+        name: g.groupName,
+        folderId: g.folderId,
+        sortOrder: g.sortOrder,
+        avatarUrl: g.avatarUrl,
+        count: g.totalInvitedCount,
+      }));
+    return fallbackGroups.map((g) => ({
+      id: g.id,
+      name: g.name,
+      folderId: g.folderId,
+      sortOrder: g.sortOrder,
+      avatarUrl: g.avatarUrl,
+      count: 0,
+    }));
+  }, [state?.groups, fallbackGroups, isBs]);
+  const ws = useTargetWorkspace(finderItems, Boolean(state));
+  const {
+    selected: selectedGroups,
+    setSelected: setSelectedGroups,
+    folders,
+    setFolders,
+    addFolder,
+    draftRows,
+    setFormError,
+    setSubmittingAdd,
+    refreshingAvatars,
+    setRefreshingAvatars,
+  } = ws;
   const orderedSelectedGroupIds = useMemo(
     () =>
       orderedFinderItems(finderItems, folders)
@@ -120,19 +131,30 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
   );
   const selectedIds = useMemo(() => [...selectedTargetIds], [selectedTargetIds]);
   const bsInstances = bluestacksState?.instances ?? [];
-  const selectedInstances = useMemo(
-    () => bsInstances.filter((i) => selectedTargetIds.has(i.id)),
-    [bsInstances, selectedTargetIds],
+  const pageIdentitySelected = useMemo(
+    () =>
+      isBs
+        ? bsInstances.filter((i) => selectedTargetIds.has(i.id) && i.identityType === 'page')
+        : [],
+    [isBs, bsInstances, selectedTargetIds],
   );
-  const pageIdentitySelected = isBs
-    ? selectedInstances.filter((i) => i.identityType === 'page')
-    : [];
   const isRunning = isBs ? Boolean(bluestacksState?.inviterRunning) : Boolean(state?.running);
   const idleSelected = isBs ? [] : selectedIds.filter((id) => !state?.profileCounts?.[id]?.running);
   const totalInvited = finderItems.reduce((sum, item) => sum + item.count, 0);
   const normalizeInvites = (v: number) =>
     Number.isFinite(v) ? Math.max(1, Math.min(maxInvites, Math.round(v))) : defaultInvites;
-
+  const runSummary = !isBs ? state?.lastRunSummary : undefined;
+  const failedGroupIds = useMemo(() => {
+    if (!runSummary) return [];
+    const existing = new Set(finderItems.map((i) => i.id));
+    return [
+      ...new Set(
+        runSummary.groupResults
+          .filter((r) => r.status === 'failed' && existing.has(r.groupId))
+          .map((r) => r.groupId),
+      ),
+    ];
+  }, [runSummary, finderItems]);
   async function runBsAction(action: string, payload: unknown, okMsg: string, errFallback: string) {
     setLocalBusy(true);
     try {
@@ -144,20 +166,15 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
       setLocalBusy(false);
     }
   }
-
   async function submitAddGroups(event: React.FormEvent) {
     event.preventDefault();
-    const collected: Array<{ groupId: string; groupName: string; folderId?: string | null }> = [];
-    for (const row of draftRows) {
-      const groupId = extractGroupId(row.groupId);
-      const groupName = row.groupName.trim();
-      if (!groupId && !groupName) continue;
-      if (!groupId) return setFormError('请填写每行的「小组ID或链接」');
-      if (!/^[A-Za-z0-9._-]+$/.test(groupId))
-        return setFormError(`小组ID「${groupId}」格式不正确，仅支持数字、字母、点、下划线或连字符`);
-      collected.push({ groupId, groupName, folderId: addFolder });
-    }
-    if (!collected.length) return setFormError('请至少输入一行小组数据');
+    const res = collectTargetDraftItems(draftRows, addFolder, extractGroupId, '小组');
+    if (!res.ok) return setFormError(res.error);
+    const collected = res.items.map((x) => ({
+      groupId: x.id,
+      groupName: x.name,
+      folderId: x.folderId,
+    }));
     setFormError('');
     setSubmittingAdd(true);
     try {
@@ -167,28 +184,38 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
         await onRefresh();
         onMessage?.(`已保存 ${collected.length} 个小组，正在后台获取小组头像`);
       }
-      setAddingModalOpen(false);
+      ws.setAddingOpen(false);
     } catch (error) {
       setFormError(errMsg(error, '添加小组失败'));
     } finally {
       setSubmittingAdd(false);
     }
   }
-
-  async function startRun(overrideGroupIds?: string[]) {
+  async function startRun() {
     const count = normalizeInvites((await invitesInputRef.current?.flush()) ?? invitesInput);
-    if (!isBs)
-      return void (await p.onStartBrowser?.(overrideGroupIds ?? orderedSelectedGroupIds, count));
+    if (!isBs) return void (await p.onStartBrowser?.(orderedSelectedGroupIds, count));
     if (!selectedIds.length) return onMessage?.('请先在左侧蓝蝶窗口列表中勾选至少一个个人号模拟器');
     if (!orderedSelectedGroupIds.length) return onMessage?.('请至少勾选 1 个目标小组');
     await runBsAction(
       'inviter/start',
-      { instanceIds: selectedIds, groupIds: orderedSelectedGroupIds, invitesPerGroup: count },
+      {
+        instanceIds: selectedIds,
+        groupIds: orderedSelectedGroupIds,
+        invitesPerGroup: count,
+        ...(bsCloseWindow ? { closeWindowOnFinish: true } : {}),
+      },
       `已启动蓝蝶小组邀请人（${selectedIds.length} 台蓝蝶 × ${orderedSelectedGroupIds.length} 个小组）`,
       '启动蓝蝶小组邀请人失败',
     );
   }
-
+  async function retryFailedGroups() {
+    if (!failedGroupIds.length) return;
+    if (!selectedIds.length) return void onMessage?.('请先勾选至少一个执行账号后再重试失败组');
+    const count = normalizeInvites((await invitesInputRef.current?.flush()) ?? invitesInput);
+    setSelectedGroups(new Set(failedGroupIds));
+    setSummaryOpen(false);
+    await p.onStartBrowser?.(failedGroupIds, count);
+  }
   const stopRun = () =>
     isBs
       ? runBsAction('inviter/stop', {}, '已发送停止蓝蝶小组邀请人指令', '停止失败')
@@ -207,7 +234,6 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
       : isBs
         ? `使用已选的 ${selectedIds.length} 台蓝蝶向 ${orderedSelectedGroupIds.length} 个小组邀人（未启动窗口会自动拉起）`
         : `使用已选的 ${selectedIds.length} 个账号向 ${selectedGroups.size} 个小组随机错峰邀请好友`;
-
   const runAvatarCmd = (req: Promise<GroupInviterState>, fallback?: string) => {
     void req
       .then((next) => {
@@ -218,7 +244,6 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
       .catch((err) => onMessage?.(errMsg(err, String(err))))
       .finally(() => setRefreshingAvatars(false));
   };
-
   return (
     <section
       className="records-page bumper-page group-inviter-page flex h-full min-h-0 flex-col gap-2.5"
@@ -264,52 +289,74 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
                 />
                 <span>人</span>
               </label>
-              {!isBs && (
+              {isBs && (
                 <span
                   className="bumper-policy-field inline-flex items-center gap-1.5 text-xs font-medium text-[var(--text-2)]"
-                  title="所有账号邀请完成后播放提示音"
+                  title="每台蓝蝶完成本轮邀人后自动关闭模拟器窗口释放内存"
                 >
                   <UiSwitch
-                    ariaLabel="完成后播放提示音"
-                    label="完成后播放提示音"
-                    disabled={busy}
-                    checked={state?.playSoundOnComplete !== false}
-                    onCheckedChange={(checked) =>
-                      void api
-                        .saveGroupInviterSettings({ playSoundOnComplete: checked })
-                        .then(() => onRefresh())
-                        .catch((err) => onMessage?.(errMsg(err, '保存提示音设置失败')))
-                    }
+                    ariaLabel="蓝蝶邀人完毕关窗"
+                    label="完后关窗"
+                    disabled={busy || isRunning}
+                    checked={bsCloseWindow}
+                    onCheckedChange={updateBsCloseWindow}
                   />
                 </span>
               )}
+              {!isBs &&
+                [
+                  {
+                    label: '完成后播放提示音',
+                    title: '所有账号邀请完成后播放提示音',
+                    checked: state?.playSoundOnComplete !== false,
+                    key: 'playSoundOnComplete',
+                    errText: '保存提示音设置失败',
+                  },
+                  {
+                    label: '完后关窗',
+                    title: '单轮邀请结束后自动关闭对应 Chrome 浏览器窗口（若无其他排队任务）',
+                    checked: Boolean(state?.closeBrowserOnFinish),
+                    key: 'closeBrowserOnFinish',
+                    errText: '保存完后关窗设置失败',
+                  },
+                ].map((sw) => (
+                  <span
+                    key={sw.key}
+                    className="bumper-policy-field inline-flex items-center gap-1.5 text-xs font-medium text-[var(--text-2)]"
+                    title={sw.title}
+                  >
+                    <UiSwitch
+                      ariaLabel={sw.label}
+                      label={sw.label}
+                      disabled={busy}
+                      checked={sw.checked}
+                      onCheckedChange={(v) =>
+                        void api
+                          .saveGroupInviterSettings({ [sw.key]: v })
+                          .then(() => onRefresh())
+                          .catch((err) => onMessage?.(errMsg(err, sw.errText)))
+                      }
+                    />
+                  </span>
+                ))}
               <span className="bumper-policy-field text-xs text-[var(--text-3)]">
                 共 {finderItems.length} 个小组 · 累计邀请 {totalInvited} 人
               </span>
             </div>
           </div>
-
           <div className="bumper-actions flex flex-wrap items-center justify-end gap-2">
-            {statusText &&
-              (isRunning && p.onOpenLiveRuns ? (
-                <button
-                  type="button"
-                  className="m-0 inline-flex h-[22px] items-center gap-1 rounded-full border-0 bg-[var(--run-soft)] px-2 text-xs font-semibold whitespace-nowrap text-[var(--run)] transition-colors hover:bg-blue-100"
-                  role="status"
-                  title="点击查看实时任务队列"
-                  onClick={p.onOpenLiveRuns}
-                >
-                  <span>{statusText}</span>
-                  <span className="opacity-75">· 查看队列</span>
-                </button>
-              ) : (
-                <span
-                  className={`m-0 inline-flex h-[22px] items-center rounded-full px-2 text-xs whitespace-nowrap ${isRunning || state?.groupAvatarRefreshing ? 'bg-[var(--run-soft)] font-semibold text-[var(--run)]' : 'bg-[var(--surface-3)] text-[var(--text-2)]'}`}
-                  role="status"
-                >
-                  {statusText}
-                </span>
-              ))}
+            <RunStatusPill
+              text={statusText}
+              running={isRunning}
+              highlight={Boolean(state?.groupAvatarRefreshing)}
+              onOpenLiveRuns={p.onOpenLiveRuns}
+            />
+            {runSummary && (
+              <Btn onClick={() => setSummaryOpen(true)} title="查看上一轮各账号与小组执行结果明细">
+                本轮执行明细 ({runSummary.groupResults.length})
+                {failedGroupIds.length > 0 ? ` · ${failedGroupIds.length} 失败` : ''}
+              </Btn>
+            )}
             {isBs && (
               <span className="pill inline-flex h-6 items-center rounded-full bg-[var(--surface-3)] px-2.5 text-xs font-medium text-[var(--text-2)]">
                 已选蓝蝶 {selectedIds.length} 台
@@ -364,20 +411,15 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
                       name: isBs ? '蓝蝶小组邀人' : '小组邀人',
                       targetIds: selectedIds,
                       steps: [
-                        isBs
-                          ? {
-                              id: crypto.randomUUID(),
-                              type: 'bluestacks-group-inviter',
-                              groupIds: [...orderedSelectedGroupIds],
-                              invitesPerGroup: perGroup,
-                            }
-                          : {
-                              id: crypto.randomUUID(),
-                              type: 'group-inviter',
-                              groupIds: [...orderedSelectedGroupIds],
-                              invitesPerGroup: perGroup,
-                              playSoundOnComplete: state?.playSoundOnComplete !== false,
-                            },
+                        {
+                          id: crypto.randomUUID(),
+                          type: isBs ? 'bluestacks-group-inviter' : 'group-inviter',
+                          groupIds: [...orderedSelectedGroupIds],
+                          invitesPerGroup: perGroup,
+                          ...(isBs
+                            ? {}
+                            : { playSoundOnComplete: state?.playSoundOnComplete !== false }),
+                        },
                       ],
                     } as QuickScheduleSeed);
                   })()
@@ -389,7 +431,6 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
           </div>
         </div>
       </div>
-
       {pageIdentitySelected.length > 0 && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-[13px] leading-relaxed text-amber-900 shadow-xs">
           <strong>身份提示：</strong>已选窗口中有 {pageIdentitySelected.length} 台当前为
@@ -399,7 +440,6 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
           专页身份」先切回个人主号。
         </div>
       )}
-
       {!loaded ? (
         <p className="rounded-xl border border-dashed border-[var(--line-strong)] bg-white px-4 py-12 text-center text-xs text-[var(--text-3)]">
           正在读取小组库…
@@ -424,56 +464,97 @@ export function InviterWorkspacePage(p: InviterWorkspaceProps) {
           onChanged={onRefresh}
           onFolders={setFolders}
           tools={
-            <Btn
-              disabled={busy}
-              onClick={() => {
-                setAddFolder(null);
-                setDraftRows(Array.from({ length: 5 }, () => makeDraftRow()));
-                setFormError('');
-                setAddingModalOpen(true);
-              }}
-            >
+            <Btn disabled={busy} onClick={ws.openAddModal}>
               ＋ 添加小组
             </Btn>
           }
           moreItems={[
-            refreshingAvatars || state?.groupAvatarRefreshing
-              ? {
-                  label: '停止刷新头像',
-                  disabled: busy,
-                  onSelect: () =>
-                    runAvatarCmd(api.stopRefreshGroupInviterGroups(), '已停止读取小组资料'),
-                }
-              : {
-                  label: '刷新头像',
-                  disabled: busy || isRunning || finderItems.length === 0,
-                  onSelect: () => {
-                    setRefreshingAvatars(true);
-                    runAvatarCmd(
-                      api.refreshGroupInviterGroups(
-                        selectedGroups.size ? { ids: [...selectedGroups] } : {},
-                      ),
-                    );
-                  },
-                },
+            refreshAvatarMenuItem({
+              refreshing: Boolean(refreshingAvatars || state?.groupAvatarRefreshing),
+              busy,
+              disabled: busy || isRunning || finderItems.length === 0,
+              onStop: () => runAvatarCmd(api.stopRefreshGroupInviterGroups(), '已停止读取小组资料'),
+              onStart: () => {
+                setRefreshingAvatars(true);
+                runAvatarCmd(
+                  api.refreshGroupInviterGroups(
+                    selectedGroups.size ? { ids: [...selectedGroups] } : {},
+                  ),
+                );
+              },
+            }),
           ]}
         />
       )}
-
       <TargetAddModal
-        open={addingModalOpen}
-        folders={folders}
-        addFolder={addFolder}
-        onFolderChange={setAddFolder}
-        rows={draftRows}
-        onRowsChange={setDraftRows}
-        busy={submittingAdd}
-        error={formError}
-        onError={setFormError}
+        {...ws.modalProps}
         normalizeId={extractGroupId}
-        onClose={() => setAddingModalOpen(false)}
-        onSubmit={(event) => void submitAddGroups(event)}
+        onSubmit={(e) => void submitAddGroups(e)}
       />
+      {runSummary && (
+        <SlideDrawer
+          open={summaryOpen}
+          title="本轮各组执行明细"
+          subtitle={`完成时间 ${new Date(runSummary.finishedAt).toLocaleString()} · 已邀 ${runSummary.invitedTotal} 人 · 待确认 ${runSummary.pendingTotal} 人`}
+          widthClass="max-w-[680px]"
+          headerActions={
+            failedGroupIds.length > 0 ? (
+              <Btn
+                v="primary"
+                disabled={busy || isRunning || !selectedIds.length}
+                title={
+                  selectedIds.length
+                    ? `立即重新运行 ${failedGroupIds.length} 个失败小组`
+                    : '请先勾选至少一个执行账号'
+                }
+                onClick={() => void retryFailedGroups()}
+              >
+                <IconRefresh size={13} /> 重试失败组 ({failedGroupIds.length})
+              </Btn>
+            ) : undefined
+          }
+          onClose={() => setSummaryOpen(false)}
+        >
+          {runSummary.failedProfiles.length > 0 && (
+            <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+              本轮共有 {runSummary.failedProfiles.length} 个账号出现失败或中止。
+            </div>
+          )}
+          <DataTbl
+            headers={['账号', '小组', '状态', '已邀/跳过', '原因说明']}
+            rows={runSummary.groupResults}
+            empty="暂无各小组明细记录"
+            wrapClass="overflow-auto rounded-lg border border-[var(--line)]"
+            renderRow={(row, idx) => {
+              const badge = OUTCOME_BADGE[row.status];
+              return (
+                <tr key={`${row.profileId}-${row.groupId}-${idx}`}>
+                  <td className="max-w-[120px] truncate px-2.5 py-2 font-medium text-slate-900">
+                    {row.profileName || row.profileId.slice(0, 8)}
+                  </td>
+                  <td
+                    className="max-w-[150px] truncate px-2.5 py-2 text-slate-700"
+                    title={row.groupId}
+                  >
+                    {row.groupName || row.groupId}
+                  </td>
+                  <td className="px-2.5 py-2 whitespace-nowrap">
+                    <span
+                      className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold ${badge.cls}`}
+                    >
+                      {badge.label}
+                    </span>
+                  </td>
+                  <td className="px-2.5 py-2 whitespace-nowrap tabular-nums text-slate-600">
+                    {row.invitedCount} / {row.skippedCount}
+                  </td>
+                  <td className="px-2.5 py-2 text-slate-600">{row.reason || '—'}</td>
+                </tr>
+              );
+            }}
+          />
+        </SlideDrawer>
+      )}
     </section>
   );
 }

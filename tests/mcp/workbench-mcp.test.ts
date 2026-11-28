@@ -219,7 +219,6 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
         running: false,
         statusText: '就绪',
         profileCounts: {},
-        dailyStats: [],
         tasks: [],
         pendingReviewOperations: [],
       }),
@@ -266,7 +265,6 @@ test('MCP Streamable HTTP handler serves initialize, notifications, tools/list, 
         statusText: '就绪',
         profileCounts: {},
         total: 0,
-        dailyStats: [],
       }),
     } as unknown as WorkbenchMcpDependencies['bluestacksService'],
     agentBrowser,
@@ -858,8 +856,6 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
       pageBumperProfileCounts: {},
       total: 0,
       pageTotal: 1,
-      dailyStats: [],
-      pageDailyStats: [],
       pendingReviewOperations: [],
     }),
     manage: async (route: string, input: Record<string, unknown>) => {
@@ -954,8 +950,6 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
     pageBumperProfileCounts: {},
     total: 0,
     pageTotal: 1,
-    dailyStats: [],
-    pageDailyStats: [],
   });
 
   const deps: WorkbenchMcpDependencies = {
@@ -1106,7 +1100,6 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
         running: false,
         statusText: '就绪',
         profileCounts: {},
-        dailyStats: [],
         tasks: [],
         pendingReviewOperations: [],
       }),
@@ -1258,11 +1251,18 @@ test('MCP cross-module parity: wb_bluestacks_control settings/sound/URL auto-add
     1,
   );
 
-  const aaPause = await callTool('wb_active_accounts_control', { action: 'pause' });
-  assert.equal(aaPause.acceptedCount, 1);
+  const pauseReject = await toolMap.get('wb_active_accounts_control')?.handler({ action: 'pause' });
+  assert.equal(Boolean(pauseReject?.isError), true);
+  assert.equal(
+    (pauseReject?.structuredContent as { errorCode?: string } | undefined)?.errorCode,
+    'MCP_INVALID_ACTION',
+  );
 
   const aaStop = await callTool('wb_active_accounts_control', { action: 'stop' });
-  assert.equal(aaStop.acceptedCount, 0);
+  assert.equal(aaStop.acceptedCount, 1);
+
+  const aaStopAgain = await callTool('wb_active_accounts_control', { action: 'stop' });
+  assert.equal(aaStopAgain.acceptedCount, 0);
 
   const waitAa = await callTool('wb_wait_for_task', {
     module: 'active-accounts',

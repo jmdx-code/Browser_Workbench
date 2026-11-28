@@ -1,10 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 const readContexts = new AsyncLocalStorage<Set<DatabaseSync>>();
-const commitHooks = new WeakMap<DatabaseSync, () => void>();
-export function beforeCommit(db: DatabaseSync, hook: () => void) {
-  commitHooks.set(db, hook);
-}
 interface ConnectionTransactionState {
   writeDepth: number;
   readDepth: number;
@@ -48,9 +44,7 @@ export function transaction<T>(db: DatabaseSync, work: () => T): T {
     state.writeDepth++;
     try {
       const result = work();
-      if (isThenable(result)) {
-        throw Error('TRANSACTION_ASYNC_FORBIDDEN');
-      }
+      if (isThenable(result)) throw Error('TRANSACTION_ASYNC_FORBIDDEN');
       db.exec('RELEASE ' + name);
       return result;
     } catch (error) {
@@ -69,10 +63,7 @@ export function transaction<T>(db: DatabaseSync, work: () => T): T {
   state.writeDepth++;
   try {
     const result = work();
-    if (isThenable(result)) {
-      throw Error('TRANSACTION_ASYNC_FORBIDDEN');
-    }
-    commitHooks.get(db)?.();
+    if (isThenable(result)) throw Error('TRANSACTION_ASYNC_FORBIDDEN');
     db.exec('COMMIT');
     return result;
   } catch (error) {
@@ -112,9 +103,7 @@ function performReadSnapshot<T>(
     state.readDepth++;
     try {
       const result = work();
-      if (isThenable(result)) {
-        throw Error('READ_SNAPSHOT_ASYNC_FORBIDDEN');
-      }
+      if (isThenable(result)) throw Error('READ_SNAPSHOT_ASYNC_FORBIDDEN');
       return result;
     } finally {
       state.readDepth--;
@@ -125,9 +114,7 @@ function performReadSnapshot<T>(
   state.ownedReadSnapshot = true;
   try {
     const result = work();
-    if (isThenable(result)) {
-      throw Error('READ_SNAPSHOT_ASYNC_FORBIDDEN');
-    }
+    if (isThenable(result)) throw Error('READ_SNAPSHOT_ASYNC_FORBIDDEN');
     db.exec('COMMIT');
     return result;
   } catch (error) {

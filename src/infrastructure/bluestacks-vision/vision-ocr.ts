@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { isLocalAvatar } from '../../shared/group-bumper.js';
+import { attachChildJsonlReader } from '../bluestacks-win32.js';
 import { clampCrop, getCanonicalFrame, type RectBounds } from './vision-xml.js';
 const WINRT_OCR_POWERSHELL_SCRIPT = `
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
@@ -55,60 +56,66 @@ export interface OcrRecognizer {
   recognizeBounds(pngBuffer: Buffer, bounds: RectBounds): Promise<string>;
   close(): void;
 }
+export type SpawnOcrProcessFn = () => ChildProcessWithoutNullStreams;
 export class WindowsOcrClient implements OcrRecognizer {
   private proc: ChildProcessWithoutNullStreams | null = null;
-  private stdoutBuffer = '';
   private nextId = 1;
   private closed = false;
+  private readonly timeoutMs: number;
+  private readonly spawnChild: SpawnOcrProcessFn;
   private readonly pending = new Map<
     number,
-    { resolve: (text: string) => void; timer: ReturnType<typeof setTimeout> }
+    {
+      child: ChildProcessWithoutNullStreams;
+      resolve: (text: string) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
   >();
   private queue: Promise<unknown> = Promise.resolve();
+  constructor(options: { timeoutMs?: number; spawnChild?: SpawnOcrProcessFn } = {}) {
+    this.timeoutMs = options.timeoutMs ?? 8000;
+    this.spawnChild =
+      options.spawnChild ??
+      (() =>
+        spawn(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-WindowStyle',
+            'Hidden',
+            '-Command',
+            WINRT_OCR_POWERSHELL_SCRIPT,
+          ],
+          { windowsHide: true },
+        ));
+  }
   private ensureProcess(): ChildProcessWithoutNullStreams | null {
     if (this.closed || process.platform !== 'win32') return null;
-    if (this.proc && !this.proc.killed && this.proc.exitCode === null) return this.proc;
-    const child = spawn(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-WindowStyle',
-        'Hidden',
-        '-Command',
-        WINRT_OCR_POWERSHELL_SCRIPT,
-      ],
-      { windowsHide: true },
+    if (this.proc && !this.proc.killed && this.proc.exitCode === null && this.proc.stdin.writable)
+      return this.proc;
+    const child = this.spawnChild();
+    attachChildJsonlReader<{ id?: number; text?: string }>(
+      child,
+      () => this.proc === child,
+      (parsed) => {
+        if (typeof parsed.id !== 'number') return;
+        const waiter = this.pending.get(parsed.id);
+        if (waiter && waiter.child === child) {
+          clearTimeout(waiter.timer);
+          this.pending.delete(parsed.id);
+          waiter.resolve(String(parsed.text ?? ''));
+        }
+      },
     );
-    this.stdoutBuffer = '';
-    child.stdout.on('data', (chunk: Buffer) => {
-      this.stdoutBuffer += chunk.toString('utf8');
-      let nlIdx: number;
-      while ((nlIdx = this.stdoutBuffer.indexOf('\n')) !== -1) {
-        const line = this.stdoutBuffer.slice(0, nlIdx).trim();
-        this.stdoutBuffer = this.stdoutBuffer.slice(nlIdx + 1);
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line) as { id?: number; text?: string };
-          if (typeof parsed.id === 'number') {
-            const waiter = this.pending.get(parsed.id);
-            if (waiter) {
-              clearTimeout(waiter.timer);
-              this.pending.delete(parsed.id);
-              waiter.resolve(String(parsed.text ?? ''));
-            }
-          }
-        } catch {}
-      }
-    });
-    const flushPendingEmpty = () => {
-      this.clearPending();
+    const flushForChild = () => {
+      this.clearPendingForChild(child);
       if (this.proc === child) this.proc = null;
     };
     child.stderr.resume();
-    child.stdin.on('error', flushPendingEmpty);
-    child.on('exit', flushPendingEmpty);
-    child.on('error', flushPendingEmpty);
+    child.stdin.on('error', flushForChild);
+    child.on('exit', flushForChild);
+    child.on('error', flushForChild);
     this.proc = child;
     return child;
   }
@@ -171,9 +178,19 @@ export class WindowsOcrClient implements OcrRecognizer {
               child.kill();
             } catch {}
             resolve('');
-          }, 8000);
-          this.pending.set(id, { resolve, timer });
-          child.stdin.write(JSON.stringify({ id, b64 }) + '\n');
+          }, this.timeoutMs);
+          this.pending.set(id, { child, resolve, timer });
+          try {
+            child.stdin.write(JSON.stringify({ id, b64 }) + '\n');
+          } catch {
+            clearTimeout(timer);
+            this.pending.delete(id);
+            if (this.proc === child) this.proc = null;
+            try {
+              child.kill();
+            } catch {}
+            resolve('');
+          }
         });
         return rawText.replace(/\s+/g, ' ').trim();
       } catch {
@@ -183,11 +200,19 @@ export class WindowsOcrClient implements OcrRecognizer {
     this.queue = task.catch(() => '');
     return task;
   }
+  private clearPendingForChild(child: ChildProcessWithoutNullStreams): void {
+    for (const [id, waiter] of this.pending) {
+      if (waiter.child !== child) continue;
+      clearTimeout(waiter.timer);
+      this.pending.delete(id);
+      waiter.resolve('');
+    }
+  }
   private clearPending(): void {
     for (const [id, waiter] of this.pending) {
       clearTimeout(waiter.timer);
-      waiter.resolve('');
       this.pending.delete(id);
+      waiter.resolve('');
     }
   }
   close(): void {

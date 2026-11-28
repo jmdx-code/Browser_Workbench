@@ -1,6 +1,7 @@
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import {
   isBluestacksPortraitResolution,
+  isCompositePlaceholderBsAccountId,
   type BluestacksIdentityType,
   type BluestacksInstance,
   type BluestacksManagedIdentity,
@@ -116,9 +117,8 @@ async function openLiteMenuProfileCard(
   let cardNode = ready(menuXml) ? findMenuProfileCard(menuXml) : undefined;
   let lastTab = detectHomeTabBar(menuXml)?.tabs.at(-1) ?? null;
   for (let attempt = 0; attempt < 3 && !ready(menuXml); attempt++) {
-    if (attempt === 0) {
-      await tap900(ctx, serial, 859, 72, sw, sh, signal);
-    } else {
+    if (attempt === 0) await tap900(ctx, serial, 859, 72, sw, sh, signal);
+    else {
       if (!detectHomeTabBar(menuXml)) {
         await keyevent(ctx, serial, 4, signal).catch(() => null);
         await abortableWait(900, signal);
@@ -130,11 +130,75 @@ async function openLiteMenuProfileCard(
     await abortableWait(requireGridTiles ? 2200 : 2000, signal);
     menuXml = await dumpXml(ctx, serial, sw, sh, signal);
     cardNode = findMenuProfileCard(menuXml);
-    if (!ready(menuXml) && onLateAbnormalCheck) {
-      await onLateAbnormalCheck(menuXml);
-    }
+    if (!ready(menuXml) && onLateAbnormalCheck) await onLateAbnormalCheck(menuXml);
   }
   return { menuXml, cardNode: ready(menuXml) ? cardNode : undefined };
+}
+export function isValidNumericFbId(value: string | null | undefined): value is string {
+  return typeof value === 'string' && /^\d{5,}$/.test(value.trim());
+}
+export function isPlaceholderAccountString(
+  value: string | null | undefined,
+  displayName?: string,
+  serial?: string,
+): boolean {
+  const t = value?.trim() ?? '';
+  if (!t) return true;
+  const lo = t.toLowerCase(),
+    dn = displayName?.trim();
+  return Boolean(
+    (dn && (lo === dn.toLowerCase() || (t.startsWith(`${dn} (`) && t.endsWith(')')))) ||
+    (serial && lo === serial.trim().toLowerCase()) ||
+    /\((?:fb\s*lite)\)$/i.test(t) ||
+    /^(?:fb\s*lite|facebook|meta|menu|菜单|菜單|未知|unknown)$/i.test(t) ||
+    /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(t) ||
+    /^\d{1,4}$/.test(t),
+  );
+}
+export function classifyManagedIdentityRows(
+  rows: ReadonlyArray<{ name: string; active: boolean; bounds: RectBounds; rawText?: string }>,
+  activeType: BluestacksIdentityType,
+  knownIdentities?: ReadonlyArray<BluestacksManagedIdentity>,
+): Array<{ name: string; identityType: 'personal' | 'page'; active: boolean; bounds: RectBounds }> {
+  const fallbackType: 'personal' | 'page' = activeType === 'page' ? 'page' : 'personal';
+  const knownByName = new Map<string, 'personal' | 'page'>();
+  for (const k of knownIdentities ?? []) {
+    if (k.identityType === 'personal' || k.identityType === 'page') {
+      knownByName.set(k.name.trim().toLowerCase(), k.identityType);
+    }
+  }
+  const resolved: Array<{
+    name: string;
+    identityType: 'personal' | 'page' | null;
+    active: boolean;
+    bounds: RectBounds;
+  }> = rows.map((row) => {
+    const raw = row.rawText ?? '';
+    let identityType: 'personal' | 'page' | null = null;
+    if (/个人主页|个人资料|個人主頁|personal\s*profile|main\s*profile/i.test(raw)) {
+      identityType = 'personal';
+    } else if (
+      /公共主页|专页|專頁|粉丝专页|粉絲專頁|digital\s*creator|public\s*figure/i.test(raw)
+    ) {
+      identityType = 'page';
+    } else identityType = knownByName.get(row.name.trim().toLowerCase()) ?? null;
+    if (!identityType && row.active) identityType = fallbackType;
+    return { name: row.name, identityType, active: row.active, bounds: row.bounds };
+  });
+  let hasPersonal = resolved.some((r) => r.identityType === 'personal');
+  for (const item of resolved) {
+    if (item.identityType !== null) continue;
+    if (fallbackType === 'page' && !hasPersonal && !item.active) {
+      item.identityType = 'personal';
+      hasPersonal = true;
+    } else item.identityType = 'page';
+  }
+  return resolved.map((r) => ({
+    name: r.name,
+    identityType: r.identityType ?? 'page',
+    active: r.active,
+    bounds: r.bounds,
+  }));
 }
 export async function inspectOrSelectManagedIdentities(
   ctx: DeviceRuntimeContext,
@@ -144,7 +208,11 @@ export async function inspectOrSelectManagedIdentities(
   activeType: BluestacksIdentityType,
   sw: number,
   sh: number,
-  selectTarget?: { targetName?: string; targetType?: 'personal' | 'page' },
+  selectTarget?: {
+    targetName?: string;
+    targetType?: 'personal' | 'page';
+    knownIdentities?: ReadonlyArray<BluestacksManagedIdentity>;
+  },
   signal?: AbortSignal,
 ): Promise<{ identities: BluestacksManagedIdentity[]; switchedTo: string | null }> {
   const identities: BluestacksManagedIdentity[] = [];
@@ -162,12 +230,7 @@ export async function inspectOrSelectManagedIdentities(
   await abortableWait(1400, signal);
   const dropPng = await screencap(ctx, serial, signal);
   if (!(await isBottomSheetOpen(dropPng))) return { identities, switchedTo: null };
-  const parsedRows: Array<{
-    name: string;
-    identityType: 'personal' | 'page';
-    active: boolean;
-    bounds: RectBounds;
-  }> = [];
+  const rawRows: Array<{ name: string; active: boolean; bounds: RectBounds; rawText: string }> = [];
   for (const row of await detectBottomSheetIdentityRows(dropPng)) {
     const rawFull = (await ctx.ocr.recognizeBounds(dropPng, row.fullTextBounds))
       .replace(/[|_~`]/g, '')
@@ -183,6 +246,7 @@ export async function inspectOrSelectManagedIdentities(
       .replace(/[·•.,]?\s*\d+\s*(?:\+?\s*)?条\s*通\s*知.*$/i, '')
       .replace(/[·•.,]?\s*\d+\s*(?:\+?\s*)?notifications?.*$/i, '')
       .replace(/[·•.,]?\s*unread.*$/i, '')
+      .replace(/\s*(?:个人主页|个人资料|個人主頁|公共主页|专页|專頁)$/i, '')
       .trim();
     if (!cleanedName || cleanedName.length < 2) continue;
     const normRaw = cleanedName.toLowerCase();
@@ -192,20 +256,20 @@ export async function inspectOrSelectManagedIdentities(
       (Boolean(normActive) && (normRaw.includes(normActive) || normActive.includes(normRaw)));
     const displayName =
       isActive && activeName && normRaw.includes(normActive) ? activeName : cleanedName;
-    const rowType: 'personal' | 'page' = isActive
-      ? fallbackType
-      : parsedRows.length === 0 && fallbackType === 'page'
-        ? 'personal'
-        : 'page';
-    if (!parsedRows.some((p) => p.name.toLowerCase() === displayName.toLowerCase())) {
-      parsedRows.push({
+    if (!rawRows.some((p) => p.name.toLowerCase() === displayName.toLowerCase())) {
+      rawRows.push({
         name: displayName,
-        identityType: rowType,
         active: isActive,
         bounds: row.rowBounds,
+        rawText: rawFull,
       });
     }
   }
+  const parsedRows = classifyManagedIdentityRows(
+    rawRows,
+    activeType,
+    selectTarget?.knownIdentities,
+  );
   if (parsedRows.length > 0) {
     identities.splice(
       0,
@@ -213,7 +277,7 @@ export async function inspectOrSelectManagedIdentities(
       ...parsedRows.map(({ name, identityType, active }) => ({ name, identityType, active })),
     );
   }
-  if (selectTarget) {
+  if (selectTarget && (selectTarget.targetName || selectTarget.targetType)) {
     const wantName = selectTarget.targetName?.trim().toLowerCase() ?? '';
     const chosen = wantName
       ? parsedRows.find(
@@ -257,36 +321,52 @@ export async function extractActiveProfileNumericId(
       screencap(ctx, serial, signal),
       dumpXml(ctx, serial, sw, sh, signal),
     ]);
-    const allProfNodes = flattenLiteNodes(profXml);
-    const moreBtn =
+    const allProfNodes = flattenLiteNodes(profXml),
+      MORE_OCR_RE = /^(?:\.{2,3}|···|•••|…|more|更多|选项|菜單|菜单)$/i,
+      inBox = (
+        n: LiteXmlNode,
+        x1: number,
+        x2: number,
+        y1: number,
+        y2: number,
+        w1: number,
+        w2: number,
+        h1: number,
+        h2: number,
+      ) =>
+        n.bounds.x1 >= x1 &&
+        n.bounds.x2 <= x2 &&
+        n.bounds.y1 >= y1 &&
+        n.bounds.y2 <= y2 &&
+        n.bounds.w >= w1 &&
+        n.bounds.w <= w2 &&
+        n.bounds.h >= h1 &&
+        n.bounds.h <= h2;
+    let moreBtn =
+      allProfNodes.find(
+        (n) =>
+          n.clickable &&
+          inBox(n, 680, 900, 25, 1260, 36, 180, 36, 130) &&
+          (MORE_OCR_RE.test(`${n.text} ${n.contentDesc}`.replace(/\s+/g, '')) ||
+            /more|overflow|menu/i.test(n.resourceId)),
+      ) ??
       allProfNodes
-        .filter(
-          (n) =>
-            n.clickable &&
-            n.bounds.x1 >= 795 &&
-            n.bounds.x2 <= 900 &&
-            n.bounds.y1 >= 25 &&
-            n.bounds.y2 <= 155 &&
-            n.bounds.w >= 45 &&
-            n.bounds.w <= 115 &&
-            n.bounds.h >= 45 &&
-            n.bounds.h <= 120,
-        )
+        .filter((n) => n.clickable && inBox(n, 760, 900, 25, 165, 38, 130, 38, 125))
         .sort((a, b) => b.bounds.x1 - a.bounds.x1)[0] ??
       allProfNodes
-        .filter(
-          (n) =>
-            n.clickable &&
-            n.bounds.x1 >= 720 &&
-            n.bounds.x2 <= 895 &&
-            n.bounds.y1 >= 440 &&
-            n.bounds.y2 <= 1060 &&
-            n.bounds.w >= 48 &&
-            n.bounds.w <= 150 &&
-            n.bounds.h >= 40 &&
-            n.bounds.h <= 105,
+        .filter((n) => n.clickable && inBox(n, 680, 900, 360, 1260, 40, 175, 36, 120))
+        .sort((a, b) => a.bounds.y1 - b.bounds.y1 || b.bounds.x2 - a.bounds.x2)[0];
+    if (!moreBtn)
+      moreBtn = (
+        await findOcrNode(
+          ctx.ocr,
+          profPng,
+          allProfNodes
+            .filter((n) => inBox(n, 640, 900, 25, 1300, 32, 220, 32, 140))
+            .sort((a, b) => Number(b.clickable) - Number(a.clickable) || b.bounds.x1 - a.bounds.x1),
+          MORE_OCR_RE,
         )
-        .sort((a, b) => a.bounds.y1 - b.bounds.y1)[0];
+      )?.node;
     if (!moreBtn) {
       const profText = (
         await ctx.ocr.recognizeBounds(profPng, makeCanonicalRect(0, 420, 900, 960))
@@ -328,15 +408,11 @@ export async function extractActiveProfileNumericId(
             n.bounds.h <= 140,
         )
         .sort((a, b) => b.bounds.y1 - a.bounds.y1);
+      const COPY_RE = /复制链接|复制个人主页链接|复制公共主页链接|copylink|copyprofile|copypage/i;
       return (
-        (
-          await findOcrNode(
-            ctx.ocr,
-            morePng,
-            rows,
-            /复制链接|复制个人主页链接|复制公共主页链接|copylink|copyprofile|copypage/i,
-          )
-        )?.node ?? null
+        rows.find((n) => COPY_RE.test(`${n.text} ${n.contentDesc}`.replace(/\s+/g, ''))) ??
+        (await findOcrNode(ctx.ocr, morePng, rows, COPY_RE))?.node ??
+        null
       );
     };
     let copyBtn = await scanMoreScreen();
@@ -513,19 +589,19 @@ export async function inspectAccount(
     ctx,
     inst.serial,
     cardNode.bounds,
-    cleanName || expectedHint,
+    !isPlaceholderAccountString(cleanName, inst.displayName, inst.serial)
+      ? cleanName
+      : expectedHint,
     identityType,
     liveSize.width,
     liveSize.height,
-    undefined,
+    inst.managedIdentities?.length ? { knownIdentities: inst.managedIdentities } : undefined,
     signal,
   ).catch(() => ({ identities: [], switchedTo: null }));
   const effectiveName =
-    cleanName ||
-    expectedHint ||
-    managedIdentities.find((m) => m.active)?.name?.trim() ||
-    inst.accountName ||
-    inst.displayName;
+    [cleanName, expectedHint, managedIdentities.find((m) => m.active)?.name, inst.accountName]
+      .map((s) => s?.trim() ?? '')
+      .find((s) => !isPlaceholderAccountString(s, inst.displayName, inst.serial)) ?? '';
   const { numericId, identityHint: profIdentityHint } = await extractActiveProfileNumericId(
     ctx,
     inst.serial,
@@ -534,23 +610,39 @@ export async function inspectAccount(
     liveSize.height,
     signal,
   ).catch(() => ({ numericId: null, identityHint: 'unknown' as BluestacksIdentityType }));
-  if (profIdentityHint !== 'unknown') identityType = profIdentityHint;
+  if (profIdentityHint !== 'unknown') {
+    identityType = profIdentityHint;
+    for (const m of managedIdentities) {
+      if (m.active) m.identityType = profIdentityHint;
+    }
+  }
+  const sameAccount =
+    !effectiveName ||
+    isPlaceholderAccountString(inst.accountName, inst.displayName, inst.serial) ||
+    effectiveName.toLowerCase() === inst.accountName.trim().toLowerCase();
+  const existingNumericId = sameAccount
+    ? ([inst.numericAccountId, inst.accountId].find((v) => isValidNumericFbId(v))?.trim() ?? null)
+    : null;
+  const resolvedNumericId =
+    (isValidNumericFbId(numericId) ? numericId.trim() : null) ?? existingNumericId;
+  const preservedNonPlaceholderId =
+    sameAccount &&
+    !isPlaceholderAccountString(inst.accountId, inst.displayName, inst.serial) &&
+    !isCompositePlaceholderBsAccountId(inst.accountId, inst.displayName, inst.instanceKey)
+      ? inst.accountId.trim()
+      : null;
   await keyevent(ctx, inst.serial, 4, signal).catch(() => null);
   return await ctx.repo.saveInspectionResult({
     id: inst.id,
     fbLiteInstalled: true,
     accountState: 'logged-in',
-    accountId:
-      numericId ||
-      (effectiveName
-        ? `${inst.displayName} (${effectiveName})`
-        : inst.accountId || `${inst.displayName} (FB Lite)`),
+    accountId: resolvedNumericId ?? preservedNonPlaceholderId ?? '',
     accountName: effectiveName,
     avatarUrl: avatarUrl ?? inst.avatarUrl,
     fbWidth: liveSize.width,
     fbHeight: liveSize.height,
     identityType,
-    numericAccountId: numericId ?? undefined,
+    numericAccountId: resolvedNumericId ?? undefined,
     managedIdentities,
     androidSdk,
     fbLiteVersion,
@@ -612,15 +704,20 @@ export async function switchIdentity(
     ctx,
     inst.serial,
     cardNode.bounds,
-    inst.accountName,
+    isPlaceholderAccountString(inst.accountName, inst.displayName, inst.serial)
+      ? ''
+      : inst.accountName,
     inst.identityType ?? 'unknown',
     liveSize.width,
     liveSize.height,
-    target,
+    {
+      ...target,
+      ...(inst.managedIdentities?.length ? { knownIdentities: inst.managedIdentities } : {}),
+    },
     signal,
   );
   if (!switchedTo)
-    throw new ProductError(
+    failError(
       'BLUESTACKS_IDENTITY_NOT_FOUND',
       '未找到可切换的目标身份（可能该账号未管理公共主页或已处于目标身份）',
       404,

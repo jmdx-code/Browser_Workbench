@@ -4,7 +4,6 @@ import { devDiag } from '../../shared/dev-diagnostics.js';
 import { kernelAgentBrowserURL } from '../../shared/kernel-policy.js';
 import type { KernelBridge } from '../kernel-bridge.js';
 import * as P from './agent-browser-page.js';
-
 export type {
   HumanGateStatus,
   ObservedInteractiveElement,
@@ -30,7 +29,6 @@ interface ManagedAgentSession {
   browsingAbort: AbortController | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
 }
-
 const isPageClosed = (s: ManagedAgentSession) => {
   try {
     return s.connection.page.isClosed();
@@ -41,12 +39,10 @@ const isPageClosed = (s: ManagedAgentSession) => {
 const randBetween = (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1));
 const clamp = (v: number | undefined, def: number, min: number, max: number) =>
   Math.max(min, Math.min(max, Math.floor(v ?? def)));
-
 export class AgentBrowserManager {
   private readonly sessions = new Map<string, ManagedAgentSession>();
   private readonly locks = new Map<string, Promise<void>>();
   private readonly idleTimeoutMs: number;
-
   constructor(
     private readonly getCore: () => Core,
     private readonly getKernel: () => KernelBridge | undefined,
@@ -62,7 +58,6 @@ export class AgentBrowserManager {
       stopProfiles: async (ids) => void (await Promise.allSettled(ids.map((id) => this.close(id)))),
     });
   }
-
   private diag(
     event: string,
     profileId: string,
@@ -70,7 +65,6 @@ export class AgentBrowserManager {
   ) {
     devDiag.record({ level: 'INFO', category: 'BROWSER_ACTION', event, profileId, ...extra });
   }
-
   listSessions(): AgentBrowserSessionSummary[] {
     const now = Date.now();
     return [...this.sessions.values()].map((s) => {
@@ -89,7 +83,6 @@ export class AgentBrowserManager {
       };
     });
   }
-
   private touchIdleTimer(s: ManagedAgentSession): void {
     s.lastActiveAt = Date.now();
     if (s.idleTimer) clearTimeout(s.idleTimer);
@@ -100,7 +93,6 @@ export class AgentBrowserManager {
     }, this.idleTimeoutMs);
     s.idleTimer.unref?.();
   }
-
   private async withProfileLock<T>(profileId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(profileId) ?? Promise.resolve();
     let release: () => void = () => {};
@@ -114,7 +106,6 @@ export class AgentBrowserManager {
       if (this.locks.get(profileId) === chained) this.locks.delete(profileId);
     }
   }
-
   private withSession<T>(
     profileId: string,
     fn: (s: ManagedAgentSession) => Promise<T>,
@@ -136,7 +127,6 @@ export class AgentBrowserManager {
       return fn(s);
     });
   }
-
   private async closeSessionUnlocked(profileId: string): Promise<boolean> {
     const existing = this.sessions.get(profileId);
     if (!existing) return false;
@@ -154,7 +144,6 @@ export class AgentBrowserManager {
     });
     return true;
   }
-
   async close(profileId: string) {
     this.sessions.get(profileId)?.browsingAbort?.abort();
     return {
@@ -162,13 +151,11 @@ export class AgentBrowserManager {
       profileId,
     };
   }
-
   async closeAll() {
     const ids = [...this.sessions.keys()];
     ids.forEach((id) => this.sessions.get(id)?.browsingAbort?.abort());
     await Promise.allSettled(ids.map((id) => this.close(id)));
   }
-
   private async connectOrReuse(input: {
     profileId: string;
     foreground?: boolean;
@@ -236,7 +223,6 @@ export class AgentBrowserManager {
     } catch {}
     return { session, reusedSession: false };
   }
-
   async open(input: {
     profileId: string;
     url: string;
@@ -281,7 +267,6 @@ export class AgentBrowserManager {
       }
     });
   }
-
   private async runHumanBrowseLoop(session: ManagedAgentSession, requestedSeconds: number) {
     const abort = new AbortController();
     const startMs = Date.now();
@@ -320,7 +305,6 @@ export class AgentBrowserManager {
     }
     return { requestedSeconds, elapsedMs: Date.now() - startMs, scrollSteps, stoppedReason };
   }
-
   observe(input: {
     profileId: string;
     maxElements?: number;
@@ -331,7 +315,6 @@ export class AgentBrowserManager {
       P.observeWithNavRetry(s.connection.page, input),
     );
   }
-
   act(input: P.AgentBrowserActParams & { action: P.AgentBrowserActionKind }) {
     return this.withSession(input.profileId, async (s) => {
       const page = s.connection.page;
@@ -360,7 +343,6 @@ export class AgentBrowserManager {
       return { profileId: input.profileId, action: input.action, observation };
     });
   }
-
   screenshot(input: { profileId: string; fullPage?: boolean; quality?: number }) {
     return this.withSession(input.profileId, async (s) => {
       const buf = await s.connection.captureScreenshot({

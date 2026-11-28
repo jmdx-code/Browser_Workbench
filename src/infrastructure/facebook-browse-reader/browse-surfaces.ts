@@ -83,9 +83,10 @@ export function createBrowseRuntime(createRt: typeof createDomEvalRuntime): Brow
   let dialogDismissCSS: typeof FACEBOOK_BROWSE_DIALOG_DISMISS_CSS | null = null;
   if (dialogs) {
     const dangerousRe = /删除|刪除|Delete|注销|註銷|Deactivate|退出|登出|Log\s*Out|Sign\s*Out/i,
-      primaryLabelRe = /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now)$/i,
+      primaryLabelRe =
+        /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now|ပိတ်ရန်|ပိတ်ပါ|နောက်မှ|မလုပ်တော့ပါ|Đóng|Lúc\s*khác|ปิด|ไม่ใช่ตอนนี้)$/i,
       secondaryLabelRe =
-        /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now|继续|繼續|Continue|知道了|Got\s*it|OK|确定|確定|取消|Cancel)$/i,
+        /^(?:关闭|關閉|Close|Dismiss|以后再说|稍后|稍後|Not\s*Now|继续|繼續|Continue|知道了|Got\s*it|OK|确定|確定|取消|Cancel|ပိတ်ရန်|ပိတ်ပါ|နောက်မှ|ဆက်လုပ်ရန်|အိုကေ|မလုပ်တော့ပါ|Đóng|Lúc\s*khác|Tiếp\s*tục|ปิด|ไม่ใช่ตอนนี้|ดำเนินการต่อ|ตกลง)$/i,
       candidates: { el: Element; priority: number }[] = [];
     for (const dlg of blockingDialogs)
       for (const btn of Array.from(dlg.querySelectorAll('[role="button"],button')).slice(0, 80)) {
@@ -308,7 +309,15 @@ export function readBrowseFriendsAndMarket(rt: BrowseRuntime): BrowseFriendsAndM
             /auto|scroll/.test(getComputedStyle(el).overflowY),
         )
       : undefined;
-  const confirmLabels = new Set(['confirm', '确认', '確認']),
+  const confirmLabels = new Set([
+      'confirm',
+      '确认',
+      '確認',
+      'အတည်ပြုရန်',
+      'အတည်ပြုပါ',
+      'xác nhận',
+      'ยืนยัน',
+    ]),
     enabledFriendButtons = (pred: (el: Element) => boolean) =>
       friendNav
         ? Array.from(friendNav.querySelectorAll('[role="button"], button')).filter(
@@ -393,7 +402,13 @@ export function readBrowseFriendsAndMarket(rt: BrowseRuntime): BrowseFriendsAndM
     if (first) {
       const btnRect = first.getBoundingClientRect();
       if (btnRect.top < 72 || btnRect.bottom > innerHeight - 24)
-        first.scrollIntoView({ block: 'center' });
+        first.scrollIntoView({ block: 'center', inline: 'nearest' });
+      if (!canHitCenter(first)) {
+        const afterRect = first.getBoundingClientRect();
+        const delta = afterRect.top < 120 ? -100 : 100;
+        if (friendScroller) friendScroller.scrollTop += delta;
+        else window.scrollBy(0, delta);
+      }
       let cssMatched = false;
       if (canHitCenter(first)) {
         first.setAttribute(attr, '1');
@@ -471,28 +486,7 @@ export function readBrowseFriendsAndMarket(rt: BrowseRuntime): BrowseFriendsAndM
     /^\/marketplace(?:\/category\/[a-z0-9_-]{1,80}(?:\/search)?|\/(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)(?:\/|$))[a-z0-9_-]{1,80})(?:\/search)?|\/search)?\/?$/i.test(
       location.pathname,
     );
-  const marketplaceCategories = marketplace
-    ? [
-        ...new Set(
-          Array.from(document.querySelectorAll('a[href*="category_id="]'))
-            .slice(0, 200)
-            .map((el) => (el as HTMLAnchorElement).href)
-            .filter((href) => {
-              if (href.length > 2048) return false;
-              const url = new URL(href);
-              return (
-                url.origin === 'https://www.facebook.com' &&
-                /^\/marketplace\/(?:category\/[a-z0-9_-]{1,80}\/|(?:(?!(?:inbox|you|create|item|selling|buying|notifications|ineligible|search)\/)[a-z0-9_-]{1,80}\/))?search\/?$/i.test(
-                  url.pathname,
-                ) &&
-                url.searchParams.getAll('category_id').length === 1 &&
-                /^\d{1,30}$/.test(url.searchParams.get('category_id') ?? '') &&
-                url.searchParams.getAll('query').length <= 1
-              );
-            }),
-        ),
-      ].slice(0, 32)
-    : [];
+  const marketplaceCategories: string[] = [];
   const items = marketplace
     ? Array.from(main?.querySelectorAll('a[href]') ?? [])
         .slice(0, 1000)

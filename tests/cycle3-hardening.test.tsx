@@ -8,6 +8,8 @@ import type { Workspace } from '../src/shared/contracts.js';
 import type { Inspection } from '../src/shared/profile-inspection.js';
 import { ConfirmDialog } from '../src/renderer/confirm-dialog.js';
 import { InspectionReader } from '../src/renderer/inspection-reader.js';
+import { computeDragAutoScrollDelta } from '../src/renderer/accounts-sidebar-shell.js';
+import { getTargetProfileIds } from '../src/renderer/modules/window-layout-preview-canvas.js';
 import { ControlledNumberInput } from '../src/renderer/modules/shared/controlled-number-input.js';
 import { WorkspaceReader } from '../src/renderer/workspace-reader.js';
 
@@ -227,5 +229,36 @@ describe('Cycle 3 renderer hardening regressions', () => {
     expect(topbarTsx).toContain('topbar-concurrency-popover');
     expect(authPanelTsx).not.toContain('.css');
     expect(authPanelTsx).toContain('type="file"');
+  });
+
+  it('window layout selected scope filters strictly to checked online browsers without falling back to unchecked windows', () => {
+    const base = makeWorkspace().profiles[0];
+    if (!base) throw Error('missing fixture profile');
+    const p1 = { ...base, id: 'p-1', alias: 'A', browserName: 'A', online: true };
+    const p2 = { ...base, id: 'p-2', alias: 'B', browserName: 'B', online: true };
+    const p3 = { ...base, id: 'p-3', alias: 'C', browserName: 'C', online: false };
+    const profiles = [p1, p2, p3];
+
+    expect(getTargetProfileIds(profiles, new Set(['p-1']), 'selected', 'list')).toEqual(['p-1']);
+    expect(getTargetProfileIds(profiles, new Set(['p-3']), 'selected', 'list')).toEqual([]);
+    expect(getTargetProfileIds(profiles, new Set(), 'selected', 'list')).toEqual([]);
+    expect(getTargetProfileIds(profiles, new Set(['p-1']), 'all_online', 'list')).toEqual([
+      'p-1',
+      'p-2',
+    ]);
+
+    const routerTsx = readFileSync(
+      join(process.cwd(), 'src/renderer/workbench-view-router.tsx'),
+      'utf8',
+    );
+    expect(routerTsx).toContain('selectedProfileIds={s.selected}');
+    expect(routerTsx).toContain('selectedBluestacksIds={s.selectedBluestacks}');
+  });
+
+  it('computeDragAutoScrollDelta returns proportional edge scroll velocities and zero in the middle', () => {
+    expect(computeDragAutoScrollDelta(110, 100, 600)).toBeLessThan(0);
+    expect(computeDragAutoScrollDelta(350, 100, 600)).toBe(0);
+    expect(computeDragAutoScrollDelta(590, 100, 600)).toBeGreaterThan(0);
+    expect(computeDragAutoScrollDelta(100, 100, 100)).toBe(0);
   });
 });

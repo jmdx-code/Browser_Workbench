@@ -29,6 +29,14 @@ const buildTsvDocument = (
     headers.map(sanitizeTsvCell).join('\t'),
     ...rows.map((cols) => cols.map(sanitizeTsvCell).join('\t')),
   ].join('\n');
+export function formatDynamicTableAsTsv<T>(
+  columns: ReadonlyArray<{ header: string; value: (row: T) => unknown }>,
+  rows: readonly T[],
+): { tsv: string; count: number; colCount: number } {
+  const headers = columns.map((c) => c.header),
+    body = rows.map((row) => columns.map((c) => c.value(row)));
+  return { tsv: buildTsvDocument(headers, body), count: rows.length, colCount: columns.length };
+}
 export const POSTER_LOG_TSV_HEADERS =
   '发帖时间 浏览器 发帖身份 发帖账号/专页 账号/专页ID 目标小组 小组ID 状态 贴文摘要 帖子ID 发帖链接'.split(
     ' ',

@@ -3,7 +3,6 @@ import {
   type ResourceDownloadProgressValue,
   type ResourceDownloadReportValue,
 } from '../shared/resource-download.js';
-
 export async function readResourceDownloadStream(
   body: ReadableStream<Uint8Array>,
   onProgress: (value: ResourceDownloadProgressValue) => void,

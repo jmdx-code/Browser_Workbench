@@ -1,12 +1,6 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  type MouseEvent,
-  type ReactNode,
-  type RefObject,
-} from 'react';
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { TargetFolder, TargetListCommand, TargetListKind } from '../shared/target-list.js';
+import { mi } from './accounts-sidebar-shell.js';
 import { api } from './api.js';
 import { ConfirmDialog } from './confirm-dialog.js';
 import {
@@ -16,24 +10,37 @@ import {
   type FinderItem,
 } from './finder-list-model.js';
 import { IconMore, IconSearch } from './icons.js';
-import { Btn } from './modules/shared/module-ui.js';
+import { Btn, TriCheck } from './modules/shared/module-ui.js';
 import { NameDialog } from './name-dialog.js';
 import { PopoverMenu, type MenuItem } from './popover-menu.js';
 import { buildTargetCandidates, SelectByIdsDialog } from './select-by-ids-dialog.js';
 import { toggleSet } from './selection.js';
 import { UI_CHECKBOX, UI_INPUT_SM } from './ui/primitives.js';
-
+import { usePointerDragReorder, type PointerDragRowProps } from './use-pointer-drag-reorder.js';
 export { orderedFinderItems } from './finder-list-model.js';
-
 const FINDER_GRID =
-  'grid grid-cols-[28px_minmax(140px,1fr)_144px_96px_28px] items-center gap-2 max-[860px]:grid-cols-[28px_minmax(120px,1fr)_116px_80px_24px]';
+  'grid grid-cols-[24px_minmax(110px,1fr)_116px_80px_28px] items-center gap-1.5 max-[860px]:grid-cols-[24px_minmax(96px,1fr)_96px_68px_24px]';
 const PILL_CLS: Record<'ok' | 'run' | 'warn' | 'idle', string> = {
   ok: 'pill pill-ok inline-flex items-center rounded-full bg-[var(--ok-soft)] px-2 py-0.5 text-[11px] font-semibold tabular-nums text-[var(--ok)]',
   run: 'pill pill-run inline-flex items-center rounded-full bg-[var(--run-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--run)]',
   warn: 'pill pill-warn inline-flex items-center rounded-full bg-[var(--warn-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--warn)]',
   idle: 'pill pill-idle inline-flex items-center rounded-full bg-[var(--idle-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-2)]',
 };
-
+export function refreshAvatarMenuItem(p: {
+  refreshing: boolean;
+  busy: boolean;
+  disabled?: boolean;
+  onStart: () => void;
+  onStop: () => void;
+}): MenuItem {
+  return p.refreshing
+    ? { label: '停止刷新头像', disabled: p.busy, onSelect: p.onStop }
+    : {
+        label: p.busy ? '读取中…' : '刷新头像',
+        disabled: Boolean(p.disabled),
+        onSelect: p.onStart,
+      };
+}
 export function FinderAvatar({ item }: { item: Pick<FinderItem, 'name' | 'avatarUrl'> }) {
   const [broken, setBroken] = useState(false);
   useEffect(() => setBroken(false), [item.avatarUrl]);
@@ -51,13 +58,11 @@ export function FinderAvatar({ item }: { item: Pick<FinderItem, 'name' | 'avatar
     </span>
   );
 }
-
 export interface FinderDisabledItemInfo {
   badge: string;
   tone?: 'muted' | 'run' | 'warn' | undefined;
   title?: string | undefined;
 }
-
 export function FinderCheck(p: {
   ids: string[];
   selected: ReadonlySet<string>;
@@ -65,54 +70,30 @@ export function FinderCheck(p: {
   label: string;
   disabled?: boolean;
 }) {
-  const ref = useRef<HTMLInputElement>(null);
-  const count = p.ids.filter((id) => p.selected.has(id)).length;
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = count > 0 && count < p.ids.length;
-  }, [count, p.ids.length]);
+  const n = p.ids.filter((id) => p.selected.has(id)).length;
   return (
-    <input
-      ref={ref}
-      type="checkbox"
-      className={UI_CHECKBOX}
-      aria-label={p.label}
-      checked={p.ids.length > 0 && count === p.ids.length}
+    <TriCheck
+      checked={p.ids.length > 0 && n === p.ids.length}
+      mixed={n > 0 && n < p.ids.length}
+      label={p.label}
       disabled={p.disabled}
-      onChange={(e) => p.onChange(e.target.checked)}
+      onChange={p.onChange}
     />
   );
 }
-
 interface RowCtx {
-  listKind: TargetListKind;
   unavailable: boolean;
   selected: ReadonlySet<string>;
-  drop: string;
-  ordered: FinderItem[];
-  drag: RefObject<string[]>;
+  dropKey: string;
   paint: RefObject<boolean | null>;
-  textSelectRef: RefObject<boolean>;
   pointerHandledRef: RefObject<string | null>;
   selectionRef: RefObject<ReadonlySet<string>>;
   anchor: RefObject<string | null>;
-  setDrop: (v: string) => void;
   choose: (id: string, shift: boolean) => void;
   select: (ids: string[], checked: boolean) => void;
-  move: (
-    folderId: string | null,
-    moved?: string[],
-    target?: string,
-    after?: boolean,
-  ) => Promise<unknown>;
-  disableDrag: (e: MouseEvent<HTMLElement>) => void;
+  getDragProps: (rowId: string, folderId: string, rowDisabled: boolean) => PointerDragRowProps;
   onDel: (item: FinderItem) => void;
 }
-
-const isAfter = (e: MouseEvent<HTMLElement>) => {
-  const r = e.currentTarget.getBoundingClientRect();
-  return e.clientY >= r.top + r.height / 2;
-};
-
 function FinderTargetRow({
   item,
   dis,
@@ -126,14 +107,15 @@ function FinderTargetRow({
   const selectedRow = !dis && ctx.selected.has(item.id);
   const rowCls =
     `finder-row ${FINDER_GRID} border-b border-slate-100 px-3 py-1.5 text-xs transition-colors ` +
+    (!off ? 'cursor-grab active:cursor-grabbing ' : '') +
     (selectedRow
       ? 'is-selected bg-[var(--brand-soft)]/70 hover:bg-[var(--brand-soft)]'
       : dis
         ? 'is-disabled-target bg-slate-50/60 opacity-65'
         : 'hover:bg-slate-50/90') +
-    (ctx.drop === 'b:' + item.id
+    (ctx.dropKey === 'b:' + item.id
       ? ' drop-before shadow-[inset_0_2px_0_#2f6fed]'
-      : ctx.drop === 'a:' + item.id
+      : ctx.dropKey === 'a:' + item.id
         ? ' drop-after shadow-[inset_0_-2px_0_#2f6fed]'
         : '');
   const pillCls = dis
@@ -142,58 +124,15 @@ function FinderTargetRow({
   return (
     <div
       data-finder-id={item.id}
-      draggable={!off}
       title={dis?.title}
       className={rowCls}
       onClick={(e) => {
         if (!window.getSelection()?.toString().trim() && !off) ctx.choose(item.id, e.shiftKey);
       }}
-      onDragStart={(e) => {
-        if (
-          ctx.paint.current !== null ||
-          ctx.textSelectRef.current ||
-          window.getSelection()?.toString().trim()
-        )
-          return e.preventDefault();
-        ctx.drag.current = ctx.selected.has(item.id)
-          ? ctx.ordered.filter((i) => ctx.selected.has(i.id)).map((i) => i.id)
-          : [item.id];
-        e.dataTransfer.setData(
-          'text/plain',
-          JSON.stringify({ listKind: ctx.listKind, ids: ctx.drag.current }),
-        );
-        e.dataTransfer.effectAllowed = 'move';
-        const ghost = Object.assign(document.createElement('div'), {
-          className:
-            'finder-drag-ghost fixed -top-[9999px] left-0 rounded-lg border border-[var(--brand)] bg-[var(--graphite)] px-2.5 py-1 text-xs font-medium text-white shadow-md',
-          textContent: `移动 ${ctx.drag.current.length} 个条目`,
-        });
-        document.body.append(ghost);
-        e.dataTransfer.setDragImage(ghost, 0, 0);
-        setTimeout(() => ghost.remove(), 0);
-      }}
-      onDragEnd={() => {
-        ctx.drag.current = [];
-        ctx.setDrop('');
-      }}
-      onDragOver={(e) => {
-        if (!ctx.unavailable && ctx.drag.current.length) {
-          e.preventDefault();
-          ctx.setDrop((isAfter(e) ? 'a:' : 'b:') + item.id);
-        }
-      }}
-      onDragLeave={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) ctx.setDrop('');
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        if (ctx.unavailable || ctx.drag.current.includes(item.id)) return;
-        void ctx.move(item.folderId, ctx.drag.current, item.id, isAfter(e)).catch(() => {});
-        ctx.drag.current = [];
-        ctx.setDrop('');
-      }}
+      {...ctx.getDragProps(item.id, item.folderId ?? '', off)}
     >
       <span
+        data-no-drag="true"
         className="finder-check-cell flex h-full cursor-pointer items-center justify-center"
         onClick={(e) => e.stopPropagation()}
         onPointerDown={(e) => {
@@ -232,16 +171,16 @@ function FinderTargetRow({
       <span className="finder-name flex min-w-0 items-center gap-2">
         <FinderAvatar item={item} />
         <strong
+          data-no-drag="true"
           className="finder-row-name min-w-0 truncate font-medium text-[var(--text)] select-text"
-          onMouseDown={ctx.disableDrag}
         >
           {item.name}
         </strong>
       </span>
       <code
+        data-no-drag="true"
         className="truncate font-mono text-[11px] text-[var(--text-3)] select-text"
         title={item.id}
-        onMouseDown={ctx.disableDrag}
       >
         {item.id}
       </code>
@@ -265,14 +204,12 @@ function FinderTargetRow({
     </div>
   );
 }
-
 type FinderModal =
   | { kind: 'ids' }
   | { kind: 'name'; id?: string; name: string }
   | { kind: 'delete'; target: 'items'; ids: string[]; label: string }
   | { kind: 'delete'; target: 'folder'; id: string; name: string }
   | null;
-
 export function FinderTargetList(p: {
   listKind: TargetListKind;
   items: FinderItem[];
@@ -310,30 +247,13 @@ export function FinderTargetList(p: {
   const [modal, setModal] = useState<FinderModal>(null);
   const [error, setError] = useState('');
   const [working, setWorking] = useState(false);
-  const [drop, setDrop] = useState('');
   const anchor = useRef<string | null>(null);
-  const drag = useRef<string[]>([]);
   const paint = useRef<boolean | null>(null);
-  const textSelectRef = useRef(false);
   const pointerHandledRef = useRef<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const selectionRef = useRef(selected);
   selectionRef.current = selected;
   const unavailable = disabled || working;
-
-  const disableDrag = (e: MouseEvent<HTMLElement>) => {
-    textSelectRef.current = true;
-    e.stopPropagation();
-    const row = e.currentTarget.closest<HTMLElement>('.finder-row');
-    if (!row?.draggable) return;
-    row.draggable = false;
-    const restore = () => {
-      row.draggable = !unavailable;
-      window.removeEventListener('mouseup', restore, true);
-      window.removeEventListener('dragend', restore, true);
-    };
-    window.addEventListener('mouseup', restore, true);
-    window.addEventListener('dragend', restore, true);
-  };
   const loadFolders = async () => {
     const next = await api.targetFolders(listKind);
     setFolders(next);
@@ -361,7 +281,6 @@ export function FinderTargetList(p: {
   useEffect(() => {
     const stop = () => {
       paint.current = null;
-      textSelectRef.current = false;
       setTimeout(() => {
         pointerHandledRef.current = null;
       }, 0);
@@ -372,7 +291,6 @@ export function FinderTargetList(p: {
         window.removeEventListener(ev, stop);
     };
   }, []);
-
   const q = query.trim().toLowerCase();
   const matchedFids = new Set(
     q ? folders.filter((f) => f.name.toLowerCase().includes(q)).map((f) => f.id) : [],
@@ -396,7 +314,6 @@ export function FinderTargetList(p: {
           .filter((i) => (i.folderId ?? '') === f.id && !disabledItems?.has(i.id))
           .map((i) => i.id),
   );
-
   const select = (ids: string[], checked: boolean) => {
     const next = new Set(selectionRef.current);
     ids.forEach((id) => (checked ? !disabledItems?.has(id) && next.add(id) : next.delete(id)));
@@ -470,52 +387,51 @@ export function FinderTargetList(p: {
       setWorking(false);
     }
   };
-
+  const drag = usePointerDragReorder({
+    disabled: unavailable,
+    scrollContainerRef: scrollRef,
+    unitLabel: '条目',
+    getDragIds: (rowId) =>
+      selectionRef.current.has(rowId)
+        ? ordered.filter((i) => selectionRef.current.has(i.id)).map((i) => i.id)
+        : [rowId],
+    isFolderCollapsed: (fid) => !q && closed.has(fid),
+    onAutoExpandFolder: (fid) => setClosed((prev) => toggleSet(prev, [fid], false)),
+    onDropOnRow: (fid, ids, targetId, after) => {
+      void move(fid || null, ids, targetId, after).catch(() => {});
+    },
+    onDropOnFolder: (fid, ids) => {
+      void move(fid || null, ids).catch(() => {});
+    },
+  });
   const rowCtx: RowCtx = {
-    listKind,
     unavailable,
     selected,
-    drop,
-    ordered,
-    drag,
+    dropKey: drag.dropKey,
     paint,
-    textSelectRef,
     pointerHandledRef,
     selectionRef,
     anchor,
-    setDrop,
     choose,
     select,
-    move,
-    disableDrag,
+    getDragProps: drag.getRowProps,
     onDel: (t) =>
       setModal({ kind: 'delete', target: 'items', ids: [t.id], label: `「${t.name}」` }),
   };
   const selectedCount = items.filter((i) => selected.has(i.id)).length;
   const menuItems: MenuItem[] = [
     ...(moreItems ?? []),
-    {
-      label: '＋ 新建分组…',
-      disabled: unavailable,
-      onSelect: () => setModal({ kind: 'name', name: '' }),
-    },
+    mi('＋ 新建分组…', () => setModal({ kind: 'name', name: '' }), { disabled: unavailable }),
     ...(selected.size > 0
       ? [
           { separator: true as const, label: '移动已选到分组' },
-          {
-            label: '移到：未分组',
-            disabled: unavailable,
-            onSelect: () => void move(null).catch(() => {}),
-          },
-          ...folders.map((f) => ({
-            label: '移到：' + f.name,
-            disabled: unavailable,
-            onSelect: () => void move(f.id).catch(() => {}),
-          })),
+          mi('移到：未分组', () => void move(null).catch(() => {}), { disabled: unavailable }),
+          ...folders.map((f) =>
+            mi('移到：' + f.name, () => void move(f.id).catch(() => {}), { disabled: unavailable }),
+          ),
         ]
       : []),
   ];
-
   const dropCls = ' is-drop ring-2 ring-inset ring-blue-500 bg-blue-50/60';
   return (
     <section
@@ -609,7 +525,11 @@ export function FinderTargetList(p: {
           {error}
         </p>
       )}
-      <div className="min-h-0 flex-1 overflow-auto rounded-b-xl">
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-auto rounded-b-xl"
+        onClickCapture={drag.onContainerClickCapture}
+      >
         <div
           className={`finder-columns ${FINDER_GRID} sticky top-0 z-10 border-b border-[var(--line)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] font-semibold text-[var(--text-3)]`}
         >
@@ -629,34 +549,15 @@ export function FinderTargetList(p: {
           const selIds = rows.map((i) => i.id).filter((id) => !disabledItems?.has(id));
           if (q && rows.length === 0) return null;
           const isClosed = !q && closed.has(f.id);
-          const dropHandlers = (reqNonEmpty: boolean) => ({
-            onDragOver: (e: React.DragEvent<HTMLElement>) => {
-              if (!unavailable && drag.current.length) {
-                e.preventDefault();
-                setDrop('f:' + f.id);
-              }
-            },
-            onDragLeave: (e: React.DragEvent<HTMLElement>) => {
-              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrop('');
-            },
-            onDrop: (e: React.DragEvent<HTMLElement>) => {
-              e.preventDefault();
-              if (!unavailable && (!reqNonEmpty || drag.current.length)) {
-                void move(f.id || null, drag.current).catch(() => {});
-                drag.current = [];
-                setDrop('');
-              }
-            },
-          });
           return (
             <section key={f.id || 'unfiled'}>
               {(f.id || folders.length > 0) && (
                 <div
+                  data-drag-drop-folder-id={f.id}
                   className={
                     'finder-folder group/fld flex items-center gap-2 border-b border-[var(--line)] bg-slate-50/90 px-3 py-1.5 text-xs transition-colors' +
-                    (drop === 'f:' + f.id ? dropCls : '')
+                    (drag.dropKey === 'f:' + f.id ? dropCls : '')
                   }
-                  {...dropHandlers(false)}
                 >
                   <FinderCheck
                     ids={selIds}
@@ -725,11 +626,11 @@ export function FinderTargetList(p: {
                 ))}
               {!isClosed && !rows.length && (
                 <p
+                  data-drag-drop-folder-id={f.id}
                   className={
                     'finder-empty m-0 px-3 py-5 text-center text-xs text-[var(--text-3)] transition-colors' +
-                    (drop === 'f:' + f.id ? dropCls : '')
+                    (drag.dropKey === 'f:' + f.id ? dropCls : '')
                   }
-                  {...dropHandlers(true)}
                 >
                   {query ? '无匹配条目' : '暂无条目'}
                 </p>
@@ -792,6 +693,7 @@ export function FinderTargetList(p: {
           }}
         />
       )}
+      {drag.ghost}
     </section>
   );
 }

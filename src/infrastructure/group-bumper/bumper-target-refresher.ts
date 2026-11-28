@@ -6,7 +6,6 @@ import {
   isCompleteNumericId,
   isLocalAvatar,
   isPlaceholderTargetName,
-  isTargetIncomplete,
   type BumperRefreshResult,
   type BumperTarget,
 } from '../../shared/group-bumper.js';
@@ -35,6 +34,11 @@ import {
   extractTargetCandidateInPage,
   type InPageTargetProbeResult,
 } from './bumper-target-extractor.js';
+import {
+  buildTargetCompletionSnapshot,
+  isAccountAbnormalCodeOrMessage,
+  resolveAvatarFallbackSource,
+} from './target-meta-helpers.js';
 export interface TargetRefresherDeps {
   repo: CompatibleRepository<SqliteGroupBumperRepository>;
   kernel: () => KernelBridge | undefined;
@@ -62,9 +66,7 @@ export async function refreshBumperTargets(
   }
   const kernel = deps.kernel(),
     core = deps.core();
-  if (!kernel || !core) {
-    return { updated: 0, needsBrowser: items.length, failed: 0 };
-  }
+  if (!kernel || !core) return { updated: 0, needsBrowser: items.length, failed: 0 };
   const isPeerEligible = async (peer: NonNullable<ReturnType<Core['peers']['get']>>) =>
     peer.online &&
     peer.synced &&
@@ -89,9 +91,7 @@ export async function refreshBumperTargets(
   const priority = (c: (typeof candidates)[number]) =>
     preferred?.id === c.peer.profileId && preferred.epoch === c.peer.epoch ? 2 : c.ready;
   candidates.sort((a, b) => priority(b) - priority(a));
-  if (candidates.length === 0) {
-    return { updated: 0, needsBrowser: items.length, failed: 0 };
-  }
+  if (candidates.length === 0) return { updated: 0, needsBrowser: items.length, failed: 0 };
   let nextItemIndex = 0;
   let totalUpdated = 0;
   let totalFailed = 0;
@@ -162,6 +162,8 @@ export async function refreshBumperTargets(
               processedCount++;
               nextItemIndex = i + 1;
             };
+            const isItemActive = () =>
+              !itemController.signal.aborted && activeItemToken === itemToken;
             try {
               if (kind === 'pages') {
                 const redirectedId = await readBumperPageRedirect(page, item.id).catch(() => null);
@@ -179,9 +181,7 @@ export async function refreshBumperTargets(
                     avatarUrl: item.avatarUrl,
                   });
                   updated++;
-                  itemCounted = true;
-                  processedCount++;
-                  nextItemIndex = i + 1;
+                  advanceItem(false);
                   continue;
                 }
               }
@@ -237,17 +237,13 @@ export async function refreshBumperTargets(
                 lastObservedHref = probe.href || lastObservedHref;
                 const urlAbnormal = classifyFacebookAbnormalUrl(probe.href);
                 const abnormalCode = urlAbnormal ?? probe.abnormal;
-                if (abnormalCode) {
-                  throw new BumperMetadataAccountError(abnormalCode);
-                }
+                if (abnormalCode) throw new BumperMetadataAccountError(abnormalCode);
                 if (!probe.navigated) {
                   await wait(250);
                   continue;
                 }
                 if (probe.summary) {
-                  devDiag.record({
-                    category: 'GROUP_BUMPER',
-                    event: 'TARGET_METADATA_SAMPLE',
+                  devDiag.emit('INFO', 'GROUP_BUMPER', 'TARGET_METADATA_SAMPLE', {
                     profileId: peer.profileId,
                     data: { rawId: item.id, summary: probe.summary },
                   });
@@ -294,31 +290,19 @@ export async function refreshBumperTargets(
                 }
                 await wait(350);
               }
-              if (!itemController.signal.aborted && activeItemToken === itemToken) {
-                let localizedAvatar: string | null = isLocalAvatar(item.avatarUrl)
-                  ? item.avatarUrl
-                  : null;
-                const avatarSourceUrl =
-                  bestRawAvatarUrl ??
-                  (!localizedAvatar &&
-                  typeof item.avatarUrl === 'string' &&
-                  item.avatarUrl.startsWith('https://')
-                    ? item.avatarUrl
-                    : null);
-                if (
-                  avatarSourceUrl &&
-                  !itemController.signal.aborted &&
-                  activeItemToken === itemToken
-                ) {
+              if (isItemActive()) {
+                const avatarFallback = resolveAvatarFallbackSource(
+                  bestRawAvatarUrl,
+                  item.avatarUrl,
+                );
+                let localizedAvatar = avatarFallback.localized;
+                const avatarSourceUrl = avatarFallback.sourceUrl;
+                if (avatarSourceUrl && isItemActive()) {
                   localizedAvatar = await fetchAndLocalizeAvatar(
                     avatarSourceUrl,
                     itemController.signal,
                   );
-                  if (
-                    !localizedAvatar &&
-                    !itemController.signal.aborted &&
-                    activeItemToken === itemToken
-                  ) {
+                  if (!localizedAvatar && isItemActive()) {
                     const inPageBytes = await page
                       .evaluate(async (imgUrl) => {
                         const res = await fetch(imgUrl, {
@@ -335,17 +319,13 @@ export async function refreshBumperTargets(
                           : Array.from(new Uint8Array(buf));
                       }, avatarSourceUrl)
                       .catch(() => null);
-                    if (
-                      inPageBytes?.length &&
-                      !itemController.signal.aborted &&
-                      activeItemToken === itemToken
-                    )
+                    if (inPageBytes?.length && isItemActive())
                       localizedAvatar = await localizeAvatarBytesToDataUrl(
                         new Uint8Array(inPageBytes),
                       );
                   }
                 }
-                if (!itemController.signal.aborted && activeItemToken === itemToken) {
+                if (isItemActive()) {
                   const resolvedMeta: ResolvedTargetMetadata = {
                     canonicalId: bestCanonicalId,
                     name: bestName,
@@ -353,20 +333,12 @@ export async function refreshBumperTargets(
                   };
                   if (resolvedMeta.canonicalId || resolvedMeta.name || resolvedMeta.avatarUrl)
                     await options?.onItemResolved?.(item.id, resolvedMeta);
-                  const finalTarget = {
-                    id: resolvedMeta.canonicalId ?? item.id,
-                    name: resolvedMeta.name ?? item.name,
-                    avatarUrl:
-                      resolvedMeta.avatarUrl ??
-                      (isLocalAvatar(item.avatarUrl) ? item.avatarUrl : null),
-                  };
-                  if (!isTargetIncomplete(finalTarget)) updated++;
+                  const { complete } = buildTargetCompletionSnapshot(item, resolvedMeta);
+                  if (complete) updated++;
                   else failed++;
                   advanceItem(false);
                   previousHref = lastObservedHref || targetUrl;
-                  devDiag.record({
-                    category: 'GROUP_BUMPER',
-                    event: 'TARGET_METADATA_READ',
+                  devDiag.emit('INFO', 'GROUP_BUMPER', 'TARGET_METADATA_READ', {
                     profileId: peer.profileId,
                     data: {
                       kind,
@@ -383,18 +355,11 @@ export async function refreshBumperTargets(
             } catch (itemError) {
               if (itemError instanceof BumperMetadataAccountError) throw itemError;
               const msg = itemError instanceof Error ? itemError.message : String(itemError);
-              if (
-                /FACEBOOK_ACCOUNT_(?:LOGGED_OUT|VERIFICATION_REQUIRED|RESTRICTED)|FACEBOOK_METADATA_LOGIN_REQUIRED/.test(
-                  msg,
-                )
-              )
-                throw new BumperMetadataAccountError(msg);
+              if (isAccountAbnormalCodeOrMessage(msg)) throw new BumperMetadataAccountError(msg);
               if (/FACEBOOK_METADATA_BROWSER_BUSY|FACEBOOK_METADATA_BATCH_ABORTED/.test(msg))
                 throw itemError;
               advanceItem(true);
-              devDiag.record({
-                category: 'GROUP_BUMPER',
-                event: 'TARGET_METADATA_ITEM_ERROR',
+              devDiag.emit('INFO', 'GROUP_BUMPER', 'TARGET_METADATA_ITEM_ERROR', {
                 profileId: peer.profileId,
                 reason: msg.slice(0, 500),
                 data: { kind, rawId: item.id },
@@ -430,27 +395,20 @@ export async function refreshBumperTargets(
       totalFailed += failed;
       if (enteredBatchSession) anyEnteredBatchSession = true;
       const msg = error instanceof Error ? error.message : String(error);
-      devDiag.record({
-        category: 'GROUP_BUMPER',
-        event: 'TARGET_METADATA_ERROR',
+      devDiag.emit('INFO', 'GROUP_BUMPER', 'TARGET_METADATA_ERROR', {
         profileId: peer.profileId,
         reason: msg.slice(0, 700),
         data: { enteredBatchSession, processedCount, totalItems: items.length },
       });
-      if (
-        error instanceof BumperMetadataAccountError ||
-        /FACEBOOK_ACCOUNT_(?:LOGGED_OUT|VERIFICATION_REQUIRED|RESTRICTED)|FACEBOOK_METADATA_LOGIN_REQUIRED/.test(
-          msg,
-        )
-      ) {
-        const abnormalState =
+      if (error instanceof BumperMetadataAccountError || isAccountAbnormalCodeOrMessage(msg)) {
+        const state =
           error instanceof BumperMetadataAccountError
             ? error.abnormalState
             : (inferAbnormalStateFromCodeOrMessage(msg) ?? 'logged-out');
         await deps.getOnAccountAbnormal()?.({
           profileId: peer.profileId,
           scope: 'global_route',
-          state: abnormalState,
+          state,
           reason: msg,
         });
         lastAccountError = '当前闲置浏览器登录态失效或受限，请先检查账号状态';
@@ -473,17 +431,12 @@ export async function refreshBumperTargets(
       deps.metadataProfiles.delete(peer.profileId);
     }
   }
-  const remaining = Math.max(0, items.length - nextItemIndex);
-  if (lastAccountError)
-    return {
-      updated: totalUpdated,
-      needsBrowser: 0,
-      failed: totalFailed + remaining,
-      error: lastAccountError,
-    };
-  if (anyEnteredBatchSession)
-    return { updated: totalUpdated, needsBrowser: 0, failed: totalFailed + remaining };
-  return { updated: totalUpdated, needsBrowser: remaining, failed: totalFailed };
+  const rem = Math.max(0, items.length - nextItemIndex);
+  return lastAccountError
+    ? { updated: totalUpdated, needsBrowser: 0, failed: totalFailed + rem, error: lastAccountError }
+    : anyEnteredBatchSession
+      ? { updated: totalUpdated, needsBrowser: 0, failed: totalFailed + rem }
+      : { updated: totalUpdated, needsBrowser: rem, failed: totalFailed };
 }
 export async function refreshBumperTargetBatch(
   deps: TargetRefresherDeps,
@@ -498,6 +451,15 @@ export async function refreshBumperTargetBatch(
   const browserQueueSlots: Array<BumperTarget | null> = new Array(items.length).fill(null);
   let nextHttpIdx = 0;
   const httpWorkerCount = Math.min(5, Math.max(1, items.length));
+  const applyResolvedMeta = async (rawId: string, meta: ResolvedTargetMetadata) => {
+    if (
+      (meta.name || meta.avatarUrl || (meta.canonicalId && meta.canonicalId !== rawId)) &&
+      (await deps.repo.applyResolvedTargetMetadata(kind, rawId, meta))
+    ) {
+      updatedIds.add(rawId);
+      options?.onUpdated?.();
+    }
+  };
   await Promise.all(
     Array.from({ length: httpWorkerCount }, async () => {
       for (;;) {
@@ -510,60 +472,36 @@ export async function refreshBumperTargetBatch(
           const meta = await resolveBumperTargetMetadata(kind, item.id, batchSignal);
           if (batchSignal?.aborted) break;
           if (!meta.avatarUrl) {
-            if (isLocalAvatar(item.avatarUrl)) {
-              meta.avatarUrl = item.avatarUrl;
-            } else if (
-              typeof item.avatarUrl === 'string' &&
-              item.avatarUrl.startsWith('https://')
-            ) {
-              meta.avatarUrl = await fetchAndLocalizeAvatar(item.avatarUrl, batchSignal);
-            }
+            const avatarFallback = resolveAvatarFallbackSource(null, item.avatarUrl);
+            meta.avatarUrl =
+              avatarFallback.localized ??
+              (avatarFallback.sourceUrl
+                ? await fetchAndLocalizeAvatar(avatarFallback.sourceUrl, batchSignal)
+                : null);
           }
           if (batchSignal?.aborted) break;
-          const hasNewMeta = Boolean(
-            meta.name || meta.avatarUrl || (meta.canonicalId && meta.canonicalId !== item.id),
-          );
-          if (hasNewMeta) {
-            if (await deps.repo.applyResolvedTargetMetadata(kind, item.id, meta)) {
-              updatedIds.add(item.id);
-              options?.onUpdated?.();
-            }
-          }
-          const effectiveTarget = {
-            id: meta.canonicalId ?? item.id,
-            name: meta.name ?? item.name,
-            avatarUrl: meta.avatarUrl ?? (isLocalAvatar(item.avatarUrl) ? item.avatarUrl : null),
-          };
-          if (!isTargetIncomplete(effectiveTarget)) {
-            updatedIds.add(item.id);
-          } else {
+          await applyResolvedMeta(item.id, meta);
+          const { target: effectiveTarget, complete } = buildTargetCompletionSnapshot(item, meta);
+          if (complete) updatedIds.add(item.id);
+          else
             browserQueueSlots[idx] = {
               ...item,
               id: effectiveTarget.id,
               name: effectiveTarget.name,
               avatarUrl: effectiveTarget.avatarUrl ?? item.avatarUrl,
             };
-          }
         } catch {
           browserQueueSlots[idx] = item;
         }
       }
     }),
   );
-  for (const queued of browserQueueSlots) {
-    if (queued) browserQueue.push(queued);
-  }
+  for (const queued of browserQueueSlots) if (queued) browserQueue.push(queued);
   if (browserQueue.length > 0 && !batchSignal?.aborted) {
     const browserOut = await refreshBumperTargets(deps, kind, browserQueue, {
       signal: batchSignal,
       onItemResolved: async (rawId, meta) => {
-        if (batchSignal?.aborted) return;
-        if (meta.name || meta.avatarUrl || meta.canonicalId) {
-          if (await deps.repo.applyResolvedTargetMetadata(kind, rawId, meta)) {
-            updatedIds.add(rawId);
-            options?.onUpdated?.();
-          }
-        }
+        if (!batchSignal?.aborted) await applyResolvedMeta(rawId, meta);
       },
     });
     result.needsBrowser += browserOut.needsBrowser;

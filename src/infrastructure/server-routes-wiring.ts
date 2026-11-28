@@ -27,13 +27,12 @@ import {
   FeatureExecutionRegistry,
   ensureFeatureExecutionRegistry,
 } from '../application/feature-execution-registry.js';
-import { syncGlobalConcurrencyToModules } from '../application/global-concurrency-sync.js';
 import {
   createGlobalAccountAbnormalReporter,
   type GlobalAccountAbnormalReporter,
 } from '../application/account-abnormal-reporter.js';
 import { taskBlocksSoftwareUpdate } from '../domain/system-ports.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { GroupBumperBrowserAdapter } from './group-bumper-runner.js';
 import { TargetMetadataRefreshService } from './target-metadata-refresh.js';
 import { FilesystemPosterMediaPreparer, GroupPosterBrowserAdapter } from './group-poster-runner.js';
@@ -77,6 +76,7 @@ import type { FilesystemRuntimeLog } from './runtime-log.js';
 import type { DevDiagnosticsFileWriter } from './dev-diagnostics-writer.js';
 import type { KernelBridge } from './kernel-bridge.js';
 import type { ActiveAccountRuntime } from './active-account-runtime.js';
+import type { DailyRiskActionKind } from '../shared/daily-risk-limits.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { WorkspaceEventHub } from '../application/workspace-event-hub.js';
 interface ServerRoutesContextRefs {
@@ -119,7 +119,6 @@ const NON_MUTATING_POST_ROUTES = new Set([
   '/api/workspace/google-sheets/links/sync-library',
   '/api/workspace/google-sheets/links/import-library',
   '/api/workspace/tasks/records',
-  '/api/workspace/tasks/history',
   '/api/workspace/resource-tables/read',
   '/api/workspace/data-cleanup/preview',
 ]);
@@ -217,27 +216,41 @@ export function buildServerAppRoutes({
       (id) => refs.getMainKernel()?.presentationStatus(id) ?? null,
     ),
   );
+  const autoLayoutArranged = new Map<string, string>();
   refs.setAutoInspectSweep(async () => {
+    if (refs.getShuttingDown() || process.env.WORKBENCH_DIAGNOSTICS === '1') return;
+    const layout = refs.getWindowLayout();
+    const layoutEnabled = layout?.isEnabled() === true;
+    const layoutGen = layout?.currentGeneration() ?? 0;
+    if (!layoutEnabled) autoLayoutArranged.clear();
+    else {
+      for (const [pid, tag] of autoLayoutArranged) {
+        const peer = core.peers.get(pid);
+        if (!peer?.online || peer.browserWindowCount === 0 || tag !== `${peer.epoch}:${layoutGen}`)
+          autoLayoutArranged.delete(pid);
+      }
+    }
     const activeInspection = refs.getInspection();
-    if (!activeInspection || refs.getShuttingDown() || process.env.WORKBENCH_DIAGNOSTICS === '1')
-      return;
-    const cache = await repository.profileAccountCache();
+    const cache = activeInspection ? await repository.profileAccountCache() : null;
     const candidates: string[] = [];
     for (const peer of core.peers.values()) {
-      if (
-        !peer.online ||
-        !peer.synced ||
-        peer.phase !== 'PAUSED' ||
-        peer.browserWindowCount === 0 ||
-        !peer.capabilities?.includes('facebook-existing-display-v1')
-      )
+      if (!peer.online || !peer.synced || peer.phase !== 'PAUSED' || peer.browserWindowCount === 0)
         continue;
-      const cached = cache.get(peer.profileId);
-      if (cached?.id && isLocalAvatar(cached.avatar)) continue;
       if (await featureExecution.isProfileBusy(peer.profileId)) continue;
+      if (layout && layoutEnabled) {
+        const tag = `${peer.epoch}:${layoutGen}`;
+        if (autoLayoutArranged.get(peer.profileId) !== tag) {
+          autoLayoutArranged.set(peer.profileId, tag);
+          void layout.arrange(peer.profileId).catch(() => {});
+        }
+      }
+      if (!activeInspection || !peer.capabilities?.includes('facebook-existing-display-v1'))
+        continue;
+      const cached = cache?.get(peer.profileId);
+      if (cached?.id && isLocalAvatar(cached.avatar)) continue;
       candidates.push(peer.profileId);
     }
-    if (candidates.length > 0) activeInspection.observeConnections(candidates);
+    if (activeInspection && candidates.length > 0) activeInspection.observeConnections(candidates);
   });
   const assertSystemIdle = () => {
     refs.getDataCleanup()?.assertNotResetting();
@@ -249,13 +262,17 @@ export function buildServerAppRoutes({
     () => refs.getActiveRuntime(),
     assertSystemIdle,
   );
+  taskService.setWorkboard(workboard);
   let groupBumperService: GroupBumperService | undefined;
   featureExecution.register({
     id: 'active-accounts',
     label: '活跃账号',
     isProfileRunning: (profileId) =>
+      workboard.carrierModule(profileId) === 'active-accounts' ||
       repository.tasks.hasProfilePlanInStates(profileId, ['QUEUED', 'RUNNING']),
-    hasActiveExecution: () => refs.getActiveRuntime()?.hasActiveExecution() === true,
+    hasActiveExecution: () =>
+      workboard.isModuleActive('active-accounts') ||
+      refs.getActiveRuntime()?.hasActiveExecution() === true,
     stopProfiles: async (profileIds) => {
       await Promise.all(profileIds.map((id) => taskService.stopActiveProfile(id)));
     },
@@ -402,7 +419,7 @@ export function buildServerAppRoutes({
           ),
         );
         if (activeLabels.length > 0 || hasLiveTaskPlan)
-          throw new ProductError(
+          failError(
             'UPDATE_TASKS_ACTIVE',
             `当前有任务正在运行${activeLabels.length > 0 ? `（${activeLabels.join('、')}）` : ''}，请先暂停或停止任务后再执行一键更新`,
             409,
@@ -438,7 +455,7 @@ export function buildServerAppRoutes({
     async () => {
       const activeLabels = await featureExecution.activeModuleLabels();
       if (activeLabels.length > 0)
-        throw new ProductError(
+        failError(
           'RESET_TASKS_ACTIVE',
           `请先停止当前正在执行的任务（${activeLabels.join('、')}）`,
           409,
@@ -463,6 +480,9 @@ export function buildServerAppRoutes({
     getGroupBumperService: () => groupBumperService,
     groupPosterService,
     getBluestacksService: () => bluestacksService,
+    getWindowLayout: refs.getWindowLayout,
+    getAutoSchedulerService: refs.getAutoSchedulerService,
+    getGoogleSheetsService: refs.getGoogleSheetsService,
     postBumpRecords: repository.postBumpRecords,
     tasksRepository: repository.tasks,
     core,
@@ -489,7 +509,8 @@ export function buildServerAppRoutes({
         throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '浏览器未连接或内核未就绪', 409);
       return kernel.consolidateFacebookWorkspace(peer, preferActiveTab);
     },
-    (profileId) => featureExecution.isProfileBusy(profileId),
+    async (profileId) =>
+      workboard.isCarrierBusy(profileId) || (await featureExecution.isProfileBusy(profileId)),
   );
   const wired = wireLifecycleAndMcpRuntime({
     softwareVersion,
@@ -530,8 +551,28 @@ export function buildServerAppRoutes({
   const { profileLifecycle } = wired;
   refs.setProfileLifecycle(profileLifecycle);
   refs.setScheduleOfflineHygiene((id) => profileLifecycle.scheduleOfflineTabGroupHygiene(id));
+  const syncConcurrency = async (
+    browserConcurrency: number,
+    bluestacksConcurrency: number,
+    launchStaggerMs?: number,
+  ): Promise<void> => {
+    workboard.setConcurrencyLimits({
+      browserConcurrency,
+      bluestacksConcurrency,
+      ...(launchStaggerMs !== undefined ? { launchStaggerMs } : {}),
+    });
+    await Promise.all([
+      taskService.syncMaxConcurrency(browserConcurrency),
+      groupPosterService.syncMaxConcurrency(browserConcurrency),
+      groupBumperService.syncMaxConcurrency(browserConcurrency),
+      groupInviterService.syncMaxConcurrency(browserConcurrency),
+      googleSheetsService?.syncMaxConcurrency(browserConcurrency, bluestacksConcurrency),
+      bluestacksService.syncMaxConcurrency(bluestacksConcurrency),
+    ]);
+  };
   const autoSchedulerService = new AutoSchedulerService(repository.autoScheduler, {
     workspace: workspaceService,
+    workboard,
     tasks: taskService,
     groupBumper: groupBumperService,
     groupPoster: groupPosterService,
@@ -540,19 +581,12 @@ export function buildServerAppRoutes({
     profileLifecycle,
     featureExecution,
     assertAllowed: assertSystemIdle,
-    onPowerLockChange: (mode) => process.parentPort?.postMessage({ type: 'SET_POWER_LOCK', mode }),
     onConcurrencyChanged: (next) =>
-      syncGlobalConcurrencyToModules(next, {
-        workboard,
-        tasks: taskService,
-        groupBumper: groupBumperService,
-        groupPoster: groupPosterService,
-        groupInviter: groupInviterService,
-        bluestacks: bluestacksService,
-        googleSheets: refs.getGoogleSheetsService(),
-      }),
+      syncConcurrency(next.browserConcurrency, next.bluestacksConcurrency),
   });
   refs.setAutoSchedulerService(autoSchedulerService);
+  const checkBrowserRiskLimit = (profileId: string, actionKind: DailyRiskActionKind) =>
+    repository.activityStats.checkBrowserRiskLimit(profileId, actionKind);
   const googleOAuthManager = new GoogleOAuthManager(repository.googleSheets);
   const googleSheetsService = new GoogleSheetsService(repository.googleSheets, {
     workspace: workspaceService,
@@ -569,6 +603,21 @@ export function buildServerAppRoutes({
       repository.groupBumper,
       googleOAuthManager,
     ),
+    prepareMaterialMedia: async (mediaSource) => {
+      const prep = await posterMediaPreparer.prepareWithOAuthFallback(mediaSource, () =>
+        googleOAuthManager.getValidAccessToken(),
+      );
+      return {
+        localFilePath: prep.localFilePath,
+        mediaKind: prep.mediaKind === 'video' ? 'video' : 'image',
+        thumbnailDataUrl: prep.thumbnailDataUrl ?? null,
+        isTemporaryCache: prep.isTemporaryCache,
+      };
+    },
+    cleanupPreparedMedia: (localFilePath) =>
+      posterMediaPreparer.removeCachedDriveFile(localFilePath).then(() => undefined),
+    workboard,
+    checkDailyRiskLimit: checkBrowserRiskLimit,
     featureExecution,
     profileLifecycle,
     assertSystemIdle,
@@ -585,12 +634,14 @@ export function buildServerAppRoutes({
   groupPosterService.setPostBumpRecords(repository.postBumpRecords);
   groupBumperService.setPostBumpRecords(repository.postBumpRecords);
   bluestacksService.setPostBumpRecords(repository.postBumpRecords);
+  groupPosterService.setCheckDailyRiskLimit(checkBrowserRiskLimit);
+  groupBumperService.setCheckDailyRiskLimit(checkBrowserRiskLimit);
+  groupInviterService.setCheckDailyRiskLimit(checkBrowserRiskLimit);
   void posterMediaPreparer.pruneOldCachedFiles(24 * 60 * 60_000).catch(() => {});
   void Promise.resolve(repository.autoScheduler.settings())
-    .then((s) => {
-      googleSheetsService.syncMaxConcurrency(s.browserConcurrency, s.bluestacksConcurrency);
-      void bluestacksService.syncMaxConcurrency(s.bluestacksConcurrency);
-    })
+    .then((s) =>
+      syncConcurrency(s.browserConcurrency, s.bluestacksConcurrency, s.launchStaggerSeconds * 1000),
+    )
     .catch(() => {});
   refs.setAgentBrowserManager(wired.agentBrowserManager);
   refs.setMcpHttpHandler(wired.mcpHttpHandler);
@@ -636,6 +687,8 @@ export function buildServerAppRoutes({
     googleSheetsService,
     repository.postBumpRecords,
     eventHub,
+    repository.activityStats,
+    (id: string) => workboard.isCarrierBusy(id),
   ] as const;
   return {
     apiArgs,

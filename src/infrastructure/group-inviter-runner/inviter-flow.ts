@@ -1,5 +1,6 @@
+import type { Locator } from 'playwright-core';
 import type { GroupInviterRepository } from '../../application/group-inviter-service.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import { devDiag } from '../../shared/dev-diagnostics.js';
 import { dismissUnexpectedFacebookOverlays } from '../facebook-overlay-dismisser.js';
 import { invitationDigest } from '../facebook-workspace-preparation.js';
@@ -19,12 +20,13 @@ import type {
 import {
   checkGroupPendingOrQuestions,
   collectInvitationConfirmations,
-  findNonInvitePopupCloseCoords,
   invitationResultStatus,
   inviterVerificationError,
+  markNonInvitePopupCloseButton,
   mountedInvitationSelectionMatches,
   observeInvitationGraphQL,
   readGroupReadyDebugControls,
+  revealInvitationControl,
   scrollInvitationList,
   settleInvitationConfirmation,
 } from './inviter-ops.js';
@@ -46,37 +48,55 @@ export async function ensureGroupReadyAndJoin(ctx: InviterFlowCtx): Promise<void
   } = ctx;
   const joinBtnLoc = page.locator('[data-wb-group-join-btn="1"]').first();
   const dismissNonInvitePopupIfNeeded = async () => {
-    const popupCloseCoords = await findNonInvitePopupCloseCoords(page);
-    if (popupCloseCoords) {
-      await execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
-        await page.mouse.click(popupCloseCoords.x, popupCloseCoords.y);
-      });
-    }
+    if (!(await markNonInvitePopupCloseButton(page))) return;
+    await execBoundOp(conn, boundAccountId, 'close-join-popup', async () => {
+      if (!(await markNonInvitePopupCloseButton(page))) return;
+      const closeBtn = page.locator('[data-wb-non-invite-close-btn="1"]').first();
+      await clickControl(closeBtn, async () => await markNonInvitePopupCloseButton(page));
+    });
   };
-  // The URL can arrive before React mounts the group's actions.
+  const revealIfAttached = async (loc: Locator | null): Promise<boolean> => {
+    if (!loc) return false;
+    if ((await loc.count().catch(() => 0)) === 0) return false;
+    await revealInvitationControl(loc, 0).catch(() => {});
+    return loc.isVisible().catch(() => false);
+  };
+  const hasEntry = async () =>
+    (await revealIfAttached(await inviteButton())) || (await revealIfAttached(joinBtnLoc));
+  // The URL can arrive before React mounts the group's actions, or narrow windows can push them below fold.
   const groupReadyDeadline = Date.now() + 15000;
-  while (!(await (await inviteButton())?.isVisible()) && !(await joinBtnLoc.isVisible())) {
+  let scrollSweepStep = 0;
+  let lastScrollAt = Date.now();
+  while (!(await hasEntry())) {
     guard();
     if (!atGroup())
       throw new ProductError('GROUP_INVITER_GROUP_CHANGED', '小组页面已跳转，未继续邀请', 409);
-    if (await checkGroupPendingOrQuestions(page)) {
-      throw new ProductError(
+    if (await checkGroupPendingOrQuestions(page))
+      failError(
         'GROUP_INVITER_GROUP_UNINVITABLE',
         `跳过：该群需管理员审核或回答入群问题 · ${group.groupName.slice(0, 10)}`,
         409,
       );
-    }
     await dismissNonInvitePopupIfNeeded();
     await dismissUnexpectedFacebookOverlays(page, { keepSelector: '[role="checkbox"]' });
-    if ((await (await inviteButton())?.isVisible()) || (await joinBtnLoc.isVisible())) break;
+    if (await hasEntry()) break;
+    if (Date.now() - lastScrollAt >= 2000) {
+      await page
+        .evaluate(
+          (down) => (down ? window.scrollBy(0, 300) : window.scrollTo(0, 0)),
+          scrollSweepStep < 3,
+        )
+        .catch(() => {});
+      scrollSweepStep = (scrollSweepStep + 1) % 4;
+      lastScrollAt = Date.now();
+      if (await hasEntry()) break;
+    }
     if (Date.now() >= groupReadyDeadline) {
-      devDiag.record({
-        category: 'GROUP_INVITER',
-        event: 'GROUP_INVITER_GROUP_CONTROLS_MISSING',
+      devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_GROUP_CONTROLS_MISSING', {
         profileId,
         data: await readGroupReadyDebugControls(page),
       });
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_GROUP_NOT_READY',
         '小组页面未出现加入或邀请入口，请检查加载状态和访问权限',
         409,
@@ -128,7 +148,7 @@ export async function ensureGroupReadyAndJoin(ctx: InviterFlowCtx): Promise<void
       'unjoinableIntervention' in joinRes &&
       (joinRes as { unjoinableIntervention?: boolean }).unjoinableIntervention
     ) {
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_GROUP_UNINVITABLE',
         `跳过：当前身份暂不支持直接加入该群 · ${group.groupName.slice(0, 10)}`,
         409,
@@ -137,7 +157,7 @@ export async function ensureGroupReadyAndJoin(ctx: InviterFlowCtx): Promise<void
     await dismissNonInvitePopupIfNeeded();
   }
   if (!(await inviteButton())) {
-    throw new ProductError(
+    failError(
       'GROUP_INVITER_GROUP_UNINVITABLE',
       `小组待审核或不可邀请 · ${group.groupName.slice(0, 10)}`,
       409,
@@ -247,7 +267,9 @@ export async function runInviteBatchAndSubmit(
       await sleep(250);
     } while (Date.now() < deadline);
     if (state.dialog && state.sendButton) return state;
-    throw new ProductError(
+    if (bound)
+      failError('GROUP_INVITER_INVITE_MODAL_UNAVAILABLE', '跳过：邀请列表未能打开，未发送', 409);
+    failError(
       'GROUP_INVITER_RESULT_DIALOG_REQUIRED',
       '邀请列表未能打开，已保留待核对记录，未重发',
       409,
@@ -360,9 +382,7 @@ export async function runInviteBatchAndSubmit(
       ) {
         stagnantScrolls = 0;
         unscrolledStreak = 0;
-      } else {
-        stagnantScrolls++;
-      }
+      } else stagnantScrolls++;
       lastSignature = currentSignature;
       lastCheckboxTotal = Math.max(lastCheckboxTotal, candidate.totalCheckboxes);
       if (stagnantScrolls >= 8) break;
@@ -370,16 +390,12 @@ export async function runInviteBatchAndSubmit(
       if (!(await scrollInvitationList(page, reading))) {
         unscrolledStreak++;
         if (unscrolledStreak >= 2) break;
-      } else {
-        unscrolledStreak = 0;
-      }
+      } else unscrolledStreak = 0;
       await sleep(700);
     }
   }
   if (selectedBatch.length === 0 && !callbacks.isCancelled(profileId)) {
-    devDiag.record({
-      category: 'GROUP_INVITER',
-      event: 'GROUP_INVITER_NO_CANDIDATE_BREAKDOWN',
+    devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_NO_CANDIDATE_BREAKDOWN', {
       profileId,
       reason: `groupId=${group.groupId}`,
       data: {
@@ -396,201 +412,261 @@ export async function runInviteBatchAndSubmit(
   if (selectedBatch.length > 0 && !callbacks.isCancelled(profileId)) {
     const selectedIds = selectedBatch.map((f) => f.friendId);
     const confirmed = new Set<string>();
-    const sent = await execBoundOp(
-      conn,
-      boundAccountId,
-      'send-group-invites',
-      async (operationId) => {
-        const before = await readGroupInvitationState(page, guard);
-        if (!mountedInvitationSelectionMatches(before, selectedIds))
+    const awaitSendButtonReady = async (
+      operationId: string,
+      waitMs: number,
+      verifySelection: boolean,
+    ) => {
+      let state = await readGroupInvitationState(page, guard);
+      if (verifySelection && !mountedInvitationSelectionMatches(state, selectedIds))
+        throw Error('GROUP_INVITER_SELECTION_CHANGED');
+      const deadline = Date.now() + waitMs;
+      while ((!state.sendButton || state.sendButton.disabled) && Date.now() < deadline) {
+        await sleep(250);
+        guard();
+        state = await readGroupInvitationState(page, guard);
+        if (verifySelection && !mountedInvitationSelectionMatches(state, selectedIds))
           throw Error('GROUP_INVITER_SELECTION_CHANGED');
-        if (!before.sendButton || before.sendButton.disabled)
-          throw Error('邀请发送按钮不可用，未发送');
-        const observation = observeInvitationGraphQL(
-          page,
+      }
+      if (!state.sendButton || state.sendButton.disabled) {
+        devDiag.emit('WARN', 'GROUP_INVITER', 'GROUP_INVITER_SEND_BUTTON_UNAVAILABLE', {
           profileId,
           operationId,
-          effectiveGroupId,
-          selectedIds,
-          boundAccountId,
-        );
-        try {
-          try {
-            const ctx = await conn.context(boundAccountId);
-            const scope = scopes.get(conn);
-            if (!scope) throw Error('GROUP_INVITER_SCOPE_REQUIRED');
-            if (ctx)
-              await conn.enablePostNetworkObservation(
-                {
-                  ...ctx,
-                  operationId,
-                  jobId: scope.jobId,
-                  stepId: scope.stepId,
-                  actionDigest: invitationDigest('send-group-invites', boundAccountId, operationId),
-                },
-                guard,
-              );
-          } catch (e) {
-            devDiag.record({
-              category: 'GROUP_INVITER',
-              event: 'GROUP_INVITER_NETWORK_OBSERVER_UNAVAILABLE',
-              profileId,
-              operationId,
-              reason: e instanceof Error ? e.message.slice(0, 160) : 'UNAVAILABLE',
-            });
-          }
-          await callbacks.setProfileStatus(profileId, `发送 ${selectedBatch.length} 份邀请`);
-          const markedSend = dialogLocator(before).locator('[data-wb-group-send-btn="1"]').first();
-          const sendButton = (await markedSend.count())
-            ? markedSend
-            : dialogLocator(before).locator('[role="button"],button').nth(before.sendButton.index);
-          await sendButton.evaluate((el) =>
-            el.scrollIntoView({ block: 'center', inline: 'center' }),
-          );
-          await sleep(100);
-          await sendButton.click({ timeout: 5000 });
-          const sentAt = Date.now();
-          const closedDeadline = sentAt + 6000;
-          let closed = false;
-          while (Date.now() < closedDeadline) {
-            guard();
-            const s = await readGroupInvitationState(page, guard);
-            if (s.verificationRequired)
-              throw new ProductError(
-                'GROUP_INVITER_VERIFICATION_REQUIRED',
-                '受限 · 需要手机验证或操作受限',
-                409,
-              );
-            if (!s.dialog) {
-              closed = true;
-              break;
-            }
-            if (observation.hasSettled() && Date.now() - sentAt >= 800) break;
-            await sleep(250);
-          }
-          observation.endSubmission();
-          const persist = async (ids: string[]) => {
-            const inserted = await repo.recordInvites(
-              selectedBatch
-                .filter((f) => ids.includes(f.friendId))
-                .map((f) => ({
-                  profileId,
-                  accountId: effectiveAccountId,
-                  friendId: f.friendId,
-                  friendName: f.friendName,
-                  groupId: effectiveGroupId,
-                  invitedAt: Date.now(),
-                })),
-              operationId,
-            );
-            await callbacks.addSessionInvited(profileId, inserted);
-            const addedCount = ids.filter((id) => !confirmed.has(id)).length;
-            await callbacks.setProfileStatus(
-              profileId,
-              invitationResultStatus(
-                confirmed.size + addedCount,
-                selectedIds.length - confirmed.size - addedCount,
-              ),
-            );
-          };
-          const collect = () =>
-            collectInvitationConfirmations({
-              selectedIds,
-              accountId: boundAccountId,
-              groupId: effectiveGroupId,
-              read: () => readGroupInvitationState(page, guard),
-              scroll: (s) => scrollInvitationList(page, s),
-              persist,
-              confirmed,
-              guard,
-              budgetMs: 6000,
-              allowHidden: scopeRef.backgroundAllowed === true,
-            });
-          let fallbackReopens = 0;
-          const graphqlConfirmed = await settleInvitationConfirmation({
-            selectedIds,
-            confirmed,
-            persist,
-            graphql:
-              closed || observation.hasSettled() ? observation.confirmations : async () => [],
-            assertCurrent: async () => {
-              guard();
-              const current = await readGroupInvitationState(page, guard);
-              if (current.verificationRequired)
-                throw new ProductError(
-                  'GROUP_INVITER_VERIFICATION_REQUIRED',
-                  '受限 · 需要手机验证或操作受限',
-                  409,
-                );
-              if (current.accountId !== boundAccountId || !atGroup())
-                throw new ProductError(
-                  'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
-                  '邀请核对页面发生变化，结果仍待确认，未重发',
-                  409,
-                );
-            },
-            fallback: async () => {
-              if (observation.hasSettled() && confirmed.size > 0) return;
-              if (confirmed.size === 0) {
-                try {
-                  fallbackReopens++;
-                  await openDialog(false);
-                  await collect();
-                } catch (e) {
-                  if (e instanceof ProductError && e.code === 'GROUP_INVITER_VERIFICATION_REQUIRED')
-                    throw e;
-                  devDiag.record({
-                    category: 'GROUP_INVITER',
-                    event: 'GROUP_INVITER_RESULT_READ_INCOMPLETE',
-                    profileId,
-                    operationId,
-                    reason: e instanceof Error ? e.message.slice(0, 200) : 'READ_FAILED',
-                    data: {
-                      confirmed: confirmed.size,
-                      pending: selectedIds.length - confirmed.size,
-                    },
-                  });
-                }
-              }
-            },
-          });
-          return {
-            submitted: true as const,
-            total: selectedIds.length,
-            confirmedIds: [...confirmed],
-            pending: selectedIds.length - confirmed.size,
-            graphqlConfirmed,
-            fallbackReopens,
-            reloads: 0,
-          };
-        } finally {
-          await observation.close();
-        }
-      },
-      undefined,
-      async (operationId) => {
-        if (!repo.reserveInvites) throw Error('GROUP_INVITER_RESERVATION_REQUIRED');
-        await repo.reserveInvites(
-          operationId,
-          selectedBatch.map((f) => ({
-            ...f,
-            profileId,
-            accountId: effectiveAccountId,
+          data: {
             groupId: effectiveGroupId,
-          })),
-        );
-        releaseSelections(effectiveGroupId, selectedInMemory);
-      },
-    );
+            hasDialog: state.dialog,
+            hasSendButton: Boolean(state.sendButton),
+            sendDisabled: state.sendButton?.disabled ?? null,
+            selectedCount: selectedIds.length,
+            checkedItemsCount: state.items.filter((i) => i.checked).length,
+          },
+        });
+        failError('GROUP_INVITER_SEND_BUTTON_UNAVAILABLE', '跳过：邀请发送按钮不可用，未发送', 409);
+      }
+      return state;
+    };
+    await awaitSendButtonReady('pre-send-check', 3500, false);
+    let reservedOpId: string | null = null;
+    let dispatchAttempted = false;
+    let graphqlDispatched = false;
+    let sent: Awaited<ReturnType<typeof execBoundOp<InvitationSubmission>>>;
+    try {
+      sent = await execBoundOp(
+        conn,
+        boundAccountId,
+        'send-group-invites',
+        async (operationId) => {
+          const before = await awaitSendButtonReady(operationId, 1500, true);
+          if (!before.sendButton) throw Error('GROUP_INVITER_SEND_BUTTON_UNAVAILABLE');
+          const observation = observeInvitationGraphQL(
+            page,
+            profileId,
+            operationId,
+            effectiveGroupId,
+            selectedIds,
+            boundAccountId,
+          );
+          try {
+            try {
+              const ctx = await conn.context(boundAccountId);
+              const scope = scopes.get(conn);
+              if (!scope) throw Error('GROUP_INVITER_SCOPE_REQUIRED');
+              if (ctx)
+                await conn.enablePostNetworkObservation(
+                  {
+                    ...ctx,
+                    operationId,
+                    jobId: scope.jobId,
+                    stepId: scope.stepId,
+                    actionDigest: invitationDigest(
+                      'send-group-invites',
+                      boundAccountId,
+                      operationId,
+                    ),
+                  },
+                  guard,
+                );
+            } catch (e) {
+              devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_NETWORK_OBSERVER_UNAVAILABLE', {
+                profileId,
+                operationId,
+                reason: e instanceof Error ? e.message.slice(0, 160) : 'UNAVAILABLE',
+              });
+            }
+            await callbacks.setProfileStatus(profileId, `发送 ${selectedBatch.length} 份邀请`);
+            const markedSend = dialogLocator(before)
+              .locator('[data-wb-group-send-btn="1"]')
+              .first();
+            const sendButton = (await markedSend.count())
+              ? markedSend
+              : dialogLocator(before)
+                  .locator('[role="button"],button')
+                  .nth(before.sendButton.index);
+            await revealInvitationControl(sendButton, 0).catch(() => {});
+            await sleep(120);
+            const clickBlockedRe = /timeout|intercept|outside.*viewport|obscures|not visible/i;
+            try {
+              await sendButton.click({ timeout: 5000 });
+              dispatchAttempted = true;
+            } catch (clickErr) {
+              if (!(clickErr instanceof Error) || !clickBlockedRe.test(clickErr.message))
+                throw clickErr;
+              const latest = await readGroupInvitationState(page, guard);
+              if (!mountedInvitationSelectionMatches(latest, selectedIds))
+                throw Error('GROUP_INVITER_SELECTION_CHANGED');
+              await revealInvitationControl(sendButton, 140).catch(() => {});
+              await sleep(150);
+              try {
+                await sendButton.click({ timeout: 4000 });
+                dispatchAttempted = true;
+              } catch (retryErr) {
+                if (!(retryErr instanceof Error) || !clickBlockedRe.test(retryErr.message))
+                  throw retryErr;
+                failError(
+                  'GROUP_INVITER_SEND_BUTTON_UNAVAILABLE',
+                  '跳过：邀请发送按钮无法点击，未发送',
+                  409,
+                );
+              }
+            }
+            const sentAt = Date.now();
+            const closedDeadline = sentAt + 6000;
+            let closed = false;
+            while (Date.now() < closedDeadline) {
+              guard();
+              const s = await readGroupInvitationState(page, guard);
+              if (s.verificationRequired) throw inviterVerificationError();
+              if (!s.dialog) {
+                closed = true;
+                break;
+              }
+              if (observation.hasSettled() && Date.now() - sentAt >= 800) break;
+              await sleep(250);
+            }
+            observation.endSubmission();
+            const persist = async (ids: string[]) => {
+              const inserted = await repo.recordInvites(
+                selectedBatch
+                  .filter((f) => ids.includes(f.friendId))
+                  .map((f) => ({
+                    profileId,
+                    accountId: effectiveAccountId,
+                    friendId: f.friendId,
+                    friendName: f.friendName,
+                    groupId: effectiveGroupId,
+                    invitedAt: Date.now(),
+                  })),
+                operationId,
+              );
+              await callbacks.addSessionInvited(profileId, inserted);
+              const addedCount = ids.filter((id) => !confirmed.has(id)).length;
+              await callbacks.setProfileStatus(
+                profileId,
+                invitationResultStatus(
+                  confirmed.size + addedCount,
+                  selectedIds.length - confirmed.size - addedCount,
+                ),
+              );
+            };
+            const collect = () =>
+              collectInvitationConfirmations({
+                selectedIds,
+                accountId: boundAccountId,
+                groupId: effectiveGroupId,
+                read: () => readGroupInvitationState(page, guard),
+                scroll: (s) => scrollInvitationList(page, s),
+                persist,
+                confirmed,
+                guard,
+                budgetMs: 6000,
+                allowHidden: scopeRef.backgroundAllowed === true,
+              });
+            let fallbackReopens = 0;
+            const graphqlConfirmed = await settleInvitationConfirmation({
+              selectedIds,
+              confirmed,
+              persist,
+              graphql:
+                closed || observation.hasSettled() ? observation.confirmations : async () => [],
+              assertCurrent: async () => {
+                guard();
+                const current = await readGroupInvitationState(page, guard);
+                if (current.verificationRequired) throw inviterVerificationError();
+                if (current.accountId !== boundAccountId || !atGroup())
+                  failError(
+                    'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
+                    '邀请核对页面发生变化，结果仍待确认，未重发',
+                    409,
+                  );
+              },
+              fallback: async () => {
+                if (observation.hasSettled() && confirmed.size > 0) return;
+                if (confirmed.size === 0) {
+                  try {
+                    fallbackReopens++;
+                    await openDialog(false);
+                    await collect();
+                  } catch (e) {
+                    if (
+                      e instanceof ProductError &&
+                      e.code === 'GROUP_INVITER_VERIFICATION_REQUIRED'
+                    )
+                      throw e;
+                    devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_RESULT_READ_INCOMPLETE', {
+                      profileId,
+                      operationId,
+                      reason: e instanceof Error ? e.message.slice(0, 200) : 'READ_FAILED',
+                      data: {
+                        confirmed: confirmed.size,
+                        pending: selectedIds.length - confirmed.size,
+                      },
+                    });
+                  }
+                }
+              },
+            });
+            return {
+              submitted: true as const,
+              total: selectedIds.length,
+              confirmedIds: [...confirmed],
+              pending: selectedIds.length - confirmed.size,
+              graphqlConfirmed,
+              fallbackReopens,
+              reloads: 0,
+            };
+          } finally {
+            graphqlDispatched ||= observation.hasDispatched();
+            await observation.close();
+          }
+        },
+        undefined,
+        async (operationId) => {
+          if (!repo.reserveInvites) throw Error('GROUP_INVITER_RESERVATION_REQUIRED');
+          reservedOpId = operationId;
+          await repo.reserveInvites(
+            operationId,
+            selectedBatch.map((f) => ({
+              ...f,
+              profileId,
+              accountId: effectiveAccountId,
+              groupId: effectiveGroupId,
+            })),
+          );
+          releaseSelections(effectiveGroupId, selectedInMemory);
+        },
+      );
+    } catch (sendErr) {
+      if (reservedOpId && !dispatchAttempted && !graphqlDispatched)
+        await Promise.resolve(repo.releasePendingInvites?.(reservedOpId)).catch(() => {});
+      throw sendErr;
+    }
     submission = sent;
     await callbacks.reportBatchResult?.(profileId, sent.confirmedIds.length, sent.pending);
     await callbacks.setProfileStatus(
       profileId,
       invitationResultStatus(sent.confirmedIds.length, sent.pending),
     );
-    devDiag.record({
-      category: 'GROUP_INVITER',
-      event: 'GROUP_INVITER_BATCH_RESULT',
+    devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_BATCH_RESULT', {
       profileId,
       data: {
         selected: sent.total,
@@ -602,9 +678,8 @@ export async function runInviteBatchAndSubmit(
         reloads: sent.reloads ?? 0,
       },
     });
-  } else if (!callbacks.isCancelled(profileId)) {
+  } else if (!callbacks.isCancelled(profileId))
     await callbacks.setProfileStatus(profileId, '无可邀请对象');
-  }
   if (!callbacks.isCancelled(profileId) && (!submission || submission.pending === 0)) {
     const state = await readGroupInvitationState(page, guard);
     if (state.dialog && state.closeButton) {

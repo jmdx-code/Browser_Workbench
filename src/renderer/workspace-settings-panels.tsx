@@ -9,12 +9,17 @@ import type { MediaComponentStatus } from '../shared/media-component.js';
 import { WorkspacePreferenceValues, type Preferences } from '../shared/workspace-preferences.js';
 import { api } from './api.js';
 import { ConfirmDialog } from './confirm-dialog.js';
-import { Btn, Chk, errMsg, useAbortQuery, useBusyTask } from './modules/shared/module-ui.js';
-import { UI_DANGER_TEXT, UI_INPUT, UI_MUTED, UI_SELECT } from './ui/primitives.js';
-
+import {
+  Btn,
+  Chk,
+  ErrText,
+  errMsg,
+  useAbortQuery,
+  useBusyTask,
+} from './modules/shared/module-ui.js';
+import { UI_INPUT, UI_MUTED, UI_SELECT } from './ui/primitives.js';
 const LBL_ROW = 'inline-flex items-center gap-2 whitespace-nowrap text-xs text-[var(--text-2)]';
 const SETTINGS_ROW = 'flex flex-wrap items-center gap-2.5 text-xs';
-
 export function WorkspacePreferencesPanel() {
   const {
     data: saved,
@@ -30,7 +35,6 @@ export function WorkspacePreferencesPanel() {
     [autoBusy, setAutoBusy] = useState(false),
     [autoNotice, setAutoNotice] = useState('');
   const { busy, error: err, run } = useBusyTask();
-
   useEffect(() => {
     const desktop = window.workbenchDesktop;
     if (typeof desktop?.getAutoLaunch !== 'function') return;
@@ -43,14 +47,12 @@ export function WorkspacePreferencesPanel() {
       active = false;
     };
   }, []);
-
   useEffect(() => {
     if (!saved) return;
     setSystemZone(saved.defaultTimeZone === null);
     setZone(saved.defaultTimeZone ?? sysTz());
     setNotifications(saved.desktopNotifications);
   }, [saved]);
-
   const values = WorkspacePreferenceValues.safeParse({
     defaultTimeZone: systemZone ? null : zone.trim(),
     desktopNotifications: notifications,
@@ -60,7 +62,6 @@ export function WorkspacePreferencesPanel() {
     values.success &&
     (values.data.defaultTimeZone !== saved.defaultTimeZone ||
       values.data.desktopNotifications !== saved.desktopNotifications);
-
   return (
     <>
       <h3>日程与通知</h3>
@@ -126,16 +127,10 @@ export function WorkspacePreferencesPanel() {
           {busy ? '保存中…' : '保存偏好设置'}
         </Btn>
       </form>
-      {!values.success && (
-        <p className={UI_DANGER_TEXT} role="alert">
-          {values.error.issues[0]?.message ?? '请检查默认设置'}
-        </p>
-      )}
-      {(err || loadErr) && (
-        <p className={UI_DANGER_TEXT} role="alert">
-          {err || loadErr}
-        </p>
-      )}
+      <ErrText
+        msg={!values.success ? (values.error.issues[0]?.message ?? '请检查默认设置') : undefined}
+      />
+      <ErrText msg={err || loadErr || undefined} />
       {notice && <p role="status">{notice}</p>}
       {autoLaunch?.supported && (
         <div className={`${SETTINGS_ROW} mt-[18px]`}>
@@ -171,12 +166,10 @@ export function WorkspacePreferencesPanel() {
     </>
   );
 }
-
 export function MediaComponentPanel() {
   const [status, setStatus] = useState<z.infer<typeof MediaComponentStatus> | null>(null);
   const { busy: pending, error, setError, run } = useBusyTask();
   const isInstalling = Boolean(status?.busy);
-
   useEffect(() => {
     const controller = new AbortController();
     let loading = false;
@@ -203,10 +196,8 @@ export function MediaComponentPanel() {
       clearInterval(timer);
     };
   }, [isInstalling, setError]);
-
   const act = (action: 'install' | 'cancel') =>
     void run(async () => setStatus(await api.mediaComponent(action)), '操作失败');
-
   return (
     <section className="grid justify-items-start gap-2.5" aria-label="可选组件">
       <h3>
@@ -239,22 +230,16 @@ export function MediaComponentPanel() {
           取消安装
         </Btn>
       )}
-      {(error || status?.error) && (
-        <p className={UI_DANGER_TEXT} role="alert">
-          {error || status?.error}
-        </p>
-      )}
+      <ErrText msg={error || status?.error || undefined} />
     </section>
   );
 }
-
 export function BridgeConnectionPanel({ profiles }: { profiles: Profile[] }) {
   const [health, setHealth] = useState<ConnectionHealth | null>(null),
     [error, setError] = useState(''),
     [notice, setNotice] = useState(''),
     [revision, setRevision] = useState(0),
     [selected, setSelected] = useState<ConnectionHealth['pending'][number] | null>(null);
-
   useEffect(() => {
     const controller = new AbortController();
     let reading = false;
@@ -285,20 +270,14 @@ export function BridgeConnectionPanel({ profiles }: { profiles: Profile[] }) {
       clearInterval(timer);
     };
   }, [revision]);
-
   const name = (id: string) => {
     const row = profiles.find((p) => p.id === id);
     return row?.browserName || row?.alias || id.slice(0, 8);
   };
-
   return (
     <div className="grid gap-1.5">
       <h3>连接状态</h3>
-      {error && (
-        <p className={UI_DANGER_TEXT} role="alert">
-          {error}
-        </p>
-      )}
+      <ErrText msg={error || undefined} />
       {notice && <p role="status">{notice}</p>}
       {health && (
         <>

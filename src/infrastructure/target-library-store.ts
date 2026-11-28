@@ -8,7 +8,6 @@ import {
 import { AVATAR_URL_MAX_LENGTH } from '../shared/group-inviter.js';
 import * as Q from './persistence/sqlite-query-helpers.js';
 import { transaction } from './sqlite-transaction.js';
-
 export interface SharedFacebookGroupRow {
   groupId: string;
   groupName: string;
@@ -32,12 +31,10 @@ export interface ResolvedTargetMetadataInput {
   name?: string | null;
   avatarUrl?: string | null;
 }
-
 const isHttpAvatarUrl = (url: string | null | undefined): url is string =>
   typeof url === 'string' &&
   /^https?:\/\//i.test(url.trim()) &&
   !/\/(?:rsrc|emoji)\.php\//i.test(url);
-
 export function sanitizeTargetAvatarUrl(value?: string | null): string | null {
   if (typeof value !== 'string') return null;
   const t = value.trim();
@@ -47,7 +44,6 @@ export function sanitizeTargetAvatarUrl(value?: string | null): string | null {
       ? t
       : null;
 }
-
 export function mergedAvatar(
   existingAvatar: string | null | undefined,
   incomingAvatar: string | null | undefined,
@@ -57,7 +53,6 @@ export function mergedAvatar(
   for (const v of [incomingAvatar, existingAvatar]) if (isHttpAvatarUrl(v)) return v.trim();
   return null;
 }
-
 export function ensureTargetLibrarySchema(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS shared_facebook_groups (group_id TEXT PRIMARY KEY, group_name TEXT NOT NULL, avatar_url TEXT, folder_id TEXT DEFAULT NULL, sort_order INTEGER NOT NULL DEFAULT 0, invited_count INTEGER NOT NULL DEFAULT 0, bumped_count INTEGER NOT NULL DEFAULT 0, posted_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
@@ -66,7 +61,6 @@ export function ensureTargetLibrarySchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_target_list_folders_kind ON target_list_folders(list_kind, sort_order); CREATE INDEX IF NOT EXISTS idx_shared_facebook_groups_folder_sort ON shared_facebook_groups(folder_id, sort_order, created_at DESC); CREATE INDEX IF NOT EXISTS idx_group_bumper_pages_folder_sort ON group_bumper_pages(folder_id, sort_order, created_at DESC);
   `);
 }
-
 function pickResolvedName(
   incomingName: string,
   existingName: string,
@@ -84,7 +78,6 @@ function pickResolvedName(
   if (currentName && !isPlaceholderTargetName(currentName, cleanRawId)) return currentName;
   return incomingName || existingName || currentName || canonicalId;
 }
-
 function cascadeCanonicalId(
   db: DatabaseSync,
   isGroup: boolean,
@@ -131,7 +124,6 @@ function cascadeCanonicalId(
     Q.run(db, sql, canonicalId, finalName, cleanRawId);
   }
 }
-
 export class SqliteTargetLibraryRepository {
   constructor(private readonly db: DatabaseSync) {
     ensureTargetLibrarySchema(this.db);

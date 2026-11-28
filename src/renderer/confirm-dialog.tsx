@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react';
-import { Btn, useShowModal } from './modules/shared/module-ui.js';
+import { Btn, ErrText, useShowModal } from './modules/shared/module-ui.js';
 import { UI_DIALOG_CARD } from './ui/primitives.js';
-
 export function ConfirmDialog({
   title,
   description,
@@ -49,6 +48,7 @@ export function ConfirmDialog({
   return (
     <dialog
       ref={dialog}
+      role="alertdialog"
       className={`${UI_DIALOG_CARD} confirm-dialog`}
       aria-label={title}
       onCancel={(event) => {
@@ -60,11 +60,7 @@ export function ConfirmDialog({
       <p className="mt-2 mb-3 max-h-[min(45vh,360px)] overflow-y-auto text-[13px] leading-relaxed whitespace-pre-line text-[var(--text-2)]">
         {description}
       </p>
-      {error && (
-        <p role="alert" className="mb-3 text-xs font-medium text-rose-600">
-          {error}
-        </p>
-      )}
+      <ErrText msg={error} className="mb-3" />
       <footer className="mt-4 flex justify-end gap-2">
         <Btn sm={false} autoFocus disabled={busy} onClick={closeDialog}>
           取消

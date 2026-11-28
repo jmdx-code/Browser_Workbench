@@ -4,6 +4,8 @@ import path from 'node:path';
 import {
   classifyAbnormalScreenText,
   detectHomeTabBar,
+  extractActionBars,
+  extractPostCards,
   flattenLiteNodes,
   isBottomSheetOpen,
   isLiteTextInputClass,
@@ -32,7 +34,6 @@ import {
   getHostClipboard,
   isTaskStoppedError,
   isTcpPortOpen,
-  runProcess,
   setHostClipboard,
   withPreservedClipboard,
 } from './runner-helpers.js';
@@ -248,9 +249,7 @@ export async function setMediaSoundEnabled(
       if (state && !state.muted && state.speakerVol >= 3) return;
       await setVol(11);
       if ((await readAudio())?.muted) await keyevent(ctx, serial, 24, signal);
-    } else {
-      await setVol(0);
-    }
+    } else await setVol(0);
   } catch (err) {
     if (isTaskStoppedError(err, signal)) throw new Error('TASK_STOPPED');
   }
@@ -271,11 +270,10 @@ export async function focusBySerial(serial: string): Promise<void> {
   if (process.platform !== 'win32') return;
   const port = Number(/:(\d+)$/.exec(serial)?.[1] ?? 0);
   if (!port) return;
-  const matched = (await queryRunningBlueStacksWindows(runProcess)).find((w) =>
+  const matched = (await queryRunningBlueStacksWindows()).find((w) =>
     w.listeningPorts.includes(port),
   );
-  if (matched)
-    await focusBlueStacksWindow(runProcess, matched.hwnd, matched.pid).catch(() => false);
+  if (matched) await focusBlueStacksWindow(undefined, matched.hwnd, matched.pid).catch(() => false);
 }
 export async function openDeepLink(
   ctx: DeviceRuntimeContext,
@@ -315,11 +313,35 @@ export async function openDeepLink(
     8000,
     signal,
   );
+  const expectsLeaveHome = !/^https?:\/\/(?:www\.|m\.|mbasic\.)?facebook\.com\/?(?:[?#].*)?$/i.test(
+    url.trim(),
+  );
   for (let attempt = 0; attempt < 5; attempt++) {
     await abortableWait(1100, signal);
     const xml = await dumpXml(ctx, serial, screenW, screenH, signal);
-    if (xml?.packageName === 'com.facebook.lite' && flattenLiteNodes(xml).length >= 10) return;
+    if (
+      xml?.packageName === 'com.facebook.lite' &&
+      flattenLiteNodes(xml).length >= 10 &&
+      (!expectsLeaveHome || detectHomeTabBar(xml) === null)
+    )
+      return;
   }
+}
+export function splitAndroidInputTextChunks(text: string, maxChunkLen = 16): string[] {
+  if (!text) return [];
+  const cap = Math.max(1, maxChunkLen);
+  const chunks: string[] = [];
+  let current = '';
+  for (const ch of text) {
+    current += ch;
+    // End chunk right after '%' so Android `input text` never sees literal `%s` as a space token.
+    if (ch === '%' || current.length >= cap) {
+      chunks.push(current);
+      current = '';
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
 }
 export async function typeAsciiAt900(
   ctx: DeviceRuntimeContext,
@@ -331,13 +353,14 @@ export async function typeAsciiAt900(
   screenH = 1600,
   signal?: AbortSignal,
 ): Promise<void> {
+  if (!text) return;
   await tap900(ctx, serial, x900, y900, screenW, screenH, signal);
   await abortableWait(300, signal);
-  for (let i = 0; i < text.length; i += 16) {
+  for (const chunk of splitAndroidInputTextChunks(text, 16)) {
     await adb(
       ctx,
       serial,
-      ['shell', `input text ${quoteForAndroidInputText(text.slice(i, i + 16))}`],
+      ['shell', `input text ${quoteForAndroidInputText(chunk)}`],
       8000,
       signal,
     );
@@ -356,21 +379,22 @@ export async function pasteIntoFocused(
   signal?: AbortSignal,
   options: { preferClipboard?: boolean } = {},
 ): Promise<void> {
-  if (!options.preferClipboard && text.length > 0 && text.length <= 160 && isPrintableAscii(text)) {
+  if (!text) return;
+  if (!options.preferClipboard && text.length <= 160 && isPrintableAscii(text)) {
     await typeAsciiAt900(ctx, serial, x900, y900, text, screenW, screenH, signal);
     return;
   }
-  await withPreservedClipboard(
-    () => focusBySerial(serial),
-    async () => {
-      await setHostClipboard(text);
-      await abortableWait(260, signal);
-      await tap900(ctx, serial, x900, y900, screenW, screenH, signal);
-      await abortableWait(280, signal);
-      await keyevent(ctx, serial, 279, signal);
-      await abortableWait(350, signal);
-    },
-  );
+  await withPreservedClipboard(undefined, async () => {
+    if (signal?.aborted) throw new Error('TASK_STOPPED');
+    await setHostClipboard(text);
+    await abortableWait(120, signal);
+    await focusBySerial(serial);
+    await abortableWait(180, signal);
+    await tap900(ctx, serial, x900, y900, screenW, screenH, signal);
+    await abortableWait(260, signal);
+    await keyevent(ctx, serial, 279, signal);
+    await abortableWait(350, signal);
+  });
 }
 export async function pruneOldPushedMedia(
   ctx: DeviceRuntimeContext,
@@ -468,7 +492,6 @@ export async function copyLinkFromMoreMenu(
   return withPreservedClipboard(undefined, async () => {
     prevClip = await getHostClipboard().catch(() => null);
     try {
-      await focusBySerial(serial);
       const marker = `__AGY_EMPTY_${Date.now()}__`;
       const markerApplied = await setHostClipboard(marker)
         .then(() => true)
@@ -502,6 +525,7 @@ export async function copyLinkFromMoreMenu(
         sheetRows,
         /复制链接|複製連結|copylink/i,
       );
+      await focusBySerial(serial);
       await tap900(ctx, serial, 450, copyMatch?.node.bounds.cy ?? 1370, screenW, screenH, signal);
       await abortableWait(900, signal);
       const afterPng = await screencap(ctx, serial, signal).catch(() => null);
@@ -538,14 +562,25 @@ export function isLoginOrLoggedOutXml(root: LiteXmlNode | null): boolean {
       n.bounds.y2 <= 112 &&
       ((n.bounds.x1 <= 15 && n.bounds.x2 <= 95) || (n.bounds.x1 >= 815 && n.bounds.x2 <= 900)),
   );
-  if (hasHomeTabBar || hasTopMenuOrBack) return false;
-  return all.some(
-    (n) =>
-      (isLiteTextInputClass(n.className) && n.bounds.y1 >= 140 && n.bounds.y2 <= 1180) ||
-      /登录|登入|log\s*in|sign\s*in|创建新账号|创建新账户|建立新帳號|create\s*new\s*account|手机号或邮箱/i.test(
-        `${n.text} ${n.contentDesc}`.trim(),
-      ),
-  );
+  if (
+    hasHomeTabBar ||
+    hasTopMenuOrBack ||
+    extractPostCards(root).length > 0 ||
+    extractActionBars(root).length > 0
+  )
+    return false;
+  const inputCount = all.filter(
+    (n) => isLiteTextInputClass(n.className) && n.bounds.y1 >= 140 && n.bounds.y2 <= 1180,
+  ).length;
+  if (inputCount >= 2) return true;
+  const joinedText = all.map((n) => `${n.text} ${n.contentDesc}`.trim()).join(' ');
+  if (
+    /创建新账号|创建新账户|建立新帳號|create\s*new\s*account|手机号或邮箱|forgot\s*password|忘记密码/i.test(
+      joinedText,
+    )
+  )
+    return true;
+  return inputCount >= 1 && /登录|登入|log\s*in|sign\s*in/i.test(joinedText);
 }
 export async function detectAbnormalScreen(
   ctx: DeviceRuntimeContext,

@@ -12,6 +12,7 @@ export interface DesktopHostingMonitorDeps {
     runningCount: number;
     autoMonitorCount: number;
     keepAwake: boolean;
+    powerLockMode: 'none' | 'prevent-app-suspension' | 'prevent-display-sleep';
     summary: string;
   }) => void;
 }
@@ -31,9 +32,7 @@ export function startDesktopHostingMonitor(deps: DesktopHostingMonitorDeps): () 
         const parts: string[] = [];
         const activeLabels = (await deps.getFeatureExecution()?.activeModuleLabels()) ?? [];
         const runningCount = activeLabels.length;
-        if (activeLabels.length > 0) {
-          parts.push(`运行中：${activeLabels.slice(0, 2).join('、')}`);
-        }
+        if (activeLabels.length > 0) parts.push(`运行中：${activeLabels.slice(0, 2).join('、')}`);
         const monitors = (await deps.getGoogleSheets()?.countEnabledMonitors()) ?? {
           scheduleEnabled: 0,
           recordsEnabled: 0,
@@ -50,11 +49,17 @@ export function startDesktopHostingMonitor(deps: DesktopHostingMonitorDeps): () 
           monitors.scheduleEnabled > 0 ||
           monitors.recordsEnabled > 0 ||
           (enabledScheds > 0 && allowScheduleKeepAwake);
+        const powerLockMode: 'none' | 'prevent-app-suspension' | 'prevent-display-sleep' =
+          !keepAwake
+            ? 'none'
+            : runningCount > 0 && allowScheduleKeepAwake
+              ? 'prevent-display-sleep'
+              : 'prevent-app-suspension';
         if (monitors.scheduleEnabled > 0) parts.push(`自动发帖 ${monitors.scheduleEnabled} 表`);
         if (monitors.recordsEnabled > 0) parts.push(`自动顶贴 ${monitors.recordsEnabled} 表`);
         if (enabledScheds > 0) parts.push(`定时排班 ${enabledScheds} 项`);
         const summary = parts.join(' · ');
-        const key = `${runningCount}:${autoMonitorCount}:${keepAwake ? 1 : 0}:${summary}`;
+        const key = `${runningCount}:${autoMonitorCount}:${keepAwake ? 1 : 0}:${powerLockMode}:${summary}`;
         if (!stopped && !deps.isShuttingDown() && key !== lastKey) {
           lastKey = key;
           deps.postMessage({
@@ -62,6 +67,7 @@ export function startDesktopHostingMonitor(deps: DesktopHostingMonitorDeps): () 
             runningCount,
             autoMonitorCount,
             keepAwake,
+            powerLockMode,
             summary,
           });
         }

@@ -165,9 +165,7 @@ export async function watchBumperVideo(input: {
           el.loop = false;
           if (!opts.sound) {
             el.muted = true;
-            if (el.paused && !el.ended) {
-              void el.play().catch(() => {});
-            }
+            if (el.paused && !el.ended) void el.play().catch(() => {});
             return;
           }
           if (el.volume < 0.5) el.volume = 0.8;
@@ -176,9 +174,7 @@ export async function watchBumperVideo(input: {
               typeof navigator === 'undefined' ||
               !('userActivation' in navigator) ||
               Boolean(navigator.userActivation?.hasBeenActive);
-            if (el.muted && (canUnmuteDirectly || el.paused)) {
-              el.muted = false;
-            }
+            if (el.muted && (canUnmuteDirectly || el.paused)) el.muted = false;
           }
           if (el.paused && !el.ended) {
             void el.play().catch(() => {
@@ -284,9 +280,7 @@ export async function watchBumperVideo(input: {
             : null,
         );
       }
-      if (lastTime >= 3 && time + 1.5 < lastTime && progressed) {
-        return finish('ended');
-      }
+      if (lastTime >= 3 && time + 1.5 < lastTime && progressed) return finish('ended');
       lastTime = time;
       lastFrames = frames;
       css = current.videoCSS ?? css;

@@ -1,6 +1,6 @@
 import type { Page } from 'playwright-core';
 import { ZodError } from 'zod';
-import { ProductError } from '../../domain/workspace.js';
+import { failError } from '../../domain/workspace.js';
 import type { Awaitable } from '../../domain/persistence.js';
 import { sameTabProof } from '../../domain/task-tabs.js';
 import type { Peer } from '../../bridge/core.js';
@@ -227,11 +227,7 @@ export async function navigateRetainedPageHomeImpl(
 export async function prepareInvitationHomeImpl(page: Page, guard: () => Awaitable<void>) {
   if (page.url() === 'https://www.facebook.com/') return false;
   if (!(await navigateRetainedPageHomeImpl(page, guard)))
-    throw new ProductError(
-      'GROUP_INVITER_HOME_REQUIRED',
-      '无法打开 Facebook 首页，请检查登录或验证页面',
-      409,
-    );
+    failError('GROUP_INVITER_HOME_REQUIRED', '无法打开 Facebook 首页，请检查登录或验证页面', 409);
   return true;
 }
 export async function waitInvitationHomeIdentityImpl(page: Page, guard: () => Awaitable<void>) {
@@ -243,11 +239,7 @@ export async function waitInvitationHomeIdentityImpl(page: Page, guard: () => Aw
         page.url(),
       )
     )
-      throw new ProductError(
-        'GROUP_INVITER_LOGIN_REQUIRED',
-        'Facebook 尚未登录或需要完成账号验证',
-        409,
-      );
+      failError('GROUP_INVITER_LOGIN_REQUIRED', 'Facebook 尚未登录或需要完成账号验证', 409);
     try {
       const current = await readCurrentFacebookBrowseIdentity(page, guard);
       if (current.document.url === 'https://www.facebook.com/') return current;
@@ -263,7 +255,7 @@ export async function waitInvitationHomeIdentityImpl(page: Page, guard: () => Aw
         throw error;
     }
     if (Date.now() >= deadline)
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_IDENTITY_TIMEOUT',
         '首页已打开，但未能读取当前登录账号，请检查页面是否正常加载',
         409,
@@ -463,6 +455,15 @@ export async function withSummaryImpl<T>(
       throw Error('SUMMARY_SESSION_CHANGED');
     session.lease.check();
   };
+  const releaseSession = () => {
+    if (host.sessions.get(peer.profileId) === session) host.sessions.delete(peer.profileId);
+    host.core.releaseFixtureKernel(peer, owner);
+  };
+  const stopOwned = async () => {
+    const s = await session.request({ kind: 'stop' });
+    if (s.state !== 'stopped') throw Error('SUMMARY_STOP_UNCONFIRMED');
+    releaseSession();
+  };
   let opened = false,
     closed = false;
   try {
@@ -526,6 +527,12 @@ export async function withSummaryImpl<T>(
           throw Error('SUMMARY_NOTIFICATION_PROFILE_REJECTED');
         const expected = SettlementReceipt.parse({ binding, resolution });
         if (await archivedNotice(host.core, binding, resolution)) return expected;
+        const parseReceipt = (reply: { binding?: unknown; resolution?: unknown }) =>
+          SettlementReceipt.parse({ binding: reply.binding, resolution: reply.resolution });
+        const parseStopOk = (rawStop: unknown) => {
+          const stop = KernelJsonObject.parse(rawStop);
+          return stop.state === 'stopped' && stop.requestId === resolution.id;
+        };
         if (
           peer.capabilities?.includes('kernel-journal-collection-v1') &&
           (binding.connectionEpoch !== peer.epoch || binding.leaseId !== session.stamp.leaseId)
@@ -535,18 +542,13 @@ export async function withSummaryImpl<T>(
             { kind: 'retireOperation', binding, resolution },
             resolution.id,
           );
-          const stop = KernelJsonObject.parse(reply.stop),
-            receipt = SettlementReceipt.parse({
-              binding: reply.binding,
-              resolution: reply.resolution,
-            }),
+          const receipt = parseReceipt(reply),
             remote = KernelPersistentState.parse(reply.inventory).operations.find(
               (row) => row.binding.operationId === binding.operationId,
             );
           if (
             reply.retired !== true ||
-            stop.state !== 'stopped' ||
-            stop.requestId !== resolution.id ||
+            !parseStopOk(reply.stop) ||
             !sameNotice(expected, receipt) ||
             !remote ||
             ![remote.resolution, remote.disposition].some(
@@ -566,19 +568,14 @@ export async function withSummaryImpl<T>(
             resolution.id,
           );
           assertCurrent();
-          const receipt = SettlementReceipt.parse({
-              binding: reply.binding,
-              resolution: reply.resolution,
-            }),
-            stop = KernelJsonObject.parse(reply.stop),
+          const receipt = parseReceipt(reply),
             snapshot = KernelPersistentState.parse(reply.inventory),
             remote = snapshot.operations.find(
               (op) => op.binding.operationId === binding.operationId,
             );
           if (
             reply.ended !== true ||
-            stop.state !== 'stopped' ||
-            stop.requestId !== resolution.id ||
+            !parseStopOk(reply.stop) ||
             snapshot.profileId !== peer.profileId ||
             !sameNotice(expected, receipt) ||
             !remote?.disposition ||
@@ -588,10 +585,7 @@ export async function withSummaryImpl<T>(
           return receipt;
         }
         const reply = await session.request({ kind: 'reconcileOperation', binding, resolution }),
-          receipt = SettlementReceipt.parse({
-            binding: reply.binding,
-            resolution: reply.resolution,
-          });
+          receipt = parseReceipt(reply);
         if (reply.reconciled !== true || !sameNotice(expected, receipt))
           throw Error('SUMMARY_NOTICE_RECEIPT_MISMATCH');
         const remote = (await inventory()).operations.find(
@@ -624,11 +618,8 @@ export async function withSummaryImpl<T>(
     assertCurrent();
     closed = true;
     session.closing = true;
-    const stop = await session.request({ kind: 'stop' });
-    if (stop.state !== 'stopped') throw Error('SUMMARY_STOP_UNCONFIRMED');
-    if (host.sessions.get(peer.profileId) === session) host.sessions.delete(peer.profileId);
+    await stopOwned();
     session.fail('SUMMARY_CLOSED');
-    host.core.releaseFixtureKernel(peer, owner);
     return value;
   } catch (error) {
     closed = true;
@@ -639,18 +630,11 @@ export async function withSummaryImpl<T>(
       /^(?:KERNEL_LEASE_REJECTED(?::[a-z0-9_]+)?|KERNEL_SUMMARY_SCOPE_REJECTED|KERNEL_READONLY_FILES_REJECTED|KERNEL_CONTEXT_REJECTED|KERNEL_RPC_BUDGET_EXCEEDED)$/.test(
         errMessage,
       );
-    if (deterministicOpenRejected) {
-      if (host.sessions.get(peer.profileId) === session) host.sessions.delete(peer.profileId);
-      host.core.releaseFixtureKernel(peer, owner);
-    } else if (opened) {
-      try {
-        const stopped = await session.request({ kind: 'stop' });
-        if (stopped.state !== 'stopped') throw Error('SUMMARY_STOP_UNCONFIRMED');
-        if (host.sessions.get(peer.profileId) === session) host.sessions.delete(peer.profileId);
-        host.core.releaseFixtureKernel(peer, owner);
-      } catch {
-        await host.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
-      }
+    if (deterministicOpenRejected) releaseSession();
+    else if (opened) {
+      await stopOwned().catch(() =>
+        host.stopOwnedSessionOnCloseFailure(peer, session, owner, true),
+      );
     } else await host.stopOwnedSessionOnCloseFailure(peer, session, owner, true);
     session.fail('SUMMARY_FAILED');
     throw error;

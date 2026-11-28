@@ -29,6 +29,14 @@ export const addIssue = (ctx: z.RefinementCtx, message: string, path?: PropertyK
     cleanPath ? { code: 'custom', message, path: cleanPath } : { code: 'custom', message },
   );
 };
+export const TaskTimeZone = sReq(100).refine((v) => {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: v });
+    return true;
+  } catch {
+    return false;
+  }
+}, '时区无效');
 export const PostAILabelSetting = z.enum(['preserve-current', 'on', 'off']);
 export type AILabelSetting = z.infer<typeof PostAILabelSetting>;
 const optNonNegF = NonNegFinite.nullable();
@@ -80,7 +88,7 @@ export const feedDetourFields = {
 export const priceField = z.number().finite().min(0).max(1_000_000_000).multipleOf(0.01).optional();
 const marketplaceFields = {
   durationMinutes: browseFields.durationMinutes,
-  keyword: trimMax(120),
+  keyword: trimMax(120).default(''),
   categoryId: FbDigits.optional(),
   minPrice: priceField,
   maxPrice: priceField,
@@ -105,8 +113,6 @@ export const StepSchema = z.discriminatedUnion('type', [
     (s, ctx) => {
       if (s.minPrice !== undefined && s.maxPrice !== undefined && s.minPrice > s.maxPrice)
         addIssue(ctx, '最低价不能大于最高价', ['minPrice']);
-      if ((s.minPrice !== undefined || s.maxPrice !== undefined) && !s.keyword && !s.categoryId)
-        addIssue(ctx, '设置价格时请选择分类或填写关键词', ['keyword']);
     },
   ),
   strictObj({ id: Id, type: z.literal('friends'), ...friendsFields }).superRefine((s, ctx) => {
@@ -181,6 +187,7 @@ export const ProfileSchema = strictObj({
   extensionVersion: z.string().nullable(),
   capabilities: z.array(z.string()),
   presentation: ProfilePresentationStatus.nullable().optional(),
+  bindingConflict: z.string().optional(),
   account: strictObj({
     state: z.enum(['unknown', 'logged-in', 'logged-out', 'restricted', 'verification']),
     id: z.string().nullable(),
@@ -237,11 +244,24 @@ export const RenameGroup = strictObj({ groupId: Id, name: title });
 export const DeleteGroup = strictObj({ groupId: Id });
 export const RenameProfile = strictObj({ profileId: Id, alias: title });
 export const DeleteProfiles = strictObj({ profileIds: profileIdList });
-export const CreateCombination = strictObj({ value: CombinationSchema });
+const UNIFIED_POST_RESOURCE_MODE_ERR =
+  '发帖步骤已统一为「组合资源表」模式，不再支持旧本地目录模式，请改用组合资源表';
+const WritableCombinationSchema = CombinationSchema.superRefine((v, ctx) => {
+  v.steps.forEach((s, index) => {
+    if (s.type === 'post' && (s.resourceMode !== 'table' || s.resourceDirectory !== '')) {
+      addIssue(ctx, UNIFIED_POST_RESOURCE_MODE_ERR, [
+        'steps',
+        index,
+        s.resourceMode !== 'table' ? 'resourceMode' : 'resourceDirectory',
+      ]);
+    }
+  });
+});
+export const CreateCombination = strictObj({ value: WritableCombinationSchema });
 export const SaveCombination = strictObj({
   id: Id,
   expectedRevision: NonNegInt,
-  value: CombinationSchema,
+  value: WritableCombinationSchema,
 });
 export const DeleteCombination = strictObj({ id: Id });
 export const StopProfiles = strictObj({ profileIds: profileIdList });

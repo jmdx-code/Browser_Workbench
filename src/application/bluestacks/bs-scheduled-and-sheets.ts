@@ -1,4 +1,4 @@
-import { bluestacksDisplayTitle } from '../../shared/bluestacks.js';
+import { bluestacksDisplayTitle, resolveEffectiveBsAccountId } from '../../shared/bluestacks.js';
 import { PAGE_TIMELINE_SYNTHETIC_GROUP_ID } from '../../shared/google-sheets.js';
 import type { BumperSettings, BumperTarget } from '../../shared/group-bumper.js';
 import {
@@ -6,10 +6,13 @@ import {
   type PosterLog,
   type PosterMaterial,
 } from '../../shared/group-poster.js';
-import { HARD_BLOCK_MSG_RE, errMsg } from '../module-worker-pool.js';
+import { HARD_BLOCK_MSG_RE, errMsg, pickRandomFreeJob, sleepMs } from '../module-worker-pool.js';
 import { ensureInstanceOnlineForSchedule } from './bs-bumper.js';
 import {
-  makeActiveActionRecorder,
+  activeStepRiskChecks,
+  bumpBsStat,
+  collectUnpostedPosterJobs,
+  createBsActiveCallbacks,
   prepareBsPosterMaterials,
   recordBsPosterTargetFailure,
   resolveActiveSteps,
@@ -17,6 +20,7 @@ import {
 import {
   type BluestacksActiveStepParam,
   type BluestacksServiceContext,
+  type BsPostDone,
   type ExtraExecutionKind,
   classifyBsWorkerError,
   getDiscoverySnapshot,
@@ -27,9 +31,18 @@ import {
   saveLastStatusSafe,
   setBsStat,
   triggerRiskQuotaAbort,
+  withBsCarrierPermit,
   withTrackedDeviceOp,
 } from './bs-types.js';
-
+const scheduledPosterGroupLocks = new WeakMap<BluestacksServiceContext, Set<string>>();
+function getScheduledPosterGroupLocks(ctx: BluestacksServiceContext): Set<string> {
+  let locks = scheduledPosterGroupLocks.get(ctx);
+  if (!locks) {
+    locks = new Set<string>();
+    scheduledPosterGroupLocks.set(ctx, locks);
+  }
+  return locks;
+}
 function runTrackedExtraStep(options: {
   ctx: BluestacksServiceContext;
   instanceId: string;
@@ -47,7 +60,7 @@ function runTrackedExtraStep(options: {
   let hardBlocked = false;
   let softIssue = false;
   let finalStatus = options.defaultStatus;
-  return runLinkedExtraWorker(
+  return runLinkedExtraWorker<{ status: string; hardBlocked: boolean; softIssue: boolean }>(
     ctx,
     instanceId,
     kind,
@@ -55,7 +68,9 @@ function runTrackedExtraStep(options: {
     () => ({ status: '已停止', hardBlocked: false, softIssue: false }),
     async (controller) => {
       try {
-        const out = await options.run(controller);
+        const out = await withBsCarrierPermit(ctx, instanceId, controller.signal, () =>
+          options.run(controller),
+        );
         finalStatus = out.finalStatus;
         if (out.softIssue) softIssue = true;
         if (out.hardBlocked) hardBlocked = true;
@@ -67,7 +82,7 @@ function runTrackedExtraStep(options: {
         );
         if (riskReason) {
           finalStatus = riskReason;
-          softIssue = true;
+          softIssue = false;
           await saveLastStatusSafe(ctx, instanceId, riskReason);
         } else {
           finalStatus = rawMsg;
@@ -79,15 +94,16 @@ function runTrackedExtraStep(options: {
       return { status: finalStatus, hardBlocked, softIssue };
     },
     () => options.onCleanup?.({ finalStatus, hardBlocked, softIssue }),
+    () => ({ status: '跳过：该蓝蝶窗口正在执行其他任务', hardBlocked: false, softIssue: true }),
   );
 }
-
 export async function runScheduledActiveStep(
   ctx: BluestacksServiceContext,
   input: {
     instanceId: string;
     combinationId?: string;
     quickStep?: BluestacksActiveStepParam;
+    closeWindowOnFinish?: boolean;
     signal?: AbortSignal;
     onProgress: (status: string) => void;
   },
@@ -98,16 +114,9 @@ export async function runScheduledActiveStep(
     combinationId: input.combinationId,
     quickStep: input.quickStep,
   });
-  for (const [needed, kind] of [
-    [
-      steps.some((s) => (s.type === 'feed' || s.type === 'video') && (s.maxLikes ?? 2) > 0),
-      'active-like',
-    ],
-    [steps.some((s) => s.type === 'post' || s.type === 'story'), 'post'],
-  ] as const) {
-    if (!needed) continue;
+  for (const kind of activeStepRiskChecks(steps)) {
     const blockedMsg = await guardInstanceRiskQuota(ctx, input.instanceId, kind);
-    if (blockedMsg) return { status: blockedMsg, hardBlocked: false, softIssue: true };
+    if (blockedMsg) return { status: blockedMsg, hardBlocked: false, softIssue: false };
   }
   return runTrackedExtraStep({
     ctx,
@@ -117,22 +126,33 @@ export async function runScheduledActiveStep(
     defaultStatus: '活跃步骤完成',
     errorLabel: '活跃异常',
     run: async (controller) => {
-      const res = await runner.run(input.instanceId, steps, controller.signal, {
-        status: (text) => {
-          setBsStat(ctx.activeProfileStats, input.instanceId, { running: true, status: text });
-          input.onProgress(text);
-        },
-        action: makeActiveActionRecorder(ctx, input.instanceId, controller),
-      });
+      const res = await runner.run(
+        input.instanceId,
+        steps,
+        controller.signal,
+        createBsActiveCallbacks(ctx, input.instanceId, steps, controller, {
+          combinationId: input.combinationId ?? null,
+          closeOnFinish: input.closeWindowOnFinish,
+          onProgress: input.onProgress,
+        }),
+      );
       return {
         finalStatus: res ? `完成 ${res.completedSteps} 步 · 点赞 ${res.likes}` : '活跃步骤完成',
       };
     },
-    onCleanup: ({ finalStatus }) =>
-      setBsStat(ctx.activeProfileStats, input.instanceId, { running: false, status: finalStatus }),
+    onCleanup: ({ finalStatus }) => {
+      const cur = ctx.activeProfileStats.get(input.instanceId);
+      setBsStat(ctx.activeProfileStats, input.instanceId, {
+        running: false,
+        status: finalStatus,
+        ...(cur?.steps ? { steps: cur.steps } : {}),
+        ...(cur?.combinationId !== undefined ? { combinationId: cur.combinationId } : {}),
+        ...(cur?.closeOnFinish !== undefined ? { closeOnFinish: cur.closeOnFinish } : {}),
+      });
+    },
   });
 }
-
+const stepSkip = (status: string, softIssue = true) => ({ status, hardBlocked: false, softIssue });
 export async function runScheduledPosterStep(
   ctx: BluestacksServiceContext,
   input: {
@@ -148,14 +168,12 @@ export async function runScheduledPosterStep(
 ): Promise<{ postedCount: number; status: string; hardBlocked: boolean; softIssue: boolean }> {
   const skip = (status: string, softIssue = true) => ({
     postedCount: 0,
-    status,
-    hardBlocked: false,
-    softIssue,
+    ...stepSkip(status, softIssue),
   });
   const runner = ctx.extra?.posterRunner;
   if (!runner) return skip('跳过：蓝蝶发帖执行器未就绪');
   const blockedMsg = await guardInstanceRiskQuota(ctx, input.instanceId, 'post');
-  if (blockedMsg) return skip(blockedMsg);
+  if (blockedMsg) return skip(blockedMsg, false);
   if (isProfileRunning(ctx, input.instanceId)) return skip('跳过：该蓝蝶窗口正在执行其他任务');
   const [allGroups, allMaterials] = await Promise.all([
     ctx.repo.targets('groups'),
@@ -171,6 +189,23 @@ export async function runScheduledPosterStep(
   });
   if (!Array.isArray(prepRes)) return skip(prepRes.error, prepRes.error !== '已停止');
   let postedCount = 0;
+  const activeGroupIds = getScheduledPosterGroupLocks(ctx);
+  const claimedHere = new Set<string>();
+  const pendingJobs = await collectUnpostedPosterJobs(
+    ctx,
+    grps,
+    prepRes,
+    Math.max(1, input.materialsPerGroup ?? 1),
+  );
+  const releaseClaimed = (groupId?: string) => {
+    if (groupId) {
+      activeGroupIds.delete(groupId);
+      claimedHere.delete(groupId);
+      return;
+    }
+    for (const gid of claimedHere) activeGroupIds.delete(gid);
+    claimedHere.clear();
+  };
   const out = await runTrackedExtraStep({
     ctx,
     instanceId: input.instanceId,
@@ -179,45 +214,66 @@ export async function runScheduledPosterStep(
     defaultStatus: '发帖完成',
     errorLabel: '发帖异常',
     run: async (controller) => {
-      const res = await runner.run(
-        input.instanceId,
-        prepRes,
-        grps,
-        {
-          maxGroupsPerInstance: input.maxGroupsPerProfile,
-          materialsPerGroup: input.materialsPerGroup,
-          postToTimeline: Boolean(input.postToTimeline),
-          hasGroupPostedMaterial: ctx.extra?.hasGroupPostedMaterial,
-        },
-        controller.signal,
-        {
-          status: (text) => {
-            setBsStat(ctx.posterProfileStats, input.instanceId, {
-              running: true,
-              status: text,
-              session: postedCount,
-            });
-            input.onProgress(text, postedCount);
+      try {
+        const res = await runner.run(
+          input.instanceId,
+          prepRes,
+          grps,
+          {
+            maxGroupsPerInstance: input.maxGroupsPerProfile,
+            materialsPerGroup: input.materialsPerGroup,
+            postToTimeline: Boolean(input.postToTimeline),
+            hasGroupPostedMaterial: ctx.extra?.hasGroupPostedMaterial,
+            claimNextGroupJob: async () => {
+              const job = await pickRandomFreeJob(
+                pendingJobs,
+                activeGroupIds,
+                () => controller.signal.aborted,
+                () => sleepMs(100, controller.signal),
+                (c) =>
+                  ctx.extra?.hasGroupPostedMaterial
+                    ? ctx.extra.hasGroupPostedMaterial(c.group.id, c.material.id)
+                    : false,
+              );
+              if (job) {
+                activeGroupIds.add(job.group.id);
+                claimedHere.add(job.group.id);
+              }
+              return job;
+            },
+            releaseGroupJob: (gid) => releaseClaimed(gid),
           },
-          posted: () => {
-            postedCount++;
-            const cur = ctx.posterProfileStats.get(input.instanceId);
-            setBsStat(ctx.posterProfileStats, input.instanceId, {
-              running: true,
-              status: `已发帖 ${postedCount} 组`,
-              session: postedCount,
-              today: (cur?.today ?? 0) + 1,
-            });
-            input.onProgress(`已发帖 ${postedCount} 组`, postedCount);
-            triggerRiskQuotaAbort(ctx, input.instanceId, 'post', controller);
+          controller.signal,
+          {
+            status: (text) => {
+              setBsStat(ctx.posterProfileStats, input.instanceId, {
+                running: true,
+                status: text,
+                session: postedCount,
+              });
+              input.onProgress(text, postedCount);
+            },
+            posted: () => {
+              postedCount++;
+              bumpBsStat(ctx.posterProfileStats, input.instanceId, 1);
+              setBsStat(ctx.posterProfileStats, input.instanceId, {
+                running: true,
+                status: `已发帖 ${postedCount} 组`,
+                session: postedCount,
+              });
+              input.onProgress(`已发帖 ${postedCount} 组`, postedCount);
+              triggerRiskQuotaAbort(ctx, input.instanceId, 'post', controller);
+            },
+            onTargetFailed: (info) => recordBsPosterTargetFailure(ctx, input.instanceId, info),
           },
-          onTargetFailed: (info) => recordBsPosterTargetFailure(ctx, input.instanceId, info),
-        },
-      );
-      const totalPosted = res?.posted ?? postedCount;
-      return totalPosted === 0 && (res?.skipped ?? 0) > 0
-        ? { finalStatus: res?.notes[0] ?? `发帖跳过 ${res?.skipped ?? 0} 条`, softIssue: true }
-        : { finalStatus: `已发帖 ${totalPosted} 条` };
+        );
+        const totalPosted = res?.posted ?? postedCount;
+        return totalPosted === 0 && (res?.skipped ?? 0) > 0
+          ? { finalStatus: res?.notes[0] ?? `发帖跳过 ${res?.skipped ?? 0} 条`, softIssue: true }
+          : { finalStatus: `已发帖 ${totalPosted} 条` };
+      } finally {
+        releaseClaimed();
+      }
     },
     onFailureRecord: (msg) =>
       recordBsFailure(ctx, {
@@ -236,7 +292,6 @@ export async function runScheduledPosterStep(
   });
   return { postedCount, ...out };
 }
-
 export async function runScheduledInviterStep(
   ctx: BluestacksServiceContext,
   input: {
@@ -247,19 +302,16 @@ export async function runScheduledInviterStep(
     onProgress: (status: string, sessionInvited: number) => void;
   },
 ): Promise<{ invitedCount: number; status: string; hardBlocked: boolean; softIssue: boolean }> {
-  const skip = (status: string) => ({
+  const skip = (status: string, softIssue = true) => ({
     invitedCount: 0,
-    status,
-    hardBlocked: false,
-    softIssue: true,
+    ...stepSkip(status, softIssue),
   });
   const runner = ctx.extra?.inviterRunner;
   if (!runner) return skip('跳过：蓝蝶邀请执行器未就绪');
   const blockedMsg = await guardInstanceRiskQuota(ctx, input.instanceId, 'invite');
-  if (blockedMsg) return skip(blockedMsg);
+  if (blockedMsg) return skip(blockedMsg, false);
   const grps = (await ctx.repo.targets('groups')).filter((g) => input.groupIds.includes(g.id));
   if (!grps.length) return skip('跳过：未找到有效目标小组');
-
   let invitedCount = 0;
   const out = await runTrackedExtraStep({
     ctx,
@@ -282,6 +334,7 @@ export async function runScheduledInviterStep(
             triggerRiskQuotaAbort(ctx, input.instanceId, 'invite', controller);
           },
         },
+        { getInvitedFriendIds: (gid) => ctx.repo.invitedFriendIdsForGroup?.(gid) ?? [] },
       );
       return { finalStatus: `已邀请 ${res?.invited ?? invitedCount} 人` };
     },
@@ -294,7 +347,6 @@ export async function runScheduledInviterStep(
   });
   return { invitedCount, ...out };
 }
-
 export async function runDirectPostsForSheet(
   ctx: BluestacksServiceContext,
   input: {
@@ -311,12 +363,7 @@ export async function runDirectPostsForSheet(
     commentPool: readonly string[];
     signal?: AbortSignal;
     onProgress?: (status: string) => void;
-    onPostDone?: (res: {
-      postId: string;
-      liked: boolean;
-      commented: boolean;
-      commentText?: string | null;
-    }) => void | Promise<void>;
+    onPostDone?: (res: BsPostDone) => void | Promise<void>;
   },
 ): Promise<{ bumped: number; attempted: number }> {
   if (!ctx.runner.runDirectPosts) return { bumped: 0, attempted: 0 };
@@ -333,20 +380,19 @@ export async function runDirectPostsForSheet(
     () => ({ bumped: 0, attempted: 0 }),
     async (controller) => {
       try {
-        await ensureInstanceOnlineForSchedule(ctx, input.instanceId, controller.signal);
-        return (
-          (await ctx.runner.runDirectPosts?.(
-            input.instanceId,
-            input.posts,
-            input.settings,
-            input.commentPool,
-            controller.signal,
-            {
-              status: (text) => input.onProgress?.(text),
-              onPostDone: input.onPostDone,
-            },
-          )) ?? { bumped: 0, attempted: 0 }
-        );
+        return await withBsCarrierPermit(ctx, input.instanceId, controller.signal, async () => {
+          await ensureInstanceOnlineForSchedule(ctx, input.instanceId, controller.signal);
+          return (
+            (await ctx.runner.runDirectPosts?.(
+              input.instanceId,
+              input.posts,
+              input.settings,
+              input.commentPool,
+              controller.signal,
+              { status: (text) => input.onProgress?.(text), onPostDone: input.onPostDone },
+            )) ?? { bumped: 0, attempted: 0 }
+          );
+        });
       } catch (err) {
         const msg = errMsg(err);
         if (!controller.signal.aborted && msg !== 'TASK_STOPPED') {
@@ -367,9 +413,10 @@ export async function runDirectPostsForSheet(
         throw err;
       }
     },
+    undefined,
+    () => ({ bumped: 0, attempted: 0 }),
   );
 }
-
 export async function runDirectPosterForSheet(
   ctx: BluestacksServiceContext,
   input: {
@@ -401,7 +448,6 @@ export async function runDirectPosterForSheet(
   let timelinePosted = false;
   let errorMsg: string | undefined;
   let shouldCloseOnExit = false;
-
   await runLinkedExtraWorker(
     ctx,
     input.instanceId,
@@ -410,80 +456,87 @@ export async function runDirectPosterForSheet(
     () => undefined,
     async (controller) => {
       try {
-        const wasOnline = Boolean(
-          (await getDiscoverySnapshot(ctx, false)).instances.find((i) => i.id === input.instanceId)
-            ?.online,
-        );
-        input.onStatus?.(wasOnline ? '正在校验蓝蝶在线状态…' : '正在自动启动蓝蝶窗口…');
-        let inst = await ensureInstanceOnlineForSchedule(ctx, input.instanceId, controller.signal);
-        shouldCloseOnExit = !wasOnline && input.closeOnFinish !== false;
-
-        const normId = (input.targetPageId ?? '').trim().toLowerCase();
-        const normName = (input.targetPageName ?? '').trim().toLowerCase();
-        const matchesCurrent =
-          (Boolean(normId) &&
-            ((inst.numericAccountId ?? '').trim().toLowerCase() === normId ||
-              inst.accountId.trim().toLowerCase() === normId)) ||
-          (Boolean(normName) && inst.accountName.trim().toLowerCase() === normName);
-
-        const switchFn = ctx.devices.switchIdentity;
-        if (!matchesCurrent && switchFn) {
-          const managedPage = (inst.managedIdentities ?? []).find(
-            (m) =>
-              m.identityType === 'page' &&
-              !m.active &&
-              Boolean(normName) &&
-              (m.name.trim().toLowerCase() === normName ||
-                m.name.trim().toLowerCase().includes(normName) ||
-                normName.includes(m.name.trim().toLowerCase())),
+        await withBsCarrierPermit(ctx, input.instanceId, controller.signal, async () => {
+          const wasOnline = Boolean(
+            (await getDiscoverySnapshot(ctx, false)).instances.find(
+              (i) => i.id === input.instanceId,
+            )?.online,
           );
-          if (managedPage) {
-            input.onStatus?.(`正在自动切换专页身份：${managedPage.name}…`);
-            inst = await withTrackedDeviceOp(ctx, ctx.switchingIds, input.instanceId, () =>
-              switchFn(
-                input.instanceId,
-                { targetName: managedPage.name, targetType: 'page' },
-                controller.signal,
-              ),
+          input.onStatus?.(wasOnline ? '正在校验蓝蝶在线状态…' : '正在自动启动蓝蝶窗口…');
+          let inst = await ensureInstanceOnlineForSchedule(
+            ctx,
+            input.instanceId,
+            controller.signal,
+          );
+          shouldCloseOnExit = !wasOnline && input.closeOnFinish !== false;
+          const normId = (input.targetPageId ?? '').trim().toLowerCase();
+          const normName = (input.targetPageName ?? '').trim().toLowerCase();
+          const matchesCurrent =
+            (Boolean(normId) &&
+              ((inst.numericAccountId ?? '').trim().toLowerCase() === normId ||
+                inst.accountId.trim().toLowerCase() === normId)) ||
+            (Boolean(normName) && inst.accountName.trim().toLowerCase() === normName);
+          const switchFn = ctx.devices.switchIdentity;
+          if (!matchesCurrent && switchFn) {
+            const managedPage = (inst.managedIdentities ?? []).find(
+              (m) =>
+                m.identityType === 'page' &&
+                !m.active &&
+                Boolean(normName) &&
+                (m.name.trim().toLowerCase() === normName ||
+                  m.name.trim().toLowerCase().includes(normName) ||
+                  normName.includes(m.name.trim().toLowerCase())),
             );
+            if (managedPage) {
+              input.onStatus?.(`正在自动切换专页身份：${managedPage.name}…`);
+              inst = await withTrackedDeviceOp(ctx, ctx.switchingIds, input.instanceId, () =>
+                switchFn(
+                  input.instanceId,
+                  { targetName: managedPage.name, targetType: 'page' },
+                  controller.signal,
+                ),
+              );
+            }
           }
-        }
-
-        const preparedMaterial =
-          input.material.mediaSource.trim() && ctx.extra?.ensurePosterMaterialLocal
-            ? await ctx.extra.ensurePosterMaterialLocal(input.material)
-            : input.material;
-        const postToTimeline = input.targets.some((t) => t.id === PAGE_TIMELINE_SYNTHETIC_GROUP_ID);
-        const groupTargets = input.targets.filter((t) => t.id !== PAGE_TIMELINE_SYNTHETIC_GROUP_ID);
-
-        const outcome = await posterRunner.run(
-          input.instanceId,
-          [preparedMaterial],
-          groupTargets,
-          { maxGroupsPerInstance: Math.max(groupTargets.length, 0), postToTimeline },
-          controller.signal,
-          {
-            status: (text) => input.onStatus?.(text),
-            posted: () => {},
-            onPostLog: async (log, isTimeline) => {
-              if (isTimeline) timelinePosted = true;
-              else postedCount++;
-              await input.onPosted?.(log, isTimeline);
-              const quotaMsg = await guardInstanceRiskQuota(ctx, input.instanceId, 'post');
-              if (quotaMsg && !controller.signal.aborted)
-                controller.abort(new Error(`RISK_LIMIT_REACHED:${quotaMsg}`));
+          const preparedMaterial =
+            input.material.mediaSource.trim() && ctx.extra?.ensurePosterMaterialLocal
+              ? await ctx.extra.ensurePosterMaterialLocal(input.material)
+              : input.material;
+          const postToTimeline = input.targets.some(
+            (t) => t.id === PAGE_TIMELINE_SYNTHETIC_GROUP_ID,
+          );
+          const groupTargets = input.targets.filter(
+            (t) => t.id !== PAGE_TIMELINE_SYNTHETIC_GROUP_ID,
+          );
+          const outcome = await posterRunner.run(
+            input.instanceId,
+            [preparedMaterial],
+            groupTargets,
+            { maxGroupsPerInstance: Math.max(groupTargets.length, 0), postToTimeline },
+            controller.signal,
+            {
+              status: (text) => input.onStatus?.(text),
+              posted: () => {},
+              onPostLog: async (log, isTimeline) => {
+                if (isTimeline) timelinePosted = true;
+                else postedCount++;
+                await input.onPosted?.(log, isTimeline);
+                const quotaMsg = await guardInstanceRiskQuota(ctx, input.instanceId, 'post');
+                if (quotaMsg && !controller.signal.aborted)
+                  controller.abort(new Error(`RISK_LIMIT_REACHED:${quotaMsg}`));
+              },
+              onTargetFailed: (info) =>
+                recordBsPosterTargetFailure(ctx, input.instanceId, info, {
+                  accountId: resolveEffectiveBsAccountId(inst),
+                  accountName: inst.accountName || bluestacksDisplayTitle(inst),
+                  pageId: input.targetPageId ?? '',
+                  pageName: input.targetPageName ?? '',
+                }),
             },
-            onTargetFailed: (info) =>
-              recordBsPosterTargetFailure(ctx, input.instanceId, info, {
-                accountId: inst.numericAccountId || inst.accountId || '',
-                accountName: inst.accountName || bluestacksDisplayTitle(inst),
-                pageId: input.targetPageId ?? '',
-                pageName: input.targetPageName ?? '',
-              }),
-          },
-        );
-        if (postedCount === 0 && !timelinePosted && outcome.notes.length)
-          errorMsg = outcome.notes[0];
+          );
+          if (postedCount === 0 && !timelinePosted && outcome.notes.length)
+            errorMsg = outcome.notes[0];
+        });
       } catch (err) {
         const { riskReason, rawMsg, stopped } = classifyBsWorkerError(controller, err);
         errorMsg = riskReason ?? (stopped ? '任务已手动停止' : rawMsg);
@@ -509,6 +562,7 @@ export async function runDirectPosterForSheet(
         );
       }
     },
+    () => void (errorMsg = '跳过：该蓝蝶窗口正在执行其他任务'),
   );
   return { postedCount, timelinePosted, ...(errorMsg ? { error: errorMsg } : {}) };
 }

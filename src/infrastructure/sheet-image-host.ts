@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { CompatibleRepository } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { maskGyazoToken, resolveEffectiveGyazoTokens } from '../shared/google-sheets.js';
 import type {
   GoogleOAuthPort,
@@ -219,7 +219,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
       hit = await this.cacheHit(contentHash, bypassCache);
     if (hit) return { remoteUrl: hit.remoteUrl, host: hit.host, cached: true };
     if (gyazoTokens.length === 0)
-      throw new ProductError(
+      failError(
         'GYAZO_TOKEN_MISSING',
         '当前选择了 Gyazo 图床，但尚未填写 Gyazo Access Token（可改回「自动」以使用免配置的 Google 网盘兜底）',
         400,
@@ -261,14 +261,14 @@ export class SheetImageHostClient implements SheetImageHostPort {
         return await this.saveAndReturnDrive(bytes, mimeType, filename, bypassCache, true);
       } catch (driveErr) {
         const driveMsg = driveErr instanceof Error ? driveErr.message : String(driveErr);
-        throw new ProductError(
+        failError(
           'GYAZO_UPLOAD_FAILED',
           `全部 ${gyazoTokens.length} 个 Gyazo Token 上传失败，且自动切换 Google 网盘兜底也失败（${driveMsg}）；Gyazo 明细：${errors.join('；')}`,
           502,
         );
       }
     }
-    throw new ProductError(
+    failError(
       'GYAZO_UPLOAD_FAILED',
       gyazoTokens.length === 1
         ? (errors[0]?.replace(/^#1\([^)]+\):\s*/, '') ?? 'Gyazo 上传失败')
@@ -296,10 +296,11 @@ export class SheetImageHostClient implements SheetImageHostPort {
       json = JSON.parse(text) as Record<string, unknown>;
     } catch {}
     if (!resp.ok || typeof json.url !== 'string' || !json.url.startsWith('http')) {
-      const errMsg =
+      const errMsg = (
         (typeof json.message === 'string' && json.message) ||
         text.slice(0, 180) ||
-        `HTTP ${resp.status}`;
+        `HTTP ${resp.status}`
+      ).replaceAll(accessToken, maskGyazoToken(accessToken) ?? '••••••');
       throw new ProductError('GYAZO_UPLOAD_FAILED', `Gyazo 上传失败：${errMsg}`, 502);
     }
     return json.url;
@@ -320,7 +321,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
         );
         if (!searchResp.ok) {
           const searchErrText = await searchResp.text().catch(() => '');
-          throw new ProductError(
+          failError(
             'GOOGLE_DRIVE_FOLDER_FAILED',
             `查询 Google 网盘图床目录失败 (${searchResp.status})：${searchErrText.slice(0, 140)}`,
             searchResp.status === 401 ? 401 : 502,
@@ -346,7 +347,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
           error?: { message?: string };
         };
         if (!createResp.ok || !created.id) {
-          throw new ProductError(
+          failError(
             'GOOGLE_DRIVE_FOLDER_FAILED',
             `无法在 Google 网盘创建图床目录：${created.error?.message ?? `HTTP ${createResp.status}`}`,
             502,
@@ -421,7 +422,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
       error?: { message?: string };
     };
     if (!uploadResp.ok || !uploaded.id) {
-      throw new ProductError(
+      failError(
         'GOOGLE_DRIVE_UPLOAD_FAILED',
         `Google 网盘图床上传失败：${uploaded.error?.message ?? `HTTP ${uploadResp.status}`}`,
         502,
@@ -449,7 +450,7 @@ export class SheetImageHostClient implements SheetImageHostPort {
           signal: AbortSignal.timeout(10_000),
         },
       ).catch(() => {});
-      throw new ProductError(
+      failError(
         'GOOGLE_DRIVE_PERMISSION_FAILED',
         `设置 Google 网盘图片公开可读失败 (${permResp.status})：${errText.slice(0, 140)}`,
         502,

@@ -39,6 +39,10 @@ export const PostBumpRecordSchema = strictObj({
   status: PostBumpStatus,
   profileId: reqStr,
   ...makeStrShape(str),
+  windowName: str.default(''),
+  accountAvatarUrl: str.default(''),
+  pageAvatarUrl: str.default(''),
+  groupAvatarUrl: str.default(''),
   liked: z.boolean(),
   commentText: str.nullable(),
   storyShared: z.boolean(),
@@ -65,31 +69,26 @@ export const PostBumpRecordQuerySchema = strictObj({
   carrier: z.enum(['all', 'browser', 'bluestacks']).default('all'),
   status: z.enum(['all', 'success', 'failed']).default('all'),
   search: sMax(200).default(''),
+  accountQuery: sMax(200).default(''),
+  groupQuery: sMax(200).default(''),
+  pageQuery: sMax(200).default(''),
+  postUrlQuery: sMax(200).default(''),
   from: intNum.optional(),
   to: intNum.optional(),
   limit: intRange(1, 1000).default(200),
   offset: NonNegInt.default(0),
 });
 export type PostBumpRecordQuery = z.input<typeof PostBumpRecordQuerySchema>;
-const PostBumpDailyStatSchema = strictObj({
-    dateKey: str,
-    posts: NonNegInt,
-    bumps: NonNegInt,
-    failures: NonNegInt,
-  }),
-  PostBumpStatusCountsSchema = strictObj({
-    total: NonNegInt,
-    confirmed: NonNegInt,
-    pending: NonNegInt,
-    failed: NonNegInt,
-  });
-export type PostBumpDailyStat = z.infer<typeof PostBumpDailyStatSchema>;
-export type PostBumpStatusCounts = z.infer<typeof PostBumpStatusCountsSchema>;
+const PostBumpStatusCountsSchema = strictObj({
+  total: NonNegInt,
+  confirmed: NonNegInt,
+  pending: NonNegInt,
+  failed: NonNegInt,
+});
 export const PostBumpRecordsResponseSchema = strictObj({
   records: z.array(PostBumpRecordSchema),
   total: NonNegInt,
   hasMore: z.boolean(),
-  dailyStats: z.array(PostBumpDailyStatSchema).optional(),
   statusCounts: PostBumpStatusCountsSchema.optional(),
 });
 export type PostBumpRecordsResponse = z.infer<typeof PostBumpRecordsResponseSchema>;

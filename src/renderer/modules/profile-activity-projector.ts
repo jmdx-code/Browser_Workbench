@@ -7,9 +7,7 @@ import type { GroupInviterProfileStat } from '../../shared/group-inviter.js';
 import type { PosterProfileStat } from '../../shared/group-poster.js';
 import { profileTaskResultLabel } from '../../shared/profile-task-result.js';
 import type { TaskRuntimeOverview } from '../../shared/task-contracts.js';
-import { isErroredPausedPlan, taskReasonDescription } from '../../shared/task-issues.js';
-import { taskTimingLabel } from '../../shared/task-timing.js';
-import { stepName } from '../task-record-summary.js';
+import { taskReasonDescription } from '../../shared/task-issues.js';
 import {
   BREADCRUMB_LABELS,
   buildFeatureNavItems,
@@ -18,12 +16,28 @@ import {
   type ProfileActivityDescriptor,
   type SelectionControlSummary,
 } from './module-contracts.js';
-
+export function stepName(step: {
+  type: string;
+  feedMode?: string | undefined;
+  friendAction?: string | undefined;
+  destination?: string | undefined;
+}): string {
+  if (step.type === 'feed') {
+    if (step.feedMode === 'search_pages') return '搜专页逛时间线';
+    if (step.feedMode === 'random_profile') return '逛他人时间线';
+    if (step.feedMode === 'random_page') return '逛公共专页';
+    return '浏览首页';
+  }
+  if (step.type === 'video') return '浏览 Reels';
+  if (step.type === 'marketplace') return '浏览商城';
+  if (step.type === 'friends')
+    return step.friendAction === 'add_suggested' ? '加推荐好友' : '接受好友';
+  if (step.type === 'post') return step.destination === 'story' ? '发布快拍' : '发帖';
+  return step.type;
+}
 export { buildFeatureNavItems } from './module-contracts.js';
-
 interface SchedulerActiveProfileInfo {
   scheduleName: string;
-  phase: 'prewarm' | 'main';
   status: 'running' | 'queued';
   currentStep: string;
   summary: string;
@@ -31,7 +45,6 @@ interface SchedulerActiveProfileInfo {
 type TasksOverview = z.infer<typeof TaskRuntimeOverview>;
 type RunFlags = Record<string, { running: boolean }>;
 const ENDED_STATES = ['STOPPED', 'COMPLETED', 'FAILED'];
-
 const runningStatIds = (counts?: RunFlags) =>
   Object.entries(counts ?? {})
     .filter(([, s]) => s.running)
@@ -53,9 +66,8 @@ const toneFor = (
   extraErr?: boolean,
 ): ProfileActivityDescriptor['tone'] =>
   running ? 'run' : extraErr || errRe.test(status) ? 'err' : /停止/.test(status) ? 'pause' : 'ok';
-
 function extractSchedulerMap(
-  activeRuns?: readonly Pick<AutoScheduleRun, 'carrier' | 'scheduleName' | 'phase' | 'items'>[],
+  activeRuns?: readonly Pick<AutoScheduleRun, 'carrier' | 'scheduleName' | 'items'>[],
 ) {
   const map: Record<string, SchedulerActiveProfileInfo> = {};
   for (const run of activeRuns ?? []) {
@@ -67,7 +79,6 @@ function extractSchedulerMap(
       ) {
         map[item.targetId] = {
           scheduleName: run.scheduleName,
-          phase: run.phase,
           status: item.status,
           currentStep: item.currentStep,
           summary: item.summary,
@@ -77,25 +88,17 @@ function extractSchedulerMap(
   }
   return map;
 }
-
 function fmtScheduler(info: SchedulerActiveProfileInfo): ProfileActivityDescriptor {
-  const tag = info.phase === 'prewarm' ? '预热' : '排班';
   return {
     moduleId: 'auto-scheduler',
     moduleLabel: '定时排班',
     running: true,
     tone: info.status === 'running' ? 'run' : 'queue',
     text:
-      info.status === 'running'
-        ? `${tag} · ${info.currentStep}`
-        : `${tag}排队 · ${info.scheduleName}`,
-    tooltipLines: [
-      `定时排班：${info.scheduleName}（${info.phase === 'prewarm' ? '提前预热场' : '正点冲锋场'}）`,
-      `${info.currentStep} · ${info.summary}`,
-    ],
+      info.status === 'running' ? `排班 · ${info.currentStep}` : `排班排队 · ${info.scheduleName}`,
+    tooltipLines: [`定时排班：${info.scheduleName}`, `${info.currentStep} · ${info.summary}`],
   };
 }
-
 function fmtSheets(info: GoogleSheetsActiveProfile): ProfileActivityDescriptor {
   const moduleId: FeatureModuleId =
     info.kind === 'post_schedule' ? 'sheets-schedule' : 'sheets-records';
@@ -111,7 +114,6 @@ function fmtSheets(info: GoogleSheetsActiveProfile): ProfileActivityDescriptor {
     tooltipLines: [`${moduleLabel}：${info.title}`, status],
   };
 }
-
 const posterAct = (
   s: PosterProfileStat | undefined,
   running: boolean,
@@ -128,7 +130,6 @@ const posterAct = (
     tooltipLines: [`小组发帖：今日 ${today} 贴 · 本轮 ${session} 贴 · ${status}`],
   };
 };
-
 const bumperAct = (
   mod: 'group-bumper' | 'page-bumper',
   s: BumperProfileStat | undefined,
@@ -145,7 +146,6 @@ const bumperAct = (
     tooltipLines: [`${label}：今日 ${s?.today ?? 0} 次 · 本轮 ${s?.session ?? 0} 次 · ${status}`],
   };
 };
-
 const inviterAct = (
   s: GroupInviterProfileStat | undefined,
   running: boolean,
@@ -161,7 +161,6 @@ const inviterAct = (
     tooltipLines: [`小组邀请人：${summary}`],
   };
 };
-
 export interface ProfileActivityProjectionInput {
   activeModule?: FeatureModuleId;
   tasks?: TasksOverview | null;
@@ -176,7 +175,6 @@ export interface ProfileActivityProjectionInput {
   schedulerBrowserMap?: Record<string, SchedulerActiveProfileInfo>;
   googleSheetsActiveMap?: Record<string, GoogleSheetsActiveProfile>;
 }
-
 interface IndexedActivityLookup {
   activePlanByProfile: Map<string, TasksOverview['plans'][number]>;
   stepByJobId: Map<string, TasksOverview['currentSteps'][number]>;
@@ -186,7 +184,6 @@ interface IndexedActivityLookup {
   pageBumperRunningSet: Set<string>;
   inviterRunningSet: Set<string>;
 }
-
 function indexBy<T>(
   items: readonly T[] | undefined,
   key: (v: T) => string,
@@ -196,7 +193,6 @@ function indexBy<T>(
   for (const v of items ?? []) if (!skip?.(v) && !m.has(key(v))) m.set(key(v), v);
   return m;
 }
-
 function buildIndexedLookup(input: ProfileActivityProjectionInput): IndexedActivityLookup {
   return {
     activePlanByProfile: indexBy(
@@ -212,7 +208,6 @@ function buildIndexedLookup(input: ProfileActivityProjectionInput): IndexedActiv
     inviterRunningSet: new Set(input.groupInviterRunningIds ?? []),
   };
 }
-
 function buildStepProgressView(
   plan: TasksOverview['plans'][number],
   step: TasksOverview['currentSteps'][number] | undefined,
@@ -228,7 +223,6 @@ function buildStepProgressView(
     maxLikes: step.maxLikes ?? (spec && 'maxLikes' in spec ? spec.maxLikes : undefined),
   };
 }
-
 export function projectProfileActivity(
   profileOrId: string | { id: string },
   input: ProfileActivityProjectionInput,
@@ -250,7 +244,6 @@ export function projectProfileActivity(
   }
   const sheetInfo = input.googleSheetsActiveMap?.[pid];
   if (sheetInfo) return fmtSheets(sheetInfo);
-
   const hasId = (set: Set<string> | undefined, arr: readonly string[] | undefined) =>
     indexed ? Boolean(set?.has(pid)) : arr?.includes(pid) === true;
   if (
@@ -282,11 +275,9 @@ export function projectProfileActivity(
       plan.snapshot.steps.length > 1 ? `[${plan.position + 1}/${plan.snapshot.steps.length}] ` : '';
     const stepLabel =
       plan.state === 'QUEUED'
-        ? plan.timing
-          ? taskTimingLabel(plan.timing)
-          : reasonSummary
-            ? '排队中 · ' + reasonSummary
-            : '排队中'
+        ? reasonSummary
+          ? '排队中 · ' + reasonSummary
+          : '排队中'
         : step
           ? prefix + stepName(step) + ' · 执行中'
           : '运行中';
@@ -309,7 +300,6 @@ export function projectProfileActivity(
     };
   }
   if (schedInfo) return fmtScheduler(schedInfo);
-
   for (const [counts, render] of [
     [input.groupPosterCounts, () => posterAct(input.groupPosterCounts?.[pid], false)],
     [
@@ -323,7 +313,6 @@ export function projectProfileActivity(
     if (counts && stat && ((activeCount ?? 0) > 0 || (stat.status && stat.status !== '未运行')))
       return render();
   }
-
   const lastResult = indexed
     ? indexed.resultByProfile.get(pid)
     : input.tasks?.profileResults?.find((v) => v.profileId === pid);
@@ -354,7 +343,6 @@ export function projectProfileActivity(
   if (input.groupInviterCounts) return inviterAct(input.groupInviterCounts[pid], false);
   return null;
 }
-
 export function projectProfileActivitiesMap(
   profiles: readonly Pick<Profile, 'id'>[],
   input: ProfileActivityProjectionInput,
@@ -367,7 +355,6 @@ export function projectProfileActivitiesMap(
   }
   return map;
 }
-
 export function projectSelectionControls(
   selected: ReadonlySet<string>,
   input: ProfileActivityProjectionInput,
@@ -389,13 +376,9 @@ export function projectSelectionControls(
   ]);
   const stoppableModuleProfileIds = [...selected].filter((id) => runningModuleIds.has(id));
   const activePlanProfileIds = new Set(
-    plans
-      .filter((p) => !ENDED_STATES.includes(p.state) && !isErroredPausedPlan(p))
-      .map((p) => p.profileId),
+    plans.filter((p) => !ENDED_STATES.includes(p.state)).map((p) => p.profileId),
   );
   return {
-    pausableTargets: [],
-    resumableTargets: [],
     stoppableTargets: stoppable.map((p) => ({
       profileId: p.profileId,
       planId: p.id,
@@ -410,7 +393,6 @@ export function projectSelectionControls(
     isProfileBusy: (pid: string) => activePlanProfileIds.has(pid) || runningModuleIds.has(pid),
   };
 }
-
 type CountsArg<T> = Record<string, T>;
 export interface WorkbenchProjectionParams {
   viewKind: FeatureModuleId | 'home' | 'edit';
@@ -459,11 +441,10 @@ export interface WorkbenchProjectionParams {
       recordsConfig?: { enabled: boolean };
     }[];
   } | null;
-  attentionCount: number;
+  attentionCount?: number;
   message: string;
   carrier?: 'browser' | 'bluestacks';
 }
-
 export function buildWorkbenchProjection(p: WorkbenchProjectionParams) {
   const {
     viewKind,
@@ -515,7 +496,6 @@ export function buildWorkbenchProjection(p: WorkbenchProjectionParams) {
     viewKind === 'sheets-pages'
       ? viewKind
       : undefined;
-
   const navItems = buildFeatureNavItems({
     carrier: carrier ?? (viewKind.startsWith('bluestacks-') ? 'bluestacks' : 'browser'),
     ...(activeSheetsModule ? { activeSheetsModule } : {}),
@@ -524,9 +504,7 @@ export function buildWorkbenchProjection(p: WorkbenchProjectionParams) {
       : 0,
     autoSchedulerEnabledCount: autoScheduler?.schedules.filter((s) => s.enabled).length ?? 0,
     activeAccountRunningCount: new Set(
-      plans
-        .filter((pl) => !ENDED_STATES.includes(pl.state) && !isErroredPausedPlan(pl))
-        .map((pl) => pl.profileId),
+      plans.filter((pl) => !ENDED_STATES.includes(pl.state)).map((pl) => pl.profileId),
     ).size,
     groupInviterRunning: Boolean(groupInviter?.running),
     inviterRunningCount: inviterRunningIds.length,
@@ -560,7 +538,6 @@ export function buildWorkbenchProjection(p: WorkbenchProjectionParams) {
     ),
     attentionCount,
   });
-
   const projectionInput: ProfileActivityProjectionInput = {
     activeModule: viewKind === 'home' || viewKind === 'edit' ? 'active-accounts' : viewKind,
     tasks,
@@ -592,7 +569,7 @@ export function buildWorkbenchProjection(p: WorkbenchProjectionParams) {
     schedulerRunningIds: Object.keys(schedulerBrowserMap),
     sheetsRunningIds: Object.keys(googleSheetsActiveMap),
     activeModule: projectionInput.activeModule as FeatureModuleId,
-    breadcrumbText: BREADCRUMB_LABELS[viewKind] ?? '执行记录',
+    breadcrumbText: BREADCRUMB_LABELS[viewKind] ?? '数据与记录',
     navItems,
     projectedActivities: profiles
       ? projectProfileActivitiesMap(profiles, projectionInput)

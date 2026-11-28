@@ -6,14 +6,12 @@ export interface ProfileStartAdmissionInput {
   busyModuleLabelsForProfile?(profileId: string): Promise<string[]>;
   isProfileBusyInOtherModule?(profileId: string): boolean | Promise<boolean>;
 }
-
 export interface ProfileStartAdmissionResult {
   readonly admittedProfileIds: string[];
   readonly alreadyRunningIds: string[];
   readonly skippedBusy: Array<{ profileId: string; reason: string; labels: string[] }>;
   readonly skippedOffline: Array<{ profileId: string; reason: string }>;
 }
-
 export async function admitProfilesForStart(
   input: ProfileStartAdmissionInput,
 ): Promise<ProfileStartAdmissionResult> {
@@ -21,7 +19,6 @@ export async function admitProfilesForStart(
   const alreadyRunningIds: string[] = [];
   const skippedBusy: Array<{ profileId: string; reason: string; labels: string[] }> = [];
   const skippedOffline: Array<{ profileId: string; reason: string }> = [];
-
   for (const profileId of new Set(input.requestedProfileIds)) {
     if (await input.isAlreadyRunningInCurrentModule?.(profileId)) {
       alreadyRunningIds.push(profileId);

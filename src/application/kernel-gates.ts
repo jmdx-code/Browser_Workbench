@@ -6,14 +6,12 @@ import {
 import { validateProjection, type PageProjectionRequest } from '../shared/page-read.js';
 import type { Awaitable } from '../domain/persistence.js';
 import type { KernelTarget, KernelJsonObject } from '../shared/kernel-protocol.js';
-
 export interface NativeInputCommand {
   target: KernelTarget;
   method: string;
   params: KernelJsonObject;
 }
 export type NativeInputGuard = (command: NativeInputCommand) => Promise<void>;
-
 // Every SDK Input/file command passes here after asynchronous SDK waits and before transport send.
 export async function guardNativeInput(
   command: NativeInputCommand,
@@ -33,7 +31,6 @@ export async function guardNativeInput(
   await assertCurrent();
   return original;
 }
-
 function pruneOlderThan(
   map: Map<string, number>,
   now: number,
@@ -43,21 +40,17 @@ function pruneOlderThan(
   for (const [id, at] of map)
     if (inclusive ? now - at >= maxAgeMs : now - at > maxAgeMs) map.delete(id);
 }
-
 export class PresentationFocusGate {
   private nextAt = 0;
   private readonly waiting = new Map<string, number>();
   private readonly recovered = new Map<string, number>();
-
   constructor(
     private readonly globalGap = 1500,
     private readonly profileGap = 15000,
   ) {}
-
   cancel(key: string) {
     this.waiting.delete(key);
   }
-
   request(key: string, now: number): boolean {
     pruneOlderThan(this.waiting, now, 10000, false);
     pruneOlderThan(this.recovered, now, 60000, true);
@@ -71,10 +64,8 @@ export class PresentationFocusGate {
     return true;
   }
 }
-
 export class PositionRecoveryGate {
   private readonly recovered = new Map<string, number>();
-
   request(key: string, now: number): boolean {
     pruneOlderThan(this.recovered, now, 60000, true);
     if (now - (this.recovered.get(key) ?? -Infinity) < 2000) return false;
@@ -82,18 +73,15 @@ export class PositionRecoveryGate {
     this.recovered.set(key, now);
     return true;
   }
-
   cancel(key: string) {
     this.recovered.delete(key);
   }
 }
-
 export interface PageReadSamplingPort {
   assertCurrent(): Awaitable<void>;
   read(): Promise<unknown>;
   wait(): Promise<void>;
 }
-
 // Reads may be sampled during an initial navigation; no action is retried or dispatched here.
 export async function sampleFacebookPage(
   request: PageProjectionRequest,
@@ -122,7 +110,6 @@ export async function sampleFacebookPage(
   }
   throw Error('PAGE_READ_EXHAUSTED');
 }
-
 type Pong = {
   type: 'PONG';
   connectionEpoch: string;
@@ -130,10 +117,8 @@ type Pong = {
   profileWindowFocused?: boolean;
   lastFocusedAt?: number;
 };
-
 export class ProfileHeartbeat {
   private observing = false;
-
   constructor(
     private readonly current: () => boolean,
     private readonly epoch: () => string,
@@ -141,7 +126,6 @@ export class ProfileHeartbeat {
     private readonly windows: () => Promise<readonly { focused?: boolean }[]>,
     private readonly onObservation?: (focused: boolean) => number | undefined,
   ) {}
-
   pulse(): void {
     if (!this.current()) return;
     const epoch = this.epoch();
@@ -176,12 +160,10 @@ export class ProfileHeartbeat {
       });
   }
 }
-
 // Bounded FIFO for expensive phases. A permit never grants account or input authority.
 export class AsyncWorkBudget {
   private active = 0;
   private readonly waiting: (() => void)[] = [];
-
   constructor(
     private readonly limit: number,
     private readonly capacity: number,
@@ -189,7 +171,6 @@ export class AsyncWorkBudget {
     if (!Number.isInteger(limit) || limit < 1 || !Number.isInteger(capacity) || capacity < 1)
       throw Error('WORK_BUDGET_INVALID');
   }
-
   run<T>(guard: () => Awaitable<void>, work: () => Promise<T>): Promise<T> {
     if (this.waiting.length >= this.capacity)
       return Promise.reject(Error('HEAVY_PHASE_QUEUE_FULL'));
@@ -209,7 +190,6 @@ export class AsyncWorkBudget {
       this.drain();
     });
   }
-
   private drain() {
     while (this.active < this.limit && this.waiting.length) {
       const next = this.waiting.shift();
@@ -218,7 +198,6 @@ export class AsyncWorkBudget {
       next();
     }
   }
-
   status() {
     return { active: this.active, waiting: this.waiting.length, limit: this.limit };
   }

@@ -10,12 +10,10 @@ import {
   type NormalizedTargetListKind,
   type TargetFolder,
 } from '../shared/target-list.js';
-
 const normalizedTables: Record<NormalizedTargetListKind, readonly [string, string]> = {
   shared_groups: ['shared_facebook_groups', 'group_id'],
   bumper_pages: ['group_bumper_pages', 'page_id'],
 };
-
 export class SqliteTargetLists {
   constructor(private readonly db: DatabaseSync) {}
   folders(kind: TargetListKind): TargetFolder[] {

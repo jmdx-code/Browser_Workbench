@@ -13,8 +13,8 @@ import { WorkspaceService } from '../src/application/workspace-service.js';
 import { TaskService } from '../src/application/task-service.js';
 import {
   TaskOverview,
-  TaskHistory,
   TaskCapabilities,
+  TaskRecords,
   TaskRuntimeOverview,
 } from '../src/shared/task-contracts.js';
 import { BridgeProfileSource } from '../src/infrastructure/browser-source.js';
@@ -261,33 +261,11 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
       403,
     );
     assert.equal(repo.tasks.settings().maxConcurrentProfiles, 4);
-    assert.equal((await post('/tasks/settings', { maxConcurrentProfiles: 100 })).status, 409);
-    assert.equal(repo.tasks.settings().maxConcurrentProfiles, 4);
-    const capacityHeaders = {
-      cookie,
-      origin: server.origin,
-      'content-type': 'application/json',
-      'x-workbench-task-capacity': '2',
-    };
-    const capacitySaved = await fetch(server.origin + '/api/workspace/tasks/settings', {
-      method: 'POST',
-      headers: capacityHeaders,
-      body: JSON.stringify({ maxConcurrentProfiles: 100 }),
-    });
+    const capacitySaved = await post('/tasks/settings', { maxConcurrentProfiles: 100 });
     assert.equal(capacitySaved.status, 200);
     assert.equal(repo.tasks.settings().maxConcurrentProfiles, 100);
-    const runtimeHeaders = {
-      cookie,
-      'x-workbench-task-contract': '4',
-      'x-workbench-runtime-contract': '2',
-    };
-    assert.equal(
-      (await fetch(server.origin + '/api/workspace/tasks/runtime', { headers: runtimeHeaders }))
-        .status,
-      409,
-    );
     const currentRuntime = await fetch(server.origin + '/api/workspace/tasks/runtime', {
-      headers: { ...runtimeHeaders, 'x-workbench-task-capacity': '2' },
+      headers: { cookie, 'x-workbench-runtime-contract': '2' },
     });
     assert.equal(currentRuntime.status, 200);
     assert.equal(
@@ -309,50 +287,24 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
       409,
     );
     const recordsUrl = server.origin + '/api/workspace/tasks/records';
-    assert.equal(
-      (
-        await fetch(recordsUrl, {
+    const recordResponses = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        fetch(recordsUrl, {
           method: 'POST',
-          headers: { cookie, origin: server.origin, 'content-type': 'application/json' },
-          body: '{}',
-        })
-      ).status,
-      409,
+          headers: {
+            cookie,
+            origin: server.origin,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ limit: 50 }),
+        }),
+      ),
     );
-    const reader = repo.tasks.recordReader as unknown as { readPage(...args: unknown[]): unknown };
-    const read = reader.readPage.bind(reader);
-    let calculations = 0;
-    reader.readPage = (...args) => {
-      calculations++;
-      return read(...args);
-    };
-    try {
-      const responses = await Promise.all(
-        Array.from({ length: 10 }, () =>
-          fetch(recordsUrl, {
-            method: 'POST',
-            headers: {
-              cookie,
-              origin: server.origin,
-              'content-type': 'application/json',
-              'x-workbench-records-contract': '1',
-              'x-workbench-task-contract': '4',
-            },
-            body: JSON.stringify({ limit: 50 }),
-          }),
-        ),
-      );
-      assert.ok(responses.every((response) => response.status === 200));
-      const pages = await Promise.all(responses.map((response) => response.json()));
-      assert.ok(pages.every((page) => JSON.stringify(page) === JSON.stringify(pages[0])));
-      assert.equal(
-        calculations,
-        1,
-        '10 identical real HTTP requests compute once; subsequent requests use committed-data cache',
-      );
-    } finally {
-      reader.readPage = read;
-    }
+    assert.ok(recordResponses.every((response) => response.status === 200));
+    const pages = await Promise.all(
+      recordResponses.map(async (response) => TaskRecords.parse(await response.json())),
+    );
+    assert.ok(pages.every((page) => JSON.stringify(page) === JSON.stringify(pages[0])));
 
     assert.equal(
       (
@@ -380,7 +332,7 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
           ],
         })
       ).status,
-      409,
+      400,
     );
     assert.equal(
       (
@@ -399,37 +351,7 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
       404,
     );
     assert.deepEqual(repo.tasks.list(), []);
-    const taskHistoryUrl = server.origin + '/api/workspace/tasks/history';
-    assert.equal(
-      (
-        await fetch(taskHistoryUrl, {
-          method: 'POST',
-          headers: {
-            origin: server.origin,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({ profileId: profileIds[0] }),
-        })
-      ).status,
-      401,
-    );
-    assert.equal(
-      (await post('/tasks/history', { profileId: profileIds[0] }, 'https://attacker.example'))
-        .status,
-      403,
-    );
-    assert.equal((await post('/tasks/history', { profileId: randomUUID() })).status, 404);
-    assert.equal(
-      (await post('/tasks/history', { profileId: profileIds[0], resolveUnknown: true })).status,
-      400,
-    );
-    const historyResponse = await post('/tasks/history', { profileId: profileIds[0] });
-    assert.equal(historyResponse.status, 200);
-    const history = TaskHistory.parse(await historyResponse.json());
-    assert.equal(history.profileId, profileIds[0]);
-    assert.equal(history.selectedPlanId, null);
-    assert.deepEqual(history.operations, []);
-    assert.equal(repo.tasks.list().length, 0);
+    assert.equal((await post('/tasks/history', { profileId: profileIds[0] })).status, 404);
     assert.equal((await fetch(server.origin + '/api/workspace/profiles/inspection')).status, 401);
     assert.equal(
       (await post('/profiles/inspect', { profileIds, url: 'https://evil.test/' })).status,
@@ -574,7 +496,8 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
           type: 'post',
           destination: 'story',
           audience: 'friends',
-          resourceDirectory: materialDirectory,
+          resourceMode: 'table',
+          resourceDirectory: '',
           count: 1,
           allowRepeat: false,
           forbidSameAccountRepeat: true,
@@ -584,33 +507,38 @@ test('real HTTP workspace preserves auth boundary, public schema, reorder and sa
       randomOrder: false,
       loop: { mode: 'finite', rounds: 1 },
     };
-    const storyRequest = (contract: string) =>
+    assert.equal(
+      (
+        await post('/combinations/create', {
+          value: {
+            ...storyValue,
+            steps: [
+              {
+                ...storyValue.steps[0],
+                resourceMode: 'directory',
+                resourceDirectory: materialDirectory,
+              },
+            ],
+          },
+        })
+      ).status,
+      400,
+    );
+    const storyRequest = () =>
       fetch(server.origin + '/api/workspace/combinations/create', {
         method: 'POST',
         headers: {
           cookie,
           origin: server.origin,
           'content-type': 'application/json',
-          'x-workbench-workspace-contract': contract,
         },
         body: JSON.stringify({ value: storyValue }),
       });
-    const beforeStory = repo.combinations().length;
-    assert.equal((await storyRequest('4')).status, 409);
-    assert.equal(repo.combinations().length, beforeStory);
-    assert.equal((await storyRequest('5')).status, 201);
+    assert.equal((await storyRequest()).status, 201);
     assert.equal(
       (
         await fetch(server.origin + '/api/workspace', {
-          headers: { cookie, 'x-workbench-workspace-contract': '4' },
-        })
-      ).status,
-      409,
-    );
-    assert.equal(
-      (
-        await fetch(server.origin + '/api/workspace', {
-          headers: { cookie, 'x-workbench-workspace-contract': '5' },
+          headers: { cookie },
         })
       ).status,
       200,

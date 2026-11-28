@@ -22,6 +22,7 @@ test('display remains available during tasks, stopping, review and unsynced conn
   peer.capabilities = ['browser-window-reveal-v1'];
   const service = new BridgeBrowserWindow(core, {
     list: () => assert.fail('display must not query plans'),
+    livePlans: () => assert.fail('display must not query plans'),
   });
   try {
     for (const phase of ['RUNNING', 'PAUSED', 'OFFLINE'] as const) {
@@ -95,6 +96,7 @@ test('cleanupTabs falls back to lightweight CLEANUP_EXTRA_TABS when browser is b
     core,
     {
       list: async () => [],
+      livePlans: async () => [],
       hasProfilePlanInStates: async () => false,
     },
     async () => ({
@@ -103,7 +105,7 @@ test('cleanupTabs falls back to lightweight CLEANUP_EXTRA_TABS when browser is b
       focused: true as const,
     }),
     async () => {
-      throw Error('KERNEL_RPC_FALLBACK');
+      throw Error('WORKSPACE_CLEANUP_EXTENSION_UPDATE_REQUIRED');
     },
   );
   try {

@@ -1,5 +1,6 @@
 import { MAX_ACCOUNT_AVATAR_BYTES } from '../shared/account-state-policy.js';
 import { isLocalAvatar, MAX_LOCAL_AVATAR_BYTES } from '../shared/group-bumper.js';
+import { buildFacebookTargetUrl, targetDomHelpers } from './group-bumper/target-meta-helpers.js';
 export const MAX_AVATAR_DOWNLOAD_BYTES = 4 * 1024 * 1024; // 4MB
 const HTML_ENTITIES: Record<string, string> = {
   quot: '"',
@@ -11,32 +12,22 @@ const HTML_ENTITIES: Record<string, string> = {
   amp: '&',
 };
 export function decodeHtmlEntities(raw: string): string {
-  const decoded = raw
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => {
-      const code = Number.parseInt(hex, 16);
-      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : '';
-    })
-    .replace(/&#(\d+);/g, (_, dec: string) => {
-      const code = Number.parseInt(dec, 10);
-      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : '';
-    })
-    .replace(
-      /&(quot|apos|#039|lt|gt|nbsp|amp);/gi,
-      (full, entity: string) => HTML_ENTITIES[entity.toLowerCase()] ?? full,
-    )
-    .replace(/\s+/g, ' ')
-    .replace(/^\(\d+\+?\)\s*/, '')
-    .replace(/\s*[|-]\s*Facebook\s*$/i, '')
-    .trim();
-  if (
-    !decoded ||
-    /^(?:Facebook|Log in or sign up to view|Log into Facebook|Log In|登录 Facebook|登入 Facebook|請先登入|请先登录|Error|错误|找不到内容|Content Not Found|目前無法查看此內容|目前无法查看此内容)$/i.test(
-      decoded,
-    )
-  ) {
-    return '';
-  }
-  return decoded;
+  const decoded = targetDomHelpers.cleanTargetHeading(
+    raw
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => {
+        const code = Number.parseInt(hex, 16);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : '';
+      })
+      .replace(/&#(\d+);/g, (_, dec: string) => {
+        const code = Number.parseInt(dec, 10);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : '';
+      })
+      .replace(
+        /&(quot|apos|#039|lt|gt|nbsp|amp);/gi,
+        (full, entity: string) => HTML_ENTITIES[entity.toLowerCase()] ?? full,
+      ),
+  );
+  return targetDomHelpers.isGenericTargetHeading(decoded) ? '' : decoded;
 }
 export interface ResolvedTargetMetadata {
   canonicalId: string | null;
@@ -56,19 +47,14 @@ export function parseTargetMetadataFromHtml(
     const rawContent = /content=["']([^"']+)["']/i.exec(tag)?.[1] ?? '';
     if (!prop || !rawContent) continue;
     if (prop === 'al:android:url' || prop === 'al:ios:url') {
-      const match =
-        kind === 'pages'
-          ? /fb:\/\/(?:profile|page)\/(\d+)/i.exec(rawContent)
-          : /fb:\/\/group\/(\d+)/i.exec(rawContent);
-      if (match?.[1]) canonicalId ??= match[1];
+      const deepId = targetDomHelpers.extractDeepLinkTargetId(rawContent, kind);
+      if (deepId) canonicalId ??= deepId;
     } else if (prop === 'og:title' || prop === 'twitter:title') {
       const cleaned = decodeHtmlEntities(rawContent);
       if (cleaned) name ??= cleaned;
     } else if (prop === 'og:image' || prop === 'twitter:image') {
       const url = rawContent.replace(/&amp;/g, '&').trim();
-      if (url.startsWith('https://') && !/static\.xx\.fbcdn\.net\/rsrc\.php/i.test(url)) {
-        avatarUrl ??= url;
-      }
+      if (targetDomHelpers.isValidHttpAvatarUrl(url)) avatarUrl ??= url;
     }
   }
   if (!name) {
@@ -108,9 +94,7 @@ export function parseTargetMetadataFromHtml(
       const val = row[key];
       if (
         typeof val === 'string' &&
-        /^https:\/\//.test(val) &&
-        !/^https:\/\/(?:www\.)?facebook\.com\//i.test(val) &&
-        !/static\.xx\.fbcdn\.net\/rsrc\.php|\/rsrc\.php\/|\/emoji\.php\//i.test(val)
+        targetDomHelpers.isValidHttpAvatarUrl(val, { disallowFacebookOrigin: true })
       )
         return val;
     }
@@ -139,21 +123,16 @@ export function parseTargetMetadataFromHtml(
     const id = String(row.id ?? row.__id ?? '');
     const type = String(row.__typename ?? '');
     if (type && !(kind === 'groups' ? /^Group$/ : /^(?:User|Page|Profile)$/).test(type)) continue;
-    let matches = !!id && (id === expectedId || id === canonicalId);
-    if (expectedId && !/^\d+$/.test(expectedId)) {
-      matches ||= row.username === expectedId || row.vanity === expectedId;
-      for (const key of ['url', 'profile_url', 'group_url'])
-        if (typeof row[key] === 'string') {
-          try {
-            const u = new URL(row[key], 'https://www.facebook.com');
-            matches ||=
-              u.origin === 'https://www.facebook.com' &&
-              u.pathname.replace(/\/$/, '').toLowerCase() ===
-                (kind === 'groups' ? '/groups/' : '/') + expectedId.toLowerCase();
-          } catch {}
-        }
-    }
-    if (!matches) continue;
+    if (
+      !targetDomHelpers.matchesTargetEntity(
+        row,
+        kind,
+        expectedId ?? '',
+        canonicalId,
+        'https://www.facebook.com',
+      )
+    )
+      continue;
     if (/^\d+$/.test(id)) canonicalId ??= id;
     if (typeof row.name === 'string') name ||= decodeHtmlEntities(row.name) || null;
     const fields = Object.entries(row).filter(([key]) =>
@@ -269,6 +248,18 @@ async function readBoundedImageStream(
   }
   return total < 16 ? null : Buffer.concat(chunks, total);
 }
+function normalizeFetchableAvatarUrl(avatarUrl: string | null | undefined): {
+  local?: string;
+  remote?: string;
+} {
+  if (typeof avatarUrl !== 'string') return {};
+  const trimmed = avatarUrl.trim();
+  if (!trimmed) return {};
+  if (isLocalAvatar(trimmed)) return { local: trimmed };
+  if (!/^https?:\/\//i.test(trimmed) || targetDomHelpers.isFacebookResourceNoiseUrl(trimmed))
+    return {};
+  return { remote: trimmed };
+}
 async function fetchLocalizedAvatarWithBudget(
   avatarUrl: string | null | undefined,
   opts: {
@@ -277,11 +268,10 @@ async function fetchLocalizedAvatarWithBudget(
     encode: (bytes: Uint8Array) => Promise<string | null>;
   },
 ): Promise<string | null> {
-  if (typeof avatarUrl !== 'string') return null;
-  const trimmed = avatarUrl.trim();
+  const normalized = normalizeFetchableAvatarUrl(avatarUrl);
+  if (normalized.local) return normalized.local;
+  const trimmed = normalized.remote;
   if (!trimmed) return null;
-  if (isLocalAvatar(trimmed)) return trimmed;
-  if (!/^https?:\/\//i.test(trimmed) || /\/rsrc\.php\/|\/emoji\.php\//i.test(trimmed)) return null;
   const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
   const effectiveSignal = opts.signal
     ? AbortSignal.any([opts.signal, timeoutSignal])
@@ -320,11 +310,10 @@ export async function fetchAndLocalizeAccountAvatar(
   signal?: AbortSignal,
   singleflightKey?: string,
 ): Promise<string | null> {
-  if (typeof avatarUrl !== 'string') return null;
-  const trimmed = avatarUrl.trim();
+  const normalized = normalizeFetchableAvatarUrl(avatarUrl);
+  if (normalized.local) return normalized.local;
+  const trimmed = normalized.remote;
   if (!trimmed) return null;
-  if (isLocalAvatar(trimmed)) return trimmed;
-  if (!/^https?:\/\//i.test(trimmed) || /\/rsrc\.php\/|\/emoji\.php\//i.test(trimmed)) return null;
   const key = singleflightKey ? `${singleflightKey}|${trimmed}` : trimmed;
   const existing = accountAvatarSingleflight.get(key);
   if (existing) return existing;
@@ -345,12 +334,7 @@ export async function resolveBumperTargetMetadata(
 ): Promise<ResolvedTargetMetadata> {
   const id = rawId.trim();
   if (!id) return { canonicalId: null, name: null, avatarUrl: null };
-  const url =
-    kind === 'groups'
-      ? `https://www.facebook.com/groups/${encodeURIComponent(id)}/`
-      : /^\d+$/.test(id)
-        ? `https://www.facebook.com/profile.php?id=${encodeURIComponent(id)}`
-        : `https://www.facebook.com/${encodeURIComponent(id)}`;
+  const url = buildFacebookTargetUrl(kind, id);
   let canonicalId: string | null = null;
   let name: string | null = null;
   let rawAvatarUrl: string | null = null;
@@ -425,9 +409,7 @@ export interface StartupAccountAvatarLocalizationDeps {
   forceInTests?: boolean;
   isShuttingDown: () => boolean;
 }
-export interface StartupAccountAvatarLocalizationHandle {
-  cancel(): void;
-}
+export type StartupAccountAvatarLocalizationHandle = { cancel(): void };
 export function scheduleStartupAccountAvatarLocalization(
   deps: StartupAccountAvatarLocalizationDeps,
 ): StartupAccountAvatarLocalizationHandle {

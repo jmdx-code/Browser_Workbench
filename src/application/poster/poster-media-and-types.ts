@@ -1,11 +1,7 @@
 import type { CompatibleRepository } from '../../domain/persistence.js';
 import { mediaReference } from '../../domain/resource-table.js';
-import { ProductError } from '../../domain/workspace.js';
-import type {
-  BumperDailyStat,
-  BumperRefreshResult,
-  BumperTarget,
-} from '../../shared/group-bumper.js';
+import { ProductError, failError } from '../../domain/workspace.js';
+import type { BumperRefreshResult, BumperTarget } from '../../shared/group-bumper.js';
 import type {
   PosterCacheStatus,
   PosterLog,
@@ -16,17 +12,16 @@ import type {
   PosterSettings,
   PosterTask,
 } from '../../shared/group-poster.js';
+import type { CheckDailyRiskLimitFn } from '../../shared/daily-risk-limits.js';
 import type { PostBumpRecordsPort } from '../../shared/post-bump-records.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
 import type { ProfileTaskResultValue } from '../../shared/task-contracts.js';
 import type { FeatureExecutionRegistry } from '../feature-execution-registry.js';
 import { errMsg, sleepMs } from '../module-worker-pool.js';
 import { Workboard } from '../workboard.js';
-
 export class PosterAccountRestrictedError extends Error {
   readonly scope: 'global_route' | 'feature_action';
   readonly abnormalState: 'logged-out' | 'verification' | 'restricted';
-
   constructor(
     message = '受限 · 需要手机验证或操作受限',
     options?: {
@@ -40,19 +35,16 @@ export class PosterAccountRestrictedError extends Error {
     this.abnormalState = options?.abnormalState ?? 'restricted';
   }
 }
-
 export interface PreparedPosterMedia {
   localFilePath: string;
   mediaKind: PosterMediaKind;
   thumbnailDataUrl?: string | null;
 }
-
 export interface PosterMediaStreamChunk {
   status: 200 | 206 | 416;
   headers: Record<string, string | number>;
   bytes?: Uint8Array;
 }
-
 export interface PosterMediaPreparerPort {
   prepare(
     mediaSource: string,
@@ -68,14 +60,12 @@ export interface PosterMediaPreparerPort {
     rangeHeader?: string,
   ): Promise<PosterMediaStreamChunk | null>;
 }
-
 export interface GroupPosterTaskItem {
   group: BumperTarget;
   material: PosterMaterial;
   taskIds?: Set<string>;
   allowedProfileIds?: Set<string> | null;
 }
-
 export interface GroupPosterBrowserCallbacks {
   runId: string;
   cancelled(): boolean;
@@ -90,7 +80,6 @@ export interface GroupPosterBrowserCallbacks {
   ): Promise<{ alreadyPosted?: boolean } | void> | { alreadyPosted?: boolean } | void;
   onTargetError?(groupId: string, reason: string): void;
 }
-
 export interface GroupPosterBrowserPort {
   ready(profileId: string): boolean;
   busy(profileId: string): Promise<boolean>;
@@ -104,7 +93,6 @@ export interface GroupPosterBrowserPort {
   ): Promise<void>;
   stop(profileId: string): Promise<void>;
 }
-
 export interface PosterRepository {
   settings(): PosterSettings;
   saveSettings(input: unknown): PosterSettings;
@@ -172,11 +160,9 @@ export interface PosterRepository {
   deleteLogs(input: unknown): number;
   total(): number;
   todayCounts(): Record<string, number>;
-  weeklyDailyCounts?(): BumperDailyStat[];
   pendingReviewOperations?(limit?: number): PosterPendingOperation[];
   saveProfileResult?(result: ProfileTaskResultValue): void;
 }
-
 export function createPosterRuntime(opts: {
   repo: CompatibleRepository<PosterRepository>;
   runner: GroupPosterBrowserPort;
@@ -215,18 +201,20 @@ export function createPosterRuntime(opts: {
     groupAvatarRefreshing: false,
     refreshAbort: null as AbortController | null,
     tickingSchedule: false,
+    closingCount: 0,
+    onWorkerSettled: undefined as (() => Promise<void>) | undefined,
     profileLifecycle: undefined as ProfileLifecyclePort | undefined,
-    workboard: new Workboard(),
+    workboard: new Workboard({ browserConcurrency: 100, bluestacksConcurrency: 50 }),
     postBumpRecords: undefined as PostBumpRecordsPort | undefined,
+    checkDailyRiskLimit: undefined as CheckDailyRiskLimitFn | undefined,
     isProfileRunning: (id: string) =>
       rt.active.has(id) || rt.starting.has(id) || rt.workers.has(id),
-    hasActiveExecution: () => rt.active.size > 0 || rt.starting.size > 0 || rt.workers.size > 0,
+    hasActiveExecution: () =>
+      rt.active.size > 0 || rt.starting.size > 0 || rt.workers.size > 0 || rt.closingCount > 0,
   };
   return rt;
 }
-
 export type PosterRuntimeContext = ReturnType<typeof createPosterRuntime>;
-
 function isLocalMediaSource(src: string): boolean {
   try {
     return mediaReference(src).kind === 'local';
@@ -234,7 +222,6 @@ function isLocalMediaSource(src: string): boolean {
     return false;
   }
 }
-
 export async function preparePosterMaterialById(
   ctx: PosterRuntimeContext,
   id: string,
@@ -244,7 +231,6 @@ export async function preparePosterMaterialById(
   await ensurePosterMaterialPrepared(ctx, item);
   return (await ctx.repo.materials()).find((m) => m.id === id) ?? null;
 }
-
 export async function prepareAdHocPosterMaterial(
   ctx: PosterRuntimeContext,
   item: PosterMaterial,
@@ -264,7 +250,6 @@ export async function prepareAdHocPosterMaterial(
     cacheError: null,
   };
 }
-
 export async function preparePendingPosterMaterials(
   ctx: PosterRuntimeContext,
   materials: readonly PosterMaterial[],
@@ -280,7 +265,6 @@ export async function preparePendingPosterMaterials(
       await ensurePosterMaterialPrepared(ctx, item).catch(() => {});
   }
 }
-
 export async function ensurePosterMaterialPrepared(
   ctx: PosterRuntimeContext,
   item: PosterMaterial,
@@ -309,7 +293,6 @@ export async function ensurePosterMaterialPrepared(
     };
   };
   if (!src) return commitReady(null, 'none', null);
-
   const isLocal = isLocalMediaSource(src);
   if (item.cacheStatus === 'ready' && item.localFilePath) {
     const exists = (await ctx.mediaPreparer.verifyExists?.(item.localFilePath)) ?? true;
@@ -366,16 +349,11 @@ export async function ensurePosterMaterialPrepared(
       cacheStatus: 'error',
       cacheError: friendlyError,
     });
-    throw new ProductError(
-      'POSTER_MEDIA_PREPARE_FAILED',
-      `素材媒体准备失败: ${friendlyError}`,
-      409,
-    );
+    failError('POSTER_MEDIA_PREPARE_FAILED', `素材媒体准备失败: ${friendlyError}`, 409);
   } finally {
     ctx.preparingMaterials.delete(item.id);
   }
 }
-
 export async function getPosterMaterialThumbnail(
   ctx: PosterRuntimeContext,
   id: string,
@@ -385,7 +363,11 @@ export async function getPosterMaterialThumbnail(
   if (current?.thumbnailDataUrl) return current;
   if (ctx.repo.getMaterialMediaPath && ctx.mediaPreparer.generateThumbnail) {
     const media = await ctx.repo.getMaterialMediaPath(id);
-    if (media?.localFilePath && media.mediaKind !== 'none') {
+    if (
+      media?.localFilePath &&
+      media.mediaKind !== 'none' &&
+      ((await ctx.mediaPreparer.verifyExists?.(media.localFilePath)) ?? true)
+    ) {
       const generated = await ctx.mediaPreparer
         .generateThumbnail(media.localFilePath, media.mediaKind)
         .catch(() => null);
@@ -402,7 +384,6 @@ export async function getPosterMaterialThumbnail(
   }
   return current;
 }
-
 export async function streamPosterMaterialMedia(
   ctx: PosterRuntimeContext,
   id: string,
@@ -414,7 +395,6 @@ export async function streamPosterMaterialMedia(
     ? ctx.mediaPreparer.readMediaRange(media.localFilePath, media.mediaKind, rangeHeader)
     : null;
 }
-
 export async function cleanupExpiredPosterDriveCache(
   ctx: PosterRuntimeContext,
   nowMs = Date.now(),

@@ -13,9 +13,22 @@ import {
   GroupInviteLogRow,
   AddInviterGroupsRequest,
   DeleteInviterGroupsRequest,
+  DeleteInviterRecordsInputSchema,
+  InviterRecordSchema,
+  InviterRecordsQuerySchema,
   UpdateGroupInviterSettingsRequest,
+  type InviterRecordsQuery,
+  type InviterRecordsResponse,
 } from '../shared/group-inviter.js';
-
+import { loadKnownAvatarSets, recordAvatarURL } from './record-avatar-store.js';
+import { normalizeRecordAccountId } from '../shared/activity-stats.js';
+type InviteEntryInput = {
+  profileId: string;
+  accountId: string;
+  friendId: string;
+  friendName: string;
+  groupId: string;
+};
 export function ensureGroupInviterSchema(db: DatabaseSync): void {
   ensureTargetLibrarySchema(db);
   db.exec(`
@@ -24,11 +37,13 @@ export function ensureGroupInviterSchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_account ON group_inviter_logs(account_id); CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_invited_at ON group_inviter_logs(invited_at DESC);
     CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_operation ON group_inviter_logs(operation_id); CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_conf_invited_at ON group_inviter_logs(confirmation, invited_at DESC, id ASC);
     CREATE INDEX IF NOT EXISTS idx_group_inviter_logs_conf_profile ON group_inviter_logs(confirmation, profile_id);
-    CREATE TABLE IF NOT EXISTS group_inviter_settings(id INTEGER PRIMARY KEY CHECK(id=1), invites_per_group INTEGER NOT NULL DEFAULT 30 CHECK(invites_per_group BETWEEN 1 AND 200), max_concurrent_profiles INTEGER NOT NULL DEFAULT 4 CHECK(max_concurrent_profiles BETWEEN 1 AND 50), play_sound_on_complete INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS group_inviter_settings(id INTEGER PRIMARY KEY CHECK(id=1), invites_per_group INTEGER NOT NULL DEFAULT 30 CHECK(invites_per_group BETWEEN 1 AND 200), max_concurrent_profiles INTEGER NOT NULL DEFAULT 4 CHECK(max_concurrent_profiles BETWEEN 1 AND 50), play_sound_on_complete INTEGER NOT NULL DEFAULT 1, close_browser_on_finish INTEGER NOT NULL DEFAULT 0);
     INSERT OR IGNORE INTO group_inviter_settings(id, invites_per_group, max_concurrent_profiles, play_sound_on_complete) VALUES(1, 30, 4, 1);
   `);
+  Q.ensureColumns(db, 'group_inviter_settings', [
+    ['close_browser_on_finish', 'INTEGER NOT NULL DEFAULT 0'],
+  ]);
 }
-
 export class SqliteGroupInviterRepository {
   private readonly targetLibrary: SqliteTargetLibraryRepository;
   constructor(private readonly db: DatabaseSync) {
@@ -68,7 +83,7 @@ export class SqliteGroupInviterRepository {
     );
   getSettings() {
     const sql =
-      'SELECT invites_per_group, max_concurrent_profiles, play_sound_on_complete FROM group_inviter_settings WHERE id=1';
+      'SELECT invites_per_group, max_concurrent_profiles, play_sound_on_complete, close_browser_on_finish FROM group_inviter_settings WHERE id=1';
     const row = Q.getRow(this.db, sql),
       inv = Number(row?.invites_per_group ?? 30),
       conc = Number(row?.max_concurrent_profiles ?? 4);
@@ -76,21 +91,33 @@ export class SqliteGroupInviterRepository {
       invitesPerGroup: Number.isInteger(inv) && inv >= 1 && inv <= 200 ? inv : 30,
       maxConcurrentProfiles: Number.isInteger(conc) && conc >= 1 && conc <= 50 ? conc : 4,
       playSoundOnComplete: Number(row?.play_sound_on_complete ?? 1) === 1,
+      closeBrowserOnFinish: Number(row?.close_browser_on_finish ?? 0) === 1,
     };
   }
   saveSettings(input: unknown) {
     const p = UpdateGroupInviterSettingsRequest.parse(input),
       cur = this.getSettings(),
       sql =
-        'UPDATE group_inviter_settings SET invites_per_group=?, max_concurrent_profiles=?, play_sound_on_complete=? WHERE id=1';
+        'UPDATE group_inviter_settings SET invites_per_group=?, max_concurrent_profiles=?, play_sound_on_complete=?, close_browser_on_finish=? WHERE id=1';
     Q.run(
       this.db,
       sql,
       p.invitesPerGroup ?? cur.invitesPerGroup,
       p.maxConcurrentProfiles ?? cur.maxConcurrentProfiles,
       (p.playSoundOnComplete ?? cur.playSoundOnComplete) ? 1 : 0,
+      (p.closeBrowserOnFinish ?? cur.closeBrowserOnFinish) ? 1 : 0,
     );
     return this.getSettings();
+  }
+  releasePendingInvites(operationId: string): number {
+    if (!/^[a-f0-9-]{36}$/.test(operationId)) return 0;
+    return Number(
+      Q.run(
+        this.db,
+        "DELETE FROM group_inviter_logs WHERE operation_id=? AND confirmation='PENDING'",
+        operationId,
+      ).changes ?? 0,
+    );
   }
   getInvitedFriendIdsForGroup = (groupId: string): Set<string> =>
     new Set(
@@ -113,16 +140,7 @@ export class SqliteGroupInviterRepository {
         ),
     );
   }
-  reserveInvites(
-    operationId: string,
-    entries: ReadonlyArray<{
-      profileId: string;
-      accountId: string;
-      friendId: string;
-      friendName: string;
-      groupId: string;
-    }>,
-  ): void {
+  reserveInvites(operationId: string, entries: ReadonlyArray<InviteEntryInput>): void {
     if (!/^[a-f0-9-]{36}$/.test(operationId) || !entries.length || entries.length > 200)
       throw Error('GROUP_INVITER_RESERVATION_INVALID');
     const sql =
@@ -146,14 +164,7 @@ export class SqliteGroupInviterRepository {
     });
   }
   recordInvites(
-    entries: ReadonlyArray<{
-      profileId: string;
-      accountId: string;
-      friendId: string;
-      friendName: string;
-      groupId: string;
-      invitedAt?: number;
-    }>,
+    entries: ReadonlyArray<InviteEntryInput & { invitedAt?: number }>,
     operationId?: string,
   ): number {
     if (!entries.length) return 0;
@@ -253,5 +264,137 @@ export class SqliteGroupInviterRepository {
     if (limitClause) params.push(Q.clampLimit(Math.floor(filter?.limit ?? 300), 1, 5000));
     const sql = `SELECT id, profile_id, account_id, friend_id, friend_name, group_id, invited_at FROM group_inviter_logs WHERE ${clauses.join(' AND ')} ORDER BY invited_at DESC, id ASC${limitClause}`;
     return Q.allRows(this.db, sql, ...params).map((r) => GroupInviteLogRow.parse(Q.camel(r)));
+  }
+  queryEnrichedLogs(queryInput: InviterRecordsQuery = {}): InviterRecordsResponse {
+    const q = InviterRecordsQuerySchema.parse(queryInput),
+      avatars = loadKnownAvatarSets(this.db),
+      bsIds = new Set<string>(),
+      winNames = new Map<string, string>(),
+      accNames = new Map<string, string>(),
+      groupNames = new Map<string, string>();
+    if (Q.sqliteTableExists(this.db, 'bluestacks_instances')) {
+      for (const r of Q.allRows(
+        this.db,
+        'SELECT id, instance_key, display_name, alias, account_id, numeric_account_id, account_name FROM bluestacks_instances',
+      )) {
+        const id = Q.s(r.id);
+        if (!id) continue;
+        bsIds.add(id);
+        winNames.set(id, Q.s(r.alias).trim() || Q.s(r.display_name).trim() || Q.s(r.instance_key));
+        const an = Q.s(r.account_name).trim();
+        if (an) accNames.set(id, an);
+      }
+    }
+    if (Q.sqliteTableExists(this.db, 'profile_launch_bindings'))
+      for (const r of Q.allRows(
+        this.db,
+        'SELECT profile_id, browser_name, window_name FROM profile_launch_bindings',
+      )) {
+        const id = Q.s(r.profile_id),
+          bn = Q.s(r.browser_name).trim() || Q.s(r.window_name).trim();
+        if (id && bn && !bsIds.has(id)) winNames.set(id, bn);
+      }
+    if (Q.sqliteTableExists(this.db, 'profile_metadata'))
+      for (const r of Q.allRows(this.db, 'SELECT profile_id, alias FROM profile_metadata')) {
+        const id = Q.s(r.profile_id),
+          a = Q.s(r.alias).trim();
+        if (id && a && !bsIds.has(id)) winNames.set(id, a);
+      }
+    if (Q.sqliteTableExists(this.db, 'profile_account_cache'))
+      for (const r of Q.allRows(
+        this.db,
+        'SELECT profile_id, account_id, account_name FROM profile_account_cache',
+      )) {
+        const id = Q.s(r.profile_id),
+          aid = Q.s(r.account_id).trim(),
+          an = Q.s(r.account_name).trim();
+        if (id && an) accNames.set(id, an);
+        if (aid && an) accNames.set(`acc:${aid}`, an);
+      }
+    if (Q.sqliteTableExists(this.db, 'shared_facebook_groups'))
+      for (const r of Q.allRows(this.db, 'SELECT group_id, group_name FROM shared_facebook_groups'))
+        groupNames.set(Q.s(r.group_id), Q.s(r.group_name));
+    const clauses: string[] = ['1=1'],
+      params: Array<string | number> = [];
+    if (q.confirmation !== 'all') {
+      clauses.push('confirmation = ?');
+      params.push(q.confirmation);
+    }
+    if (q.from !== undefined) {
+      clauses.push('invited_at >= ?');
+      params.push(q.from);
+    }
+    if (q.to !== undefined) {
+      clauses.push('invited_at <= ?');
+      params.push(q.to);
+    }
+    const rawRows = Q.allRows(
+      this.db,
+      `SELECT id, profile_id, account_id, friend_id, friend_name, group_id, confirmation, invited_at FROM group_inviter_logs WHERE ${clauses.join(' AND ')} ORDER BY invited_at DESC, id ASC`,
+      ...params,
+    );
+    const aq = q.accountQuery.trim().toLowerCase(),
+      gq = q.groupQuery.trim().toLowerCase(),
+      fq = q.friendQuery.trim().toLowerCase();
+    const matched = rawRows
+      .map((r) => {
+        const pid = Q.s(r.profile_id),
+          normAcc = normalizeRecordAccountId(Q.s(r.account_id)),
+          aid = normAcc.accountId,
+          gid = Q.s(r.group_id),
+          carrier = bsIds.has(pid) ? ('bluestacks' as const) : ('browser' as const),
+          windowName = winNames.get(pid) ?? pid,
+          accountName = accNames.get(`acc:${aid}`) ?? accNames.get(pid) ?? normAcc.extractedName,
+          groupName = groupNames.get(gid) ?? '';
+        return InviterRecordSchema.parse({
+          id: Q.s(r.id),
+          carrier,
+          profileId: pid,
+          windowName,
+          accountId: aid,
+          accountName,
+          accountAvatarUrl: aid && avatars.accounts.has(aid) ? recordAvatarURL('account', aid) : '',
+          groupId: gid,
+          groupName,
+          groupAvatarUrl: gid && avatars.groups.has(gid) ? recordAvatarURL('group', gid) : '',
+          friendId: Q.s(r.friend_id),
+          friendName: Q.s(r.friend_name),
+          confirmation: Q.s(r.confirmation) === 'PENDING' ? 'PENDING' : 'CONFIRMED',
+          invitedAt: Q.n(r.invited_at),
+        });
+      })
+      .filter((row) => {
+        if (q.carrier !== 'all' && row.carrier !== q.carrier) return false;
+        if (
+          aq &&
+          !`${row.accountName} ${row.accountId} ${row.windowName} ${row.profileId}`
+            .toLowerCase()
+            .includes(aq)
+        )
+          return false;
+        if (gq && !`${row.groupName} ${row.groupId}`.toLowerCase().includes(gq)) return false;
+        if (fq && !`${row.friendName} ${row.friendId}`.toLowerCase().includes(fq)) return false;
+        return true;
+      });
+    const total = matched.length,
+      records = matched.slice(q.offset, q.offset + q.limit);
+    return { records, total, hasMore: q.offset + records.length < total };
+  }
+  deleteLogs(input: unknown): { deleted: number } {
+    const parsed = DeleteInviterRecordsInputSchema.parse(input ?? {});
+    return transaction(this.db, () => {
+      let deleted = 0;
+      if (parsed.clearAll) {
+        deleted = Number(Q.run(this.db, 'DELETE FROM group_inviter_logs').changes ?? 0);
+      } else if (parsed.ids?.length) {
+        deleted = Q.deleteByJsonIds(this.db, 'group_inviter_logs', 'id', [...new Set(parsed.ids)]);
+      }
+      if (deleted > 0 && Q.sqliteTableExists(this.db, 'shared_facebook_groups'))
+        Q.run(
+          this.db,
+          "UPDATE shared_facebook_groups SET invited_count=(SELECT COUNT(*) FROM group_inviter_logs WHERE group_inviter_logs.group_id=shared_facebook_groups.group_id AND confirmation='CONFIRMED')",
+        );
+      return { deleted };
+    });
   }
 }

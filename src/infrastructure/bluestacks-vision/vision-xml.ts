@@ -184,9 +184,34 @@ export function parseDumpsysTop(
   let rootNode: LiteXmlNode | null = null,
     resumedRootNode: LiteXmlNode | null = null,
     lastValidRootNode: LiteXmlNode | null = null,
-    skipUntilIndent = -1;
+    skipUntilIndent = -1,
+    effScreenW = screenW,
+    effScreenH = screenH;
+  const isFullViewportContainer = (n: LiteXmlNode): boolean =>
+    n.bounds.w >= 840 && n.bounds.h >= 980 && n.bounds.y1 <= 260;
+  const hasFullViewportScrollableDescendant = (n: LiteXmlNode): boolean =>
+    n.children.some(
+      (c) =>
+        ((c.scrollable || c.className.includes('RecyclerView')) && isFullViewportContainer(c)) ||
+        hasFullViewportScrollableDescendant(c),
+    );
+  const markStructuralFeedContainers = (node: LiteXmlNode, treeRoot: LiteXmlNode): void => {
+    for (const c of node.children) markStructuralFeedContainers(c, treeRoot);
+    if (node === treeRoot || node.clickable || node.children.length === 0) return;
+    if (!isFullViewportContainer(node) || hasFullViewportScrollableDescendant(node)) return;
+    if (/^(?:android|com\.android)\./.test(node.className) || node.className.includes('DecorView'))
+      return;
+    const hasFeedChildren =
+      node.children.length >= 2 || node.children.some((c) => c.bounds.h < 980 || c.bounds.w < 840);
+    if (!hasFeedChildren) return;
+    node.scrollable = true;
+    if (!node.className.includes('RecyclerView')) {
+      node.className = 'androidx.recyclerview.widget.RecyclerView';
+    }
+  };
   const commitCurrentHierarchy = () => {
     if (rootNode && rootNode.children.length > 0) {
+      markStructuralFeedContainers(rootNode, rootNode);
       lastValidRootNode = rootNode;
       if (currentActivityResumed) resumedRootNode = rootNode;
     }
@@ -211,6 +236,8 @@ export function parseDumpsysTop(
       if (hMatch && hMatch[1] !== undefined) {
         inHierarchy = true;
         hierarchyBaseIndent = hMatch[1].length;
+        effScreenW = screenW;
+        effScreenH = screenH;
         stack.length = 0;
         rootNode = null;
         skipUntilIndent = -1;
@@ -265,15 +292,25 @@ export function parseDumpsysTop(
       skipUntilIndent = indent;
       continue;
     }
-    const scaled = scaleBoundsTo900(rawX1, rawY1, rawX2, rawY2, screenW, screenH);
+    if (
+      parent.node === rootNode &&
+      rootNode.children.length === 0 &&
+      relX1 === 0 &&
+      relY1 === 0 &&
+      relX2 >= 300 &&
+      relY2 >= 300
+    ) {
+      effScreenW = relX2;
+      effScreenH = relY2;
+    }
+    const scaled = scaleBoundsTo900(rawX1, rawY1, rawX2, rawY2, effScreenW, effScreenH);
     if (scaled.w === 0 || scaled.h === 0) {
       skipUntilIndent = indent;
       continue;
     }
     const isRecycler =
-      rawClass === 'X.10N' ||
-      rawClass === 'X.0wX' ||
       rawClass.includes('RecyclerView') ||
+      rawClass.includes('ListView') ||
       parent.node.className.includes('SwipeRefreshLayout');
     const node: LiteXmlNode = {
       index: parent.node.children.length,
@@ -466,10 +503,7 @@ export function readPngDimensions(pngBuffer: Buffer): { width: number; height: n
     height = pngBuffer.readUInt32BE(20);
   return width > 0 && height > 0 && width <= 10000 && height <= 10000 ? { width, height } : null;
 }
-export interface CanonicalFrame {
-  canvas: Canvas;
-  ctx: SKRSContext2D;
-}
+export type CanonicalFrame = { canvas: Canvas; ctx: SKRSContext2D };
 const canonicalFrameCache = new WeakMap<Buffer, Promise<CanonicalFrame | null>>();
 export async function getCanonicalFrame(pngBuffer: Buffer): Promise<CanonicalFrame | null> {
   const existing = canonicalFrameCache.get(pngBuffer);
@@ -543,6 +577,55 @@ export async function isSolidBlueButton(pngBuffer: Buffer, bounds: RectBounds): 
     (r, g, b) => b >= 150 && b - r >= 55 && b - g >= 18,
   );
   return Boolean(res && res.total > 0 && res.matched / res.total >= 0.4);
+}
+export async function isGalleryCameraTile(pngBuffer: Buffer, bounds: RectBounds): Promise<boolean> {
+  const frame = await getCanonicalFrame(pngBuffer);
+  if (!frame) return false;
+  const crop = clampCrop(bounds.x1, bounds.y1, bounds.w, bounds.h, 24);
+  if (!crop) return false;
+  const ctx = frame.canvas.getContext('2d');
+  const { data } = ctx.getImageData(crop.left, crop.top, crop.width, crop.height);
+  const inset = Math.min(10, Math.max(4, Math.floor(Math.min(crop.width, crop.height) * 0.08)));
+  const cornerPts: Array<[number, number]> = [
+    [inset, inset],
+    [crop.width - 1 - inset, inset],
+    [inset, crop.height - 1 - inset],
+    [crop.width - 1 - inset, crop.height - 1 - inset],
+  ];
+  let minR = 255,
+    maxR = 0,
+    minG = 255,
+    maxG = 0,
+    minB = 255,
+    maxB = 0;
+  for (const [cx, cy] of cornerPts) {
+    const idx = (cy * crop.width + cx) * 4;
+    const r = data[idx] ?? 0,
+      g = data[idx + 1] ?? 0,
+      b = data[idx + 2] ?? 0;
+    if (Math.min(r, g, b) < 210 || Math.max(r, g, b) - Math.min(r, g, b) > 14) return false;
+    if (r < minR) minR = r;
+    if (r > maxR) maxR = r;
+    if (g < minG) minG = g;
+    if (g > maxG) maxG = g;
+    if (b < minB) minB = b;
+    if (b > maxB) maxB = b;
+  }
+  if (maxR - minR > 12 || maxG - minG > 12 || maxB - minB > 12) return false;
+  const xStart = Math.floor(crop.width * 0.25),
+    xEnd = Math.floor(crop.width * 0.75),
+    yStart = Math.floor(crop.height * 0.25),
+    yEnd = Math.floor(crop.height * 0.75);
+  let matched = 0,
+    total = 0;
+  for (let y = yStart; y < yEnd; y += 3) {
+    for (let x = xStart; x < xEnd; x += 3) {
+      const idx = (y * crop.width + x) * 4;
+      total++;
+      if (isBlue(data[idx] ?? 0, data[idx + 1] ?? 0, data[idx + 2] ?? 0)) matched++;
+    }
+  }
+  return total > 0 && matched / total >= 0.25;
 }
 export async function isReactionButtonActive(
   pngBuffer: Buffer,

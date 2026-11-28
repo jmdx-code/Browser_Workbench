@@ -10,9 +10,7 @@ import type { Profile } from '../shared/contracts.js';
 import type { Inspection } from '../shared/profile-inspection.js';
 import { BackdropModal, Btn, ModalHeading } from './modules/shared/module-ui.js';
 import { UI_TEXTAREA } from './ui/primitives.js';
-
 export { buildTargetCandidates, normalizeTargetToken, type SelectByIdsCandidate };
-
 export function buildProfileCandidates(
   profiles: readonly Profile[],
   inspections: readonly Inspection[],
@@ -33,7 +31,6 @@ export function buildProfileCandidates(
     return { id: p.id, keys: [...keys] };
   });
 }
-
 export function SelectByIdsDialog({
   title,
   kind,
@@ -54,7 +51,6 @@ export function SelectByIdsDialog({
   const [text, setText] = useState('');
   const { tokens, matchedIds, unmatchedTokens } = resolveSelectByIds(text, kind, candidates);
   const isProf = kind === 'profiles';
-
   return (
     <BackdropModal label={title} modalClass="w-[min(460px,92vw)]" onClose={onClose}>
       <ModalHeading title={title} className="px-0 pt-0 pb-2.5" onClose={onClose} />

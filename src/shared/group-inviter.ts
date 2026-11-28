@@ -4,10 +4,12 @@ import {
   NonNegInt,
   NumNull,
   StrNull,
+  boolF,
   boolT,
   intRange,
   optBool,
   sMax,
+  sReq,
   strictObj,
   trimMax,
   trimReq,
@@ -23,6 +25,7 @@ const inviterOptFields = {
   invitesPerGroup: intRange(1, 200).optional(),
   maxConcurrentProfiles: intRange(1, 50).optional(),
   playSoundOnComplete: optBool,
+  closeBrowserOnFinish: optBool,
 };
 export const InviterGroupRow = strictObj({
   groupId: GroupIdString,
@@ -45,6 +48,45 @@ export const GroupInviteLogRow = strictObj({
   invitedAt: NonNegInt,
 });
 export type GroupInviteLogRow = z.infer<typeof GroupInviteLogRow>;
+export const InviterRecordSchema = strictObj({
+  id: Id,
+  carrier: z.enum(['browser', 'bluestacks']),
+  profileId: Id,
+  windowName: sMax(200),
+  accountId: trimMax(120),
+  accountName: sMax(200),
+  accountAvatarUrl: sMax(300),
+  groupId: GroupIdString,
+  groupName: sMax(200),
+  groupAvatarUrl: sMax(300),
+  friendId: trimReq(200),
+  friendName: trimMax(200),
+  confirmation: z.enum(['CONFIRMED', 'PENDING']),
+  invitedAt: NonNegInt,
+});
+export type InviterRecord = z.infer<typeof InviterRecordSchema>;
+export const InviterRecordsQuerySchema = strictObj({
+  carrier: z.enum(['all', 'browser', 'bluestacks']).default('all'),
+  confirmation: z.enum(['all', 'CONFIRMED', 'PENDING']).default('CONFIRMED'),
+  accountQuery: sMax(200).default(''),
+  groupQuery: sMax(200).default(''),
+  friendQuery: sMax(200).default(''),
+  from: z.number().int().optional(),
+  to: z.number().int().optional(),
+  limit: intRange(1, 1000).default(200),
+  offset: NonNegInt.default(0),
+});
+export type InviterRecordsQuery = z.input<typeof InviterRecordsQuerySchema>;
+export const InviterRecordsResponseSchema = strictObj({
+  records: z.array(InviterRecordSchema),
+  total: NonNegInt,
+  hasMore: z.boolean(),
+});
+export type InviterRecordsResponse = z.infer<typeof InviterRecordsResponseSchema>;
+export const DeleteInviterRecordsInputSchema = strictObj({
+  ids: z.array(Id).max(1000).optional(),
+  clearAll: z.boolean().optional(),
+});
 export const GroupInviterProfileStat = strictObj({
   sessionInvited: NonNegInt,
   totalInvited: NonNegInt,
@@ -52,11 +94,31 @@ export const GroupInviterProfileStat = strictObj({
   running: optBool,
 });
 export type GroupInviterProfileStat = z.infer<typeof GroupInviterProfileStat>;
+export const InviterGroupOutcome = strictObj({
+  profileId: sReq(120),
+  profileName: sMax(200),
+  groupId: GroupIdString,
+  groupName: sMax(200),
+  status: z.enum(['invited', 'skipped', 'failed']),
+  invitedCount: NonNegInt,
+  skippedCount: NonNegInt,
+  reason: sMax(300),
+});
+export type InviterGroupOutcome = z.infer<typeof InviterGroupOutcome>;
+export const InviterRunSummarySchema = strictObj({
+  runId: sReq(120),
+  invitedTotal: NonNegInt,
+  pendingTotal: NonNegInt,
+  failedProfiles: z.array(sReq(120)),
+  finishedAt: NonNegInt,
+  groupResults: z.array(InviterGroupOutcome),
+});
 export const GroupInviterState = strictObj({
   groups: z.array(InviterGroupRow),
   invitesPerGroup: intRange(1, 200),
   maxConcurrentProfiles: inviterOptFields.maxConcurrentProfiles,
   playSoundOnComplete: inviterOptFields.playSoundOnComplete,
+  closeBrowserOnFinish: inviterOptFields.closeBrowserOnFinish,
   running: z.boolean(),
   groupAvatarRefreshing: optBool,
   avatarRefreshStatusText: sMax(500).optional(),
@@ -65,6 +127,7 @@ export const GroupInviterState = strictObj({
   finishedAt: NumNull,
   statusText: sMax(500),
   profileCounts: z.record(z.string(), GroupInviterProfileStat),
+  lastRunSummary: InviterRunSummarySchema.optional(),
 });
 export type GroupInviterState = z.infer<typeof GroupInviterState>;
 export const AddInviterGroupsRequest = strictObj({
@@ -91,8 +154,12 @@ export const GroupInviterSettings = strictObj({
   invitesPerGroup: intRange(1, 200).default(20),
   maxConcurrentProfiles: intRange(1, 50).default(4),
   playSoundOnComplete: boolT,
+  closeBrowserOnFinish: boolF,
 });
-export type GroupInviterSettings = z.infer<typeof GroupInviterSettings>;
+export type GroupInviterSettings = Omit<
+  z.infer<typeof GroupInviterSettings>,
+  'closeBrowserOnFinish'
+> & { closeBrowserOnFinish?: boolean };
 export const UpdateGroupInviterSettingsRequest = strictObj(inviterOptFields);
 export type UpdateGroupInviterSettingsRequest = z.infer<typeof UpdateGroupInviterSettingsRequest>;
 export const StartGroupInviterRequest = strictObj({

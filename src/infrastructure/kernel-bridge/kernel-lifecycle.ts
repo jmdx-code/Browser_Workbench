@@ -131,10 +131,7 @@ export async function handleKernelMessage(
             error: error.message,
           };
         }
-        devDiag.record({
-          level: 'WARN',
-          category: 'KERNEL_RPC',
-          event: 'TASK_WINDOW_OCCLUSION_RECOVERY_DEFERRED',
+        devDiag.emit('WARN', 'KERNEL_RPC', 'TASK_WINDOW_OCCLUSION_RECOVERY_DEFERRED', {
           profileId: peer.profileId,
           reason: error instanceof Error ? error.message : String(error),
         });
@@ -154,14 +151,16 @@ export async function handleKernelMessage(
       expiresAt: exposed ? Date.now() + 500 : now + 1000,
     });
     if (granted)
-      devDiag.record({
-        level: 'WARN',
-        category: 'KERNEL_RPC',
-        event: exposed ? 'TASK_WINDOW_OCCLUSION_MOVED' : 'TASK_PRESENTATION_RECOVERY_GRANTED',
-        profileId: peer.profileId,
-        reason: exposed ? 'HIDDEN_WINDOW_REPOSITIONED_UNVERIFIED' : 'TASK_PRESENTATION_RECOVERY',
-        data: { tabId: request.proof.tabId },
-      });
+      devDiag.emit(
+        'WARN',
+        'KERNEL_RPC',
+        exposed ? 'TASK_WINDOW_OCCLUSION_MOVED' : 'TASK_PRESENTATION_RECOVERY_GRANTED',
+        {
+          profileId: peer.profileId,
+          reason: exposed ? 'HIDDEN_WINDOW_REPOSITIONED_UNVERIFIED' : 'TASK_PRESENTATION_RECOVERY',
+          data: { tabId: request.proof.tabId },
+        },
+      );
     return true;
   }
   if (rawType !== 'KERNEL_REPLY' && rawType !== 'KERNEL_EVENT') return false;
@@ -246,13 +245,12 @@ export async function handleKernelMessage(
         prior?.windowFocused !== session.presentationStatus.windowFocused
       ) {
         session.presentationLogAt = at;
-        devDiag.record({
-          level: state.phase.endsWith('ERROR') ? 'WARN' : 'INFO',
-          category: 'KERNEL_RPC',
-          event: 'TASK_PRESENTATION_MONITOR',
-          profileId: peer.profileId,
-          data: { tabId: event.source.tabId, ...state },
-        });
+        devDiag.emit(
+          state.phase.endsWith('ERROR') ? 'WARN' : 'INFO',
+          'KERNEL_RPC',
+          'TASK_PRESENTATION_MONITOR',
+          { profileId: peer.profileId, data: { tabId: event.source.tabId, ...state } },
+        );
       }
       return true;
     }

@@ -1,15 +1,14 @@
 import {
   computeCascadeRects,
   computeMultiDisplayTileRects,
+  computeTileSlotCapacity,
   contentWindowRect,
   displayForRect,
   fitTaskWindow,
   gridCascadeSlotRect,
   normalizeTaskWindowSize,
   reservedLayoutDisplay,
-  taskWindowPositions,
 } from '../domain/window-layout.js';
-import { sameTabProof } from '../domain/task-tabs.js';
 import { mapAsync } from '../shared/async-collections.js';
 import {
   WindowLayoutCommand,
@@ -20,10 +19,8 @@ import {
   type TaskWindow,
   type TaskWindowPort,
 } from '../shared/window-layout.js';
-
 const errMsg = (e: unknown, fallback?: string) =>
   e instanceof Error ? e.message : fallback && !e ? fallback : String(e);
-
 export class WindowLayoutService {
   private settings: LayoutSettings = defaultWindowLayout;
   private loaded?: Promise<void>;
@@ -35,25 +32,22 @@ export class WindowLayoutService {
   private lastArrangedAt = 0;
   private layoutGeneration = 0;
   private lastMovedCount = 0;
-  private readonly recoveries = new Map<
-    string,
-    { positions: TaskWindow['rect'][]; lastMoveAt: number; exhausted: boolean }
-  >();
+  private lastFailedProfiles: string[] = [];
   private error = '';
-
   constructor(
     private readonly displays: () => LayoutScreen[],
     private readonly port: TaskWindowPort,
     private readonly loadSettings: () => Promise<LayoutSettings>,
     private readonly saveSettings: (value: LayoutSettings) => Promise<void>,
-    private readonly trace?: (data: unknown) => void,
+    _trace?: (data: unknown) => void,
     private readonly lastFocusedProfileId?: () => string | null,
   ) {}
-
   isEnabled() {
     return this.settings.enabled;
   }
-
+  currentGeneration() {
+    return this.layoutGeneration;
+  }
   private load() {
     if (!this.loaded) {
       const work = this.loadSettings()
@@ -68,13 +62,11 @@ export class WindowLayoutService {
     }
     return this.loaded;
   }
-
   private serial<T>(run: () => Promise<T>): Promise<T> {
     const op = this.tail.catch(() => {}).then(run);
     this.tail = op;
     return op;
   }
-
   private withProfileLock<T>(profileId: string, run: () => Promise<T>): Promise<T> {
     const prev = this.profileLocks.get(profileId) ?? Promise.resolve();
     const op = prev.catch(() => {}).then(run);
@@ -86,7 +78,6 @@ export class WindowLayoutService {
       .catch(() => {});
     return op;
   }
-
   private selectedDisplay(settings = this.settings, preferredRect?: Rect) {
     const displays = this.displays();
     const display =
@@ -97,7 +88,6 @@ export class WindowLayoutService {
     if (!display) throw Error('WINDOW_LAYOUT_DISPLAY_MISSING');
     return reservedLayoutDisplay(display, settings);
   }
-
   private async resolveActiveDisplay(
     fallbackRect?: Rect,
     liveWindows?: ReadonlyMap<string, TaskWindow>,
@@ -130,14 +120,12 @@ export class WindowLayoutService {
     }
     return { display: this.selectedDisplay(this.settings, referenceRect), referenceRect };
   }
-
   private slotIndexFor(profileId: string): number {
     const existing = this.slotOrder.indexOf(profileId);
     if (existing >= 0) return existing;
     this.slotOrder.push(profileId);
     return this.slotOrder.length - 1;
   }
-
   private async read(profileId: string, guard: () => void) {
     guard();
     const current = await this.port.read(profileId);
@@ -146,7 +134,6 @@ export class WindowLayoutService {
     contentWindowRect(current);
     return current;
   }
-
   private async move(
     profileId: string,
     current: TaskWindow,
@@ -163,34 +150,40 @@ export class WindowLayoutService {
     this.managed.set(profileId, after);
     return after;
   }
-
   private async readProfilesBatch(
     profileIds: string[],
-  ): Promise<{ id: string; current: TaskWindow }[]> {
+  ): Promise<{ inspected: { id: string; current: TaskWindow }[]; failedIds: string[] }> {
     const settled = await Promise.allSettled(
       profileIds.map(async (id) => ({ id, current: await this.read(id, () => {}) })),
     );
     const inspected: { id: string; current: TaskWindow }[] = [];
+    const failedIds: string[] = [];
     let firstError: unknown;
-    for (const item of settled) {
+    for (let i = 0; i < settled.length; i++) {
+      const item = settled[i];
+      const id = profileIds[i];
+      if (!item || !id) continue;
       if (item.status === 'fulfilled') inspected.push(item.value);
-      else if (firstError === undefined) firstError = item.reason;
+      else {
+        failedIds.push(id);
+        if (firstError === undefined) firstError = item.reason;
+      }
     }
     if (!inspected.length) {
       throw firstError instanceof Error
         ? firstError
         : Error(errMsg(firstError, 'WINDOW_LAYOUT_PROFILE_OFFLINE'));
     }
-    return inspected;
+    return { inspected, failedIds };
   }
-
   private async moveBatch(
     inspected: { id: string; current: TaskWindow }[],
     getRect: (item: { id: string; current: TaskWindow }, index: number) => Rect | undefined,
     concurrency: number,
     focus: boolean,
-  ): Promise<number> {
+  ): Promise<{ movedCount: number; failedIds: string[] }> {
     let movedCount = 0;
+    const failedIds: string[] = [];
     let firstMoveError: unknown;
     await mapAsync(
       inspected,
@@ -199,9 +192,9 @@ export class WindowLayoutService {
         if (!candidate) return;
         try {
           await this.move(item.id, item.current, candidate, () => {}, undefined, focus);
-          this.recoveries.delete(item.id);
           movedCount++;
         } catch (err) {
+          failedIds.push(item.id);
           if (firstMoveError === undefined) firstMoveError = err;
         }
       },
@@ -210,9 +203,8 @@ export class WindowLayoutService {
     if (inspected.length > 0 && movedCount === 0 && firstMoveError !== undefined) {
       throw firstMoveError instanceof Error ? firstMoveError : Error(String(firstMoveError));
     }
-    return movedCount;
+    return { movedCount, failedIds };
   }
-
   private cascadeOpts(referenceRect?: Rect) {
     const s = this.settings;
     return {
@@ -226,7 +218,6 @@ export class WindowLayoutService {
       referenceRect,
     };
   }
-
   private hasCustomCascade(s = this.settings): boolean {
     return (
       s.cascadeWidth !== undefined ||
@@ -237,7 +228,6 @@ export class WindowLayoutService {
       s.cascadeStartY !== undefined
     );
   }
-
   private resolveCascadeUniformSize(display: LayoutScreen, referenceRect?: Rect) {
     if (this.hasCustomCascade()) {
       const firstRect = computeCascadeRects(1, display, this.cascadeOpts(referenceRect))[0];
@@ -245,7 +235,6 @@ export class WindowLayoutService {
     }
     return normalizeTaskWindowSize(display, referenceRect);
   }
-
   private tileRectsFor(count: number, explicitDisplay?: LayoutScreen) {
     const displays = this.displays();
     const pool = explicitDisplay ? [explicitDisplay] : displays;
@@ -268,79 +257,6 @@ export class WindowLayoutService {
       this.settings.tileOverflow ?? 'wrap',
     );
   }
-
-  visible(profileId: string, observedAt: number) {
-    const attempt = this.recoveries.get(profileId);
-    if (attempt && observedAt >= attempt.lastMoveAt) {
-      this.recoveries.delete(profileId);
-      if (![...this.recoveries.values()].some((a) => a.exhausted)) this.error = '';
-    }
-  }
-
-  async recover(profileId: string, guard: () => void, deadline?: number) {
-    return this.serial(async () => {
-      await this.load();
-      guard();
-      if (!this.settings.enabled) throw Error('WINDOW_LAYOUT_RECOVERY_DISABLED');
-      try {
-        const current = await this.read(profileId, guard);
-        const previous = this.managed.get(profileId);
-        if (
-          previous &&
-          (!sameTabProof(previous.proof, current.proof) || previous.windowId !== current.windowId)
-        ) {
-          this.recoveries.delete(profileId);
-        }
-        this.managed.set(profileId, current);
-        const display = this.selectedDisplay();
-        const rect = fitTaskWindow(current.rect, display);
-        const attempt = this.recoveries.get(profileId) ?? {
-          positions: [],
-          lastMoveAt: 0,
-          exhausted: false,
-        };
-        this.recoveries.set(profileId, attempt);
-        if (
-          (attempt.exhausted || attempt.positions.length >= 3) &&
-          Date.now() - attempt.lastMoveAt >= 15_000
-        ) {
-          attempt.positions = [];
-          attempt.exhausted = false;
-        }
-        const peers = [...this.managed].filter(([id]) => id !== profileId).map(([, w]) => w);
-        const candidates = taskWindowPositions(
-          rect,
-          attempt.positions.length ? [] : peers,
-          display,
-          this.settings.step,
-        );
-        const candidate = candidates.find(
-          (r) =>
-            !attempt.positions.some(
-              (p) => Math.abs(p.x - r.x) < rect.width / 2 && Math.abs(p.y - r.y) < rect.height / 2,
-            ) &&
-            (r.x !== current.rect.x ||
-              r.y !== current.rect.y ||
-              r.width !== current.rect.width ||
-              r.height !== current.rect.height),
-        );
-        if (attempt.positions.length >= 3 || !candidate) {
-          attempt.exhausted = true;
-          throw Error('WINDOW_LAYOUT_RECOVERY_EXHAUSTED');
-        }
-        this.trace?.({ profileId, current, candidate, moves: attempt.positions.length });
-        guard();
-        attempt.positions.push(candidate);
-        attempt.lastMoveAt = Date.now();
-        await this.move(profileId, current, candidate, guard, deadline);
-        this.error = '';
-      } catch (error) {
-        this.error = errMsg(error);
-        throw error;
-      }
-    });
-  }
-
   async snapshot() {
     await this.load();
     return {
@@ -349,21 +265,16 @@ export class WindowLayoutService {
       managed: [...this.managed].map(([profileId, w]) => ({ profileId, rect: w.rect })),
       error: this.error,
       movedCount: this.lastMovedCount,
-      recovery: [...this.recoveries].map(([profileId, a]) => ({
-        profileId,
-        state: a.exhausted ? ('NEEDS_ATTENTION' as const) : ('AWAITING_VISIBILITY' as const),
-        moves: a.positions.length,
-        reason: a.exhausted ? 'WINDOW_LAYOUT_RECOVERY_EXHAUSTED' : '',
-      })),
+      failedProfiles: [...this.lastFailedProfiles],
     };
   }
-
   async command(input: unknown) {
     const request = WindowLayoutCommand.parse(input);
     return this.serial(async () => {
       await this.load();
       this.error = '';
       this.lastMovedCount = 0;
+      this.lastFailedProfiles = [];
       try {
         if (request.action === 'configure') {
           if (!request.settings) throw Error('WINDOW_LAYOUT_SETTINGS_REQUIRED');
@@ -382,106 +293,96 @@ export class WindowLayoutService {
           await this.saveSettings(settings);
           this.settings = settings;
           this.layoutGeneration++;
-          this.recoveries.clear();
         } else if (request.action === 'focus_all') {
           if (!request.profileIds) throw Error('WINDOW_LAYOUT_SELECTION_REQUIRED');
-          const inspected = await this.readProfilesBatch(request.profileIds);
-          this.lastMovedCount = await this.moveBatch(
-            inspected,
-            ({ current }) => current.rect,
-            6,
-            true,
+          const { inspected, failedIds: readFailed } = await this.readProfilesBatch(
+            request.profileIds,
           );
+          const recordMove = (moveRes: { movedCount: number; failedIds: string[] }) => {
+            this.lastMovedCount = moveRes.movedCount;
+            this.lastFailedProfiles = [...new Set([...readFailed, ...moveRes.failedIds])].slice(
+              0,
+              100,
+            );
+          };
+          recordMove(await this.moveBatch(inspected, ({ current }) => current.rect, 6, true));
         } else if (request.action === 'apply') {
           this.layoutGeneration++;
           if (!request.profileIds) throw Error('WINDOW_LAYOUT_SELECTION_REQUIRED');
           const effectiveMode = request.mode ?? this.settings.mode ?? 'cascade';
           const hasCustomCascade = this.hasCustomCascade();
-          if (
-            this.lastFocusedProfileId ||
-            effectiveMode === 'tile' ||
-            request.targetDisplayId ||
-            hasCustomCascade
-          ) {
-            const inspected = await this.readProfilesBatch(request.profileIds);
-            const displays = this.displays();
-            const explicitDisplay = request.targetDisplayId
-              ? displays.find((d) => d.id === request.targetDisplayId)
-              : undefined;
-            if (request.targetDisplayId && !explicitDisplay)
-              throw Error('WINDOW_LAYOUT_DISPLAY_MISSING');
-            let movedToOtherRect: Rect | undefined;
-            if (this.lastArrangedAt > 0 || this.managed.size > 0) {
-              for (const { id, current } of inspected) {
-                const prev = this.managed.get(id);
-                if (!prev) continue;
-                const pd = displayForRect(prev.rect, displays);
-                const cd = displayForRect(current.rect, displays);
-                if (pd && cd && pd.id !== cd.id) movedToOtherRect = current.rect;
-              }
+          const { inspected, failedIds: readFailed } = await this.readProfilesBatch(
+            request.profileIds,
+          );
+          const recordMove = (moveRes: { movedCount: number; failedIds: string[] }) => {
+            this.lastMovedCount = moveRes.movedCount;
+            this.lastFailedProfiles = [...new Set([...readFailed, ...moveRes.failedIds])].slice(
+              0,
+              100,
+            );
+          };
+          const displays = this.displays();
+          const explicitDisplay = request.targetDisplayId
+            ? displays.find((d) => d.id === request.targetDisplayId)
+            : undefined;
+          if (request.targetDisplayId && !explicitDisplay)
+            throw Error('WINDOW_LAYOUT_DISPLAY_MISSING');
+          let movedToOtherRect: Rect | undefined;
+          if (this.lastArrangedAt > 0 || this.managed.size > 0) {
+            for (const { id, current } of inspected) {
+              const prev = this.managed.get(id);
+              if (!prev) continue;
+              const pd = displayForRect(prev.rect, displays);
+              const cd = displayForRect(current.rect, displays);
+              if (pd && cd && pd.id !== cd.id) movedToOtherRect = current.rect;
             }
-            const liveMap = new Map(inspected.map(({ id, current }) => [id, current]));
-            this.slotOrder.splice(0, this.slotOrder.length, ...inspected.map((x) => x.id));
-            if (effectiveMode === 'tile') {
-              const tileRects = this.tileRectsFor(inspected.length, explicitDisplay);
-              this.lastArrangedAt = Date.now();
-              this.lastMovedCount = await this.moveBatch(
-                inspected,
-                (_it, i) => tileRects[i] ?? undefined,
-                8,
-                false,
-              );
-            } else {
-              const firstRect = inspected[0]?.current.rect;
-              const resolved = await this.resolveActiveDisplay(firstRect, liveMap);
-              const anchorRect = movedToOtherRect ?? resolved.referenceRect ?? firstRect;
-              const rawTarget =
-                explicitDisplay ??
-                (anchorRect ? displayForRect(anchorRect, displays) : undefined) ??
-                resolved.display;
-              if (!explicitDisplay && this.settings.displayId !== rawTarget.id) {
-                this.settings = {
-                  ...this.settings,
-                  displayId: rawTarget.id,
-                  reservedArea: undefined,
-                };
-                await this.saveSettings(this.settings);
-              }
-              const targetDisplay = reservedLayoutDisplay(rawTarget, this.settings);
-              const targetAnchorRect = explicitDisplay ? explicitDisplay.workArea : anchorRect;
-              const uniformSize = this.resolveCascadeUniformSize(targetDisplay, targetAnchorRect);
-              this.uniformSize = { ...uniformSize, displayId: targetDisplay.id };
-              const customRects = hasCustomCascade
-                ? computeCascadeRects(
-                    inspected.length,
-                    targetDisplay,
-                    this.cascadeOpts(targetAnchorRect),
-                  )
-                : undefined;
-              this.lastArrangedAt = Date.now();
-              this.lastMovedCount = await this.moveBatch(
+          }
+          const liveMap = new Map(inspected.map(({ id, current }) => [id, current]));
+          this.slotOrder.splice(0, this.slotOrder.length, ...inspected.map((x) => x.id));
+          if (effectiveMode === 'tile') {
+            const tileRects = this.tileRectsFor(inspected.length, explicitDisplay);
+            this.lastArrangedAt = Date.now();
+            recordMove(
+              await this.moveBatch(inspected, (_it, i) => tileRects[i] ?? undefined, 8, false),
+            );
+          } else {
+            const firstRect = inspected[0]?.current.rect;
+            const resolved = await this.resolveActiveDisplay(firstRect, liveMap);
+            const anchorRect = movedToOtherRect ?? resolved.referenceRect ?? firstRect;
+            const rawTarget =
+              explicitDisplay ??
+              (anchorRect ? displayForRect(anchorRect, displays) : undefined) ??
+              resolved.display;
+            if (!explicitDisplay && this.settings.displayId !== rawTarget.id) {
+              this.settings = {
+                ...this.settings,
+                displayId: rawTarget.id,
+                reservedArea: undefined,
+              };
+              await this.saveSettings(this.settings);
+            }
+            const targetDisplay = reservedLayoutDisplay(rawTarget, this.settings);
+            const targetAnchorRect = explicitDisplay ? explicitDisplay.workArea : anchorRect;
+            const uniformSize = this.resolveCascadeUniformSize(targetDisplay, targetAnchorRect);
+            this.uniformSize = { ...uniformSize, displayId: targetDisplay.id };
+            const customRects = hasCustomCascade
+              ? computeCascadeRects(
+                  inspected.length,
+                  targetDisplay,
+                  this.cascadeOpts(targetAnchorRect),
+                )
+              : undefined;
+            this.lastArrangedAt = Date.now();
+            recordMove(
+              await this.moveBatch(
                 inspected,
                 (_it, i) =>
                   customRects?.[i] ??
                   gridCascadeSlotRect(i, uniformSize, targetDisplay, this.settings.step),
                 8,
                 false,
-              );
-            }
-          } else {
-            let movedCount = 0;
-            for (const id of request.profileIds) {
-              const current = await this.read(id, () => {});
-              const display = this.selectedDisplay();
-              const rect = fitTaskWindow(current.rect, display);
-              const peers = [...this.managed].filter(([other]) => other !== id).map(([, w]) => w);
-              const candidate =
-                taskWindowPositions(rect, peers, display, this.settings.step)[0] ?? rect;
-              await this.move(id, current, candidate, () => {});
-              this.recoveries.delete(id);
-              movedCount++;
-            }
-            this.lastMovedCount = movedCount;
+              ),
+            );
           }
         } else {
           this.settings = { ...this.settings, enabled: false };
@@ -490,7 +391,6 @@ export class WindowLayoutService {
           this.managed.clear();
           this.slotOrder.length = 0;
           this.uniformSize = undefined;
-          this.recoveries.clear();
         }
       } catch (error) {
         this.error = errMsg(error);
@@ -499,7 +399,6 @@ export class WindowLayoutService {
       return this.snapshot();
     });
   }
-
   async arrange(profileId: string, guard: () => void = () => {}) {
     return this.withProfileLock(profileId, async () => {
       await this.load();
@@ -510,7 +409,9 @@ export class WindowLayoutService {
       if (!this.settings.enabled || this.layoutGeneration !== gen) return;
       if (this.settings.mode === 'tile') {
         const slotIndex = this.slotIndexFor(profileId);
-        const targetRect = this.tileRectsFor(slotIndex + 1)[slotIndex];
+        const capacity = computeTileSlotCapacity(this.displays(), this.settings.tileDisplays);
+        const slotTotal = Math.max(capacity, this.slotOrder.length, slotIndex + 1);
+        const targetRect = this.tileRectsFor(slotTotal)[slotIndex];
         if (targetRect) await this.move(profileId, current, targetRect, guard, undefined, false);
       } else if (this.lastFocusedProfileId || this.hasCustomCascade()) {
         const { display, referenceRect } = await this.resolveActiveDisplay(current.rect);
@@ -554,7 +455,6 @@ export class WindowLayoutService {
         );
       }
       if (!this.settings.enabled || this.layoutGeneration !== gen) return;
-      this.recoveries.delete(profileId);
       this.error = '';
     });
   }

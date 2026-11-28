@@ -28,9 +28,7 @@ export async function encodeImageBufferToPosterThumbnail(
       try {
         const encoded = canvas.toBuffer('image/webp', quality);
         const dataUrl = `data:image/webp;base64,${Buffer.from(encoded).toString('base64')}`;
-        if (dataUrl.length <= MAX_POSTER_THUMBNAIL_DATA_URL_BYTES) {
-          return dataUrl;
-        }
+        if (dataUrl.length <= MAX_POSTER_THUMBNAIL_DATA_URL_BYTES) return dataUrl;
       } catch {
         // Try lower quality
       }
@@ -90,18 +88,14 @@ export async function removePosterCachedFileIfSafe(
   cacheDir: string,
   targetPath: string,
 ): Promise<boolean> {
-  if (!isPathInsidePosterCacheDir(cacheDir, targetPath)) {
-    return false;
-  }
+  if (!isPathInsidePosterCacheDir(cacheDir, targetPath)) return false;
   try {
     const st = await stat(targetPath);
     if (!st.isFile()) return false;
     await unlink(targetPath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
-      return true;
-    }
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return true;
     return false;
   }
 }

@@ -76,45 +76,63 @@ export function createGroupSurfaceHelpers(input: {
     } catch {
       return false;
     }
-    const page = session.getPage();
-    let current = s ?? (await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId }));
+    let current =
+      s ?? (await readGroupBumper(session.getPage(), { groupId: groupCtx.effectiveGroupId }));
     rejectBlockedGroup(current);
     let closed = false;
-    for (let count = 0; current.welcomeDismissCSS && count < 3; count++) {
+    const canTryDismiss = (surf: BumperSurface) =>
+      Boolean(
+        surf.welcomeDismissCSS ||
+        surf.joinRestrictionDismissCSS ||
+        (surf.blockingDialog && !surf.restricted && surf.groupJoinState !== 'questions'),
+      );
+    for (let count = 0; canTryDismiss(current) && count < 3; count++) {
       const token = randomUUID();
       await session.op(
         '关闭入组欢迎弹窗',
         async () => {
-          const next = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+          const next = await readGroupBumper(session.getPage(), {
+            groupId: groupCtx.effectiveGroupId,
+          });
           rejectBlockedGroup(next);
-          if (!next.welcomeDismissCSS) return false;
-          await markDialogClosing(next.welcomeDismissCSS, token);
-          return true;
+          const dismissSel = next.welcomeDismissCSS ?? next.joinRestrictionDismissCSS ?? null;
+          if (dismissSel) {
+            await markDialogClosing(dismissSel, token);
+            return 'button' as const;
+          }
+          if (next.blockingDialog && !next.restricted && next.groupJoinState !== 'questions') {
+            await session.getPage().keyboard.press('Escape');
+            return 'escape' as const;
+          }
+          return null;
         },
-        async (clicked) => {
-          if (!clicked) return true;
+        async (mode) => {
+          if (!mode) return true;
           const until = Date.now() + 2000;
           do {
             session.guard();
-            rejectBlockedGroup(await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId }));
-            if (await page.evaluate(bumperDialogClosed, token)) return true;
+            const activePage = session.getPage();
+            const next = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
+            rejectBlockedGroup(next);
+            if (!next.blockingDialog) return true;
+            if (mode === 'button' && (await activePage.evaluate(bumperDialogClosed, token)))
+              return true;
             await wait(150);
           } while (Date.now() < until);
-          return false;
+          return true;
         },
       );
       closed = true;
-      current = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+      current = await readGroupBumper(session.getPage(), { groupId: groupCtx.effectiveGroupId });
       rejectBlockedGroup(current);
     }
     if (current.blockingDialog) throw new BumperGroupSkipped('页面有未处理的阻断弹窗');
     return closed;
   };
   const dismissPostJoinObstructionIfNeeded = async (s: BumperSurface) => {
-    const page = session.getPage(),
-      throwIfRestricted = (v: BumperSurface) => {
-        if (v.checkpointRestricted || v.restrictionReason) throwRestricted(v);
-      };
+    const throwIfRestricted = (v: BumperSurface) => {
+      if (v.checkpointRestricted || v.restrictionReason) throwRestricted(v);
+    };
     let current = s;
     for (
       let count = 0;
@@ -126,13 +144,14 @@ export function createGroupSurfaceHelpers(input: {
       await session.op(
         '关闭入组欢迎弹窗',
         async () => {
-          const next = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+          const activePage = session.getPage();
+          const next = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
           throwIfRestricted(next);
           const dismissSelector = next.joinRestrictionDismissCSS ?? next.welcomeDismissCSS ?? null;
           if (dismissSelector)
             return (await markDialogClosing(dismissSelector, token), 'button' as const);
           if (next.blockingDialog || next.restricted)
-            return (await page.keyboard.press('Escape'), 'escape' as const);
+            return (await activePage.keyboard.press('Escape'), 'escape' as const);
           return null;
         },
         async (mode) => {
@@ -140,12 +159,13 @@ export function createGroupSurfaceHelpers(input: {
           const until = Date.now() + 2500;
           do {
             session.guard();
-            const next = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+            const activePage = session.getPage();
+            const next = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
             throwIfRestricted(next);
             if (
               mode === 'button' &&
               !next.restricted &&
-              (await page.evaluate(bumperDialogClosed, token))
+              (await activePage.evaluate(bumperDialogClosed, token))
             )
               return true;
             if (!next.restricted && !next.blockingDialog) return true;
@@ -154,7 +174,7 @@ export function createGroupSurfaceHelpers(input: {
           return true;
         },
       );
-      current = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+      current = await readGroupBumper(session.getPage(), { groupId: groupCtx.effectiveGroupId });
     }
     return current;
   };
@@ -168,10 +188,7 @@ export function createGroupSurfaceHelpers(input: {
     callbacks.status(
       `${reason}，已自动切换${fallbackMode === 'page_group_feed' ? '直接打开专页小组贴' : '随机浏览'} · ${group.name}`,
     );
-    devDiag.record({
-      level: 'INFO',
-      category: 'GROUP_BUMPER',
-      event: 'BUMPER_JOIN_RESTRICTED_FALLBACK',
+    devDiag.emit('INFO', 'GROUP_BUMPER', 'BUMPER_JOIN_RESTRICTED_FALLBACK', {
       profileId,
       reason,
       data: {
@@ -184,14 +201,13 @@ export function createGroupSurfaceHelpers(input: {
   };
   const joinGroupIfNeeded = async (s?: BumperSurface) => {
     if (
-      session.scanOnly ||
       isPageBumperMode ||
       groupCtx.effectiveSearchMode === 'random_browse' ||
       groupCtx.joinRestrictedFallback
     )
       return false;
-    const page = session.getPage(),
-      current = s ?? (await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId }));
+    const current =
+      s ?? (await readGroupBumper(session.getPage(), { groupId: groupCtx.effectiveGroupId }));
     rejectBlockedGroup(current);
     if (
       (groupCtx.effectiveSearchMode === 'page_group_feed' && current.posts.length > 0) ||
@@ -205,11 +221,12 @@ export function createGroupSurfaceHelpers(input: {
     await session.op(
       '加入小组',
       async () => {
-        const refreshed = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+        const activePage = session.getPage();
+        const refreshed = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
         rejectBlockedGroup(refreshed);
         if (refreshed.groupJoinState === 'member') return false;
         if (!refreshed.joinGroupCSS) throw Error('入组按钮已变化');
-        const btn = page.locator(refreshed.joinGroupCSS).first();
+        const btn = activePage.locator(refreshed.joinGroupCSS).first();
         await centerBumperControl(btn, paceScale);
         await btn.click({ timeout: 4000 });
         return true;
@@ -219,15 +236,20 @@ export function createGroupSurfaceHelpers(input: {
         const end = Date.now() + 6000;
         do {
           session.guard();
-          next = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+          const activePage = session.getPage();
+          next = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
           if (
             next.checkpointRestricted ||
             /^\/(?:login|checkpoint)(?:\/|\.php|$)/i.test(new URL(next.url).pathname)
           )
             throwRestricted(next);
           if (next.restricted && !next.restrictionReason) {
-            await dismissFeatureOrJoinCSS(page, next.joinRestrictionDismissCSS, session.guard);
-            next = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+            await dismissFeatureOrJoinCSS(
+              activePage,
+              next.joinRestrictionDismissCSS,
+              session.guard,
+            );
+            next = await readGroupBumper(activePage, { groupId: groupCtx.effectiveGroupId });
             if (!next.restricted || (next.joinRestrictionDismissCSS && !next.checkpointRestricted))
               return ((unjoinableIntervention = true), true);
           }
@@ -280,17 +302,16 @@ export function createGroupSurfaceHelpers(input: {
     return true;
   };
   const waitForFeed = async (pageId?: string) => {
-    const page = session.getPage(),
-      startedAt = Date.now(),
+    const startedAt = Date.now(),
       until = startedAt + 12000,
       minWaitUntil = startedAt + Math.min(3500, Math.max(400, Math.round(3500 * paceScale))),
       opts = { groupId: groupCtx.effectiveGroupId, ...(pageId ? { pageId } : {}) };
     let wakeScrolls = 0;
     const readFeed = async () => {
-      let obs = await readGroupBumper(page, opts);
+      let obs = await readGroupBumper(session.getPage(), opts);
       if (obs.welcomeDismissCSS) {
         await dismissWelcomeDialogIfNeeded(obs);
-        obs = await readGroupBumper(page, opts);
+        obs = await readGroupBumper(session.getPage(), opts);
       }
       return obs;
     };
@@ -308,17 +329,23 @@ export function createGroupSurfaceHelpers(input: {
         !observed.restricted
       ) {
         wakeScrolls++;
-        await page.evaluate(() => window.scrollBy(0, 480)).catch(() => {});
+        await session
+          .getPage()
+          .evaluate(() => window.scrollBy(0, 480))
+          .catch(() => {});
       }
       await wait(400);
       observed = await readFeed();
     }
     if (wakeScrolls > 0 && isPageBumperMode && observed.posts.length > 0 && !observed.restricted) {
-      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+      await session
+        .getPage()
+        .evaluate(() => window.scrollTo(0, 0))
+        .catch(() => {});
       await wait(300);
-      observed = await readGroupBumper(page, opts);
+      observed = await readGroupBumper(session.getPage(), opts);
     }
-    if (!session.scanOnly) rejectBlockedGroup(observed);
+    rejectBlockedGroup(observed);
     if (observed.restricted) throwRestricted(observed);
     return observed;
   };
@@ -341,7 +368,6 @@ export async function enterBumperGroupSurface(input: {
 }): Promise<{ surface: BumperSurface; initialFeed: BumperSurface }> {
   const { paceScale, callbacks, session, groupCtx, helpers, stats } = input,
     { group } = groupCtx,
-    page = session.getPage(),
     groupUrl = (chrono: boolean) =>
       `https://www.facebook.com/groups/${encodeURIComponent(groupCtx.effectiveGroupId)}/${chrono ? '?sorting_setting=CHRONOLOGICAL' : ''}`,
     fallbackGroupUrl = `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/${groupCtx.effectiveSearchMode === 'time_sort' ? '?sorting_setting=CHRONOLOGICAL' : ''}`;
@@ -354,7 +380,8 @@ export async function enterBumperGroupSurface(input: {
       searchUrl:
         'https://www.facebook.com/groups/search/groups/?q=' + encodeURIComponent(group.name),
       fallbackUrl: fallbackGroupUrl,
-      readSurface: () => readGroupBumper(page, { groupId: group.id, groupName: group.name }),
+      readSurface: () =>
+        readGroupBumper(session.getPage(), { groupId: group.id, groupName: group.name }),
       missingMsg: '搜索入口未找到',
       urlOk: (u) =>
         u.origin === 'https://www.facebook.com' &&
@@ -365,7 +392,7 @@ export async function enterBumperGroupSurface(input: {
     await session.navigate(fallbackGroupUrl);
     navigatedChronological = groupCtx.effectiveSearchMode === 'time_sort';
   }
-  let surface = await readGroupBumper(page, { groupId: group.id });
+  let surface = await readGroupBumper(session.getPage(), { groupId: group.id });
   const applyRedirect = () => {
     if (
       isCompleteNumericId(group.id) ||
@@ -393,7 +420,7 @@ export async function enterBumperGroupSurface(input: {
   if (!surface.groupIds.includes(groupCtx.effectiveGroupId.toLowerCase())) {
     await session.navigate(fallbackGroupUrl);
     navigatedChronological = groupCtx.effectiveSearchMode === 'time_sort';
-    surface = await readGroupBumper(page, { groupId: group.id });
+    surface = await readGroupBumper(session.getPage(), { groupId: group.id });
     applyRedirect();
   }
   if (!surface.groupIds.includes(groupCtx.effectiveGroupId.toLowerCase()))
@@ -439,7 +466,7 @@ export async function enterBumperGroupSurface(input: {
   else if (
     groupCtx.joinRestrictedFallback &&
     groupCtx.effectiveSearchMode !== 'time_sort' &&
-    page.url().includes('sorting_setting=CHRONOLOGICAL')
+    session.getPage().url().includes('sorting_setting=CHRONOLOGICAL')
   )
     await session.navigate(groupUrl(false));
   let initialFeed = await helpers.waitForFeed();
@@ -447,12 +474,15 @@ export async function enterBumperGroupSurface(input: {
     if (groupCtx.effectiveSearchMode === 'time_sort') {
       await session.navigate(groupUrl(true));
       initialFeed = await helpers.waitForFeed();
-    } else initialFeed = await readGroupBumper(page, { groupId: groupCtx.effectiveGroupId });
+    } else
+      initialFeed = await readGroupBumper(session.getPage(), {
+        groupId: groupCtx.effectiveGroupId,
+      });
   }
   if (
     !initialFeed.posts.length &&
     !initialFeed.restricted &&
-    page.url().includes('sorting_setting=CHRONOLOGICAL')
+    session.getPage().url().includes('sorting_setting=CHRONOLOGICAL')
   ) {
     await session.navigate(groupUrl(false));
     initialFeed = await helpers.waitForFeed();

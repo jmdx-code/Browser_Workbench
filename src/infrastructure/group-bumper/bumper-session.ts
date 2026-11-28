@@ -57,7 +57,6 @@ export interface BumperSessionSetupInput {
 }
 export interface BumperSessionRuntime {
   runId: string;
-  scanOnly: boolean;
   accountId: string;
   getPeer: () => Peer;
   getEpoch: () => string;
@@ -133,12 +132,7 @@ export async function createBumperSessionRuntime(
       idleRes = <R extends 'PEER_OFFLINE' | 'NOT_SYNCED' | 'PHASE_RUNNING' | 'IDLE'>(
         idle: boolean,
         reason: R,
-      ) => ({
-        idle,
-        reason,
-        unresolvedCount: 0,
-        legacyFixtureCount: 0,
-      });
+      ) => ({ idle, reason, unresolvedCount: 0, legacyFixtureCount: 0 });
     if (!currentPeer || !currentPeer.online) return idleRes(false, 'PEER_OFFLINE');
     if (!currentPeer.synced) return idleRes(false, 'NOT_SYNCED');
     if (currentPeer.phase !== undefined && currentPeer.phase !== 'PAUSED')
@@ -294,10 +288,7 @@ export async function createBumperSessionRuntime(
       : !(error instanceof BumperFatalError) && isRawDisconnectTechnicalError(error)
         ? new Error(`未能建立顶贴控制连接（${formatBumperDisconnectReason(error)}）`)
         : error;
-    devDiag.record({
-      level: 'WARN',
-      category: 'GROUP_BUMPER',
-      event: 'BUMPER_PREPARE_FAILED',
+    devDiag.emit('WARN', 'GROUP_BUMPER', 'BUMPER_PREPARE_FAILED', {
       profileId,
       reason: error instanceof Error ? error.message : String(error),
     });
@@ -423,20 +414,18 @@ export async function createBumperSessionRuntime(
     return recoveryPromise;
   };
   const runId = callbacks.runId ?? randomUUID();
-  const scanOnly = callbacks.executionMode === 'scan_only';
   const localizeIfNeeded = async (rawUrl: string) =>
     isLocalAvatar(rawUrl)
       ? rawUrl
       : ((await fetchAndLocalizeAvatar(rawUrl).catch(() => null)) ?? rawUrl);
   const updateAvatar = async (kind: 'groups' | 'pages', id: string, rawUrl: string) => {
-    if (!scanOnly && rawUrl) await repo.updateAvatar(kind, id, await localizeIfNeeded(rawUrl));
+    if (rawUrl) await repo.updateAvatar(kind, id, await localizeIfNeeded(rawUrl));
   };
   const updateMetadata = async (
     kind: 'groups' | 'pages',
     rawId: string,
     resolved: BumperTargetMetadataUpdate,
   ) => {
-    if (scanOnly) return;
     await repo.applyResolvedTargetMetadata?.(kind, rawId, {
       canonicalId: resolved.canonicalId ?? null,
       name: resolved.name ?? null,
@@ -487,7 +476,6 @@ export async function createBumperSessionRuntime(
     onPrepared?: (binding: Binding) => void,
   ) => {
     const submission = label === '点赞' || label === '发送评论' || label === '分享到快拍';
-    if (scanOnly && submission) throw new BumperFatalError('BUMPER_SCAN_SUBMISSION_DENIED');
     await assertIdentity(submission);
     const activeConnRef = conn,
       ctx = await activeConnRef.context(accountId);
@@ -605,31 +593,35 @@ export async function createBumperSessionRuntime(
         },
       );
   const searchViaInputOrUrl = async (query: string, fallbackSearchUrl: string) => {
-    const searchSelector =
-      'input[type="search"], input[role="combobox"], input[aria-label*="Search" i], input[aria-label*="搜索"], input[aria-label*="搜尋"], input[placeholder*="Search" i], input[placeholder*="搜索"], input[placeholder*="搜尋"]';
+    const searchSelector = [
+      '[role="banner"] input[type="search"]',
+      '[role="banner"] input[role="combobox"]',
+      '[role="banner"] input[aria-label*="Search" i]',
+      '[role="banner"] input[aria-label*="搜索"]',
+      '[role="banner"] input[aria-label*="搜尋"]',
+      '[role="banner"] input[aria-label*="ရှာ"]',
+      '[role="banner"] input[placeholder*="Search" i]',
+      '[role="banner"] input[placeholder*="搜索"]',
+      '[role="banner"] input[placeholder*="搜尋"]',
+    ].join(', ');
     let typed = false;
     try {
-      const activePage = getPage(),
-        hasVisibleInput = await activePage
-          .evaluate((sel) => {
-            for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
-              const r = el.getBoundingClientRect(),
-                s = getComputedStyle(el);
-              if (
-                r.width > 20 &&
-                r.height > 12 &&
-                s.display !== 'none' &&
-                s.visibility !== 'hidden'
-              )
-                return true;
-            }
-            return false;
-          }, searchSelector)
-          .catch(() => false);
+      const hasVisibleInput = await getPage()
+        .evaluate((sel) => {
+          for (const el of Array.from(document.querySelectorAll<HTMLElement>(sel))) {
+            const r = el.getBoundingClientRect(),
+              s = getComputedStyle(el);
+            if (r.width > 20 && r.height > 12 && s.display !== 'none' && s.visibility !== 'hidden')
+              return true;
+          }
+          return false;
+        }, searchSelector)
+        .catch(() => false);
       if (hasVisibleInput === true) {
         await op(
           '打开搜索结果',
           async () => {
+            const activePage = getPage();
             const box = activePage.locator(searchSelector).first();
             await box.click({ timeout: 3000 });
             await box.press('ControlOrMeta+A').catch(() => {});
@@ -665,7 +657,6 @@ export async function createBumperSessionRuntime(
   };
   return {
     runId,
-    scanOnly,
     accountId,
     getPeer: () => peer,
     getEpoch: () => epoch,

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { z } from 'zod';
 import { profileDisplayName, type Profile, type Workspace } from '../shared/contracts.js';
 import type { BumperProfileStat } from '../shared/group-bumper.js';
@@ -10,9 +10,7 @@ import { windowLayoutMessage } from '../shared/window-layout.js';
 import {
   AccountsSidebarShell,
   buildMoveMenuItems,
-  buildSidebarRowDragHandlers,
   buildSidebarViewModel,
-  createGroupDropProps,
   mi,
   sa,
   SidebarRowShell,
@@ -27,6 +25,7 @@ import {
   inspectionDisplayName,
   inspectionPresentation,
 } from './inspection-presentation.js';
+import { DailyRiskLimitModal } from './modules/daily-risk-limit-modal.js';
 import type {
   ProfileActivityDescriptor,
   SelectionControlSummary,
@@ -40,7 +39,7 @@ import { NameDialog } from './name-dialog.js';
 import type { MenuItem } from './popover-menu.js';
 import type { StatusTone } from './profile-avatar.js';
 import { SelectByIdsDialog, buildProfileCandidates } from './select-by-ids-dialog.js';
-
+import type { PointerDragRowProps } from './use-pointer-drag-reorder.js';
 declare const __BRIDGE_EXTENSION_VERSION__: string;
 const EXPECTED_BRIDGE_VERSION =
   typeof __BRIDGE_EXTENSION_VERSION__ !== 'undefined' ? __BRIDGE_EXTENSION_VERSION__ : '0.3.88';
@@ -62,13 +61,12 @@ const toneNames: Record<StatusTone, string> = {
   warn: '需要留意',
   err: '账号状态异常',
 };
-
 type SidebarModal =
   | { kind: 'ids' }
+  | { kind: 'risk' }
   | { kind: 'createMove'; ids: string[] }
   | { kind: 'delete'; ids: string[]; label: string }
   | null;
-
 export function Sidebar(p: {
   workspace: Workspace;
   selected: ReadonlySet<string>;
@@ -121,11 +119,8 @@ export function Sidebar(p: {
     onNotify,
   } = p;
   const list = useSidebarListState(selected, onSelect);
-  const draggingProfiles = useRef<string[]>([]);
-  const [dropProfile, setDropProfile] = useState('');
   const [modal, setModal] = useState<SidebarModal>(null);
   const [arrangingWindows, setArrangingWindows] = useState(false);
-
   const inspectionByProfile = useMemo(
     () => new Map(inspections.map((i) => [i.profileId, i])),
     [inspections],
@@ -141,15 +136,38 @@ export function Sidebar(p: {
       [...ws.profiles].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id)),
     [ws.profiles],
   );
-
+  const sortedGroups = useMemo(
+    () => [...ws.groups].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    [ws.groups],
+  );
+  const isAttentionProfile = (r: Profile) => {
+    const inspection = inspectionByProfile.get(r.id);
+    const account = inspection?.state === 'OBSERVED' ? inspection.account : r.account;
+    const extensionOutdated =
+      r.online && !marketplaceBridgeSupported(r.extensionVersion, EXPECTED_BRIDGE_VERSION);
+    return (
+      ['logged-out', 'restricted', 'verification'].includes(account.state) ||
+      account.state === 'unknown' ||
+      !account.id ||
+      !account.avatar ||
+      Boolean(r.bindingConflict) ||
+      extensionOutdated ||
+      r.unresolved > 0
+    );
+  };
+  const attentionCount = sortedProfiles.filter(isAttentionProfile).length;
   const qLower = list.query.toLowerCase();
-  const matched = sortedProfiles.filter(
-    (r) =>
+  const matched = sortedProfiles.filter((r) => {
+    const nameHit =
       `${r.alias} ${r.browserName ?? ''} ${r.account.name ?? ''} ${r.account.id ?? ''} ${inspectionDisplayName(r, inspectionByProfile.get(r.id), inspectionAvailable) ?? ''}`
         .toLowerCase()
-        .includes(qLower) &&
-      (list.filter === 'all' || (list.filter === 'online' ? r.online : selected.has(r.id))),
-  );
+        .includes(qLower);
+    if (!nameHit) return false;
+    if (list.filter === 'online') return r.online;
+    if (list.filter === 'selected') return selected.has(r.id);
+    if (list.filter === 'attention') return isAttentionProfile(r);
+    return true;
+  });
   const projIn = {
     tasks,
     bumperCounts: p.bumperCounts,
@@ -160,7 +178,7 @@ export function Sidebar(p: {
   const resolvedActivities = p.activities ?? projectProfileActivitiesMap(ws.profiles, projIn);
   const resolvedControls = p.selectionControls ?? projectSelectionControls(selected, projIn);
   const visibleGroups = [
-    ...[...ws.groups].sort((a, b) => a.order - b.order || a.id.localeCompare(b.id)),
+    ...sortedGroups,
     { id: 'ungrouped', name: '未分组', color: 'gray', order: -1 },
   ];
   const { folderGroups, visibleIds } = buildSidebarViewModel({
@@ -171,7 +189,6 @@ export function Sidebar(p: {
     isRunning: (r) => resolvedActivities.get(r.id)?.running === true,
     closed: list.closed,
   });
-
   const visualIdx = new Map(
     visibleGroups
       .flatMap((g) =>
@@ -188,6 +205,7 @@ export function Sidebar(p: {
     .filter((r) => !r.account.id || !r.account.avatar)
     .map((r) => r.id);
   const selectedOnlineIds = onlineProfiles.filter((r) => selected.has(r.id)).map((r) => r.id);
+  const orderedSelectedOnlineIds = sortVisual([...selectedOnlineIds]);
   const inspectingAny = inspections.some((i) => i.state === 'QUEUED' || i.state === 'READING');
   const quickIdentifyTargetIds = selectedOnlineIds.length
     ? selectedOnlineIds
@@ -201,50 +219,41 @@ export function Sidebar(p: {
       : onlineProfiles.length
         ? `刷新全部 ${onlineProfiles.length} 个在线浏览器的 FB 账号与头像`
         : '暂无已连接的在线浏览器';
-
   const moveProfilesTo = (
     groupId: string | null,
     ids = [...selected],
     target?: string,
     after = false,
-  ) =>
-    mutate(() =>
+  ) => {
+    const normalizedGid = groupId ?? null;
+    return mutate(() =>
       api.reorderProfiles(
-        groupId,
+        normalizedGid,
         insertFinderIds(
-          sortedProfiles.filter((r) => r.groupId === groupId).map((r) => r.id),
+          sortedProfiles.filter((r) => (r.groupId ?? null) === normalizedGid).map((r) => r.id),
           ids,
           target,
           after,
         ),
       ),
     );
-
+  };
   async function nudgeProfiles(direction: -1 | 1, targetIds: ReadonlySet<string> = selected) {
     for (const g of visibleGroups) {
       const id = g.id === 'ungrouped' ? null : g.id;
-      const ids = sortedProfiles.filter((r) => r.groupId === id).map((r) => r.id);
+      const ids = sortedProfiles.filter((r) => (r.groupId ?? null) === id).map((r) => r.id);
       if (ids.some((k) => targetIds.has(k)))
         await mutate(() => api.reorderProfiles(id, nudgeFinderIds(ids, targetIds, direction)));
     }
   }
-
   function nudgeGroup(id: string, direction: -1 | 1) {
-    const ids = ws.groups.map((g) => g.id);
+    const ids = sortedGroups.map((g) => g.id);
     const at = ids.indexOf(id);
     const to = at + direction;
-    if (to < 0 || to >= ids.length) return;
+    if (at < 0 || to < 0 || to >= ids.length) return;
     [ids[at], ids[to]] = [ids[to] ?? '', ids[at] ?? ''];
     void mutate(() => api.reorderGroups(ids));
   }
-
-  const groupDropProps = createGroupDropProps(
-    busy,
-    draggingProfiles,
-    setDropProfile,
-    (gid, ids) => void moveProfilesTo(gid === 'ungrouped' ? null : gid, ids),
-  );
-
   async function arrangeWindowBatch(ids: string[], emptyMsg: string, successLabel: string) {
     if (arrangingWindows || !ids.length) return;
     setArrangingWindows(true);
@@ -252,14 +261,14 @@ export function Sidebar(p: {
       const res = await api.windowLayout({ action: 'apply', profileIds: ids });
       if (res.error) throw Error(windowLayoutMessage(res.error));
       const moved = res.movedCount ?? res.managed.length;
+      const failedCount = res.failedProfiles?.length ?? 0;
       return moved
-        ? `已${successLabel} ${moved} 个${successLabel === '整理' ? '在线' : ''}浏览器窗口`
+        ? `已${successLabel} ${moved} 个${successLabel === '整理' ? '在线' : ''}浏览器窗口${failedCount ? `（${failedCount} 个失败）` : ''}`
         : emptyMsg;
     } finally {
       setArrangingWindows(false);
     }
   }
-
   const runPower = (ids: string[], mode: 'launch' | 'close', singleName?: string, emptyMsg = '') =>
     void mutate(async () => {
       const res = mode === 'launch' ? await api.launchProfiles(ids) : await api.closeProfiles(ids);
@@ -278,17 +287,14 @@ export function Sidebar(p: {
       ].filter(Boolean);
       return parts.length ? `批量${verb}完成：${parts.join('，')}` : emptyMsg;
     });
-
   const dispatchStop = (plans: TaskCommand['plans'], moduleIds: string[]) => {
     if (onStopProfiles) return onStopProfiles(plans, moduleIds);
     if (plans.length) onTaskCommand?.('stop', plans);
     if (moduleIds.length) onStopModules?.(moduleIds);
   };
-
   const selectedList = ws.profiles.filter((r) => selected.has(r.id));
   const selectedOfflineIds = selectedList.filter((r) => !r.online).map((r) => r.id);
   const selectedOnlineOnlyIds = selectedList.filter((r) => r.online).map((r) => r.id);
-
   const selectionActions = [
     sa(
       '启动',
@@ -337,8 +343,10 @@ export function Sidebar(p: {
       { title: '按当前排版模式整齐排列所选窗口' },
     ),
   ];
-
-  function renderProfileRow(profile: Profile) {
+  function renderProfileRow(
+    profile: Profile,
+    drag?: { rowProps: PointerDragRowProps; dropClass: string } | undefined,
+  ) {
     const displayName = profileDisplayName(profile);
     const inspection = inspectionByProfile.get(profile.id);
     const activity = resolvedActivities.get(profile.id) ?? null;
@@ -347,11 +355,14 @@ export function Sidebar(p: {
     const extensionOutdated =
       profile.online &&
       !marketplaceBridgeSupported(profile.extensionVersion, EXPECTED_BRIDGE_VERSION);
+    const hasBindingConflict = Boolean(profile.bindingConflict);
     const tone: StatusTone = !profile.online
-      ? 'idle'
+      ? hasBindingConflict
+        ? 'warn'
+        : 'idle'
       : ['logged-out', 'restricted', 'verification'].includes(account.state)
         ? 'err'
-        : extensionOutdated
+        : extensionOutdated || hasBindingConflict
           ? 'warn'
           : activity?.running
             ? 'run'
@@ -361,6 +372,7 @@ export function Sidebar(p: {
       displayName + (fbName ? ' · ' + fbName : ''),
       '连接：' + (phaseNames[profile.phase] ?? profile.phase),
       'FB 状态：' + inspectionPresentation(profile, inspection, inspectionAvailable).title,
+      ...(profile.bindingConflict ? [`⚠️ ${profile.bindingConflict}，易触发启动冲突`] : []),
       ...(profile.unresolved ? [profile.unresolved + ' 项待核对'] : []),
       ...(extensionOutdated
         ? [`插件 ${profile.extensionVersion ?? '未知'}，建议刷新至 ${EXPECTED_BRIDGE_VERSION}`]
@@ -382,7 +394,6 @@ export function Sidebar(p: {
     const moveTargets =
       selected.has(profile.id) && selected.size > 1 ? [...selected] : [profile.id];
     const isBusyAny = resolvedControls.isProfileBusy(profile.id);
-
     const rowItems: MenuItem[] = [
       ...(!profile.online
         ? [
@@ -424,8 +435,8 @@ export function Sidebar(p: {
       ),
       { separator: true },
       ...buildMoveMenuItems(
-        profile.groupId,
-        ws.groups,
+        profile.groupId ?? null,
+        sortedGroups,
         busy,
         (dir) => void nudgeProfiles(dir, new Set([profile.id])),
         (gid) => void moveProfilesTo(gid, moveTargets),
@@ -464,7 +475,6 @@ export function Sidebar(p: {
         },
       ),
     ];
-
     return (
       <SidebarRowShell
         key={profile.id}
@@ -473,14 +483,8 @@ export function Sidebar(p: {
         codeText={account.id ?? profile.account.id ?? '—'}
         selected={selected.has(profile.id)}
         isFiltered={filteredId === profile.id}
-        dropClass={
-          dropProfile === 'b:' + profile.id
-            ? ' drop-before'
-            : dropProfile === 'a:' + profile.id
-              ? ' drop-after'
-              : ''
-        }
-        draggable={!busy}
+        dropClass={drag?.dropClass ?? ''}
+        dragProps={drag?.rowProps}
         avatarUrl={inspectionAvatarURL(profile, inspection, inspectionAvailable)}
         online={profile.online}
         refreshKey={inspection?.checkedAt ?? 0}
@@ -488,10 +492,16 @@ export function Sidebar(p: {
         toneLabel={toneNames[tone]}
         tooltip={tooltip}
         ariaPressed={nameAction === 'filter' ? filteredId === profile.id : undefined}
-        taskText={activity?.text}
-        taskTone={activity?.tone}
-        taskClassName={activity?.className}
-        progressView={activity?.progressView}
+        taskText={
+          profile.bindingConflict && !activity?.running ? profile.bindingConflict : activity?.text
+        }
+        taskTone={profile.bindingConflict && !activity?.running ? 'warn' : activity?.tone}
+        taskClassName={
+          profile.bindingConflict && !activity?.running ? undefined : activity?.className
+        }
+        progressView={
+          profile.bindingConflict && !activity?.running ? undefined : activity?.progressView
+        }
         menuItems={rowItems}
         onSelect={(checked, shift) => list.selectRow(visibleIds, profile.id, checked, shift)}
         onMainClick={(shift, ctrl) =>
@@ -499,21 +509,12 @@ export function Sidebar(p: {
             ? onInspect(profile.id)
             : list.selectRow(visibleIds, profile.id, !selected.has(profile.id), shift)
         }
-        dragHandlers={buildSidebarRowDragHandlers({
-          id: profile.id,
-          folderId: profile.groupId,
-          busy,
-          selected,
-          orderedIds: sortedProfiles.map((r) => r.id),
-          unitLabel: '浏览器',
-          draggingRef: draggingProfiles,
-          setDrop: setDropProfile,
-          onMove: (gid, ids, target, after) => void moveProfilesTo(gid, ids, target, after),
-        })}
       />
     );
   }
-
+  const headerArrangeIds = selected.size > 0 ? orderedSelectedOnlineIds : orderedOnlineIds;
+  const headerArrangeLabel =
+    selected.size > 0 ? `整理已选 (${orderedSelectedOnlineIds.length})` : '整理全部在线浏览器窗口';
   return (
     <AccountsSidebarShell
       title="浏览器"
@@ -522,9 +523,45 @@ export function Sidebar(p: {
       totalCount={ws.profiles.length}
       onHideSidebar={p.onHideSidebar}
       headingActions={
-        <>
+        <Btn
+          v="icon"
+          className="h-[26px] w-[26px]"
+          title={
+            selected.size > 0
+              ? orderedSelectedOnlineIds.length
+                ? `按当前排版模式整理已选的 ${orderedSelectedOnlineIds.length} 个在线浏览器窗口`
+                : '所选浏览器当前均未在线'
+              : '按当前排版模式整理全部在线浏览器窗口'
+          }
+          aria-label={headerArrangeLabel}
+          disabled={busy || arrangingWindows || !headerArrangeIds.length}
+          onClick={() =>
+            void mutate(() =>
+              arrangeWindowBatch(
+                headerArrangeIds,
+                selected.size > 0 ? '所选浏览器当前均未在线' : '暂无在线浏览器窗口可整理',
+                '整理',
+              ),
+            )
+          }
+        >
+          <IconWindow size={15} />
+        </Btn>
+      }
+      searchPlaceholder="搜索名称、别名或 FB ID"
+      list={list}
+      selectAllLabel="全选当前显示的浏览器"
+      matchedIds={matched.map((r) => r.id)}
+      filterLabels={['全部', '已连接', '已选']}
+      attentionChip={{
+        label: '异常 / 需验证 / 未识别',
+        count: attentionCount,
+        title: '一键筛选登出、受限、需验证、冲突、过期扩展或未识别账号',
+      }}
+      extraTools={
+        <div className="mt-2 grid grid-cols-3 gap-1.5 [&_.btn]:h-[27px] [&_.btn]:justify-center [&_.btn]:px-1.5 [&_.btn]:text-[11.5px]">
           <Btn
-            className={ID_BTN + (unidentifiedOnlineIds.length > 0 ? ID_ATTN : '')}
+            className={`${ID_BTN}${unidentifiedOnlineIds.length > 0 ? ID_ATTN : ''}`}
             title={quickIdentifyTitle}
             aria-label="一键识别在线浏览器账号与头像"
             disabled={busy || !inspectionAvailable || !quickIdentifyTargetIds.length}
@@ -546,26 +583,15 @@ export function Sidebar(p: {
             按 ID
           </Btn>
           <Btn
-            v="icon"
-            className="h-[26px] w-[26px]"
-            title="按当前排版模式整理全部在线浏览器窗口"
-            aria-label="整理全部在线浏览器窗口"
-            disabled={busy || arrangingWindows || !orderedOnlineIds.length}
-            onClick={() =>
-              void mutate(() =>
-                arrangeWindowBatch(orderedOnlineIds, '暂无在线浏览器窗口可整理', '整理'),
-              )
-            }
+            className={ID_BTN}
+            title="设置浏览器每日安全限额（全局与单号覆盖）"
+            aria-label="浏览器日限额设置"
+            onClick={() => setModal({ kind: 'risk' })}
           >
-            <IconWindow size={15} />
+            日限额
           </Btn>
-        </>
+        </div>
       }
-      searchPlaceholder="搜索名称、别名或 FB ID"
-      list={list}
-      selectAllLabel="全选当前显示的浏览器"
-      matchedIds={matched.map((r) => r.id)}
-      filterLabels={['全部', '已连接', '已选']}
       onCreateGroup={(name) => mutate(() => api.createGroup(name, 'blue'))}
       groups={folderGroups}
       selected={selected}
@@ -581,8 +607,17 @@ export function Sidebar(p: {
         await mutate(async () => '分组已删除，浏览器已移到未分组');
       }}
       deleteGroupDescription="组内浏览器会移到未分组，保留当前选择、别名和任务记录。"
-      groupDropProps={groupDropProps}
-      dropGroupId={dropProfile}
+      dragReorder={{
+        disabled: busy,
+        unitLabel: '浏览器',
+        getDragIds: (id) =>
+          selected.has(id)
+            ? sortedProfiles.filter((x) => selected.has(x.id)).map((x) => x.id)
+            : [id],
+        onDropOnRow: (gid, ids, targetId, after) =>
+          void moveProfilesTo(gid === 'ungrouped' ? null : gid, ids, targetId, after),
+        onDropOnFolder: (gid, ids) => void moveProfilesTo(gid === 'ungrouped' ? null : gid, ids),
+      }}
       renderRow={renderProfileRow}
       emptyGroupText={(n) => (n ? '没有匹配的浏览器' : '暂无浏览器')}
       emptyListNode={
@@ -607,6 +642,18 @@ export function Sidebar(p: {
       selectionActions={selectionActions}
       dialogs={
         <>
+          {modal?.kind === 'risk' && (
+            <DailyRiskLimitModal
+              carrier="browser"
+              targets={sortedProfiles.map((prof) => ({
+                id: prof.id,
+                title: profileDisplayName(prof),
+                subtitle: prof.account.name || prof.account.id || undefined,
+              }))}
+              onNotify={onNotify}
+              onClose={() => setModal(null)}
+            />
+          )}
           {modal?.kind === 'ids' && (
             <SelectByIdsDialog
               title="按 ID 批量选中浏览器"

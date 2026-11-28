@@ -1,7 +1,7 @@
 {
   "name": "browser-workbench",
   "productName": "Browser Workbench",
-  "version": "0.1.269",
+  "version": "0.1.275",
   "private": true,
   "type": "module",
   "main": "dist/src/desktop/bootstrap.js",
@@ -21,7 +21,7 @@
     "desktop": "electron .",
     "package:dir": "electron-builder --dir",
     "package:win": "electron-builder --win nsis",
-    "format": "prettier --write src extension tests scripts docs *.json *.ts",
+    "format": "prettier --write src extension tests scripts *.json *.ts",
     "smoke:desktop": "node scripts/desktop-smoke.mjs",
     "smoke:feed": "node scripts/facebook-feed-projection-fixture.mjs"
   },

@@ -11,14 +11,13 @@ import type {
 } from '../../../shared/google-sheets.js';
 import { api } from '../../api.js';
 import { ConfirmDialog } from '../../confirm-dialog.js';
-import { UiSegmented } from '../../ui/primitives.js';
+import { UI_BETWEEN, UI_ROW, UiSegmented } from '../../ui/primitives.js';
 import { BackdropModal, Btn, errMsg, ModalHeading } from '../shared/module-ui.js';
 import { GoogleSheetsTopbar } from './google-sheets-topbar.js';
 import { SheetBottomTabs } from './sheet-bottom-tabs.js';
 import { RecordsBumpConfigModal, RecordsFrequencyModal } from './sheet-config-modal.js';
 import { SheetConnectModal } from './sheet-connect-modal.js';
 import { SheetDataGrid } from './sheet-data-grid.js';
-
 const KIND_ORDER: readonly GoogleSheetKind[] = [
   'post_schedule',
   'post_records',
@@ -51,13 +50,11 @@ const KIND_META: Record<GoogleSheetKind, [string, boolean, string, string]> = {
     '连接发帖记录表后，可在顶部选择顶贴账号组、编辑本机名并开启自动顶贴。',
   ],
 };
-
 const clientGridCache = new Map<string, { snapshot: SheetGridSnapshot; cachedAt: number }>();
 export function clearGoogleSheetsGridCache(linkId?: string): void {
   if (linkId) clientGridCache.delete(linkId);
   else clientGridCache.clear();
 }
-
 export function GoogleSheetsPage(p: {
   kind: GoogleSheetKind;
   overview: GoogleSheetsOverview | null;
@@ -65,6 +62,7 @@ export function GoogleSheetsPage(p: {
   profileGroups: readonly Group[];
   profiles: readonly Profile[];
   bluestacksState?: BluestacksState | null;
+  globalMaxConcurrency?: number | null;
   onSelectKind?: (kind: GoogleSheetKind) => void;
   onOpenAuthMenu: () => void;
   onAfterLibrarySync: () => void;
@@ -80,7 +78,6 @@ export function GoogleSheetsPage(p: {
     () => (overview?.links ?? []).filter((l) => l.kind === 'post_records'),
     [overview?.links],
   );
-
   const [activeLinkId, setActiveLinkId] = useState<string | null>(null),
     [gridByLink, setGridByLink] = useState<Record<string, SheetGridSnapshot>>(() =>
       Object.fromEntries([...clientGridCache.entries()].map(([id, e]) => [id, e.snapshot])),
@@ -99,7 +96,6 @@ export function GoogleSheetsPage(p: {
       link: GoogleSheetLink;
     } | null>(null),
     [patchingConfig, setPatchingConfig] = useState(false);
-
   const activeLink = useMemo(
     () =>
       (activeLinkId && linksOfKind.find((l) => l.id === activeLinkId)) || linksOfKind[0] || null,
@@ -109,24 +105,19 @@ export function GoogleSheetsPage(p: {
     if (activeLink && activeLink.id !== activeLinkId) setActiveLinkId(activeLink.id);
     else if (!activeLink && activeLinkId !== null) setActiveLinkId(null);
   }, [activeLink, activeLinkId]);
-
   const refreshOverview = useCallback(async () => {
     const next = await api.googleSheetsOverview();
     onOverview(next);
     return next;
   }, [onOverview]);
-
   const [machineNameDraft, setMachineNameDraft] = useState('');
   const machineTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null),
     machineSavedRef = useRef<{ linkId: string; value: string } | null>(null),
     machineLatestRef = useRef<{ linkId: string; value: string } | null>(null);
-
   const flushMachineName = useCallback(
     async (override?: { linkId: string; value: string }) => {
-      if (machineTimerRef.current) {
-        clearTimeout(machineTimerRef.current);
-        machineTimerRef.current = null;
-      }
+      if (machineTimerRef.current) clearTimeout(machineTimerRef.current);
+      machineTimerRef.current = null;
       const target = override ?? machineLatestRef.current;
       if (!target) return;
       const norm = target.value.trim() || '电脑1号';
@@ -148,7 +139,6 @@ export function GoogleSheetsPage(p: {
     },
     [onNotify, refreshOverview],
   );
-
   const activeRecMachine =
     activeLink?.kind === 'post_records' ? (activeLink.recordsConfig?.machineName ?? '电脑1号') : '';
   const activeRecId = activeLink?.kind === 'post_records' ? activeLink.id : null;
@@ -190,13 +180,18 @@ export function GoogleSheetsPage(p: {
     },
     [],
   );
-
   const configPatchChainRef = useRef<Promise<void>>(Promise.resolve()),
     failedGridLinksRef = useRef<Set<string>>(new Set()),
     activeGridReqSeqRef = useRef(0),
     activeLinkIdRef = useRef<string | null>(activeLink?.id ?? null);
   activeLinkIdRef.current = activeLink?.id ?? null;
-
+  const isAuthorized = Boolean(overview?.auth.authorized);
+  const prevAuthorizedRef = useRef<boolean>(isAuthorized);
+  useEffect(() => {
+    const wasAuthorized = prevAuthorizedRef.current;
+    prevAuthorizedRef.current = isAuthorized;
+    if (!wasAuthorized && isAuthorized) failedGridLinksRef.current.clear();
+  }, [isAuthorized]);
   const loadGrid = useCallback(
     async (linkId: string, manual = false, silent = false) => {
       if (!overview?.auth.authorized) return;
@@ -218,7 +213,6 @@ export function GoogleSheetsPage(p: {
     },
     [overview?.auth.authorized, onNotify],
   );
-
   const activeLinkIdResolved = activeLink?.id ?? null;
   useEffect(() => {
     if (
@@ -236,7 +230,6 @@ export function GoogleSheetsPage(p: {
     );
     if (Date.now() - cached.cachedAt > 60_000) void loadGrid(activeLinkIdResolved, false, true);
   }, [activeLinkIdResolved, overview?.auth.authorized, loadGrid]);
-
   const activeGrid = activeLink ? (gridByLink[activeLink.id] ?? null) : null;
   const activeLogs = useMemo(() => {
     const logs = overview?.logs ?? [];
@@ -244,7 +237,6 @@ export function GoogleSheetsPage(p: {
       ? logs.filter((i) => i.linkId === activeLink.id || i.linkId === null).slice(0, 30)
       : logs.slice(0, 20);
   }, [overview?.logs, activeLink]);
-
   async function runAction(
     label: string,
     work: () => Promise<string | void>,
@@ -286,7 +278,6 @@ export function GoogleSheetsPage(p: {
   }
   const overviewRef = useRef(overview);
   overviewRef.current = overview;
-
   function patchLinkCfg<K extends 'scheduleConfig' | 'recordsConfig'>(
     key: K,
     linkId: string,
@@ -327,10 +318,10 @@ export function GoogleSheetsPage(p: {
       await refreshOverview();
       onNotify(msg);
     });
-
-  const isAuthorized = Boolean(overview?.auth.authorized);
-  const isMinimalGridKind = kind === 'post_schedule' || kind === 'post_records';
   const isRunning = Boolean(activeLink && activeLink.runtime.activeRunningCount > 0);
+  const overviewGlobalConcurrency =
+    (overview as { globalMaxConcurrency?: number | null } | null)?.globalMaxConcurrency ?? null;
+  const effectiveGlobalConcurrency = p.globalMaxConcurrency ?? overviewGlobalConcurrency;
   const isAutoEnabled =
     activeLink?.kind === 'post_schedule'
       ? Boolean(activeLink.scheduleConfig?.enabled)
@@ -344,7 +335,33 @@ export function GoogleSheetsPage(p: {
       return { value, label: KIND_META[value][0], ...(c > 0 ? { count: c } : {}) };
     });
   }, [overview?.links]);
-
+  const importOptions = activeLink
+    ? ([
+        {
+          cls: 'border-emerald-300 bg-emerald-50/50 hover:bg-emerald-50',
+          title: '增量导入（推荐）',
+          badgeCls: 'bg-emerald-100 text-emerald-800',
+          badge: '安全不删旧数据',
+          desc: '新增表格里的新 ID，并按表格「类别」更新对应分组；软件里原有但表格里没有的条目会继续保留。',
+          onClick: () => {
+            setModal(null);
+            void runAction('增量导入', async () => {
+              const res = await api.googleSheetsImportLibrary(activeLink.id, 'incremental');
+              onAfterLibrarySync();
+              return res.summary;
+            });
+          },
+        },
+        {
+          cls: 'border-amber-300 bg-amber-50/40 hover:bg-amber-50',
+          title: '覆盖导入（与表格完全对齐）',
+          badgeCls: 'bg-amber-100 text-amber-800',
+          badge: '会删除多余条目',
+          desc: '以当前 Google 表格为准：新增新 ID、更新分类，并移除软件里多余的不在表格中的条目。',
+          onClick: () => setConfirmDlg({ kind: 'overwrite', link: activeLink }),
+        },
+      ] as const)
+    : [];
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col gap-2 overflow-hidden bg-[var(--bg)] p-3">
       {p.onSelectKind && (
@@ -359,7 +376,7 @@ export function GoogleSheetsPage(p: {
       )}
       {!isAuthorized && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className={UI_ROW}>
             <strong>
               {overview?.auth.lastError ? 'Google 表格授权已失效' : '尚未完成 Google 表格授权'}
             </strong>
@@ -377,21 +394,17 @@ export function GoogleSheetsPage(p: {
         title={title}
         addLabel={addLabel}
         activeLink={activeLink}
-        activeGrid={activeGrid}
         allRecordLinks={allRecordLinks}
         profileGroups={p.profileGroups}
         profiles={p.profiles}
         bluestacksState={p.bluestacksState}
         isAuthorized={isAuthorized}
-        isMinimalGridKind={isMinimalGridKind}
         isRunning={isRunning}
         isAutoEnabled={isAutoEnabled}
-        gridLoading={gridLoading}
         busyAction={busyAction}
         stoppingLink={stoppingLink}
         patchingConfig={patchingConfig}
         machineNameDraft={machineNameDraft}
-        onRefreshGrid={(id) => void loadGrid(id, true)}
         onOpenConnect={() => setConnectTarget({ kind })}
         onOpenConnectRecordForSchedule={(id) =>
           setConnectTarget({ kind: 'post_records', bindScheduleId: id })
@@ -427,13 +440,27 @@ export function GoogleSheetsPage(p: {
           loading={gridLoading}
           emptyTitle={activeLink ? '表格暂无数据' : `尚未连接${title}`}
           emptyHint={emptyHint}
-          showToolbar={!isMinimalGridKind}
+          showToolbar={true}
+          enableStatusFilter={kind === 'post_schedule' || kind === 'post_records'}
+          onResetStuckRows={
+            kind === 'post_schedule' && activeLink && isAuthorized
+              ? () =>
+                  void runAction('重置卡死行', async () => {
+                    const res = await api.googleSheetsResetStuckRows(activeLink.id);
+                    return (
+                      res.summary ||
+                      (res.resetCount > 0
+                        ? `已重置 ${res.resetCount} 条卡死行`
+                        : '当前没有卡死行需要重置')
+                    );
+                  })
+              : undefined
+          }
+          resettingStuck={busyAction === '重置卡死行'}
           refreshing={gridLoading}
           onNotify={onNotify}
           onRefresh={
-            !isMinimalGridKind && activeLink && isAuthorized
-              ? () => void loadGrid(activeLink.id, true)
-              : undefined
+            activeLink && isAuthorized ? () => void loadGrid(activeLink.id, true) : undefined
           }
         />
       </div>
@@ -528,6 +555,10 @@ export function GoogleSheetsPage(p: {
                   ...(activeLink.recordsConfig?.bumperSettings ?? {}),
                   likeProbability: patch.likeProbability,
                   commentProbability: patch.commentProbability,
+                  consumeCommentOnUse: patch.consumeCommentOnUse,
+                  enableSound: patch.enableSound,
+                  useLongPressReaction: patch.useLongPressReaction,
+                  reactionTypes: patch.reactionTypes,
                 },
               },
               '顶贴配置已保存',
@@ -538,6 +569,7 @@ export function GoogleSheetsPage(p: {
       {modal === 'freq' && activeLink?.kind === 'post_records' && (
         <RecordsFrequencyModal
           link={activeLink}
+          globalMaxConcurrency={effectiveGlobalConcurrency}
           onClose={() => setModal(null)}
           onSave={(patch) =>
             saveModalRecordsPatch(
@@ -571,48 +603,25 @@ export function GoogleSheetsPage(p: {
               onClose={() => setModal(null)}
             />
             <div className="flex flex-col gap-2.5 p-4">
-              <button
-                type="button"
-                className="flex w-full cursor-pointer flex-col gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50/50 p-3.5 text-left transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={Boolean(busyAction)}
-                onClick={() => {
-                  setModal(null);
-                  void runAction('增量导入', async () => {
-                    const res = await api.googleSheetsImportLibrary(activeLink.id, 'incremental');
-                    onAfterLibrarySync();
-                    return res.summary;
-                  });
-                }}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <strong className="text-sm font-semibold text-slate-900">增量导入（推荐）</strong>
-                  <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
-                    安全不删旧数据
-                  </span>
-                </div>
-                <p className="m-0 text-xs leading-relaxed text-[var(--text-2)]">
-                  新增表格里的新
-                  ID，并按表格「类别」更新对应分组；软件里原有但表格里没有的条目会继续保留。
-                </p>
-              </button>
-              <button
-                type="button"
-                className="flex w-full cursor-pointer flex-col gap-1.5 rounded-xl border border-amber-300 bg-amber-50/40 p-3.5 text-left transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={Boolean(busyAction)}
-                onClick={() => setConfirmDlg({ kind: 'overwrite', link: activeLink })}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <strong className="text-sm font-semibold text-slate-900">
-                    覆盖导入（与表格完全对齐）
-                  </strong>
-                  <span className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800">
-                    会删除多余条目
-                  </span>
-                </div>
-                <p className="m-0 text-xs leading-relaxed text-[var(--text-2)]">
-                  以当前 Google 表格为准：新增新 ID、更新分类，并移除软件里多余的不在表格中的条目。
-                </p>
-              </button>
+              {importOptions.map((opt) => (
+                <button
+                  key={opt.title}
+                  type="button"
+                  className={`flex w-full cursor-pointer flex-col gap-1.5 rounded-xl border p-3.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${opt.cls}`}
+                  disabled={Boolean(busyAction)}
+                  onClick={opt.onClick}
+                >
+                  <div className={UI_BETWEEN}>
+                    <strong className="text-sm font-semibold text-slate-900">{opt.title}</strong>
+                    <span
+                      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${opt.badgeCls}`}
+                    >
+                      {opt.badge}
+                    </span>
+                  </div>
+                  <p className="m-0 text-xs leading-relaxed text-[var(--text-2)]">{opt.desc}</p>
+                </button>
+              ))}
             </div>
           </div>
         </BackdropModal>

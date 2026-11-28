@@ -8,6 +8,7 @@ import {
   type Workspace,
 } from '../shared/contracts.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
+import { taskReasonDescription } from '../shared/task-issues.js';
 import {
   BLUESTACKS_QUICK_ACTIONS,
   BROWSER_INSTANT_MODULES,
@@ -27,11 +28,9 @@ import {
 } from './modules/module-contracts.js';
 import { Btn, errMsg } from './modules/shared/module-ui.js';
 import { CarrierScopeBar } from './modules/shared/target-scope-bar.js';
-import { taskReasonDescription } from './task-alerts.js';
 import type { useTasks } from './use-tasks.js';
-
+import { UI_ROW } from './ui/primitives.js';
 const BS_CLOSE_STORAGE_KEY = 'wb.bluestacksActive.closeWindowOnFinish';
-
 function readStoredCloseBs(): boolean {
   try {
     return window.localStorage.getItem(BS_CLOSE_STORAGE_KEY) === '1';
@@ -39,7 +38,6 @@ function readStoredCloseBs(): boolean {
     return false;
   }
 }
-
 export function ActiveAccountsPage(p: {
   carrier?: 'browser' | 'bluestacks' | undefined;
   workspace: Workspace;
@@ -79,7 +77,6 @@ export function ActiveAccountsPage(p: {
     onSelectBluestacks,
   } = p;
   const isBs = carrier === 'bluestacks';
-
   const [closeBrowserOnFinish, setCloseBrowserOnFinish] = useState(readStoredCloseBrowserOnFinish);
   const [closeBsOnFinish, setCloseBsOnFinish] = useState(readStoredCloseBs);
   const updateCloseBrowser = (next: boolean) => {
@@ -94,7 +91,6 @@ export function ActiveAccountsPage(p: {
       window.localStorage.setItem(BS_CLOSE_STORAGE_KEY, next ? '1' : '0');
     } catch {}
   };
-
   const activePlans = useMemo(
     () =>
       (tasks.runtime?.plans ?? []).filter(
@@ -103,7 +99,6 @@ export function ActiveAccountsPage(p: {
     [tasks.runtime?.plans],
   );
   const profileById = useMemo(() => new Map(ws.profiles.map((r) => [r.id, r])), [ws.profiles]);
-
   const bsSelectedSet = selectedBluestacks ?? new Set<string>();
   const isBsProfileBusy = (id: string) =>
     Boolean(
@@ -120,7 +115,6 @@ export function ActiveAccountsPage(p: {
   const runningCount = isBs
     ? bsRunningCount || (bluestacksState?.activeRunning ? 1 : 0)
     : activePlans.length;
-
   function stopAllActive() {
     if (isBs) {
       void p.onMutate(async () => {
@@ -145,19 +139,16 @@ export function ActiveAccountsPage(p: {
       return fail ? `已停止 ${ok} 份，${fail} 份未完成` : `已停止 ${ok} 份活跃任务`;
     });
   }
-
   const [testMod, setTestMod] = useState<{ id: BrowseModule; ids: string[] } | null>(null);
   const [bsTestMod, setBsTestMod] = useState<{
     type: BluestacksQuickActiveStepType;
     ids: string[];
   } | null>(null);
-
   const delOne = async (row: SavedCombination) => {
     await api.deleteCombination(row.id);
     await p.onRefreshResources();
     return `已删除「${row.saved?.name || '未命名组合'}」`;
   };
-
   const quickButtons = isBs
     ? BLUESTACKS_QUICK_ACTIONS.map((item) => ({
         key: item.type,
@@ -196,7 +187,6 @@ export function ActiveAccountsPage(p: {
           },
         };
       });
-
   return (
     <>
       <CarrierScopeBar
@@ -215,7 +205,7 @@ export function ActiveAccountsPage(p: {
           <span className="text-xs font-bold tracking-wide whitespace-nowrap text-[var(--text-3)] max-[1100px]:hidden">
             快速单任务
           </span>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className={UI_ROW}>
             {quickButtons.map((btn) => (
               <button
                 key={btn.key}
@@ -295,6 +285,7 @@ export function ActiveAccountsPage(p: {
         carrier={carrier}
         capabilities={tasks.capabilities}
         runtime={tasks.runtime}
+        bluestacksState={bluestacksState}
         profiles={isBs ? undefined : ws.profiles}
         isProfileBusy={isBs ? isBsProfileBusy : sc.isProfileBusy}
         closeBrowserOnFinish={isBs ? closeBsOnFinish : closeBrowserOnFinish}
@@ -355,7 +346,9 @@ export function ActiveAccountsPage(p: {
             return `已启动 ${res.plans.length} 份${tags.length ? `（${tags.join(' · ')}）` : ''}`;
           });
         }}
-        rows={ws.combinations.filter(isUserSavedCombination)}
+        rows={ws.combinations.filter(
+          (c) => isUserSavedCombination(c) && !c.id.startsWith('__wb_quick_test'),
+        )}
         selectedCount={isBs ? bsSelectedSet.size : selected.size}
         selectedIds={isBs ? bsSelectedSet : selected}
         resourceSummaries={p.resourceSummaries}

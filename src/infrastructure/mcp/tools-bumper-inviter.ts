@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { extractFacebookGroupId } from '../../shared/facebook-target-id.js';
 import * as M from './mcp-context.js';
-
 async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const bumper = deps.getGroupBumperService();
   M.req(bumper, 'BUMPER_UNAVAILABLE', '顶贴服务当前不可用', 503);
@@ -10,7 +9,7 @@ async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<strin
   const action = M.strArg(args.action) || 'state';
   const isPage = mode === 'page-bumper';
   const scopeOf = (st: object) => M.pickBumperScope(st, isPage);
-  const startOrScan = async () => {
+  const startBumper = async () => {
     const [profileIds, pageIds, groupIds] = [
       (await M.optPids(deps, args)) ?? [],
       M.extractPageIds(args.pageIds),
@@ -20,9 +19,7 @@ async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<strin
       await M.ensureBumperTargets(deps, isPage ? [] : groupIds, pageIds);
     const st = isPage
       ? await bumper.startPageBumper({ profileIds, pageIds })
-      : action === 'scan_only'
-        ? await bumper.startScanOnly({ profileIds, groupIds, pageIds })
-        : await bumper.start({ profileIds, groupIds, pageIds });
+      : await bumper.start({ profileIds, groupIds, pageIds });
     return {
       mode,
       ...M.pick(scopeOf(st), 'running statusText profileCounts'),
@@ -85,12 +82,7 @@ async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<strin
         M.extractGroupIds(args.groupIds),
         M.parseFlexibleScheduleTime(args.scheduledAt),
       ];
-      M.req(
-        parsed.mode === 'scheduled',
-        'SCHEDULE_TIME_REQUIRED',
-        'schedule 需要提供未来的 scheduledAt 时间',
-      );
-      const onceAt = parsed.scheduledAt;
+      const onceAt = parsed.mode === 'scheduled' ? parsed.scheduledAt : null;
       M.req(onceAt, 'SCHEDULE_TIME_REQUIRED', 'schedule 需要提供未来的 scheduledAt 时间');
       if (args.autoAddMissingTargets !== false)
         await M.ensureBumperTargets(deps, isPage ? [] : groupIds, pageIds);
@@ -122,8 +114,7 @@ async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<strin
     },
     cancel_task: cancelOrDel,
     delete_task: cancelOrDel,
-    start: startOrScan,
-    scan_only: startOrScan,
+    start: startBumper,
     stop: async () => ({
       mode,
       ...M.pick(
@@ -158,7 +149,10 @@ async function handleBumper(deps: M.WorkbenchMcpDependencies, args: Record<strin
     },
   });
 }
-
+const INV_SETTINGS_KEYS =
+  'invitesPerGroup maxConcurrentProfiles playSoundOnComplete closeBrowserOnFinish!';
+const INV_SETTINGS_SPEC =
+  'invitesPerGroup:n maxConcurrentProfiles:n playSoundOnComplete:b closeBrowserOnFinish:b';
 async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const action = M.strArg(args.action) || 'state';
   const inv = deps.groupInviterService;
@@ -169,10 +163,7 @@ async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<stri
     folderId?: string | null;
     totalInvitedCount: number;
     updatedAt: number;
-  }) => ({
-    ...M.summarizeTarget(g),
-    ...M.pick(g, 'groupId groupName totalInvitedCount'),
-  });
+  }) => ({ ...M.summarizeTarget(g), ...M.pick(g, 'groupId groupName totalInvitedCount') });
   return M.act(action, {
     list_groups: async () => {
       const st = await inv.state();
@@ -244,10 +235,10 @@ async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<stri
     save_settings: async () =>
       M.pick(
         await inv.updateSettings({
-          ...M.pick(await inv.state(), 'invitesPerGroup maxConcurrentProfiles playSoundOnComplete'),
-          ...M.pickTypes(args, 'invitesPerGroup:n maxConcurrentProfiles:n playSoundOnComplete:b'),
+          ...M.pick(await inv.state(), INV_SETTINGS_KEYS),
+          ...M.pickTypes(args, INV_SETTINGS_SPEC),
         } as Parameters<typeof inv.updateSettings>[0]),
-        'invitesPerGroup maxConcurrentProfiles playSoundOnComplete',
+        INV_SETTINGS_KEYS,
       ),
     start: async () => {
       const profileIds = (await M.optPids(deps, args)) ?? [];
@@ -258,11 +249,7 @@ async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<stri
         if (missing.length > 0) await inv.addGroups({ items: missing });
       }
       return M.pick(
-        await inv.start({
-          profileIds,
-          groupIds,
-          ...M.pickTypes(args, 'invitesPerGroup:n maxConcurrentProfiles:n playSoundOnComplete:b'),
-        }),
+        await inv.start({ profileIds, groupIds, ...M.pickTypes(args, INV_SETTINGS_SPEC) }),
         'running statusText profileCounts runId?',
       );
     },
@@ -278,7 +265,7 @@ async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<stri
       return {
         ...M.pick(
           st,
-          'running statusText invitesPerGroup maxConcurrentProfiles playSoundOnComplete profileCounts runId? groupAvatarRefreshing!',
+          `running statusText ${INV_SETTINGS_KEYS} profileCounts runId? groupAvatarRefreshing! lastRunSummary?`,
         ),
         groupsCount: st.groups.length,
         ...(args.includeGroups === true && { groups: st.groups.map(sumG) }),
@@ -286,7 +273,6 @@ async function handleInviter(deps: M.WorkbenchMcpDependencies, args: Record<stri
     },
   });
 }
-
 export function createBumperAndInviterTools(
   deps: M.WorkbenchMcpDependencies,
 ): M.McpToolDefinition[] {
@@ -294,9 +280,7 @@ export function createBumperAndInviterTools(
     M.reg(
       'wb_bumper_control',
       '控制与监控「小组顶贴」和「专页顶贴」。',
-      M.sp(
-        '@profileIds|@groupIds|@pageIds|@scheduledAt|@taskId|@settings|@comments|@consumeCommentOnUse|@search|@limit|@autoAddMissingTargets|@includeComments|mode:e(group-bumper page-bumper):顶贴模式|action:e(state logs save_settings save_comments start scan_only schedule cancel_task delete_task stop):操作类型',
-      ),
+      '@profileIds|@groupIds|@pageIds|@scheduledAt|@taskId|@settings|@comments|@consumeCommentOnUse|@search|@limit|@autoAddMissingTargets|@includeComments|mode:e(group-bumper page-bumper):顶贴模式|action:e(state logs save_settings save_comments start schedule cancel_task delete_task stop):操作类型',
       (args) => handleBumper(deps, args),
       { req: 'mode action' },
     ),
@@ -304,7 +288,7 @@ export function createBumperAndInviterTools(
       'wb_inviter_control',
       '控制与监控「小组邀请人」模块。',
       M.sp(
-        '@profileIds|@groupIds|@search|action:e(state list_groups add_groups delete_groups refresh_groups stop_refresh_groups logs save_settings start stop):操作类型|autoAddMissingGroups:b:自动补入小组|includeGroups:b:返回小组列表|invitesPerGroup:n(1,200):每组邀请人数|maxConcurrentProfiles:n(1,50):最大并发数|playSoundOnComplete:b:完后提示音|limit:n(1,300):日志条数上限',
+        '@profileIds|@groupIds|@search|action:e(state list_groups add_groups delete_groups refresh_groups stop_refresh_groups logs save_settings start stop):操作类型|autoAddMissingGroups:b:自动补入小组|includeGroups:b:返回小组列表|invitesPerGroup:n(1,200):每组邀请人数|maxConcurrentProfiles:n(1,50):最大并发数|playSoundOnComplete:b:完后提示音|closeBrowserOnFinish:b:完后关窗|limit:n(1,300):日志条数上限',
         {
           items: M.A(
             M.U('object string', undefined, {

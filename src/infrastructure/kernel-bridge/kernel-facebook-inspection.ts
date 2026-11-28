@@ -435,6 +435,20 @@ async function readFacebookDisplayDocumentImpl(
   }
   return { page: projection, actor };
 }
+const readDisplay = (
+  deps: KernelInspectionDeps,
+  page: Page,
+  guard: () => Awaitable<void>,
+  currentRoute: boolean,
+  profileId: string,
+) =>
+  readFacebookDisplayDocumentImpl(
+    deps.observeExternalPageAccount,
+    page,
+    guard,
+    currentRoute,
+    profileId,
+  );
 async function inspectDisplayDoc(
   deps: KernelInspectionDeps,
   peer: Peer,
@@ -447,14 +461,7 @@ async function inspectDisplayDoc(
       peer,
       guard,
       'https://www.facebook.com/',
-      (page) =>
-        readFacebookDisplayDocumentImpl(
-          deps.observeExternalPageAccount,
-          page,
-          guard,
-          currentRoute,
-          peer.profileId,
-        ),
+      (page) => readDisplay(deps, page, guard, currentRoute, peer.profileId),
       false,
       false,
       existingTab,
@@ -470,13 +477,7 @@ export async function inspectRetainedFacebookDisplayImpl(
   await guard();
   const ready = await getReadyIdleRow(deps, peer, guard, proof);
   return ready
-    ? readFacebookDisplayDocumentImpl(
-        deps.observeExternalPageAccount,
-        ready.page,
-        guard,
-        true,
-        peer.profileId,
-      )
+    ? readDisplay(deps, ready.page, guard, true, peer.profileId)
     : inspectDisplayDoc(deps, peer, guard, true, proof);
 }
 export const inspectFacebookDisplayImpl = (
@@ -521,13 +522,7 @@ export async function inspectFacebookAccountSilentlyImpl(
       for (let attempt = 0; ; attempt++) {
         await guard();
         try {
-          return await readFacebookDisplayDocumentImpl(
-            deps.observeExternalPageAccount,
-            page,
-            guard,
-            true,
-            peer.profileId,
-          );
+          return await readDisplay(deps, page, guard, true, peer.profileId);
         } catch (error) {
           if (
             attempt < 4 &&
@@ -698,10 +693,7 @@ export async function inspectOwnedFacebookPageImpl<T>(
             : closeError instanceof Error
               ? closeError.message
               : 'CLOSE_FAILED';
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'INSPECT_OWNED_PAGE_CLOSE_FAILED_AFTER_READ_ERROR',
+        devDiag.emit('WARN', 'BRIDGE_WS', 'INSPECT_OWNED_PAGE_CLOSE_FAILED_AFTER_READ_ERROR', {
           profileId: peer.profileId,
           reason: msg,
         });

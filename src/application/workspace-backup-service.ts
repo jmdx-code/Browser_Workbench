@@ -1,7 +1,6 @@
 import type { TaskRepository } from '../domain/tasks.js';
 import type { WorkspaceBackupWriter, WorkspaceRestorePort } from '../domain/system-ports.js';
-import { ProductError } from '../domain/workspace.js';
-import { taskTimingEligibility } from '../domain/system-ports.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import {
   CreateWorkspaceBackup,
   WorkspaceBackupResult,
@@ -22,23 +21,14 @@ export class WorkspaceBackupService {
   }
   assertIdle() {
     if (this.restorePrepared)
-      throw new ProductError(
-        'RESTORE_RESTART_REQUIRED',
-        '数据恢复已准备，请先重启软件再运行任务',
-        409,
-      );
+      failError('RESTORE_RESTART_REQUIRED', '数据恢复已准备，请先重启软件再运行任务', 409);
     this.assertNotBusy();
   }
   private async assertStopped() {
     const active = this.active
       ? await this.active()
       : (await this.tasks.livePlans()).some(
-          (plan) =>
-            plan.state === 'RUNNING' ||
-            (plan.state === 'QUEUED' &&
-              (!plan.timing ||
-                plan.timingReleased ||
-                taskTimingEligibility(plan.timing, Date.now()) !== 'WAIT')),
+          (plan) => plan.state === 'RUNNING' || plan.state === 'QUEUED',
         );
     if (active)
       throw new ProductError('BACKUP_TASKS_ACTIVE', '请先停止运行中的任务，再进行数据备份', 409);

@@ -1,10 +1,15 @@
-import { IconActivity, IconCheckCircle, IconCircle, IconStop, IconWindow } from '../icons.js';
+import {
+  IconActivity,
+  IconAlertTriangle,
+  IconCheckCircle,
+  IconCircle,
+  IconStop,
+  IconWindow,
+} from '../icons.js';
 import { EmptyState, SlideDrawer } from '../ui/primitives.js';
 import type { LiveRunCard } from './live-run-cards.js';
 import { Btn } from './shared/module-ui.js';
-
 export { buildLiveRunCards, type LiveRunCard, type LiveRunStepItem } from './live-run-cards.js';
-
 export function LiveRunsDrawer(p: {
   open: boolean;
   onClose: () => void;
@@ -93,6 +98,8 @@ export function LiveRunsDrawer(p: {
                         <IconCheckCircle size={13} className="shrink-0 text-emerald-600" />
                       ) : step.state === 'running' ? (
                         <IconActivity size={13} className="shrink-0 text-blue-600" />
+                      ) : step.state === 'failed' ? (
+                        <IconAlertTriangle size={13} className="shrink-0 text-rose-600" />
                       ) : (
                         <IconCircle size={13} className="shrink-0 text-slate-300" />
                       )}
@@ -102,14 +109,22 @@ export function LiveRunsDrawer(p: {
                             ? 'text-slate-400 line-through'
                             : step.state === 'running'
                               ? 'font-medium text-slate-900'
-                              : 'text-slate-500'
+                              : step.state === 'failed'
+                                ? 'font-medium text-rose-700'
+                                : 'text-slate-500'
                         }`}
                       >
                         {i + 1}. {step.label}
                       </span>
                     </span>
                     {step.meta && (
-                      <span className="shrink-0 text-[11px] text-slate-500">{step.meta}</span>
+                      <span
+                        className={`shrink-0 text-[11px] ${
+                          step.state === 'failed' ? 'text-rose-600' : 'text-slate-500'
+                        }`}
+                      >
+                        {step.meta}
+                      </span>
                     )}
                   </li>
                 ))}

@@ -220,6 +220,7 @@ test('bulk cleanup counts idle/paused, offline, daily busy and inviter busy accu
           { profileId: peers[1]!.profileId, state: 'RUNNING' },
           { profileId: peers[3]!.profileId, state: 'STOPPED' },
         ] as Plan[],
+      livePlans: () => [{ profileId: peers[1]!.profileId, state: 'RUNNING' }] as Plan[],
     },
     undefined,
     async (id, prefer) => {
@@ -291,7 +292,7 @@ test('authenticated cleanup-tabs HTTP routes to native consolidation and returns
       profileId = peer.profileId;
       const windows = new BridgeBrowserWindow(
         core,
-        { list: () => [] },
+        { list: () => [], livePlans: () => [] },
         undefined,
         async (id, prefer) => {
           calls.push(prefer ?? false);

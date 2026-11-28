@@ -19,10 +19,10 @@ import {
   requireLink,
   resolveBoundBumperProfiles,
   runSerializedRecordWrite,
+  safeAppendSheetLog,
   tryClaimProfile,
   type GoogleSheetsContext,
 } from './gs-context-and-library.js';
-
 export function resolveRecordRowIdentity(
   row: SheetGridRow,
   cols: ReturnType<typeof resolveRecordColumns>,
@@ -32,7 +32,6 @@ export function resolveRecordRowIdentity(
   const postId = extractFacebookPostIdFromUrl(postUrl);
   return { postUrl, postId, postCode: rawCode || `URL-${postId ?? row.rowNumber}` };
 }
-
 export function buildRecordFromRow(
   ctx: GoogleSheetsContext,
   linkId: string,
@@ -68,7 +67,6 @@ export function buildRecordFromRow(
     localBumpedCount: Math.max(existing?.localBumpedCount ?? 0, numOr(cols.machineColumn, 0) ?? 0),
   });
 }
-
 export async function resolveSheetRowIndexMaps(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -87,17 +85,17 @@ export async function resolveSheetRowIndexMaps(
   const usedUrl = Boolean(ctx.deps.sheetsApi.readColumnValues && needUrl && cols.postUrl >= 0);
   return { rowByCode, rowByUrl, usedKeyLookup: usedCode || usedUrl };
 }
-
+export type SheetCellUpdateEntry = {
+  postCode: string;
+  postUrl: string;
+  value: string;
+  hintRowNumber?: number;
+};
 export async function writeBatchRecordCellsByKey(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
   colIndex: number,
-  entries: ReadonlyArray<{
-    postCode: string;
-    postUrl: string;
-    value: string;
-    hintRowNumber?: number;
-  }>,
+  entries: ReadonlyArray<SheetCellUpdateEntry>,
   cachedCols?: ReturnType<typeof resolveRecordColumns>,
 ): Promise<void> {
   if (!entries.length) return;
@@ -133,7 +131,6 @@ export async function writeBatchRecordCellsByKey(
     ctx.invalidateGridCache(link.id);
   }
 }
-
 export async function ensureMachineColumnAndWriteCells(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -157,7 +154,6 @@ export async function ensureMachineColumnAndWriteCells(
   if (entries.length) await writeBatchRecordCellsByKey(ctx, link, machineColIndex, entries, cols);
   return machineColIndex;
 }
-
 async function claimMetricsFallbackProfile(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -180,7 +176,6 @@ async function claimMetricsFallbackProfile(
   }
   return null;
 }
-
 export async function collectDueMetricsForLink(
   ctx: GoogleSheetsContext,
   linkId: string,
@@ -192,19 +187,16 @@ export async function collectDueMetricsForLink(
   const abortCtrl = new AbortController();
   ctx.metricsAbortByLink.set(linkId, abortCtrl);
   let claimedScraperProfileId: string | null = null;
-
   try {
     const link = await requireLink(ctx, linkId);
     if (link.kind !== 'post_records')
       throw new ProductError('SHEET_KIND_MISMATCH', '只有发帖记录表支持采集点赞和留言数', 400);
     if (!ctx.deps.automation)
       throw new ProductError('SHEET_AUTOMATION_UNAVAILABLE', '采集桥接未就绪', 503);
-
     const grid = await ctx.readGrid(link.id, { force: forceAllEligible });
     const cols = resolveRecordColumns(grid.headers, link.recordsConfig?.machineName);
     if (cols.postUrl < 0 || (cols.likes < 0 && cols.comments < 0))
       return { updated: 0, failed: 0, summary: '表格未包含「贴文链接」或「点赞/留言」表头' };
-
     const knownByCode = new Map(
       (await ctx.repo.listRecordPosts(link.id)).map((r) => [r.postCode, r]),
     );
@@ -216,7 +208,6 @@ export async function collectDueMetricsForLink(
       stageTarget: '24h' | '72h';
       postedAtMs: number;
     }> = [];
-
     for (const row of grid.rows) {
       if (row.isHintRow) continue;
       const { postUrl, postCode } = resolveRecordRowIdentity(row, cols);
@@ -252,7 +243,6 @@ export async function collectDueMetricsForLink(
           postedAtMs: postedAtMs ?? 0,
         });
     }
-
     if (!dueTargets.length)
       return { updated: 0, failed: 0, summary: '暂无满 24h/72h 待采集赞/评的贴文' };
     dueTargets.sort((a, b) => b.postedAtMs - a.postedAtMs || b.rowNumber - a.rowNumber);
@@ -260,7 +250,6 @@ export async function collectDueMetricsForLink(
     await ctx.repo.updateLinkRuntime(link.id, {
       activeJobText: `正在无账号直采 ${batch.length} 条贴文赞/评数…`,
     });
-
     const scrapedByCode = new Map<string, ScrapedPostMetrics>();
     let usedAnonymousCount = 0;
     let fallbackNeeded: typeof batch = [];
@@ -277,7 +266,6 @@ export async function collectDueMetricsForLink(
         }
       }
     } else fallbackNeeded = [...batch];
-
     let privateSkippedNoBrowser = 0;
     if (fallbackNeeded.length && !abortCtrl.signal.aborted) {
       claimedScraperProfileId = await claimMetricsFallbackProfile(ctx, link);
@@ -285,16 +273,26 @@ export async function collectDueMetricsForLink(
         await ctx.repo.updateLinkRuntime(link.id, {
           activeJobText: `正在用浏览器补采 ${fallbackNeeded.length} 条私密贴赞/评数…`,
         });
-        for (const item of await ctx.deps.automation.scrapePostMetrics({
-          profileId: claimedScraperProfileId,
-          posts: fallbackNeeded.map((b) => ({ postCode: b.postCode, postUrl: b.postUrl })),
-          signal: abortCtrl.signal,
-        })) {
-          scrapedByCode.set(item.postCode, item);
+        try {
+          for (const item of await ctx.deps.automation.scrapePostMetrics({
+            profileId: claimedScraperProfileId,
+            posts: fallbackNeeded.map((b) => ({ postCode: b.postCode, postUrl: b.postUrl })),
+            signal: abortCtrl.signal,
+          })) {
+            scrapedByCode.set(item.postCode, item);
+          }
+        } catch (scrapeErr) {
+          const msg = scrapeErr instanceof Error ? scrapeErr.message : String(scrapeErr);
+          await safeAppendSheetLog(
+            ctx,
+            link.id,
+            'warn',
+            'metrics_scrape_circuit_break',
+            `浏览器补采赞/评中止：${msg.slice(0, 160)}`,
+          );
         }
       } else privateSkippedNoBrowser = fallbackNeeded.length;
     }
-
     const { rowByCode, rowByUrl, usedKeyLookup } = await resolveSheetRowIndexMaps(
       ctx,
       link,
@@ -308,7 +306,6 @@ export async function collectDueMetricsForLink(
     }> = [];
     let updated = 0;
     let failed = 0;
-
     for (const targetMeta of batch) {
       const item = scrapedByCode.get(targetMeta.postCode);
       const writeRow =
@@ -321,9 +318,11 @@ export async function collectDueMetricsForLink(
         failed++;
         const key = `${link.id}:${targetMeta.postCode}`;
         const attempts = (ctx.metricsFailureBackoff.get(key)?.attempts ?? 0) + 1;
-        const delayMs =
-          METRICS_BACKOFF_STEPS_MS[Math.min(attempts - 1, METRICS_BACKOFF_STEPS_MS.length - 1)] ??
-          86400_000;
+        const delayMs = item?.unavailable
+          ? 86400_000
+          : (METRICS_BACKOFF_STEPS_MS[
+              Math.min(attempts - 1, METRICS_BACKOFF_STEPS_MS.length - 1)
+            ] ?? 86400_000);
         ctx.metricsFailureBackoff.delete(key);
         ctx.metricsFailureBackoff.set(key, { attempts, retryAfter: ctx.nowFn() + delayMs });
         while (ctx.metricsFailureBackoff.size > 5_000) {
@@ -344,7 +343,6 @@ export async function collectDueMetricsForLink(
         });
       pendingDbCommits.push({ targetMeta, item });
     }
-
     if (cellUpdates.length) {
       await ctx.deps.sheetsApi.batchUpdateCells(link.spreadsheetId, link.sheetName, cellUpdates);
       ctx.invalidateGridCache(link.id);
@@ -367,7 +365,6 @@ export async function collectDueMetricsForLink(
       });
       updated++;
     }
-
     const detail = [
       usedAnonymousCount > 0 ? `无账号直采 ${usedAnonymousCount} 条` : '',
       privateSkippedNoBrowser > 0

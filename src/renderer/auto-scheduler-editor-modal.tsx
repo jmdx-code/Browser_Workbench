@@ -46,8 +46,17 @@ import {
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
 import { BackdropModal, Btn, errMsg, useEscapeKey } from './modules/shared/module-ui.js';
 import { UnifiedTargetPicker } from './modules/shared/unified-target-picker.js';
-import { DayPillGroup, UI_INPUT, UI_INPUT_SM, UiSegmented, UiSwitch } from './ui/primitives.js';
-
+import {
+  DayPillGroup,
+  UI_BETWEEN,
+  UI_INPUT,
+  UI_INPUT_SM,
+  UI_MUTED,
+  UI_ROW,
+  UI_ROW_SM,
+  UiSegmented,
+  UiSwitch,
+} from './ui/primitives.js';
 export interface AutoSchedulerEditorModalProps {
   initial: AutoSchedule | null;
   seed?: QuickScheduleSeed | null | undefined;
@@ -65,9 +74,7 @@ export interface AutoSchedulerEditorModalProps {
   onSave: (payload: SaveAutoScheduleInput) => Promise<void>;
   onClose: () => void;
 }
-
 const DT_CLS = `${UI_INPUT_SM} font-medium tabular-nums`;
-
 export function MiniSegTabs<T extends string>(p: {
   ariaLabel?: string;
   value: T;
@@ -91,7 +98,6 @@ export function MiniSegTabs<T extends string>(p: {
     </div>
   );
 }
-
 export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
   const { initial, seed } = p;
   const savedCombos = useMemo(
@@ -117,7 +123,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
       }),
     [defaultComboId, p.sharedGroups, inviterGroupTargetItems, p.sharedPages, p.posterMaterials],
   );
-
   const [carrier, setCarrier] = useState<AutoScheduleCarrier>(
     initial?.carrier ?? seed?.carrier ?? 'browser',
   );
@@ -171,57 +176,78 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
   const [manualPickerOpen, setManualPickerOpen] = useState(false);
   const [rangeStart, setRangeStart] = useState(1);
   const [rangeEnd, setRangeEnd] = useState(Math.min(30, Math.max(1, p.profiles.length)));
+  const initSteps = <T extends AnyStep>(c: AutoScheduleCarrier, def: T): T[] =>
+    initial?.carrier === c
+      ? [...(initial.steps as T[])]
+      : seed?.carrier === c && seed.steps.length > 0
+        ? [...(seed.steps as T[])]
+        : [def];
   const [browserSteps, setBrowserSteps] = useState<BrowserPipelineStep[]>(() =>
-    initial?.carrier === 'browser'
-      ? [...initial.steps]
-      : seed?.carrier === 'browser' && seed.steps.length > 0
-        ? [...(seed.steps as BrowserPipelineStep[])]
-        : defaultComboId
-          ? [{ id: uid(), type: 'active-combination', combinationId: defaultComboId }]
-          : [{ id: uid(), type: 'group-bumper', groupIds: [], pageIds: [] }],
+    initSteps(
+      'browser',
+      defaultComboId
+        ? { id: uid(), type: 'active-combination', combinationId: defaultComboId }
+        : { id: uid(), type: 'group-bumper', groupIds: [], pageIds: [] },
+    ),
   );
   const [bsSteps, setBsSteps] = useState<BluestacksPipelineStep[]>(() =>
-    initial?.carrier === 'bluestacks'
-      ? [...initial.steps]
-      : seed?.carrier === 'bluestacks' && seed.steps.length > 0
-        ? [...(seed.steps as BluestacksPipelineStep[])]
-        : defaultComboId
-          ? [{ id: uid(), type: 'bluestacks-active-combination', combinationId: defaultComboId }]
-          : [{ id: uid(), type: 'bluestacks-health-check', autoInstallApk: false }],
+    initSteps(
+      'bluestacks',
+      defaultComboId
+        ? { id: uid(), type: 'bluestacks-active-combination', combinationId: defaultComboId }
+        : { id: uid(), type: 'bluestacks-health-check', autoInstallApk: false },
+    ),
   );
   const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
-  const [paramOpenStepId, setParamOpenStepId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const [errorText, setErrorText] = useState('');
-
   useEscapeKey(!saving, () => {
     if (!document.querySelector('dialog[open], .select-by-ids-modal')) p.onClose();
   });
-
   const activeGroupsPool =
     carrier === 'browser' ? p.profileGroups : (p.bluestacksState?.folders ?? []);
-  const activeTargetsPool = useMemo(
-    () =>
-      carrier === 'browser'
-        ? p.profiles.map((r, i) => ({
-            id: r.id,
-            groupId: r.groupId,
-            name: `${i + 1}. ${profileDisplayName(r)}`,
-            sub: r.account.name || r.account.id || undefined,
-            avatarUrl: r.account.avatar ?? null,
-            badge: r.online ? '在线' : undefined,
-          }))
-        : (p.bluestacksState?.instances ?? []).map((inst, i) => ({
-            id: inst.id,
-            groupId: inst.folderId,
-            name: `${i + 1}. ${bluestacksDisplayTitle(inst)}`,
-            sub: inst.accountName || inst.instanceKey,
-            avatarUrl: inst.avatarUrl ?? null,
-            badge: inst.online ? '在线' : undefined,
-          })),
-    [carrier, p.profiles, p.bluestacksState?.instances],
-  );
+  const activeTargetsPool = useMemo(() => {
+    const mapRow = (
+      id: string,
+      groupId: string | null,
+      title: string,
+      idx: number,
+      sub: string | undefined,
+      avatarUrl: string | null | undefined,
+      online: boolean,
+    ) => ({
+      id,
+      groupId,
+      name: `${idx + 1}. ${title}`,
+      sub,
+      avatarUrl: avatarUrl ?? null,
+      badge: online ? '在线' : undefined,
+    });
+    return carrier === 'browser'
+      ? p.profiles.map((r, i) =>
+          mapRow(
+            r.id,
+            r.groupId,
+            profileDisplayName(r),
+            i,
+            r.account.name || r.account.id || undefined,
+            r.account.avatar,
+            r.online,
+          ),
+        )
+      : (p.bluestacksState?.instances ?? []).map((inst, i) =>
+          mapRow(
+            inst.id,
+            inst.folderId,
+            bluestacksDisplayTitle(inst),
+            i,
+            inst.accountName || inst.instanceKey,
+            inst.avatarUrl,
+            inst.online,
+          ),
+        );
+  }, [carrier, p.profiles, p.bluestacksState?.instances]);
   const matchedTargetCount = useMemo(() => {
     const set = new Set(selectorMode === 'groups' ? groupIds : targetIds);
     return activeTargetsPool.filter((t) =>
@@ -242,22 +268,17 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
         weekdays,
         times,
         timeZone,
-        jitterMinutes: 0,
-        prewarmEnabled: false,
-        prewarmLeadMinutes: 90,
       },
       Date.now(),
       1,
     );
   }, [initial?.id, triggerMode, onceAtMs, weekdays, times, timeZone]);
-
   const pageTargetItems = useMemo(() => mapTargetItems(p.sharedPages), [p.sharedPages]);
   const groupTargetItems = useMemo(() => mapTargetItems(p.sharedGroups), [p.sharedGroups]);
   const posterMaterialItems = useMemo(
     () => mapPosterMaterialItems(p.posterMaterials),
     [p.posterMaterials],
   );
-
   function switchCarrier(next: AutoScheduleCarrier) {
     if (next === carrier) return;
     setCarrier(next);
@@ -271,7 +292,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
     setSelectorMode(nextGroups[0]?.id ? 'groups' : 'explicit');
     setGroupIds(nextGroups[0]?.id ? [nextGroups[0].id] : []);
   }
-
   const activeSteps: readonly AnyStep[] = carrier === 'browser' ? browserSteps : bsSteps;
   const stepMeta = carrier === 'browser' ? BROWSER_STEP_META : BS_STEP_META;
   const maxSteps = carrier === 'browser' ? 12 : 8;
@@ -281,7 +301,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
       : setBsSteps((prev) => updater(prev) as BluestacksPipelineStep[]);
   const updateStep = (index: number, next: AnyStep) =>
     setSteps((prev) => prev.map((s, i) => (i === index ? next : s)));
-
   async function handleSubmit() {
     if (savingRef.current || saving) return;
     setErrorText('');
@@ -328,7 +347,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
       setSaving(false);
     }
   }
-
   const concurrencyCap = carrier === 'browser' ? p.browserConcurrency : p.bluestacksConcurrency;
   const wavesCount = Math.max(
     1,
@@ -346,9 +364,7 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
     updateStep,
     setSteps,
     setExpandedStepId,
-    setParamOpenStepId,
   };
-
   return (
     <BackdropModal
       label={initial ? '编辑排班' : '新建排班'}
@@ -384,7 +400,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
             </Btn>
           </div>
         </header>
-
         <div className="flex flex-1 flex-col gap-3.5 overflow-y-auto px-[18px] py-4">
           <input
             aria-label="排班名称"
@@ -394,15 +409,12 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
             placeholder="排班名称，如：早班日常养号"
             onChange={(e) => setName(e.target.value)}
           />
-
           <section className={CARD_BOX}>
-            <div className="flex items-center justify-between gap-2">
+            <div className={UI_BETWEEN}>
               <div className="flex items-center gap-2">
                 <strong className="text-[13px] font-semibold">时间</strong>
                 {upcomingPreview[0]?.label && (
-                  <span className="text-xs text-[var(--text-3)]">
-                    下次 {upcomingPreview[0].label}
-                  </span>
+                  <span className={UI_MUTED}>下次 {upcomingPreview[0].label}</span>
                 )}
               </div>
               <UiSegmented
@@ -471,7 +483,7 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
               </div>
             ) : (
               <div className="flex flex-col gap-2">
-                <div className="flex flex-wrap items-center gap-2">
+                <div className={UI_ROW}>
                   <input
                     type="date"
                     className={DT_CLS}
@@ -488,9 +500,9 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
                     disabled={saving}
                     onChange={(e) => setOnceTime(e.target.value)}
                   />
-                  <span className="text-xs text-[var(--text-3)]">执行一次后自动停用</span>
+                  <span className={UI_MUTED}>执行一次后自动停用</span>
                 </div>
-                <div className="flex flex-wrap items-center gap-1.5">
+                <div className={UI_ROW_SM}>
                   {buildOncePresets(timeZone).map((pr) => (
                     <button
                       key={pr.label}
@@ -509,12 +521,11 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
               </div>
             )}
           </section>
-
           <section className={CARD_BOX}>
-            <div className="flex items-center justify-between gap-2">
+            <div className={UI_BETWEEN}>
               <div className="flex items-center gap-2">
                 <strong className="text-[13px] font-semibold">对象</strong>
-                <span className="text-xs text-[var(--text-3)]">
+                <span className={UI_MUTED}>
                   {matchedTargetCount} {carrier === 'browser' ? '窗' : '台'} · {concurrencyCap}并发
                   · 约{wavesCount}波
                 </span>
@@ -549,7 +560,9 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
                       >
                         <span>{checked ? '✓' : '+'}</span>
                         <span>{g.name}</span>
-                        <em className="not-italic text-[11px] text-[var(--text-3)]">{count}</em>
+                        <em className="shrink-0 whitespace-nowrap not-italic text-[11px] text-[var(--text-3)]">
+                          {count}
+                        </em>
                       </button>
                     );
                   })}
@@ -564,23 +577,21 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
                   <div className="flex flex-wrap items-center gap-2 text-[12.5px]">
                     {activeTargetsPool.length > 1 && (
                       <span className="flex flex-wrap items-center gap-2 text-[12.5px]">
-                        {(
-                          [
-                            ['起始序号', rangeStart, setRangeStart],
-                            ['结束序号', rangeEnd, setRangeEnd],
-                          ] as const
-                        ).map(([aria, v, setV], i) => (
-                          <span key={aria} className="inline-flex items-center gap-2">
+                        {[
+                          ['起始序号', rangeStart, setRangeStart],
+                          ['结束序号', rangeEnd, setRangeEnd],
+                        ].map(([aria, v, setV], i) => (
+                          <span key={aria as string} className="inline-flex items-center gap-2">
                             {i === 1 && <span>-</span>}
                             <ControlledNumberInput
-                              ariaLabel={aria}
+                              ariaLabel={aria as string}
                               className={`${UI_INPUT_SM} w-[60px] px-1.5 text-center`}
                               debounceMs={0}
-                              value={v}
-                              defaultValue={v}
+                              value={v as number}
+                              defaultValue={v as number}
                               min={1}
                               max={Math.max(1, activeTargetsPool.length)}
-                              onChange={setV}
+                              onChange={setV as (n: number) => void}
                             />
                           </span>
                         ))}
@@ -606,22 +617,22 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
                   </div>
                 </div>
                 {manualPickerOpen && (
-                  <UnifiedTargetPicker
-                    title="选择账号"
-                    items={activeTargetsPool}
-                    selectedIds={targetIds}
-                    onChange={setTargetIds}
-                    onDone={() => setManualPickerOpen(false)}
-                  />
+                  <div className="[&_.overflow-y-auto]:max-h-none [&_.overflow-y-auto]:overflow-visible">
+                    <UnifiedTargetPicker
+                      title="选择账号"
+                      items={activeTargetsPool}
+                      selectedIds={targetIds}
+                      onChange={setTargetIds}
+                    />
+                  </div>
                 )}
               </div>
             )}
           </section>
-
           <section className={CARD_BOX}>
-            <div className="flex items-center justify-between gap-2">
+            <div className={UI_BETWEEN}>
               <strong className="text-[13px] font-semibold">步骤</strong>
-              <span className="text-xs text-[var(--text-3)]">{activeSteps.length} 步</span>
+              <span className={UI_MUTED}>{activeSteps.length} 步</span>
             </div>
             <div className="flex flex-col gap-[7px]">
               {activeSteps.map((step, idx) => (
@@ -631,7 +642,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
                   idx={idx}
                   totalSteps={activeSteps.length}
                   isOpen={expandedStepId === step.id}
-                  isParamOpen={paramOpenStepId === step.id}
                   ctx={stepCtx}
                 />
               ))}
@@ -656,7 +666,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
             </div>
           </section>
         </div>
-
         {errorText && (
           <div
             className="mx-[18px] mb-2.5 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12.5px] text-red-700"
@@ -665,7 +674,6 @@ export function AutoSchedulerEditorModal(p: AutoSchedulerEditorModalProps) {
             {errorText}
           </div>
         )}
-
         <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)] bg-slate-50 px-[18px] py-3">
           <UiSwitch
             checked={closeWindowOnFinish}

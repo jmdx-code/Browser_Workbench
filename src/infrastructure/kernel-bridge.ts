@@ -3,7 +3,6 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Core, Peer } from '../bridge/core.js';
 import type { KernelBridgeHooks } from '../bridge/server.js';
 import type { KernelState, TabProof } from '../shared/kernel-state.js';
-import type { PageProjection, PageProjectionRequest } from '../shared/page-read.js';
 import type { ProfilePresentationStatus } from '../shared/presentation-recovery.js';
 import type { Rect, TaskWindow } from '../shared/window-layout.js';
 import { PresentationFocusGate, PositionRecoveryGate } from '../application/kernel-gates.js';
@@ -16,7 +15,6 @@ import {
   inspectIdleFacebookPageImpl,
   inspectOwnedFacebookPageImpl,
   inspectRetainedFacebookDisplayImpl,
-  type InspectReadOptions,
   type KernelInspectionDeps,
 } from './kernel-bridge/kernel-facebook-inspection.js';
 import {
@@ -56,6 +54,8 @@ import {
   type KernelSummaryPort,
 } from './kernel-bridge/kernel-rpc-session.js';
 export type { KernelSummaryPort };
+type Tail1<F> = F extends (a: never, ...r: infer R) => unknown ? R : never;
+type Tail2<F> = F extends (a: never, b: never, ...r: infer R) => unknown ? R : never;
 export class KernelBridge implements KernelBridgeHooks {
   recoverBumperWorkspace?: (
     peer: Peer,
@@ -210,19 +210,11 @@ export class KernelBridge implements KernelBridgeHooks {
   setAccountObserver(observer: AccountObserver) {
     this.accountObserver = observer;
   }
-  observeExternalPageAccount(
-    profileId: string,
-    page: Page,
-    actor: { accountId: string; name: string | null } | null,
-  ) {
-    return observeExternalPageAccountImpl(this.accountObserver, profileId, page, actor);
+  observeExternalPageAccount(...a: Tail1<typeof observeExternalPageAccountImpl>) {
+    return observeExternalPageAccountImpl(this.accountObserver, ...a);
   }
-  observeProjectedAccount(
-    profileId: string,
-    page: PageProjection,
-    actor: { accountId: string; name: string | null } | null,
-  ) {
-    return observeProjectedAccountImpl(this.accountObserver, profileId, page, actor);
+  observeProjectedAccount(...a: Tail1<typeof observeProjectedAccountImpl>) {
+    return observeProjectedAccountImpl(this.accountObserver, ...a);
   }
   diagnostics(profileId: string) {
     return [...(this.traces.get(profileId) ?? [])];
@@ -243,53 +235,17 @@ export class KernelBridge implements KernelBridgeHooks {
   archivedOperations(profileId: string, operationIds: readonly string[]) {
     return archivedOperationsQuery(this.core, profileId, operationIds);
   }
-  readFacebookPage(
-    peer: Peer,
-    input: PageProjectionRequest,
-    destination: 'home' | 'self-profile' = 'home',
-    assertAllowed: () => Awaitable<void> = () => {},
-    withIdentity = false,
-  ) {
-    return readFacebookPageImpl(
-      this.hostRef,
-      peer,
-      input,
-      destination,
-      assertAllowed,
-      withIdentity,
-    );
+  readFacebookPage(...a: Tail1<typeof readFacebookPageImpl>) {
+    return readFacebookPageImpl(this.hostRef, ...a);
   }
   withSummary<T>(peer: Peer, work: (port: KernelSummaryPort) => Promise<T>): Promise<T> {
     return withSummaryImpl(this.hostRef, this.retiredPeers, this.retireClosedSession, peer, work);
   }
-  connectAgentBrowser(
-    peer: Peer,
-    options: { initialUrl: string; files?: readonly string[]; foreground?: boolean },
-  ) {
-    return connectAgentBrowserImpl(
-      this.hostRef,
-      (p) => this.releaseIdleForExtension(p),
-      peer,
-      options,
-    );
+  connectAgentBrowser(...a: Tail2<typeof connectAgentBrowserImpl>) {
+    return connectAgentBrowserImpl(this.hostRef, (p) => this.releaseIdleForExtension(p), ...a);
   }
-  connectFacebook(
-    peer: Peer,
-    accountId: string,
-    assertIdentity: () => Awaitable<void>,
-    retainedTab?: TabProof,
-    storyAdmission = false,
-    files: readonly string[] = [],
-  ) {
-    return connectFacebookImpl(
-      this.inspectionDeps,
-      peer,
-      accountId,
-      assertIdentity,
-      retainedTab,
-      storyAdmission,
-      files,
-    );
+  connectFacebook(...a: Tail1<typeof connectFacebookImpl>) {
+    return connectFacebookImpl(this.inspectionDeps, ...a);
   }
   waitInvitationHomeIdentity(page: Page, guard: () => Awaitable<void>) {
     return waitInvitationHomeIdentityImpl(page, guard);
@@ -297,42 +253,14 @@ export class KernelBridge implements KernelBridgeHooks {
   navigateRetainedPageHome(page: Page, guard: () => Awaitable<void>) {
     return navigateRetainedPageHomeImpl(page, guard);
   }
-  inspectIdleFacebookPage(
-    peer: Peer,
-    guard: () => Awaitable<void>,
-    storyAdmission = false,
-    homeAdmission = false,
-  ) {
-    return inspectIdleFacebookPageImpl(
-      this.inspectionDeps,
-      peer,
-      guard,
-      storyAdmission,
-      homeAdmission,
-    );
+  inspectIdleFacebookPage(...a: Tail1<typeof inspectIdleFacebookPageImpl>) {
+    return inspectIdleFacebookPageImpl(this.inspectionDeps, ...a);
   }
   discardAdmissionTab(peer: Peer, proof: TabProof) {
     return discardAdmissionTabImpl(this.inspectionDeps, peer, proof);
   }
-  inspectFacebookIdentity(
-    peer: Peer,
-    assertAllowed: () => Awaitable<void>,
-    retainForTask = false,
-    existingTab?: TabProof,
-    browseAdmission = false,
-    storyAdmission = false,
-    homeAdmission = false,
-  ) {
-    return inspectFacebookIdentityImpl(
-      this.inspectionDeps,
-      peer,
-      assertAllowed,
-      retainForTask,
-      existingTab,
-      browseAdmission,
-      storyAdmission,
-      homeAdmission,
-    );
+  inspectFacebookIdentity(...a: Tail1<typeof inspectFacebookIdentityImpl>) {
+    return inspectFacebookIdentityImpl(this.inspectionDeps, ...a);
   }
   inspectRetainedFacebookDisplay(peer: Peer, proof: TabProof, guard: () => Awaitable<void>) {
     return inspectRetainedFacebookDisplayImpl(this.inspectionDeps, peer, proof, guard);
@@ -344,48 +272,20 @@ export class KernelBridge implements KernelBridgeHooks {
     return inspectFacebookAccountSilentlyImpl(this.inspectionDeps, peer, guard, timeoutMs);
   }
   readFacebookMetadataPage<T>(
-    peer: Peer,
-    guard: () => Awaitable<void>,
-    read: (page: Page) => Promise<T>,
-    existingTab?: TabProof,
-    timeoutMs = 10_000,
-    options?: {
-      initialUrl?: string;
-      forceNewTemporaryTab?: boolean;
-      backgroundMetadataRead?: boolean;
-      disableOuterTimeout?: boolean;
-    },
+    ...a: Parameters<typeof readFacebookMetadataPageImpl<T>> extends [unknown, ...infer R]
+      ? R
+      : never
   ) {
-    return readFacebookMetadataPageImpl(
-      this.inspectionDeps,
-      peer,
-      guard,
-      read,
-      existingTab,
-      timeoutMs,
-      options,
-    );
+    return readFacebookMetadataPageImpl<T>(this.inspectionDeps, ...a);
   }
   private inspectOwnedFacebookPage<T>(
-    peer: Peer,
-    assertAllowed: () => Awaitable<void>,
-    initialUrl: string,
-    read: (page: Page, reusedTab?: TabProof) => Promise<T>,
-    foreground = false,
-    retainForTask = false,
-    existingTab?: TabProof,
-    readOptions?: InspectReadOptions,
+    ...a: Parameters<typeof inspectOwnedFacebookPageImpl<T>> extends [unknown, ...infer R]
+      ? R
+      : never
   ) {
-    return inspectOwnedFacebookPageImpl(
+    return inspectOwnedFacebookPageImpl<T>(
       this.inspectionDeps ?? (this as unknown as KernelInspectionDeps),
-      peer,
-      assertAllowed,
-      initialUrl,
-      read,
-      foreground,
-      retainForTask,
-      existingTab,
-      readOptions,
+      ...a,
     );
   }
   private connectOwned(

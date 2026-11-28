@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto';
+import type { BluestacksBumperRunnerPort } from '../application/bluestacks/bs-types.js';
 import type { CompatibleRepository } from '../domain/persistence.js';
 import {
   extractOcrReadableText,
   hasUnsupportedOcrScript,
   nameSimilarity,
+  resolveEffectiveBsAccountId,
   type BluestacksAccountState,
-  type BluestacksBumperMode,
   type BluestacksInstance,
 } from '../shared/bluestacks.js';
+import { devDiag } from '../shared/dev-diagnostics.js';
 import { inferBumperSourceMode, isDirectFacebookPostUrl } from '../shared/google-sheets.js';
 import {
   isLocalAvatar,
@@ -54,6 +56,14 @@ import {
   type RectBounds,
 } from './bluestacks-vision.js';
 import { runFeedBumperFlow } from './bluestacks-bumper-runner/feed-bumper-runner.js';
+export const emitBumperCommentSkipped = (
+  reason: string | null,
+  data: { instanceId: string; groupId: string; pageId: string; postId: string; commentId?: string },
+) =>
+  devDiag.emit('WARN', 'TASK_RUNNER', 'BLUESTACKS_BUMPER_COMMENT_SKIPPED', {
+    reason: reason ?? 'unknown',
+    data,
+  });
 export async function executeBarActions(
   ops: ScreenOps,
   bar: Pick<LitePostActionBar, 'likeBounds' | 'commentBounds'>,
@@ -61,9 +71,10 @@ export async function executeBarActions(
   wantLike: boolean,
   commentText: string | null | undefined,
   onStatus?: (mode: 'like' | 'comment') => void,
-): Promise<{ didLike: boolean; didComment: string | null }> {
+): Promise<{ didLike: boolean; didComment: string | null; commentSkippedReason: string | null }> {
   let didLike = false,
-    didComment: string | null = null;
+    didComment: string | null = null,
+    commentSkippedReason: string | null = null;
   if (wantLike) {
     onStatus?.('like');
     didLike = await applyLikeOrReaction(ops, bar.likeBounds, settings);
@@ -71,10 +82,11 @@ export async function executeBarActions(
   if (commentText) {
     ops.guard();
     onStatus?.('comment');
-    if (await submitCommentOnActionBar(ops, bar.commentBounds, commentText))
-      didComment = commentText;
+    const res = await submitCommentWithReason(ops, bar.commentBounds, commentText);
+    if (res.ok) didComment = commentText;
+    else commentSkippedReason = res.commentSkippedReason;
   }
-  return { didLike, didComment };
+  return { didLike, didComment, commentSkippedReason };
 }
 export interface BluestacksBumperRunnerRepo {
   savedSettings?(): { bumperSettings: BumperSettings; pageBumperSettings?: BumperSettings };
@@ -153,44 +165,138 @@ export async function applyLikeOrReaction(
     const popupMap = extractReactionPopupButtons(await ops.xml(), likeBounds);
     const targetRect = popupMap[chosenReaction] ?? popupMap.love ?? popupMap.like;
     if (targetRect) {
-      const { ok } = await ops.tapLike(targetRect, 1400);
-      if (ok) return true;
+      await ops.tap(targetRect.cx, targetRect.cy, 1400);
+      if (await isReactionButtonActive(await ops.png(), likeBounds)) return true;
     } else await ops.back(500);
   }
   return (await ops.tapLike(likeBounds, 1400)).ok;
 }
-export async function submitCommentOnActionBar(
+const COMMENT_SEND_RE = /^(?:发送|發送|send|submit|ပို့|gửi|ส่ง)$/i;
+export function findCommentSendButtonNode(
+  root: LiteXmlNode | null,
+  inputNode: LiteXmlNode | null,
+): LiteXmlNode | null {
+  if (!root) return null;
+  const all = flattenLiteNodes(root).filter((n) => n.clickable && n !== inputNode);
+  const inInputBand = (n: LiteXmlNode) =>
+    inputNode
+      ? (n.bounds.cy >= inputNode.bounds.y1 - 28 && n.bounds.cy <= inputNode.bounds.y2 + 28) ||
+        Math.abs(n.bounds.cy - inputNode.bounds.cy) <= 90
+      : Math.abs(n.bounds.cy - 1480) <= 90;
+  const explicit = all.find(
+    (n) =>
+      n.bounds.x1 >= 580 &&
+      n.bounds.w >= 28 &&
+      n.bounds.h >= 28 &&
+      inInputBand(n) &&
+      isSendNodeExplicit(n),
+  );
+  if (explicit) return explicit;
+  if (!inputNode) return null;
+  return (
+    all
+      .filter(
+        (n) =>
+          n.bounds.x1 >= Math.max(660, inputNode.bounds.x2 - 20) &&
+          n.bounds.x2 <= 900 &&
+          inInputBand(n) &&
+          n.bounds.w >= 30 &&
+          n.bounds.w <= 150 &&
+          n.bounds.h >= 30 &&
+          n.bounds.h <= 130,
+      )
+      .sort((a, b) => b.bounds.x2 - a.bounds.x2 || b.bounds.cy - a.bounds.cy)[0] ?? null
+  );
+}
+function isSendNodeExplicit(n: LiteXmlNode): boolean {
+  return (
+    COMMENT_SEND_RE.test(`${n.text} ${n.contentDesc}`.replace(/\s+/g, '')) ||
+    /send/i.test(n.resourceId)
+  );
+}
+const normCommentTxt = (s: string) => s.replace(/[\s\uFE00-\uFE0F\u200D]+/g, '').toLowerCase();
+const sliceCp = (s: string, max: number) => Array.from(s).slice(0, max).join('');
+async function hasPostedCommentEvidence(
+  xml: LiteXmlNode | null,
+  commentText: string,
+  ops: ScreenOps,
+  png: Buffer,
+): Promise<boolean> {
+  if (!xml) return false;
+  const fullNorm = normCommentTxt(commentText);
+  if (!fullNorm) return false;
+  const lineNeedles = commentText
+    .split(/\r?\n/)
+    .map((l) => normCommentTxt(l.replace(/[\p{Extended_Pictographic}\p{Emoji_Component}]/gu, '')))
+    .filter((l) => Array.from(l).length >= 4)
+    .map((l) => sliceCp(l, 16));
+  const fullNeedle = sliceCp(fullNorm, 16);
+  const xmlNeedles = [...new Set([fullNeedle, ...lineNeedles].filter(Boolean))];
+  const ocrNeedles = lineNeedles.length > 0 ? [...new Set(lineNeedles)] : [fullNeedle];
+  const all = flattenLiteNodes(xml),
+    afterInput = findTextInputNode(xml),
+    inputNorm = afterInput ? normCommentTxt(`${afterInput.text} ${afterInput.contentDesc}`) : '';
+  if (inputNorm && xmlNeedles.some((nd) => inputNorm.includes(nd))) return false;
+  const threadNodes = all.filter(
+    (n) => n !== afterInput && !/TextInputView|EditText/i.test(n.className),
+  );
+  const nodeNorms = threadNodes.map((n) => normCommentTxt(`${n.text} ${n.contentDesc}`));
+  const joinedThread = nodeNorms.join('');
+  if (xmlNeedles.some((nd) => nodeNorms.some((t) => t.includes(nd)) || joinedThread.includes(nd)))
+    return true;
+  if (
+    threadNodes.some((n) => (n.text || n.contentDesc).trim().length > 0) &&
+    !ocrNeedles.some((nd) => Array.from(nd).length >= 4)
+  )
+    return false;
+  const ocrText = normCommentTxt(
+    await ops.ocr(
+      png,
+      makeCanonicalRect(0, 120, 900, Math.max(200, (afterInput?.bounds.y1 ?? 1440) - 8)),
+    ),
+  );
+  return ocrNeedles.some((nd) => ocrText.includes(nd));
+}
+export async function submitCommentWithReason(
   ops: ScreenOps,
   commentBounds: RectBounds,
   commentText: string,
-): Promise<boolean> {
+): Promise<{ ok: boolean; commentSkippedReason: string | null }> {
   await ops.tap(commentBounds.cx, commentBounds.cy, 1800);
-  const inputNode = findTextInputNode(await ops.xml());
-  await ops.paste(inputNode?.bounds.cx ?? 300, inputNode?.bounds.cy ?? 1480, commentText);
+  const openXml = await ops.xml();
+  const inputNode = findTextInputNode(openXml);
+  if (!inputNode) {
+    if (openXml && findTextInputNode(openXml) === null) await ops.back(600);
+    return { ok: false, commentSkippedReason: 'input_not_found' };
+  }
+  await ops.paste(inputNode.bounds.cx, inputNode.bounds.cy, commentText);
   await ops.wait(800);
-  const sendRowY = inputNode ? inputNode.bounds.cy : 1484;
-  const primarySendBounds = makeCanonicalRect(
-    790,
-    Math.max(0, sendRowY - 42),
-    900,
-    Math.min(1600, sendRowY + 42),
-  );
-  const fallbackSendBounds = makeCanonicalRect(790, 1440, 900, 1520);
-  const typedPng = await ops.png();
-  const activeSendBounds = (await isLikeButtonBlue(typedPng, primarySendBounds))
-    ? primarySendBounds
-    : (await isLikeButtonBlue(typedPng, fallbackSendBounds))
-      ? fallbackSendBounds
-      : null;
+  const { xml: typedXml, png: typedPng } = await ops.capture();
+  const liveInput = findTextInputNode(typedXml) ?? inputNode;
+  const sendNode = findCommentSendButtonNode(typedXml, liveInput);
   let sent = false;
-  if (activeSendBounds) {
-    await ops.tap(854, activeSendBounds.cy, 2400);
-    sent = !(await isLikeButtonBlue(await ops.png(), activeSendBounds));
+  let commentSkippedReason: string | null = null;
+  if (!sendNode) commentSkippedReason = 'send_button_not_found';
+  else if (!isSendNodeExplicit(sendNode) && !(await isLikeButtonBlue(typedPng, sendNode.bounds)))
+    commentSkippedReason = 'send_button_not_ready';
+  else {
+    await ops.tap(sendNode.bounds.cx, sendNode.bounds.cy, 2200);
+    for (let attempt = 0; attempt < 2 && !sent; attempt++) {
+      if (attempt > 0) await ops.wait(1000);
+      const { xml: afterXml, png: afterPng } = await ops.capture();
+      sent = await hasPostedCommentEvidence(afterXml, commentText, ops, afterPng);
+    }
+    if (!sent) commentSkippedReason = 'post_evidence_unconfirmed';
   }
   await ops.back(950);
   if (findTextInputNode(await ops.xml())) await ops.back(1100);
-  return sent;
+  return { ok: sent, commentSkippedReason };
 }
+export const submitCommentOnActionBar = async (
+  ops: ScreenOps,
+  commentBounds: RectBounds,
+  commentText: string,
+): Promise<boolean> => (await submitCommentWithReason(ops, commentBounds, commentText)).ok;
 export async function resolveLiveEnableSound(
   repo: CompatibleRepository<BluestacksBumperRunnerRepo>,
   fallback: BumperSettings,
@@ -360,17 +466,27 @@ export async function switchGroupSortToNewest(ops: ScreenOps): Promise<void> {
   await ops.tap(sortBtn.bounds.cx, sortBtn.bounds.cy, 1400);
   const { xml: sheetXml, png } = await ops.capture();
   if (await isBottomSheetOpen(png)) {
-    const rows = flattenLiteNodes(sheetXml).filter(
-      (n) =>
-        n.clickable &&
-        n.bounds.x1 <= 60 &&
-        n.bounds.x2 >= 800 &&
-        n.bounds.y1 >= 900 &&
-        n.bounds.h >= 50 &&
-        n.bounds.h <= 140,
-    );
-    const match = await ops.findOcr(png, rows, /新帖子|最新帖子|新貼文|recentposts|newposts/i);
-    await ops.tap(450, match?.node.bounds.cy ?? 1490, 2000);
+    const rows = flattenLiteNodes(sheetXml)
+      .filter(
+        (n) =>
+          n.clickable &&
+          n.bounds.x1 <= 60 &&
+          n.bounds.x2 >= 800 &&
+          n.bounds.y1 >= 900 &&
+          n.bounds.h >= 50 &&
+          n.bounds.h <= 140,
+      )
+      .sort((a, b) => b.bounds.y1 - a.bounds.y1);
+    let matchedY: number | null = null;
+    for (const row of rows) {
+      const rowText = (await ops.ocr(png, row.bounds)).replace(/\s+/g, '');
+      if (/最相关|最相關|mostrelevant/i.test(rowText)) continue;
+      if (/新帖子|最新帖子|新貼文|newposts|mostrecent|recentposts/i.test(rowText)) {
+        matchedY = row.bounds.cy;
+        break;
+      }
+    }
+    await ops.tap(450, matchedY ?? 1490, 2000);
   }
 }
 export async function openPageGroupFeed(
@@ -529,44 +645,27 @@ export class BluestacksGroupBumperRunner {
     public readonly devices: BluestacksDeviceManager,
     private readonly ocr: OcrRecognizer,
   ) {}
-  private context(): BluestacksBumperContext {
-    return {
-      repo: this.repo,
-      targetAvatarUpdater: this.targetAvatarUpdater,
-      devices: this.devices,
-      ocr: this.ocr,
-      postClaims: this.postClaims,
-      commentClaims: this.commentClaims,
-    };
-  }
-  async runDirectPosts(
-    instanceId: string,
-    posts: ReadonlyArray<{
-      postId: string;
-      postUrl: string;
-      groupId: string;
-      groupName: string;
-      pageId: string;
-      pageName: string;
-    }>,
-    settings: BumperSettings,
-    commentPool: readonly string[],
-    signal: AbortSignal,
-    callbacks: {
-      status(text: string): void;
-      onPostDone?: (res: {
-        postId: string;
-        liked: boolean;
-        commented: boolean;
-        commentText: string | null;
-      }) => void | Promise<void>;
-    },
-  ): Promise<{ bumped: number; attempted: number }> {
+  private context = (): BluestacksBumperContext => ({
+    repo: this.repo,
+    targetAvatarUpdater: this.targetAvatarUpdater,
+    devices: this.devices,
+    ocr: this.ocr,
+    postClaims: this.postClaims,
+    commentClaims: this.commentClaims,
+  });
+  runDirectPosts: NonNullable<BluestacksBumperRunnerPort['runDirectPosts']> = async (
+    instanceId,
+    posts,
+    settings,
+    commentPool,
+    signal,
+    callbacks,
+  ) => {
     const ctx = this.context();
     callbacks.status('正在校验蓝蝶账号与连接…');
     const inst = await ctx.devices.ensureReadyAndLoggedIn(instanceId, signal),
       ops = createScreenOps(ctx.devices, ctx.ocr, inst, signal),
-      { accountId } = inst;
+      accountId = resolveEffectiveBsAccountId(inst);
     ops.guard();
     let bumped = 0,
       attempted = 0;
@@ -591,10 +690,7 @@ export class BluestacksGroupBumperRunner {
         break;
       }
       if (!q.allowed) {
-        if (q.riskLimitReason) {
-          callbacks.status(q.riskLimitReason);
-          break;
-        }
+        if (q.riskLimitReason) return (callbacks.status(q.riskLimitReason), { bumped, attempted });
         continue;
       }
       attempted++;
@@ -629,13 +725,20 @@ export class BluestacksGroupBumperRunner {
           chosenText = localComments[chosenCommentIdx] ?? null;
         }
         if (!wantLike && !chosenText) continue;
-        const { didLike, didComment } = await executeBarActions(
+        const { didLike, didComment, commentSkippedReason } = await executeBarActions(
           ops,
           bar,
           settings,
           wantLike,
           chosenText,
         );
+        if (chosenText && !didComment)
+          emitBumperCommentSkipped(commentSkippedReason, {
+            instanceId,
+            groupId: post.groupId,
+            pageId: post.pageId,
+            postId: normalizedPostId,
+          });
         if (didLike || didComment) {
           await ctx.repo.recordBump({
             id: randomUUID(),
@@ -668,27 +771,7 @@ export class BluestacksGroupBumperRunner {
       }
     }
     return { bumped, attempted };
-  }
-  async run(
-    instanceId: string,
-    groups: readonly BumperTarget[],
-    pages: readonly BumperTarget[],
-    settings: BumperSettings,
-    signal: AbortSignal,
-    callbacks: { status(text: string, today?: number): void; added(today: number): void },
-    mode: BluestacksBumperMode = 'group',
-    options?: { lockEnableSound?: boolean },
-  ): Promise<void> {
-    await runFeedBumperFlow(
-      this.context(),
-      instanceId,
-      groups,
-      pages,
-      settings,
-      signal,
-      callbacks,
-      mode,
-      options,
-    );
-  }
+  };
+  run: BluestacksBumperRunnerPort['run'] = (id, gs, ps, s, sig, cb, mode = 'group', opts) =>
+    runFeedBumperFlow(this.context(), id, gs, ps, s, sig, cb, mode, opts);
 }

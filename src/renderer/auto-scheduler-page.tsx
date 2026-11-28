@@ -40,21 +40,31 @@ import { ControlledNumberInput } from './modules/shared/controlled-number-input.
 import { Btn, DataTbl, errMsg, useDropdownDismiss } from './modules/shared/module-ui.js';
 import { PopoverMenu } from './popover-menu.js';
 import { toggleSet } from './selection.js';
-import { UI_INPUT_SM, UI_MUTED, UiSwitch } from './ui/primitives.js';
-
+import {
+  UI_HINT,
+  UI_INPUT_SM,
+  UI_MUTED,
+  UI_ROW,
+  UI_ROW_BT,
+  UI_ROW_SM,
+  UiSwitch,
+} from './ui/primitives.js';
 const PILL_BASE =
   'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap';
+const pillCls = (tone: string) => `${PILL_BASE} ${tone}`;
 const RUN_STATUS_PILL: Record<AutoRunItemStatus, string> = {
-  running: `${PILL_BASE} bg-[var(--brand-soft)] text-[var(--brand)]`,
-  queued: `${PILL_BASE} bg-slate-100 text-slate-600`,
-  completed: `${PILL_BASE} bg-emerald-50 text-emerald-700`,
-  soft_warning: `${PILL_BASE} bg-amber-50 text-amber-700`,
-  hard_blocked: `${PILL_BASE} bg-rose-50 text-rose-700`,
-  watchdog_timeout: `${PILL_BASE} bg-amber-50 text-amber-700`,
-  skipped: `${PILL_BASE} bg-slate-100 text-slate-600`,
-  stopped: `${PILL_BASE} bg-slate-100 text-slate-600`,
+  running: pillCls('bg-[var(--brand-soft)] text-[var(--brand)]'),
+  queued: pillCls('bg-slate-100 text-slate-600'),
+  completed: pillCls('bg-emerald-50 text-emerald-700'),
+  soft_warning: pillCls('bg-amber-50 text-amber-700'),
+  hard_blocked: pillCls('bg-rose-50 text-rose-700'),
+  watchdog_timeout: pillCls('bg-amber-50 text-amber-700'),
+  skipped: pillCls('bg-slate-100 text-slate-600'),
+  stopped: pillCls('bg-slate-100 text-slate-600'),
 };
-
+const Pill = ({ tone, children }: { tone: string; children: React.ReactNode }) => (
+  <span className={pillCls(tone)}>{children}</span>
+);
 export interface AutoSchedulerPageProps {
   state: AutoSchedulerState | null;
   onState: (next: AutoSchedulerState) => void;
@@ -71,10 +81,8 @@ export interface AutoSchedulerPageProps {
   onOpenLiveRuns?: (() => void) | undefined;
   onMessage: (msg: string) => void;
 }
-
 const fmtDate = (ms: number, opt: Intl.DateTimeFormatOptions) =>
   new Date(ms).toLocaleString('zh-CN', opt);
-
 export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
   const {
     state,
@@ -95,12 +103,13 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
   const [staggerSec, setStaggerSec] = useState(state?.settings.launchStaggerSeconds ?? 3);
   const [watchdogMin, setWatchdogMin] = useState(state?.settings.idleWatchdogMinutes ?? 5);
   const [preventSleep, setPreventSleep] = useState(state?.settings.preventSystemSleep ?? true);
+  const [recentRunsOpen, setRecentRunsOpen] = useState(false);
   const [expandedRunIds, setExpandedRunIds] = useState<Set<string>>(new Set());
   const [runFilterById, setRunFilterById] = useState<Record<string, 'all' | 'issues'>>({});
   const [deletingSchedule, setDeletingSchedule] = useState<AutoSchedule | null>(null);
   const [confirmClearHistory, setConfirmClearHistory] = useState(false);
   const [busyAction, setBusyAction] = useState(false);
-
+  const [launchingScheduleId, setLaunchingScheduleId] = useState<string | null>(null);
   useEffect(() => {
     if (!state || guardOpen) return;
     setStaggerSec(state.settings.launchStaggerSeconds);
@@ -112,9 +121,7 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
     state?.settings.idleWatchdogMinutes,
     state?.settings.preventSystemSleep,
   ]);
-
   useDropdownDismiss(guardOpen, guardRef, () => setGuardOpen(false));
-
   const comboNameById = new Map(
     combinations
       .filter((c) => isUserSavedCombination(c) && c.saved)
@@ -126,7 +133,6 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
     ...profileGroups.map((g): [string, string] => [g.id, g.name]),
     ...(bluestacksState?.folders ?? []).map((f): [string, string] => [f.id, f.name]),
   ]);
-
   function describeTargets(s: AutoSchedule, n: number): string {
     const unit = s.carrier === 'browser' ? '窗' : '台';
     if (s.targetSelector.mode !== 'groups') return `${n}${unit}`;
@@ -136,13 +142,14 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
       .map((id) => groupNameById.get(id) || '分组')
       .join('、')}${gids.length > 2 ? ` +${gids.length - 2}` : ''} (${n}${unit})`;
   }
-
   async function runAction(
     action: Parameters<typeof api.autoSchedulerAction>[0],
     payload: unknown,
     okMsg: string,
+    launchingId?: string,
   ) {
     setBusyAction(true);
+    if (launchingId) setLaunchingScheduleId(launchingId);
     try {
       onState(await api.autoSchedulerAction(action, payload));
       onMessage(okMsg);
@@ -152,15 +159,14 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
       return false;
     } finally {
       setBusyAction(false);
+      if (launchingId) setLaunchingScheduleId((cur) => (cur === launchingId ? null : cur));
     }
   }
-
   const toggleExpandRun = (runId: string) => setExpandedRunIds((prev) => toggleSet(prev, runId));
   const schedules = state?.schedules ?? [],
     activeRuns = state?.activeRuns ?? [],
     recentRuns = state?.recentRuns ?? [],
     enabledCount = schedules.filter((v) => v.enabled).length;
-
   function renderRunItems(run: AutoScheduleRun) {
     const filter = runFilterById[run.id] ?? 'all',
       items = run.items ?? [],
@@ -222,7 +228,6 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
       </div>
     );
   }
-
   return (
     <div className="flex max-w-[960px] flex-col gap-3.5">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -263,30 +268,44 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                     全排班共用
                   </span>
                 </div>
-                {(
-                  [
-                    ['错峰启动', '错峰启动间隔秒', '秒', staggerSec, 0, 30, setStaggerSec],
-                    ['卡死超时', '无进展看门狗分钟', '分', watchdogMin, 2, 60, setWatchdogMin],
-                  ] as const
-                ).map(([title, aria, unit, val, min, max, set]) => (
+                {[
+                  {
+                    title: '错峰启动',
+                    aria: '错峰启动间隔秒',
+                    unit: '秒',
+                    val: staggerSec,
+                    min: 0,
+                    max: 30,
+                    set: setStaggerSec,
+                  },
+                  {
+                    title: '卡死超时',
+                    aria: '无进展看门狗分钟',
+                    unit: '分',
+                    val: watchdogMin,
+                    min: 2,
+                    max: 60,
+                    set: setWatchdogMin,
+                  },
+                ].map((f) => (
                   <label
-                    key={aria}
+                    key={f.aria}
                     className="flex items-center justify-between gap-2 text-[12.5px] text-[var(--text-2)]"
                   >
-                    <span>{title}</span>
+                    <span>{f.title}</span>
                     <div className="inline-flex items-center gap-[5px]">
                       <ControlledNumberInput
-                        ariaLabel={aria}
+                        ariaLabel={f.aria}
                         className={`${UI_INPUT_SM} w-[54px] px-1.5 text-center`}
                         debounceMs={0}
-                        value={val}
-                        defaultValue={val}
-                        min={min}
-                        max={max}
-                        onChange={set}
+                        value={f.val}
+                        defaultValue={f.val}
+                        min={f.min}
+                        max={f.max}
+                        onChange={f.set}
                       />
                       <span className="min-w-[14px] text-[11.5px] text-[var(--text-3)]">
-                        {unit}
+                        {f.unit}
                       </span>
                     </div>
                   </label>
@@ -331,7 +350,6 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
           </Btn>
         </div>
       </header>
-
       {activeRuns.length > 0 && (
         <section className="flex flex-col gap-2" aria-label="正在运行">
           {activeRuns.map((run) => {
@@ -346,8 +364,8 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                 key={run.id}
                 className="flex flex-col gap-2 rounded-[var(--r-md)] border border-blue-200 bg-white px-3.5 py-2.5 shadow-2xs"
               >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-2">
+                <div className={UI_ROW_BT}>
+                  <div className={UI_ROW}>
                     <span className={`${PILL_BASE} bg-[var(--brand-soft)] text-[var(--brand)]`}>
                       运行中
                     </span>
@@ -357,7 +375,7 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                       {run.totalTargets}
                     </span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-1.5">
+                  <div className={UI_ROW_SM}>
                     {p.onOpenLiveRuns && (
                       <Btn onClick={p.onOpenLiveRuns} title="打开实时任务队列查看完整进度">
                         查看队列
@@ -381,7 +399,6 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
           })}
         </section>
       )}
-
       {state === null || schedules.length === 0 ? (
         <section className="flex flex-col items-center gap-3 rounded-[var(--r-lg)] border border-dashed border-[var(--line-strong)] bg-[var(--surface)] px-6 py-10 text-center">
           {state === null ? (
@@ -414,7 +431,8 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                 ? fmtDate(s.trigger.onceAt, { hour: '2-digit', minute: '2-digit', hour12: false })
                 : (s.trigger.times[0] ?? '09:00');
             const extraTimes = isOnce ? [] : s.trigger.times.slice(1);
-            const isRunning = activeRuns.some((r) => r.scheduleId === s.id && r.phase === 'main');
+            const isRunning = activeRuns.some((r) => r.scheduleId === s.id);
+            const isLaunching = launchingScheduleId === s.id;
             const stepCls = `text-xs rounded-md whitespace-nowrap px-[7px] py-0.5 bg-[var(--surface-2)] border border-[var(--line)] text-[var(--text-2)]${!s.enabled ? ' opacity-75' : ''}`;
             return (
               <article
@@ -450,14 +468,14 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-[var(--text-3)]">
+                    <div className={UI_MUTED}>
                       {onceDisplay
                         ? `单次 · ${onceDisplay.split(' ')[0] ?? ''}`
                         : formatWeekdaysLabel(s.trigger.weekdays)}
                     </div>
                   </div>
                   <div className="flex min-w-0 flex-col gap-1.5">
-                    <div className="flex flex-wrap items-center gap-2">
+                    <div className={UI_ROW}>
                       <h3 className="m-0 text-[14.5px] font-semibold">{s.name}</h3>
                       <span className="whitespace-nowrap rounded-md bg-[var(--surface-2)] px-[7px] py-[2px] text-[11.5px] text-[var(--text-2)]">
                         {s.carrier === 'browser' ? '浏览器' : '蓝蝶'} ·{' '}
@@ -467,7 +485,7 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                     <div className="flex flex-wrap items-center gap-[5px]">
                       {s.steps.map((step, idx) => (
                         <Fragment key={step.id}>
-                          {idx > 0 && <span className="text-[11px] text-[var(--text-3)]">→</span>}
+                          {idx > 0 && <span className={UI_HINT}>→</span>}
                           <span className={stepCls}>
                             {step.type === 'active-combination' ||
                             step.type === 'bluestacks-active-combination'
@@ -478,7 +496,7 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                       ))}
                       {s.closeWindowOnFinish && (
                         <>
-                          <span className="text-[11px] text-[var(--text-3)]">→</span>
+                          <span className={UI_HINT}>→</span>
                           <span
                             className={`text-xs rounded-md whitespace-nowrap px-[7px] py-0.5 border border-blue-200 bg-sky-50 text-sky-700${!s.enabled ? ' opacity-75' : ''}`}
                           >
@@ -508,10 +526,10 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
                     }
                   />
                   <Btn
-                    disabled={busyAction || isRunning}
-                    onClick={() => void runAction('run-now', { id: s.id, phase: 'main' }, '已启动')}
+                    disabled={busyAction || isRunning || isLaunching}
+                    onClick={() => void runAction('run-now', { id: s.id }, '已启动', s.id)}
                   >
-                    {isRunning ? '运行中' : '运行'}
+                    {isLaunching ? '启动中…' : isRunning ? '运行中' : '运行'}
                   </Btn>
                   <PopoverMenu
                     label="更多操作"
@@ -540,83 +558,93 @@ export function AutoSchedulerPage(p: AutoSchedulerPageProps) {
           })}
         </section>
       )}
-
       {recentRuns.length > 0 && (
-        <details className="rounded-xl border border-[var(--line)] bg-white px-3.5 py-3 shadow-xs [&>summary::-webkit-details-marker]:hidden">
-          <summary className="flex cursor-pointer list-none items-center justify-between text-[13px] font-semibold text-[var(--text-2)]">
-            <span>执行记录 ({recentRuns.length})</span>
+        <section className="rounded-xl border border-[var(--line)] bg-white px-3.5 py-3 shadow-xs">
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              aria-expanded={recentRunsOpen}
+              onClick={() => setRecentRunsOpen((v) => !v)}
+              className="flex flex-1 cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-[13px] font-semibold text-[var(--text-2)]"
+            >
+              <span>{recentRunsOpen ? '▾' : '▸'}</span>
+              <span>执行记录 ({recentRuns.length})</span>
+            </button>
             <button
               type="button"
               className={LINK_BTN}
               disabled={busyAction}
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setConfirmClearHistory(true);
-              }}
+              onClick={() => setConfirmClearHistory(true)}
             >
               清空
             </button>
-          </summary>
-          <div className="mt-2.5 flex flex-col gap-1.5">
-            {recentRuns.map((run) => {
-              const expanded = expandedRunIds.has(run.id),
-                dur = formatRunDuration(run.startedAt, run.finishedAt),
-                errTotal = run.hardBlockedCount + run.watchdogTimeoutCount;
-              return (
-                <div
-                  key={run.id}
-                  className="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)]"
-                >
-                  <div
-                    className="flex cursor-pointer flex-wrap items-center gap-2.5 px-2.5 py-[7px] text-[12.5px]"
-                    onClick={() => toggleExpandRun(run.id)}
-                  >
-                    <span className="tabular-nums text-[var(--text-3)]">
-                      {fmtDate(run.startedAt, {
-                        month: '2-digit',
-                        day: '2-digit',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                    </span>
-                    <strong>{run.scheduleName}</strong>
-                    <span className="flex flex-1 flex-wrap items-center gap-1.5 tabular-nums text-[var(--text-2)]">
-                      <span
-                        className={`${PILL_BASE} ${errTotal > 0 ? 'bg-slate-100 text-slate-600' : 'bg-emerald-50 text-emerald-700'}`}
-                      >
-                        {run.completedCount}/{run.totalTargets}
-                      </span>
-                      {run.skippedCount > 0 && (
-                        <span className={`${PILL_BASE} bg-amber-50 text-amber-700`}>
-                          跳过 {run.skippedCount}
-                        </span>
-                      )}
-                      {errTotal > 0 && (
-                        <span className={`${PILL_BASE} bg-rose-50 text-rose-700`}>
-                          异常 {errTotal}
-                        </span>
-                      )}
-                      {run.status === 'stopped' && (
-                        <span className={`${PILL_BASE} bg-slate-100 text-slate-600`}>已停</span>
-                      )}
-                      {dur && <span className="text-[11.5px] text-[var(--text-3)]">{dur}</span>}
-                    </span>
-                    <span className="inline-flex items-center justify-center text-[var(--text-2)]">
-                      <IconChevronDown
-                        size={14}
-                        className={`transition-transform duration-150${expanded ? ' rotate-180' : ''}`}
-                      />
-                    </span>
-                  </div>
-                  {expanded && renderRunItems(run)}
-                </div>
-              );
-            })}
           </div>
-        </details>
+          {recentRunsOpen && (
+            <div className="mt-2.5 flex flex-col gap-1.5">
+              {recentRuns.map((run) => {
+                const expanded = expandedRunIds.has(run.id),
+                  dur = formatRunDuration(run.startedAt, run.finishedAt),
+                  errTotal = run.hardBlockedCount + run.watchdogTimeoutCount;
+                return (
+                  <div
+                    key={run.id}
+                    className="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)]"
+                  >
+                    <div
+                      className="flex cursor-pointer flex-wrap items-center gap-2.5 px-2.5 py-[7px] text-[12.5px]"
+                      onClick={() => toggleExpandRun(run.id)}
+                    >
+                      <span className="tabular-nums text-[var(--text-3)]">
+                        {fmtDate(run.startedAt, {
+                          month: '2-digit',
+                          day: '2-digit',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </span>
+                      <strong>{run.scheduleName}</strong>
+                      <span className="flex flex-1 flex-wrap items-center gap-1.5 tabular-nums text-[var(--text-2)]">
+                        {run.status === 'skipped_expired' ? (
+                          <Pill tone="bg-slate-100 text-slate-500">已过期跳过</Pill>
+                        ) : run.status === 'skipped' ? (
+                          <Pill tone="bg-slate-100 text-slate-600">日限额跳过</Pill>
+                        ) : (
+                          <Pill
+                            tone={
+                              errTotal > 0
+                                ? 'bg-slate-100 text-slate-600'
+                                : 'bg-emerald-50 text-emerald-700'
+                            }
+                          >
+                            {run.completedCount}/{run.totalTargets}
+                          </Pill>
+                        )}
+                        {run.skippedCount > 0 && (
+                          <Pill tone="bg-slate-100 text-slate-600">跳过 {run.skippedCount}</Pill>
+                        )}
+                        {errTotal > 0 && (
+                          <Pill tone="bg-rose-50 text-rose-700">异常 {errTotal}</Pill>
+                        )}
+                        {run.status === 'stopped' && (
+                          <Pill tone="bg-slate-100 text-slate-600">已停</Pill>
+                        )}
+                        {dur && <span className="text-[11.5px] text-[var(--text-3)]">{dur}</span>}
+                      </span>
+                      <span className="inline-flex items-center justify-center text-[var(--text-2)]">
+                        <IconChevronDown
+                          size={14}
+                          className={`transition-transform duration-150${expanded ? ' rotate-180' : ''}`}
+                        />
+                      </span>
+                    </div>
+                    {expanded && renderRunItems(run)}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
       )}
-
       {(deletingSchedule || confirmClearHistory) && (
         <ConfirmDialog
           title={deletingSchedule ? '删除排班' : '清空记录'}

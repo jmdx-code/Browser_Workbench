@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Page, Request, Response } from 'playwright-core';
+import type { CompatibleRepository } from '../../domain/persistence.js';
 import {
   inferAbnormalStateFromCodeOrMessage,
   type AccountAbnormalScope,
@@ -93,6 +94,19 @@ export interface BumperGroupFeedContext {
   isPageBumperMode: boolean;
   sourceMode: 'group' | 'page';
   pages: BumperTarget[];
+}
+export interface BumperFeedStepContext {
+  profileId: string;
+  paceScale: number;
+  repo: CompatibleRepository<SqliteGroupBumperRepository>;
+  inFlightCoordinator: import('../facebook-group-session.js').InFlightBumperCoordinator;
+  commentClaims: Set<string>;
+  settings: import('../../shared/group-bumper.js').BumperSettings;
+  callbacks: BumperRunCallbacks;
+  session: BumperSessionRuntime;
+  groupCtx: BumperGroupFeedContext;
+  groupHelpers: import('./bumper-group-setup.js').BumperGroupSurfaceHelpers;
+  stats: BumperRunStats;
 }
 export const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const digest = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -189,9 +203,7 @@ export function formatBumperDisconnectReason(raw: unknown): string {
 }
 export function isRawDisconnectTechnicalError(raw: unknown): boolean {
   const msg = raw instanceof Error ? raw.message : String(raw ?? '');
-  return /KERNEL_(?:DEBUGGER_|CONNECTION_LOST|CONTROL_STOPPED|RPC_SEND_UNKNOWN|FENCED|CONTEXT|LEASE|BOUND_EXECUTION|OPERATION_CONTEXT|RPC_RESULT_UNKNOWN|PEER_NOT_IDLE|EXECUTE_TIMEOUT)|SESSION_CHANGED|CONNECTION_CHANGED|Target page, context or browser has been closed|Target\.detachedFromTarget|Inspected target navigated or closed|Navigation failed because page was closed|Session closed|Inspector\.detached|FRAME_DETACHED|Frame was detached|Execution context was destroyed|Cannot find context|BROWSER_OFFLINE/i.test(
-    msg,
-  );
+  return bumperDisconnPatterns.some(([re]) => re.test(msg));
 }
 export function isBumperFatal(error: unknown): boolean {
   return (
@@ -279,6 +291,17 @@ const chunksHaveErrors = (chunks: unknown[]) =>
     const errors = object(c).errors;
     return errors != null && (!Array.isArray(errors) || errors.length > 0);
   });
+const parseBumperVars = (variables: unknown) => {
+  const vars = object(object(variables).input ?? variables),
+    msg = vars.message;
+  return {
+    vars,
+    actorId: vars.actor_id ?? vars.actorId,
+    feedbackId: vars.feedback_id ?? vars.feedbackId ?? object(vars.feedback).id,
+    messageText:
+      typeof msg === 'string' ? msg : String(object(msg).text ?? vars.comment_text ?? ''),
+  };
+};
 export function confirmedBumperGraphQL(input: {
   actorId: string;
   feedbackId: string;
@@ -289,14 +312,19 @@ export function confirmedBumperGraphQL(input: {
   status: number;
   body: string;
 }): boolean {
-  const vars = object(object(input.variables).input);
+  const {
+    vars,
+    actorId: varActorId,
+    feedbackId: varFeedbackId,
+    messageText: varMessageText,
+  } = parseBumperVars(input.variables);
   if (
     !input.feedbackId.trim() ||
     input.status !== 200 ||
     (input.kind === 'like'
-      ? vars.actor_id !== input.actorId
-      : vars.actor_id != null && vars.actor_id !== input.actorId) ||
-    !sameBumperFeedbackId(vars.feedback_id, input.feedbackId)
+      ? varActorId !== input.actorId
+      : varActorId != null && varActorId !== input.actorId) ||
+    !sameBumperFeedbackId(varFeedbackId, input.feedbackId)
   )
     return false;
   const chunks = parseFacebookJsonChunks(input.body);
@@ -325,21 +353,26 @@ export function confirmedBumperGraphQL(input: {
           (typeof reactionId === 'string' && /^[1-9]\d*$/.test(reactionId)))
       );
     }
-    const created = object(data.comment_create);
-    const comment = object(object(created.feedback_comment_edge).node ?? created.comment);
+    const created = object(
+      data.comment_create ?? data.ufi2_comment_create ?? data.feedback_comment_create,
+    );
+    const edge = object(created.feedback_comment_edge ?? data.feedback_comment_edge);
+    const comment = object(edge.node ?? created.comment);
+    const hasEdge = Boolean(created.feedback_comment_edge || data.feedback_comment_edge);
+    const parentFeedbackId =
+      object(created.feedback).id ??
+      object(edge.feedback).id ??
+      (hasEdge ? undefined : varFeedbackId);
+    const commentBodyText = String(
+      object(comment.body).text ?? object(comment.preferred_body).text ?? '',
+    );
     return (
-      normalizeBumperComment(String(object(vars.message).text ?? '')) ===
-        normalizeBumperComment(input.comment ?? '') &&
+      normalizeBumperComment(varMessageText) === normalizeBumperComment(input.comment ?? '') &&
       typeof comment.id === 'string' &&
       comment.id.length > 0 &&
       object(comment.author).id === input.actorId &&
-      normalizeBumperComment(String(object(comment.body).text ?? '')) ===
-        normalizeBumperComment(input.comment ?? '') &&
-      sameBumperFeedbackId(
-        object(created.feedback).id ??
-          (created.feedback_comment_edge ? undefined : vars.feedback_id),
-        input.feedbackId,
-      )
+      normalizeBumperComment(commentBodyText) === normalizeBumperComment(input.comment ?? '') &&
+      sameBumperFeedbackId(parentFeedbackId, input.feedbackId)
     );
   });
 }
@@ -461,23 +494,30 @@ export function observeBumperGraphql(
     postId?: string;
   },
 ) {
-  return makeGraphqlResultObs<unknown>(
+  let activeExpectedReactionId = scope.expectedReactionId;
+  const { base } = makeGraphqlResultObs<unknown>(
     page,
     (name, varsRaw) => {
-      if (
-        !(scope.kind === 'like' ? /ReactMutation/.test(name) : /CreateCommentMutation/.test(name))
-      )
-        return null;
+      const isLike = scope.kind === 'like';
+      const commentMutationMatch =
+        /(?:CreateComment|CommentCreate|CometUFICreateComment|UFICreateComment|FeedbackCommentCreate|AddComment).*Mutation|CometUFICreateComment/i.test(
+          name,
+        ) ||
+        (!name && /"feedback_id"\s*:/.test(varsRaw) && /"message"\s*:/.test(varsRaw));
+      if (!(isLike ? /ReactMutation/.test(name) : commentMutationMatch)) return null;
       const variables: unknown = JSON.parse(varsRaw || '{}'),
-        vars = object(object(variables).input);
+        {
+          actorId: varActorId,
+          feedbackId: varFeedbackId,
+          messageText: varMessageText,
+        } = parseBumperVars(variables);
       if (
-        (scope.kind === 'like'
-          ? vars.actor_id !== scope.actorId
-          : vars.actor_id != null && vars.actor_id !== scope.actorId) ||
-        !sameBumperFeedbackId(vars.feedback_id, scope.feedbackId) ||
-        (scope.kind === 'comment' &&
-          normalizeBumperComment(String(object(vars.message).text ?? '')) !==
-            normalizeBumperComment(scope.comment ?? ''))
+        (isLike
+          ? varActorId !== scope.actorId
+          : varActorId != null && varActorId !== scope.actorId) ||
+        !sameBumperFeedbackId(varFeedbackId, scope.feedbackId) ||
+        (!isLike &&
+          normalizeBumperComment(varMessageText) !== normalizeBumperComment(scope.comment ?? ''))
       )
         return null;
       return variables;
@@ -487,13 +527,21 @@ export function observeBumperGraphql(
       const chunks = parseFacebookJsonChunks(body);
       if (chunks && chunksHaveErrors(chunks)) st.failure = 'Facebook 明确拒绝了本次互动';
       if (isBumperGraphQLRestricted(body)) st.restricted = true;
+      const topVars = object(variables),
+        vars = object(topVars.input ?? topVars);
       if (
         scope.kind === 'like' &&
-        scope.expectedReactionId &&
-        object(object(variables).input).feedback_reaction_id !== scope.expectedReactionId
+        activeExpectedReactionId &&
+        vars.feedback_reaction_id !== activeExpectedReactionId
       )
         st.failure = 'Facebook 实际提交的反应与配置不一致';
-      st.confirmed ||= confirmedBumperGraphQL({ ...scope, variables, status, body });
+      st.confirmed ||= confirmedBumperGraphQL({
+        ...scope,
+        expectedReactionId: activeExpectedReactionId,
+        variables,
+        status,
+        body,
+      });
       devDiag.record({
         category: 'GROUP_BUMPER',
         event: 'BUMPER_NATIVE_RESULT',
@@ -506,14 +554,20 @@ export function observeBumperGraphql(
           postId: scope.postId,
           feedbackId: scope.feedbackId,
           actorId: scope.actorId,
-          expectedReactionId: scope.expectedReactionId,
+          expectedReactionId: activeExpectedReactionId,
           failed: !!st.failure,
           restricted: st.restricted,
           bytes: body.length,
         },
       });
     },
-  ).base;
+  );
+  return {
+    ...base,
+    setExpectedReactionId: (next?: string) => {
+      activeExpectedReactionId = next;
+    },
+  };
 }
 export function observeBumperStoryShareGraphql(
   page: Page,
@@ -671,9 +725,7 @@ export async function trackBumperSubmissionOp<T>(input: {
       countBefore !== undefined && (conn.submissionCalls?.[input.callKind] ?? 0) > countBefore;
     if (opId) {
       input.onErrorProgress(await input.session.resolveActionProgressOnOpExit(opId, dispatched));
-    } else if (dispatched) {
-      input.onErrorProgress('UNKNOWN');
-    }
+    } else if (dispatched) input.onErrorProgress('UNKNOWN');
     throw err;
   } finally {
     await input.native.close();

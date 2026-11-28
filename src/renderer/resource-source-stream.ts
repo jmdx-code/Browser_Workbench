@@ -3,7 +3,6 @@ import {
   type ResourceCheckProgressValue,
   type ResourceSourceReportValue,
 } from '../shared/resource-source.js';
-
 // One original check response, not a retained job or a second material/task ledger.
 export async function readResourceCheckStream(
   body: ReadableStream<Uint8Array>,

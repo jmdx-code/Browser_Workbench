@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState } from 'react';
 import type { z } from 'zod';
 import type { CacheOverview } from '../shared/material-cache-management.js';
 import type { MaterialUsage, MaterialUsageClearRequest } from '../shared/material-usage.js';
@@ -11,17 +11,15 @@ import {
 } from '../shared/workspace-backup.js';
 import { api } from './api.js';
 import { ConfirmDialog } from './confirm-dialog.js';
-import { DataCleanupPanel } from './data-cleanup-panel.js';
+import { DataCleanupPanel, isIntInRange, StatusAlerts } from './data-cleanup-panel.js';
 import { Btn, Chk, useAbortQuery, useBusyTask } from './modules/shared/module-ui.js';
 import {
   downloadJsonFile,
   FileLocationButton,
-  UI_DANGER_TEXT,
   UI_INPUT,
   UI_INPUT_SM,
   UI_MUTED,
 } from './ui/primitives.js';
-
 const LOG_LABELS: Record<string, string> = {
   ready: '可用',
   busy: '写入中',
@@ -31,28 +29,46 @@ const LOG_LABELS: Record<string, string> = {
 const DIR_CLS =
   '[&_[role=status]]:mt-3 [&_[role=status]]:grid [&_[role=status]]:gap-2 [&_[role=status]]:justify-items-start';
 const HR = <hr className="my-3.5 border-0 border-t border-[var(--line)]" />;
-
-const StatusAlerts = ({
-  err,
-  notice,
-  children,
-}: {
-  err?: string;
-  notice?: string;
-  children?: ReactNode;
-}) => (
-  <>
-    {err && (
-      <p role="alert" className={UI_DANGER_TEXT}>
-        {err}
-      </p>
-    )}
-    {notice && <p role="status">{notice}</p>}
-    {children}
-  </>
-);
-
-export function WorkspaceBackupPanel() {
+function FolderActionRow(p: {
+  ariaLabel: string;
+  value: string;
+  placeholder: string;
+  inputDisabled: boolean;
+  onChange: (v: string) => void;
+  pickerLabel?: string | false;
+  pickerDisabled?: boolean;
+  onPick?: () => void;
+  actionLabel: string;
+  actionPrimary?: boolean;
+  actionDisabled: boolean;
+  onAction: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+      <input
+        className={`${UI_INPUT} min-w-[200px] flex-1`}
+        aria-label={p.ariaLabel}
+        value={p.value}
+        disabled={p.inputDisabled}
+        placeholder={p.placeholder}
+        onChange={(e) => p.onChange(e.target.value)}
+      />
+      {p.pickerLabel && p.onPick && (
+        <Btn disabled={p.pickerDisabled} onClick={p.onPick}>
+          {p.pickerLabel}
+        </Btn>
+      )}
+      <Btn
+        v={p.actionPrimary ? 'primary' : 'default'}
+        disabled={p.actionDisabled}
+        onClick={p.onAction}
+      >
+        {p.actionLabel}
+      </Btn>
+    </div>
+  );
+}
+export function WorkspaceBackupPanel(p?: { onOpenMaintenance?: () => void }) {
   const { data: status, error: loadErr } = useAbortQuery<z.infer<typeof WorkspaceBackupStatus>>(
     api.backupStatus,
     0,
@@ -64,61 +80,53 @@ export function WorkspaceBackupPanel() {
     [redactSecrets, setRedactSecrets] = useState(false),
     [result, setResult] = useState<BackupResult | null>(null);
   const { busy, error: err, run } = useBusyTask();
-
   useEffect(() => {
     if (status?.defaultDirectory) setDirectory((p) => p || status.defaultDirectory || '');
   }, [status?.defaultDirectory]);
-
   return (
     <div className={DIR_CLS}>
-      <h3>数据备份</h3>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="!m-0">数据备份</h3>
+        {p?.onOpenMaintenance && <Btn onClick={p.onOpenMaintenance}>前往数据清理与重置</Btn>}
+      </div>
       <p>
         保存分组、浏览器资料、组合、资源表、任务及使用记录。原素材和媒体缓存保持原位，不复制到备份中。
       </p>
-      <div className="flex flex-wrap items-center gap-2 text-xs">
-        <input
-          className={`${UI_INPUT} min-w-[200px] flex-1`}
-          aria-label="数据备份保存位置"
-          value={directory}
-          disabled={busy}
-          placeholder={status?.defaultDirectory ?? '选择本机文件夹，或填写完整路径'}
-          onChange={(e) => setDirectory(e.target.value)}
-        />
-        {typeof window.workbenchDesktop?.chooseBackupDirectory === 'function' && (
-          <Btn
-            disabled={busy}
-            onClick={() => {
-              const prev = directory;
-              void run(async () => {
-                try {
-                  const v = await window.workbenchDesktop?.chooseBackupDirectory();
-                  if (v) setDirectory(v);
-                } catch {
-                  setDirectory(prev);
-                  throw Error('文件夹选择失败');
-                }
-              }, '文件夹选择失败');
-            }}
-          >
-            选择文件夹…
-          </Btn>
-        )}
-        <Btn
-          v="primary"
-          disabled={busy || !status?.available || !directory.trim()}
-          onClick={() => {
-            if (!directory.trim()) return;
-            setResult(null);
-            void run(async () => {
-              const value = await api.createBackup(directory.trim(), redactSecrets);
-              localStorage.setItem('workspace-backup-directory', directory.trim());
-              setResult(value);
-            }, '备份未完成，请检查保存位置');
-          }}
-        >
-          {busy ? '正在备份…' : '创建数据备份'}
-        </Btn>
-      </div>
+      <FolderActionRow
+        ariaLabel="数据备份保存位置"
+        value={directory}
+        inputDisabled={busy}
+        placeholder={status?.defaultDirectory ?? '选择本机文件夹，或填写完整路径'}
+        onChange={setDirectory}
+        pickerLabel={
+          typeof window.workbenchDesktop?.chooseBackupDirectory === 'function' && '选择文件夹…'
+        }
+        pickerDisabled={busy}
+        onPick={() => {
+          const prev = directory;
+          void run(async () => {
+            try {
+              const v = await window.workbenchDesktop?.chooseBackupDirectory();
+              if (v) setDirectory(v);
+            } catch {
+              setDirectory(prev);
+              throw Error('文件夹选择失败');
+            }
+          }, '文件夹选择失败');
+        }}
+        actionLabel={busy ? '正在备份…' : '创建数据备份'}
+        actionPrimary
+        actionDisabled={busy || !status?.available || !directory.trim()}
+        onAction={() => {
+          if (!directory.trim()) return;
+          setResult(null);
+          void run(async () => {
+            const value = await api.createBackup(directory.trim(), redactSecrets);
+            localStorage.setItem('workspace-backup-directory', directory.trim());
+            setResult(value);
+          }, '备份未完成，请检查保存位置');
+        }}
+      />
       <Chk
         className="mt-2 text-xs"
         label="导出时移除 Google 授权与图床密钥"
@@ -139,7 +147,6 @@ export function WorkspaceBackupPanel() {
     </div>
   );
 }
-
 function WorkspaceRestorePanel() {
   const {
     data: status,
@@ -150,7 +157,7 @@ function WorkspaceRestorePanel() {
     [inspection, setInspection] = useState<RestoreInspection | null>(null),
     [confirmRestore, setConfirmRestore] = useState(false);
   const { busy, error: err, setError, run } = useBusyTask();
-
+  const locked = busy || status?.state === 'READY';
   return (
     <div className={`mt-4 ${DIR_CLS}`}>
       <h3>恢复数据</h3>
@@ -158,50 +165,41 @@ function WorkspaceRestorePanel() {
         选择备份文件夹中的
         backup.json，先核对内容，再重启恢复。素材路径保持原样；原文件需要仍在原位置。
       </p>
-      <div className="flex flex-wrap items-center gap-2 text-xs">
-        <input
-          className={`${UI_INPUT} min-w-[200px] flex-1`}
-          aria-label="待恢复备份文件夹"
-          value={directory}
-          disabled={busy || status?.state === 'READY'}
-          placeholder={
-            status?.defaultDirectory
-              ? `默认从 ${status.defaultDirectory} 选择具体备份文件夹`
-              : '完整备份文件夹路径'
-          }
-          onChange={(e) => {
-            setDirectory(e.target.value);
-            setInspection(null);
-          }}
-        />
-        {typeof window.workbenchDesktop?.chooseRestoreBackup === 'function' && (
-          <Btn
-            disabled={busy || status?.state === 'READY'}
-            onClick={() =>
-              void run(async () => {
-                const v = await window.workbenchDesktop?.chooseRestoreBackup();
-                if (v) {
-                  setDirectory(v);
-                  setInspection(null);
-                }
-              }, '备份选择失败')
-            }
-          >
-            选择备份…
-          </Btn>
-        )}
-        <Btn
-          disabled={busy || !status?.available || !directory.trim() || status.state === 'READY'}
-          onClick={() =>
-            void run(async () => {
+      <FolderActionRow
+        ariaLabel="待恢复备份文件夹"
+        value={directory}
+        inputDisabled={locked}
+        placeholder={
+          status?.defaultDirectory
+            ? `默认从 ${status.defaultDirectory} 选择具体备份文件夹`
+            : '完整备份文件夹路径'
+        }
+        onChange={(v) => {
+          setDirectory(v);
+          setInspection(null);
+        }}
+        pickerLabel={
+          typeof window.workbenchDesktop?.chooseRestoreBackup === 'function' && '选择备份…'
+        }
+        pickerDisabled={locked}
+        onPick={() =>
+          void run(async () => {
+            const v = await window.workbenchDesktop?.chooseRestoreBackup();
+            if (v) {
+              setDirectory(v);
               setInspection(null);
-              setInspection(await api.inspectRestore(directory.trim()));
-            }, '备份检查失败')
-          }
-        >
-          {busy ? '正在处理…' : '检查备份'}
-        </Btn>
-      </div>
+            }
+          }, '备份选择失败')
+        }
+        actionLabel={busy ? '正在处理…' : '检查备份'}
+        actionDisabled={locked || !status?.available || !directory.trim()}
+        onAction={() =>
+          void run(async () => {
+            setInspection(null);
+            setInspection(await api.inspectRestore(directory.trim()));
+          }, '备份检查失败')
+        }
+      />
       {inspection && (
         <div role="status">
           <p>
@@ -258,7 +256,6 @@ function WorkspaceRestorePanel() {
     </div>
   );
 }
-
 function MaterialCachePanel() {
   const [rev, setRev] = useState(0),
     [confirm, setConfirm] = useState<string[] | null>(null),
@@ -271,7 +268,6 @@ function MaterialCachePanel() {
   const { busy, error: err, run } = useBusyTask();
   const eligible = status?.entries.filter((e) => e.eligible) ?? [],
     bytes = status?.entries.reduce((sum, e) => sum + e.bytes, 0) ?? 0;
-
   return (
     <section aria-label="上传缓存">
       <h3>上传缓存</h3>
@@ -311,7 +307,6 @@ function MaterialCachePanel() {
     </section>
   );
 }
-
 function MaterialUsagePanel() {
   const [rev, setRev] = useState(0),
     [notice, setNotice] = useState(''),
@@ -321,7 +316,6 @@ function MaterialUsagePanel() {
     rev,
     '使用记录读取失败，请重新读取或更新软件',
   );
-
   return (
     <section aria-label="活跃账号素材使用记录">
       <h3>活跃账号素材使用记录</h3>
@@ -369,22 +363,20 @@ function MaterialUsagePanel() {
     </section>
   );
 }
-
-export function WorkspaceMaintenancePanel() {
+export function WorkspaceMaintenancePanel(p?: { onOpenBackup?: () => void }) {
   const {
     data: saved,
     setData: setSaved,
     error: loadErr,
   } = useAbortQuery<z.infer<typeof MaintenanceOverview>>(api.maintenance, 0, '维护设置读取失败。');
   const [days, setDays] = useState('14'),
-    [notice, setNotice] = useState('');
+    [notice, setNotice] = useState(''),
+    [settingsRev, setSettingsRev] = useState(0);
   const { busy, error: err, setError: setErr, run } = useBusyTask();
-
   useEffect(() => {
     if (saved) setDays(String(saved.settings.logRetentionDays));
   }, [saved]);
-  const valid = Number.isInteger(Number(days)) && Number(days) >= 1 && Number(days) <= 90;
-
+  const valid = isIntInRange(days, 1, 90);
   function execute(kind: 'save' | 'export') {
     if (!saved || (kind === 'save' && !valid)) return;
     setNotice('');
@@ -399,6 +391,7 @@ export function WorkspaceMaintenancePanel() {
               signal,
             ),
           );
+          setSettingsRev((v) => v + 1);
           setNotice('日志保留设置已保存。');
         } else {
           const value = await api.runtimeLogs(signal);
@@ -411,10 +404,12 @@ export function WorkspaceMaintenancePanel() {
       kind === 'save' ? '保存未确认，请重新读取；不会自动重试。' : '日志导出失败。',
     );
   }
-
   return (
     <section aria-label="日志与位置">
-      <h3>日志与位置</h3>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="!m-0">日志与位置</h3>
+        {p?.onOpenBackup && <Btn onClick={p.onOpenBackup}>前往数据备份与恢复</Btn>}
+      </div>
       <dl>
         <dt>上传缓存位置</dt>
         <dd className="break-all">{saved?.locations.cacheDirectory ?? '未读取'}</dd>
@@ -431,7 +426,7 @@ export function WorkspaceMaintenancePanel() {
         }}
       >
         <label className="inline-flex items-center gap-1.5">
-          日志保留天数{' '}
+          运行与诊断日志保留天数{' '}
           <input
             type="number"
             className={`${UI_INPUT_SM} w-[76px]`}
@@ -464,7 +459,10 @@ export function WorkspaceMaintenancePanel() {
       {HR}
       <MaterialUsagePanel />
       {HR}
-      <DataCleanupPanel />
+      <DataCleanupPanel
+        logRetentionDays={saved?.settings.logRetentionDays}
+        settingsRevision={settingsRev}
+      />
     </section>
   );
 }

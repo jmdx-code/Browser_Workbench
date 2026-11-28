@@ -1,5 +1,6 @@
 import type { Page } from 'playwright-core';
 import type { BumperTarget } from '../shared/group-bumper.js';
+import { createRelativePostAge, relativePostAge } from '../shared/relative-post-age.js';
 import { serializeDomEval, type createDomEvalRuntime } from './shared-dom-eval-runtime.js';
 import {
   createBumperDomRuntime,
@@ -11,18 +12,17 @@ import {
   collectBumperStoryRoots,
   extractBumperPosts,
 } from './group-bumper-effects/bumper-post-extract.js';
+export { relativePostAge };
 export interface ProjectGroupBumperInput {
   groupId: string;
   pageId?: string;
   groupName?: string;
   pageName?: string;
   targetPostId?: string;
-  audit?: boolean;
 }
 export interface BumperPost {
   postId: string;
   postUrl: string;
-  sourceEvidence?: { frames: Record<string, unknown>[]; parents: Record<string, unknown>[] };
   authorId: string | null;
   authorName: string;
   authorAliases: string[];
@@ -81,28 +81,6 @@ export interface BumperShareDialogState {
   closeButtonCSS: string | null;
   restricted: boolean;
   toastConfirmed: boolean;
-}
-export function relativePostAge(text: string, now = Date.now()): number | null {
-  const value = text.trim().toLowerCase();
-  if (/^(?:just now|刚刚|剛剛|vừa xong|เมื่อสักครู่|ယခုလေးတင်)$/u.test(value)) return 0;
-  if (/^(?:yesterday|昨天|hôm qua|เมื่อวาน|မနေ့က)$/u.test(value)) return 24;
-  const match =
-    /^(\d+(?:\.\d+)?)\s*(m|min(?:ute)?s?|分钟|分鐘|phút|นาที|မိနစ်|h|hours?|小时|小時|giờ|ชั่วโมง|နာရီ|d|days?|天|ngày|วัน|ရက်)/u.exec(
-      value,
-    );
-  if (match) {
-    const unit = match[2] ?? '';
-    return (
-      Number(match[1]) *
-      (/^(?:m|分钟|分鐘|phút|นาที|မိနစ်)/u.test(unit)
-        ? 1 / 60
-        : /^(?:h|小时|小時|giờ|ชั่วโมง|နာရီ)/u.test(unit)
-          ? 1
-          : 24)
-    );
-  }
-  const timestamp = Date.parse(text);
-  return Number.isFinite(timestamp) && timestamp <= now ? (now - timestamp) / 3600000 : null;
 }
 export function bumperAuthorMatch(
   post: Pick<BumperPost, 'authorId' | 'authorName'> & { authorAliases?: string[] },
@@ -277,9 +255,10 @@ function projectGroupBumperEntry(
   extractControls: typeof extractBumperPostControls,
   extractPosts: typeof extractBumperPosts,
   inspectMeta: typeof inspectBumperDialogsAndMeta,
+  createAge: typeof createRelativePostAge,
   input: ProjectGroupBumperInput,
 ): BumperSurface {
-  const rt = initBumperRt(createDomRt, input);
+  const rt = initBumperRt(createDomRt, input, createAge);
   const discovery = discoverEntry(rt, input);
   const rootsInfo = collectRoots(rt, input);
   const { posts, loading: postLoading } = extractPosts(rt, input, rootsInfo, extractControls);
@@ -331,6 +310,7 @@ export const projectGroupBumper = serializeDomEval<
   extractBumperPostControls,
   extractBumperPosts,
   inspectBumperDialogsAndMeta,
+  createRelativePostAge,
 });
 export async function readGroupBumper(
   page: Page,

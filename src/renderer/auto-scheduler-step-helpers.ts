@@ -7,12 +7,11 @@ import type {
   BrowserPipelineStep,
   SaveAutoScheduleInput,
 } from '../shared/auto-scheduler.js';
-import type { SavedCombination } from '../shared/contracts.js';
+import type { SavedCombination, Step } from '../shared/contracts.js';
 import type { BumperTarget } from '../shared/group-bumper.js';
 import type { InviterGroupRow } from '../shared/group-inviter.js';
 import type { PosterMaterial } from '../shared/group-poster.js';
 import type { UnifiedPickerItem } from './modules/shared/unified-target-picker.js';
-
 export const MINI_SEG = 'inline-flex rounded-lg p-0.5 bg-[var(--surface-2)]';
 export const MINI_SEG_BTN = (active: boolean) =>
   `rounded-md text-xs font-medium cursor-pointer border-0 px-2.5 py-1 transition-colors ${
@@ -26,10 +25,8 @@ export const ADD_CHIP =
   'rounded-lg text-xs cursor-pointer bg-transparent px-[9px] py-1 text-[var(--text-2)] border border-dashed border-[var(--line-strong)] hover:border-[var(--brand)] hover:text-[var(--brand)] hover:bg-[var(--brand-soft)]';
 export const CARD_BOX =
   'flex flex-col gap-2.5 rounded-[var(--r-md)] border border-[var(--line)] px-3.5 py-3';
-
 export const asIds = (v: unknown): readonly string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
-
 const toPicker = (
   id: string,
   name: string | undefined,
@@ -42,10 +39,8 @@ const toPicker = (
   folderId: x.folderId,
   sortOrder: x.sortOrder,
 });
-
 export const mapTargetItems = (list: readonly BumperTarget[]): UnifiedPickerItem[] =>
   list.map((x) => toPicker(x.id, x.name, x));
-
 export function mergeInviterAndSharedGroups(
   inviterGroups: readonly InviterGroupRow[] | undefined,
   sharedGroups: readonly BumperTarget[],
@@ -55,7 +50,6 @@ export function mergeInviterAndSharedGroups(
   for (const g of sharedGroups) if (!map.has(g.id)) map.set(g.id, toPicker(g.id, g.name, g));
   return [...map.values()];
 }
-
 export const mapPosterMaterialItems = (
   posterMaterials: readonly PosterMaterial[],
 ): UnifiedPickerItem[] =>
@@ -77,7 +71,6 @@ export const mapPosterMaterialItems = (
             ? '彩贴'
             : '纯文',
   }));
-
 export const buildOncePresets = (zone: string) => {
   const at =
     (hour: number, addDays = 0) =>
@@ -95,13 +88,8 @@ export const buildOncePresets = (zone: string) => {
     { label: '明早 09:00', ms: at(9, 1) },
   ];
 };
-
 export type AnyStep = BrowserPipelineStep | BluestacksPipelineStep;
-export interface StepMetaItem {
-  type: AnyStep['type'];
-  label: string;
-  needsDrawer?: boolean;
-}
+export type StepMetaItem = { type: AnyStep['type']; label: string; needsDrawer?: boolean };
 export const SMART_TIME_SLOTS = [
   '09:00',
   '14:00',
@@ -112,7 +100,6 @@ export const SMART_TIME_SLOTS = [
   '07:30',
   '12:30',
 ] as const;
-
 export const BROWSER_STEP_META: readonly StepMetaItem[] = [
   { type: 'active-combination', label: '活跃组合' },
   { type: 'group-poster', label: '小组发帖', needsDrawer: true },
@@ -120,7 +107,6 @@ export const BROWSER_STEP_META: readonly StepMetaItem[] = [
   { type: 'page-bumper', label: '专页顶贴', needsDrawer: true },
   { type: 'group-inviter', label: '小组邀人', needsDrawer: true },
 ];
-
 export const BS_STEP_META: readonly StepMetaItem[] = [
   { type: 'bluestacks-health-check', label: '蓝蝶体检' },
   { type: 'bluestacks-active-combination', label: '蓝蝶活跃' },
@@ -129,28 +115,30 @@ export const BS_STEP_META: readonly StepMetaItem[] = [
   { type: 'bluestacks-page-bumper', label: '蓝蝶专页顶贴', needsDrawer: true },
   { type: 'bluestacks-group-inviter', label: '蓝蝶邀人', needsDrawer: true },
 ];
-
 export const uid = () => crypto.randomUUID();
 export const defaultOnceTimestamp = (nowMs = Date.now()) =>
   Math.ceil((nowMs + 30 * 60_000) / 60_000) * 60_000;
-
 export function splitMillisInZone(ms: number, zone: string) {
   const dt = DateTime.fromMillis(ms).setZone(zone);
   return dt.isValid
     ? { date: dt.toFormat('yyyy-MM-dd'), time: dt.toFormat('HH:mm') }
     : { date: DateTime.now().toFormat('yyyy-MM-dd'), time: '09:00' };
 }
-
 export function combineDateTimeInZone(dateStr: string, timeStr: string, zone: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(timeStr))
     return null;
   const dt = DateTime.fromISO(`${dateStr}T${timeStr}:00`, { zone });
   return dt.isValid ? dt.toMillis() : null;
 }
-
-export const isUnsupportedOnBluestacks = (combo: SavedCombination) =>
-  combo.saved?.steps.some((s) => s.type === 'marketplace' || s.type === 'post') ?? false;
-
+const isBsSupportedStep = (s: Step) =>
+  s.type === 'feed' ||
+  s.type === 'video' ||
+  s.type === 'marketplace' ||
+  (s.type === 'friends' && s.friendAction !== 'add_suggested');
+export const isUnsupportedOnBluestacks = (combo: SavedCombination) => {
+  const steps = combo.saved?.steps ?? [];
+  return steps.length === 0 || !steps.some(isBsSupportedStep);
+};
 export function createStepFactory(deps: {
   defaultComboId: string | undefined;
   sharedGroups: readonly BumperTarget[];
@@ -167,9 +155,6 @@ export function createStepFactory(deps: {
   return (type: AnyStep['type']): AnyStep => {
     const id = uid();
     switch (type) {
-      case 'quick-browse':
-      case 'bluestacks-quick-browse':
-        return { id, type, target: 'feed', durationMinutes: type === 'quick-browse' ? 1 : 2 };
       case 'active-combination':
       case 'bluestacks-active-combination':
         return { id, type, combinationId };
@@ -202,7 +187,6 @@ export function createStepFactory(deps: {
     }
   };
 }
-
 export function describeStepDrawer(
   step: AnyStep,
   totals: { pages: number; groups: number; inviterGroups: number },
@@ -247,7 +231,6 @@ export function describeStepDrawer(
   }
   return null;
 }
-
 export function validateSteps(
   steps: readonly AnyStep[],
   savedCombos: readonly SavedCombination[],
@@ -261,8 +244,17 @@ export function validateSteps(
       if (!c) return { stepId: s.id, message: `${lbl}请选择有效的活跃组合` };
       if (c.saved?.loop.mode === 'until-stopped')
         return { stepId: s.id, message: `${lbl}不能使用「无限循环」组合` };
-      if (s.type === 'bluestacks-active-combination' && isUnsupportedOnBluestacks(c))
-        return { stepId: s.id, message: `${lbl}所选组合包含 Marketplace/发帖步骤，暂不支持蓝蝶` };
+      if (s.type === 'bluestacks-active-combination' && isUnsupportedOnBluestacks(c)) {
+        const hasAddFriend = c.saved?.steps.some(
+          (st) => st.type === 'friends' && st.friendAction === 'add_suggested',
+        );
+        return {
+          stepId: s.id,
+          message: hasAddFriend
+            ? `${lbl}所选组合仅含「加推荐好友」，暂不支持蓝蝶`
+            : `${lbl}所选组合仅含仅浏览器支持的步骤（发帖/快拍），暂不支持蓝蝶`,
+        };
+      }
     } else if (s.type === 'group-bumper' || s.type === 'bluestacks-group-bumper') {
       if (!asIds(s.groupIds).length || !s.pageIds.length)
         return {
@@ -289,7 +281,6 @@ export function validateSteps(
   }
   return null;
 }
-
 export function moveItem<T>(list: readonly T[], index: number, dir: -1 | 1): T[] {
   const target = index + dir;
   if (target < 0 || target >= list.length) return [...list];
@@ -298,7 +289,6 @@ export function moveItem<T>(list: readonly T[], index: number, dir: -1 | 1): T[]
   if (item !== undefined) copy.splice(target, 0, item);
   return copy;
 }
-
 export const ITEM_STATUS_BADGE: Record<AutoRunItemStatus, { label: string; cls: string }> = {
   running: { label: '运行中', cls: 'pill pill-run' },
   queued: { label: '排队', cls: 'pill pill-idle' },
@@ -309,10 +299,8 @@ export const ITEM_STATUS_BADGE: Record<AutoRunItemStatus, { label: string; cls: 
   skipped: { label: '跳过', cls: 'pill pill-idle' },
   stopped: { label: '已停', cls: 'pill pill-idle' },
 };
-
 export const isAbnormalRunItem = (s: AutoRunItemStatus) =>
-  s === 'hard_blocked' || s === 'watchdog_timeout' || s === 'soft_warning' || s === 'skipped';
-
+  s === 'hard_blocked' || s === 'watchdog_timeout' || s === 'soft_warning';
 export function formatRunDuration(startedAt: number, finishedAt: number | null): string {
   if (!finishedAt || finishedAt <= startedAt) return '';
   const sec = Math.max(1, Math.round((finishedAt - startedAt) / 1000));
@@ -321,7 +309,6 @@ export function formatRunDuration(startedAt: number, finishedAt: number | null):
     s = sec % 60;
   return m < 60 ? (s > 0 ? `${m}m${s}s` : `${m}m`) : `${Math.floor(m / 60)}h${m % 60}m`;
 }
-
 export function buildAutoSchedulePayload(opts: {
   initial: AutoSchedule | null;
   name: string;
@@ -356,26 +343,12 @@ export function buildAutoSchedulePayload(opts: {
       weekdays: opts.weekdays.length > 0 ? opts.weekdays : [1, 2, 3, 4, 5, 6, 7],
       times: opts.times.length > 0 ? [...opts.times].sort() : ['09:00'],
       timeZone: opts.timeZone,
-      jitterMinutes: initial?.trigger.jitterMinutes ?? 0,
       misfireGraceMinutes: initial?.trigger.misfireGraceMinutes ?? 120,
     },
     closeWindowOnFinish: opts.closeWindowOnFinish,
     maxSafetyMinutesPerTarget: initial?.maxSafetyMinutesPerTarget ?? null,
   };
   return carrier === 'browser'
-    ? {
-        ...base,
-        carrier: 'browser',
-        prewarm:
-          triggerMode === 'weekly' && initial?.carrier === 'browser' && initial.prewarm
-            ? initial.prewarm
-            : { enabled: false as const, leadMinutes: 90, steps: [] as BrowserPipelineStep[] },
-        steps: opts.browserSteps,
-      }
-    : {
-        ...base,
-        carrier: 'bluestacks',
-        prewarm: { enabled: false as const, leadMinutes: 90, steps: [] },
-        steps: opts.bsSteps,
-      };
+    ? { ...base, carrier: 'browser', steps: opts.browserSteps }
+    : { ...base, carrier: 'bluestacks', steps: opts.bsSteps };
 }

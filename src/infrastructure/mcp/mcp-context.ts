@@ -13,7 +13,7 @@ import type { TaskService } from '../../application/task-service.js';
 import type { WorkspaceService } from '../../application/workspace-service.js';
 import type { Core } from '../../bridge/core.js';
 import type { Awaitable } from '../../domain/persistence.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import { bluestacksDisplayTitle, type BluestacksInstance } from '../../shared/bluestacks.js';
 import type { BrowserWindowPort } from '../../shared/browser-window.js';
 import { profileDisplayName } from '../../shared/contracts.js';
@@ -27,7 +27,6 @@ import type { WindowLayoutPort } from '../../shared/window-layout.js';
 import type { KernelBridge } from '../kernel-bridge.js';
 import type { BridgeStorePort } from '../persistence-port.js';
 import type { AgentBrowserManager, AgentBrowserSessionSummary } from './agent-browser-manager.js';
-
 export {
   formatExcelSerialValue,
   readSpreadsheetOrTableFile,
@@ -35,7 +34,6 @@ export {
   type TableReadOptions,
   type TableReadResult,
 } from './mcp-table-reader.js';
-
 export type McpContentItem =
   { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
 export interface McpToolCallResult {
@@ -134,49 +132,35 @@ export interface ParsedScheduleTime {
   mode: 'immediate' | 'scheduled';
   rolledToNextDay: boolean;
 }
-
 type P = McpJsonSchemaProperty;
-type PExtra = Pick<P, 'properties' | 'required' | 'additionalProperties'>;
-export const E = (v: string | readonly (string | number | boolean)[], d?: string): P => ({
-  type: 'string',
-  enum: typeof v === 'string' ? v.split(' ') : v,
-  ...(d && { description: d }),
-});
-export const A = (items: P, d?: string): P => ({
-  type: 'array',
-  items,
-  ...(d && { description: d }),
-});
-export const O = (d?: string, x?: PExtra): P => ({
-  type: 'object',
+type PExtra = Partial<P>;
+const mkProp = (type: string | readonly string[], d?: string, x?: PExtra): P => ({
+  type,
   ...(d && { description: d }),
   ...x,
 });
-export const U = (t: string | readonly string[], d?: string, x?: PExtra): P => ({
-  type: typeof t === 'string' ? t.split(' ') : t,
-  ...(d && { description: d }),
-  ...x,
-});
+export const E = (v: string | readonly (string | number | boolean)[], d?: string): P =>
+  mkProp('string', d, { enum: typeof v === 'string' ? v.split(' ') : v });
+export const A = (items: P, d?: string): P => mkProp('array', d, { items });
+export const O = (d?: string, x?: PExtra): P => mkProp('object', d, x);
+export const U = (t: string | readonly string[], d?: string, x?: PExtra): P =>
+  mkProp(typeof t === 'string' ? t.split(' ') : t, d, x);
 export const arrObj = (spec: string, desc: string, reqFields?: string): P =>
   A(
     O(undefined, { properties: sp(spec), ...(reqFields && { required: reqFields.split(' ') }) }),
     desc,
   );
-
 const parseProp = (ts: string, d?: string): P => {
-  if (ts === 's' || ts === 'b')
-    return { type: ts === 's' ? 'string' : 'boolean', ...(d && { description: d }) };
+  if (ts === 's' || ts === 'b') return mkProp(ts === 's' ? 'string' : 'boolean', d);
   if (ts === 'sa') return A({ type: 'string' }, d);
   if (ts === 'o') return O(d);
   if (ts.startsWith('e(') || ts.startsWith('u('))
     return (ts[0] === 'e' ? E : U)(ts.slice(2, -1), d);
   const [a, b] = ts === 'n' ? [] : ts.slice(2, -1).split(',');
-  return {
-    type: 'number',
+  return mkProp('number', d, {
     ...(a && { minimum: Number(a) }),
     ...(b && { maximum: Number(b) }),
-    ...(d && { description: d }),
-  };
+  });
 };
 const CP = sp(
   'profileId:s:浏览器标识/名称|profileIds:sa:浏览器标识列表|groupIds:sa:目标小组 ID 或链接|pageIds:sa:目标专页 ID 或链接|search:s:搜索关键词|limit:n(1,200):返回条数上限|taskId:s:任务或计划 ID|taskIds:sa:任务或计划 ID 列表|scheduledAt:u(string number):定时时间（20:30/+30m/ISO/时间戳）|settings:o:设置参数补丁|comments:sa:留言话术列表|consumeCommentOnUse:b:用后消耗移除|includeComments:b:返回留言话术|autoAddMissingTargets:b:未入库目标自动补入',
@@ -201,7 +185,6 @@ export function sp(spec: string, extra?: Record<string, P>): Record<string, P> {
   }
   return extra ? { ...out, ...extra } : out;
 }
-
 export function reg(
   name: string,
   description: string,
@@ -242,7 +225,6 @@ export function reg(
     },
   };
 }
-
 export const act = (action: string, map: Record<string, () => Promise<object> | object>) => {
   const fn = map[action];
   if (!fn) throw new ProductError('MCP_INVALID_ACTION', `未知 action: ${action}`, 400);
@@ -254,7 +236,7 @@ export function req<T>(
   msg: string,
   status = 400,
 ): asserts val is NonNullable<T> {
-  if (val === undefined || val === null || val === '') throw new ProductError(code, msg, status);
+  if (!val) throw new ProductError(code, msg, status);
 }
 export const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -274,7 +256,6 @@ export const extractGroupIds = (v: unknown) =>
   strArrArg(v).map(extractFacebookGroupId).filter(Boolean);
 export const extractPageIds = (v: unknown) =>
   strArrArg(v).map(extractFacebookPageId).filter(Boolean);
-
 const PICK_MOD: Record<string, (v: unknown) => unknown> = {
   '?': (v) => v ?? null,
   '!': (v) => Boolean(v),
@@ -301,7 +282,6 @@ export const mapAt = <T extends object>(rows: readonly T[], k: string) =>
       (r as Record<string, unknown>)[k] as number | null | undefined,
     ),
   }));
-
 const TYPE_PRED: Record<string, (v: unknown) => boolean> = {
   n: (v) => typeof v === 'number',
   b: (v) => typeof v === 'boolean',
@@ -318,15 +298,10 @@ export function pickTypes(src: Record<string, unknown>, spec: string): Record<st
   }
   return out;
 }
-
 export const mapActivePlan = (
   p: Plan,
   keys = 'id profileId combinationId state reason round position updatedAt@',
-) => ({
-  ...pick(p, keys),
-  combinationName: p.snapshot.name,
-});
-
+) => ({ ...pick(p, keys), combinationName: p.snapshot.name });
 export const pickBumperScope = (st: object, isPage: boolean) => {
   const r = st as Record<string, unknown>;
   const g = (p: string, q: string) => r[isPage ? p : q];
@@ -339,7 +314,6 @@ export const pickBumperScope = (st: object, isPage: boolean) => {
     total: Number(g('pageTotal', 'total') ?? 0),
   };
 };
-
 export const summarizeTarget = (i: {
   id?: string;
   groupId?: string;
@@ -361,7 +335,6 @@ export const summarizeTarget = (i: {
     updatedAt: i.updatedAt ?? 0,
   };
 };
-
 export function parseTargetAddItems(args: Record<string, unknown>, defFolder?: string) {
   const out: Array<{ id: string; name?: string; folderId?: string | null }> = [];
   for (const raw of Array.isArray(args.items) ? args.items : []) {
@@ -377,7 +350,6 @@ export function parseTargetAddItems(args: Record<string, unknown>, defFolder?: s
         out.push({ id: l.trim(), ...(defFolder !== undefined && { folderId: defFolder }) });
   return out;
 }
-
 export async function ensureBumperTargets(
   deps: WorkbenchMcpDependencies,
   gIds: readonly string[],
@@ -391,7 +363,6 @@ export async function ensureBumperTargets(
   if (mg.length > 0) await bumper.manage('groups/add', { items: mg });
   if (mp.length > 0) await bumper.manage('pages/add', { items: mp });
 }
-
 export function recentDiagSlice(
   maxScan: number,
   limit: number,
@@ -418,7 +389,6 @@ export function recentDiagSlice(
     )
     .slice(-limit);
 }
-
 export async function pollUntil(
   deadlineMs: number,
   intervalMs: number,
@@ -426,7 +396,6 @@ export async function pollUntil(
 ) {
   while (Date.now() < deadlineMs && !(await checkDone())) await sleep(intervalMs);
 }
-
 export async function scheduleOnceViaAutoScheduler(
   schedSvc: AutoSchedulerService,
   name: string,
@@ -435,7 +404,6 @@ export async function scheduleOnceViaAutoScheduler(
   step: Record<string, unknown>,
 ) {
   const scheduleId = randomUUID();
-  const now = Date.now();
   const schedState = await schedSvc.saveSchedule({
     id: scheduleId,
     name: `${name} · ${formatLocalDateTime(onceAt)}`,
@@ -453,16 +421,11 @@ export async function scheduleOnceViaAutoScheduler(
       weekdays: [1, 2, 3, 4, 5, 6, 7],
       times: ['09:00'],
       timeZone: localTz(),
-      jitterMinutes: 0,
       misfireGraceMinutes: 120,
     },
-    prewarm: { enabled: false, leadMinutes: 90, steps: [] },
     steps: [step],
     closeWindowOnFinish: true,
     maxSafetyMinutesPerTarget: null,
-    sortOrder: 0,
-    createdAt: now,
-    updatedAt: now,
   });
   return {
     scheduleId,
@@ -470,14 +433,12 @@ export async function scheduleOnceViaAutoScheduler(
     created: schedState.schedules.find((s) => s.id === scheduleId) ?? null,
   };
 }
-
 export function formatLocalDateTime(ms: number | null | undefined): string | null {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
   const d = new Date(ms);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
-
 export function parseFlexibleScheduleTime(raw: unknown, nowMs = Date.now()): ParsedScheduleTime {
   const res = (ms: number | null, rolledToNextDay = false): ParsedScheduleTime => ({
     scheduledAt: ms,
@@ -516,14 +477,8 @@ export function parseFlexibleScheduleTime(raw: unknown, nowMs = Date.now()): Par
     text,
   );
   if (dt) {
-    const ms = new Date(
-      Number(dt[1]),
-      Number(dt[2]) - 1,
-      Number(dt[3]),
-      Number(dt[4]),
-      Number(dt[5]),
-      dt[6] ? Number(dt[6]) : 0,
-    ).getTime();
+    const [, y = 0, mo = 1, d = 1, h = 0, m = 0, s = 0] = dt.map(Number);
+    const ms = new Date(y, mo - 1, d, h, m, s || 0).getTime();
     if (!Number.isFinite(ms)) throw new Error(`INVALID_SCHEDULE_TIME: 无效日期 "${text}"`);
     return res(ms);
   }
@@ -531,7 +486,6 @@ export function parseFlexibleScheduleTime(raw: unknown, nowMs = Date.now()): Par
   if (Number.isFinite(iso) && iso > 0) return res(iso);
   throw new Error(`INVALID_SCHEDULE_TIME: 无法解析 "${text}"`);
 }
-
 export function resolveDataDirIntegrity(dataDir: string) {
   const configuredPath = path.resolve(dataDir);
   let realPath = configuredPath;
@@ -546,24 +500,20 @@ export function resolveDataDirIntegrity(dataDir: string) {
     ),
   };
 }
-
-export const okResult = (payload: Record<string, unknown>): McpToolCallResult => ({
+export const okResult = (
+  payload: Record<string, unknown>,
+  isError?: boolean,
+): McpToolCallResult => ({
   content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
   structuredContent: payload,
+  ...(isError && { isError }),
 });
 export const errorResult = (
   code: string,
   message: string,
   details?: Record<string, unknown>,
-): McpToolCallResult => {
-  const payload = { ok: false, errorCode: code, error: message, ...(details && { details }) };
-  return {
-    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-    structuredContent: payload,
-    isError: true,
-  };
-};
-
+): McpToolCallResult =>
+  okResult({ ok: false, errorCode: code, error: message, ...(details && { details }) }, true);
 export async function buildEnrichedProfiles(
   deps: WorkbenchMcpDependencies,
 ): Promise<EnrichedProfileSummary[]> {
@@ -610,21 +560,15 @@ export async function buildEnrichedProfiles(
           hasLocalAvatar: isLocalAvatar(p.account.avatar),
         } as EnrichedProfileSummary['account'],
         liveInspection: live
-          ? ({
-              state: live.state,
-              reason: live.reason,
-              ...pick(live, 'checkedAt@'),
-            } as EnrichedProfileSummary['liveInspection'])
+          ? (pick(live, 'state reason checkedAt@') as EnrichedProfileSummary['liveInspection'])
           : null,
         agentBrowserSession: sessionMap.get(p.id) ?? null,
       };
     }),
   );
 }
-
 export const buildProfileDisplayNameMap = async (deps: WorkbenchMcpDependencies) =>
   new Map((await buildEnrichedProfiles(deps)).map((p) => [p.id, p.displayName]));
-
 export function resolveEntityIdentifier<T extends { id: string }>(
   items: readonly T[],
   rawQuery: string,
@@ -649,7 +593,7 @@ export function resolveEntityIdentifier<T extends { id: string }>(
     if (matches.length === 1 && matches[0]) return matches[0];
     const on = opts.isOnline ? matches.filter(opts.isOnline) : [];
     if (on.length === 1 && on[0]) return on[0];
-    throw new ProductError(
+    failError(
       `AMBIGUOUS_${opts.prefix}_IDENTIFIER`,
       `标识 "${query}" 同时匹配到多个${opts.label}：${matches.slice(0, 6).map(opts.formatLabel).join('；')}`,
       409,
@@ -669,13 +613,12 @@ export function resolveEntityIdentifier<T extends { id: string }>(
     .slice(0, 8)
     .map(opts.formatHint ?? opts.formatLabel)
     .join('；');
-  throw new ProductError(
+  failError(
     `${opts.prefix}_NOT_FOUND`,
     `未找到匹配 "${query}" 的${opts.label}。${hints ? `可用：${hints}` : opts.emptyHints}`,
     404,
   );
 }
-
 export function resolveUniqueIds(
   rawQueries: readonly string[],
   resolveOne: (query: string) => string,
@@ -684,7 +627,6 @@ export function resolveUniqueIds(
   for (const raw of rawQueries) if (raw.trim()) seen.add(resolveOne(raw.trim()));
   return [...seen];
 }
-
 const fmtMatch = (
   title: string,
   id: string,
@@ -693,7 +635,6 @@ const fmtMatch = (
   full: boolean,
 ) =>
   `${title} (id=${id}${extra}${full ? `, account=${acct || '未知'}` : acct ? `, 账号=${acct}` : ''})`;
-
 export const resolveProfileIdentifierFromList = (
   profiles: readonly EnrichedProfileSummary[],
   rawQuery: string,
@@ -708,7 +649,6 @@ export const resolveProfileIdentifierFromList = (
     formatLabel: (c) => fmtMatch(c.displayName, c.id, c.account.name, `, online=${c.online}`, true),
     formatHint: (p) => fmtMatch(p.displayName, p.id, p.account.name, '', false),
   }).id;
-
 export const resolveProfileId = async (deps: WorkbenchMcpDependencies, rawQuery: string) =>
   resolveProfileIdentifierFromList(await buildEnrichedProfiles(deps), rawQuery);
 export async function resolveProfileIds(
@@ -719,6 +659,26 @@ export async function resolveProfileIds(
   const profiles = await buildEnrichedProfiles(deps);
   return resolveUniqueIds(rawQueries, (q) => resolveProfileIdentifierFromList(profiles, q));
 }
+export const resolveCollectedPids = async (
+  deps: WorkbenchMcpDependencies,
+  args: Record<string, unknown>,
+  fallbackOnline = false,
+): Promise<string[] | undefined> => {
+  const raw = collectRawIds(args, 'profileIds', 'profileId');
+  if (raw.length > 0) return resolveProfileIds(deps, raw);
+  return fallbackOnline
+    ? (await buildEnrichedProfiles(deps)).filter((p) => p.online).map((p) => p.id)
+    : undefined;
+};
+export const reqCollectedPids = async (
+  deps: WorkbenchMcpDependencies,
+  args: Record<string, unknown>,
+  msg = '请通过 profileId 或 profileIds 指定浏览器',
+) => {
+  const pids = await resolveCollectedPids(deps, args);
+  req(pids?.length, 'PROFILE_IDS_REQUIRED', msg);
+  return pids;
+};
 export const optPids = (deps: WorkbenchMcpDependencies, args: Record<string, unknown>) => {
   const r = strArrArg(args.profileIds);
   return r.length > 0
@@ -733,7 +693,6 @@ export const reqSinglePid = async (
   req(raw, 'PROFILE_ID_REQUIRED', '必须提供 profileId');
   return resolveProfileId(deps, raw);
 };
-
 const bsBase = (i: BluestacksInstance) => [
   bluestacksDisplayTitle(i),
   i.displayName,
@@ -743,7 +702,8 @@ const bsBase = (i: BluestacksInstance) => [
   i.accountId,
   i.serial,
 ];
-
+const bsFmt = (c: BluestacksInstance, extra: string, full: boolean) =>
+  fmtMatch(bluestacksDisplayTitle(c), c.id, c.accountName, extra, full);
 export const resolveBluestacksInstanceIdentifierFromList = (
   instances: readonly BluestacksInstance[],
   rawQuery: string,
@@ -756,18 +716,9 @@ export const resolveBluestacksInstanceIdentifierFromList = (
     isOnline: (i) => i.online,
     exactFields: (i) => [...bsBase(i), String(i.adbPort), `:${i.adbPort}`],
     fuzzyFields: bsBase,
-    formatLabel: (c) =>
-      fmtMatch(
-        bluestacksDisplayTitle(c),
-        c.id,
-        c.accountName,
-        `, port=${c.adbPort}, online=${c.online}`,
-        true,
-      ),
-    formatHint: (i) =>
-      fmtMatch(bluestacksDisplayTitle(i), i.id, i.accountName, `, port=${i.adbPort}`, false),
+    formatLabel: (c) => bsFmt(c, `, port=${c.adbPort}, online=${c.online}`, true),
+    formatHint: (i) => bsFmt(i, `, port=${i.adbPort}`, false),
   }).id;
-
 export const resolveBluestacksInstanceIds = (
   instances: readonly BluestacksInstance[],
   rawQueries: readonly string[],

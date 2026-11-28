@@ -9,14 +9,11 @@ import {
 } from '../shared/kernel-state.js';
 import { DispatchBinding, sameBinding, type Binding } from '../shared/task-execution.js';
 import { OperationDisposition, type Disposition } from '../shared/task-policies.js';
-
 export interface KernelStateStorage {
   read(): Promise<unknown>;
   write(state: KernelState): Promise<void>;
 }
-
 const ResolutionSchema = KernelOperationRecord.shape.resolution.unwrap();
-
 const sameTabProof = (a: TabProof | null | undefined, b: TabProof | null | undefined): boolean =>
   Boolean(
     a &&
@@ -27,7 +24,6 @@ const sameTabProof = (a: TabProof | null | undefined, b: TabProof | null | undef
     a.tabId === b.tabId &&
     a.targetId === b.targetId,
   );
-
 function pruneHistoricalTabs(next: KernelState): void {
   if (next.tabs.length <= 80) return;
   const keepRequired: KernelState['tabs'] = [];
@@ -53,7 +49,6 @@ function pruneHistoricalTabs(next: KernelState): void {
     ...keepRequired,
   ];
 }
-
 function rescueRawTabs(raw: unknown): unknown {
   if (!raw || typeof raw !== 'object' || !('tabs' in raw)) return raw;
   const obj = raw as Record<string, unknown> & { tabs?: unknown };
@@ -69,38 +64,31 @@ function rescueRawTabs(raw: unknown): unknown {
     tabs: [...endedTabs.slice(-Math.max(0, 450 - protectedTabs.length)), ...protectedTabs],
   };
 }
-
 function findBoundOperation(next: KernelState, binding: Binding) {
   const record = next.operations.find((row) => row.binding.operationId === binding.operationId);
   if (!record || !sameBinding(record.binding, binding))
     throw Error('KERNEL_OPERATION_BINDING_REJECTED');
   return record;
 }
-
 const hasReadyTabDuplicate = (next: KernelState, tabId: number, targetId: string) =>
   next.tabs.some(
     (t) => t.state === 'READY' && (t.proof?.tabId === tabId || t.proof?.targetId === targetId),
   );
-
 export class KernelJournal {
   private state: KernelState | undefined;
   private tail: Promise<unknown> = Promise.resolve();
   private healthy = true;
   private revision = 0;
-
   constructor(private readonly storage: KernelStateStorage) {}
-
   private serialized<T>(run: () => Promise<T>): Promise<T> {
     const pending = this.tail.catch(() => {}).then(run);
     this.tail = pending;
     return pending;
   }
-
   private current(): KernelState {
     if (!this.healthy || !this.state) throw Error('KERNEL_JOURNAL_NOT_READY');
     return this.state;
   }
-
   private mutate<R>(fn: (next: KernelState) => { commit: boolean; result: R }): Promise<R> {
     return this.serialized(async () => {
       const next = structuredClone(this.current());
@@ -109,19 +97,15 @@ export class KernelJournal {
       return result;
     });
   }
-
   private mutateVoid(fn: (next: KernelState) => boolean): Promise<void> {
     return this.mutate((next) => ({ commit: fn(next), result: undefined }));
   }
-
   get writable(): boolean {
     return this.healthy && this.state !== undefined;
   }
-
   get currentRevision(): number {
     return this.revision;
   }
-
   private async commit(next: KernelState): Promise<void> {
     const parsed = KernelPersistentState.parse(next);
     try {
@@ -134,7 +118,6 @@ export class KernelJournal {
       throw error;
     }
   }
-
   initialize(profileId: string, browserSessionEpoch: string): Promise<void> {
     return this.serialized(async () => {
       if (this.state) {
@@ -185,11 +168,9 @@ export class KernelJournal {
       await this.commit(next);
     });
   }
-
   snapshot(): Promise<KernelState> {
     return this.serialized(async () => structuredClone(this.current()));
   }
-
   begin(
     input: Binding,
     operationSequence?: number,
@@ -235,7 +216,6 @@ export class KernelJournal {
       return { commit: true, result: { fresh: true, record } };
     });
   }
-
   collect(records: KernelRecord[], browserSessionEpoch: string): Promise<number> {
     return this.mutate<number>((next) => {
       if (next.browserSessionEpoch !== browserSessionEpoch)
@@ -259,7 +239,6 @@ export class KernelJournal {
       return { commit: true, result: ids.size };
     });
   }
-
   finish(input: Binding, state: 'ACKNOWLEDGED' | 'UNKNOWN', reason = ''): Promise<void> {
     const binding = DispatchBinding.parse(input);
     return this.mutateVoid((next) => {
@@ -277,7 +256,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   reconcile(
     input: Binding,
     resolution: NonNullable<KernelState['operations'][number]['resolution']>,
@@ -306,7 +284,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   prepareTab(ownershipId: string, url: string): Promise<void> {
     return this.mutateVoid((next) => {
       if (next.tabs.some((row) => row.ownershipId === ownershipId))
@@ -318,7 +295,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   endUnknown(input: Binding, value: Disposition): Promise<void> {
     const binding = DispatchBinding.parse(input);
     const disposition = OperationDisposition.parse(value);
@@ -336,7 +312,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   acknowledgeSessionEnd(browserSessionEpoch: string): Promise<void> {
     return this.mutateVoid((next) => {
       if (
@@ -350,7 +325,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   retireOperation(
     input: Binding,
     resolution: NonNullable<KernelRecord['resolution']> | Disposition,
@@ -392,7 +366,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   confirmTab(proof: TabProof): Promise<void> {
     return this.mutateVoid((next) => {
       const row = next.tabs.find((tab) => tab.ownershipId === proof.ownershipId);
@@ -411,7 +384,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   restoreWithdrawnTab(proof: TabProof): Promise<void> {
     return this.mutateVoid((next) => {
       const row = next.tabs.find((tab) => tab.ownershipId === proof.ownershipId);
@@ -430,7 +402,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   reobserveMain(previous: TabProof, proof: TabProof, url: string): Promise<void> {
     return this.mutateVoid((next) => {
       const old = next.tabs.find((tab) => tab.ownershipId === previous.ownershipId);
@@ -460,7 +431,6 @@ export class KernelJournal {
       return true;
     });
   }
-
   bindWorkspaceMainTab(input: TabProof, url: string): Promise<TabProof> {
     const proof = OwnedTabProof.parse(input);
     return this.mutate<TabProof>((next) => {
@@ -500,7 +470,6 @@ export class KernelJournal {
       return { commit: true, result: activeProof };
     });
   }
-
   rebindRecoveredTab(previousInput: TabProof, nextInput: TabProof, url: string): Promise<TabProof> {
     const previous = OwnedTabProof.parse(previousInput);
     const nextProof = OwnedTabProof.parse(nextInput);
@@ -539,7 +508,6 @@ export class KernelJournal {
       return { commit: true, result: nextProof };
     });
   }
-
   tabState(
     ownershipId: string,
     state: 'UNKNOWN' | 'LOST' | 'CLOSED',

@@ -641,6 +641,7 @@ test('WO-R1.7: BridgeBrowserWindow.consolidate rejects cleanupExtraTabs when pee
     core,
     {
       list: async () => [],
+      livePlans: async () => [],
       hasProfilePlanInStates: async () => false,
     },
     undefined,

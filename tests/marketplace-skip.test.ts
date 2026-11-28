@@ -8,11 +8,9 @@ import {
   workspaceFixture,
 } from './fixtures/workspace-fixture.js';
 import { TaskService } from '../src/application/task-service.js';
-import { groupTaskRecords } from '../src/domain/task-run-records.js';
 import { profileTaskResultLabel } from '../src/shared/profile-task-result.js';
 import { ProfileTaskResult } from '../src/shared/task-contracts.js';
 import { isSuccessfulTaskStep } from '../src/shared/task-step-outcome.js';
-import { stepResultLabel, runSummary } from '../src/renderer/task-record-summary.js';
 import type { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 
 const marketplace = () => ({
@@ -33,20 +31,14 @@ const feed = () => ({
 
 async function checkViews(store: WorkspaceStore, expected: 'COMPLETED' | 'FAILED', runs = 1) {
   const service = new TaskService(store.tasks);
-  for (const status of ['all', 'completed', 'failed'] as const) {
-    const indexed = await service.records({ groupBy: 'run', status, limit: 100 });
-    assert.equal(
-      indexed.total,
-      status === 'all' ||
-        (status === 'completed' && expected === 'COMPLETED') ||
-        (status === 'failed' && expected === 'FAILED')
-        ? runs
-        : 0,
-    );
-  }
-  const rows = (await service.records({ groupBy: 'run', status: 'all' })).records;
-  assert.equal(groupTaskRecords(rows).at(-1)?.state, expected);
-  return rows;
+  const all = await service.records({ status: 'all', limit: 100 });
+  const completed = await service.records({ status: 'completed', limit: 100 });
+  const failed = await service.records({ status: 'failed', limit: 100 });
+  assert.equal(new Set(all.records.map((r) => `${r.planId}:${r.round}`)).size, runs);
+  assert.equal(failed.total, expected === 'FAILED' ? 1 : 0);
+  if (expected === 'COMPLETED') assert.equal(completed.total, all.total);
+  assert.equal(all.records.at(-1)?.planState, expected);
+  return all.records;
 }
 
 test('unavailable-only marketplace finishes successfully with zero fake browsing, green summary, completed filters and retained final snapshot', async () =>
@@ -66,8 +58,6 @@ test('unavailable-only marketplace finishes successfully with zero fake browsing
     const before = await checkViews(store, 'COMPLETED');
     const first = before[0];
     assert.ok(first);
-    assert.match(stepResultLabel(first), /当前身份不可用，已跳过/);
-    assert.match(runSummary(before), /商城不可用，已正常跳过/);
     const result = ProfileTaskResult.parse(store.tasks.runtimeSnapshot().profileResults?.[0]);
     assert.equal(result.failedSteps, 0);
     assert.equal(result.skippedSteps, 1);

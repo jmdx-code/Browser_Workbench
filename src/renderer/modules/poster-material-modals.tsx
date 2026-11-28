@@ -16,25 +16,25 @@ import { mediaReference } from '../../domain/resource-table.js';
 import { api } from '../api.js';
 import { orderedFinderItems } from '../finder-target-list.js';
 import { extractGroupId, type DraftGroupEntry } from '../group-inviter-grid.js';
+import { resolveElectronFilePath } from '../matrix-grid.js';
 import { createEmptyMaterialDraft, toMaterialDraft } from '../poster-material-matrix.js';
-import { UI_INPUT, UI_TEXTAREA } from '../ui/primitives.js';
+import { UI_HINT, UI_INPUT, UI_MUTED, UI_ROW, UI_ROW_SM, UI_TEXTAREA } from '../ui/primitives.js';
 import {
   BackdropModal,
   Btn,
+  ErrText,
   errMsg,
   Fld,
   ModalFoot,
   ModalHeading,
   SelFld,
 } from './shared/module-ui.js';
-
 export const emptyDraftRows = (n = 8): DraftGroupEntry[] =>
   Array.from({ length: n }, (_, i) => ({
     key: `row-${i}-${Date.now()}`,
     groupId: '',
     groupName: '',
   }));
-
 export function mergeServerMaterialsIntoDrafts(
   prev: readonly MaterialDraft[],
   serverMaterials: readonly PosterMaterial[],
@@ -53,7 +53,6 @@ export function mergeServerMaterialsIntoDrafts(
   merged.push(...byId.values());
   return merged.length > 0 ? merged : [createEmptyMaterialDraft()];
 }
-
 export const toMaterialInputs = (rows: readonly MaterialDraft[]): PosterMaterialInput[] =>
   rows.filter(hasPosterMaterialContent).map((d) => ({
     id: d.id,
@@ -63,41 +62,51 @@ export const toMaterialInputs = (rows: readonly MaterialDraft[]): PosterMaterial
     aiLabel: d.aiLabel ?? 'default',
     selected: d.selected,
   }));
-
 export const buildGroupAddItems = (rows: readonly DraftGroupEntry[], folderId: string | null) =>
   rows
     .filter((r) => r.groupId.trim() || r.groupName.trim())
     .map((r) => ({ id: extractGroupId(r.groupId), name: r.groupName.trim(), folderId }));
-
 export function buildMaterialScheduleSeed(
   row: MaterialDraft,
   state: PosterState | null,
   folders: readonly TargetFolder[],
-  selectedProfileIds: ReadonlySet<string>,
+  selectedTargetIds: ReadonlySet<string>,
   settings: PosterState['settings'] | null,
+  options?: { carrier?: 'browser' | 'bluestacks'; bsMaxGroups?: number; bsPostTimeline?: boolean },
 ): QuickScheduleSeed {
   const posted = new Set(state?.postedGroupIdsByMaterial?.[row.id] ?? []);
   const all = state?.groups ?? [];
   const cand = orderedFinderItems(all, folders)
     .filter((g) => !posted.has(g.id))
     .map((g) => g.id);
+  const groupIds = cand.length ? cand : all.map((g) => g.id);
+  const isBs = options?.carrier === 'bluestacks';
+  const captionSnippet = row.caption.trim().slice(0, 18) || '小组发帖';
+  if (isBs) {
+    return buildBsPosterScheduleSeed(
+      [...selectedTargetIds],
+      [row.id],
+      groupIds,
+      options?.bsMaxGroups ?? 3,
+      Boolean(options?.bsPostTimeline),
+    );
+  }
   return {
     carrier: 'browser',
-    name: `发帖 · ${row.caption.trim().slice(0, 18) || '小组发帖'}`,
-    targetIds: [...selectedProfileIds],
+    name: `发帖 · ${captionSnippet}`,
+    targetIds: [...selectedTargetIds],
     steps: [
       {
         id: crypto.randomUUID(),
         type: 'group-poster',
         materialIds: [row.id],
-        groupIds: cand.length ? cand : all.map((g) => g.id),
+        groupIds,
         maxGroupsPerProfile: Math.max(1, Math.min(50, settings?.maxPostsPerAccount ?? 3)),
         materialsPerGroup: Math.max(1, Math.min(50, settings?.materialsPerGroup ?? 1)),
       },
     ],
   };
 }
-
 export const buildBsPosterScheduleSeed = (
   targetIds: readonly string[],
   materialIds: readonly string[],
@@ -120,7 +129,6 @@ export const buildBsPosterScheduleSeed = (
     },
   ],
 });
-
 export function applyBatchMaterialPatch(
   drafts: readonly MaterialDraft[],
   ids: readonly string[],
@@ -142,94 +150,77 @@ export function applyBatchMaterialPatch(
   });
   return { next, updated };
 }
-
 export function formatCreatedDate(ts?: number | null): string {
   if (!ts || !Number.isFinite(ts) || ts <= 0) return '刚刚创建';
   const d = new Date(ts);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
-
-export const taskStatusBadge = (status: PosterTask['status']): { label: string; cls: string } =>
-  ({
-    scheduled: {
-      label: '⏰ 定时待启动',
-      cls: 'border border-amber-200 bg-amber-50 text-amber-800',
-    },
-    running: { label: '▶ 正在发送', cls: 'border border-blue-200 bg-blue-50 text-blue-700' },
-    completed: {
-      label: '✓ 已完成',
-      cls: 'border border-emerald-200 bg-emerald-50 text-emerald-700',
-    },
-    partial: { label: '◑ 部分成功', cls: 'border border-amber-200 bg-amber-50 text-amber-800' },
-    failed: { label: '✕ 失败', cls: 'border border-rose-200 bg-rose-50 text-rose-700' },
-    cancelled: { label: '■ 已停止', cls: 'border border-slate-200 bg-slate-100 text-slate-600' },
-  })[status];
-
-export function posterRowBadge(row: MaterialDraft): { text: string; cls: string; title: string } {
+const B = (t: string, c: string, d: string) => ({ text: t, cls: `border ${c}`, title: d });
+export const taskStatusBadge = (s: PosterTask['status']) => {
+  const [label, c] = (
+    {
+      scheduled: ['⏰ 定时待启动', 'amber-200 bg-amber-50 text-amber-800'],
+      running: ['▶ 正在发送', 'blue-200 bg-blue-50 text-blue-700'],
+      completed: ['✓ 已完成', 'emerald-200 bg-emerald-50 text-emerald-700'],
+      partial: ['◑ 部分成功', 'amber-200 bg-amber-50 text-amber-800'],
+      failed: ['✕ 失败', 'rose-200 bg-rose-50 text-rose-700'],
+      cancelled: ['■ 已停止', 'slate-200 bg-slate-100 text-slate-600'],
+    } as const
+  )[s];
+  return { label, cls: `border border-${c}` };
+};
+export function posterRowBadge(row: MaterialDraft) {
   if (!hasPosterMaterialContent(row))
-    return {
-      text: '空行',
-      cls: 'border border-slate-200 bg-slate-100 text-slate-500',
-      title: '未填写文案或媒体',
-    };
+    return B('空行', 'border-slate-200 bg-slate-100 text-slate-500', '未填写文案或媒体');
   const src = row.mediaSource.trim();
   if (!src) {
-    if (row.background === 'color') {
-      return canPosterMaterialUseColorBackground(row)
-        ? {
-            text: '彩贴',
-            cls: 'border border-violet-200 bg-violet-50 text-violet-700',
-            title: '纯文字彩底贴文（≤120字且≤4行）',
-          }
-        : {
-            text: '彩贴(超长转文字)',
-            cls: 'border border-slate-200 bg-slate-100 text-slate-700',
-            title: '超过 120 字符或 4 行，Facebook 将自动按普通文字发布',
-          };
-    }
-    return {
-      text: '纯文案',
-      cls: 'border border-slate-200 bg-slate-100 text-slate-700',
-      title: '普通纯文字贴文',
-    };
+    if (row.background !== 'color')
+      return B('纯文案', 'border-slate-200 bg-slate-100 text-slate-700', '普通纯文字贴文');
+    return canPosterMaterialUseColorBackground(row)
+      ? B(
+          '彩贴',
+          'border-violet-200 bg-violet-50 text-violet-700',
+          '纯文字彩底贴文（≤120字且≤4行）',
+        )
+      : B(
+          '彩贴(超长转文字)',
+          'border-slate-200 bg-slate-100 text-slate-700',
+          '超过 120 字符或 4 行，Facebook 将自动按普通文字发布',
+        );
   }
   let isLocal = false;
   try {
     isLocal = mediaReference(src).kind === 'local';
-  } catch {
-    isLocal = false;
-  }
+  } catch {}
   if (row.cacheStatus === 'ready') {
     const k = row.mediaKind === 'image' ? '图片' : '视频';
-    return {
-      text: isLocal ? `本机${k}` : `已缓存 (${k})`,
-      cls: 'border border-emerald-200 bg-emerald-50 text-emerald-700',
-      title: row.localFilePath ?? '媒体已就绪',
-    };
+    return B(
+      isLocal ? `本机${k}` : `已缓存 (${k})`,
+      'border-emerald-200 bg-emerald-50 text-emerald-700',
+      row.localFilePath ?? '媒体已就绪',
+    );
   }
   if (row.cacheStatus === 'expired')
-    return {
-      text: '已释空(用时重下)',
-      cls: 'border border-slate-200 bg-slate-100 text-slate-700',
-      title: '超过 3 天未使用已自动清理缓存文件，下次发帖用到时自动重下',
-    };
+    return B(
+      '已释空(用时重下)',
+      'border-slate-200 bg-slate-100 text-slate-700',
+      '超过 3 天未使用已自动清理缓存文件，下次发帖用到时自动重下',
+    );
   if (row.cacheStatus === 'downloading')
-    return {
-      text: '下载缓存中…',
-      cls: 'border border-blue-200 bg-blue-50 text-blue-700',
-      title: '正在后台下载并缓存网盘媒体',
-    };
-  return {
-    text: isLocal ? '本地文件不存在' : '缓存失败',
-    cls: 'border border-rose-200 bg-rose-50 text-rose-700',
-    title: row.cacheError ?? '媒体下载或校验失败',
-  };
+    return B(
+      '下载缓存中…',
+      'border-blue-200 bg-blue-50 text-blue-700',
+      '正在后台下载并缓存网盘媒体',
+    );
+  return B(
+    isLocal ? '本地文件不存在' : '缓存失败',
+    'border-rose-200 bg-rose-50 text-rose-700',
+    row.cacheError ?? '媒体下载或校验失败',
+  );
 }
-
 const mediaEndpoint = (kind: 'media' | 'thumbnail', row: MaterialDraft) =>
   `/api/workspace/group-poster/materials/${kind}?id=${encodeURIComponent(row.id)}&v=${row.updatedAt ?? 0}`;
-
 export function useSerialVideoThumbnailGenerator(
   rows: readonly MaterialDraft[],
   onThumbnailSaved: (id: string) => void,
@@ -241,14 +232,12 @@ export function useSerialVideoThumbnailGenerator(
   const onSavedRef = useRef(onThumbnailSaved);
   onSavedRef.current = onThumbnailSaved;
   const [tick, setTick] = useState(0);
-
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };
   }, []);
-
   useEffect(() => {
     if (runningRef.current || options?.paused || typeof document === 'undefined') return;
     const persistedIds = options?.persistedIds;
@@ -264,7 +253,6 @@ export function useSerialVideoThumbnailGenerator(
     if (!cand) return;
     attemptedRef.current.add(`${cand.id}:${cand.mediaSource}`);
     runningRef.current = true;
-
     void (async () => {
       const video = document.createElement('video');
       video.preload = 'auto';
@@ -337,7 +325,6 @@ export function useSerialVideoThumbnailGenerator(
     })();
   }, [rows, options?.paused, options?.persistedIds, tick]);
 }
-
 function renderMediaContent(row: MaterialDraft) {
   const isReadyVideo = row.mediaKind === 'video' && row.cacheStatus === 'ready';
   const mediaUrl = mediaEndpoint('media', row);
@@ -369,7 +356,6 @@ function renderMediaContent(row: MaterialDraft) {
     );
   return null;
 }
-
 export function PosterMaterialThumbnailCell({
   row,
   onPreview,
@@ -403,12 +389,11 @@ export function PosterMaterialThumbnailCell({
     );
   }
   return (
-    <span className="text-xs text-[var(--text-3)]">
+    <span className={UI_MUTED}>
       {row.mediaSource.trim() ? (row.mediaKind === 'video' ? '🎬 视频' : '🖼️ 图片') : '—'}
     </span>
   );
 }
-
 export function PosterMaterialSummaryBox(p: {
   row: MaterialDraft;
   badge: { text: string; cls: string };
@@ -427,16 +412,14 @@ export function PosterMaterialSummaryBox(p: {
         <PosterMaterialCardPreview row={p.row} onPreview={p.onPreview} />
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className={UI_ROW_SM}>
           <span
             className={`poster-status-badge inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${p.badge.cls}`}
           >
             {p.badge.text}
           </span>
           {p.extraBadges}
-          <span className="text-[11px] text-[var(--text-3)]">
-            {formatCreatedDate(p.row.createdAt)}
-          </span>
+          <span className={UI_HINT}>{formatCreatedDate(p.row.createdAt)}</span>
         </div>
         {p.metaRow}
         <div className="line-clamp-2 text-slate-800">
@@ -446,7 +429,6 @@ export function PosterMaterialSummaryBox(p: {
     </div>
   );
 }
-
 export function PosterMaterialCardPreview({
   row,
   onPreview,
@@ -513,7 +495,6 @@ export function PosterMaterialCardPreview({
     </div>
   );
 }
-
 export function PosterMediaPreviewModal({
   row,
   onClose,
@@ -521,15 +502,27 @@ export function PosterMediaPreviewModal({
   row: MaterialDraft | null;
   onClose: () => void;
 }) {
+  useEffect(() => {
+    if (!row) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, [row, onClose]);
   if (!row) return null;
-  const hasMedia = row.mediaSource.trim().length > 0;
-  const mediaUrl = mediaEndpoint('media', row);
-  const thumbUrl = mediaEndpoint('thumbnail', row);
-  const canStream = hasMedia && row.cacheStatus === 'ready' && Boolean(row.localFilePath);
+  const hasMedia = row.mediaSource.trim().length > 0,
+    mediaUrl = mediaEndpoint('media', row),
+    thumbUrl = mediaEndpoint('thumbnail', row),
+    canStream = hasMedia && row.cacheStatus === 'ready' && Boolean(row.localFilePath);
   return (
     <BackdropModal
       label={hasMedia ? '预览贴文素材媒体' : '预览贴文文案'}
       modalClass="!gap-0 !p-0 flex max-h-[88vh] w-[min(720px,92vw)] flex-col overflow-hidden"
+      blockEscape
       onClose={onClose}
     >
       <ModalHeading title={hasMedia ? '预览素材媒体' : '预览贴文文案'} onClose={onClose} />
@@ -538,26 +531,16 @@ export function PosterMediaPreviewModal({
           <div className="w-full rounded-xl border border-[var(--line)] bg-slate-50 p-4 text-sm leading-relaxed whitespace-pre-wrap">
             {row.caption.trim() || '（未填写发帖文案）'}
           </div>
-        ) : canStream ? (
-          row.mediaKind === 'video' ? (
-            <video controls autoPlay src={mediaUrl} className="max-h-[68vh] rounded-lg" />
-          ) : (
-            <img
-              src={mediaUrl}
-              alt={row.caption || row.mediaSource}
-              className="max-h-[68vh] rounded-lg object-contain"
-            />
-          )
-        ) : row.hasThumbnail ? (
+        ) : canStream && row.mediaKind === 'video' ? (
+          <video controls autoPlay src={mediaUrl} className="max-h-[68vh] rounded-lg" />
+        ) : canStream || row.hasThumbnail ? (
           <img
-            src={thumbUrl}
+            src={canStream ? mediaUrl : thumbUrl}
             alt={row.caption || row.mediaSource}
             className="max-h-[68vh] rounded-lg object-contain"
           />
         ) : (
-          <p className="text-xs text-[var(--text-3)]">
-            当前媒体尚未缓存就绪，保存或发帖时会自动准备。
-          </p>
+          <p className={UI_MUTED}>当前媒体尚未缓存就绪，保存或发帖时会自动准备。</p>
         )}
         {hasMedia && (
           <small className="text-xs break-all text-[var(--text-3)]">{row.mediaSource}</small>
@@ -566,7 +549,6 @@ export function PosterMediaPreviewModal({
     </BackdropModal>
   );
 }
-
 export function PosterMaterialEditModal({
   initial,
   isNew,
@@ -585,17 +567,17 @@ export function PosterMaterialEditModal({
   const [background, setBackground] = useState<PosterMaterialBackground>(initial.background);
   const [aiLabel, setAiLabel] = useState<PosterMaterialAiLabel>(initial.aiLabel ?? 'default');
   const [error, setError] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
+  const fileRef = useRef<HTMLInputElement>(null);
+  const title = isNew ? '新建贴文素材' : '编辑贴文素材';
   const handleSubmit = async () => {
     setError('');
-    const trimmedCaption = caption.trim();
-    const trimmedMedia = mediaSource.trim();
-    if (!trimmedCaption && !trimmedMedia) return setError('请至少填写发帖文案或选择图片/视频媒体');
-    let normalizedSource = trimmedMedia;
-    if (trimmedMedia) {
+    const cap = caption.trim(),
+      media = mediaSource.trim();
+    if (!cap && !media) return setError('请至少填写发帖文案或选择图片/视频媒体');
+    let src = media;
+    if (media) {
       try {
-        normalizedSource = mediaReference(trimmedMedia).source;
+        src = mediaReference(media).source;
       } catch (err) {
         return setError(errMsg(err, '媒体路径或链接格式无效'));
       }
@@ -603,29 +585,23 @@ export function PosterMaterialEditModal({
     if (
       await onSaveItem({
         ...initial,
-        caption: trimmedCaption,
-        mediaSource: normalizedSource,
-        background: normalizedSource ? 'plain' : background,
+        caption: cap,
+        mediaSource: src,
+        background: src ? 'plain' : background,
         aiLabel,
         createdAt: initial.createdAt || Date.now(),
       })
     )
       onClose();
   };
-
   return (
     <BackdropModal
-      label={isNew ? '新建贴文素材' : '编辑贴文素材'}
+      label={title}
       modalClass="!gap-0 !p-0 flex w-[min(620px,94vw)] flex-col overflow-hidden"
       busy={busy}
       onClose={onClose}
     >
-      <ModalHeading
-        title={isNew ? '新建贴文素材' : '编辑贴文素材'}
-        disabled={busy}
-        closeText="×"
-        onClose={onClose}
-      />
+      <ModalHeading title={title} disabled={busy} closeText="×" onClose={onClose} />
       <div className="flex flex-col gap-3 p-4">
         <Fld label="发帖文案">
           <textarea
@@ -637,7 +613,7 @@ export function PosterMaterialEditModal({
           />
         </Fld>
         <Fld label="画面媒体（本机图片/视频路径 或 Google Drive 分享链接，留空则为纯文字贴）">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className={UI_ROW}>
             <input
               type="text"
               className={`${UI_INPUT} min-w-0 flex-1`}
@@ -648,10 +624,10 @@ export function PosterMaterialEditModal({
                 if (e.target.value.trim()) setBackground('plain');
               }}
             />
-            <Btn onClick={() => fileInputRef.current?.click()}>浏览本机图片/视频…</Btn>
+            <Btn onClick={() => fileRef.current?.click()}>浏览本机图片/视频…</Btn>
             {mediaSource && <Btn onClick={() => setMediaSource('')}>清除媒体</Btn>}
             <input
-              ref={fileInputRef}
+              ref={fileRef}
               type="file"
               accept=".png,.jpg,.jpeg,.webp,.gif,.mp4,.mov,image/*,video/*"
               className="hidden"
@@ -659,10 +635,7 @@ export function PosterMaterialEditModal({
                 const file = e.target.files?.[0];
                 e.target.value = '';
                 if (!file) return;
-                const localPath = (
-                  window.workbenchDesktop?.materialFilePath?.(file) ||
-                  ((file as File & { path?: string }).path ?? '')
-                ).trim();
+                const localPath = resolveElectronFilePath(file);
                 if (!localPath)
                   return setError('当前环境未能读取本地文件路径，请直接在下方粘贴文件完整路径');
                 setMediaSource(localPath);
@@ -692,11 +665,7 @@ export function PosterMaterialEditModal({
           <option value="on">开启 AI 声明标签</option>
           <option value="off">关闭 AI 声明标签</option>
         </SelFld>
-        {error && (
-          <p className="m-0 text-xs font-medium text-rose-600" role="alert">
-            {error}
-          </p>
-        )}
+        <ErrText msg={error} />
       </div>
       <ModalFoot
         busy={busy}

@@ -20,18 +20,137 @@ import {
   type SheetGridRow,
   type SheetGridSnapshot,
 } from '../../shared/google-sheets.js';
+import { ProductError } from '../../domain/workspace.js';
 import type { BumperTarget } from '../../shared/group-bumper.js';
 import { shuffleArray } from '../module-worker-pool.js';
+import type { Workboard } from '../workboard.js';
 import type { WorkspaceService } from '../workspace-service.js';
 import {
   loadSheetColumnIndexMap,
   makeSheetRecordPost,
+  releaseProfile,
   safeAppendSheetLog,
   tryClaimProfile,
   wakeBrowserProfile,
   type GoogleSheetsContext,
 } from './gs-context-and-library.js';
-
+const STUCK_STATUS_RE = /^(?:蓝蝶)?发布中(?:\(([^)#]+)#[^)]*\))?…?\s*$/i;
+export async function resetStuckRowsForLink(
+  ctx: GoogleSheetsContext,
+  linkId: string,
+  options?: { onlyThisMachine?: boolean; allowDuringPollSetup?: boolean },
+): Promise<{ linkId: string; resetCount: number; rowNumbers: number[]; summary: string }> {
+  const link = await ctx.repo.getLink(linkId);
+  if (!link) throw new ProductError('SHEET_LINK_NOT_FOUND', '表格连接不存在', 404);
+  if (link.kind !== 'post_schedule')
+    throw new ProductError('SHEET_KIND_MISMATCH', '只有排贴表支持重置卡死行', 400);
+  const grid = await ctx.readGrid(link.id, { force: true });
+  const cols = resolveScheduleColumns(grid.headers);
+  if (cols.status < 0)
+    throw new ProductError('SHEET_HEADER_MISSING', '排贴表缺少「发布状态」列', 400);
+  const pcTag = ((await ctx.repo.getImageHostConfig()).defaultMachineName || '本机')
+    .trim()
+    .slice(0, 16)
+    .toLowerCase();
+  const rowNumbers: number[] = [];
+  const updates: Array<{ rowNumber: number; colIndex: number; value: string }> = [];
+  const codesToReset = new Set<string>();
+  for (const row of grid.rows) {
+    if (row.isHintRow) continue;
+    const statusText = (row.displayValues[cols.status] ?? '').trim();
+    const m = STUCK_STATUS_RE.exec(statusText);
+    if (!m) continue;
+    if (options?.onlyThisMachine) {
+      const rowMachine = (m[1] ?? '').trim().toLowerCase();
+      if (
+        !rowMachine ||
+        rowMachine !== pcTag ||
+        (!options.allowDuringPollSetup && ctx.runningScheduleLinks.has(link.id))
+      )
+        continue;
+    }
+    rowNumbers.push(row.rowNumber);
+    updates.push({ rowNumber: row.rowNumber, colIndex: cols.status, value: '待发布' });
+    const code = cols.resourceCode >= 0 ? (row.displayValues[cols.resourceCode] ?? '').trim() : '';
+    if (code) codesToReset.add(code);
+  }
+  if (updates.length) {
+    await ctx.deps.sheetsApi.batchUpdateCells(link.spreadsheetId, link.sheetName, updates);
+    ctx.invalidateGridCache(link.id);
+    for (const code of codesToReset) {
+      const prev = await ctx.repo.getScheduleItem(link.id, code);
+      if (prev) {
+        await ctx.repo.upsertScheduleItem({
+          ...prev,
+          status: prev.timelinePosted || prev.postedGroupCount > 0 ? 'partial' : 'pending',
+          attemptCount: 0,
+          nextRetryAt: null,
+          lastError: null,
+          errorMessage: options?.onlyThisMachine
+            ? '启动检测到上次遗留发布中状态，已自动重置待续跑'
+            : '已手动重置卡死状态，等待重新调度',
+          updatedAt: ctx.nowFn(),
+        });
+      }
+    }
+  }
+  const summary = updates.length
+    ? `${options?.onlyThisMachine ? '自动恢复' : '已重置'} ${updates.length} 条卡死排贴行`
+    : '未发现处于卡死发布中的排贴行';
+  if (updates.length) {
+    await safeAppendSheetLog(ctx, link.id, 'warn', 'schedule_reset_stuck', summary);
+    await ctx.repo.updateLinkRuntime(link.id, { lastSyncSummary: summary });
+  }
+  return { linkId: link.id, resetCount: updates.length, rowNumbers, summary };
+}
+export const SCHEDULE_RETRY_BACKOFF_MS = [2 * 60_000, 6 * 60_000, 18 * 60_000] as const;
+export const SCHEDULE_MAX_ATTEMPTS = 3;
+export const isTerminalScheduleError = (message: string): boolean =>
+  /受限|restricted|verification|logged-out|checkpoint|RISK_LIMIT|日限额|未匹配到可发布的目标小组|未找到当前专页|未找到匹配专页|可用蓝蝶模拟器|对应的浏览器/i.test(
+    message,
+  );
+export function computeScheduleRetryState(
+  prevAttempts: number,
+  errorMsg: string,
+  nowMs: number,
+  hasPartialProgress: boolean,
+): {
+  terminal: boolean;
+  status: 'pending' | 'partial' | 'failed';
+  attemptCount: number;
+  nextRetryAt: number | null;
+  delayMs: number;
+  sheetStatus: string;
+} {
+  const attemptCount = Math.max(0, prevAttempts) + 1;
+  const terminal = isTerminalScheduleError(errorMsg) || attemptCount >= SCHEDULE_MAX_ATTEMPTS;
+  if (terminal) {
+    const suffix =
+      !isTerminalScheduleError(errorMsg) && attemptCount >= SCHEDULE_MAX_ATTEMPTS
+        ? `已重试${SCHEDULE_MAX_ATTEMPTS}次仍失败·${errorMsg.slice(0, 32)}`
+        : errorMsg.slice(0, 48);
+    return {
+      terminal: true,
+      status: hasPartialProgress ? 'partial' : 'failed',
+      attemptCount,
+      nextRetryAt: null,
+      delayMs: 0,
+      sheetStatus: `失败：${suffix}`,
+    };
+  }
+  const delayMs =
+    SCHEDULE_RETRY_BACKOFF_MS[Math.min(attemptCount - 1, SCHEDULE_RETRY_BACKOFF_MS.length - 1)] ??
+    18 * 60_000;
+  const mins = Math.max(1, Math.round(delayMs / 60_000));
+  return {
+    terminal: false,
+    status: hasPartialProgress ? 'partial' : 'pending',
+    attemptCount,
+    nextRetryAt: nowMs + delayMs,
+    delayMs,
+    sheetStatus: `待重试(${attemptCount}/${SCHEDULE_MAX_ATTEMPTS}·${mins}m后)：${errorMsg.slice(0, 28)}`,
+  };
+}
 export interface DueScheduleRow {
   row: SheetGridRow;
   pageId: string;
@@ -46,8 +165,8 @@ export interface DueScheduleRow {
   existingThumbnailUrl: string | null;
   prevTimelinePosted: boolean;
   prevPostedGroupIds: string[];
+  prevAttemptCount: number;
 }
-
 const makeStubTarget = (id: string, name: string): BumperTarget => ({
   id,
   name,
@@ -58,7 +177,6 @@ const makeStubTarget = (id: string, name: string): BumperTarget => ({
   createdAt: 0,
   updatedAt: 0,
 });
-
 export const resolvePageDisplayName = async (
   ctx: GoogleSheetsContext,
   pageId: string,
@@ -69,7 +187,6 @@ export const resolvePageDisplayName = async (
   )?.name ||
   fallback ||
   pageId;
-
 export async function updateScheduleRowByKey(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -103,10 +220,15 @@ export async function updateScheduleRowByKey(
       resourceCode.trim(),
     );
     if (found) rowNumber = found;
-    else if (!allowInitialRowHint) return;
+    else if (!allowInitialRowHint)
+      throw new Error(`排贴表回写定位失败：未找到资源编号 [${resourceCode}]`);
   } else if (hintRowNumber >= 2) rowNumber = hintRowNumber;
-  if (rowNumber === null || rowNumber < 2) return;
-
+  if (rowNumber === null || rowNumber < 2)
+    throw new Error(`排贴表回写失败：行号无效 [${resourceCode}]`);
+  if (patch.status !== undefined && cols.status < 0)
+    throw new Error('排贴表缺少「发布状态」列，无法回写状态');
+  if (patch.resourceCode !== undefined && cols.resourceCode < 0)
+    throw new Error('排贴表缺少「资源编号」列，无法回写编号');
   const updates = (
     [
       [patch.resourceCode, cols.resourceCode],
@@ -117,12 +239,10 @@ export async function updateScheduleRowByKey(
   ).flatMap(([value, colIndex]) =>
     value !== undefined && colIndex >= 0 ? [{ rowNumber, colIndex, value }] : [],
   );
-  if (updates.length) {
-    await ctx.deps.sheetsApi.batchUpdateCells(link.spreadsheetId, link.sheetName, updates);
-    ctx.invalidateGridCache(link.id);
-  }
+  if (!updates.length) throw new Error(`排贴表无可回写字段 [${resourceCode}]`);
+  await ctx.deps.sheetsApi.batchUpdateCells(link.spreadsheetId, link.sheetName, updates);
+  ctx.invalidateGridCache(link.id);
 }
-
 export async function collectDueScheduleRows(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -134,14 +254,13 @@ export async function collectDueScheduleRows(
   const dueRows: DueScheduleRow[] = [];
   const cell = (row: SheetGridRow, idx: number) =>
     idx >= 0 ? (row.displayValues[idx] ?? '').trim() : '';
-
   for (const row of grid.rows) {
     if (row.isHintRow) continue;
     const statusText = cell(row, cols.status);
     const isExplicitRetry = /^(?:重试|重試|retry)$/i.test(statusText);
     if (
       statusText !== '' &&
-      !/^(?:待发布|待發佈|待执行|待執行|等待|pending)$/i.test(statusText) &&
+      !/^(?:待发布|待發佈|待执行|待執行|等待|pending|待重试)/i.test(statusText) &&
       !isExplicitRetry
     )
       continue;
@@ -158,7 +277,6 @@ export async function collectDueScheduleRows(
     const groupsSpecRaw = cell(row, cols.groupsSpec);
     const extraCategory = cell(row, cols.groupCategory) || null;
     if (!postTimeline && parseGroupsSpec(groupsSpecRaw, extraCategory).mode === 'none') continue;
-
     const existingResourceCode = cell(row, cols.resourceCode);
     const prev = existingResourceCode
       ? await ctx.repo.getScheduleItem(link.id, existingResourceCode)
@@ -166,12 +284,30 @@ export async function collectDueScheduleRows(
     if (prev && (prev.status === 'completed' || prev.status === 'running')) continue;
     if (
       prev &&
-      (prev.status === 'failed' || prev.status === 'partial') &&
+      prev.status === 'failed' &&
       !isExplicitRetry &&
       !(manualTrigger && statusText === '')
     )
       continue;
-
+    if (
+      prev &&
+      prev.status === 'partial' &&
+      !isExplicitRetry &&
+      !(manualTrigger && statusText === '') &&
+      (prev.nextRetryAt == null || (prev.attemptCount ?? 0) >= SCHEDULE_MAX_ATTEMPTS)
+    )
+      continue;
+    if (prev && !isExplicitRetry && prev.nextRetryAt != null) {
+      if ((prev.attemptCount ?? 0) >= SCHEDULE_MAX_ATTEMPTS) continue;
+      if (now < prev.nextRetryAt) continue;
+    }
+    if (
+      prev &&
+      prev.status === 'pending' &&
+      !isExplicitRetry &&
+      (prev.attemptCount ?? 0) >= SCHEDULE_MAX_ATTEMPTS
+    )
+      continue;
     if (!manualTrigger && !isExplicitRetry && !prev && now - scheduledAt > 60 * 60_000) {
       const expiredCode = existingResourceCode || generateResourceCode(scheduledAt);
       await updateScheduleRowByKey(
@@ -192,7 +328,6 @@ export async function collectDueScheduleRows(
       );
       continue;
     }
-
     dueRows.push({
       row,
       pageId,
@@ -209,31 +344,68 @@ export async function collectDueScheduleRows(
       ),
       prevTimelinePosted: Boolean(prev?.timelinePosted),
       prevPostedGroupIds: [...(prev?.postedGroupIds ?? [])],
+      prevAttemptCount: isExplicitRetry ? 0 : (prev?.attemptCount ?? 0),
     });
   }
   return dueRows;
 }
-
+interface ManagedIdentityLike {
+  id?: string | null;
+  name?: string | null;
+  identityType?: 'personal' | 'page' | string;
+}
+type ProfileWithOptionalManaged = Awaited<
+  ReturnType<WorkspaceService['snapshot']>
+>['profiles'][number] & {
+  managedIdentities?: readonly ManagedIdentityLike[];
+  account: Awaited<ReturnType<WorkspaceService['snapshot']>>['profiles'][number]['account'] & {
+    managedIdentities?: readonly ManagedIdentityLike[];
+  };
+};
 export async function findOrWakeProfileForPage(
   ctx: GoogleSheetsContext,
   pageId: string,
   linkId: string,
   linkTitle: string,
+  pageName?: string | null,
+  workboard?: Workboard,
 ): Promise<
   | {
       status: 'found';
       profile: Awaited<ReturnType<WorkspaceService['snapshot']>>['profiles'][number];
       wokeFromOffline: boolean;
+      needsPageSwitch: boolean;
     }
   | { status: 'busy'; label: string }
+  | { status: 'risk_limited'; reason: string }
   | { status: 'not_found' }
 > {
   const norm = pageId.trim().toLowerCase();
-  const candidates = (await ctx.deps.workspace.snapshot()).profiles.filter(
-    (p) =>
-      (p.account.id ?? '').trim().toLowerCase() === norm &&
-      !['restricted', 'verification', 'logged-out'].includes(p.account.state),
+  const normName = (pageName ?? '').trim().toLowerCase();
+  const allProfiles = (await ctx.deps.workspace.snapshot())
+    .profiles as ProfileWithOptionalManaged[];
+  const eligible = allProfiles.filter(
+    (p) => !['restricted', 'verification', 'logged-out'].includes(p.account.state),
   );
+  const directMatches = eligible
+    .filter((p) => (p.account.id ?? '').trim().toLowerCase() === norm)
+    .map((p) => ({ profile: p, needsPageSwitch: false }));
+  const directSet = new Set(directMatches.map((m) => m.profile.id));
+  const managedMatches = eligible
+    .filter((p) => {
+      if (directSet.has(p.id)) return false;
+      const list = p.managedIdentities ?? p.account.managedIdentities ?? [];
+      return list.some(
+        (m) =>
+          m.identityType !== 'personal' &&
+          (((m.id ?? '').trim().toLowerCase() === norm && Boolean(norm)) ||
+            (Boolean(normName) &&
+              normName !== norm &&
+              (m.name ?? '').trim().toLowerCase() === normName)),
+      );
+    })
+    .map((p) => ({ profile: p, needsPageSwitch: true }));
+  const candidates = [...directMatches, ...managedMatches];
   if (!candidates.length) return { status: 'not_found' };
   const claimMeta = {
     linkId,
@@ -242,26 +414,73 @@ export async function findOrWakeProfileForPage(
     status: '准备排贴发布…',
   };
   let sawBusyLabel: string | null = null;
-  for (const p of candidates) {
+  let riskLimitedReason: string | null = null;
+  const checkRiskOk = async (pid: string): Promise<boolean> => {
+    if (!ctx.deps.checkDailyRiskLimit) return true;
+    const res = await Promise.resolve(ctx.deps.checkDailyRiskLimit(pid, 'post'));
+    if (!res.allowed) {
+      riskLimitedReason = res.reason ?? '今日已达浏览器发帖日限额，自动休眠保护';
+      return false;
+    }
+    return true;
+  };
+  for (const { profile: p, needsPageSwitch } of candidates) {
     if (!p.online) continue;
+    if (!(await checkRiskOk(p.id))) continue;
     if (await tryClaimProfile(ctx, p.id, claimMeta))
-      return { status: 'found', profile: p, wokeFromOffline: false };
+      return { status: 'found', profile: p, wokeFromOffline: false, needsPageSwitch };
     sawBusyLabel = p.browserName || p.alias || p.id;
   }
-  const offline = candidates.find((p) => !p.online);
-  if (
-    offline &&
-    (await wakeBrowserProfile(ctx, offline.id, () => ctx.cancelledLinks.has(linkId)))
-  ) {
-    const ready = (await ctx.deps.workspace.snapshot()).profiles.find(
-      (p) => p.id === offline.id && p.online,
-    );
-    if (ready && (await tryClaimProfile(ctx, ready.id, claimMeta)))
-      return { status: 'found', profile: ready, wokeFromOffline: true };
+  for (const { profile: offline, needsPageSwitch } of candidates) {
+    if (offline.online) continue;
+    if (!(await checkRiskOk(offline.id))) continue;
+    // Atomic synchronous claim BEFORE launching offline Chrome to eliminate TOCTOU / leaked windows
+    if (!(await tryClaimProfile(ctx, offline.id, claimMeta))) {
+      sawBusyLabel = sawBusyLabel ?? (offline.browserName || offline.alias || offline.id);
+      continue;
+    }
+    try {
+      const wakeFn = () =>
+        wakeBrowserProfile(ctx, offline.id, () => ctx.cancelledLinks.has(linkId));
+      const woke = workboard
+        ? await workboard.runStaggeredLaunch(new AbortController().signal, wakeFn)
+        : await wakeFn();
+      if (woke) {
+        const ready = (await ctx.deps.workspace.snapshot()).profiles.find(
+          (p) => p.id === offline.id && p.online,
+        );
+        if (ready)
+          return { status: 'found', profile: ready, wokeFromOffline: true, needsPageSwitch };
+      }
+      releaseProfile(ctx, offline.id, linkId);
+    } catch (err) {
+      releaseProfile(ctx, offline.id, linkId);
+      throw err;
+    }
   }
-  return sawBusyLabel ? { status: 'busy', label: sawBusyLabel } : { status: 'not_found' };
+  if (sawBusyLabel) return { status: 'busy', label: sawBusyLabel };
+  if (riskLimitedReason) return { status: 'risk_limited', reason: riskLimitedReason };
+  return { status: 'not_found' };
 }
-
+export async function switchChromeProfilePageIfNeeded(
+  ctx: GoogleSheetsContext,
+  opts: {
+    profileId: string;
+    needsPageSwitch: boolean;
+    targetPageId: string;
+    targetPageName?: string;
+  },
+): Promise<void> {
+  if (!opts.needsPageSwitch) return;
+  const switcher = ctx.deps.automation?.switchProfilePageIdentity;
+  if (!switcher) return;
+  const ok = await switcher({
+    profileId: opts.profileId,
+    targetPageId: opts.targetPageId,
+    ...(opts.targetPageName ? { targetPageName: opts.targetPageName } : {}),
+  });
+  if (!ok) throw new Error(`未能切换至目标专页（${opts.targetPageName || opts.targetPageId}）`);
+}
 export async function findBluestacksInstanceForPage(
   ctx: GoogleSheetsContext,
   pageId: string,
@@ -322,7 +541,6 @@ export async function findBluestacksInstanceForPage(
     if (await tryClaimProfile(ctx, inst.id, claimMeta)) return { status: 'found', instance: inst };
   return { status: 'busy', label: ordered[0] ? bluestacksDisplayTitle(ordered[0]) : pageId };
 }
-
 export async function buildScheduleTargets(
   ctx: GoogleSheetsContext,
   pageName: string,
@@ -366,7 +584,6 @@ export async function buildScheduleTargets(
   targets.push(...shuffleArray(pool).slice(0, remainingCount));
   return targets;
 }
-
 export async function appendPostToRecordsSheet(
   ctx: GoogleSheetsContext,
   recordLinkId: string,

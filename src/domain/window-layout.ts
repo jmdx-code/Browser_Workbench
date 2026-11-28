@@ -6,11 +6,6 @@ import type {
   TileDisplayConfig,
 } from '../shared/window-layout.js';
 const clamp = (min: number, max: number, v: number) => Math.max(min, Math.min(max, v));
-const sortByDistance = (rect: Rect, list: Rect[]) =>
-  [...new Map(list.map((r) => [`${r.x}:${r.y}`, r])).values()].sort(
-    (a, b) =>
-      (a.x - rect.x) ** 2 + (a.y - rect.y) ** 2 - ((b.x - rect.x) ** 2 + (b.y - rect.y) ** 2),
-  );
 const clampRect = (
   r: { width: number; height: number },
   x: number,
@@ -38,41 +33,6 @@ export function fitTaskWindow(rect: Rect, display: LayoutScreen): Rect {
     rect.y,
     a,
   );
-}
-export function taskWindowPositions(
-  rect: Rect,
-  peers: readonly { rect: Rect; contentInsets?: TaskWindow['contentInsets'] }[],
-  display: LayoutScreen,
-  step: number,
-): Rect[] {
-  const a = display.workArea,
-    stride =
-      step +
-      Math.max(
-        0,
-        ...peers.map((w) => Math.max(w.contentInsets?.left ?? 0, w.contentInsets?.bottom ?? 0)),
-      ),
-    overlaps: Rect[] = [];
-  for (const p of peers)
-    for (const x of [p.rect.x, p.rect.x + p.rect.width - rect.width])
-      for (const y of [p.rect.y, p.rect.y + p.rect.height - rect.height])
-        for (const dx of [-stride, stride])
-          for (const dy of [-stride, stride]) {
-            const c = { ...rect, x: x + dx, y: y + dy };
-            if (
-              c.x >= a.x + 12 &&
-              c.y >= a.y + 12 &&
-              c.x + c.width <= a.x + a.width - 12 &&
-              c.y + c.height <= a.y + a.height - 12
-            )
-              overlaps.push(c);
-          }
-  return sortByDistance(rect, [
-    ...overlaps,
-    ...[a.x + 12, a.x + a.width - 12 - rect.width].flatMap((x) =>
-      [a.y + 12, a.y + a.height - 12 - rect.height].map((y) => ({ ...rect, x, y })),
-    ),
-  ]);
 }
 export function reservedLayoutDisplay(
   display: LayoutScreen,
@@ -234,15 +194,10 @@ interface DisplayTilePlanEntry {
   slots: Rect[];
   slotWindowIndices: number[][];
 }
-export function computeMultiDisplayTilePlan(
-  count: number,
+function resolveActiveTileDisplays(
   displays: readonly LayoutScreen[],
   tileConfigs?: readonly TileDisplayConfig[],
-  gap = 8,
-  overflow: 'wrap' | 'keep' = 'wrap',
-): { entries: DisplayTilePlanEntry[]; rects: Array<Rect | null> } {
-  if (count <= 0 || !displays.length)
-    return { entries: [], rects: Array.from({ length: Math.max(0, count) }, () => null) };
+): Array<{ display: LayoutScreen; config: TileDisplayConfig }> {
   const byId = new Map(displays.map((d) => [d.id, d])),
     active = (tileConfigs ?? []).flatMap((c) => {
       const d = byId.get(c.displayId);
@@ -256,6 +211,41 @@ export function computeMultiDisplayTilePlan(
         config: { displayId: primary.id, enabled: true, rows: 0, cols: 0, startSlot: 1 },
       });
   }
+  return active;
+}
+export function computeTileSlotCapacity(
+  displays: readonly LayoutScreen[],
+  tileConfigs?: readonly TileDisplayConfig[],
+): number {
+  const active = resolveActiveTileDisplays(displays, tileConfigs);
+  if (!active.length) return 1;
+  let total = 0;
+  for (const { config } of active) {
+    if (config.rows > 0 && config.cols > 0) {
+      const cap = clamp(1, 8, Math.floor(config.rows)) * clamp(1, 8, Math.floor(config.cols));
+      const startIdx = clamp(0, Math.max(0, cap - 1), config.startSlot - 1);
+      total += Math.max(0, cap - startIdx);
+    } else {
+      const autoCap = Math.max(
+        4,
+        config.rows > 0 ? config.rows * 2 : config.cols > 0 ? config.cols * 2 : 4,
+      );
+      const startIdx = clamp(0, autoCap - 1, config.startSlot - 1);
+      total += Math.max(1, autoCap - startIdx);
+    }
+  }
+  return Math.max(1, total);
+}
+export function computeMultiDisplayTilePlan(
+  count: number,
+  displays: readonly LayoutScreen[],
+  tileConfigs?: readonly TileDisplayConfig[],
+  gap = 8,
+  overflow: 'wrap' | 'keep' = 'wrap',
+): { entries: DisplayTilePlanEntry[]; rects: Array<Rect | null> } {
+  if (count <= 0 || !displays.length)
+    return { entries: [], rects: Array.from({ length: Math.max(0, count) }, () => null) };
+  const active = resolveActiveTileDisplays(displays, tileConfigs);
   const entries: DisplayTilePlanEntry[] = [],
     pool: Array<{ rect: Rect; display: LayoutScreen; entryIndex: number; slotIndex: number }> = [];
   let rem = count;

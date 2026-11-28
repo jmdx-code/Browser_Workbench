@@ -328,10 +328,7 @@ export class SoftwareUpdateBackend {
           rootDir: runtime,
           softwareVersion: release.softwareVersion,
         }).catch((err: unknown) => {
-          devDiag.record({
-            level: 'WARN',
-            category: 'SYSTEM',
-            event: 'AI_WORKSPACE_SYNC_FAILED',
+          devDiag.emit('WARN', 'SYSTEM', 'AI_WORKSPACE_SYNC_FAILED', {
             reason: err instanceof Error ? err.message : 'SYNC_FAILED',
           });
         });
@@ -347,9 +344,7 @@ export class SoftwareUpdateBackend {
             ),
           );
       }
-      if (moved) {
-        await this.renameWithRetry(previous, runtime).catch(() => {});
-      }
+      if (moved) await this.renameWithRetry(previous, runtime).catch(() => {});
       throw error;
     } finally {
       await rm(stage, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 }).catch(

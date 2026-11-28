@@ -1,10 +1,8 @@
 import { bluestacksDisplayTitle, isBluestacksPortraitResolution } from '../../shared/bluestacks.js';
 import * as M from './mcp-context.js';
-
 const BS_ACTIONS =
   'state refresh launch close show arrange install_apk inspect switch_identity rename_instance save_paths save_settings save_page_settings save_risk_limits save_comments logs start_active stop_active start_poster stop_poster start_bumper stop_bumper start_page_bumper stop_page_bumper start_inviter stop_inviter start_health_check stop_health_check stop_all';
 type BsState = Awaited<ReturnType<M.WorkbenchMcpDependencies['bluestacksService']['state']>>;
-
 async function formatBsState(
   deps: M.WorkbenchMcpDependencies,
   st: BsState,
@@ -44,7 +42,6 @@ async function formatBsState(
     })),
   };
 }
-
 async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const action = M.strArg(args.action) || 'state';
   const scopeMode: 'group' | 'page' =
@@ -59,7 +56,10 @@ async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<s
     rawQueries.length === 0
       ? []
       : M.resolveBluestacksInstanceIds((await bs.state(force)).instances, rawQueries);
-  const optIds = async () => ((await resolveIds(false)).length > 0 ? resolveIds(false) : undefined);
+  const optIds = async () => {
+    const ids = await resolveIds(false);
+    return ids.length > 0 ? ids : undefined;
+  };
   const reqIds = async (force = false, single = false) => {
     M.req(
       rawQueries.length > 0,
@@ -75,7 +75,6 @@ async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<s
     if (args.autoAddMissingTargets !== false) await M.ensureBumperTargets(deps, groupIds, pageIds);
     return { ids, groupIds, pageIds };
   };
-
   if (action === 'save_settings' || action === 'save_page_settings') {
     const cur = await bs.state(false);
     const merged = {
@@ -149,7 +148,6 @@ async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<s
       });
     return { mode: scopeMode, bluestacksOnly: bsOnly, count: logs.length, logs };
   }
-
   const stateHandlers: Record<string, () => Promise<BsState>> = {
     state: () => bs.state(false),
     refresh: () => bs.state(true),
@@ -206,10 +204,7 @@ async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<s
       const { ids: profileIds, pageIds } = await prepRun(false, true);
       return bs.startPageBumper({ profileIds, pageIds });
     },
-    stop_bumper: async () => {
-      const ids = await optIds();
-      return bs.stopBumper(ids, ids ? undefined : 'group');
-    },
+    stop_bumper: async () => bs.stopBumper(await optIds(), scopeMode),
     stop_page_bumper: async () => bs.stopBumper(await optIds(), 'page'),
     save_paths: () => {
       const p: Record<string, unknown> = {};
@@ -243,14 +238,13 @@ async function handleBluestacks(deps: M.WorkbenchMcpDependencies, args: Record<s
   };
   return render(await (stateHandlers[action] ?? (() => bs.state(false)))());
 }
-
 export function createBluestacksTools(deps: M.WorkbenchMcpDependencies): M.McpToolDefinition[] {
   return [
     M.reg(
       'wb_bluestacks_control',
       '控制与监控蓝蝶模拟器多开全功能。',
       M.sp(
-        `@groupIds|@pageIds|@autoAddMissingTargets|@settings|@comments|@consumeCommentOnUse|@includeComments|@search|@limit|action:e(${BS_ACTIONS}):操作类型|mode:e(group page):顶贴作用域|instanceIds:sa:实例标识列表|instanceId:s:单个实例标识|alias:u(string null):实例备注名|installDir:u(string null):蓝蝶安装目录|confPath:u(string null):conf路径|apkPath:u(string null):APK路径|columns:n(1,8):平铺列数|gap:n(0,40):平铺间距|targetName:s:目标身份名|targetType:e(personal page):身份类型|combinationId:s:活跃组合ID|quickStep:o:快捷单步|closeWindowOnFinish:b:完后关窗|materialIds:sa:发帖素材ID|maxGroupsPerInstance:n(1,50):单台发帖上限|postToTimeline:b:发到时间线|invitesPerGroup:n(1,50):每组邀请上限|bluestacksOnly:b:仅蓝蝶记录|maxConcurrency:n(1,10):体检并发|autoLaunch:b:自动拉起窗口|autoInstallApk:b:自动装包|closeOnFinish:b:体检后关窗|riskLimits:o:风控限额`,
+        `@groupIds|@pageIds|@autoAddMissingTargets|@settings|@comments|@consumeCommentOnUse|@includeComments|@search|@limit|action:e(${BS_ACTIONS}):操作类型|mode:e(group page):顶贴作用域|instanceIds:sa:实例标识列表|instanceId:s:单个实例标识|alias:u(string null):实例备注名|installDir:u(string null):蓝蝶安装目录|confPath:u(string null):conf路径|apkPath:u(string null):APK路径|columns:n(1,10):平铺列数|gap:n(0,40):平铺间距|targetName:s:目标身份名|targetType:e(personal page):身份类型|combinationId:s:活跃组合ID|quickStep:o:快捷单步|closeWindowOnFinish:b:完后关窗|materialIds:sa:发帖素材ID|maxGroupsPerInstance:n(1,50):单台发帖上限|postToTimeline:b:发到时间线|invitesPerGroup:n(1,50):每组邀请上限|bluestacksOnly:b:仅蓝蝶记录|maxConcurrency:n(1,10):体检并发|autoLaunch:b:自动拉起窗口|autoInstallApk:b:自动装包|closeOnFinish:b:体检后关窗|riskLimits:o:风控限额`,
       ),
       (args) => handleBluestacks(deps, args),
       { req: 'action' },

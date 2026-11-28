@@ -1,6 +1,6 @@
 import type { GlobalAccountAbnormalReporter } from '../application/account-abnormal-reporter.js';
 import type { TaskExecutionPort } from '../application/task-service.js';
-import { isWorkAbortError, Workboard } from '../application/workboard.js';
+import { isWorkAbortError, sleepAbortable, Workboard } from '../application/workboard.js';
 import type { Core, Peer } from '../bridge/core.js';
 import { hasResource } from '../domain/resource-table.js';
 import type { Awaitable } from '../domain/persistence.js';
@@ -12,6 +12,7 @@ import type { Profile, Step } from '../shared/contracts.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { Assignment, Plan, TaskCapabilities, TaskCommand } from '../shared/task-contracts.js';
 import type { TaskFeatureId } from '../shared/task-policies.js';
+import { TEST_COMBINATION_NOTE } from '../shared/task-tests.js';
 import { isAccountAbnormalError, withBrowserSession } from './browser-session-lease.js';
 import { executeDirectPostStep } from './facebook-direct-publisher.js';
 import type { KernelBridge } from './kernel-bridge.js';
@@ -45,42 +46,10 @@ export interface ActiveAccountRuntimeOptions {
 export class ActiveAccountRuntime implements TaskExecutionPort {
   private readonly claimedSourceKeys = new Set<string>();
   private readonly activePlanByProfile = new Map<string, string>();
-  private readonly scheduleTimer: ReturnType<typeof setInterval>;
   private closed = false;
-  private scheduleTickBusy = false;
-  constructor(private readonly options: ActiveAccountRuntimeOptions) {
-    this.scheduleTimer = setInterval(() => {
-      if (this.closed || this.scheduleTickBusy) return;
-      this.scheduleTickBusy = true;
-      void this.tickSchedules()
-        .catch(() => {})
-        .finally(() => {
-          this.scheduleTickBusy = false;
-        });
-    }, 1000);
-    this.scheduleTimer.unref?.();
-    void this.syncConcurrencyLimit().catch(() => {});
-  }
-  private async syncConcurrencyLimit(): Promise<void> {
-    const settings = await this.options.store.tasks.settings();
-    this.options.workboard.browserPermits.setLimit(settings.maxConcurrentProfiles);
-  }
-  private async tickSchedules(): Promise<void> {
-    await this.syncConcurrencyLimit();
-    await this.options.store.tasks.releaseScheduled();
-    const live = await this.options.store.tasks.livePlans();
-    for (const plan of live) {
-      if (this.closed) break;
-      if (plan.state !== 'QUEUED') continue;
-      if (plan.timing && !plan.timingReleased) continue;
-      if (!this.options.workboard.isCarrierBusy(plan.profileId)) {
-        this.spawnSoldier(plan.profileId);
-      }
-    }
-  }
+  constructor(private readonly options: ActiveAccountRuntimeOptions) {}
   async close(): Promise<void> {
     this.closed = true;
-    clearInterval(this.scheduleTimer);
     this.options.workboard.abortModule('active-accounts', 'SHUTDOWN');
     await this.options.workboard.waitUntilModuleIdle('active-accounts', 8_000);
   }
@@ -125,7 +94,7 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
       saved
         .filter(
           (combo): combo is typeof combo & { saved: NonNullable<typeof combo.saved> } =>
-            combo.saved !== null,
+            combo.saved !== null && !combo.saved.note.startsWith(TEST_COMBINATION_NOTE),
         )
         .map(async (combo) => {
           const missingType = combo.saved.steps.find((s) => !types.includes(s.type));
@@ -154,12 +123,7 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
               };
             }
           }
-          return {
-            id: combo.id,
-            version: combo.version,
-            enabled: true,
-            reason: '',
-          };
+          return { id: combo.id, version: combo.version, enabled: true, reason: '' };
         }),
     );
     return { types, combinations };
@@ -177,33 +141,29 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
   }
   async start(input: Assignment): Promise<Plan[]> {
     this.options.beforeStart?.();
-    await this.syncConcurrencyLimit();
     const profiles = await this.runtimeProfiles();
     const plans = await this.options.store.tasks.assign(input, profiles);
     const seenProfiles = new Set<string>();
     for (const plan of plans) {
       if (seenProfiles.has(plan.profileId)) continue;
       seenProfiles.add(plan.profileId);
-      if (plan.state === 'QUEUED' && (!plan.timing || plan.timingReleased)) {
-        this.spawnSoldier(plan.profileId);
-      }
+      if (plan.state === 'QUEUED') this.spawnSoldier(plan.profileId);
     }
     return plans;
   }
   async stopProfile(profileId: string): Promise<void> {
     this.options.workboard.abortCarrier(profileId, 'USER_STOP');
-    const plans = await this.options.store.tasks.plansForProfile(profileId, ['QUEUED', 'RUNNING']);
-    for (const plan of plans) {
-      try {
-        await this.options.store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
-      } catch {}
-    }
-    await this.options.workboard.waitUntilCarrierIdle(profileId, 8_000);
+    const tasks = this.options.store.tasks;
+    const stopPlans = Promise.resolve(tasks.plansForProfile(profileId, ['QUEUED', 'RUNNING']))
+      .then((ps) =>
+        Promise.all(
+          ps.map((p) => Promise.resolve(tasks.stopPlanDirect(p.id, 'USER_STOP')).catch(() => {})),
+        ),
+      )
+      .catch(() => {});
+    await Promise.all([stopPlans, this.options.workboard.waitUntilCarrierIdle(profileId, 3_000)]);
   }
-  async commandPlan(planId: string, command: TaskCommand['command']): Promise<Plan> {
-    if (command === 'resume') {
-      throw new ProductError('TASK_RESUME_REMOVED', '已精简暂停状态，请直接重新启动任务', 409);
-    }
+  async commandPlan(planId: string, _command: TaskCommand['command']): Promise<Plan> {
     const plan = await this.options.store.tasks.get(planId);
     if (['STOPPED', 'COMPLETED', 'FAILED'].includes(plan.state)) return plan;
     this.options.workboard.abortCarrier(plan.profileId, 'USER_STOP');
@@ -223,8 +183,14 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
       .catch(() => {});
   }
   private async runSoldierLoop(profileId: string, signal: AbortSignal): Promise<void> {
+    let busyBackoffMs = 3_000;
     while (!this.closed && !signal.aborted) {
-      const releasePermit = await this.options.workboard.browserPermits.acquire(signal);
+      let waitAfterReleaseMs = 0;
+      const releasePermit = await this.options.workboard.acquireCarrierPermit(
+        'browser',
+        profileId,
+        signal,
+      );
       let activePlanId: string | null = null;
       let activePlan: Plan | null = null;
       try {
@@ -244,7 +210,16 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
           profileId,
           initialAccountId,
         );
-        if (!claimed) break;
+        if (!claimed) {
+          const queued = await this.options.store.tasks.plansForProfile(profileId, ['QUEUED']);
+          if (queued.some((p) => p.reason === 'ACCOUNT_BUSY')) {
+            waitAfterReleaseMs = busyBackoffMs;
+            busyBackoffMs = Math.min(15_000, Math.round(busyBackoffMs * 1.6));
+            continue;
+          }
+          break;
+        }
+        busyBackoffMs = 3_000;
         let currentPlan: Plan = claimed;
         activePlan = currentPlan;
         activePlanId = currentPlan.id;
@@ -321,10 +296,7 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
                       currentPlan = await this.options.store.tasks.completeStepDirect(
                         currentPlan.id,
                         step.id,
-                        {
-                          ...step.progress,
-                          published: postResult.published,
-                        },
+                        { ...step.progress, published: postResult.published },
                       );
                     }
                   } else {
@@ -364,11 +336,19 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
                   ) {
                     throw stepError;
                   }
+                  const businessResult =
+                    step.spec.type === 'post'
+                      ? /PUBLISH_RESULT_UNCONFIRMED|SUBMIT_DISPATCHED|OPERATION_RESULT_UNCONFIRMED|UNKNOWN/i.test(
+                          msg,
+                        )
+                        ? 'UNKNOWN'
+                        : 'NOT_PUBLISHED'
+                      : 'NOT_APPLICABLE';
                   currentPlan = await this.options.store.tasks.failStepDirect(
                     currentPlan.id,
                     step.id,
                     msg,
-                    'NOT_APPLICABLE',
+                    businessResult,
                   );
                   activePlan = currentPlan;
                 }
@@ -376,6 +356,19 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
             },
           );
         } catch (err) {
+          const isAccountBusy =
+            (err instanceof ProductError && err.code === 'ACCOUNT_BUSY') ||
+            (err instanceof Error && /ACCOUNT_BUSY/i.test(err.message));
+          if (isAccountBusy && !signal.aborted) {
+            try {
+              if (this.options.store.tasks.requeueBusyAccountPlan) {
+                await this.options.store.tasks.requeueBusyAccountPlan(activePlan.id);
+              } else await this.options.store.tasks.noteQueuedWait?.(activePlan.id, 'ACCOUNT_BUSY');
+            } catch {}
+            waitAfterReleaseMs = busyBackoffMs;
+            busyBackoffMs = Math.min(15_000, Math.round(busyBackoffMs * 1.6));
+            continue;
+          }
           if (isWorkAbortError(err) || signal.aborted) {
             const abortReason =
               typeof signal.reason === 'string' && signal.reason ? signal.reason : 'USER_STOP';
@@ -387,10 +380,7 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
             try {
               await this.options.store.tasks.failPlanDirect(activePlan.id, reason);
             } catch {}
-            devDiag.record({
-              level: 'ERROR',
-              category: 'TASK_RUNNER',
-              event: 'ACTIVE_TASK_FAILED',
+            devDiag.emit('ERROR', 'TASK_RUNNER', 'ACTIVE_TASK_FAILED', {
               profileId,
               planId: activePlan.id,
               reason: reason.slice(0, 200),
@@ -402,6 +392,7 @@ export class ActiveAccountRuntime implements TaskExecutionPort {
         if (activePlanId) this.activePlanByProfile.delete(profileId);
         releasePermit();
       }
+      if (waitAfterReleaseMs > 0) await sleepAbortable(waitAfterReleaseMs, signal);
     }
   }
 }

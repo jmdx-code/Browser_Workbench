@@ -13,6 +13,10 @@ import {
   facebookComposerPostLabels,
 } from '../shared/facebook-ui.js';
 const loginForm = 'form:has(input[name="email"]):has(input[type="password"])';
+const composerSubmitLabelsSelector = facebookUILabelSelector([
+  ...facebookComposerPostLabels(),
+  ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),
+]);
 const reviewActionsScope =
   ':is([role="dialog"]' +
   facebookUILabelSelector(FACEBOOK_POST_SETTINGS_LABELS) +
@@ -45,13 +49,7 @@ export const facebookIdentityProjection = PageReadRequest.parse({
       text: false,
       attributes: ['src', 'alt', 'xlink:href', 'href'],
     },
-    {
-      key: 'loginForm',
-      selector: loginForm,
-      limit: 2,
-      text: false,
-      attributes: [],
-    },
+    { key: 'loginForm', selector: loginForm, limit: 2, text: false, attributes: [] },
     {
       key: 'loginEmail',
       selector: loginForm + ' input[name="email"]',
@@ -178,10 +176,7 @@ export const facebookComposerProjection = PageReadRequest.parse({
       selector:
         FACEBOOK_COMPOSER_SCOPE +
         ' [role="button"]' +
-        facebookUILabelSelector([
-          ...facebookComposerPostLabels(),
-          ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),
-        ]) +
+        composerSubmitLabelsSelector +
         ':is([aria-disabled="true"], [disabled])',
       limit: 2,
       text: false,
@@ -203,21 +198,13 @@ export const facebookComposerProjection = PageReadRequest.parse({
         ],
         [
           'composerReviewSubmits',
-          reviewActionsScope +
-            ' [role="button"]' +
-            facebookUILabelSelector([
-              ...facebookComposerPostLabels(),
-              ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),
-            ]),
+          reviewActionsScope + ' [role="button"]' + composerSubmitLabelsSelector,
         ],
         [
           'composerReviewDisabled',
           reviewActionsScope +
             ' [role="button"]' +
-            facebookUILabelSelector([
-              ...facebookComposerPostLabels(),
-              ...FACEBOOK_COMPOSER_ADVANCE_COPY.map((copy) => copy.label),
-            ]) +
+            composerSubmitLabelsSelector +
             ':is([aria-disabled="true"],[disabled])',
         ],
       ] as const

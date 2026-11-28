@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { Id, NonNegInt, Sha256Hex, StrNull, boolT, strictObj } from './contracts.js';
-
 export const EXTENSION_VERSION = '0.3.92';
 const httpOrHttpsUrl = z.string().refine((value) => {
   try {

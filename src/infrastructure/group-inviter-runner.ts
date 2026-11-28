@@ -8,7 +8,7 @@ import type {
 } from '../application/group-inviter-service.js';
 import type { Core } from '../bridge/core.js';
 import type { Awaitable } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { failError } from '../domain/workspace.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import { isLocalAvatar } from '../shared/group-bumper.js';
 import type { InviterGroupRow } from '../shared/group-inviter.js';
@@ -182,7 +182,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           await scope.activate?.();
         }
         if (Date.now() >= deadline)
-          throw new ProductError(
+          failError(
             'GROUP_INVITER_PAGE_NOT_READY',
             state.visible
               ? 'Facebook 页面加载超时，未继续邀请'
@@ -194,7 +194,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
       }
       scope.guard();
       if (state.accountId !== accountId)
-        throw new ProductError(
+        failError(
           'GROUP_INVITER_ACCOUNT_CHANGED',
           '当前登录账号已变化，已停止本次邀请；请检查浏览器中的实际账号',
           409,
@@ -284,7 +284,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
           state.accountId !== accountId ||
           !isGroupRouteUrl(state.url, scope.groupId)
         )
-          throw new ProductError(
+          failError(
             'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
             '邀请结果核对时账号、小组或可见状态发生变化，未自动重发',
             409,
@@ -336,14 +336,12 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     if (!observed && label === 'enter-group')
       throw Error('GROUP_INVITER_NAVIGATION_FAILED:小组页面未能在期限内完成加载');
     if (!observed) {
-      devDiag.record({
-        category: 'GROUP_INVITER',
-        event: 'GROUP_INVITER_EFFECT_MISSING',
+      devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_EFFECT_MISSING', {
         profileId: binding.profileId,
         operationId: binding.operationId,
         data: { label, dialogs: await readInvitationDialogDebugInfo(scope.page) },
       });
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_EFFECT_UNCONFIRMED',
         `${sending ? '邀请结果' : '页面操作结果'}未确认，已停止；不会自动重复发送`,
         409,
@@ -400,7 +398,7 @@ export class GroupInviterBrowserAdapter implements GroupInviterBrowserRunner {
     }
     guard();
     if (prepared.inventory.operations.some(kernelOperationPending))
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_PRIOR_RESULT_UNCONFIRMED',
         '该浏览器有待核对操作，请先处理原记录；未改写原结果、未发送新邀请',
         409,

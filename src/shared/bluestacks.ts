@@ -11,8 +11,30 @@ import {
   trimMax,
   trimReq,
 } from './contracts.js';
-import { BumperSettings, type BumperDailyStat, type BumperProfileStat } from './group-bumper.js';
+import { parseRelativePostAge } from './relative-post-age.js';
+import { BumperSettings, type BumperProfileStat } from './group-bumper.js';
+import {
+  DailyRiskActionKind,
+  DailyRiskLimitOverrideSchema,
+  DailyRiskLimitRuleSchema,
+  DailyRiskLimitSettingsSchema,
+  evaluateDailyRiskQuota,
+  type DailyRiskLimitOverride,
+} from './daily-risk-limits.js';
 import { GroupIdString } from './group-inviter.js';
+export const normalizeTotpSecret = (raw: string): string =>
+  raw
+    .replace(/[\s-]+/g, '')
+    .trim()
+    .toUpperCase();
+export function isValidTotpSecret(raw: string): boolean {
+  const clean = normalizeTotpSecret(raw);
+  return Boolean(clean && /^[A-Z2-7]+={0,6}$/.test(clean) && clean.replace(/=+$/, '').length >= 8);
+}
+const TOTP_ERR_MSG = '2FA 密钥格式无效（需为至少 8 位 Base32 字符 A-Z / 2-7）';
+const OptTotpSecret = trimMax(200)
+  .refine((v) => !v || isValidTotpSecret(v), TOTP_ERR_MSG)
+  .optional();
 export const BluestacksLoginExistingPolicy = z.enum(['skip', 'clear-and-relogin']);
 export type BluestacksLoginExistingPolicy = z.infer<typeof BluestacksLoginExistingPolicy>;
 export const BluestacksBatchLoginItemStatus = z.enum([
@@ -33,12 +55,12 @@ export const StartBluestacksBatchLoginInput = strictObj({
         instanceId: Id,
         account: trimReq(200),
         password: sReq(200),
-        totpSecret: trimMax(200).optional(),
+        totpSecret: OptTotpSecret,
       }),
     )
     .min(1)
     .max(200),
-  maxConcurrency: intRange(1, 20).default(3),
+  maxConcurrency: intRange(1, 10).default(3),
   autoLaunch: boolT,
   autoInstallApk: boolT,
   ifAlreadyLoggedIn: BluestacksLoginExistingPolicy.default('skip'),
@@ -76,15 +98,6 @@ export interface BluestacksBatchLoginState extends BluestacksRunBase<BluestacksB
   restricted: number;
   failed: number;
   stopped: number;
-}
-export const normalizeTotpSecret = (raw: string): string =>
-  raw
-    .replace(/[\s-]+/g, '')
-    .trim()
-    .toUpperCase();
-export function isValidTotpSecret(raw: string): boolean {
-  const clean = normalizeTotpSecret(raw);
-  return Boolean(clean && /^[A-Z2-7]+={0,6}$/.test(clean) && clean.replace(/=+$/, '').length >= 8);
 }
 export function maskLoginAccountLabel(account: string): string {
   const t = account.trim();
@@ -161,13 +174,7 @@ export function parseBatchLoginText(raw: string): {
       const cur = block;
       block = null;
       if (cur.account || cur.password || cur.totpSecret)
-        pushEntry(
-          cur.startLine,
-          cur.account,
-          cur.password,
-          cur.totpSecret,
-          '2FA 密钥格式无效（需为至少 6 位 Base32 字符 A-Z / 2-7）',
-        );
+        pushEntry(cur.startLine, cur.account, cur.password, cur.totpSecret, TOTP_ERR_MSG);
     },
     labelSpecs: Array<[RegExp, 'account' | 'password' | 'totpSecret', boolean]> = [
       [ACCOUNT_LABEL_RE, 'account', true],
@@ -230,13 +237,7 @@ export function parseBatchLoginText(raw: string): {
           : (extraCols.filter(isValidTotpSecret).sort((a, b) => score(b) - score(a))[0] ??
             extraCols[0] ??
             '');
-    pushEntry(
-      lineNum,
-      account,
-      password,
-      rawTotp,
-      '第 3 列 2FA 密钥格式无效（需为至少 6 位 Base32 字符 A-Z / 2-7）',
-    );
+    pushEntry(lineNum, account, password, rawTotp, `第 3 列 ${TOTP_ERR_MSG}`);
   }
   return (flushBlock(), { entries, errors });
 }
@@ -336,20 +337,14 @@ export function formatBluestacksHealthReportText(state: BluestacksHealthCheckSta
     }),
   ].join('\n');
 }
-export const BluestacksRiskActionKind = z.enum(['bump', 'post', 'invite', 'active-like']);
+export const BluestacksRiskActionKind = DailyRiskActionKind;
 export type BluestacksRiskActionKind = z.infer<typeof BluestacksRiskActionKind>;
-const BluestacksRiskLimitRule = strictObj({
-  dailyMaxTotalActions: intRange(0, 2000).default(60),
-  dailyMaxBumps: intRange(0, 500).default(30),
-  dailyMaxPosts: intRange(0, 200).default(10),
-  dailyMaxInvites: intRange(0, 300).default(20),
-  dailyMaxActiveLikes: intRange(0, 300).default(25),
-});
+const BluestacksRiskLimitRule = DailyRiskLimitRuleSchema;
 type BluestacksRiskLimitRule = z.infer<typeof BluestacksRiskLimitRule>;
-export const BluestacksRiskLimitOverride = BluestacksRiskLimitRule.partial().strict();
-export type BluestacksRiskLimitOverride = z.infer<typeof BluestacksRiskLimitOverride>;
-export const BluestacksRiskLimitSettings = BluestacksRiskLimitRule.extend({
-  enabled: z.boolean().default(true),
+export const BluestacksRiskLimitOverride = DailyRiskLimitOverrideSchema;
+export type BluestacksRiskLimitOverride = DailyRiskLimitOverride;
+export const BluestacksRiskLimitSettings = DailyRiskLimitRuleSchema.extend({
+  enabled: DailyRiskLimitSettingsSchema.shape.enabled,
   perInstanceOverrides: z.record(z.string(), BluestacksRiskLimitOverride).default({}),
 }).strict();
 export type BluestacksRiskLimitSettings = z.infer<typeof BluestacksRiskLimitSettings>;
@@ -382,67 +377,20 @@ export interface BluestacksDailyUsageOverview {
   reachedLimitInstances: number;
   perInstance: Record<string, BluestacksDailyInstanceStats>;
 }
-interface BluestacksRiskQuotaEvaluation {
-  allowed: boolean;
-  reason: string | null;
-  totalActions: number;
-  effectiveLimits: BluestacksRiskLimitRule;
-  hasOverride: boolean;
-}
-const RULE_KEYS = [
-  'dailyMaxTotalActions',
-  'dailyMaxBumps',
-  'dailyMaxPosts',
-  'dailyMaxInvites',
-  'dailyMaxActiveLikes',
-] as const;
-export function evaluateBluestacksRiskQuota(
+export const evaluateBluestacksRiskQuota = (
   settings: BluestacksRiskLimitSettings,
   instanceId: string,
   counts: BluestacksRawDailyCounts,
   actionKind?: BluestacksRiskActionKind,
-): BluestacksRiskQuotaEvaluation {
-  const ov = settings.perInstanceOverrides[instanceId],
-    hasOverride = Boolean(ov && RULE_KEYS.some((k) => ov[k] !== undefined)),
-    effectiveLimits = Object.fromEntries(
-      RULE_KEYS.map((k) => [k, ov?.[k] ?? settings[k]]),
-    ) as BluestacksRiskLimitRule,
-    bumpsToday = counts.groupBumpsToday + counts.pageBumpsToday,
-    totalActions = bumpsToday + counts.postsToday + counts.invitesToday + counts.activeLikesToday,
-    res = (allowed: boolean, reason: string | null): BluestacksRiskQuotaEvaluation => ({
-      allowed,
-      reason,
-      totalActions,
-      effectiveLimits,
-      hasOverride,
-    });
-  if (!settings.enabled) return res(true, null);
-  const maxTotal = effectiveLimits.dailyMaxTotalActions;
-  if (maxTotal > 0 && totalActions >= maxTotal)
-    return res(
-      false,
-      `今日已达蓝蝶风控安全上限（总动作 ${totalActions}/${maxTotal}），自动休眠保护`,
-    );
-  const caps: Array<[BluestacksRiskActionKind, string, number, number]> = [
-    ['bump', '顶贴', bumpsToday, effectiveLimits.dailyMaxBumps],
-    ['post', '发帖', counts.postsToday, effectiveLimits.dailyMaxPosts],
-    ['invite', '邀人', counts.invitesToday, effectiveLimits.dailyMaxInvites],
-    ['active-like', '活跃赞', counts.activeLikesToday, effectiveLimits.dailyMaxActiveLikes],
-  ];
-  for (const [kind, label, count, limit] of caps)
-    if (actionKind === kind && limit > 0 && count >= limit)
-      return res(
-        false,
-        `今日已达蓝蝶${kind === 'active-like' ? '活跃点赞' : label}风控上限 (${count}/${limit})，自动休眠保护`,
-      );
-  if (!actionKind) {
-    const hits = caps
-      .filter(([, , c, l]) => l > 0 && c >= l)
-      .map(([, short, c, l]) => `${short} ${c}/${l}`);
-    if (hits.length > 0) return res(false, `已达单项上限（${hits.join('、')}）`);
-  }
-  return res(true, null);
-}
+) =>
+  evaluateDailyRiskQuota(
+    settings,
+    settings.perInstanceOverrides,
+    instanceId,
+    counts,
+    actionKind,
+    '蓝蝶风控',
+  );
 export const BluestacksAccountState = z.enum([
   'unknown',
   'logged-in',
@@ -517,7 +465,13 @@ export const BluestacksShowInstanceInput = strictObj({ instanceId: Id });
 export const BluestacksArrangeWindowsInput = strictObj({
   instanceIds: z.array(Id).max(200).optional(),
   columns: intRange(1, 10).optional(),
-  gap: intRange(0, 40).optional(),
+  gap: intRange(0, 48).optional(),
+  monitorBounds: strictObj({
+    left: intRange(-100000, 100000),
+    top: intRange(-100000, 100000),
+    width: intRange(100, 20000),
+    height: intRange(100, 20000),
+  }).optional(),
 });
 export const BluestacksInstallApkInput = strictObj({
   instanceIds: bsIds,
@@ -532,7 +486,7 @@ export const BluestacksLoginInput = strictObj({
   instanceId: Id,
   account: trimReq(200),
   password: z.string().min(1).max(200),
-  totpSecret: trimMax(200).optional(),
+  totpSecret: OptTotpSecret,
   saveLoginInfo: z.boolean().optional(),
   ifAlreadyLoggedIn: BluestacksLoginExistingPolicy.optional(),
 });
@@ -567,12 +521,14 @@ export const StartBluestacksPosterInput = strictObj({
   groupIds: z.array(GroupIdString).max(500).default([]),
   maxGroupsPerInstance: intRange(1, 50).default(3),
   postToTimeline: z.boolean().default(false),
+  closeWindowOnFinish: boolF,
 }).refine((v) => v.groupIds.length > 0 || v.postToTimeline, '请至少选择一个目标小组或开启发时间线');
 export type StartBluestacksPosterInput = z.infer<typeof StartBluestacksPosterInput>;
 export const StartBluestacksInviterInput = strictObj({
   instanceIds: bsIds,
   groupIds: bsTargetIds,
   invitesPerGroup: intRange(1, 50).default(5),
+  closeWindowOnFinish: boolF,
 });
 export type StartBluestacksInviterInput = z.infer<typeof StartBluestacksInviterInput>;
 export type BluestacksWorkerKind =
@@ -590,6 +546,8 @@ export interface BluestacksModuleProfileStat {
   status: string;
   session: number;
   today: number;
+  combinationId?: string | null | undefined;
+  closeOnFinish?: boolean | undefined;
   steps?: Array<{ label: string; state: 'done' | 'running' | 'pending' }> | undefined;
 }
 export const CreateBluestacksFolderInput = strictObj({ name: trimReq(80) });
@@ -607,10 +565,12 @@ export const StartBluestacksBumperInput = strictObj({
   profileIds: bsIds,
   groupIds: bsTargetIds,
   pageIds: bsTargetIds,
+  closeWindowOnFinish: boolF,
 });
 export const StartBluestacksPageBumperInput = strictObj({
   profileIds: bsIds,
   pageIds: bsTargetIds,
+  closeWindowOnFinish: boolF,
 });
 export const StopBluestacksBumperInput = strictObj({ profileIds: bsIds.optional() });
 export interface BluestacksState {
@@ -642,13 +602,41 @@ export interface BluestacksState {
   inviterProfileCounts?: Record<string, BluestacksModuleProfileStat>;
   total: number;
   pageTotal: number;
-  dailyStats: BumperDailyStat[];
-  pageDailyStats: BumperDailyStat[];
   batchLogin?: BluestacksBatchLoginState | null;
   healthCheck?: BluestacksHealthCheckState | null;
   riskLimitSettings?: BluestacksRiskLimitSettings;
   dailyUsage?: BluestacksDailyUsageOverview;
 }
+const COMPOSITE_BS_RE =
+  /^(?:p\d{1,4}|pie\d*\S*|nougat\d*\S*|rvc\d*\S*|bluestacks[^()]*|蓝蝶\s*#?\S*)\s*\([^()]+\)$/i;
+const PLACEHOLDER_BS_RE = /^(?:fb\s*lite|facebook|meta|menu|菜单|菜單|未知|unknown)$/i;
+export function isCompositePlaceholderBsAccountId(
+  value: string | null | undefined,
+  displayName?: string | null,
+  instanceKey?: string | null,
+): boolean {
+  const t = value?.trim() ?? '';
+  if (!t) return false;
+  const lo = t.toLowerCase();
+  return (
+    [displayName, instanceKey].some((s) => {
+      const l = s?.trim().toLowerCase();
+      return Boolean(l && (lo === l || (lo.startsWith(`${l} (`) && t.endsWith(')'))));
+    }) ||
+    /\((?:fb\s*lite)\)$/i.test(t) ||
+    COMPOSITE_BS_RE.test(t) ||
+    PLACEHOLDER_BS_RE.test(t) ||
+    /^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(t)
+  );
+}
+export const resolveEffectiveBsAccountId = (
+  inst: Pick<BluestacksInstance, 'id' | 'accountId' | 'numericAccountId'> &
+    Partial<Pick<BluestacksInstance, 'displayName' | 'instanceKey'>>,
+): string =>
+  [inst.numericAccountId, inst.accountId]
+    .map((v) => v?.trim() ?? '')
+    .find((v) => v && !isCompositePlaceholderBsAccountId(v, inst.displayName, inst.instanceKey)) ||
+  inst.id;
 export function isBluestacksPortraitResolution(fbWidth: number, fbHeight: number): boolean {
   return fbWidth > 0 && fbHeight > fbWidth;
 }
@@ -661,54 +649,9 @@ export function bluestacksDisplayTitle(
   const bsMatch = /^BlueStacks\s+App\s+Player(?:\s+(\d+))?$/i.exec(raw);
   return bsMatch ? (bsMatch[1] ? `蓝蝶 #${bsMatch[1]}` : '蓝蝶 #主') : raw || instance.instanceKey;
 }
-const EN_MONTHS = 'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec'.split('|');
-const normalizeDigitsAndLocalTimeTokens = (input: string): string =>
-  input
-    .replace(/[\u1040-\u1049]/gu, (ch) => String(ch.charCodeAt(0) - 0x1040))
-    .replace(/[\u0e50-\u0e59]/gu, (ch) => String(ch.charCodeAt(0) - 0x0e50));
+// Stage 1 compatibility wrapper: preserves BlueStacks 0.02h just-now expectation in bluestacks.test.ts:83 until Stage 2 aligns it to 0.
 export function relativePostAge(text: string, now = Date.now()): number | null {
-  const raw = normalizeDigitsAndLocalTimeTokens(text)
-    .replace(/[·•*。‧・+]/g, ' | ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-  if (!raw) return null;
-  const cleaned = raw
-    .replace(/([\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])/gu, '$1')
-    .replace(/(\d)\s+(?=[\u4e00-\u9fa5a-z\u1000-\u109f\u0e00-\u0e7f])/gu, '$1')
-    .replace(/([\u4e00-\u9fa5])\s+(?=\d)/gu, '$1');
-  if (
-    /(?:just\s*now|刚刚|剛剛|則則|则则|ယခုလေးတင်|မကြာသေးမီက|vừa\s*xong|mới\s*đây|เมื่อสักครู่)/u.test(
-      cleaned,
-    )
-  )
-    return 0.02;
-  if (/(?:yesterday|昨天|မနေ့က|hôm\s*qua|เมื่อวาน)/u.test(cleaned)) return 24;
-  const ageFromMD = (monthIdx: number, day: number) => {
-    const d = new Date(now),
-      target = new Date(d.getFullYear(), monthIdx, day);
-    if (target.getTime() > now) target.setFullYear(d.getFullYear() - 1);
-    return Math.max(24, (now - target.getTime()) / 3600000);
-  };
-  const md =
-    /(?:^|\D)(1[0-2]|0?[1-9])(?:月|[8b])([12]\d|3[01]|0?[1-9])(?:日|号|號|[80b])(?:\D|$)/iu.exec(
-      cleaned,
-    );
-  if (md) return ageFromMD(Number(md[1]) - 1, Number(md[2]));
-  const m =
-    /(?:^|\D)(\d{1,3}(?:\.\d+)?)\s*(m|min(?:ute)?s?|分钟|分鐘|分|မိနစ်|phút|นาที|h|hr|hours?|(?:[刂小]\s*[、丶]?\s*)?(?:小时|小時|时|時)|နာရီ|giờ|ชั่วโมง|ชม\.|d|days?|天|日|ရက်|ngày|วัน|w|wk|weeks?|周|週|ပတ်|tuần|สัปดาห์)(?![a-z])/iu.exec(
-      cleaned,
-    );
-  if (m) {
-    const num = Number(m[1]),
-      u = m[2] ?? '';
-    if (/^(?:m|min|分钟|分鐘|分|မိနစ်|phút|นาที)/iu.test(u)) return num / 60;
-    if (/^(?:h|hr|hour|[刂小]|小时|小時|时|時|နာရီ|giờ|ชั่วโมง|ชม)/iu.test(u)) return num;
-    return num * (/^(?:w|wk|week|周|週|ပတ်|tuần|สัปดาห์)/iu.test(u) ? 168 : 24);
-  }
-  const en = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\b/i.exec(raw),
-    mIdx = en?.[1] ? EN_MONTHS.indexOf(en[1].slice(0, 3).toLowerCase()) : -1;
-  return mIdx >= 0 && en ? ageFromMD(mIdx, Number(en[2])) : null;
+  return parseRelativePostAge(text, now, 0.02);
 }
 const cleanMatch = (s: string, re: RegExp) => s.toLowerCase().replace(re, '').trim();
 const normalizeNameForMatch = (s: string): string =>

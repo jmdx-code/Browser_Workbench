@@ -21,24 +21,20 @@ import type { MediaComponentStatus } from '../shared/media-component.js';
 import type { PostIntent } from '../shared/material-index.js';
 import type { MaterialFileSnapshot } from '../shared/materials.js';
 import type { MaterialUsageRepository } from '../domain/resource-material-rules.js';
-
 export interface MediaComponentPort {
   status(): Awaitable<z.infer<typeof MediaComponentStatus>>;
   start(): Awaitable<unknown>;
   cancel(): void;
 }
-
 export interface SourceObservation {
   fingerprint: string;
   checkedAt: string;
   files: MaterialFileSnapshot[];
 }
-
 export interface MaterialSourceVerifier {
   // assertCurrent is checked around asynchronous IO, not a reusable input permit.
   verify(intent: PostIntent, assertCurrent: () => Awaitable<void>): Promise<SourceObservation>;
 }
-
 export class MaterialUsageService {
   constructor(private readonly repository: MaterialUsageRepository) {}
   async snapshot() {
@@ -48,20 +44,16 @@ export class MaterialUsageService {
     return ClearedMaterialUsage.parse(await this.repository.clear(ClearMaterialUsage.parse(input)));
   }
 }
-
 export interface MaterialCacheBackend {
   snapshot(): Awaitable<CacheOverview>;
   cleanStage(stageId: string): Awaitable<{ cleaned: boolean; reason: string }>;
 }
-
 export class MaterialCacheManagement {
   private busy = false;
   constructor(private readonly backend: MaterialCacheBackend) {}
-
   async snapshot() {
     return MaterialCacheOverview.parse(await this.backend.snapshot());
   }
-
   async clean(input: unknown) {
     const request = MaterialCacheCleanRequest.parse(input);
     if (this.busy) throw new ProductError('CACHE_CLEANUP_BUSY', '缓存清理正在执行', 409);
@@ -76,11 +68,7 @@ export class MaterialCacheManagement {
         }
         try {
           const outcome = await this.backend.cleanStage(stageId);
-          results.push({
-            stageId,
-            cleaned: outcome.cleaned,
-            reason: outcome.reason.slice(0, 200),
-          });
+          results.push({ stageId, cleaned: outcome.cleaned, reason: outcome.reason.slice(0, 200) });
         } catch (error) {
           results.push({
             stageId,
@@ -95,7 +83,6 @@ export class MaterialCacheManagement {
     }
   }
 }
-
 export class WorkspaceMaintenance {
   constructor(
     private readonly repository: WorkspaceRepository,

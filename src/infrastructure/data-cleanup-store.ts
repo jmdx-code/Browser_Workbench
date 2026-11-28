@@ -9,12 +9,10 @@ import * as Q from './persistence/sqlite-query-helpers.js';
 import { readRecordAvatar, RecordAvatarKind } from './record-avatar-store.js';
 import { SqliteRecordRetention } from './record-retention-store.js';
 import { transaction } from './sqlite-transaction.js';
-
 const purgeablePlan = `p.state IN ('COMPLETED','STOPPED','FAILED')
  AND NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id))
  AND NOT EXISTS(SELECT 1 FROM material_post_intents m WHERE m.job_id=p.id)
  AND NOT EXISTS(SELECT 1 FROM task_outbox o WHERE o.job_id=p.id AND o.status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED','UNKNOWN'))`;
-
 export class SqliteDataCleanup {
   constructor(
     private readonly db: DatabaseSync,
@@ -113,11 +111,21 @@ export class SqliteDataCleanup {
     return { where, params };
   }
   preview(input: unknown) {
-    const { where, params } = this.selection(input);
+    const scope = RecordCleanupScope.parse(input),
+      { where, params } = this.selection(input);
     const sql = `SELECT count(*) AS total,coalesce(sum(p.state IN ('COMPLETED','STOPPED','FAILED') OR s.round<p.round),0) AS eligible FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${where}`;
     const row = Q.getRow(this.db, sql, ...params),
-      eligible = Q.n(row?.eligible);
-    return { eligible, protected: Q.n(row?.total) - eligible, bytes: 0 };
+      taskEligible = Q.n(row?.eligible),
+      taskProtected = Q.n(row?.total) - taskEligible;
+    const feature =
+      scope.before !== undefined && !scope.stepIds
+        ? this.featureCutoffCounts(scope.before, scope.profileId)
+        : { eligible: 0, protected: 0 };
+    return {
+      eligible: taskEligible + feature.eligible,
+      protected: taskProtected + feature.protected,
+      bytes: 0,
+    };
   }
   removeBatch(input: unknown, maximum = 250) {
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 250)
@@ -135,10 +143,74 @@ export class SqliteDataCleanup {
         JSON.stringify(stepIds),
       ).map((r) => Q.s(r.job_id));
       if (affected.length) this.purgeHiddenPlans(affected);
-      if (scope.before !== undefined && !scope.stepIds)
-        this.purgeExpiredFeatureOperationsByCutoff(scope.before, scope.profileId);
-      return result.length;
+      const featureRemoved =
+        scope.before !== undefined && !scope.stepIds && result.length < maximum
+          ? this.purgeExpiredFeatureOperationsByCutoff(scope.before, scope.profileId)
+          : 0;
+      return result.length + featureRemoved;
     });
+  }
+  private featureCutoffSpecs(before: number, profileId?: string) {
+    const pid = profileId ?? null;
+    const specs: Array<{ table: string; where: string; prot?: string; args: SQLInputValue[] }> = [
+      {
+        table: 'group_bumper_operations',
+        where:
+          "status='SETTLED' AND resolution_outcome<>'ENDED_UNKNOWN' AND updated_at<? AND (? IS NULL OR profile_id=?)",
+        prot: "(status<>'SETTLED' OR resolution_outcome='ENDED_UNKNOWN') AND updated_at<? AND (? IS NULL OR profile_id=?)",
+        args: [before, pid, pid],
+      },
+      {
+        table: 'group_poster_operations',
+        where:
+          "kernel_settled=1 AND status IN ('VERIFIED','NOT_APPLIED') AND updated_at<? AND (? IS NULL OR profile_id=?)",
+        prot: "(kernel_settled=0 OR status NOT IN ('VERIFIED','NOT_APPLIED')) AND updated_at<? AND (? IS NULL OR profile_id=?)",
+        args: [before, pid, pid],
+      },
+      {
+        table: 'post_bump_records',
+        where: 'created_at<? AND (? IS NULL OR profile_id=?)',
+        args: [before, pid, pid],
+      },
+    ];
+    if (!profileId) {
+      specs.push(
+        {
+          table: 'auto_scheduler_runs',
+          where: "started_at<? AND status IN ('completed','failed','stopped')",
+          args: [before],
+        },
+        {
+          table: 'group_poster_tasks',
+          where:
+            "finished_at IS NOT NULL AND finished_at<? AND status IN ('completed','failed','cancelled')",
+          args: [before],
+        },
+      );
+    }
+    return specs;
+  }
+  private featureCutoffCounts(
+    before: number,
+    profileId?: string,
+  ): { eligible: number; protected: number } {
+    let eligible = 0;
+    let protectedCount = 0;
+    for (const s of this.featureCutoffSpecs(before, profileId)) {
+      if (!Q.sqliteTableExists(this.db, s.table)) continue;
+      eligible += Q.countSql(
+        this.db,
+        `SELECT count(*) AS n FROM ${s.table} WHERE ${s.where}`,
+        ...s.args,
+      );
+      if (s.prot)
+        protectedCount += Q.countSql(
+          this.db,
+          `SELECT count(*) AS n FROM ${s.table} WHERE ${s.prot}`,
+          ...s.args,
+        );
+    }
+    return { eligible, protected: protectedCount };
   }
   purgeExpiredFeatureOperations(input: unknown): number {
     const scope = RecordCleanupScope.parse(input);
@@ -149,35 +221,19 @@ export class SqliteDataCleanup {
         );
   }
   private purgeExpiredFeatureOperationsByCutoff(before: number, profileId?: string): number {
-    const pid = profileId ?? null;
-    const del = (table: string, sql: string, ...args: SQLInputValue[]) =>
-      Q.sqliteTableExists(this.db, table) ? Number(Q.run(this.db, sql, ...args).changes ?? 0) : 0;
-    const bSql =
-      "DELETE FROM group_bumper_operations WHERE status='SETTLED' AND resolution_outcome<>'ENDED_UNKNOWN' AND updated_at<? AND (? IS NULL OR profile_id=?)";
-    const pSql =
-      "DELETE FROM group_poster_operations WHERE kernel_settled=1 AND status IN ('VERIFIED','NOT_APPLIED') AND updated_at<? AND (? IS NULL OR profile_id=?)";
-    let removed =
-      del('group_bumper_operations', bSql, before, pid, pid) +
-      del('group_poster_operations', pSql, before, pid, pid) +
-      del(
-        'post_bump_records',
-        'DELETE FROM post_bump_records WHERE created_at<? AND (? IS NULL OR profile_id=?)',
+    if (!profileId && Q.sqliteTableExists(this.db, 'auto_scheduler_runs')) {
+      Q.run(
+        this.db,
+        "DELETE FROM auto_scheduler_run_items WHERE run_id IN (SELECT id FROM auto_scheduler_runs WHERE started_at<? AND status IN ('completed','failed','stopped'))",
         before,
-        pid,
-        pid,
       );
-    if (!profileId) {
-      if (Q.sqliteTableExists(this.db, 'auto_scheduler_runs')) {
-        const iSql =
-          "DELETE FROM auto_scheduler_run_items WHERE run_id IN (SELECT id FROM auto_scheduler_runs WHERE started_at<? AND status IN ('completed','failed','stopped'))";
-        const rSql =
-          "DELETE FROM auto_scheduler_runs WHERE started_at<? AND status IN ('completed','failed','stopped')";
-        del('auto_scheduler_run_items', iSql, before);
-        removed += del('auto_scheduler_runs', rSql, before);
-      }
-      const tSql =
-        "DELETE FROM group_poster_tasks WHERE finished_at IS NOT NULL AND finished_at<? AND status IN ('completed','failed','cancelled')";
-      removed += del('group_poster_tasks', tSql, before);
+    }
+    let removed = 0;
+    for (const s of this.featureCutoffSpecs(before, profileId)) {
+      if (Q.sqliteTableExists(this.db, s.table))
+        removed += Number(
+          Q.run(this.db, `DELETE FROM ${s.table} WHERE ${s.where}`, ...s.args).changes ?? 0,
+        );
     }
     return removed;
   }

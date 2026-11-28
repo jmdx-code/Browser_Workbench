@@ -1,6 +1,6 @@
 import type { SoftwareUpdatePort } from '../domain/system-ports.js';
 import { UpdateConfig, type UpdateStatus } from '../shared/software-update.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 export class SoftwareUpdateService {
   private checking: Promise<UpdateStatus> | undefined;
   private initialized: Promise<void> | undefined;
@@ -31,14 +31,47 @@ export class SoftwareUpdateService {
     };
   }
   private async init() {
-    this.initialized ??= this.port.readConfig().then((config) => {
-      Object.assign(this.state, config);
-    });
+    if (!this.initialized) {
+      const work = this.port
+        .readConfig()
+        .then((config) => {
+          Object.assign(this.state, config);
+        })
+        .catch((error: unknown) => {
+          if (this.initialized === work) this.initialized = undefined;
+          throw error;
+        });
+      this.initialized = work;
+    }
     await this.initialized;
   }
   assertIdle() {
     if (this.state.applying)
       throw new ProductError('UPDATE_APPLYING', '正在更新软件，请稍后再启动任务', 409);
+  }
+  private startCheck(): Promise<UpdateStatus> {
+    if (this.checking) return this.checking;
+    if (!this.state.githubRepo) {
+      this.state.error = null;
+      this.state.availableUpdate = null;
+      return Promise.resolve(structuredClone(this.state));
+    }
+    this.state.checking = true;
+    this.state.error = null;
+    const repo = this.state.githubRepo;
+    this.checking = (async () => {
+      try {
+        this.state.availableUpdate = await this.port.check(repo);
+      } catch (error) {
+        this.state.error = error instanceof Error ? error.message : '更新检查失败';
+      } finally {
+        this.state.checking = false;
+        this.state.lastCheckedAt = new Date().toISOString();
+        this.checking = undefined;
+      }
+      return structuredClone(this.state);
+    })();
+    return this.checking;
   }
   async status() {
     await this.init();
@@ -48,8 +81,9 @@ export class SoftwareUpdateService {
       !this.state.checking &&
       !this.state.applying &&
       (!this.state.lastCheckedAt || Date.now() - Date.parse(this.state.lastCheckedAt) > 1_800_000)
-    )
-      await this.check();
+    ) {
+      void this.startCheck().catch(() => {});
+    }
     return structuredClone(this.state);
   }
   async configure(input: unknown) {
@@ -64,27 +98,7 @@ export class SoftwareUpdateService {
   async check() {
     await this.init();
     this.assertIdle();
-    if (this.checking) return this.checking;
-    if (!this.state.githubRepo) {
-      this.state.error = null;
-      this.state.availableUpdate = null;
-      return structuredClone(this.state);
-    }
-    this.state.checking = true;
-    this.state.error = null;
-    this.checking = (async () => {
-      try {
-        this.state.availableUpdate = await this.port.check(this.state.githubRepo);
-      } catch (error) {
-        this.state.error = error instanceof Error ? error.message : '更新检查失败';
-      } finally {
-        this.state.checking = false;
-        this.state.lastCheckedAt = new Date().toISOString();
-        this.checking = undefined;
-      }
-      return structuredClone(this.state);
-    })();
-    return this.checking;
+    return this.startCheck();
   }
   async apply() {
     await this.init();
@@ -93,11 +107,7 @@ export class SoftwareUpdateService {
     const release = this.state.availableUpdate;
     if (!release) throw new ProductError('UPDATE_NOT_AVAILABLE', '暂无可更新版本', 409);
     if (release.requiresInstaller)
-      throw new ProductError(
-        'UPDATE_INSTALLER_REQUIRED',
-        '底层引擎或依赖已变化，请下载完整安装包更新',
-        409,
-      );
+      failError('UPDATE_INSTALLER_REQUIRED', '底层引擎或依赖已变化，请下载完整安装包更新', 409);
     await this.port.assertCanApply();
     this.state.applying = true;
     this.state.error = null;

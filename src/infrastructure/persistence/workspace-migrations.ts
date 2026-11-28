@@ -6,11 +6,9 @@ import {
   backfillPostBumpRecordsMigration,
   ensurePostBumpRecordsSchema,
 } from '../post-bump-records-store.js';
-
-export const workspaceSchemaVersion = 62;
-
+import { backfillActivityStatsV63, ensureActivityStatsSchema } from '../activity-stats-store.js';
+export const workspaceSchemaVersion = 64;
 const LEGACY_REBUILD_BEFORE_VERSION = 59;
-
 const LEGACY_SINGLETON_TABLES: readonly string[] = [
   'workspace_preferences',
   'scheduler_settings',
@@ -23,8 +21,8 @@ const LEGACY_SINGLETON_TABLES: readonly string[] = [
   'auto_scheduler_settings',
   'google_sheets_config',
   'bluestacks_settings',
+  'browser_risk_limit_settings',
 ];
-
 const LEGACY_DATA_TABLES: readonly string[] = [
   'groups',
   'profile_metadata',
@@ -33,6 +31,7 @@ const LEGACY_DATA_TABLES: readonly string[] = [
   'bluestacks_folders',
   'bluestacks_instances',
   'bluestacks_daily_actions',
+  'account_daily_activity_stats',
   'combinations',
   'combination_versions',
   'resource_table_heads',
@@ -55,9 +54,7 @@ const LEGACY_DATA_TABLES: readonly string[] = [
   'record_avatar_cache',
   'task_account_likes',
 ];
-
 const quotedIdent = (ident: string): string => `"${ident.replace(/"/g, '""')}"`;
-
 function schemaTableExists(db: DatabaseSync, schema: 'main' | 'legacy', table: string): boolean {
   return Boolean(
     db
@@ -65,21 +62,18 @@ function schemaTableExists(db: DatabaseSync, schema: 'main' | 'legacy', table: s
       .get(table),
   );
 }
-
 function schemaTableColumns(db: DatabaseSync, schema: 'main' | 'legacy', table: string): string[] {
   return db
     .prepare(`PRAGMA ${schema}.table_info(${quotedIdent(table)})`)
     .all()
     .map((c) => String(c.name));
 }
-
 function commonQuotedColumns(db: DatabaseSync, table: string): string | null {
   if (!schemaTableExists(db, 'legacy', table) || !schemaTableExists(db, 'main', table)) return null;
   const legacySet = new Set(schemaTableColumns(db, 'legacy', table));
   const common = schemaTableColumns(db, 'main', table).filter((col) => legacySet.has(col));
   return common.length ? common.map(quotedIdent).join(',') : null;
 }
-
 function runInSavepoint(db: DatabaseSync, name: string, work: () => boolean): void {
   db.exec(`SAVEPOINT ${name}`);
   try {
@@ -91,7 +85,6 @@ function runInSavepoint(db: DatabaseSync, name: string, work: () => boolean): vo
     db.exec(`RELEASE ${name}`);
   }
 }
-
 function migrateAttachedLegacyTables(db: DatabaseSync): void {
   for (const table of LEGACY_SINGLETON_TABLES) {
     const colsSql = commonQuotedColumns(db, table);
@@ -123,7 +116,6 @@ function migrateAttachedLegacyTables(db: DatabaseSync): void {
     DELETE FROM main.resource_table_versions WHERE combination_id NOT IN (SELECT id FROM main.combinations);
   `);
 }
-
 function migrateAttachedLegacyLogs(db: DatabaseSync): void {
   const bsNameExpr = `(SELECT COALESCE(NULLIF(TRIM(bs.account_name), ''), NULLIF(TRIM(bs.alias), ''), NULLIF(TRIM(bs.display_name), '')) FROM main.bluestacks_instances bs WHERE bs.id = t.profile_id LIMIT 1)`;
   const cacheNameExpr = `(SELECT NULLIF(TRIM(pac.account_name), '') FROM main.profile_account_cache pac WHERE pac.profile_id = t.profile_id LIMIT 1)`;
@@ -132,7 +124,6 @@ function migrateAttachedLegacyLogs(db: DatabaseSync): void {
   const carrierExpr = `CASE WHEN EXISTS(SELECT 1 FROM main.bluestacks_instances bs WHERE bs.id = t.profile_id) THEN 'bluestacks' ELSE 'browser' END`;
   const pbCols =
     'id, record_type, carrier, status, profile_id, account_id, account_name, group_id, group_name, page_id, page_name, post_id, post_url, liked, comment_text, story_shared, caption_preview, error_reason, source_log_id, created_at';
-
   if (schemaTableExists(db, 'legacy', 'group_poster_logs')) {
     const pCols = new Set(schemaTableColumns(db, 'legacy', 'group_poster_logs'));
     if (
@@ -172,7 +163,6 @@ function migrateAttachedLegacyLogs(db: DatabaseSync): void {
       });
     }
   }
-
   if (schemaTableExists(db, 'legacy', 'group_bumper_logs')) {
     const bCols = new Set(schemaTableColumns(db, 'legacy', 'group_bumper_logs'));
     if (bCols.has('id') && bCols.has('profile_id') && bCols.has('bumped_at')) {
@@ -207,7 +197,6 @@ function migrateAttachedLegacyLogs(db: DatabaseSync): void {
     }
   }
 }
-
 function rebuildLegacyWorkspaceDbToV62(db: DatabaseSync, backupFile: string | null): void {
   db.exec('PRAGMA foreign_keys=OFF');
   let attached = false;
@@ -228,9 +217,12 @@ function rebuildLegacyWorkspaceDbToV62(db: DatabaseSync, backupFile: string | nu
         db.exec(`DROP ${kind} IF EXISTS main.${quotedIdent(obj.name)}`);
       }
       applyBaselineSchemaV62(db);
+      ensureActivityStatsSchema(db);
       if (attached) migrateAttachedLegacyTables(db);
+      backfillActivityStatsV63(db);
+      cleanupW2LegacyArtifactsV64(db);
       if (db.prepare('PRAGMA main.foreign_key_check').all().length)
-        throw Error('V62_LEGACY_REBUILD_FOREIGN_KEY_FAILED');
+        throw Error('V64_LEGACY_REBUILD_FOREIGN_KEY_FAILED');
       db.exec(`PRAGMA main.user_version=${workspaceSchemaVersion}; COMMIT`);
     } catch (error) {
       db.exec('ROLLBACK');
@@ -245,7 +237,6 @@ function rebuildLegacyWorkspaceDbToV62(db: DatabaseSync, backupFile: string | nu
     db.exec('PRAGMA foreign_keys=ON');
   }
 }
-
 const ZOMBIE_TASK_TABLES_SQL = `
   DROP TRIGGER IF EXISTS retain_settlement_notice; DROP TRIGGER IF EXISTS immutable_settlement_notice;
   DROP TRIGGER IF EXISTS retain_browse_intent; DROP TRIGGER IF EXISTS immutable_browse_intent;
@@ -257,7 +248,6 @@ const ZOMBIE_TASK_TABLES_SQL = `
   DROP TABLE IF EXISTS task_control_receipts; DROP TABLE IF EXISTS task_control_bindings;
   DROP TABLE IF EXISTS task_tab_state; DROP TABLE IF EXISTS task_tab_ownership; DROP TABLE IF EXISTS task_browse_intents;
 `;
-
 function ensureLegacyUpgradeColumns(db: DatabaseSync): void {
   ensureColumns(db, 'workspace_preferences', [
     ['combination_colors', "TEXT NOT NULL DEFAULT '{}'"],
@@ -276,7 +266,6 @@ function ensureLegacyUpgradeColumns(db: DatabaseSync): void {
   `);
   ensureColumns(db, 'group_bumper_effects', [['story_shared', 'INTEGER NOT NULL DEFAULT 0']]);
 }
-
 function retireLegacyLogTables(db: DatabaseSync): void {
   if (sqliteTableExists(db, 'group_poster_logs'))
     db.exec(
@@ -298,7 +287,104 @@ function retireLegacyLogTables(db: DatabaseSync): void {
     DROP TABLE IF EXISTS group_poster_logs; DROP TABLE IF EXISTS group_bumper_logs;
   `);
 }
-
+export function cleanupW2LegacyArtifactsV64(db: DatabaseSync): void {
+  const now = Date.now();
+  const isLeakedExpr = (col: string) =>
+    `(json_valid(${col}) AND (` +
+    `json_extract(${col}, '$.name') LIKE '单项测试：%' OR ` +
+    `json_extract(${col}, '$.name') LIKE '单项测试:%' OR ` +
+    `json_extract(${col}, '$.name') LIKE '单项测试 · %' OR ` +
+    `json_extract(${col}, '$.name') = '排班快捷' OR ` +
+    `json_extract(${col}, '$.name') LIKE '排班 · %' OR ` +
+    `json_extract(${col}, '$.note') LIKE '单项测试工作台：%'` +
+    `))`;
+  if (sqliteTableExists(db, 'combinations') && sqliteTableExists(db, 'combination_versions')) {
+    const leakedRows = db
+      .prepare(
+        `SELECT DISTINCT combination_id AS id FROM combination_versions WHERE ${isLeakedExpr('body')}
+         UNION
+         SELECT id FROM combinations WHERE draft IS NOT NULL AND ${isLeakedExpr('draft')}`,
+      )
+      .all() as Array<{ id: string }>;
+    if (leakedRows.length > 0) {
+      const delUnusedVersions = db.prepare(
+        `DELETE FROM combination_versions
+         WHERE combination_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM task_plans p
+             WHERE p.combination_id = combination_versions.combination_id
+               AND p.version = combination_versions.version
+           )`,
+      );
+      const canHardDeleteCombo = db.prepare(
+        `SELECT 1 FROM combinations c
+         WHERE c.id = ?
+           AND NOT EXISTS (SELECT 1 FROM combination_versions cv WHERE cv.combination_id = c.id)
+           AND NOT EXISTS (SELECT 1 FROM resource_table_heads rth WHERE rth.combination_id = c.id)
+           AND NOT EXISTS (SELECT 1 FROM resource_table_versions rtv WHERE rtv.combination_id = c.id)
+         LIMIT 1`,
+      );
+      const hardDeleteCombo = db.prepare('DELETE FROM combinations WHERE id = ?');
+      const softDeleteCombo = db.prepare(
+        'UPDATE combinations SET deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE id = ?',
+      );
+      for (const { id } of leakedRows) {
+        delUnusedVersions.run(id);
+        if (canHardDeleteCombo.get(id)) hardDeleteCombo.run(id);
+        else softDeleteCombo.run(now, now, id);
+      }
+    }
+    db.exec(`
+      DELETE FROM combination_versions WHERE combination_id NOT IN (SELECT id FROM combinations);
+      DELETE FROM resource_table_heads WHERE combination_id NOT IN (SELECT id FROM combinations);
+    `);
+  }
+  if (sqliteTableExists(db, 'task_steps') && sqliteTableExists(db, 'task_plans')) {
+    const zombies = db
+      .prepare(
+        `SELECT s.id, s.status, json_extract(s.spec, '$.type') AS step_type,
+                COALESCE(NULLIF(p.reason, ''), CASE WHEN p.state = 'FAILED' THEN 'TASK_FAILED' ELSE 'USER_STOP' END) AS plan_reason,
+                p.updated_at AS plan_updated_at
+         FROM task_steps s
+         JOIN task_plans p ON p.id = s.job_id
+         WHERE p.state IN ('FAILED', 'STOPPED', 'COMPLETED')
+           AND s.status IN ('ACTIVE', 'PENDING')`,
+      )
+      .all() as Array<{
+      id: string;
+      status: string;
+      step_type: string | null;
+      plan_reason: string;
+      plan_updated_at: number | null;
+    }>;
+    if (zombies.length > 0) {
+      const upd = db.prepare('UPDATE task_steps SET status = ?, outcome = ? WHERE id = ?');
+      for (const z of zombies) {
+        const endedAt = Math.max(0, Math.floor(Number(z.plan_updated_at) || now));
+        if (z.status === 'ACTIVE') {
+          const isPost = z.step_type === 'post';
+          const outcome = JSON.stringify({
+            version: 1,
+            kind: 'FAILED',
+            reason: String(z.plan_reason || 'USER_STOP').slice(0, 200),
+            endedAt,
+            submissionPhase: isPost ? 'UNKNOWN' : 'NOT_APPLICABLE',
+            businessResult: isPost ? 'UNKNOWN' : 'NOT_APPLICABLE',
+          });
+          upd.run('FAILED', outcome, z.id);
+        } else {
+          const outcome = JSON.stringify({
+            version: 1,
+            kind: 'SKIPPED',
+            reason: 'FEATURE_UNAVAILABLE',
+            endedAt,
+          });
+          upd.run('SKIPPED', outcome, z.id);
+        }
+      }
+    }
+  }
+}
 export async function initializeOrMigrateWorkspaceDb(
   db: DatabaseSync,
   file: string,
@@ -327,15 +413,19 @@ export async function initializeOrMigrateWorkspaceDb(
     try {
       if (version === 0) {
         applyBaselineSchemaV62(db);
+        ensureActivityStatsSchema(db);
         if (db.prepare('PRAGMA foreign_key_check').all().length)
           throw Error('BASELINE_SCHEMA_FOREIGN_KEY_FAILED');
       } else {
         ensurePostBumpRecordsSchema(db);
         ensureLegacyUpgradeColumns(db);
         if (version < 61) db.exec(ZOMBIE_TASK_TABLES_SQL);
-        retireLegacyLogTables(db);
+        if (version < 62) retireLegacyLogTables(db);
+        if (version < 63) backfillActivityStatsV63(db);
+        else ensureActivityStatsSchema(db);
+        if (version < 64) cleanupW2LegacyArtifactsV64(db);
         if (db.prepare('PRAGMA foreign_key_check').all().length)
-          throw Error('V62_UPGRADE_FOREIGN_KEY_FAILED');
+          throw Error('V64_UPGRADE_FOREIGN_KEY_FAILED');
       }
       db.exec(`PRAGMA user_version=${workspaceSchemaVersion}; COMMIT`);
     } catch (error) {

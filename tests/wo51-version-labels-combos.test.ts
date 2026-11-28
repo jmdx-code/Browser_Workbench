@@ -13,7 +13,6 @@ import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { Store } from '../src/bridge/store.js';
 import { Core } from '../src/bridge/core.js';
 import type { TaskRepository } from '../src/domain/tasks.js';
-import type { Operation } from '../src/shared/task-contracts.js';
 
 test('WO51: idle queued reload is permitted, active admission, operations and notices remain busy', async () => {
   const workspace = await WorkspaceStore.open(':memory:');
@@ -41,12 +40,13 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
     ],
   );
   let opening = false,
-    operations = false,
+    running = false,
     releases = 0;
-  const tasks: Pick<TaskRepository, 'plansForProfile' | 'blockingOperations' | 'operations'> = {
-    plansForProfile: (...args) => workspace.tasks.plansForProfile(...args),
-    operations: () => (operations ? [{} as Operation] : []),
-    blockingOperations: () => (operations ? [{} as Operation] : []),
+  const tasks: Pick<TaskRepository, 'plansForProfile'> = {
+    plansForProfile: (...args) =>
+      running
+        ? workspace.tasks.plansForProfile(...args).map((p) => ({ ...p, state: 'RUNNING' as const }))
+        : workspace.tasks.plansForProfile(...args),
   };
   const sent: unknown[] = [];
   const peer = core.connect(
@@ -74,14 +74,14 @@ test('WO51: idle queued reload is permitted, active admission, operations and no
     },
   );
   try {
-    for (const kind of ['opening', 'operations'] as const) {
+    for (const kind of ['opening', 'running'] as const) {
       opening = kind === 'opening';
-      operations = kind === 'operations';
+      running = kind === 'running';
       assert.equal((await manager.reload([profileId])).skippedBusy, 1);
       await manager.automatic(peer);
       assert.equal(sent.length, 0);
     }
-    opening = operations = false;
+    opening = running = false;
     assert.equal((await manager.reload([profileId])).reloaded, 1);
     assert.equal(releases, 1);
     ready();

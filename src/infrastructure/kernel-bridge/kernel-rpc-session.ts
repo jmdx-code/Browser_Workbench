@@ -223,9 +223,11 @@ export class KernelRpcSession {
       ) ||
       event === 'actor-input-fenced'
     ) {
-      const level = /^(?:connect-error:|execution-error:|rpc-error:)/.test(event)
-        ? 'ERROR'
-        : 'WARN';
+      const level =
+        /^(?:connect-error:|execution-error:|rpc-error:)/.test(event) &&
+        !/Cannot find (?:default execution )?context|Execution context was destroyed/i.test(event)
+          ? 'ERROR'
+          : 'WARN';
       this.diag(level, 'KERNEL_SESSION_TRACE', event, { owner: this.owner, access: this.access });
     } else if (event.startsWith('rpc-finished:')) {
       const msMatch = /:(\d+)ms$/.exec(event),

@@ -199,20 +199,15 @@ test('a final activity result, timestamps and step outcome remain identical afte
     });
     s.tasks.completeStepDirect(f.plan.id, step.id);
     const service = new TaskService(s.tasks),
-      request = { profileId: f.profile.id, planId: f.plan.id };
-    const before = await service.history(request),
       records = await service.records({ groupBy: 'run', limit: 100 });
     assert.equal(s.tasks.get(f.plan.id).state, 'COMPLETED');
     const boundary = { at: Date.now() + 1000, key: 'z' };
     while (s.dataCleanup.pruneDetails(boundary, 100)) {}
-    const after = await service.history(request);
-    assert.deepEqual(after.steps, before.steps);
-    assert(after.detailsReclaimed);
     assert.deepEqual(
       (await service.records({ groupBy: 'run', limit: 100 })).records,
       records.records,
     );
-    assert.equal(s.tasks.operations(f.plan.id).length, 0);
+    assert.equal(s.tasks.steps(f.plan.id).length, 1);
     assert.equal(s.tasks.events(f.plan.id).length, 0);
     const db = new DatabaseSync(file, { readOnly: true });
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
@@ -406,34 +401,28 @@ test('a late real journal for a retired cancellation restores UNKNOWN evidence w
   }
 });
 test('closed failed plans remain readable while pure events are reclaimed and step progress updates stay visible', async () => {
-  await workspaceFixture(async (s, file) => {
+  await workspaceFixture(async (s) => {
     const f = assignSamplePlan(s);
     s.tasks.claimPlanForProfile(f.profile.id, f.profile.account.id);
+    const initial = s.tasks.steps(f.plan.id)[0];
+    assert.ok(initial);
+    const progress = { ...initial.progress, revision: initial.progress.revision + 1 };
+    s.tasks.updateStepProgress(f.plan.id, initial.id, progress);
     s.tasks.stopPlanDirect(f.plan.id, 'FAIL_FIXTURE');
-    const service = new TaskService(s.tasks),
-      request = { profileId: f.profile.id, planId: f.plan.id };
-    const before = await service.history(request);
+    const service = new TaskService(s.tasks);
+    const before = s.tasks.steps(f.plan.id);
     assert.equal(s.tasks.get(f.plan.id).state, 'STOPPED');
     while (s.dataCleanup.pruneDetails({ at: Date.now() + 1000, key: 'z' }, 100)) {}
     assert.equal(s.tasks.events(f.plan.id).length, 0);
-    const after = await service.history(request);
-    assert.deepEqual(after.steps, before.steps);
-    assert(after.detailsReclaimed);
-    const old = s.tasks.steps(f.plan.id)[0];
+    const after = s.tasks.steps(f.plan.id);
+    assert.deepEqual(after, before);
+    const old = after[0];
     assert.ok(old);
-    const progress = { ...old.progress, revision: old.progress.revision + 1 };
-    const db = new DatabaseSync(file);
-    try {
-      db.prepare('UPDATE task_steps SET progress=? WHERE id=?').run(
-        JSON.stringify(progress),
-        old.id,
-      );
-    } finally {
-      db.close();
-    }
-    await service.records({ limit: 100 });
-    const refreshed = await service.history(request);
-    assert.deepEqual(refreshed.steps[0]?.progress, progress);
-    assert.equal(refreshed.steps[0]?.finishedAt, after.steps[0]?.finishedAt);
+    const refreshed = await service.records({ profileId: f.profile.id, limit: 100 });
+    assert.deepEqual(refreshed.records[0]?.progress, progress);
+    assert.equal(
+      refreshed.records[0]?.finishedAt,
+      old.outcome?.kind === 'FAILED' ? old.outcome.endedAt : null,
+    );
   });
 });

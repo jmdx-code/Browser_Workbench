@@ -6,7 +6,6 @@ import type { BumperState } from '../../../shared/group-bumper.js';
 import type { GroupInviterState } from '../../../shared/group-inviter.js';
 import type { PosterState } from '../../../shared/group-poster.js';
 import { api } from '../../api.js';
-
 function playInviterCompletionChime(): void {
   try {
     if (typeof window === 'undefined' || typeof window.AudioContext !== 'function') return;
@@ -26,7 +25,6 @@ function playInviterCompletionChime(): void {
     osc.onended = () => void ctx.close().catch(() => {});
   } catch {}
 }
-
 function useChimeOnComplete(running: boolean, enabled: boolean) {
   const prev = useRef(false);
   useEffect(() => {
@@ -34,7 +32,6 @@ function useChimeOnComplete(running: boolean, enabled: boolean) {
     prev.current = running;
   }, [running, enabled]);
 }
-
 function usePollInterval(fetchNow: boolean, poll: boolean, ms: number, refresh: () => void) {
   useEffect(() => {
     if (fetchNow) refresh();
@@ -43,7 +40,6 @@ function usePollInterval(fetchNow: boolean, poll: boolean, ms: number, refresh: 
     return () => clearInterval(t);
   }, [fetchNow, poll, ms, refresh]);
 }
-
 function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?: () => void) {
   const [state, setState] = useState<T | null>(null);
   const ctrlRef = useRef<AbortController | null>(null),
@@ -52,7 +48,6 @@ function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?:
     mountedRef = useRef(true),
     finallyRef = useRef(onFinally);
   finallyRef.current = onFinally;
-
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -61,7 +56,6 @@ function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?:
       ctrlRef.current = null;
     };
   }, []);
-
   const commit = useCallback((next: T | null) => {
     epochRef.current += 1;
     ctrlRef.current?.abort();
@@ -69,7 +63,6 @@ function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?:
     sigRef.current = JSON.stringify(next);
     setState(next);
   }, []);
-
   const refresh = useCallback(
     (force = false): Promise<void> => {
       if (!force && ctrlRef.current) return Promise.resolve();
@@ -97,18 +90,15 @@ function usePolledModule<T>(fetcher: (s: AbortSignal) => Promise<T>, onFinally?:
     },
     [fetcher],
   );
-
   const trigger = useCallback(() => void refresh(false), [refresh]);
   return [state, commit, trigger, refresh] as const;
 }
-
 export function useFeatureModulesPolling(viewKind: string, sseConnected = false) {
   const [groupInviterLoaded, setGroupInviterLoaded] = useState(false),
     [serverActiveModules, setServerActiveModules] = useState<readonly string[]>([]),
     [windowVisible, setWindowVisible] = useState(() =>
       typeof document !== 'undefined' ? !document.hidden : true,
     );
-
   const [groupBumper, setGroupBumper, refreshBumper] = usePolledModule<BumperState>(
     api.bumperState,
   );
@@ -124,7 +114,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
     usePolledModule<AutoSchedulerState>(api.autoSchedulerState);
   const [googleSheets, setGoogleSheets, refreshGoogleSheets] =
     usePolledModule<GoogleSheetsOverview>(api.googleSheetsOverview);
-
   const refreshGroupInviter = useCallback(() => fetchInviter(false), [fetchInviter]);
   const refreshBluestacks = useCallback(
     (force = false) =>
@@ -136,7 +125,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
         : fetchBs(false)),
     [setBluestacks, fetchBs],
   );
-
   useChimeOnComplete(
     Boolean(groupInviter?.running),
     groupInviter !== null && groupInviter.playSoundOnComplete !== false,
@@ -149,14 +137,12 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
     Boolean(bluestacks?.pageBumperRunning),
     Boolean(bluestacks?.pageBumperSettings?.enableSound),
   );
-
   useEffect(() => {
     if (typeof document === 'undefined') return;
     const onVis = () => setWindowVisible(!document.hidden);
     document.addEventListener('visibilitychange', onVis);
     return () => document.removeEventListener('visibilitychange', onVis);
   }, []);
-
   useEffect(() => {
     for (const fn of [
       refreshBumper,
@@ -175,7 +161,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
     refreshAutoScheduler,
     refreshGoogleSheets,
   ]);
-
   const prevActiveSigRef = useRef(''),
     mountedRef = useRef(true);
   useEffect(
@@ -199,7 +184,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
       })
       .catch(() => {});
   }, []);
-
   useEffect(() => {
     if (typeof api.runtimeSummary !== 'function') return;
     let inFlight: AbortController | null = null;
@@ -221,7 +205,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
       clearInterval(timer);
     };
   }, [windowVisible, sseConnected, pollSummary]);
-
   const hasMod = (id: string) => serverActiveModules.includes(id);
   const sBumper = hasMod('group-bumper') || hasMod('page-bumper'),
     sInviter = hasMod('group-inviter'),
@@ -230,11 +213,11 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
     sSched = hasMod('auto-scheduler'),
     sSheets = hasMod('google-sheets');
   const isBsView = viewKind.startsWith('bluestacks-'),
+    isLayoutView = viewKind === 'window-layout',
     isSheetsView = viewKind.startsWith('sheets-') || viewKind === 'records',
     isSchedView = viewKind === 'auto-scheduler',
     fastMs = (fast: boolean, activeMs = 2000, idleMs = 6000) =>
       sseConnected ? 15_000 : windowVisible ? (fast ? activeMs : idleMs) : 10_000;
-
   const bumperBusy = Boolean(
     groupBumper?.running ||
     groupBumper?.pageBumperRunning ||
@@ -283,7 +266,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
           (l.kind === 'post_records' && l.recordsConfig?.enabled)),
     ),
   );
-
   for (const [fetchNow, poll, ms, fn] of [
     [
       bumperView || isSchedView || viewKind === 'records' || sBumper,
@@ -304,9 +286,9 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
       refreshPoster,
     ],
     [
-      isBsView || isSchedView || viewKind === 'records' || sBs,
-      isBsView || viewKind === 'records' || bsBusy,
-      fastMs(isBsView || bsBusy, 1800),
+      isBsView || isLayoutView || isSchedView || viewKind === 'records' || sBs,
+      isBsView || isLayoutView || viewKind === 'records' || bsBusy,
+      fastMs(isBsView || isLayoutView || bsBusy, 1800),
       refreshBsIdle,
     ],
     [
@@ -323,7 +305,6 @@ export function useFeatureModulesPolling(viewKind: string, sseConnected = false)
     ],
   ] as const)
     usePollInterval(fetchNow, poll, ms, fn);
-
   return {
     groupBumper,
     setGroupBumper,

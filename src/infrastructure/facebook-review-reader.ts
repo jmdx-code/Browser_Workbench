@@ -2,6 +2,7 @@ import type { Awaitable } from '../domain/persistence.js';
 import type { Page } from 'playwright-core';
 import { z } from 'zod';
 import { FacebookPostEffects } from '../shared/facebook-post-observation.js';
+import { readVerifiedProfileReading } from './facebook-reel-reader.js';
 // Actual Chinese personal-profile Next stage. Only reads the original hidden editable and
 // the visible preview belonging to the same outer form; no input, navigation or page stores.
 export function projectFacebookReviewContent() {
@@ -99,16 +100,11 @@ const reading = z
     composer: FacebookPostEffects.shape.composer,
   })
   .strict();
-export async function readFacebookReviewContent(page: Page, guard: () => Awaitable<void>) {
-  await guard();
-  const value = reading.parse(await page.evaluate(projectFacebookReviewContent));
-  await guard();
-  const url = new URL(value.url);
-  if (
-    url.origin !== 'https://www.facebook.com' ||
-    (value.found &&
-      (url.pathname !== '/profile.php' || !/^\d{1,30}$/.test(url.searchParams.get('id') ?? '')))
-  )
-    throw Error('FACEBOOK_REVIEW_ROUTE_UNVERIFIED');
-  return value;
-}
+export const readFacebookReviewContent = (page: Page, guard: () => Awaitable<void>) =>
+  readVerifiedProfileReading(
+    page,
+    guard,
+    projectFacebookReviewContent,
+    reading,
+    'FACEBOOK_REVIEW_ROUTE_UNVERIFIED',
+  );

@@ -1,5 +1,4 @@
 import type { Workspace } from '../shared/contracts.js';
-
 export class WorkspaceReader {
   private pending: { controller: AbortController; work: Promise<void> } | null = null;
   private disposed = false;

@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import { normalizeRecordAccountId } from '../shared/activity-stats.js';
 import * as PB from '../shared/post-bump-records.js';
 import type { BumperLog } from '../shared/group-bumper.js';
 import type { PosterLog } from '../shared/group-poster.js';
+import { stripAnsi } from '../shared/relative-post-age.js';
 import * as Q from './persistence/sqlite-query-helpers.js';
-
+import { transaction } from './sqlite-transaction.js';
+import { loadKnownAvatarSets, recordAvatarURL } from './record-avatar-store.js';
 export const sqliteTableExists = Q.sqliteTableExists;
-
+const runIfExists = (db: DatabaseSync, tbl: string, sql: string, args: SQLInputValue[] = []) => {
+  if (Q.sqliteTableExists(db, tbl)) Q.run(db, sql, ...args);
+};
 export function ensurePostBumpRecordsSchema(db: DatabaseSync) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS post_bump_records( id TEXT PRIMARY KEY, record_type TEXT NOT NULL CHECK(record_type IN ('post','group_bump','page_bump')), carrier TEXT NOT NULL CHECK(carrier IN ('browser','bluestacks')), status TEXT NOT NULL DEFAULT 'success' CHECK(status IN ('success','failed')), profile_id TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', account_name TEXT NOT NULL DEFAULT '', group_id TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', page_id TEXT NOT NULL DEFAULT '', page_name TEXT NOT NULL DEFAULT '', post_id TEXT NOT NULL DEFAULT '', post_url TEXT NOT NULL DEFAULT '', liked INTEGER NOT NULL DEFAULT 0, comment_text TEXT, story_shared INTEGER NOT NULL DEFAULT 0, caption_preview TEXT NOT NULL DEFAULT '', error_reason TEXT NOT NULL DEFAULT '', source_log_id TEXT, created_at INTEGER NOT NULL );
@@ -15,35 +20,39 @@ export function ensurePostBumpRecordsSchema(db: DatabaseSync) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_post_bump_records_source ON post_bump_records(record_type, source_log_id) WHERE source_log_id IS NOT NULL;
   `);
 }
-
 const clean = (raw: string | null | undefined): string => {
   const t = (raw ?? '').trim();
   return !t || t === '__page_timeline__' || t === '-' ? '' : t;
 };
-
 function resolveCachedAccountIdentity(
   db: DatabaseSync,
   profileId: string,
   rawId: string,
   rawName: string,
 ): { accountId: string; accountName: string } {
-  let accountId = clean(rawId),
-    accountName = clean(rawName);
+  const normRaw = normalizeRecordAccountId(clean(rawId));
+  let accountId = normRaw.accountId,
+    accountName = clean(rawName) || normRaw.extractedName;
   if (Q.sqliteTableExists(db, 'profile_account_cache')) {
     const sql = accountId
       ? 'SELECT account_id, account_name FROM profile_account_cache WHERE profile_id=? AND account_id=? LIMIT 1'
       : 'SELECT account_id, account_name FROM profile_account_cache WHERE profile_id=? LIMIT 1';
     const c = accountId ? Q.getRow(db, sql, profileId, accountId) : Q.getRow(db, sql, profileId);
-    accountId ||= Q.nonEmptyTrimmed(c?.account_id) ?? '';
-    accountName ||= Q.nonEmptyTrimmed(c?.account_name) ?? '';
+    const normPac = normalizeRecordAccountId(Q.nonEmptyTrimmed(c?.account_id) ?? '');
+    accountId ||= normPac.accountId;
+    accountName ||= Q.nonEmptyTrimmed(c?.account_name) ?? normPac.extractedName;
   }
   if ((!accountId || !accountName) && Q.sqliteTableExists(db, 'bluestacks_instances')) {
     const sql =
-      'SELECT account_id, account_name, alias, display_name FROM bluestacks_instances WHERE id=? LIMIT 1';
+      'SELECT numeric_account_id, account_id, account_name, alias, display_name FROM bluestacks_instances WHERE id=? LIMIT 1';
     const bs = Q.getRow(db, sql, profileId);
-    accountId ||= Q.nonEmptyTrimmed(bs?.account_id) ?? '';
+    const normBs = normalizeRecordAccountId(
+      Q.nonEmptyTrimmed(bs?.numeric_account_id) || Q.nonEmptyTrimmed(bs?.account_id) || '',
+    );
+    accountId ||= normBs.accountId;
     accountName ||=
       Q.nonEmptyTrimmed(bs?.account_name) ||
+      normBs.extractedName ||
       Q.nonEmptyTrimmed(bs?.alias) ||
       Q.nonEmptyTrimmed(bs?.display_name) ||
       '';
@@ -58,7 +67,6 @@ function resolveCachedAccountIdentity(
   }
   return { accountId, accountName: accountName || accountId };
 }
-
 export const detectRecordCarrier = (
   db: DatabaseSync,
   profileId: string,
@@ -67,7 +75,6 @@ export const detectRecordCarrier = (
   db.prepare('SELECT 1 FROM bluestacks_instances WHERE id=? LIMIT 1').get(profileId)
     ? 'bluestacks'
     : 'browser';
-
 export function syncPosterLogToPostBumpRecords(db: DatabaseSync, i: PosterLog) {
   if (!Q.sqliteTableExists(db, 'post_bump_records')) return;
   const { accountId, accountName } = resolveCachedAccountIdentity(
@@ -100,7 +107,6 @@ export function syncPosterLogToPostBumpRecords(db: DatabaseSync, i: PosterLog) {
     i.postedAt,
   );
 }
-
 export function syncBumperLogToPostBumpRecords(
   db: DatabaseSync,
   i: BumperLog,
@@ -134,7 +140,6 @@ export function syncBumperLogToPostBumpRecords(
     i.bumpedAt,
   );
 }
-
 export function backfillPostBumpRecordsMigration(db: DatabaseSync) {
   ensurePostBumpRecordsSchema(db);
   const hasBs = Q.sqliteTableExists(db, 'bluestacks_instances'),
@@ -171,10 +176,70 @@ export function backfillPostBumpRecordsMigration(db: DatabaseSync) {
     );
   }
 }
-
-const mapRow = (r: Record<string, unknown>): PB.PostBumpRecord =>
-  PB.PostBumpRecordSchema.parse(Q.camel(r, 'liked,story_shared'));
-
+const mapRow = (
+  r: Record<string, unknown>,
+  winNames: ReadonlyMap<string, string>,
+  avatars: ReturnType<typeof loadKnownAvatarSets>,
+): PB.PostBumpRecord => {
+  const base = Q.camel(r, 'liked,story_shared');
+  const normAcc = normalizeRecordAccountId(Q.s(r.account_id));
+  const pid = Q.s(r.profile_id),
+    accId = normAcc.accountId,
+    accName = Q.s(r.account_name).trim() || normAcc.extractedName,
+    pageId = Q.s(r.page_id).trim(),
+    groupId = Q.s(r.group_id).trim();
+  const accountAvatarUrl =
+    accId && avatars.accounts.has(accId)
+      ? recordAvatarURL('account', accId)
+      : accId && avatars.pages.has(accId)
+        ? recordAvatarURL('page', accId)
+        : '';
+  const pageAvatarUrl = pageId && avatars.pages.has(pageId) ? recordAvatarURL('page', pageId) : '';
+  const groupAvatarUrl =
+    groupId && avatars.groups.has(groupId) ? recordAvatarURL('group', groupId) : '';
+  return PB.PostBumpRecordSchema.parse({
+    ...base,
+    accountId: accId,
+    accountName: accName,
+    errorReason: stripAnsi(Q.s(r.error_reason)),
+    windowName: winNames.get(pid) ?? pid,
+    accountAvatarUrl,
+    pageAvatarUrl,
+    groupAvatarUrl,
+  });
+};
+function loadWindowNamesMap(db: DatabaseSync): Map<string, string> {
+  const map = new Map<string, string>();
+  const sources: ReadonlyArray<[string, string, (r: Record<string, unknown>) => [string, string]]> =
+    [
+      [
+        'profile_launch_bindings',
+        'SELECT profile_id, browser_name, window_name FROM profile_launch_bindings',
+        (r) => [Q.s(r.profile_id), Q.s(r.browser_name).trim() || Q.s(r.window_name).trim()],
+      ],
+      [
+        'profile_metadata',
+        'SELECT profile_id, alias FROM profile_metadata',
+        (r) => [Q.s(r.profile_id), Q.s(r.alias).trim()],
+      ],
+      [
+        'bluestacks_instances',
+        'SELECT id, instance_key, display_name, alias FROM bluestacks_instances',
+        (r) => [
+          Q.s(r.id),
+          Q.s(r.alias).trim() || Q.s(r.display_name).trim() || Q.s(r.instance_key),
+        ],
+      ],
+    ];
+  for (const [tbl, sql, pick] of sources) {
+    if (!Q.sqliteTableExists(db, tbl)) continue;
+    for (const r of Q.allRows(db, sql)) {
+      const [id, name] = pick(r);
+      if (id && name) map.set(id, name);
+    }
+  }
+  return map;
+}
 export class SqlitePostBumpRecordsRepository {
   constructor(private readonly db: DatabaseSync) {
     ensurePostBumpRecordsSchema(db);
@@ -186,8 +251,26 @@ export class SqlitePostBumpRecordsRepository {
         p.profileId,
         p.accountId,
         p.accountName,
-      );
-    const rec: PB.PostBumpRecord = {
+      ),
+      sourceLogId = p.sourceLogId?.trim() || null,
+      errorReason = stripAnsi(p.errorReason).trim();
+    if (p.status === 'failed') {
+      const existing =
+        (sourceLogId
+          ? Q.getRow(
+              this.db,
+              'SELECT * FROM post_bump_records WHERE record_type=? AND source_log_id=? LIMIT 1',
+              p.recordType,
+              sourceLogId,
+            )
+          : undefined) ??
+        (p.id
+          ? Q.getRow(this.db, 'SELECT * FROM post_bump_records WHERE id=? LIMIT 1', p.id)
+          : undefined);
+      if (existing)
+        return mapRow(existing, loadWindowNamesMap(this.db), loadKnownAvatarSets(this.db));
+    }
+    const rawInsert = {
       ...p,
       id: p.id ?? randomUUID(),
       accountId,
@@ -196,12 +279,27 @@ export class SqlitePostBumpRecordsRepository {
       groupName: clean(p.groupName),
       pageId: clean(p.pageId),
       pageName: clean(p.pageName),
+      errorReason,
+      sourceLogId,
       createdAt: p.createdAt ?? Date.now(),
     };
     const cols =
       'id,record_type,carrier,status,profile_id,account_id,account_name,group_id,group_name,page_id,page_name,post_id,post_url,liked,comment_text,story_shared,caption_preview,error_reason,source_log_id,created_at';
-    Q.insertFrom(this.db, 'post_bump_records', cols, rec, undefined, 'INSERT OR REPLACE INTO');
-    return rec;
+    Q.insertFrom(
+      this.db,
+      'post_bump_records',
+      cols,
+      rawInsert,
+      undefined,
+      p.status === 'failed' ? 'INSERT OR IGNORE INTO' : 'INSERT OR REPLACE INTO',
+    );
+    return {
+      ...rawInsert,
+      windowName: '',
+      accountAvatarUrl: '',
+      pageAvatarUrl: '',
+      groupAvatarUrl: '',
+    };
   }
   list(queryInput: PB.PostBumpRecordQuery = {}): PB.PostBumpRecordsResponse {
     const q = PB.PostBumpRecordQuerySchema.parse(queryInput),
@@ -223,78 +321,155 @@ export class SqlitePostBumpRecordsRepository {
         params.push(val);
       }
     }
-    const kw = q.search.trim().toLowerCase();
-    if (kw) {
-      clauses.push(
-        "instr(lower(account_name||' '||account_id||' '||group_name||' '||group_id||' '||page_name||' '||page_id||' '||post_url||' '||caption_preview||' '||COALESCE(comment_text,'')||' '||error_reason), ?) > 0",
-      );
+    const pushKw = (expr: string, raw: string) => {
+      const kw = raw.trim().toLowerCase();
+      if (!kw) return;
+      clauses.push(`instr(lower(${expr}), ?) > 0`);
       params.push(kw);
-    }
+    };
+    pushKw(
+      "account_name||' '||account_id||' '||group_name||' '||group_id||' '||page_name||' '||page_id||' '||post_url||' '||caption_preview||' '||COALESCE(comment_text,'')||' '||error_reason",
+      q.search,
+    );
+    pushKw("account_name||' '||account_id||' '||profile_id", q.accountQuery);
+    pushKw("group_name||' '||group_id", q.groupQuery);
+    pushKw("page_name||' '||page_id", q.pageQuery);
+    pushKw("post_url||' '||post_id", q.postUrlQuery);
     const whereSql = clauses.join(' AND ');
     const countSql = `SELECT COUNT(*) AS n, SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count, SUM(CASE WHEN status = 'success' AND record_type = 'post' AND (post_id = 'pending_approval' OR post_id LIKE 'pending-%') THEN 1 ELSE 0 END) AS pending_count FROM post_bump_records WHERE ${whereSql}`;
     const countRow = Q.getRow(this.db, countSql, ...params),
       total = Q.n(countRow?.n),
       failed = Q.n(countRow?.failed_count),
       pending = Q.n(countRow?.pending_count);
+    const winNames = loadWindowNamesMap(this.db),
+      avatars = loadKnownAvatarSets(this.db);
     const records = Q.allRows(
       this.db,
       `SELECT * FROM post_bump_records WHERE ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
       ...params,
       q.limit,
       q.offset,
-    ).map(mapRow);
+    ).map((r) => mapRow(r, winNames, avatars));
     return {
       records,
       total,
       hasMore: q.offset + records.length < total,
-      dailyStats: this.computeWeeklyDailyStats(q.carrier),
       statusCounts: { total, confirmed: Math.max(0, total - failed - pending), pending, failed },
     };
   }
-  private computeWeeklyDailyStats(
-    carrier: 'all' | PB.PostBumpCarrierValue,
-  ): PB.PostBumpDailyStat[] {
-    const startMs = Q.localDayStartMs(Date.now()) - 6 * 86_400_000,
-      byDay = new Map<string, PB.PostBumpDailyStat>();
-    for (let i = 0; i < 7; i++) {
-      const d = Q.formatLocalYmd(new Date(startMs + i * 86_400_000));
-      byDay.set(d, { dateKey: d, posts: 0, bumps: 0, failures: 0 });
-    }
-    const sql =
-      carrier === 'all'
-        ? 'SELECT created_at, record_type, status FROM post_bump_records WHERE created_at >= ?'
-        : 'SELECT created_at, record_type, status FROM post_bump_records WHERE created_at >= ? AND carrier = ?';
-    const rows =
-      carrier === 'all'
-        ? Q.allRows(this.db, sql, startMs)
-        : Q.allRows(this.db, sql, startMs, carrier);
-    for (const r of rows) {
-      const b = byDay.get(Q.formatLocalYmd(new Date(Q.n(r.created_at))));
-      if (b) {
-        if (r.status === 'failed') b.failures++;
-        else if (r.record_type === 'post') b.posts++;
-        else b.bumps++;
-      }
-    }
-    return [...byDay.values()];
+  private syncDerivedTargetAndUsageCounts() {
+    for (const [tbl1, tbl2, sql] of [
+      [
+        'shared_facebook_groups',
+        'group_poster_usage',
+        'UPDATE shared_facebook_groups SET posted_count=(SELECT COUNT(*) FROM group_poster_usage WHERE group_poster_usage.group_id=shared_facebook_groups.group_id)',
+      ],
+      [
+        'shared_facebook_groups',
+        'group_bumper_effects',
+        'UPDATE shared_facebook_groups SET bumped_count=(SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.group_id=shared_facebook_groups.group_id)',
+      ],
+      [
+        'group_bumper_pages',
+        'group_bumper_effects',
+        'UPDATE group_bumper_pages SET total_bumped_count=(SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.page_id=group_bumper_pages.page_id)',
+      ],
+      [
+        'group_poster_materials',
+        'group_poster_usage',
+        'UPDATE group_poster_materials SET used_count=(SELECT COUNT(*) FROM group_poster_usage WHERE group_poster_usage.material_id=group_poster_materials.id)',
+      ],
+    ] as const)
+      if (Q.sqliteTableExists(this.db, tbl1)) runIfExists(this.db, tbl2, sql);
   }
-  deleteByIds = (ids: readonly string[]): { deleted: number } => ({
-    deleted: Q.deleteByJsonIds(this.db, 'post_bump_records', 'id', [
-      ...new Set(ids.map((i) => i.trim()).filter(Boolean)),
-    ]),
-  });
+  deleteByIds = (ids: readonly string[]): { deleted: number } => {
+    const uniq = [...new Set(ids.map((i) => i.trim()).filter(Boolean))];
+    if (!uniq.length) return { deleted: 0 };
+    return transaction(this.db, () => {
+      const targets = Q.allRows(
+        this.db,
+        'SELECT id, record_type, source_log_id FROM post_bump_records WHERE id IN (SELECT value FROM json_each(?))',
+        JSON.stringify(uniq),
+      );
+      const logIds = [
+        ...new Set(targets.map((r) => Q.sn(r.source_log_id)).filter((v): v is string => !!v)),
+      ];
+      if (logIds.length > 0) {
+        const logJson = JSON.stringify(logIds);
+        for (const [tbl, sql] of [
+          [
+            'group_poster_usage',
+            'DELETE FROM group_poster_usage WHERE log_id IN (SELECT value FROM json_each(?))',
+          ],
+          [
+            'group_bumper_effects',
+            'DELETE FROM group_bumper_effects WHERE log_id IN (SELECT value FROM json_each(?))',
+          ],
+          [
+            'group_poster_operations',
+            "DELETE FROM group_poster_operations WHERE kernel_settled=1 AND status='VERIFIED' AND log_id IN (SELECT value FROM json_each(?))",
+          ],
+          [
+            'group_bumper_operations',
+            "DELETE FROM group_bumper_operations WHERE status='SETTLED' AND log_id IN (SELECT value FROM json_each(?))",
+          ],
+        ] as const)
+          runIfExists(this.db, tbl, sql, [logJson]);
+      }
+      const deleted = Q.deleteByJsonIds(this.db, 'post_bump_records', 'id', uniq);
+      this.syncDerivedTargetAndUsageCounts();
+      return { deleted };
+    });
+  };
   clear(recordType?: PB.PostBumpRecordQueryTypeValue): { deleted: number } {
     const f = !recordType || recordType === 'all' ? null : recordType;
-    const res =
-      f === 'bump_all'
-        ? Q.run(
-            this.db,
-            "DELETE FROM post_bump_records WHERE record_type IN ('group_bump', 'page_bump')",
-          )
-        : f
-          ? Q.run(this.db, 'DELETE FROM post_bump_records WHERE record_type=?', f)
-          : Q.run(this.db, 'DELETE FROM post_bump_records');
-    return { deleted: Number(res.changes ?? 0) };
+    return transaction(this.db, () => {
+      const clearPosts = f === null || f === 'post',
+        clearGroupBumps = f === null || f === 'bump_all' || f === 'group_bump',
+        clearPageBumps = f === null || f === 'bump_all' || f === 'page_bump';
+      if (clearPosts) {
+        runIfExists(this.db, 'group_poster_usage', 'DELETE FROM group_poster_usage');
+        runIfExists(
+          this.db,
+          'group_poster_operations',
+          "DELETE FROM group_poster_operations WHERE kernel_settled=1 AND status='VERIFIED'",
+        );
+      }
+      if (clearGroupBumps && clearPageBumps) {
+        runIfExists(this.db, 'group_bumper_effects', 'DELETE FROM group_bumper_effects');
+        runIfExists(
+          this.db,
+          'group_bumper_operations',
+          "DELETE FROM group_bumper_operations WHERE status='SETTLED'",
+        );
+      } else if (clearGroupBumps || clearPageBumps) {
+        const sm = clearPageBumps ? 'page' : 'group';
+        runIfExists(
+          this.db,
+          'group_bumper_effects',
+          'DELETE FROM group_bumper_effects WHERE source_mode=?',
+          [sm],
+        );
+        runIfExists(
+          this.db,
+          'group_bumper_operations',
+          sm === 'page'
+            ? "DELETE FROM group_bumper_operations WHERE status='SETTLED' AND group_id='-'"
+            : "DELETE FROM group_bumper_operations WHERE status='SETTLED' AND group_id<>'-'",
+        );
+      }
+      const res =
+        f === 'bump_all'
+          ? Q.run(
+              this.db,
+              "DELETE FROM post_bump_records WHERE record_type IN ('group_bump', 'page_bump')",
+            )
+          : f
+            ? Q.run(this.db, 'DELETE FROM post_bump_records WHERE record_type=?', f)
+            : Q.run(this.db, 'DELETE FROM post_bump_records');
+      this.syncDerivedTargetAndUsageCounts();
+      return { deleted: Number(res.changes ?? 0) };
+    });
   }
   todayStats(nowMs = Date.now()): PB.TodayStatsSummary {
     const startMs = Q.localDayStartMs(nowMs),

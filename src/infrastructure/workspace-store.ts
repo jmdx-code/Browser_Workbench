@@ -5,6 +5,7 @@ import { SqliteGroupPosterRepository } from './group-poster-store.js';
 import { DEFAULT_CONCURRENT_PROFILES } from '../shared/task-policies.js';
 import { SqliteDataCleanup } from './data-cleanup-store.js';
 import type { SynchronousRepository } from '../domain/persistence.js';
+import { SqliteActivityStatsRepository } from './activity-stats-store.js';
 import { SqlitePostBumpRecordsRepository } from './post-bump-records-store.js';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
@@ -35,6 +36,7 @@ import {
 import { isLocalAvatar } from '../shared/group-bumper.js';
 import {
   ProductError,
+  failError,
   type CachedProfileAccount,
   WorkspaceRepository as CompatibleWorkspaceRepository,
 } from '../domain/workspace.js';
@@ -56,9 +58,7 @@ import {
   type Profile,
   type SavedCombination,
 } from '../shared/contracts.js';
-
 export { workspaceSchemaVersion };
-
 const VALID_ACCOUNT_STATES = new Set([
   'unknown',
   'logged-in',
@@ -66,7 +66,6 @@ const VALID_ACCOUNT_STATES = new Set([
   'restricted',
   'verification',
 ]);
-
 export class WorkspaceStore implements WorkspaceRepository {
   private stmt = (sql: string) => prepareCached(this.db, sql);
   targetFolders = (kind: import('../shared/target-list.js').TargetListKind) =>
@@ -121,11 +120,7 @@ export class WorkspaceStore implements WorkspaceRepository {
         'UPDATE workspace_preferences SET revision=revision+1,log_retention_days=? WHERE id=1 AND revision=?';
     return transaction(this.db, () => {
       if (this.stmt(sql).run(req.logRetentionDays, req.expectedRevision).changes !== 1)
-        throw new ProductError(
-          'PREFERENCES_REVISION_CONFLICT',
-          '设置已在其他窗口修改，请重新读取后保存',
-          409,
-        );
+        failError('PREFERENCES_REVISION_CONFLICT', '设置已在其他窗口修改，请重新读取后保存', 409);
       return this.maintenanceSettings();
     });
   }
@@ -178,11 +173,7 @@ export class WorkspaceStore implements WorkspaceRepository {
           ]
         : [v.defaultTimeZone, v.desktopNotifications, req.expectedRevision];
       if (this.stmt(sql).run(...args).changes !== 1)
-        throw new ProductError(
-          'PREFERENCES_REVISION_CONFLICT',
-          '设置已在其他窗口修改，请重新读取后保存',
-          409,
-        );
+        failError('PREFERENCES_REVISION_CONFLICT', '设置已在其他窗口修改，请重新读取后保存', 409);
       if (v.windowLayout !== undefined)
         this.stmt('UPDATE workspace_preferences SET window_layout=? WHERE id=1').run(
           JSON.stringify(v.windowLayout),
@@ -205,11 +196,12 @@ export class WorkspaceStore implements WorkspaceRepository {
   readonly autoScheduler: SqliteAutoSchedulerRepository;
   readonly googleSheets: SqliteGoogleSheetsRepository;
   readonly postBumpRecords: SqlitePostBumpRecordsRepository;
+  readonly activityStats: SqliteActivityStatsRepository;
   private constructor(private readonly db: DatabaseSync) {
     this.materialUsage = new SqliteMaterialUsageRepository(db);
     this.resourceTables = new SqliteResourceTableRepository(db);
     this.tasks = new SqliteTaskRepository(db);
-    this.dataCleanup = new SqliteDataCleanup(db, () => this.tasks.invalidateBatchTimingCache());
+    this.dataCleanup = new SqliteDataCleanup(db);
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
     this.groupInviter = new SqliteGroupInviterRepository(db);
     this.groupBumper = new SqliteGroupBumperRepository(db);
@@ -218,6 +210,7 @@ export class WorkspaceStore implements WorkspaceRepository {
     this.autoScheduler = new SqliteAutoSchedulerRepository(db);
     this.googleSheets = new SqliteGoogleSheetsRepository(db);
     this.postBumpRecords = new SqlitePostBumpRecordsRepository(db);
+    this.activityStats = new SqliteActivityStatsRepository(db);
   }
   static async open(file: string, onProgress?: (completed: number, total: number) => void) {
     let existed = true;
@@ -261,7 +254,6 @@ export class WorkspaceStore implements WorkspaceRepository {
       }
       if (version === 0)
         store.tasks.setSettings({ maxConcurrentProfiles: DEFAULT_CONCURRENT_PROFILES });
-      await store.tasks.recordReader.initialize(onProgress);
       return store;
     } catch (error) {
       db.close();
@@ -493,15 +485,10 @@ export class WorkspaceStore implements WorkspaceRepository {
     this.transaction(() => {
       this.get(id);
       if (this.stmt(busySql).get(id))
-        throw new ProductError(
-          'COMBINATION_IN_USE',
-          '该任务组合正在被浏览器使用，请先停止相关任务再删除',
-          409,
-        );
+        failError('COMBINATION_IN_USE', '该任务组合正在被浏览器使用，请先停止相关任务再删除', 409);
       const now = Date.now();
       this.stmt('UPDATE combinations SET deleted_at=?,updated_at=? WHERE id=?').run(now, now, id);
     });
   }
 }
-
 type WorkspaceRepository = SynchronousRepository<CompatibleWorkspaceRepository>;

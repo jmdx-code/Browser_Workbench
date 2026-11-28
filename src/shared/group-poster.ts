@@ -1,8 +1,14 @@
 import { z } from 'zod';
 import { Id, PosInt, addIssue, intRange, strictObj, trimMax, trimReq } from './contracts.js';
 import { GroupIdString } from './group-inviter.js';
-import type { BumperDailyStat, BumperTarget } from './group-bumper.js';
+import {
+  PendingOperationResolution,
+  ResolvePendingOperationInput,
+  type BumperTarget,
+} from './group-bumper.js';
+import { stripAnsi } from './relative-post-age.js';
 import type { Binding } from './task-execution.js';
+export { PendingOperationResolution, ResolvePendingOperationInput, stripAnsi };
 export const PosterActionKind = z.enum([
   'setup_search_group',
   'setup_open_group',
@@ -50,8 +56,11 @@ export const PosterSettings = strictObj({
   maxConcurrentProfiles: intRange(1, 50).default(4),
   maxPostsPerAccount: intRange(1, 200).default(10),
   materialsPerGroup: intRange(1, 50).default(1),
+  closeBrowserOnFinish: z.boolean().default(false),
 });
-export type PosterSettings = z.infer<typeof PosterSettings>;
+export type PosterSettings = Omit<z.infer<typeof PosterSettings>, 'closeBrowserOnFinish'> & {
+  closeBrowserOnFinish?: boolean;
+};
 export const PosterMediaKind = z.enum(['none', 'image', 'video']);
 export type PosterMediaKind = z.infer<typeof PosterMediaKind>;
 export const PosterCacheStatus = z.enum(['ready', 'downloading', 'expired', 'error']);
@@ -163,16 +172,24 @@ export const PosterTaskStatus = z.enum([
   'cancelled',
 ]);
 export type PosterTaskStatus = z.infer<typeof PosterTaskStatus>;
-export const CreatePosterTaskInput = strictObj({
-  materialId: posterIdStr,
+export const posterTaskTargetFields = {
   groupIds: z.array(GroupIdString).min(1).max(500),
   accountMode: PosterTaskAccountMode.optional().default('selected'),
   profileIds: z.array(Id).max(500).optional().default([]),
   scheduledAt: PosInt.nullable().optional().default(null),
-}).superRefine((val, ctx) => {
+  closeBrowserOnFinish: z.boolean().optional().default(false),
+};
+export const validatePosterTaskAccountSelection = (
+  val: { accountMode: PosterTaskAccountMode; profileIds: readonly string[] },
+  ctx: z.RefinementCtx,
+) => {
   if (val.accountMode === 'selected' && !val.profileIds.length)
     addIssue(ctx, '请至少选择 1 个发帖账号，或选择上方“全部在线账号”', []);
-});
+};
+export const CreatePosterTaskInput = strictObj({
+  materialId: posterIdStr,
+  ...posterTaskTargetFields,
+}).superRefine(validatePosterTaskAccountSelection);
 export type CreatePosterTaskInput = z.infer<typeof CreatePosterTaskInput>;
 export const PosterTaskIdInput = strictObj({ id: posterIdStr });
 export type PosterTaskIdInput = z.infer<typeof PosterTaskIdInput>;
@@ -192,6 +209,7 @@ export interface PosterTask {
   createdAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  closeBrowserOnFinish?: boolean;
 }
 export interface PosterActiveGroupItem {
   groupId: string;
@@ -226,7 +244,6 @@ export interface PosterState {
   groupAvatarRefreshing?: boolean;
   statusText: string;
   profileCounts: Record<string, PosterProfileStat>;
-  dailyStats: BumperDailyStat[];
   pendingReviewOperations?: PosterPendingOperation[];
   postedGroupIdsByMaterial?: Record<string, string[]>;
   activeGroupsByMaterial?: Record<string, PosterActiveGroupItem[]>;

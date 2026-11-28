@@ -6,11 +6,21 @@ import * as AS from '../shared/auto-scheduler.js';
 import { Id } from '../shared/contracts.js';
 import * as Q from './persistence/sqlite-query-helpers.js';
 import { transaction } from './sqlite-transaction.js';
-
 const ToggleScheduleInput = z.object({ id: Id, enabled: z.boolean() }).strict(),
   ScheduleIdInput = z.object({ id: Id }).strict(),
   DEFAULT_SETTINGS = AS.AutoSchedulerGlobalSettings.parse({});
-
+function triggerTimingChanged(
+  prev: AS.AutoSchedule['trigger'],
+  next: AS.AutoSchedule['trigger'],
+): boolean {
+  return (
+    prev.mode !== next.mode ||
+    (prev.onceAt ?? null) !== (next.onceAt ?? null) ||
+    prev.timeZone !== next.timeZone ||
+    [...prev.weekdays].sort().join(',') !== [...next.weekdays].sort().join(',') ||
+    [...prev.times].sort().join(',') !== [...next.times].sort().join(',')
+  );
+}
 function deleteRunRows(db: DatabaseSync, ids: Array<Record<string, unknown>>): void {
   const delItems = db.prepare('DELETE FROM auto_scheduler_run_items WHERE run_id=?'),
     delRun = db.prepare('DELETE FROM auto_scheduler_runs WHERE id=?');
@@ -19,7 +29,6 @@ function deleteRunRows(db: DatabaseSync, ids: Array<Record<string, unknown>>): v
     delRun.run(String(r.id));
   }
 }
-
 export class SqliteAutoSchedulerRepository {
   constructor(private readonly db: DatabaseSync) {
     db.exec(`
@@ -80,10 +89,16 @@ export class SqliteAutoSchedulerRepository {
       cols = 'id,sort_order,enabled,carrier,body_json,created_at,updated_at';
     return transaction(this.db, () => {
       const ex = parsed.id ? this.getSchedule(parsed.id) : null;
+      const armedAt = !ex
+        ? (parsed.armedAt ?? now)
+        : (!ex.enabled && parsed.enabled) || triggerTimingChanged(ex.trigger, parsed.trigger)
+          ? now
+          : (ex.armedAt ?? ex.createdAt);
       const full = AS.AutoSchedule.parse({
         ...parsed,
         id: ex ? ex.id : (parsed.id ?? randomUUID()),
         sortOrder: ex ? ex.sortOrder : Q.nextSortOrder(this.db, 'auto_scheduler_schedules'),
+        armedAt,
         createdAt: ex ? ex.createdAt : now,
         updatedAt: now,
       });
@@ -94,9 +109,7 @@ export class SqliteAutoSchedulerRepository {
         cols,
         'sort_order,enabled,carrier,body_json,updated_at',
         full,
-        {
-          body_json: JSON.stringify(full),
-        },
+        { body_json: JSON.stringify(full) },
       );
       return full;
     });
@@ -107,7 +120,9 @@ export class SqliteAutoSchedulerRepository {
     return transaction(this.db, () => {
       const existing = this.getSchedule(id);
       if (!existing) throw new ProductError('SCHEDULE_NOT_FOUND', '未找到该定时排班', 404);
-      const updated: AS.AutoSchedule = { ...existing, enabled, updatedAt: Date.now() };
+      const now = Date.now();
+      const armedAt = !existing.enabled && enabled ? now : (existing.armedAt ?? existing.createdAt);
+      const updated: AS.AutoSchedule = { ...existing, enabled, armedAt, updatedAt: now };
       Q.run(this.db, sql, enabled ? 1 : 0, JSON.stringify(updated), updated.updatedAt, id);
       return updated;
     });
@@ -124,16 +139,9 @@ export class SqliteAutoSchedulerRepository {
         id: randomUUID(),
         name: `${ex.name.replace(/\s*副本(?:\s*\d+)?$/, '').slice(0, 70)} 副本`,
         enabled: false,
-        ...(ex.carrier === 'browser'
-          ? {
-              prewarm: {
-                ...ex.prewarm,
-                steps: ex.prewarm.steps.map((s) => ({ ...s, id: randomUUID() })),
-              },
-            }
-          : {}),
         steps: ex.steps.map((s) => ({ ...s, id: randomUUID() })),
         sortOrder: Q.nextSortOrder(this.db, 'auto_scheduler_schedules'),
+        armedAt: now,
         createdAt: now,
         updatedAt: now,
       });
@@ -174,7 +182,7 @@ export class SqliteAutoSchedulerRepository {
       this.db,
       'auto_scheduler_run_items',
       'run_id,target_id',
-      'run_id,target_id,target_name,status,current_step,summary,bumped_count,posted_count,soft_issues,hard_block_reason,seamless_handoff,started_at,finished_at,updated_at',
+      'run_id,target_id,target_name,status,current_step,summary,bumped_count,posted_count,soft_issues,hard_block_reason,started_at,finished_at,updated_at',
       '*',
       p,
     );
@@ -187,12 +195,9 @@ export class SqliteAutoSchedulerRepository {
   }
   private listItemsForRun(runId: string): AS.AutoScheduleRunItem[] {
     const sql =
-      'SELECT run_id,target_id,substr(target_name,1,200) AS target_name,status,substr(current_step,1,200) AS current_step,substr(summary,1,400) AS summary,bumped_count,posted_count,soft_issues,CASE WHEN hard_block_reason IS NULL THEN NULL ELSE substr(hard_block_reason,1,240) END AS hard_block_reason,seamless_handoff,started_at,finished_at,updated_at FROM auto_scheduler_run_items WHERE run_id = ? ORDER BY COALESCE(started_at, 9999999999999) ASC, target_name ASC';
+      'SELECT run_id,target_id,substr(target_name,1,200) AS target_name,status,substr(current_step,1,200) AS current_step,substr(summary,1,400) AS summary,bumped_count,posted_count,soft_issues,CASE WHEN hard_block_reason IS NULL THEN NULL ELSE substr(hard_block_reason,1,240) END AS hard_block_reason,started_at,finished_at,updated_at FROM auto_scheduler_run_items WHERE run_id = ? ORDER BY COALESCE(started_at, 9999999999999) ASC, target_name ASC';
     return Q.allRows(this.db, sql, runId).flatMap((r) => {
-      const p = Q.parseWithFallback(
-        () => AS.AutoScheduleRunItem.parse(Q.camel(r, 'seamless_handoff')),
-        null,
-      );
+      const p = Q.parseWithFallback(() => AS.AutoScheduleRunItem.parse(Q.camel(r)), null);
       return p ? [p] : [];
     });
   }
@@ -252,10 +257,17 @@ export class SqliteAutoSchedulerRepository {
     });
   }
   pruneOldRuns(keepMaxRuns = 120): number {
+    const cutoffMs = Date.now() - 48 * 3600_000;
     const sql =
-      "SELECT id FROM auto_scheduler_runs WHERE status!='running' ORDER BY started_at DESC LIMIT -1 OFFSET ?";
+      "SELECT id FROM auto_scheduler_runs WHERE status!='running' AND scheduled_for < ? AND started_at < ? AND id NOT IN (SELECT id FROM auto_scheduler_runs ORDER BY started_at DESC LIMIT ?)";
     return transaction(this.db, () => {
-      const stale = Q.allRows(this.db, sql, Math.max(20, Math.floor(keepMaxRuns)));
+      const stale = Q.allRows(
+        this.db,
+        sql,
+        cutoffMs,
+        cutoffMs,
+        Math.max(20, Math.floor(keepMaxRuns)),
+      );
       deleteRunRows(this.db, stale);
       return stale.length;
     });

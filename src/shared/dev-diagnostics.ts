@@ -70,6 +70,12 @@ class DevDiagnosticsRecorder {
   setProfileNameResolver(resolver: ((profileId: string) => string | undefined) | null): void {
     this.nameResolver = resolver;
   }
+  emit = (
+    level: DevDiagLevel,
+    category: DevDiagCategory,
+    event: string,
+    extra?: Omit<DevDiagInput, 'level' | 'category' | 'event'>,
+  ): DevDiagEntry => this.record({ level, category, event, ...extra });
   record(input: DevDiagInput): DevDiagEntry {
     const now = new Date(),
       iso = now.toISOString(),

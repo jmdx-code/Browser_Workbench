@@ -1,4 +1,13 @@
-import { Component, lazy, Suspense, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  Component,
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from 'react';
 import type { QuickScheduleSeed } from '../shared/auto-scheduler.js';
 import type { Combination, Profile, SavedCombination, Workspace } from '../shared/contracts.js';
 import type { GoogleSheetKind } from '../shared/google-sheets.js';
@@ -9,52 +18,42 @@ import { readStoredCloseBrowserOnFinish } from './modules/module-contracts.js';
 import { api } from './api.js';
 import type { useCardColors } from './card-colors.js';
 import type { SheetsModuleId } from './modules/module-contracts.js';
-import type { PostBumpRecordTypeFilter } from './modules/post-bump-records-page.js';
+import type { RecordsTabId } from './modules/post-bump-records-page.js';
 import type { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
 import { Btn } from './modules/shared/module-ui.js';
+import {
+  mapBluestacksToScopeOptions,
+  mapProfilesToScopeOptions,
+} from './modules/shared/target-scope-bar.js';
 import type { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
-import type { ActivityRecordModuleFilter } from './modules/unified-activity-records.js';
 import type { useTasks } from './use-tasks.js';
 import type { useWorkbenchActions } from './use-workbench-actions.js';
-
-const ActiveAccountsPage = lazy(() =>
-  import('./active-accounts-page.js').then((m) => ({ default: m.ActiveAccountsPage })),
+const lz = <P,>(fn: () => Promise<ComponentType<P>>) => lazy(async () => ({ default: await fn() }));
+const ActiveAccountsPage = lz(() =>
+  import('./active-accounts-page.js').then((m) => m.ActiveAccountsPage),
 );
-const WindowLayoutPage = lazy(() =>
-  import('./modules/window-layout-page.js').then((m) => ({ default: m.WindowLayoutPage })),
+const WindowLayoutPage = lz(() =>
+  import('./modules/window-layout-page.js').then((m) => m.WindowLayoutPage),
 );
-const AutoSchedulerPage = lazy(() =>
-  import('./auto-scheduler-page.js').then((m) => ({ default: m.AutoSchedulerPage })),
+const AutoSchedulerPage = lz(() =>
+  import('./auto-scheduler-page.js').then((m) => m.AutoSchedulerPage),
 );
-const Editor = lazy(() => import('./editor.js').then((m) => ({ default: m.Editor })));
-const GroupBumperPage = lazy(() =>
-  import('./group-bumper-page.js').then((m) => ({ default: m.GroupBumperPage })),
+import { Editor } from './editor.js';
+const GroupBumperPage = lz(() => import('./group-bumper-page.js').then((m) => m.GroupBumperPage));
+const InviterWorkspacePage = lz(() =>
+  import('./inviter-workspace-page.js').then((m) => m.InviterWorkspacePage),
 );
-const GroupInviterPage = lazy(() =>
-  import('./group-inviter-page.js').then((m) => ({ default: m.GroupInviterPage })),
+const GroupPosterPage = lz(() => import('./group-poster-page.js').then((m) => m.GroupPosterPage));
+const GoogleSheetsPage = lz(() =>
+  import('./modules/sheets/google-sheets-page.js').then((m) => m.GoogleSheetsPage),
 );
-const GroupPosterPage = lazy(() =>
-  import('./group-poster-page.js').then((m) => ({ default: m.GroupPosterPage })),
+const PostBumpRecordsPage = lz(() =>
+  import('./modules/post-bump-records-page.js').then((m) => m.PostBumpRecordsPage),
 );
-const GoogleSheetsPage = lazy(() =>
-  import('./modules/sheets/google-sheets-page.js').then((m) => ({ default: m.GoogleSheetsPage })),
+const Sidebar = lz(() => import('./sidebar.js').then((m) => m.Sidebar));
+const BluestacksSidebar = lz(() =>
+  import('./modules/bluestacks-sidebar.js').then((m) => m.BluestacksSidebar),
 );
-const TaskRecordsPage = lazy(() =>
-  import('./task-records.js').then((m) => ({ default: m.TaskRecordsPage })),
-);
-const BluestacksInviterPage = lazy(() =>
-  import('./modules/bluestacks-inviter-page.js').then((m) => ({
-    default: m.BluestacksInviterPage,
-  })),
-);
-const PostBumpRecordsPage = lazy(() =>
-  import('./modules/post-bump-records-page.js').then((m) => ({ default: m.PostBumpRecordsPage })),
-);
-const Sidebar = lazy(() => import('./sidebar.js').then((m) => ({ default: m.Sidebar })));
-const BluestacksSidebar = lazy(() =>
-  import('./modules/bluestacks-sidebar.js').then((m) => ({ default: m.BluestacksSidebar })),
-);
-
 const SHEET_KIND_BY_VIEW: Record<string, GoogleSheetKind> = {
   'sheets-groups': 'group_library',
   'sheets-pages': 'page_library',
@@ -67,7 +66,6 @@ const VIEW_BY_SHEET_KIND: Record<GoogleSheetKind, SheetsModuleId> = {
   post_schedule: 'sheets-schedule',
   post_records: 'sheets-records',
 };
-
 export class WorkbenchErrorBoundary extends Component<
   { children: ReactNode; resetKey?: string; label?: string },
   { error: Error | null }
@@ -102,7 +100,6 @@ export class WorkbenchErrorBoundary extends Component<
     );
   }
 }
-
 export type View =
   | { kind: 'home' }
   | {
@@ -128,15 +125,11 @@ export type View =
   | { kind: 'bluestacks-group-bumper' }
   | { kind: 'bluestacks-page-bumper' }
   | { kind: 'bluestacks-group-inviter' };
-
 export interface LedgerFilterState {
-  type: PostBumpRecordTypeFilter;
+  tab: RecordsTabId;
   status: 'all' | PostBumpStatusValue;
-  subView: 'ledger' | 'active';
-  activeModule: ActivityRecordModuleFilter;
   nonce: number;
 }
-
 export interface ShellCtx {
   workspace: Workspace;
   mergedProfiles: Profile[];
@@ -159,7 +152,6 @@ export interface ShellCtx {
   forceRefreshWorkspace: () => Promise<void>;
   setMessage: (msg: string) => void;
 }
-
 interface RouterCtx {
   view: View;
   setView: (updater: View | ((prev: View) => View)) => void;
@@ -171,20 +163,12 @@ interface RouterCtx {
   refreshResources: () => Promise<void>;
   openQuickSchedule: (seed: QuickScheduleSeed) => void;
   onOpenLiveRuns: () => void;
-  openLedgerRecords: (opts: {
-    type?: PostBumpRecordTypeFilter;
-    status?: 'all' | PostBumpStatusValue;
-    subView?: 'ledger' | 'active';
-    activeModule?: ActivityRecordModuleFilter;
-  }) => void;
+  openLedgerRecords: (opts: { tab?: RecordsTabId; status?: 'all' | PostBumpStatusValue }) => void;
   ledger: LedgerFilterState;
-  recordFilter: string | null;
-  setRecordFilter: (id: string | null) => void;
-  onOpenDetail: (profileId: string, planId: string, round?: number) => void;
   onOpenMenuSection: (section: 'logs' | 'google-sheets') => void;
+  onCarrierChange?: (carrier: 'browser' | 'bluestacks') => void;
   navigate: (next: View) => Promise<void>;
 }
-
 export function WorkbenchViewRouter({
   shell: s,
   router: r,
@@ -208,8 +192,69 @@ export function WorkbenchViewRouter({
     onSelectBluestacks: s.setSelectedBluestacks,
     onMessage: s.setMessage,
   };
+  const startSavedCombo = async (
+    savedRow: SavedCombination,
+    editCarrier: 'browser' | 'bluestacks',
+  ) =>
+    s.mutate(async () => {
+      if (editCarrier === 'bluestacks') {
+        const bs = m.bluestacks;
+        const isBusy = (id: string) =>
+          Boolean(
+            bs?.activeProfileCounts?.[id]?.running ||
+            bs?.posterProfileCounts?.[id]?.running ||
+            bs?.inviterProfileCounts?.[id]?.running ||
+            bs?.profileCounts?.[id]?.running ||
+            bs?.pageBumperProfileCounts?.[id]?.running,
+          );
+        const eligibleIds = [...s.selectedBluestacks].filter((id) => !isBusy(id)).sort();
+        if (!eligibleIds.length) throw Error('组合已保存，但没有可用的空闲已选蓝蝶模拟器');
+        let closeWin = false;
+        try {
+          closeWin = window.localStorage.getItem('wb.bluestacksActive.closeWindowOnFinish') === '1';
+        } catch {}
+        m.setBluestacks(
+          await api.bluestacksAction('active/start', {
+            instanceIds: eligibleIds,
+            combinationId: savedRow.id,
+            ...(closeWin ? { closeWindowOnFinish: true } : {}),
+          }),
+        );
+        return `组合已保存并启动：${eligibleIds.length} 台蓝蝶`;
+      }
+      const usesTable = savedRow.saved?.steps.some(
+        (st) => st.type === 'post' && st.resourceMode === 'table',
+      );
+      const latest = usesTable ? await api.resourceSummaries() : r.resourceSummaries;
+      if (usesTable) r.setResourceSummaries(latest);
+      const revision = latest?.find((x) => x.combinationId === savedRow.id)?.revision;
+      if (usesTable && !revision)
+        throw Error('组合已保存，但尚未读取发帖资源，请先在「发帖资源」中导入');
+      const busyIds = new Set(
+        [...s.selected].filter((id) => s.projection.projectedControls.isProfileBusy(id)),
+      );
+      const eligibleIds = [...s.selected].filter((id) => !busyIds.has(id)).sort();
+      if (!eligibleIds.length) throw Error('组合已保存，但所选浏览器均在运行任务中');
+      const result = await s.tasks.start({
+        combinationId: savedRow.id,
+        version: savedRow.version,
+        profileIds: eligibleIds,
+        ...(usesTable ? { expectedResourceRevision: revision } : {}),
+        ...(readStoredCloseBrowserOnFinish() ? { closeBrowserOnFinish: true } : {}),
+      });
+      return `组合已保存并启动：已分配 ${result.plans.length} 份任务${busyIds.size ? `（跳过 ${busyIds.size} 个运行中资料）` : ''}`;
+    });
   const sheetKind = SHEET_KIND_BY_VIEW[v.kind];
-
+  const activeCarrier = v.kind === 'bluestacks-active' ? 'bluestacks' : 'browser';
+  const editCarrier = v.kind === 'edit' ? (v.carrier ?? r.carrier) : r.carrier;
+  const openEditView = (row: SavedCombination | null, initialValue?: Combination) =>
+    r.setView({
+      kind: 'edit',
+      carrier: activeCarrier,
+      row,
+      ...(initialValue ? { initialValue } : {}),
+      editorKey: row?.id ?? crypto.randomUUID(),
+    });
   return (
     <WorkbenchErrorBoundary resetKey={v.kind} label="当前功能页面加载异常">
       <Suspense
@@ -224,7 +269,7 @@ export function WorkbenchViewRouter({
       >
         {(v.kind === 'home' || v.kind === 'bluestacks-active') && (
           <ActiveAccountsPage
-            carrier={v.kind === 'bluestacks-active' ? 'bluestacks' : 'browser'}
+            carrier={activeCarrier}
             workspace={s.workspace}
             selected={s.selected}
             tasks={s.tasks}
@@ -239,23 +284,8 @@ export function WorkbenchViewRouter({
             onSelectProfiles={s.setSelected}
             onSetResourceSummaries={r.setResourceSummaries}
             onOpenResources={r.onOpenResources}
-            onEditCombination={(row) =>
-              r.setView({
-                kind: 'edit',
-                carrier: v.kind === 'bluestacks-active' ? 'bluestacks' : 'browser',
-                row,
-                editorKey: row.id,
-              })
-            }
-            onNewCombination={(initialValue) =>
-              r.setView({
-                kind: 'edit',
-                carrier: v.kind === 'bluestacks-active' ? 'bluestacks' : 'browser',
-                row: null,
-                initialValue,
-                editorKey: crypto.randomUUID(),
-              })
-            }
+            onEditCombination={(row) => openEditView(row)}
+            onNewCombination={(initialValue) => openEditView(null, initialValue)}
             onQuickSchedule={r.openQuickSchedule}
             onOpenLiveRuns={r.onOpenLiveRuns}
             onRefreshWorkspace={s.forceRefreshWorkspace}
@@ -267,8 +297,16 @@ export function WorkbenchViewRouter({
         {v.kind === 'window-layout' && (
           <WindowLayoutPage
             profiles={s.workspace.profiles}
+            profileGroups={s.workspace.groups}
+            selectedProfileIds={s.selected}
+            onSelectProfiles={s.setSelected}
             bluestacks={m.bluestacks}
+            selectedBluestacksIds={s.selectedBluestacks}
+            onSelectBluestacks={s.setSelectedBluestacks}
             onRefreshBluestacks={async () => m.setBluestacks(await api.bluestacksState(false))}
+            onBluestacksState={m.setBluestacks}
+            initialCarrier={r.carrier}
+            onCarrierChange={r.onCarrierChange}
             onNotify={s.setMessage}
           />
         )}
@@ -291,29 +329,10 @@ export function WorkbenchViewRouter({
         )}
         {v.kind === 'records' && (
           <PostBumpRecordsPage
-            initialType={r.ledger.type}
+            initialTab={r.ledger.tab}
             initialStatus={r.ledger.status}
-            initialSubView={r.ledger.subView}
             filterNonce={r.ledger.nonce}
-            profiles={s.mergedProfiles}
             onNotify={s.setMessage}
-            renderLegacyActiveRecords={() => (
-              <TaskRecordsPage
-                runtime={s.tasks.runtime}
-                profiles={s.mergedProfiles}
-                inspections={s.inspections.rows}
-                loaded={!!s.tasks.runtime}
-                filterId={r.recordFilter}
-                onClearFilter={() => r.setRecordFilter(null)}
-                onOpen={r.onOpenDetail}
-                groupInviterState={m.groupInviter}
-                googleSheetsOverview={m.googleSheets}
-                initialModule={r.ledger.activeModule}
-                moduleKey={r.ledger.nonce}
-                onOpenCleanupSettings={() => r.onOpenMenuSection('logs')}
-                onNotify={s.setMessage}
-              />
-            )}
           />
         )}
         {(v.kind === 'group-poster' || v.kind === 'bluestacks-group-poster') && (
@@ -330,16 +349,20 @@ export function WorkbenchViewRouter({
               m.setGroupPoster(next);
               void m.refreshGroupInviter();
             }}
-            onOpenRecords={() => r.openLedgerRecords({ type: 'post' })}
+            onOpenRecords={() => r.openLedgerRecords({ tab: 'posts' })}
             {...bsCommon}
           />
         )}
         {v.kind === 'bluestacks-group-inviter' && (
-          <BluestacksInviterPage
-            selected={s.selectedBluestacks}
-            groups={m.groupBumper?.groups ?? []}
-            inviterState={m.groupInviter}
-            onSyncSharedGroups={async () => syncShared()}
+          <InviterWorkspacePage
+            carrier="bluestacks"
+            state={m.groupInviter ?? null}
+            selectedTargetIds={s.selectedBluestacks}
+            fallbackGroups={m.groupBumper?.groups ?? []}
+            scopeItems={mapBluestacksToScopeOptions(m.bluestacks)}
+            scopeGroups={(m.bluestacks?.folders ?? []).map((f) => ({ id: f.id, name: f.name }))}
+            onSelectTargets={s.setSelectedBluestacks}
+            onRefresh={async () => syncShared()}
             {...bsCommon}
           />
         )}
@@ -360,11 +383,7 @@ export function WorkbenchViewRouter({
               void m.refreshGroupInviter();
               m.refreshPoster();
             }}
-            onOpenRecords={() =>
-              r.openLedgerRecords({
-                type: v.kind.includes('page-bumper') ? 'page_bump' : 'group_bump',
-              })
-            }
+            onOpenRecords={() => r.openLedgerRecords({ tab: 'bumps' })}
             {...bsCommon}
           />
         )}
@@ -388,15 +407,16 @@ export function WorkbenchViewRouter({
           />
         )}
         {v.kind === 'group-inviter' && (
-          <GroupInviterPage
+          <InviterWorkspacePage
+            carrier="browser"
             state={m.groupInviter}
-            onRefresh={async () => m.setGroupInviter(await api.groupInviterState())}
             loaded={m.groupInviterLoaded}
-            selectedProfileIds={s.selected}
-            profiles={s.workspace.profiles}
-            profileGroups={s.workspace.groups}
-            onSelectProfiles={s.setSelected}
-            busy={s.busy}
+            selectedTargetIds={s.selected}
+            externalBusy={s.busy}
+            scopeItems={mapProfilesToScopeOptions(s.workspace.profiles)}
+            scopeGroups={s.workspace.groups}
+            onSelectTargets={s.setSelected}
+            onRefresh={async () => m.setGroupInviter(await api.groupInviterState())}
             onAddGroups={async (items) => {
               m.setGroupInviter(await api.addInviterGroups({ items }));
               syncShared(true, true, false);
@@ -412,7 +432,7 @@ export function WorkbenchViewRouter({
             onSaveInvitesPerGroup={async (invitesPerGroup) =>
               m.setGroupInviter(await api.saveGroupInviterSettings({ invitesPerGroup }))
             }
-            onStart={(groupIds, invitesPerGroup) =>
+            onStartBrowser={(groupIds, invitesPerGroup) =>
               s.mutate(async () => {
                 const targetIds = (
                   m.groupInviter?.running
@@ -423,6 +443,7 @@ export function WorkbenchViewRouter({
                   profileIds: targetIds,
                   groupIds,
                   invitesPerGroup,
+                  closeBrowserOnFinish: Boolean(m.groupInviter?.closeBrowserOnFinish),
                 });
                 m.setGroupInviter(next);
                 const skipped = targetIds.filter((id) =>
@@ -431,7 +452,7 @@ export function WorkbenchViewRouter({
                 return `已启动小组邀请人：${Math.max(0, targetIds.length - skipped)} 个账号 × ${groupIds.length} 个小组${skipped > 0 ? `（已自动跳过 ${skipped} 个不可用或运行中账号）` : ''}`;
               })
             }
-            onStop={() =>
+            onStopBrowser={() =>
               s.mutate(async () => {
                 m.setGroupInviter(await api.stopGroupInviter());
                 return '已发送停止小组邀请人指令';
@@ -445,12 +466,12 @@ export function WorkbenchViewRouter({
         {v.kind === 'edit' && (
           <Editor
             key={v.editorKey}
-            carrier={v.carrier ?? r.carrier}
+            carrier={editCarrier}
             initial={v.row}
             initialValue={v.initialValue}
             selectedProfiles={s.workspace.profiles.filter((p) => s.selected.has(p.id))}
             selectedTargetCount={
-              (v.carrier ?? r.carrier) === 'bluestacks'
+              editCarrier === 'bluestacks'
                 ? s.selectedBluestacks.size
                 : s.workspace.profiles.filter((p) => s.selected.has(p.id)).length
             }
@@ -469,69 +490,9 @@ export function WorkbenchViewRouter({
             }
             resourceUsageLoaded={v.row ? r.resourceSummaries !== null : true}
             onSaved={s.forceRefreshWorkspace}
-            onSavedAndStart={async (savedRow) => {
-              const editCarrier = v.carrier ?? r.carrier;
-              if (editCarrier === 'bluestacks') {
-                await s.mutate(async () => {
-                  const isBusy = (id: string) =>
-                    Boolean(
-                      m.bluestacks?.activeProfileCounts?.[id]?.running ||
-                      m.bluestacks?.posterProfileCounts?.[id]?.running ||
-                      m.bluestacks?.inviterProfileCounts?.[id]?.running ||
-                      m.bluestacks?.profileCounts?.[id]?.running ||
-                      m.bluestacks?.pageBumperProfileCounts?.[id]?.running,
-                    );
-                  const eligibleIds = [...s.selectedBluestacks].filter((id) => !isBusy(id)).sort();
-                  if (!eligibleIds.length)
-                    throw Error('组合已保存，但没有可用的空闲已选蓝蝶模拟器');
-                  const closeWin = (() => {
-                    try {
-                      return (
-                        window.localStorage.getItem('wb.bluestacksActive.closeWindowOnFinish') ===
-                        '1'
-                      );
-                    } catch {
-                      return false;
-                    }
-                  })();
-                  const next = await api.bluestacksAction('active/start', {
-                    instanceIds: eligibleIds,
-                    combinationId: savedRow.id,
-                    ...(closeWin ? { closeWindowOnFinish: true } : {}),
-                  });
-                  m.setBluestacks(next);
-                  return `组合已保存并启动：${eligibleIds.length} 台蓝蝶`;
-                });
-                return;
-              }
-              await s.mutate(async () => {
-                const usesTable = savedRow.saved?.steps.some(
-                  (st) => st.type === 'post' && st.resourceMode === 'table',
-                );
-                const latest = usesTable ? await api.resourceSummaries() : r.resourceSummaries;
-                if (usesTable) r.setResourceSummaries(latest);
-                const revision = latest?.find((x) => x.combinationId === savedRow.id)?.revision;
-                if (usesTable && !revision)
-                  throw Error('组合已保存，但尚未读取发帖资源，请先在「发帖资源」中导入');
-                const busyIds = new Set(
-                  [...s.selected].filter((id) => s.projection.projectedControls.isProfileBusy(id)),
-                );
-                const eligibleIds = [...s.selected].filter((id) => !busyIds.has(id)).sort();
-                if (!eligibleIds.length) throw Error('组合已保存，但所选浏览器均在运行任务中');
-                const result = await s.tasks.start({
-                  combinationId: savedRow.id,
-                  version: savedRow.version,
-                  profileIds: eligibleIds,
-                  ...(usesTable ? { expectedResourceRevision: revision } : {}),
-                  ...(readStoredCloseBrowserOnFinish() ? { closeBrowserOnFinish: true } : {}),
-                });
-                return `组合已保存并启动：已分配 ${result.plans.length} 份任务${busyIds.size ? `（跳过 ${busyIds.size} 个运行中资料）` : ''}`;
-              });
-            }}
+            onSavedAndStart={(savedRow) => startSavedCombo(savedRow, editCarrier)}
             onClose={() =>
-              void r.navigate({
-                kind: (v.carrier ?? r.carrier) === 'bluestacks' ? 'bluestacks-active' : 'home',
-              })
+              void r.navigate({ kind: editCarrier === 'bluestacks' ? 'bluestacks-active' : 'home' })
             }
             notify={s.setMessage}
           />
@@ -540,10 +501,8 @@ export function WorkbenchViewRouter({
     </WorkbenchErrorBoundary>
   );
 }
-
 const SIDEBAR_KEY = 'workbench.sidebar-width.v1';
 const clampW = (v: number) => Math.min(420, Math.max(240, v));
-
 function SidebarResizer() {
   const [width, setWidth] = useState(() => {
     try {
@@ -599,7 +558,6 @@ function SidebarResizer() {
     />
   );
 }
-
 export function WorkbenchSidebarPane({
   shell,
   carrier,

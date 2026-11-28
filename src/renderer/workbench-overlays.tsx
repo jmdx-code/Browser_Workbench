@@ -3,7 +3,6 @@ import type { z } from 'zod';
 import type { QuickScheduleSeed } from '../shared/auto-scheduler.js';
 import { profileDisplayName, type Profile, type SavedCombination } from '../shared/contracts.js';
 import type { SoftwareUpdateStatus } from '../shared/software-update.js';
-import type { TaskRuntimeOverview } from '../shared/task-contracts.js';
 import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
 import { IconClose } from './icons.js';
@@ -18,11 +17,7 @@ import {
 import { NameDialog } from './name-dialog.js';
 import type { ResourceEditorHandle } from './resource-table-editor.js';
 import type { ShellCtx } from './workbench-view-router.js';
-
 const AppMenu = lazy(() => import('./app-menu.js').then((m) => ({ default: m.AppMenu })));
-const RecordDetailDrawer = lazy(() =>
-  import('./record-detail.js').then((m) => ({ default: m.RecordDetailDrawer })),
-);
 const ResourceTableEditor = lazy(() =>
   import('./resource-table-editor.js').then((m) => ({ default: m.ResourceTableEditor })),
 );
@@ -32,10 +27,8 @@ const AutoSchedulerEditorModal = lazy(() =>
 const LiveRunsDrawer = lazy(() =>
   import('./modules/live-runs-drawer.js').then((m) => ({ default: m.LiveRunsDrawer })),
 );
-
 type UpdateStatus = z.infer<typeof SoftwareUpdateStatus>;
 const FEEDBACK_DIR_KEY = 'workbench.feedbackTargetDir';
-
 function DiagnosticFeedbackModal({
   uiContext,
   onClose,
@@ -59,7 +52,6 @@ function DiagnosticFeedbackModal({
       sizeBytes: number;
     } | null>(null);
   const { busy: gen, error, setError, run } = useBusyTask();
-
   useEffect(() => {
     setError('');
     setResult(null);
@@ -72,7 +64,6 @@ function DiagnosticFeedbackModal({
       else localStorage.removeItem(FEEDBACK_DIR_KEY);
     } catch {}
   };
-
   return (
     <BackdropModal
       label="记录并导出问题反馈包"
@@ -202,13 +193,9 @@ function DiagnosticFeedbackModal({
     </BackdropModal>
   );
 }
-
 export function WorkbenchOverlays(p: {
   shell: ShellCtx | null;
   message: string;
-  detail: { profileId: string; planId: string; round?: number } | null;
-  onCloseDetail: () => void;
-  plans: z.infer<typeof TaskRuntimeOverview>['plans'];
   onRename: (profile: Profile) => void;
   onOpenResource: (row: SavedCombination | null) => void;
   menuOpen: boolean;
@@ -236,11 +223,9 @@ export function WorkbenchOverlays(p: {
   const s = p.shell,
     ws = s?.workspace ?? null,
     setMsg = s?.setMessage ?? (() => {}),
-    detailProf = p.detail ? ws?.profiles.find((r) => r.id === p.detail?.profileId) : undefined,
     failed = /失败|错误|未完成|不能|无法|请先|未确认/.test(
       p.message.replace(/\b0\s*份未完成/g, ''),
     );
-
   return (
     <>
       {p.message && (
@@ -306,29 +291,6 @@ export function WorkbenchOverlays(p: {
             onStopAll={s.actions.handleStopAllCards}
           />
         )}
-        {p.detail && s && ws && (
-          <RecordDetailDrawer
-            profile={detailProf}
-            planId={p.detail.planId}
-            round={p.detail.round}
-            plan={p.plans.find((pl) => pl.id === p.detail?.planId)}
-            workspace={ws}
-            inspection={s.inspections.rows.find((r) => r.profileId === p.detail?.profileId)}
-            inspectionAvailable={s.inspections.available}
-            inspectionError={s.inspections.error}
-            busy={s.busy}
-            onClose={p.onCloseDetail}
-            onCommand={s.actions.commandPlans}
-            onRename={p.onRename}
-            onReadInspections={() => void s.inspections.refresh()}
-            onCheck={s.actions.checkProfiles}
-            onResources={(id) => {
-              const row = ws.combinations.find((v) => v.id === id);
-              if (row) p.onOpenResource(row);
-              else setMsg('原任务组合已不在当前列表，请查看原任务记录。');
-            }}
-          />
-        )}
         {p.menuOpen && s && ws && (
           <AppMenu
             initialSection={p.menuSection ?? (p.updateMenu ? 'update' : undefined)}
@@ -341,15 +303,9 @@ export function WorkbenchOverlays(p: {
             onApplyUpdate={p.onApplyUpdate}
             updateError={p.updates.error}
             profiles={ws.profiles}
-            selected={s.selected}
-            runtime={s.tasks.runtime}
             busy={s.busy}
             restartDisabled={p.restartDisabled}
             onClose={p.onCloseMenu}
-            onRefresh={() => {
-              s.tasks.refresh();
-              void s.forceRefreshWorkspace();
-            }}
             onRestart={() =>
               void s.mutate(() => api.restartSoftware().then(() => '软件正在重启，请稍候'))
             }

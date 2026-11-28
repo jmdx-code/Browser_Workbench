@@ -247,10 +247,30 @@ export function readBrowseLikeTarget(
   const { article, structuralPost } = feed;
   for (const old of Array.from(document.querySelectorAll('[data-wb-browse-like]')))
     old.removeAttribute('data-wb-browse-like');
+  const activeReelVideo = video ?? (reelSurface ? (rt.videos[0]?.el ?? null) : null);
+  let activeReelContainer: Element | null = null;
+  if (reelSurface && activeReelVideo) {
+    const activeArea = visibleArea(activeReelVideo);
+    const siblingThreshold = Math.max(1000, activeArea * 0.25);
+    for (
+      let parent = activeReelVideo.parentElement;
+      parent && parent !== main && parent !== document.body;
+      parent = parent.parentElement
+    ) {
+      const hasSiblingReelVideo = Array.from(parent.querySelectorAll('video')).some(
+        (v) =>
+          v !== activeReelVideo &&
+          (visibleArea(v) >= siblingThreshold || v.getBoundingClientRect().height >= 200),
+      );
+      if (hasSiblingReelVideo) break;
+      activeReelContainer = parent;
+    }
+    activeReelContainer ??= activeReelVideo.parentElement;
+  }
   const likeScopeRoot = feedLikeSurface
     ? (structuralPost?.root ?? article?.el ?? null)
-    : reelSurface && video
-      ? main
+    : reelSurface && activeReelVideo
+      ? activeReelContainer
       : null;
   if (!likeScopeRoot) return null;
   const isReactionSelected = (props: DOMRecord | undefined) =>
@@ -266,13 +286,13 @@ export function readBrowseLikeTarget(
     return matching.find((f) => isReactionSelected(f.props)) ?? matching[0];
   };
   const reactionIcons = (el: Element) =>
-    Array.from(el.querySelectorAll('svg,img,[data-visualcompletion="css-img"]'))
+    Array.from(el.querySelectorAll('svg,img,i,[data-visualcompletion="css-img"]'))
       .flatMap((icon) => frames(icon, 28))
       .filter(
         (f) =>
-          /^FBNucleus.*Like.*Icon\.react$/i.test(f.name) ||
+          /^FBNucleus.*(?:Like|ThumbsUp).*Icon\.react$/i.test(f.name) ||
           /(?:^|\b)Like(?:Filled|Active)?Icon/i.test(f.name) ||
-          f.name === 'CometReactionIcon.react',
+          /CometReactionIcon\.react|(?:ThumbsUp|UFI.*Reaction).*Icon/i.test(f.name),
       );
   const feedbackEvidence = (el: Element) => {
     const chain = frames(el, 100);
@@ -329,27 +349,27 @@ export function readBrowseLikeTarget(
     return null;
   };
   const nonLikeRx =
-    /comment|share|send|评论|評論|分享|发送|發送|မှတ်ချက်|ကွန်မန့်|မျှဝေ|ဝေမျှ|ပေးပို့/i;
+    /comment|share|send|leave\s*a?\s*reaction|add\s*reaction|change\s*reaction|评论|評論|分享|发送|發送|留下心情|更改.*心情|မှတ်ချက်|ကွန်မန့်|မျှဝေ|ဝေမျှ|ပေးပို့/i;
   const matchesLikeLabel = (el: Element) => {
     if (visibleArea(el) <= 0) return false;
     const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
     if (nonLikeRx.test(label)) return false;
-    return /^(?:like|liked|remove\s+like|unlike|love|care|haha|wow|sad|angry|赞|讚|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒|ကြိုက်(?:သည်|တယ်|ခြင်းဖျက်)?|မကြိုက်(?:တော့)?|နှစ်သက်(?:သည်)?|သဘောကျ(?:သည်)?)(?:$|[\s,，·•:：0-9၀-၉])/i.test(
+    return /^(?:like|liked|remove\s+like|remove\s+reaction|remove|unlike|love|care|haha|wow|sad|angry|赞|讚|移除\s*(?:赞|讚|心情|反应|反應|大爱|大心|关心|加油|哈哈|哇|心碎|怒)?|取消\s*(?:赞|讚)|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒|ကြိုက်(?:သည်|တယ်|ပြီး|ခြင်း(?:ကို)?\s*(?:ဖျက်|ဖယ်ရှား))?|မကြိုက်(?:တော့)?|နှစ်သက်(?:သည်|ပြီး)?|သဘောကျ(?:သည်|ပြီး)?|đã\s*thích|bỏ\s*thích|thích|ถูกใจ(?:แล้ว)?|เลิกถูกใจ)(?:$|[\s,，·•:：0-9၀-၉])/i.test(
       label,
     );
   };
-  const activeVideoArea = video ? visibleArea(video) : 0;
+  const activeVideoArea = activeReelVideo ? visibleArea(activeReelVideo) : 0;
   const sharesCard = (el: Element) => {
-    if (!video) return false;
+    if (!activeReelVideo) return false;
     const siblingVideoThreshold = Math.max(1000, activeVideoArea * 0.25);
     for (
-      let parent = video.parentElement;
+      let parent = activeReelVideo.parentElement;
       parent && parent !== main;
       parent = parent.parentElement
     ) {
       if (
         Array.from(parent.querySelectorAll('video')).filter(
-          (v) => v === video || visibleArea(v) >= siblingVideoThreshold,
+          (v) => v === activeReelVideo || visibleArea(v) >= siblingVideoThreshold,
         ).length > 1
       )
         break;
@@ -358,8 +378,8 @@ export function readBrowseLikeTarget(
     return false;
   };
   const distanceToVideo = (el: Element) => {
-    if (!video) return 0;
-    const vr = video.getBoundingClientRect();
+    if (!activeReelVideo) return 0;
+    const vr = activeReelVideo.getBoundingClientRect();
     const r = el.getBoundingClientRect();
     const y = r.top + r.height / 2;
     return reelSurface
@@ -394,7 +414,9 @@ export function readBrowseLikeTarget(
       return (
         !nonLikeRx.test(label) &&
         !!reactionFrame(el) &&
-        (reactionIcons(el).length > 0 || !!el.querySelector('svg'))
+        (reactionIcons(el).length > 0 ||
+          !!el.querySelector('svg,img,i,[data-visualcompletion="css-img"]') ||
+          matchesLikeLabel(el))
       );
     });
     const candidates = rawCandidates.filter(
@@ -411,32 +433,41 @@ export function readBrowseLikeTarget(
     const labelCandidates = rawLabelCandidates.filter(
       (el) => !rawLabelCandidates.some((other) => other !== el && el.contains(other)),
     );
-    if (reelSurface && video) sortReelButtons(labelCandidates, false);
+    if (reelSurface && activeReelVideo) sortReelButtons(labelCandidates, false);
     likeBtn = labelCandidates[0] ?? rawLabelCandidates[0] ?? null;
   }
   if (!likeBtn) return null;
   const ariaPressed =
     likeBtn.getAttribute('aria-pressed') === 'true' ||
+    likeBtn.closest('[aria-pressed="true"]') !== null ||
     likeBtn.querySelector('[aria-pressed="true"]') !== null;
-  const btnLabel = (likeBtn.getAttribute('aria-label') || likeBtn.textContent || '').trim();
+  const btnLabel = (
+    likeBtn.getAttribute('aria-label') ||
+    likeBtn.querySelector('[aria-label]')?.getAttribute('aria-label') ||
+    likeBtn.textContent ||
+    ''
+  ).trim();
   const labelLiked =
-    /^(?:remove\s+|取消|收回)?(?:unlike|remove\s+like|liked|love|care|haha|wow|sad|angry|取消赞|取消讚|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒|မကြိုက်(?:တော့)?|ကြိုက်ခြင်းဖျက်|မနှစ်သက်)(?:$|[\s,，·•:：0-9၀-၉])/i.test(
+    !nonLikeRx.test(btnLabel) &&
+    (/^(?:remove\s+|取消\s*|收回\s*|移除\s*)?(?:unlike|remove\s+like|remove\s+reaction|remove|liked|love|care|haha|wow|sad|angry|移除\s*(?:赞|讚|心情|反应|反應)|取消\s*(?:赞|讚)|已赞|已讚|大爱|大心|关心|加油|哈哈|哇|心碎|怒|ကြိုက်ပြီး|ကြိုက်ခြင်း(?:ကို)?\s*(?:ဖျက်|ဖယ်ရှား)|မကြိုက်(?:တော့)?|မနှစ်သက်|နှစ်သက်ပြီး|သဘောကျပြီး|đã\s*thích|bỏ\s*thích|ถูกใจแล้ว|เลิกถูกใจ)(?:$|[\s,，·•:：0-9၀-၉])/i.test(
       btnLabel,
     ) ||
-    /unlike|remove\s+like|\bliked\b|取消赞|取消讚|已赞|已讚|မကြိုက်|ကြိုက်ခြင်းဖျက်/i.test(
-      btnLabel,
-    );
+      /unlike|remove\s+like|remove\s+reaction|\bliked\b|移除\s*(?:赞|讚|心情|反应|反應)|取消\s*(?:赞|讚)|已赞|已讚|ကြိုက်ပြီး|ကြိုက်ခြင်း(?:ကို)?\s*(?:ဖျက်|ဖယ်ရှား)|မကြိုက်|đã\s*thích|bỏ\s*thích|ถูกใจแล้ว|เลิกถูกใจ/i.test(
+        btnLabel,
+      ));
   const colorProbe = adLike ?? likeBtn;
   const colorLiked = [
     colorProbe,
-    ...Array.from(colorProbe.querySelectorAll('svg,path,g,span,i')).slice(0, 16),
+    ...Array.from(colorProbe.querySelectorAll('svg,path,g,span,i,div')).slice(0, 24),
   ].some((node) => {
     if (!node) return false;
     const style = getComputedStyle(node);
     const maskImage = style.maskImage || style.getPropertyValue('-webkit-mask-image') || '';
+    const area = visibleArea(node);
     const isMaskIcon =
       (maskImage !== '' && maskImage !== 'none') ||
-      (node.tagName === 'I' && visibleArea(node) > 0 && visibleArea(node) <= 2500);
+      (node.tagName === 'I' && area > 0 && area <= 2500);
+    const isBadgeBg = isMaskIcon || (area > 0 && area <= 5000);
     const filter = (style.filter || '').trim().toLowerCase();
     if (filter && filter !== 'none' && /hue-rotate\(/i.test(filter) && /saturate\(/i.test(filter))
       return true;
@@ -444,7 +475,7 @@ export function readBrowseLikeTarget(
       style.color,
       style.fill,
       style.stroke,
-      ...(isMaskIcon ? [style.backgroundColor] : []),
+      ...(isBadgeBg ? [style.backgroundColor] : []),
       node.getAttribute('fill') ?? '',
       node.getAttribute('stroke') ?? '',
       node.getAttribute('color') ?? '',
@@ -465,7 +496,11 @@ export function readBrowseLikeTarget(
       const r = Number(rgb[1]),
         g = Number(rgb[2]),
         b = Number(rgb[3]);
-      return (b > 180 && b > r + 40) || Math.max(r, g, b) - Math.min(r, g, b) >= 45;
+      return (
+        (b > 180 && b > r + 40) ||
+        (r > 180 && r > b + 40) ||
+        Math.max(r, g, b) - Math.min(r, g, b) >= 45
+      );
     });
   });
   const nativeFeedback = feedbackEvidence(likeBtn);
@@ -491,8 +526,8 @@ export function readBrowseLikeTarget(
   ) {
     const br = likeBtn.getBoundingClientRect();
     if (
-      br.top >= 60 &&
-      br.bottom <= innerHeight - 16 &&
+      br.top >= 48 &&
+      br.bottom <= innerHeight - 8 &&
       br.left >= 0 &&
       br.right <= innerWidth &&
       canHitCenter(likeBtn, br)
@@ -577,14 +612,15 @@ export function readBrowseLikeTarget(
   if (nativeFeedback?.count !== undefined) likeCount = nativeFeedback.count;
   let activeContentRoot: Element = likeScopeRoot;
   let activeVideoRect: DOMRect | null = null;
-  if (reelSurface && video) {
-    activeVideoRect = video.getBoundingClientRect();
+  if (reelSurface && activeReelVideo) {
+    activeVideoRect = activeReelVideo.getBoundingClientRect();
     for (
-      let candidateRoot: Element | null = video.parentElement;
+      let candidateRoot: Element | null = activeReelVideo.parentElement;
       candidateRoot && candidateRoot !== main;
       candidateRoot = candidateRoot.parentElement
     ) {
-      if (Array.from(candidateRoot.querySelectorAll('video')).some((v) => v !== video)) break;
+      if (Array.from(candidateRoot.querySelectorAll('video')).some((v) => v !== activeReelVideo))
+        break;
       activeContentRoot = candidateRoot;
     }
   }

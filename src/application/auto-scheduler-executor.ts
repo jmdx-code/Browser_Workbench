@@ -1,9 +1,8 @@
-import type { AutoSchedule, AutoSchedulePhase } from '../shared/auto-scheduler.js';
-import { CombinationSchema, type Profile, type SavedCombination } from '../shared/contracts.js';
+import type { AutoSchedule } from '../shared/auto-scheduler.js';
+import type { Profile } from '../shared/contracts.js';
 import { needsResourceTable } from '../domain/resource-material-rules.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
-import { TEST_COMBINATION_NOTE } from '../shared/task-tests.js';
 import type { BluestacksService } from './bluestacks-service.js';
 import type { FeatureExecutionRegistry } from './feature-execution-registry.js';
 import type { GroupBumperService } from './group-bumper-service.js';
@@ -15,21 +14,18 @@ import {
   runBrowserTargetPipeline,
 } from './scheduler/pipeline-runners.js';
 import type { TaskService } from './task-service.js';
+import type { Workboard } from './workboard.js';
 import type { WorkspaceService } from './workspace-service.js';
-
 export interface ActiveTargetExecutionContext {
   readonly runId: string;
   readonly scheduleId: string;
-  readonly phase: AutoSchedulePhase;
   readonly targetId: string;
   cancelled: boolean;
   keepWindowOpenOnCancel: boolean;
-  handoffToMain: boolean;
   finished: boolean;
   onHandoffReady: Array<() => void>;
   abortStep: () => void;
 }
-
 export interface TargetPipelineOutcome {
   status: 'completed' | 'soft_warning' | 'hard_blocked' | 'watchdog_timeout' | 'stopped';
   summary: string;
@@ -37,11 +33,10 @@ export interface TargetPipelineOutcome {
   postedCount: number;
   softIssues: number;
   hardBlockReason: string | null;
-  handedOffToMain: boolean;
 }
-
-export interface AutoSchedulerExecutorDeps {
+export interface SchedulerModuleRefs {
   workspace: WorkspaceService;
+  workboard?: Workboard;
   tasks?: TaskService;
   groupBumper?: GroupBumperService;
   groupPoster?: GroupPosterService;
@@ -49,13 +44,14 @@ export interface AutoSchedulerExecutorDeps {
   bluestacks?: BluestacksService;
   profileLifecycle?: ProfileLifecyclePort;
   featureExecution: FeatureExecutionRegistry;
+}
+export interface AutoSchedulerExecutorDeps extends SchedulerModuleRefs {
   getIdleWatchdogMs: () => number;
   getBrowserConcurrency: () => number;
   getBluestacksConcurrency: () => number;
   releaseOwnershipBeforeClose: (targetId: string) => void;
   pollIntervalMs?: number;
 }
-
 export type TargetProgressPatch = {
   currentStep: string;
   summary: string;
@@ -63,18 +59,11 @@ export type TargetProgressPatch = {
   postedCount: number;
   softIssues: number;
 };
-
-export interface PipelineStepResult {
-  status: string;
-  hardBlocked?: boolean;
-  softIssue?: boolean;
-}
-
+export type PipelineStepResult = { status: string; hardBlocked?: boolean; softIssue?: boolean };
 export function finishTargetContext(ctx: ActiveTargetExecutionContext): void {
   ctx.finished = true;
   for (const listener of ctx.onHandoffReady.splice(0)) listener();
 }
-
 export function sleepAbortable(ms: number, isAborted: () => boolean): Promise<void> {
   if (ms <= 0 || isAborted()) return Promise.resolve();
   return new Promise((resolve) => {
@@ -90,7 +79,6 @@ export function sleepAbortable(ms: number, isAborted: () => boolean): Promise<vo
     timer.unref?.();
   });
 }
-
 export function classifyBrowserHardAccountIssue(
   profile: Profile | undefined,
   reasonText: string,
@@ -109,48 +97,6 @@ export function classifyBrowserHardAccountIssue(
   }
   return null;
 }
-
-export async function ensureQuickBrowseCombination(
-  workspace: WorkspaceService,
-  quickComboLock: Map<string, Promise<SavedCombination>>,
-  target: 'feed' | 'video',
-  durationMinutes: number,
-): Promise<SavedCombination> {
-  const key = `${target}:${durationMinutes}`;
-  const inflight = quickComboLock.get(key);
-  if (inflight) return inflight;
-  const work = (async () => {
-    const note = `${TEST_COMBINATION_NOTE}定时排班快捷浏览:${key}`;
-    const existing = (await workspace.repository.combinations()).find(
-      (row) => row.saved?.note === note,
-    );
-    if (existing) return existing;
-    return workspace.repository.createCombination(
-      CombinationSchema.parse({
-        name: `排班 · ${target === 'video' ? '刷视频' : '刷首页'} ${durationMinutes}分钟`,
-        note,
-        steps: [
-          {
-            id: globalThis.crypto.randomUUID(),
-            type: target,
-            durationMinutes,
-            maxLikes: 0,
-            minLikeCount: 0,
-          },
-        ],
-        randomOrder: false,
-        loop: { mode: 'finite', rounds: 1 },
-      }),
-    );
-  })();
-  quickComboLock.set(key, work);
-  try {
-    return await work;
-  } finally {
-    quickComboLock.delete(key);
-  }
-}
-
 export const stopAllBrowserSubmodules = (deps: AutoSchedulerExecutorDeps, profileId: string) =>
   Promise.allSettled([
     deps.tasks?.stopActiveProfile(profileId),
@@ -158,7 +104,6 @@ export const stopAllBrowserSubmodules = (deps: AutoSchedulerExecutorDeps, profil
     deps.groupPoster?.stopProfiles([profileId]),
     deps.groupInviter?.stopProfiles({ profileIds: [profileId] }),
   ]);
-
 export async function runActiveCombinationStep(
   deps: AutoSchedulerExecutorDeps,
   profileId: string,
@@ -166,6 +111,7 @@ export async function runActiveCombinationStep(
   stepLabel: string,
   isStepAborted: () => boolean,
   onProgress: (stepText: string, detail: string) => void,
+  onStatusOnly?: (stepText: string, detail: string) => void,
 ): Promise<{ hardBlockReason: string | null; softIssue: string | null }> {
   const { tasks, workspace, featureExecution } = deps;
   if (!tasks) return { hardBlockReason: null, softIssue: '活跃任务执行器未就绪' };
@@ -177,7 +123,6 @@ export async function runActiveCombinationStep(
       hardBlockReason: null,
       softIssue: '活跃组合设置为无限循环，无法在无人值守排班中自动收尾',
     };
-
   let expectedResourceRevision: number | undefined;
   if (needsResourceTable(combo.saved)) {
     const rev = await tasks.currentResourceRevision?.(combo.id);
@@ -188,13 +133,8 @@ export async function runActiveCombinationStep(
       };
     expectedResourceRevision = rev;
   }
-  const curSettings = await tasks.settings();
-  const neededCap = Math.max(curSettings.maxConcurrentProfiles, deps.getBrowserConcurrency());
-  if (neededCap > curSettings.maxConcurrentProfiles)
-    await tasks.setSettings({ maxConcurrentProfiles: neededCap }).catch(() => {});
   if ((await tasks.livePlans()).some((p) => p.profileId === profileId))
     await tasks.stopActiveProfile(profileId).catch(() => {});
-
   const requestId = globalThis.crypto.randomUUID();
   featureExecution.setDelegatedSubmodule(profileId, 'active-accounts');
   try {
@@ -210,7 +150,6 @@ export async function runActiveCombinationStep(
     let lastFp = '';
     let heartbeatAt = Date.now();
     const pollMs = Math.max(20, deps.pollIntervalMs ?? 1500);
-
     while (!isStepAborted()) {
       await sleepAbortable(pollMs, isStepAborted);
       if (isStepAborted()) break;
@@ -249,10 +188,7 @@ export async function runActiveCombinationStep(
                 (s) => s.jobId === curPlan.id,
               ) ?? null);
       } catch (err) {
-        devDiag.record({
-          level: 'WARN',
-          category: 'TASK_RUNNER',
-          event: 'AUTO_SCHEDULER_STEP_PROGRESS_READ_FAILED',
+        devDiag.emit('WARN', 'TASK_RUNNER', 'AUTO_SCHEDULER_STEP_PROGRESS_READ_FAILED', {
           profileId,
           planId: curPlan.id,
           reason: errMsg(err, 'PROGRESS_READ_FAILED').slice(0, 200),
@@ -275,7 +211,8 @@ export async function runActiveCombinationStep(
         );
       } else if (isLongOp && Date.now() - heartbeatAt >= 45_000) {
         heartbeatAt = Date.now();
-        onProgress(
+        // Update status text without touching watchdog so truly stalled QUEUED/post plans still time out.
+        onStatusOnly?.(
           stepLabel,
           curPlan.state === 'QUEUED'
             ? `${combo.saved.name} · 等待进入执行槽位…`
@@ -289,7 +226,6 @@ export async function runActiveCombinationStep(
     featureExecution.setDelegatedSubmodule(profileId, null);
   }
 }
-
 export const makePipelineOutcome = (
   status: TargetPipelineOutcome['status'],
   summary: string,
@@ -298,7 +234,6 @@ export const makePipelineOutcome = (
     postedCount?: number;
     softIssues?: number;
     hardBlockReason?: string | null;
-    handedOffToMain?: boolean;
   } = {},
 ): TargetPipelineOutcome => ({
   status,
@@ -307,9 +242,7 @@ export const makePipelineOutcome = (
   postedCount: counts.postedCount ?? 0,
   softIssues: counts.softIssues ?? 0,
   hardBlockReason: counts.hardBlockReason ?? null,
-  handedOffToMain: counts.handedOffToMain ?? false,
 });
-
 export function startPipelineWatchdog(
   deps: AutoSchedulerExecutorDeps,
   safetyCeilingMinutes: number | null,
@@ -334,11 +267,9 @@ export function startPipelineWatchdog(
   timer.unref?.();
   return { touch: () => void (lastProgressAt = Date.now()), stop: () => clearInterval(timer) };
 }
-
 export function buildPipelineFinalOutcome(input: {
   carrier: 'browser' | 'bluestacks';
   cancelled: boolean;
-  handoffToMain: boolean;
   hardBlockReason: string | null;
   safetyCeilingHit: boolean;
   anyWatchdogTimedOut: boolean;
@@ -351,7 +282,6 @@ export function buildPipelineFinalOutcome(input: {
   const {
     carrier,
     cancelled,
-    handoffToMain,
     hardBlockReason,
     safetyCeilingHit,
     anyWatchdogTimedOut,
@@ -364,11 +294,6 @@ export function buildPipelineFinalOutcome(input: {
   const isBs = carrier === 'bluestacks';
   const counts = { bumpedCount, postedCount, softIssues };
   if (cancelled) return makePipelineOutcome('stopped', '已手动停止', counts);
-  if (handoffToMain)
-    return makePipelineOutcome('completed', '正点时间已到，已无缝衔接切入正点顶贴场', {
-      ...counts,
-      handedOffToMain: true,
-    });
   if (hardBlockReason)
     return makePipelineOutcome(
       'hard_blocked',
@@ -415,21 +340,15 @@ export function buildPipelineFinalOutcome(input: {
     { bumpedCount, postedCount, softIssues: 0 },
   );
 }
-
 export class AutoSchedulerTargetExecutor {
-  private readonly quickComboLock = new Map<string, Promise<SavedCombination>>();
   constructor(private readonly deps: AutoSchedulerExecutorDeps) {}
-
   executeBrowserTarget = (input: {
     schedule: Extract<AutoSchedule, { carrier: 'browser' }>;
-    phase: AutoSchedulePhase;
     profileId: string;
-    seamlessEntered: boolean;
     safetyCeilingMinutes: number | null;
     ctx: ActiveTargetExecutionContext;
     onUpdate: (patch: TargetProgressPatch) => void;
-  }) => runBrowserTargetPipeline(this.deps, this.quickComboLock, input);
-
+  }) => runBrowserTargetPipeline(this.deps, input);
   executeBluestacksTarget = (input: {
     schedule: Extract<AutoSchedule, { carrier: 'bluestacks' }>;
     instanceId: string;

@@ -30,6 +30,7 @@ vi.mock('../src/renderer/api.js', () => ({
     googleSheetsReadGrid: vi.fn(),
     googleSheetsPollSchedule: vi.fn(),
     googleSheetsPollRecords: vi.fn(),
+    googleSheetsResetStuckRows: vi.fn(),
     googleSheetsStopLink: vi.fn(),
   },
 }));
@@ -295,7 +296,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it('GoogleSheetsPage post_schedule renders minimal single-row controls with no search bar and no total config button', async () => {
+  it('GoogleSheetsPage post_schedule renders streamlined topbar controls with grid search, status filter chips, and reset-stuck trigger', async () => {
     const recLink = makeLink({
       id: 'rec-1',
       kind: 'post_records',
@@ -374,8 +375,21 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
       await Promise.resolve();
     });
 
-    // Zero search bar, zero total config button
-    expect(host.querySelector('input[type="search"]')).toBeNull();
+    // Toolbar search, status filter chips, reset-stuck button, and policy popover exist; no legacy total config modal
+    expect(host.querySelector('input[type="search"]')).toBeTruthy();
+    const filterGroup = host.querySelector(
+      '[role="group"][aria-label="按状态筛选"]',
+    ) as HTMLElement;
+    expect(filterGroup).toBeTruthy();
+    for (const label of ['全部', '待发', '发布中', '失败', '已完成']) {
+      expect(filterGroup.textContent).toContain(label);
+    }
+    expect(
+      Array.from(host.querySelectorAll('button')).some(
+        (b) => b.textContent?.trim() === '重置卡死行',
+      ),
+    ).toBe(true);
+    expect(host.querySelector('button[aria-label="排贴轮询与唤醒设置"]')).toBeTruthy();
     expect(host.textContent).not.toContain('排贴配置');
     expect(host.textContent).not.toContain('高级配置');
     // Corner refresh icon exists hugging table
@@ -423,7 +437,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
     });
   });
 
-  it('GoogleSheetsPage post_records splits controls cleanly with zero duplicates, 3-field bump modal, and separate frequency modal', async () => {
+  it('GoogleSheetsPage post_records splits controls cleanly with toolbar/status chips, full bump switches/pills, and separate frequency modal', async () => {
     const recLink = makeLink({
       id: 'rec-1',
       kind: 'post_records',
@@ -525,8 +539,15 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
       await Promise.resolve();
     });
 
-    // Zero search bar, corner refresh icon present
-    expect(host.querySelector('input[type="search"]')).toBeNull();
+    // Toolbar search bar, status filter chips, and corner refresh icon present
+    expect(host.querySelector('input[type="search"]')).toBeTruthy();
+    const recFilterGroup = host.querySelector(
+      '[role="group"][aria-label="按状态筛选"]',
+    ) as HTMLElement;
+    expect(recFilterGroup).toBeTruthy();
+    for (const label of ['全部', '待发', '发布中', '失败', '已完成']) {
+      expect(recFilterGroup.textContent).toContain(label);
+    }
     expect(host.querySelector('button[aria-label="刷新表格"]')).toBeTruthy();
 
     // 1. Account group dropdown auto-saves immediately
@@ -537,7 +558,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
     await act(async () => {
       groupTrigger.click();
     });
-    const grpCheckbox = host.querySelector(
+    const grpCheckbox = document.body.querySelector(
       '.gs-dropdown-menu input[type="checkbox"]',
     ) as HTMLInputElement;
     expect(grpCheckbox).toBeTruthy();
@@ -583,7 +604,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
       recordsConfig: { collectMetricsOnThisPc: true },
     });
 
-    // 4. 顶贴配置 modal contains ONLY 3 fields (likeProb, commentProb, commentPool textarea)
+    // 4. 顶贴配置 modal contains 3 text/number inputs plus full bumper switches & reaction pills
     const bumpBtn = Array.from(host.querySelectorAll('button')).find(
       (b) => b.textContent?.trim() === '顶贴配置',
     );
@@ -594,6 +615,16 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
     const bumpDialog = host.querySelector('[role="dialog"][aria-label="顶贴配置"]') as HTMLElement;
     expect(bumpDialog).toBeTruthy();
     expect(bumpDialog.querySelectorAll('input, textarea, select').length).toBe(3);
+    for (const swLabel of ['留言后移除', '开启声音', '长按选表情']) {
+      expect(bumpDialog.querySelector(`[role="switch"][aria-label="${swLabel}"]`)).toBeTruthy();
+    }
+    const longPressSwitch = bumpDialog.querySelector(
+      '[role="switch"][aria-label="长按选表情"]',
+    ) as HTMLButtonElement;
+    await act(async () => {
+      longPressSwitch.click();
+    });
+    expect(bumpDialog.querySelector('[role="group"][aria-label="表情类型选择"]')).toBeTruthy();
     expect(bumpDialog.textContent).not.toContain('本机');
     expect(bumpDialog.textContent).not.toContain('积极监听');
     const closeBump = Array.from(bumpDialog.querySelectorAll('button')).find(
@@ -603,7 +634,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
       closeBump?.click();
     });
 
-    // 5. 频率限制 modal opens as a dedicated separate modal with ONLY 6 limit inputs
+    // 5. 频率限制 modal opens as a dedicated separate modal with 6 limit inputs + inherited concurrency
     const freqBtn = Array.from(host.querySelectorAll('button')).find(
       (b) => b.textContent?.trim() === '频率限制',
     );
@@ -614,6 +645,7 @@ describe('Google Sheets streamlined UX (auth one-step, multi-token auto-save, em
     const freqDialog = host.querySelector('[role="dialog"][aria-label="频率限制"]') as HTMLElement;
     expect(freqDialog).toBeTruthy();
     expect(freqDialog.querySelectorAll('input, textarea, select').length).toBe(6);
+    expect(freqDialog.textContent).toContain('全局并发上限');
     expect(freqDialog.textContent).not.toContain('评论词库');
   });
 

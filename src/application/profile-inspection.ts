@@ -17,7 +17,6 @@ import {
   type Inspection,
   type InspectionReasonCode,
 } from '../shared/profile-inspection.js';
-
 const unknown = () => ({ state: 'unknown' as const, id: null, name: null, avatar: null });
 type AbnormalState = 'verification' | 'restricted' | 'logged-out';
 type Entry = {
@@ -27,19 +26,16 @@ type Entry = {
   lastAccountId?: string | null;
   display: { name: string | null; avatar: string | null };
 };
-
 const ABNORMAL_REASON_MAP: Record<AbnormalState, InspectionReasonCode> = {
   verification: 'CHECKPOINT_ROUTE',
   restricted: 'ACCOUNT_RESTRICTED',
   'logged-out': 'VISIBLE_LOGIN_FORM',
 };
-
 const ABNORMAL_ERROR_MAP: Record<string, AbnormalState> = {
   FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED: 'verification',
   FACEBOOK_ACCOUNT_RESTRICTED: 'restricted',
   FACEBOOK_ACCOUNT_LOGGED_OUT: 'logged-out',
 };
-
 const FAILURE_REASON_GROUPS: ReadonlyArray<readonly [InspectionReasonCode, readonly string[]]> = [
   [
     'INSPECTION_READ_RELEASE_UNCONFIRMED',
@@ -84,7 +80,6 @@ const FAILURE_REASON_GROUPS: ReadonlyArray<readonly [InspectionReasonCode, reado
   ],
   ['INSPECTION_PROFILE_NOT_IDLE', ['KERNEL_PEER_NOT_IDLE']],
 ];
-
 function failureReason(error: unknown): InspectionReasonCode {
   const message = error instanceof Error ? error.message : '';
   const known = InspectionReason.safeParse(message);
@@ -93,7 +88,6 @@ function failureReason(error: unknown): InspectionReasonCode {
   for (const [code, names] of FAILURE_REASON_GROUPS) if (names.includes(message)) return code;
   return 'INSPECTION_FAILED';
 }
-
 const makeResetRow = (
   row: Inspection,
   state: 'BLOCKED' | 'FAILED',
@@ -108,7 +102,6 @@ const makeResetRow = (
   avatarObservation: null,
   nameObservation: null,
 });
-
 export class ProfileInspectionService {
   private readonly entries = new Map<string, Entry>();
   private readonly unavailable = new Map<string, Inspection>();
@@ -118,7 +111,6 @@ export class ProfileInspectionService {
   private closing = false;
   private readonly observedConnections = new Map<string, string>();
   private readonly nextAutomaticRead = new Map<string, number>();
-
   constructor(
     private readonly port: ProfileInspectionPort,
     private readonly now: () => number,
@@ -133,7 +125,6 @@ export class ProfileInspectionService {
       },
     ) => void,
   ) {}
-
   private current(entry: Entry) {
     const conn = this.port.connection(entry.connection.profileId);
     if (
@@ -146,7 +137,6 @@ export class ProfileInspectionService {
       throw Error('INSPECTION_CONNECTION_CHANGED');
     }
   }
-
   private applyAbnormalState(profileId: string, entry: Entry, state: AbnormalState): void {
     entry.display = { name: null, avatar: null };
     entry.row = ProfileInspection.parse({
@@ -160,7 +150,6 @@ export class ProfileInspectionService {
     });
     this.nextAutomaticRead.set(profileId, this.now() + 30_000);
   }
-
   get(profileId: string): Inspection | null {
     const entry = this.entries.get(profileId);
     if (!entry) return structuredClone(this.unavailable.get(profileId) ?? null);
@@ -180,7 +169,6 @@ export class ProfileInspectionService {
     }
     return structuredClone(entry.row);
   }
-
   account(profileId: string) {
     const row = this.get(profileId);
     if (row?.state === 'OBSERVED') return row.account;
@@ -194,7 +182,6 @@ export class ProfileInspectionService {
       ? { ...unknown(), ...entry.display }
       : unknown();
   }
-
   observeConnections(profileIds: string[]) {
     if (this.closing) return;
     for (const id of this.observedConnections.keys())
@@ -243,7 +230,6 @@ export class ProfileInspectionService {
     }
     if (requests.length) this.request(requests);
   }
-
   request(profileIds: string[]): Inspection[] {
     if (this.closing) throw Error('INSPECTION_SERVICE_CLOSED');
     const results = [...new Set(profileIds)].map((profileId) => {
@@ -290,14 +276,12 @@ export class ProfileInspectionService {
     this.pump();
     return results;
   }
-
   invalidate(profileId: string) {
     const entry = this.entries.get(profileId);
     if (!entry) return;
     entry.cancelled = true;
     entry.row = makeResetRow(entry.row, 'BLOCKED', 'INSPECTION_CANCELLED');
   }
-
   private pump() {
     while (!this.closing && this.active.size < 2 && this.queue.length) {
       const entry = this.queue.shift();
@@ -313,7 +297,6 @@ export class ProfileInspectionService {
       });
     }
   }
-
   private async run(entry: Entry) {
     const profileId = entry.connection.profileId;
     try {
@@ -395,7 +378,6 @@ export class ProfileInspectionService {
         this.nextAutomaticRead.set(profileId, this.now() + 15000);
     }
   }
-
   syncExternalObservation(
     profileId: string,
     account: {
@@ -450,7 +432,6 @@ export class ProfileInspectionService {
       };
     }
   }
-
   async close() {
     this.closing = true;
     for (const entry of this.entries.values()) entry.cancelled = true;

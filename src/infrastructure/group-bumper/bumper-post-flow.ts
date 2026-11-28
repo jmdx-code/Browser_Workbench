@@ -1,18 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { Locator, Page } from 'playwright-core';
-import type { CompatibleRepository } from '../../domain/persistence.js';
 import type { BumperResolutionValue } from '../../shared/bumper-operation.js';
 import { devDiag } from '../../shared/dev-diagnostics.js';
 import type { BumperSettings, BumperTarget } from '../../shared/group-bumper.js';
 import type { Binding } from '../../shared/task-execution.js';
-import type { InFlightBumperCoordinator } from '../facebook-group-session.js';
 import { bumperAuthorMatch, type BumperPost, readGroupBumper } from '../group-bumper-effects.js';
 import type { SqliteGroupBumperRepository } from '../group-bumper-store.js';
 import {
   BUMPER_DEBUGGER_CANCELED_MESSAGE,
   type BumperConnection,
   BumperFatalError,
-  type BumperGroupFeedContext,
   BumperPostReadIncomplete,
   type BumperRunCallbacks,
   type BumperRunStats,
@@ -81,8 +78,7 @@ export async function navigateViaSearchEntry(input: {
   urlOk: (u: URL) => boolean;
 }): Promise<{ usedFallback: boolean; surface?: BumperSurface }> {
   const { session, paceScale, query, searchUrl, fallbackUrl, readSurface, missingMsg, urlOk } =
-      input,
-    page = session.getPage();
+    input;
   await session.searchViaInputOrUrl(query, searchUrl);
   const found = await pollWithGuard(
     6000,
@@ -94,23 +90,38 @@ export async function navigateViaSearchEntry(input: {
     session.clearNavigationChain();
     let latest: BumperSurface = found;
     try {
-      await session.op(
+      const navigatedUrl = await session.op(
         '打开搜索到的小组',
         async () => {
+          const opPage = session.getPage();
           const refreshed = await readSurface();
           if (!refreshed.groupEntryCSS) throw Error(missingMsg);
           latest = refreshed;
-          const entry = page.locator(refreshed.groupEntryCSS).first();
+          const entry = opPage.locator(refreshed.groupEntryCSS).first();
           await centerBumperControl(entry, paceScale);
           const prePause = Math.round((300 + Math.floor(Math.random() * 301)) * paceScale);
           if (prePause > 0) await wait(prePause);
-          await entry.click({ timeout: 4000 });
-          await page.waitForURL(urlOk, { timeout: 15000 });
-          return page.url();
+          try {
+            await entry.click({ timeout: 4000 });
+            await opPage.waitForURL(urlOk, { timeout: 15000 });
+            return opPage.url();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/Cannot find context with specified id|Execution context was destroyed/i.test(msg))
+              throw err;
+            await wait(400);
+            const livePage = session.getPage();
+            const cur = livePage.url();
+            if (urlOk(new URL(cur))) return cur;
+            await livePage.waitForURL(urlOk, { timeout: 6000 }).catch(() => {});
+            const after = session.getPage().url();
+            return urlOk(new URL(after)) ? after : '';
+          }
         },
-        async () => new URL(page.url()).origin === 'https://www.facebook.com',
+        async () => new URL(session.getPage().url()).origin === 'https://www.facebook.com',
       );
-      return { usedFallback: false, surface: latest };
+      if (navigatedUrl && urlOk(new URL(navigatedUrl)))
+        return { usedFallback: false, surface: latest };
     } catch (err) {
       if (isBumperFatal(err)) throw err;
     }
@@ -187,13 +198,9 @@ export async function closeBumperPostDialog(input: {
   );
 }
 export async function centerBumperControl(locator: Locator, paceScale = 1, timeout = 4000) {
-  await locator.evaluate(
-    (el) => el.scrollIntoView({ block: 'center', inline: 'center' }),
-    undefined,
-    {
-      timeout,
-    },
-  );
+  await locator.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }), void 0, {
+    timeout,
+  });
   if (paceScale > 0) await wait(Math.max(1, Math.round(150 * paceScale)));
 }
 export async function prepareBumperPost(input: {
@@ -206,30 +213,21 @@ export async function prepareBumperPost(input: {
 }): Promise<BumperPost> {
   const deadline = Date.now() + (input.timeoutMs ?? 12_000);
   let hydrationScrollUsed = false;
-  const center = (sel: string, remaining: number) =>
-    centerBumperControl(
-      input.page.locator(sel).first(),
-      input.paceScale ?? 1,
-      Math.min(750, remaining),
-    );
-  const isDetachErr = (error: unknown) =>
-    error instanceof Error &&
-    /locator\.evaluate: Timeout|Element is not attached|Element was detached/i.test(error.message);
+  const center = (sel: string, rem: number) =>
+    centerBumperControl(input.page.locator(sel).first(), input.paceScale ?? 1, Math.min(750, rem));
+  const isDetach = (e: unknown) =>
+    e instanceof Error &&
+    /locator\.evaluate: Timeout|Element is not attached|Element was detached/i.test(e.message);
   while (Date.now() < deadline) {
     input.guard();
     try {
-      const current = await input.readCurrent();
+      const c = await input.readCurrent();
       input.guard();
-      const anchor =
-        current.videoCSS ??
-        current.postCSS ??
-        current.likeCSS ??
-        current.commentButtonCSS ??
-        current.commentCSS;
+      const anchor = c.videoCSS ?? c.postCSS ?? c.likeCSS ?? c.commentButtonCSS ?? c.commentCSS;
       if (!anchor) throw new BumperPostReadIncomplete();
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      await center(anchor, remaining);
+      const rem = deadline - Date.now();
+      if (rem <= 0) break;
+      await center(anchor, rem);
       input.guard();
       const after = await input.readCurrent();
       input.guard();
@@ -238,26 +236,24 @@ export async function prepareBumperPost(input: {
       return after;
     } catch (error) {
       input.guard();
-      if (!(error instanceof BumperPostReadIncomplete) && !isDetachErr(error)) throw error;
+      if (!(error instanceof BumperPostReadIncomplete) && !isDetach(error)) throw error;
       if (
         error instanceof BumperPostReadIncomplete &&
         !hydrationScrollUsed &&
         input.candidateCardCSS
       ) {
         hydrationScrollUsed = true;
-        const remaining = deadline - Date.now();
-        if (remaining > 0) {
-          try {
-            await center(input.candidateCardCSS, remaining);
-          } catch (scrollError) {
-            if (!isDetachErr(scrollError)) throw scrollError;
-          }
+        const rem = deadline - Date.now();
+        if (rem > 0) {
+          await center(input.candidateCardCSS, rem).catch((e) => {
+            if (!isDetach(e)) throw e;
+          });
           input.guard();
         }
       }
     }
-    const remaining = deadline - Date.now();
-    if (remaining > 0) await wait(Math.min(200, remaining));
+    const rem = deadline - Date.now();
+    if (rem > 0) await wait(Math.min(200, rem));
   }
   input.guard();
   throw new Error('目标帖子仍在加载或控件未就绪，本帖准备超时，未执行互动');
@@ -321,6 +317,30 @@ async function waitWithGuard(ms: number, guard: () => void) {
     await wait(Math.min(100, left));
   }
 }
+export async function readBumperComposerText(box: Locator, expectedNorm?: string): Promise<string> {
+  const inner = await box.innerText().catch(() => '');
+  const safeInner = typeof inner === 'string' ? inner : '';
+  const innerNorm = normalizeBumperComment(safeInner);
+  if (expectedNorm !== undefined ? innerNorm.includes(expectedNorm) : Boolean(innerNorm))
+    return safeInner;
+  const domText = await box
+    .evaluate((el) => {
+      const readNode = (node: Node): string => {
+        if (node.nodeType === 3) return node.textContent ?? '';
+        if (!(node instanceof Element)) return '';
+        if (node.tagName === 'IMG') return node.getAttribute('alt') ?? '';
+        if (node.tagName === 'BR') return '\n';
+        let out = '';
+        for (const child of Array.from(node.childNodes)) out += readNode(child);
+        if (/^(?:P|DIV|LI)$/.test(node.tagName) && out && !out.endsWith('\n')) out += '\n';
+        return out;
+      };
+      return readNode(el);
+    })
+    .catch(() => '');
+  const safeDom = typeof domText === 'string' ? domText : '';
+  return safeDom.trim().length > safeInner.trim().length ? safeDom : safeInner;
+}
 export async function typeBumperComment(
   page: Page,
   box: Locator,
@@ -330,29 +350,51 @@ export async function typeBumperComment(
 ) {
   await revealBumperControlIfNeeded(box, paceScale);
   await box.click({ timeout: 4000 });
-  if (normalizeBumperComment(await box.innerText())) {
+  if (normalizeBumperComment(await readBumperComposerText(box))) {
     await box.press('ControlOrMeta+A');
     await box.press('Backspace');
   }
-  const typeChar =
-    typeof page.keyboard.type === 'function'
-      ? (ch: string) => page.keyboard.type(ch)
-      : (ch: string) => page.keyboard.insertText(ch);
-  for (const ch of Array.from(text)) {
+  const normalizedInput = text.replace(/\r\n?/g, '\n');
+  const pressShiftEnter = async () => {
+    if (typeof page.keyboard.press === 'function') await page.keyboard.press('Shift+Enter');
+    else await box.press('Shift+Enter');
+  };
+  const typeSegment = async (ch: string) => {
+    if (ch === '\n') return pressShiftEnter();
+    const isBmpSingle = ch.length === 1 && (ch.codePointAt(0) ?? 0) <= 0xffff;
+    if (isBmpSingle && typeof page.keyboard.type === 'function') await page.keyboard.type(ch);
+    else if (typeof page.keyboard.insertText === 'function') await page.keyboard.insertText(ch);
+    else await page.keyboard.type(ch);
+  };
+  const graphemes = Array.from(
+    new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(normalizedInput),
+    (s) => s.segment,
+  );
+  for (const ch of graphemes) {
     guard();
-    await typeChar(ch);
+    await typeSegment(ch);
     const delay =
       55 +
       Math.floor(Math.random() * 56) +
       (/[，。！？、；：,.!?;:\s]/.test(ch) ? 60 + Math.floor(Math.random() * 81) : 0);
     await waitWithGuard(Math.round(delay * paceScale), guard);
   }
-  if (!normalizeBumperComment(await box.innerText()))
-    await box.pressSequentially(text, {
-      delay: Math.max(10, Math.round((95 + Math.floor(Math.random() * 90)) * paceScale)),
-      timeout: 60000,
-    });
-  if (!normalizeBumperComment(await box.innerText()).includes(normalizeBumperComment(text)))
+  const expectedNorm = normalizeBumperComment(normalizedInput);
+  if (!normalizeBumperComment(await readBumperComposerText(box, expectedNorm))) {
+    const lines = normalizedInput.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) await pressShiftEnter();
+      const line = lines[i] ?? '';
+      if (line)
+        await box.pressSequentially(line, {
+          delay: Math.max(10, Math.round((95 + Math.floor(Math.random() * 90)) * paceScale)),
+          timeout: 60000,
+        });
+    }
+  }
+  if (
+    !normalizeBumperComment(await readBumperComposerText(box, expectedNorm)).includes(expectedNorm)
+  )
     throw Error('评论文字尚未进入编辑器，已跳过当前帖');
   await waitWithGuard(Math.round((1200 + Math.floor(Math.random() * 1401)) * paceScale), guard);
 }
@@ -460,26 +502,17 @@ export function isForeignPagePost(
   const name = page.name.trim().toLowerCase();
   return !(name && name !== page.id.toLowerCase() && post.authorName.trim().toLowerCase() === name);
 }
-export async function executeBumperPostActions(input: {
-  profileId: string;
-  paceScale: number;
-  repo: CompatibleRepository<SqliteGroupBumperRepository>;
-  inFlightCoordinator: InFlightBumperCoordinator;
-  commentClaims: Set<string>;
-  settings: BumperSettings;
-  callbacks: BumperRunCallbacks;
-  session: BumperSessionRuntime;
-  groupCtx: BumperGroupFeedContext;
-  groupHelpers: BumperGroupSurfaceHelpers;
-  stats: BumperRunStats;
-  feed: BumperTarget | null;
-  resolvedPageId: string | undefined;
-  pageOwnerAuthorId: string | null;
-  target: BumperTarget;
-  post: BumperPost;
-  isResumingCurrentPost: boolean;
-  resumableRef: { current: ResumablePostState | null };
-}): Promise<'continue' | 'quota_reached'> {
+export async function executeBumperPostActions(
+  input: import('./bumper-core.js').BumperFeedStepContext & {
+    feed: BumperTarget | null;
+    resolvedPageId: string | undefined;
+    pageOwnerAuthorId: string | null;
+    target: BumperTarget;
+    post: BumperPost;
+    isResumingCurrentPost: boolean;
+    resumableRef: { current: ResumablePostState | null };
+  },
+): Promise<'continue' | 'quota_reached'> {
   const {
       profileId,
       paceScale,
@@ -508,11 +541,11 @@ export async function executeBumperPostActions(input: {
     quotaReserved = false;
   const issueCountBeforePost = session.getIssueCount();
   try {
-    if (!session.scanOnly && !inFlightCoordinator.tryAcquirePost(accountId, post.postId)) {
+    if (!inFlightCoordinator.tryAcquirePost(accountId, post.postId)) {
       stats.skippedByQuotaPosts++;
       return 'continue';
     }
-    postClaimed = !session.scanOnly;
+    postClaimed = true;
     const q = await repo.eligibility(accountId, profileId, post.postId, Date.now(), sourceMode);
     session.guard();
     const resumed = isResumingCurrentPost ? resumableRef.current : null,
@@ -554,12 +587,11 @@ export async function executeBumperPostActions(input: {
         session.guard,
       );
     }
-    if (!session.scanOnly && !wantLike && !chosen && !wantShareToStory) {
+    if (!wantLike && !chosen && !wantShareToStory) {
       if (isResumingCurrentPost) resumableRef.current = null;
       return 'continue';
     }
     if (
-      !session.scanOnly &&
       !resumingAlreadyCredited &&
       !inFlightCoordinator.tryReserveDailyQuota(
         accountId,
@@ -569,7 +601,15 @@ export async function executeBumperPostActions(input: {
       )
     )
       return reportQuota();
-    quotaReserved = !session.scanOnly && !resumingAlreadyCredited;
+    quotaReserved = !resumingAlreadyCredited;
+    const postBase = {
+      groupId: group.id,
+      groupName: group.name,
+      pageId: target.id,
+      pageName: target.name,
+      postId: post.postId,
+      postUrl: post.postUrl,
+    };
     const activePostState: ResumablePostState = resumed ?? {
         postId: post.postId,
         wantLike,
@@ -579,12 +619,7 @@ export async function executeBumperPostActions(input: {
           id: randomUUID(),
           profileId,
           accountId,
-          groupId: group.id,
-          groupName: group.name,
-          pageId: target.id,
-          pageName: target.name,
-          postId: post.postId,
-          postUrl: post.postUrl,
+          ...postBase,
           liked: false,
           commentText: null,
           storyShared: false,
@@ -601,12 +636,7 @@ export async function executeBumperPostActions(input: {
     let credited = activePostState.credited;
     resumableRef.current = activePostState;
     session.setOperationContext({
-      groupId: group.id,
-      groupName: group.name,
-      pageId: target.id,
-      pageName: target.name,
-      postId: post.postId,
-      postUrl: post.postUrl,
+      ...postBase,
       logId: record.id,
       commentId: chosen?.id,
       commentText: chosen?.text,
@@ -630,10 +660,11 @@ export async function executeBumperPostActions(input: {
             inFlightCoordinator.releaseDailyQuota(accountId, sourceMode);
           }
           stats.sessionBumped++;
-          callbacks.added(
-            (await repo.eligibility(accountId, profileId, post.postId, Date.now(), sourceMode))
-              .today,
-          );
+          const latestToday = (
+            await repo.eligibility(accountId, profileId, post.postId, Date.now(), sourceMode)
+          ).today;
+          if (latestToday >= settings.dailyMaxLikesPerAccount) stats.quotaReached = true;
+          callbacks.added(latestToday);
         }
         return saved;
       },
@@ -651,11 +682,6 @@ export async function executeBumperPostActions(input: {
           pageOwnerAuthorId,
         });
     await groupHelpers.dismissWelcomeDialogIfNeeded();
-    if (session.scanOnly) {
-      callbacks.status('只读扫描 · ' + post.postId);
-      resumableRef.current = null;
-      return 'continue';
-    }
     const postCtx: BumperPostCtx = {
       profileId,
       paceScale,
@@ -699,10 +725,7 @@ export async function executeBumperPostActions(input: {
     }
     if (stats.consecutiveUnconfirmed >= 3)
       throw new BumperFatalError('连续 3 次互动结果未确认，本轮已结束，原操作保留待核对');
-    devDiag.record({
-      level: 'WARN',
-      category: 'GROUP_BUMPER',
-      event: 'BUMPER_POST_SKIPPED',
+    devDiag.emit('WARN', 'GROUP_BUMPER', 'BUMPER_POST_SKIPPED', {
       profileId,
       reason: errText,
       data: { groupId: group.id, postId: post.postId },
@@ -730,6 +753,10 @@ export async function executeBumperPostActions(input: {
       if (postClaimed) inFlightCoordinator.releasePost(accountId, post.postId);
       if (chosen) commentClaims.delete(chosen.id);
     }
+  }
+  if (stats.quotaReached || callbacks.shouldStopAfterCurrentPost?.()) {
+    stats.quotaReached = true;
+    return 'quota_reached';
   }
   return 'continue';
 }

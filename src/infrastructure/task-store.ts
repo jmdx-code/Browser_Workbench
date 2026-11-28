@@ -1,5 +1,4 @@
 import type { SynchronousRepository } from '../domain/persistence.js';
-import { TaskRecordReader } from './task-record-reader.js';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { TaskStepV2 } from '../shared/task-policies.js';
@@ -10,13 +9,9 @@ import { SqliteTaskResourceRepository } from './task-resource-store.js';
 import { isUncommittedTransaction, transaction } from './sqlite-transaction.js';
 import { prepareCached } from './sqlite-statement-cache.js';
 import * as Q from './persistence/sqlite-query-helpers.js';
-import { TaskTiming } from '../shared/task-timing.js';
-import { taskTimingEligibility } from '../domain/system-ports.js';
 import * as Ops from './stores/task-store-operations.js';
-
 const mapStepRow = (row: Record<string, unknown>): TC.StepInstance =>
   TaskStepV2.parse(Q.camel(row, '', 'spec,progress,outcome', 'outcome'));
-
 const lruGet = <T>(map: Map<string, T>, key: string): T | undefined => {
   const val = map.get(key);
   if (val !== undefined) {
@@ -32,22 +27,11 @@ const lruSet = <T>(map: Map<string, T>, key: string, val: T): void => {
     if (oldest !== undefined) map.delete(oldest);
   }
 };
-
 export class SqliteTaskRepository implements TaskRepository {
-  readonly recordReader: TaskRecordReader;
   readonly resources: SqliteTaskResourceRepository;
   private readonly instanceEpoch = randomUUID().slice(0, 8);
   private hasCloseBrowserColumnCache: boolean | null = null;
   private readonly planRowCache = new Map<string, { key: string; plan: TC.Plan }>();
-  private readonly batchTimingCache = new Map<
-    string,
-    {
-      body: string | null;
-      parsedTiming: ReturnType<typeof TaskTiming.parse> | undefined;
-      timingReleased: boolean;
-    }
-  >();
-
   constructor(
     private readonly db: DatabaseSync,
     private readonly dependencies: Ops.TaskStoreDependencies = {
@@ -63,14 +47,7 @@ export class SqliteTaskRepository implements TaskRepository {
       CREATE INDEX IF NOT EXISTS direct_pub_source ON direct_material_publications(usage_source_key, usage_generation); CREATE INDEX IF NOT EXISTS direct_pub_account_fp ON direct_material_publications(account_id, fingerprint);
     `);
     this.resources = new SqliteTaskResourceRepository(db);
-    this.recordReader = new TaskRecordReader(
-      db,
-      (id) => this.get(id),
-      (id, round) => this.steps(id, round),
-      () => this.cacheStateToken(),
-    );
   }
-
   private ctx(): Ops.TaskStoreContext {
     return {
       db: this.db,
@@ -90,40 +67,17 @@ export class SqliteTaskRepository implements TaskRepository {
       event: (id, t, d) => this.event(id, t, d),
       unlock: this.unlock,
       settings: this.settings,
-      invalidateBatchTimingCache: (b) => this.invalidateBatchTimingCache(b),
       hasCloseBrowserColumn: this.hasCloseBrowserColumn,
     };
   }
-  finalRecords(id: string, round: number) {
-    const row = this.db
-      .prepare(
-        'SELECT records FROM task_run_summaries WHERE job_id=? AND round=? AND details_pruned=1',
-      )
-      .get(id, round);
-    return row ? (JSON.parse(String(row.records)) as TC.TaskRecord[]) : null;
-  }
   private stmt = (sql: string) => prepareCached(this.db, sql);
-  hiddenRecordIds = () =>
-    Q.sqliteTableExists(this.db, 'task_record_deletions')
-      ? this.stmt('SELECT step_id FROM task_record_deletions')
-          .all()
-          .map((r) => String(r.step_id))
-      : [];
-  recordsPage = (
-    input: unknown,
-    profiles: readonly import('../domain/task-record-projection.js').RecordProfile[],
-  ) => this.recordReader.page(input, profiles);
+  recordsPage = (input: unknown, profiles: readonly DT.RecordProfile[]) =>
+    Ops.queryTaskRecordsPage(this.ctx(), input, profiles);
   private hasCloseBrowserColumn = (): boolean =>
     (this.hasCloseBrowserColumnCache ??= Q.tableColumns(this.db, 'task_plans').has(
       'close_browser_on_finish',
     ));
   private event(id: string, type: string, detail: TC.Operation['receipt'] = null) {
-    if (type === 'SCHEDULE_RELEASED') {
-      const batchId =
-        this.planRowCache.get(id)?.plan.batchId ??
-        this.stmt('SELECT batch_id FROM task_plans WHERE id=?').get(id)?.batch_id;
-      this.invalidateBatchTimingCache(typeof batchId === 'string' ? batchId : undefined);
-    }
     this.stmt('INSERT INTO task_events(job_id,type,detail,created_at) VALUES(?,?,?,?)').run(
       id,
       type,
@@ -155,48 +109,17 @@ export class SqliteTaskRepository implements TaskRepository {
   private unlock = (id: string) => {
     this.stmt('DELETE FROM task_account_locks WHERE job_id=?').run(id);
   };
-  invalidateBatchTimingCache(batchId?: string) {
-    if (batchId === undefined) {
-      this.batchTimingCache.clear();
-      this.planRowCache.clear();
-      return;
-    }
-    this.batchTimingCache.delete(batchId);
-    for (const [id, entry] of this.planRowCache)
-      if (entry.plan.batchId === batchId) this.planRowCache.delete(id);
-  }
   ensurePlanExists(id: string): void {
     if (!this.stmt('SELECT 1 FROM task_plans WHERE id=?').get(id)) {
       this.planRowCache.delete(id);
       throw new ProductError('TASK_NOT_FOUND', '任务计划不存在', 404);
     }
   }
-  private resolveBatchTiming(batchId: string) {
-    const inWriteTx = isUncommittedTransaction(this.db);
-    if (inWriteTx) this.batchTimingCache.delete(batchId);
-    else {
-      const cached = lruGet(this.batchTimingCache, batchId);
-      if (cached !== undefined) return cached;
-    }
-    const timingRow = this.stmt('SELECT body FROM task_batch_timing WHERE batch_id=?').get(batchId),
-      body = timingRow ? String(timingRow.body) : null;
-    const parsedTiming = body !== null ? TaskTiming.parse(JSON.parse(body)) : undefined;
-    const relSql =
-      "SELECT e.sequence FROM task_events e JOIN task_plans p ON p.id=e.job_id WHERE p.batch_id=? AND e.type='SCHEDULE_RELEASED' LIMIT 1";
-    const entry = {
-      body,
-      parsedTiming,
-      timingReleased: body !== null && Boolean(this.stmt(relSql).get(batchId)),
-    };
-    if (!inWriteTx) lruSet(this.batchTimingCache, batchId, entry);
-    return entry;
-  }
   private parsePlanRow(row: Record<string, unknown>): TC.Plan {
     const id = String(row.id),
       inWriteTx = isUncommittedTransaction(this.db);
     if (inWriteTx) this.planRowCache.delete(id);
-    const timingInfo = this.resolveBatchTiming(String(row.batch_id)),
-      closeBrowserOnFinish = row.close_browser_on_finish === 1;
+    const closeBrowserOnFinish = row.close_browser_on_finish === 1;
     const cacheKey = [
       row.state,
       row.updated_at,
@@ -206,8 +129,6 @@ export class SqliteTaskRepository implements TaskRepository {
       row.control_confirmed,
       row.round,
       row.position,
-      timingInfo.body ?? '',
-      timingInfo.timingReleased,
       closeBrowserOnFinish ? '1' : '0',
     ]
       .map(String)
@@ -242,9 +163,6 @@ export class SqliteTaskRepository implements TaskRepository {
       position: row.position,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      ...(timingInfo.parsedTiming !== undefined
-        ? { timing: timingInfo.parsedTiming, timingReleased: timingInfo.timingReleased }
-        : {}),
       ...(closeBrowserOnFinish ? { closeBrowserOnFinish: true } : {}),
     });
     if (!inWriteTx) lruSet(this.planRowCache, id, { key: cacheKey, plan });
@@ -281,65 +199,14 @@ export class SqliteTaskRepository implements TaskRepository {
       .all(profileId)
       .map((r) => this.parsePlanRow(r));
   }
-  historyPlans(profileId: string, selectedId?: string): TC.Plan[] {
-    const sql = `SELECT p.* FROM task_plans p WHERE p.profile_id=? AND (p.state NOT IN ('STOPPED','COMPLETED','FAILED') OR NOT EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round) OR EXISTS(SELECT 1 FROM task_steps s WHERE s.job_id=p.id AND s.round=p.round AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id))) ORDER BY p.created_at DESC,p.id DESC LIMIT 51`;
-    const rows = this.db.prepare(sql).all(profileId);
-    if (selectedId && !rows.some((r) => r.id === selectedId)) {
-      const row = this.db
-        .prepare('SELECT * FROM task_plans WHERE id=? AND profile_id=?')
-        .get(selectedId, profileId);
-      if (row) {
-        const visSql =
-          'SELECT 1 FROM task_steps s WHERE s.job_id=? AND s.round=? AND NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id) LIMIT 1';
-        const round = Number(row.round),
-          visible =
-            !['STOPPED', 'COMPLETED', 'FAILED'].includes(String(row.state)) ||
-            !this.db
-              .prepare('SELECT 1 FROM task_steps WHERE job_id=? AND round=? LIMIT 1')
-              .get(selectedId, round) ||
-            Boolean(this.db.prepare(visSql).get(selectedId, round));
-        if (visible || !rows.length) rows.push(row);
-      }
-    }
-    return rows.map((r) => this.parsePlanRow(r));
-  }
   hasProfilePlanInStates = (profileId: string, states: readonly TC.Plan['state'][]): boolean => {
     const sql = `SELECT 1 FROM task_plans WHERE profile_id=? AND state IN (${states.map(() => '?').join(',')}) LIMIT 1`;
     return states.length > 0 && Boolean(this.db.prepare(sql).get(profileId, ...states));
-  };
-  hasPlanOrOperation = (jobId: string, operationId: string): boolean => {
-    const sql =
-      'SELECT 1 FROM task_plans WHERE id=? UNION ALL SELECT 1 FROM task_outbox o JOIN task_plans p ON p.id=o.job_id WHERE o.id=? LIMIT 1';
-    return Boolean(this.stmt(sql).get(jobId, operationId));
   };
   list = () =>
     this.stmt('SELECT * FROM task_plans ORDER BY created_at,rowid')
       .all()
       .map((r) => this.parsePlanRow(r));
-  releaseScheduled() {
-    const candidates = this.livePlans().filter(
-      (r) =>
-        r.state === 'QUEUED' &&
-        r.timing &&
-        !r.timingReleased &&
-        taskTimingEligibility(r.timing, this.dependencies.now()) !== 'WAIT',
-    );
-    if (!candidates.length) return;
-    transaction(this.db, () => {
-      for (const plan of candidates) {
-        const cur = this.get(plan.id);
-        if (cur.state !== 'QUEUED' || !cur.timing || cur.timingReleased) continue;
-        const el = taskTimingEligibility(cur.timing, this.dependencies.now());
-        if (el === 'OPEN') {
-          this.event(cur.id, 'SCHEDULE_RELEASED');
-          this.invalidateBatchTimingCache(cur.batchId);
-        } else if (el === 'MISSED') {
-          this.state(cur.id, 'FAILED', 'SCHEDULE_MISSED');
-          this.invalidateBatchTimingCache(cur.batchId);
-        }
-      }
-    });
-  }
   livePlans = () => {
     const sql =
       "SELECT * FROM task_plans WHERE state NOT IN ('STOPPED','COMPLETED','FAILED') ORDER BY created_at,rowid";
@@ -408,9 +275,10 @@ export class SqliteTaskRepository implements TaskRepository {
   assign = (input: TC.Assignment, profiles: DT.RuntimeProfile[]) =>
     Ops.assignTaskBatch(this.ctx(), input, profiles);
   claimPlanForProfile = (profileId: string, accountId: string | null): TC.Plan | null =>
-    Ops.claimTaskPlanForProfile(this.ctx(), profileId, accountId, () => this.releaseScheduled());
+    Ops.claimTaskPlanForProfile(this.ctx(), profileId, accountId);
   bindPlanAccount = (id: string, accountId: string): TC.Plan =>
     Ops.bindTaskPlanAccount(this.ctx(), id, accountId);
+  requeueBusyAccountPlan = (id: string): TC.Plan => Ops.requeueBusyAccountPlan(this.ctx(), id);
   updateStepProgress = (id: string, stepId: string, progress: TC.Progress): void => {
     Ops.updateTaskStepProgress(this.ctx(), id, stepId, progress);
   };
@@ -423,7 +291,8 @@ export class SqliteTaskRepository implements TaskRepository {
       | 'DEPENDENCY_FAILED'
       | 'RESOURCE_EXHAUSTED'
       | 'FEATURE_UNAVAILABLE'
-      | 'MARKETPLACE_UNAVAILABLE',
+      | 'MARKETPLACE_UNAVAILABLE'
+      | 'USER_STOP',
     dependencyStepId?: string,
   ): TC.Plan => Ops.skipTaskStepDirect(this.ctx(), id, stepId, reason, dependencyStepId);
   failStepDirect = (
@@ -474,25 +343,12 @@ export class SqliteTaskRepository implements TaskRepository {
     this.hasPublication('account_id=? AND fingerprint=?', accountId, fingerprint);
   isMaterialSourceUsed = (usageSourceKey: string): boolean =>
     this.hasPublication('usage_source_key=?', usageSourceKey);
-  recoverOnStartup(preserveFutureSchedules = true) {
-    this.invalidateBatchTimingCache();
+  recoverOnStartup(_preserveFutureSchedules = true) {
+    this.planRowCache.clear();
     transaction(this.db, () => {
-      const now = this.dependencies.now();
+      const ctx = this.ctx();
       for (const plan of this.livePlans()) {
-        if (
-          preserveFutureSchedules &&
-          plan.state === 'QUEUED' &&
-          plan.timing &&
-          !plan.timingReleased
-        ) {
-          const timing = taskTimingEligibility(plan.timing, now);
-          if (timing === 'WAIT') continue;
-          if (timing === 'MISSED') {
-            this.state(plan.id, 'FAILED', 'SCHEDULE_MISSED_ON_RESTART');
-            this.unlock(plan.id);
-            continue;
-          }
-        }
+        Ops.convergeRemainingStepsToTerminal(ctx, plan.id, 'SOFTWARE_RESTART_STOPPED');
         this.stmt(
           'UPDATE task_plans SET control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
         ).run(plan.id);
@@ -501,22 +357,5 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     });
   }
-  operations = (id: string) =>
-    Ops.listTaskOperationsBySql(
-      this.ctx(),
-      'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at,rowid',
-      id,
-    );
-  recentOperations = (id: string, limit: number) =>
-    Ops.listRecentTaskOperations(this.ctx(), id, limit);
-  findOperation = (jobId: string, operationId: string): TC.Operation | null =>
-    Ops.findTaskOperation(this.ctx(), jobId, operationId);
-  blockingOperations = (id: string) =>
-    Ops.listTaskOperationsBySql(
-      this.ctx(),
-      "SELECT id FROM task_outbox WHERE job_id=? AND (status IN ('PREPARED','DISPATCHING','ACKNOWLEDGED') OR (status='UNKNOWN' AND control_ended=0)) ORDER BY created_at,rowid",
-      id,
-    );
 }
-
 type TaskRepository = SynchronousRepository<DT.TaskRepository>;

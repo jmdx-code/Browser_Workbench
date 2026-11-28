@@ -1,14 +1,13 @@
 import type { Awaitable } from '../domain/persistence.js';
 import type { ResourceTableRepository } from '../domain/resource-table.js';
 import type { ResourceDriveDownloader } from '../domain/resource-material-rules.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import {
   DownloadResourceSources,
   ResourceDownloadReport,
   type ResourceDownloadProgressValue,
 } from '../shared/resource-download.js';
 import { ResourceMedia, type ResourceMediaValue } from '../shared/resource-table.js';
-
 const ISSUE_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [
     /PERMISSION|CONFIRMATION|PUBLIC_DOWNLOAD_UNAVAILABLE/,
@@ -19,20 +18,16 @@ const ISSUE_RULES: ReadonlyArray<readonly [RegExp, string]> = [
   [/SIZE_LIMIT/, '文件超过下载容量'],
   [/MEDIA_TYPE|ENCODING/, '不支持的媒体格式或传输编码'],
 ];
-
 const issueText = (failure: unknown) =>
   ISSUE_RULES.find(([re]) => re.test(failure instanceof Error ? failure.message : ''))?.[1] ??
   '下载未完成，请检查链接后重试此行';
-
 export class ResourceDownloadService {
   private downloading = false;
-
   constructor(
     private readonly repository: ResourceTableRepository,
     private readonly downloader: ResourceDriveDownloader,
     private readonly now = Date.now,
   ) {}
-
   async download(
     input: unknown,
     assertConnected: () => Awaitable<void>,
@@ -67,20 +62,15 @@ export class ResourceDownloadService {
     const issues: { rowId: string; fileIndex: number; error: string }[] = [];
     let failure: unknown;
     let delivery = Promise.resolve();
-
     const current = async (bytes = 0) => {
       if (failure) throw failure;
       await assertConnected();
       const now = this.now();
       if (!Number.isFinite(now) || now < started || now - started > 30 * 60_000) {
-        throw new ProductError(
-          'RESOURCE_DOWNLOAD_TIMEOUT',
-          '本批下载达到30分钟，请继续下载剩余行',
-          409,
-        );
+        failError('RESOURCE_DOWNLOAD_TIMEOUT', '本批下载达到30分钟，请继续下载剩余行', 409);
       }
       if ((await this.repository.revision(request.combinationId)) !== table.revision) {
-        throw new ProductError(
+        failError(
           'RESOURCE_REVISION_CONFLICT',
           '资源表已被其他窗口修改，下载已停止；此前下载保持',
           409,
@@ -97,7 +87,6 @@ export class ResourceDownloadService {
         });
       }
     };
-
     const emit = () => {
       const snapshot = { ...progress };
       delivery = delivery
@@ -110,7 +99,6 @@ export class ResourceDownloadService {
         });
       return delivery.then(() => current());
     };
-
     await current();
     this.downloading = true;
     let next = 0;
@@ -188,7 +176,7 @@ export class ResourceDownloadService {
       });
     } catch (error) {
       if (error instanceof ProductError) throw error;
-      throw new ProductError(
+      failError(
         'RESOURCE_DOWNLOAD_INTERRUPTED',
         '下载已停止；成功下载的行已保存，未完成链接保留，可重新读取后继续',
         409,

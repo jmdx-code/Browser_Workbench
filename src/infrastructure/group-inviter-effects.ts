@@ -12,15 +12,8 @@ export interface InvitationRecipient {
   name?: string;
   disabled?: boolean;
 }
-export interface InvitationButton {
-  index: number;
-  disabled: boolean;
-}
-export interface InvitationMenuItem {
-  index: number;
-  fingerprint: string;
-  preferred?: boolean;
-}
+export type InvitationButton = { index: number; disabled: boolean };
+export type InvitationMenuItem = { index: number; fingerprint: string; preferred?: boolean };
 export interface GroupInvitationState {
   url: string;
   accountId: string | null;
@@ -76,7 +69,7 @@ function projectGroupInvitationEntry(
     let name: string | undefined;
     let invited = false;
     let member = false;
-    for (const f of chain(el, 28)) {
+    for (const f of chain(el, 28, { resolveCurrent: true })) {
       const user = f.props['user$key'];
       const candidate = record(user) ? (user.id ?? user.__id) : null;
       if (uid(candidate)) {
@@ -205,10 +198,25 @@ function projectGroupInvitationEntry(
     } catch {}
   }
   const buttons = Array.from(dialog?.querySelectorAll('[role="button"],button') ?? []);
-  const indexedButtons = buttons.map((el, index) => ({ el, index, frames: chain(el, 12) }));
+  const indexedButtons = buttons.map((el, index) => ({
+    el,
+    index,
+    frames: chain(el, 12, { resolveCurrent: true }),
+  }));
   const primary = indexedButtons
     .map((b) => ({ ...b, props: b.frames.find((f) => f.name.includes('FDSButton.react'))?.props }))
     .filter((b) => b.props?.type === 'primary');
+  const sendLabelRx =
+    /^(?:Send\s+Invites?|Send\s+invitations?|Send|发送邀请|發送邀請|送出邀請|ဖိတ်ကြားချက်\s*ပို့(?:ရန်|ပါ)|Gửi\s+lời\s+mời|ส่งคำเชิญ)$/i;
+  const cancelLabelRx = /cancel|close|取消|关闭|關閉|ပိတ်|မလုပ်တော့|Hủy|ยกเลิก/i;
+  const matchesSendLabel = (el: Element) => {
+    const aria = (el.getAttribute('aria-label') ?? '').replace(/\s+/g, ' ').trim();
+    const txt = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+    return [aria, txt].some(
+      (lbl) => lbl.length > 0 && sendLabelRx.test(lbl) && !cancelLabelRx.test(lbl),
+    );
+  };
+  const labelMatchedSend = indexedButtons.filter((b) => matchesSendLabel(b.el));
   const close =
     indexedButtons.find((b) => b.frames.some((f) => f.name.includes('FDSCircleButton'))) ??
     indexedButtons.find((b) =>
@@ -248,18 +256,39 @@ function projectGroupInvitationEntry(
   }
   const pageButtons = Array.from(document.querySelectorAll('[role="button"],button'));
   const notInShell = (el: Element) =>
-    !el.closest?.('[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav');
-  const inviteCandidates = pageButtons.filter(
+    !el.closest?.(
+      '[role="feed"],[role="article"],[role="dialog"],[role="navigation"],nav,[role="banner"]',
+    );
+  const btnLabel = (el: Element) =>
+    `${el.getAttribute('aria-label') ?? ''} ${el.textContent ?? ''}`.replace(/\s+/g, ' ').trim();
+  const isActionableHeaderBtn = (el: Element) => {
+    if (
+      !visible(el) ||
+      el.getAttribute('aria-disabled') === 'true' ||
+      el.hasAttribute?.('disabled') ||
+      !notInShell(el)
+    )
+      return false;
+    const r = el.getBoundingClientRect();
+    return r.width >= 40 && r.height >= 24 && r.height <= 72;
+  };
+  let inviteCandidates = pageButtons.filter(
     (el) =>
       visible(el) &&
       notInShell(el) &&
-      chain(el, 24).some((f) => f.name.includes('GroupsCometHeaderInviteMemberAddButton')),
+      chain(el, 48).some((f) => f.name.includes('GroupsCometHeaderInviteMemberAddButton')),
   );
+  if (inviteCandidates.length === 0) {
+    const inviteLabelRx = /^(?:\+?\s*)?(?:Invite|邀请|邀請|ဖိတ်ခေါ်|Mời|เชิญ)$/i;
+    inviteCandidates = pageButtons.filter(
+      (el) => isActionableHeaderBtn(el) && inviteLabelRx.test(btnLabel(el)),
+    );
+  }
   const inviteBtn =
     inviteCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? inviteCandidates[0];
   const invite = inviteBtn ? pageButtons.indexOf(inviteBtn) : -1;
   inviteBtn?.setAttribute('data-wb-group-invite-btn', '1');
-  const joinCandidates = pageButtons.filter((el) => {
+  let joinCandidates = pageButtons.filter((el) => {
     if (
       !visible(el) ||
       el.getAttribute('aria-disabled') === 'true' ||
@@ -278,32 +307,50 @@ function projectGroupInvitationEntry(
       return matchedId || actionGroup ? matchedId === groupId || actionGroup === groupId : true;
     });
   });
+  if (joinCandidates.length === 0) {
+    const joinLabelRx =
+      /^(?:Join group|Join|加入小组|加入小組|加入社团|加入社團|အဖွဲ့ဝင်ရန်|အဖွဲ့သို့ဝင်ရန်|Tham gia nhóm|เข้าร่วมกลุ่ม)$/i;
+    joinCandidates = pageButtons.filter(
+      (el) => isActionableHeaderBtn(el) && joinLabelRx.test(btnLabel(el)),
+    );
+  }
   const joinBtn =
     joinCandidates.find((el) => el.getBoundingClientRect().top >= 160) ?? joinCandidates[0];
   joinBtn?.setAttribute('data-wb-group-join-btn', '1');
   const menus = Array.from(document.querySelectorAll('[role="menuitem"]')).filter((m) =>
     visible(m),
   );
-  const menuItems = menus.map((el, index) => ({
-    index,
-    preferred:
-      reference(el) !== null ||
-      chain(el, 24).some((f) => {
-        const feature =
-          f.name + ' ' + (typeof f.props.actionType === 'string' ? f.props.actionType : '');
-        return /InviteFriends|InviteMember/i.test(feature) && !/Link|Share|Copy/i.test(feature);
-      }),
-    fingerprint: JSON.stringify(
-      chain(el, 20)
-        .filter((f) => !/^(div|span|a)$/.test(f.name) && f.name)
-        .map((f) => ({
-          component: f.name,
-          action: typeof f.props.actionType === 'string' ? f.props.actionType : null,
-          icon: record(f.props.icon) ? f.props.icon.src : null,
-        })),
-    ),
-  }));
-  const primaryButton = primary.length === 1 ? primary[0] : undefined;
+  const menuItems = menus.map((el, index) => {
+    const labelText = `${el.getAttribute('aria-label') ?? ''} ${el.textContent ?? ''}`
+      .replace(/\s+/g, ' ')
+      .trim();
+    const textPreferred =
+      /(?:Invite.*friend|邀请.*好友|邀請.*朋友|ဖိတ်ခေါ်|Mời bạn bè|เชิญเพื่อน)/i.test(labelText) &&
+      !/(?:link|链接|連結|copy|复制|複製|share|分享)/i.test(labelText);
+    return {
+      index,
+      preferred:
+        reference(el) !== null ||
+        chain(el, 24).some((f) => {
+          const feature =
+            f.name + ' ' + (typeof f.props.actionType === 'string' ? f.props.actionType : '');
+          return /InviteFriends|InviteMember/i.test(feature) && !/Link|Share|Copy/i.test(feature);
+        }) ||
+        textPreferred,
+      fingerprint: JSON.stringify(
+        chain(el, 20)
+          .filter((f) => !/^(div|span|a)$/.test(f.name) && f.name)
+          .map((f) => ({
+            component: f.name,
+            action: typeof f.props.actionType === 'string' ? f.props.actionType : null,
+            icon: record(f.props.icon) ? f.props.icon.src : null,
+          })),
+      ),
+    };
+  });
+  const primaryButton =
+    (primary.length === 1 ? primary[0] : primary.find((b) => matchesSendLabel(b.el))) ??
+    (labelMatchedSend.length === 1 ? labelMatchedSend[0] : labelMatchedSend.at(-1));
   primaryButton?.el.setAttribute('data-wb-group-send-btn', '1');
   close?.el.setAttribute('data-wb-group-close-btn', '1');
   const preferredMenu = menuItems.find((entry) => entry.preferred);
@@ -348,8 +395,11 @@ function projectGroupInvitationEntry(
       ? {
           index: primaryButton.index,
           disabled:
-            primaryButton.props?.disabled === true ||
-            primaryButton.el.getAttribute('aria-disabled') === 'true',
+            ('props' in primaryButton &&
+              record(primaryButton.props) &&
+              primaryButton.props.disabled === true) ||
+            primaryButton.el.getAttribute('aria-disabled') === 'true' ||
+            primaryButton.el.hasAttribute?.('disabled') === true,
         }
       : undefined,
     closeButton: close

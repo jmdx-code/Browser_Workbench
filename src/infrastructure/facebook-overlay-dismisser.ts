@@ -3,10 +3,7 @@ export interface DismissOverlaysOptions {
   /** 保留不关的当前业务工作弹窗选择器（如发帖框 '[data-wb-poster-dialog="1"]' 或邀请成员窗 '[role="checkbox"]'） */
   keepSelector?: string;
 }
-export interface DismissOverlaysResult {
-  dismissed: number;
-  labels: string[];
-}
+export type DismissOverlaysResult = { dismissed: number; labels: string[] };
 function inPageDismiss(keepSelector: string | void): DismissOverlaysResult {
   if (
     typeof location !== 'undefined' &&
@@ -138,9 +135,7 @@ export async function dismissUnexpectedFacebookOverlays(
   page: Page | null | undefined,
   options?: DismissOverlaysOptions,
 ): Promise<DismissOverlaysResult> {
-  if (!page || typeof page.evaluate !== 'function') {
-    return { dismissed: 0, labels: [] };
-  }
+  if (!page || typeof page.evaluate !== 'function') return { dismissed: 0, labels: [] };
   try {
     const raw: unknown = options?.keepSelector
       ? await page.evaluate(inPageDismiss, options.keepSelector)

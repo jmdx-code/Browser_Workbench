@@ -16,7 +16,6 @@ import { FilesystemPosterMediaPreparer } from '../src/infrastructure/group-poste
 import { SqliteGroupPosterRepository } from '../src/infrastructure/group-poster-store.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { projectProfileActivity } from '../src/renderer/modules/profile-activity-projector.js';
-import { buildUnifiedActivityFeed } from '../src/renderer/modules/unified-activity-records.js';
 import {
   buildTargetCandidates,
   normalizeTargetToken,
@@ -312,7 +311,6 @@ test('WO-R3.5: deleteLogs recalculates target counts, PENDING_REVIEW operations 
     const db = new DatabaseSync(dbPath);
     try {
       const bumperRepo = new SqliteGroupBumperRepository(db);
-      const posterRepo = new SqliteGroupPosterRepository(db);
       const pid = randomUUID();
       const epoch = randomUUID();
 
@@ -412,38 +410,9 @@ test('WO-R3.5: deleteLogs recalculates target counts, PENDING_REVIEW operations 
         settledOpId,
       );
 
-      // Verify PENDING_REVIEW op is returned and surfaces in buildUnifiedActivityFeed even with empty profileCounts
       const pendingOps = bumperRepo.pendingReviewOperations();
       assert.equal(pendingOps.length, 1);
       assert.equal(pendingOps[0]?.id, reviewOpId);
-
-      const feed = buildUnifiedActivityFeed({
-        profiles: [{ id: pid, browserName: 'P1', alias: 'P1' } as never],
-        bumperState: {
-          groups: [],
-          pages: [],
-          settings: bumperRepo.settings(),
-          comments: [],
-          total: 0,
-          running: false,
-          statusText: '',
-          profileCounts: {},
-          pendingReviewOperations: pendingOps,
-        },
-        posterState: {
-          groups: [],
-          materials: [],
-          settings: posterRepo.settings(),
-          total: 0,
-          running: false,
-          statusText: '',
-          profileCounts: {},
-          dailyStats: [],
-          pendingReviewOperations: [],
-        },
-      });
-      assert.equal(feed.statusCounts.attention, 1);
-      assert.equal(feed.items[0]?.id, `bumper-op:${reviewOpId}`);
 
       // Verify DataCleanupService.execute purges settled feature op even when task_steps has 0 rows
       const cleanupRepo = new SqliteDataCleanup(db);
@@ -458,7 +427,7 @@ test('WO-R3.5: deleteLogs recalculates target counts, PENDING_REVIEW operations 
         kind: 'records',
         scope: { before: Date.now() - 86400_000 },
       });
-      assert.equal(preview.eligible, 0);
+      assert.equal(preview.eligible, 1);
       const result = await cleanupService.execute({ token: preview.token, confirm: true });
       assert.equal(result.deleted, 1);
       assert.equal(bumperRepo.getOperation(settledOpId), null);

@@ -1,20 +1,15 @@
 import { useMemo, type ReactNode } from 'react';
 import { bluestacksDisplayTitle, type BluestacksState } from '../../../shared/bluestacks.js';
 import { profileDisplayName } from '../../../shared/contracts.js';
-import { UI_SELECT_SM } from '../../ui/primitives.js';
+import { UI_ROW, UI_ROW_SM, UI_SELECT_SM } from '../../ui/primitives.js';
 import { Btn } from './module-ui.js';
-
 export interface TargetScopeOption {
   id: string;
   label: string;
   online: boolean;
   groupId?: string | null | undefined;
 }
-interface TargetScopeGroup {
-  id: string;
-  name: string;
-}
-
+type TargetScopeGroup = { id: string; name: string };
 export const mapProfilesToScopeOptions = (
   profiles: ReadonlyArray<{
     id: string;
@@ -31,7 +26,13 @@ export const mapProfilesToScopeOptions = (
     online: Boolean(p.online),
     groupId: p.groupId ?? null,
   }));
-
+export const mapBluestacksToScopeOptions = (bs?: BluestacksState | null): TargetScopeOption[] =>
+  (bs?.instances ?? []).map((i) => ({
+    id: i.id,
+    label: bluestacksDisplayTitle(i),
+    online: i.online,
+    groupId: i.folderId,
+  }));
 export function TargetScopeBar({
   carrier,
   items,
@@ -76,14 +77,13 @@ export function TargetScopeBar({
           .filter((g) => g.ids.length > 0),
       };
     }, [items, groups, selectedIds]);
-
   return (
     <div
       className="mb-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-white px-3 py-1.5 text-xs shadow-2xs"
       role="region"
       aria-label="当前执行目标"
     >
-      <div className="flex flex-wrap items-center gap-2">
+      <div className={UI_ROW}>
         <span className="font-semibold text-slate-700">执行目标</span>
         {selectedTotal > 0 ? (
           <span className="inline-flex h-6 items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-2 font-medium text-blue-800">
@@ -100,7 +100,7 @@ export function TargetScopeBar({
         )}
         {extra}
       </div>
-      <div className="flex flex-wrap items-center gap-1.5">
+      <div className={UI_ROW_SM}>
         {onSelect && (
           <>
             <Btn
@@ -139,7 +139,6 @@ export function TargetScopeBar({
     </div>
   );
 }
-
 export function CarrierScopeBar(p: {
   isBs: boolean;
   bluestacksState?: BluestacksState | null | undefined;
@@ -159,12 +158,7 @@ export function CarrierScopeBar(p: {
   extra?: ReactNode | undefined;
 }) {
   const items = p.isBs
-    ? (p.bluestacksState?.instances ?? []).map((i) => ({
-        id: i.id,
-        label: bluestacksDisplayTitle(i),
-        online: i.online,
-        groupId: i.folderId,
-      }))
+    ? mapBluestacksToScopeOptions(p.bluestacksState)
     : mapProfilesToScopeOptions(p.profiles ?? []);
   const groups = p.isBs
     ? (p.bluestacksState?.folders ?? []).map((f) => ({ id: f.id, name: f.name }))

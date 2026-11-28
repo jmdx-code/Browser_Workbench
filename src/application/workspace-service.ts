@@ -2,7 +2,7 @@ import { mapAsync } from '../shared/async-collections.js';
 import { mergeAccountCacheUpdate } from '../shared/account-state-policy.js';
 import type { BrowserProfileSource, WorkspaceRepository } from '../domain/workspace.js';
 import { ProductError } from '../domain/workspace.js';
-import type { Workspace } from '../shared/contracts.js';
+import { profileDisplayName, type Workspace } from '../shared/contracts.js';
 import { isLocalAvatar } from '../shared/group-bumper.js';
 import { UpdateWorkspacePreferences } from '../shared/workspace-preferences.js';
 export class WorkspaceService {
@@ -28,6 +28,27 @@ export class WorkspaceService {
       metadata = await this.repository.profileMetadata();
     }
     const accountCache = (await this.repository.profileAccountCache?.()) ?? new Map();
+    const launchBindings = (await this.repository.profileLaunchBindings?.()) ?? [];
+    const dirPeers = new Map<string, string[]>();
+    for (const binding of launchBindings) {
+      const dirKey = `${binding.userDataDir}::${binding.profileDirectory}`.trim().toLowerCase();
+      if (!binding.profileDirectory.trim()) continue;
+      const list = dirPeers.get(dirKey) ?? [];
+      list.push(binding.profileId);
+      dirPeers.set(dirKey, list);
+    }
+    const bindingByProfile = new Map(launchBindings.map((b) => [b.profileId, b]));
+    const nameByProfile = new Map<string, string>();
+    for (const p of profiles) {
+      nameByProfile.set(
+        p.id,
+        profileDisplayName({
+          id: p.id,
+          alias: metadata.get(p.id)?.alias ?? p.alias,
+          browserName: p.browserName,
+        }),
+      );
+    }
     return {
       schemaVersion: 1,
       groups: await this.repository.groups(),
@@ -80,12 +101,25 @@ export class WorkspaceService {
                 : null
               : preferredAvatar;
         const customAlias = metadata.get(profile.id)?.alias;
+        const binding = bindingByProfile.get(profile.id);
+        const conflictPeers = binding?.profileDirectory.trim()
+          ? (
+              dirPeers.get(
+                `${binding.userDataDir}::${binding.profileDirectory}`.trim().toLowerCase(),
+              ) ?? []
+            ).filter((peerId) => peerId !== profile.id)
+          : [];
+        const bindingConflict =
+          conflictPeers.length > 0 && binding
+            ? `与「${conflictPeers.map((id) => nameByProfile.get(id) ?? id.slice(0, 8)).join('、')}」共用本地资料目录 (${binding.profileDirectory})`
+            : undefined;
         return {
           ...profile,
           groupId: metadata.get(profile.id)?.groupId ?? null,
           order: metadata.get(profile.id)?.order ?? 0,
           alias: customAlias ?? profile.alias,
           ...(customAlias ? { browserName: customAlias } : {}),
+          ...(bindingConflict ? { bindingConflict } : {}),
           account: {
             state,
             id: (useLiveIdentity ? live.id : null) ?? cached?.id ?? live.id ?? null,
@@ -116,9 +150,7 @@ export class WorkspaceService {
   async deleteProfiles(ids: string[]) {
     const unique = [...new Set(ids)];
     await this.requireProfiles(unique);
-    for (const profileId of unique) {
-      await this.browsers.deleteProfile?.(profileId);
-    }
+    for (const profileId of unique) await this.browsers.deleteProfile?.(profileId);
     await this.repository.deleteProfiles?.(unique);
     return { deletedIds: unique };
   }

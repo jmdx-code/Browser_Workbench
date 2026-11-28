@@ -35,24 +35,24 @@ const checkUrl = (value: string, pred: (u: URL) => boolean): boolean => {
   const u = parseCleanUrl(value);
   return u !== null && pred(u);
 };
-export const kernelAgentBrowserURL = (value: string): boolean =>
+export const kernelAgentBrowserURL = (v: string): boolean =>
   checkUrl(
-    value,
+    v,
     (u) => (u.protocol === 'https:' || u.protocol === 'http:') && !FIXTURE_ORIGINS.has(u.origin),
   );
-export const kernelAccessURL = (value: string, access: KernelAccess): boolean =>
-  access === 'agent-browser'
-    ? kernelAgentBrowserURL(value)
-    : access === 'fixture'
-      ? kernelFixtureURL(value)
-      : kernelFacebookReadURL(value);
-export const kernelFixtureURL = (value: string): boolean =>
+export const kernelFixtureURL = (v: string): boolean =>
   checkUrl(
-    value,
+    v,
     (u) =>
       FIXTURE_ORIGINS.has(u.origin) &&
       (u.pathname === '/kernel-fixture' || u.pathname === '/kernel-frame'),
   );
+export const kernelAccessURL = (v: string, access: KernelAccess): boolean =>
+  access === 'agent-browser'
+    ? kernelAgentBrowserURL(v)
+    : access === 'fixture'
+      ? kernelFixtureURL(v)
+      : kernelFacebookReadURL(v);
 const sessionMethods = new Set(
   (
     'Page.enable Page.getFrameTree Page.getLayoutMetrics Page.getNavigationHistory ' +

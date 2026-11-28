@@ -7,7 +7,6 @@ import type {
   Assignment,
   TaskCommand,
 } from '../shared/task-contracts.js';
-
 export function useTasks(sseConnected = false) {
   const [capabilities, setCapabilities] = useState<z.infer<typeof TaskCapabilities> | null>(null);
   const [runtime, setRuntime] = useState<z.infer<typeof TaskRuntimeOverview> | null>(null);
@@ -55,7 +54,6 @@ export function useTasks(sseConnected = false) {
             lastRuntimeSig.current = runtimeSig;
             setRuntime(nextRuntime);
           }
-          if (value.hasMore && !controller.signal.aborted) setTimeout(() => void load(), 0);
           setError((prev) => (prev ? '' : prev));
         }
       } catch (failure) {
@@ -89,10 +87,7 @@ export function useTasks(sseConnected = false) {
     const attempt =
       pendingStart.current?.key === key
         ? pendingStart.current
-        : {
-            key,
-            input: { ...input, requestId: crypto.randomUUID() },
-          };
+        : { key, input: { ...input, requestId: crypto.randomUUID() } };
     pendingStart.current = attempt;
     const result = await api.startTasks(attempt.input);
     pendingStart.current = null;

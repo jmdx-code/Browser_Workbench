@@ -21,11 +21,7 @@ if (
 const pending = new Set<Promise<void>>();
 let closing = false;
 function errorReply(id: number | undefined, error: unknown, route = 'startup') {
-  port.postMessage({
-    kind: 'error',
-    id,
-    error: persistenceError(error, route),
-  });
+  port.postMessage({ kind: 'error', id, error: persistenceError(error, route) });
 }
 let workspace: WorkspaceStore | undefined;
 let bridge: Store | undefined;

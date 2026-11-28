@@ -26,7 +26,6 @@ import {
   fillPosterMaterialFiles,
   pastePosterMaterialCells,
 } from '../src/domain/poster-material-table.js';
-import { buildUnifiedActivityFeed } from '../src/renderer/modules/unified-activity-records.js';
 import { GroupPosterService } from '../src/application/group-poster-service.js';
 
 const P01 = '00000000-0000-4000-8000-000000000041';
@@ -278,7 +277,7 @@ test('WO-U4.3: 480px aspect-ratio WebP thumbnail generation, zero-polling-bloat 
   }
 });
 
-test('WO-U4.4: SqliteDataCleanup purges settled operations while protecting PENDING_REVIEW & unsettled locks, and buildUnifiedActivityFeed supports all 5 modules', async () => {
+test('WO-U4.4: SqliteDataCleanup purges settled operations while protecting PENDING_REVIEW & unsettled locks', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'wb-wou4-cleanup-'));
   try {
     const dbPath = path.join(dir, 'cleanup.sqlite');
@@ -353,80 +352,6 @@ test('WO-U4.4: SqliteDataCleanup purges settled operations while protecting PEND
     ).map((r) => r.operation_id);
     assert.deepEqual(remainingIds, ['op-pending-review-settled']);
     raw.close();
-
-    // 2. Verify buildUnifiedActivityFeed 5-module projection
-    const feed = buildUnifiedActivityFeed({
-      profiles: [
-        {
-          id: P01,
-          alias: 'Browser 1',
-          browserName: 'Browser 1',
-          groupId: null,
-          order: 0,
-          online: true,
-          synced: true,
-          phase: 'PAUSED',
-          unresolved: 0,
-          extensionVersion: '0.3.59',
-          capabilities: ['facebook-readonly-v2'],
-          account: { state: 'logged-in', id: '10001', name: 'User 1', avatar: null },
-        },
-      ],
-      bumperLogs: [
-        {
-          id: 'bl-group',
-          profileId: P01,
-          accountId: '10001',
-          groupId: 'g1',
-          groupName: 'Group 1',
-          pageId: 'p1',
-          pageName: 'Page 1',
-          postId: 'post1',
-          postUrl: 'https://www.facebook.com/groups/g1/posts/post1/',
-          liked: true,
-          commentText: null,
-          bumpedAt: 1000,
-          sourceMode: 'group',
-        },
-        {
-          id: 'bl-page',
-          profileId: P01,
-          accountId: '10001',
-          groupId: '-',
-          groupName: '专页直顶',
-          pageId: 'p1',
-          pageName: 'Page 1',
-          postId: 'post2',
-          postUrl: 'https://www.facebook.com/p1/posts/post2',
-          liked: true,
-          commentText: 'Nice',
-          bumpedAt: 2000,
-          sourceMode: 'page',
-        },
-      ],
-      posterLogs: [
-        {
-          id: 'pl-1',
-          profileId: P01,
-          accountId: '10001',
-          accountName: 'User 1',
-          accountAvatar: null,
-          identityType: 'personal',
-          groupId: 'g1',
-          groupName: 'Group 1',
-          groupAvatar: null,
-          materialId: 'm1',
-          captionPreview: 'Hello group',
-          postId: 'pending_approval',
-          postUrl: 'https://www.facebook.com/groups/g1/',
-          postedAt: 3000,
-        },
-      ],
-    });
-    assert.equal(feed.moduleCounts['group-bumper'], 1);
-    assert.equal(feed.moduleCounts['page-bumper'], 1);
-    assert.equal(feed.moduleCounts['group-poster'], 1);
-    assert.equal(feed.statusCounts.attention, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

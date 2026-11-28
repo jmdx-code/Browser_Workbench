@@ -629,8 +629,8 @@ test('ID-only target upsert, HTML metadata parser, and classic Page ID upgrade t
     assert.equal(logs[0]?.pageName, '台湾小微');
   }));
 
-test('WO56: maxLikesPerPost defaults to 50, idempotent migration upgrades legacy 10 once, and weeklyDailyCounts buckets 7 local days', async () =>
-  fixture((store, file) => {
+test('WO56: maxLikesPerPost defaults to 50 and idempotent migration upgrades legacy 10 once', async () =>
+  fixture((_store, file) => {
     assert.equal(BumperSettings.parse({}).maxLikesPerPost, 50);
 
     const rawDb = new DatabaseSync(file);
@@ -657,30 +657,6 @@ test('WO56: maxLikesPerPost defaults to 50, idempotent migration upgrades legacy
     } finally {
       rawDb.close();
     }
-
-    // 4. Verify weeklyDailyCounts for 7 days (newest to oldest) in local time
-    const nowDate = new Date(2026, 10, 1, 15, 30, 0, 0); // 2026-11-01 15:30 local
-    const day0 = new Date(2026, 10, 1, 10, 0, 0, 0).getTime(); // 2026-11-01
-    const day2 = new Date(2026, 9, 30, 21, 15, 0, 0).getTime(); // 2026-10-30
-    const day6 = new Date(2026, 9, 26, 0, 5, 0, 0).getTime(); // 2026-10-26 (6 days ago start boundary)
-    const day7Old = new Date(2026, 9, 25, 23, 59, 59, 0).getTime(); // 2026-10-25 (outside 7-day window)
-
-    store.groupBumper.record(log('80001', '10001', { bumpedAt: day0 }));
-    store.groupBumper.record(log('80002', '10001', { bumpedAt: day0 + 1000 }));
-    store.groupBumper.record(log('80003', '10001', { bumpedAt: day2 }));
-    store.groupBumper.record(log('80004', '10001', { bumpedAt: day6 }));
-    store.groupBumper.record(log('80005', '10001', { bumpedAt: day7Old }));
-
-    const stats = store.groupBumper.weeklyDailyCounts(nowDate.getTime());
-    assert.deepEqual(stats, [
-      { date: '2026-11-01', count: 2 },
-      { date: '2026-10-31', count: 0 },
-      { date: '2026-10-30', count: 1 },
-      { date: '2026-10-29', count: 0 },
-      { date: '2026-10-28', count: 0 },
-      { date: '2026-10-27', count: 0 },
-      { date: '2026-10-26', count: 1 },
-    ]);
   }));
 
 test('WO58: bumperSetupLabels maps 加入小组 to setup_open_group', async () =>
@@ -763,19 +739,25 @@ test('WO60: concurrency semaphore queues profiles above maxConcurrentProfiles', 
       undefined,
       0,
     );
+    await service.syncMaxConcurrency(1);
     await service.start({ profileIds: ids, groupIds: ['12345'], pageIds: ['20001'] });
-    for (let i = 0; i < 40 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
-    await new Promise((x) => setTimeout(x, 30));
-    const queued = (await service.state()).profileCounts;
-    assert.equal(peak, 1);
-    assert.equal(Object.values(queued).filter((s) => s.status === '排队等待并发槽位…').length, 1);
-    release.shift()?.();
-    for (let i = 0; i < 60 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
-    release.shift()?.();
-    for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
-      await new Promise((x) => setTimeout(x, 10));
-    assert.equal(peak, 1);
-    assert.equal(service.hasActiveExecution(), false);
+    try {
+      for (let i = 0; i < 40 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
+      await new Promise((x) => setTimeout(x, 30));
+      const queued = (await service.state()).profileCounts;
+      assert.equal(peak, 1);
+      assert.equal(Object.values(queued).filter((s) => s.status === '排队等待并发槽位…').length, 1);
+      release.shift()?.();
+      for (let i = 0; i < 60 && release.length < 1; i++) await new Promise((x) => setTimeout(x, 5));
+      release.shift()?.();
+      for (let i = 0; i < 60 && service.hasActiveExecution(); i++)
+        await new Promise((x) => setTimeout(x, 10));
+      assert.equal(peak, 1);
+      assert.equal(service.hasActiveExecution(), false);
+    } finally {
+      while (release.length) release.shift()?.();
+      await service.shutdown().catch(() => {});
+    }
   }));
 
 test('WO60: append run starts only idle profiles and keeps running profiles untouched; page mode is tracked separately', async () =>
@@ -971,6 +953,8 @@ test('stop revokes control immediately, waits for worker exit, and records a cle
       0,
     );
     await service.start({ profileIds: [id], groupIds: ['12345'], pageIds: ['20001'] });
+    for (let i = 0; i < 40 && !held; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(held, true);
     const stop = service.stop([id]);
     assert.equal(nativeStopped, true);
     assert.equal(exited, false);
@@ -982,4 +966,121 @@ test('stop revokes control immediately, waits for worker exit, and records a cle
     assert.equal(result?.state, 'STOPPED');
     assert.equal(result?.reason, '已停止');
     assert.equal(result?.failedSteps, 0);
+  }));
+
+test('W3 P0-2/P1/P2: resolvePendingOperation, graceful daily-limit completion, and standalone closeBrowserOnFinish', async () =>
+  fixture(async (store) => {
+    const repo = store.groupBumper;
+    repo.upsertTargets('groups', { items: [{ id: '12345', name: 'g' }] });
+    repo.upsertTargets('pages', { items: [{ id: '20001', name: 'p' }] });
+    repo.saveSettings({ dailyMaxLikesPerAccount: 1, closeBrowserOnFinish: true });
+
+    const opId1 = randomUUID();
+    const opId2 = randomUUID();
+    const pid = randomUUID();
+    const mkOp = (operationId: string, postId: string) => ({
+      binding: {
+        profileId: pid,
+        accountId: '10001',
+        connectionEpoch: randomUUID(),
+        leaseId: randomUUID(),
+        generation: 1,
+        operationId,
+        jobId: randomUUID(),
+        stepId: randomUUID(),
+        actionDigest: 'a'.repeat(64),
+      },
+      runId: randomUUID(),
+      actionKind: 'submit_like' as const,
+      groupId: '12345',
+      groupName: 'g',
+      pageId: '20001',
+      pageName: 'p',
+      postId,
+      postUrl: `https://www.facebook.com/groups/12345/posts/${postId}/`,
+      status: 'PREPARED' as const,
+      reason: '',
+    });
+    repo.prepareOperation(mkOp(opId1, '90001'));
+    repo.markOperationReview(opId1, '\u001b[31mtimeout\u001b[0m');
+    repo.prepareOperation(mkOp(opId2, '90002'));
+    repo.markOperationReview(opId2, 'unknown');
+
+    const closedProfiles: string[] = [];
+    let cancelledDuringPost = true;
+    let stopAfterCalled = false;
+    const service = new GroupBumperService(
+      repo,
+      {
+        ready: () => true,
+        busy: async () => false,
+        stop: async () => {},
+        run: async (_id, _g, _p, _s, cb) => {
+          cb.added(1);
+          cancelledDuringPost = cb.cancelled();
+          stopAfterCalled = cb.shouldStopAfterCurrentPost?.() === true;
+        },
+      },
+      async () => ({ comments: repo.comments(), total: repo.total() }),
+      () => {},
+      undefined,
+      0,
+    );
+    service.setProfileLifecycle({
+      isLaunching: () => false,
+      getStatus: async () => [],
+      launchProfile: async () => {
+        throw Error('unused');
+      },
+      closeProfile: async (id) => {
+        closedProfiles.push(id);
+        return {
+          profileId: id,
+          browserName: 'Chrome',
+          action: 'close',
+          ok: true,
+          online: false,
+          phase: 'OFFLINE',
+          synced: false,
+          launchable: true,
+          elapsedMs: 1,
+        };
+      },
+      restartProfile: async () => {
+        throw Error('unused');
+      },
+      ensureProfilesOnline: async () => ({
+        requestedIds: [],
+        readyIds: [],
+        launchedIds: [],
+        failed: [],
+        items: [],
+      }),
+    });
+
+    const s1 = await service.resolvePendingOperation({
+      operationId: opId1,
+      resolution: 'not_applied',
+    });
+    assert.equal(s1.pendingReviewOperations?.length, 1);
+    assert.equal(s1.total, 0);
+
+    const s2 = await service.resolvePendingOperation({
+      operationId: opId2,
+      resolution: 'confirmed',
+    });
+    assert.equal(s2.pendingReviewOperations?.length, 0);
+    assert.equal(s2.total, 1);
+
+    await service.start({
+      profileIds: [pid],
+      groupIds: ['12345'],
+      pageIds: ['20001'],
+      closeBrowserOnFinish: true,
+    });
+    for (let i = 0; i < 60 && (service.hasActiveExecution() || closedProfiles.length === 0); i++)
+      await new Promise((r) => setTimeout(r, 10));
+    assert.equal(cancelledDuringPost, false);
+    assert.equal(stopAfterCalled, true);
+    assert.deepEqual(closedProfiles, [pid]);
   }));

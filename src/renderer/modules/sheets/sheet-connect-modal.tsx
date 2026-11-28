@@ -6,7 +6,7 @@ import {
   type SpreadsheetMeta,
 } from '../../../shared/google-sheets.js';
 import { api } from '../../api.js';
-import { UI_INPUT_SM, UI_SELECT_SM } from '../../ui/primitives.js';
+import { UI_INPUT_SM, UI_MUTED, UI_SELECT_SM } from '../../ui/primitives.js';
 import {
   BackdropModal,
   Btn,
@@ -16,7 +16,6 @@ import {
   ModalHeading,
   NoticeBanner,
 } from '../shared/module-ui.js';
-
 const KIND_LABELS: Record<GoogleSheetKind, string> = {
   group_library: '小组表',
   page_library: '专页表',
@@ -29,7 +28,6 @@ const KIND_PATTERNS: Record<GoogleSheetKind, RegExp> = {
   post_schedule: /排贴|排貼|schedule/i,
   post_records: /发帖记录|發帖記錄|顶贴|頂貼|record/i,
 };
-
 export function SheetConnectModal(p: {
   kind: GoogleSheetKind;
   sameDocSuggestionUrl?: string | undefined;
@@ -48,7 +46,6 @@ export function SheetConnectModal(p: {
   const inspectSeqRef = useRef(0),
     pastedUrlRef = useRef<string | null>(null);
   const isMultiKind = kind === 'post_schedule' || kind === 'post_records';
-
   const connectedKeys = useMemo(() => {
     const keys = new Set<string>();
     if (isMultiKind)
@@ -60,7 +57,6 @@ export function SheetConnectModal(p: {
     (sid: string, tid: number) => connectedKeys.has(`${sid}:${tid}`),
     [connectedKeys],
   );
-
   const runInspect = useCallback(
     async (rawInput: string) => {
       const trimmed = rawInput.trim();
@@ -90,17 +86,14 @@ export function SheetConnectModal(p: {
           setTitle(pref.title);
         }
       } catch (err) {
-        if (seq === inspectSeqRef.current) {
-          setMeta(null);
-          setError(errMsg(err, '读取 Google 表格失败'));
-        }
+        if (seq === inspectSeqRef.current)
+          (setMeta(null), setError(errMsg(err, '读取 Google 表格失败')));
       } finally {
         if (seq === inspectSeqRef.current) setBusy(false);
       }
     },
     [isDup, kind],
   );
-
   const selectedTab = useMemo(
     () => meta?.tabs.find((t) => t.title === selectedTabName) ?? null,
     [meta, selectedTabName],
@@ -108,7 +101,6 @@ export function SheetConnectModal(p: {
   const selectedTabDup = Boolean(
     meta && selectedTab && isDup(meta.spreadsheetId, selectedTab.sheetId),
   );
-
   async function handleSubmit() {
     if (!urlOrId.trim() || selectedTabDup) return;
     setBusy(true);
@@ -127,7 +119,6 @@ export function SheetConnectModal(p: {
       setBusy(false);
     }
   }
-
   return (
     <BackdropModal
       label={`连接${KIND_LABELS[kind]}`}
@@ -171,9 +162,9 @@ export function SheetConnectModal(p: {
                   const pt = e.clipboardData.getData('text').trim();
                   pastedUrlRef.current = pt && parseGoogleSpreadsheetUrl(pt) ? pt : null;
                 }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !busy && urlOrId.trim()) void runInspect(urlOrId);
-                }}
+                onKeyDown={(e) =>
+                  e.key === 'Enter' && !busy && urlOrId.trim() && void runInspect(urlOrId)
+                }
               />
               <Btn
                 className="shrink-0"
@@ -186,9 +177,7 @@ export function SheetConnectModal(p: {
           </Fld>
           {p.sameDocSuggestionUrl && !urlOrId.trim() && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed border-[var(--line-strong)] bg-slate-50 px-3 py-2 text-xs">
-              <span className="text-xs text-[var(--text-3)]">
-                要连接同一份 Google 文档里的其他工作表？
-              </span>
+              <span className={UI_MUTED}>要连接同一份 Google 文档里的其他工作表？</span>
               <Btn
                 v="ghost"
                 className="h-6 px-2 text-[11px]"
@@ -207,18 +196,13 @@ export function SheetConnectModal(p: {
             <>
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-slate-50 px-3 py-2 text-xs">
                 <strong>表格：{meta.title}</strong>
-                <span className="text-xs text-[var(--text-3)]">
-                  共发现 {meta.tabs.length} 个工作表标签
-                </span>
+                <span className={UI_MUTED}>共发现 {meta.tabs.length} 个工作表标签</span>
               </div>
               <Fld label="选择工作表标签（Sheet Tab）">
                 <select
                   className={`${UI_SELECT_SM} w-full`}
                   value={selectedTabName}
-                  onChange={(e) => {
-                    setSelectedTabName(e.target.value);
-                    setTitle(e.target.value);
-                  }}
+                  onChange={(e) => (setSelectedTabName(e.target.value), setTitle(e.target.value))}
                 >
                   {meta.tabs.map((tab) => (
                     <option key={tab.sheetId} value={tab.title}>

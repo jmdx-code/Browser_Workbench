@@ -13,13 +13,11 @@ import { FeatureNavRail } from './feature-nav-rail.js';
 import { IconPanelOpen } from './icons.js';
 import { buildLiveRunCards } from './modules/live-run-cards.js';
 import type { SheetsModuleId } from './modules/module-contracts.js';
-import type { PostBumpRecordTypeFilter } from './modules/post-bump-records-page.js';
+import type { RecordsTabId } from './modules/post-bump-records-page.js';
 import { buildWorkbenchProjection } from './modules/profile-activity-projector.js';
 import { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
-import type { ActivityRecordModuleFilter } from './modules/unified-activity-records.js';
 import type { ResourceEditorHandle } from './resource-table-editor.js';
 import { useSoftwareUpdate } from './software-update-panel.js';
-import { attentionPlans } from './task-alerts.js';
 import { useTasks } from './use-tasks.js';
 import {
   useInspections,
@@ -37,14 +35,12 @@ import {
   type ShellCtx,
   type View,
 } from './workbench-view-router.js';
-
 declare const __WORKBENCH_VERSION__: string;
 declare global {
   interface Window {
     workbenchDesktop?: DesktopBridge;
   }
 }
-
 const BS_TO_BROWSER: Record<string, View['kind']> = {
   'bluestacks-active': 'home',
   'bluestacks-group-poster': 'group-poster',
@@ -60,7 +56,6 @@ const BROWSER_TO_BS: Record<string, View['kind']> = {
   'page-bumper': 'bluestacks-page-bumper',
   'group-inviter': 'bluestacks-group-inviter',
 };
-
 const pruneSelection = (
   ids: readonly string[],
   setSelected: (fn: (prev: Set<string>) => Set<string>) => void,
@@ -72,13 +67,11 @@ const pruneSelection = (
     return prev;
   });
 };
-
 function App() {
   const [view, setView] = useState<View>({ kind: 'home' }),
     [carrier, setCarrier] = useState<'browser' | 'bluestacks'>('browser'),
     lastSheetsKindRef = useRef<SheetsModuleId>('sheets-schedule'),
     isBluestacksView = view.kind.startsWith('bluestacks-');
-
   const sseRefreshRef = useRef<((topics: ReadonlySet<string>) => void) | null>(null);
   const { connected: sseConnected } = useWorkspaceEvents((topics) =>
     sseRefreshRef.current?.(topics),
@@ -89,7 +82,6 @@ function App() {
     cardColors = useCardColors(),
     mods = useFeatureModulesPolling(view.kind, sseConnected);
   const { groupBumper, groupInviter, groupPoster, bluestacks, autoScheduler, googleSheets } = mods;
-
   const resourceGen = useRef(0),
     [resourceSummaries, setResourceSummaries] = useState<ResourceUsageSummaryValue[] | null>(null);
   const refreshResources = useCallback(async () => {
@@ -99,7 +91,6 @@ function App() {
       () => gen === resourceGen.current && setResourceSummaries(null),
     );
   }, []);
-
   sseRefreshRef.current = (topics) => {
     for (const [topic, fn] of [
       [
@@ -121,37 +112,27 @@ function App() {
     ] as const)
       if (topics.has(topic)) fn();
   };
-
   const [selected, setSelected] = useState<Set<string>>(new Set());
   useEffect(() => {
-    if (workspace) {
+    if (workspace)
       pruneSelection(
         workspace.profiles.map((p) => p.id),
         setSelected,
       );
-    }
   }, [workspace]);
   const [selectedBluestacks, setSelectedBluestacks] = useState<Set<string>>(new Set());
   useEffect(() => {
-    if (bluestacks) {
+    if (bluestacks)
       pruneSelection(
         bluestacks.instances.map((i) => i.id),
         setSelectedBluestacks,
       );
-    }
   }, [bluestacks]);
-
-  const [recordFilter, setRecordFilter] = useState<string | null>(null),
-    [ledger, setLedger] = useState<LedgerFilterState>({
-      type: 'all',
+  const [ledger, setLedger] = useState<LedgerFilterState>({
+      tab: 'stats',
       status: 'all',
-      subView: 'ledger',
-      activeModule: 'all',
       nonce: 0,
     }),
-    [detail, setDetail] = useState<{ profileId: string; planId: string; round?: number } | null>(
-      null,
-    ),
     [menuOpen, setMenuOpen] = useState(false),
     [diagModalOpen, setDiagModalOpen] = useState(false),
     [liveQueueOpen, setLiveQueueOpen] = useState(false),
@@ -177,7 +158,6 @@ function App() {
   const applyUpdate = async () => {
     if (!resourceEditor.current || (await resourceEditor.current.persist())) await updates.apply();
   };
-
   useEffect(() => {
     if (view.kind !== 'home' && view.kind !== 'edit') return;
     void refreshResources();
@@ -207,7 +187,6 @@ function App() {
     const t = setTimeout(() => setMessage(''), 6000);
     return () => clearTimeout(t);
   }, [message]);
-
   const navigate = useCallback(async (next: View) => {
     if (resourceEditor.current && !(await resourceEditor.current.persist())) return;
     setResourceRow(null);
@@ -216,7 +195,6 @@ function App() {
     if (next.kind.startsWith('sheets-')) lastSheetsKindRef.current = next.kind as SheetsModuleId;
     setView(next);
   }, []);
-
   async function handleSwitchCarrier(nextCarrier: 'browser' | 'bluestacks') {
     if (
       nextCarrier === carrier ||
@@ -232,7 +210,6 @@ function App() {
       return mapped ? ({ kind: mapped } as View) : prev;
     });
   }
-
   const mutate = useCallback(
     async (work: () => Promise<unknown>) => {
       if (mutating.current) return;
@@ -251,9 +228,7 @@ function App() {
     },
     [refresh],
   );
-
   const plans = tasks.runtime?.plans ?? [],
-    attentionCount = workspace ? attentionPlans(plans, workspace.profiles).length : 0,
     onlineCount = workspace?.profiles.filter((row) => row.online).length ?? 0;
   const restartDisabled =
     plans.some((p) => ['QUEUED', 'RUNNING'].includes(p.state)) ||
@@ -272,7 +247,6 @@ function App() {
       (googleSheets?.runningRecordsCount ?? 0) > 0,
       (googleSheets?.activeProfiles?.length ?? 0) > 0,
     ].some(Boolean);
-
   const mergedProfiles = useMemo<Profile[]>(() => {
     const base = workspace?.profiles ?? [],
       bsList = bluestacks?.instances ?? [];
@@ -304,7 +278,6 @@ function App() {
         })),
     ];
   }, [workspace?.profiles, bluestacks?.instances]);
-
   const projection = useMemo(
     () =>
       buildWorkbenchProjection({
@@ -319,7 +292,6 @@ function App() {
         bluestacks,
         autoScheduler,
         googleSheets,
-        attentionCount,
         message,
       }),
     [
@@ -334,7 +306,6 @@ function App() {
       bluestacks,
       autoScheduler,
       googleSheets,
-      attentionCount,
       message,
     ],
   );
@@ -385,24 +356,16 @@ function App() {
     [groupBumper, groupPoster, groupInviter, bluestacks, mods],
   );
   const openLedgerRecords = useCallback(
-    (opts: {
-      type?: PostBumpRecordTypeFilter;
-      status?: 'all' | PostBumpStatusValue;
-      subView?: 'ledger' | 'active';
-      activeModule?: ActivityRecordModuleFilter;
-    }) => {
+    (opts: { tab?: RecordsTabId; status?: 'all' | PostBumpStatusValue }) => {
       setLedger((prev) => ({
-        type: opts.type ?? 'all',
+        tab: opts.tab ?? 'stats',
         status: opts.status ?? 'all',
-        subView: opts.subView ?? 'ledger',
-        activeModule: opts.activeModule ?? 'all',
         nonce: prev.nonce + 1,
       }));
       void navigate({ kind: 'records' });
     },
     [navigate],
   );
-
   const shell: ShellCtx | null = workspace
     ? {
         workspace,
@@ -424,6 +387,7 @@ function App() {
     : null;
   const isSheetView = view.kind.startsWith('sheets-');
   const isSplitCanvasView =
+    view.kind === 'records' ||
     view.kind === 'group-bumper' ||
     view.kind === 'page-bumper' ||
     view.kind === 'group-inviter' ||
@@ -444,7 +408,6 @@ function App() {
     setUpdateMenu(false);
     setMenuSection(undefined);
   };
-
   return (
     <div className="app flex h-screen min-h-[480px] w-full flex-col overflow-x-hidden bg-[var(--bg)]">
       <WorkbenchTopbar
@@ -454,9 +417,9 @@ function App() {
         error={error}
         carrier={carrier}
         onlineCount={onlineCount}
-        totalProfilesCount={workspace?.profiles.length ?? 0}
-        bluestacksOnlineCount={(bluestacks?.instances ?? []).filter((i) => i.online).length}
-        bluestacksTotalCount={bluestacks?.instances.length ?? 0}
+        totalProfilesCount={totalProfilesCount}
+        bluestacksOnlineCount={bsOnlineCount}
+        bluestacksTotalCount={bsTotalCount}
         onSwitchCarrier={(next) => void handleSwitchCarrier(next)}
         runningCount={liveRunCards.length}
         onOpenWindowLayout={() => void navigate({ kind: 'window-layout' })}
@@ -579,12 +542,12 @@ function App() {
                 onOpenLiveRuns: () => setLiveQueueOpen(true),
                 openLedgerRecords,
                 ledger,
-                recordFilter,
-                setRecordFilter,
-                onOpenDetail: (profileId, planId, round) => setDetail({ profileId, planId, round }),
                 onOpenMenuSection: (section) => {
                   setMenuSection(section);
                   setMenuOpen(true);
+                },
+                onCarrierChange: (next) => {
+                  void handleSwitchCarrier(next);
                 },
                 navigate,
               }}
@@ -595,9 +558,6 @@ function App() {
       <WorkbenchOverlays
         shell={shell}
         message={message}
-        detail={detail}
-        onCloseDetail={() => setDetail(null)}
-        plans={plans}
         onRename={setAliasing}
         onOpenResource={setResourceRow}
         menuOpen={menuOpen}
@@ -628,7 +588,6 @@ function App() {
     </div>
   );
 }
-
 const root = document.getElementById('root');
 if (!root) throw Error('ROOT_ELEMENT_MISSING');
 createRoot(root).render(

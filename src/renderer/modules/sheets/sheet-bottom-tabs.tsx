@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react';
 import type { GoogleSheetLink } from '../../../shared/google-sheets.js';
 import { Btn } from '../shared/module-ui.js';
-
 export function SheetBottomTabs({
   links,
   activeLinkId,
@@ -22,7 +21,6 @@ export function SheetBottomTabs({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState('');
   const committingRef = useRef(false);
-
   async function commitRename(id: string, currentTitle: string) {
     if (committingRef.current) return;
     committingRef.current = true;
@@ -34,7 +32,6 @@ export function SheetBottomTabs({
       committingRef.current = false;
     }
   }
-
   return (
     <div
       className="gs-bottom-tabs flex shrink-0 items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-slate-100 px-2 py-1.5"
@@ -67,7 +64,6 @@ export function SheetBottomTabs({
                   ? `半积极顶贴 (${link.recordsConfig?.semiActivePollMinutes ?? 10}m)`
                   : `积极顶贴 (${link.recordsConfig?.activePollMinutes ?? 2}m)`
                 : `自动排贴 (${link.scheduleConfig?.pollIntervalMinutes ?? 2}m)`;
-
           return (
             <div
               key={link.id}

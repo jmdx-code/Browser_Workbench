@@ -2,7 +2,6 @@ import {
   Activity,
   AlertTriangle,
   AppWindow,
-  ArrowDownToLine,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -11,7 +10,6 @@ import {
   Clock,
   Copy,
   Database,
-  ExternalLink,
   FileText,
   Folder,
   Globe,
@@ -40,9 +38,7 @@ import {
   type LucideProps,
 } from 'lucide-react';
 import type { SVGProps } from 'react';
-
 type P = SVGProps<SVGSVGElement> & { size?: number };
-
 function icon(Comp: (props: LucideProps) => React.ReactNode) {
   return ({ size = 16, className, style, ...rest }: P) => (
     <Comp
@@ -56,7 +52,6 @@ function icon(Comp: (props: LucideProps) => React.ReactNode) {
     />
   );
 }
-
 export const IconMenu = icon(Menu);
 export const IconPlay = ({ size = 16, ...rest }: P) => (
   <Play
@@ -73,7 +68,6 @@ export const IconPlus = icon(Plus);
 export const IconMinus = icon(Minus);
 export const IconClose = icon(X);
 export const IconSearch = icon(Search);
-export const IconDownload = icon(ArrowDownToLine);
 export const IconWindow = icon(AppWindow);
 export const IconEdit = icon(Pencil);
 export const IconCopy = icon(Copy);
@@ -96,14 +90,12 @@ export const IconPower = icon(Power);
 export const IconActivity = icon(Activity);
 export const IconLayoutGrid = icon(LayoutGrid);
 export const IconMonitor = icon(Monitor);
-export const IconExternalLink = icon(ExternalLink);
 export const IconCheckCircle = icon(CheckCircle2);
 export const IconCircle = icon(Circle);
 export const IconPanelClose = icon(PanelLeftClose);
 export const IconPanelOpen = icon(PanelLeftOpen);
 export const IconGlobe = icon(Globe);
 export const IconSmartphone = icon(Smartphone);
-
 export const IconBrand = ({ size = 20, ...rest }: P) => (
   <svg
     width={size}

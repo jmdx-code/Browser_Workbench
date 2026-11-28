@@ -1,5 +1,4 @@
-import type { FormEvent } from 'react';
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import type { TargetFolder } from '../shared/target-list.js';
 import {
   applyGroupGridPaste,
@@ -13,11 +12,9 @@ import {
   MatrixDataCell,
   useSpreadsheetGrid,
 } from './matrix-grid.js';
-import { BackdropModal, Btn, ModalHeading } from './modules/shared/module-ui.js';
-import { UI_SELECT_SM } from './ui/primitives.js';
-
+import { BackdropModal, Btn, ErrText, ModalHeading } from './modules/shared/module-ui.js';
+import { UI_ROW_SM, UI_SELECT_SM } from './ui/primitives.js';
 export { mapProfilesToScopeOptions } from './modules/shared/target-scope-bar.js';
-
 export function makeDraftRow(groupId = '', groupName = ''): DraftGroupEntry {
   return {
     key: `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -25,9 +22,91 @@ export function makeDraftRow(groupId = '', groupName = ''): DraftGroupEntry {
     groupName,
   };
 }
+export function collectTargetDraftItems(
+  rows: readonly DraftGroupEntry[],
+  folderId: string | null,
+  normalizeId: (raw: string) => string,
+  entityLabel = '小组',
+):
+  | { ok: true; items: Array<{ id: string; name: string; folderId: string | null }> }
+  | { ok: false; error: string } {
+  const items: Array<{ id: string; name: string; folderId: string | null }> = [];
+  for (const r of rows) {
+    const id = normalizeId(r.groupId),
+      name = r.groupName.trim();
+    if (!id && !name) continue;
+    if (!id) return { ok: false, error: `请填写每行的「${entityLabel}ID或链接」` };
+    if (!/^[A-Za-z0-9._-]+$/.test(id))
+      return {
+        ok: false,
+        error: `${entityLabel}ID「${id}」格式不正确，仅支持数字、字母、点、下划线或连字符`,
+      };
+    items.push({ id, name, folderId });
+  }
+  return items.length
+    ? { ok: true, items }
+    : { ok: false, error: `请至少输入一行${entityLabel}数据` };
+}
+export function useTargetWorkspace(items: readonly { id: string }[], ready = true, rowCount = 5) {
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [folders, setFolders] = useState<TargetFolder[]>([]);
+  const [addFolder, setAddFolder] = useState<string | null>(null);
+  const [addingOpen, setAddingOpen] = useState(false);
+  const [draftRows, setDraftRows] = useState<DraftGroupEntry[]>(() =>
+    Array.from({ length: rowCount }, () => makeDraftRow()),
+  );
+  const [formError, setFormError] = useState('');
+  const [submittingAdd, setSubmittingAdd] = useState(false);
+  const [refreshingAvatars, setRefreshingAvatars] = useState(false);
+  const validKey = items.map((i) => i.id).join('\0');
+  useEffect(() => {
+    if (!ready) return;
+    const valid = new Set(items.map((i) => i.id));
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((id) => valid.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [ready, validKey]);
+  const openAddModal = () => {
+    setAddFolder(null);
+    setDraftRows(Array.from({ length: rowCount }, () => makeDraftRow()));
+    setFormError('');
+    setAddingOpen(true);
+  };
+  return {
+    selected,
+    setSelected,
+    folders,
+    setFolders,
+    addFolder,
+    setAddFolder,
+    addingOpen,
+    setAddingOpen,
+    draftRows,
+    setDraftRows,
+    formError,
+    setFormError,
+    submittingAdd,
+    setSubmittingAdd,
+    refreshingAvatars,
+    setRefreshingAvatars,
+    openAddModal,
+    modalProps: {
+      open: addingOpen,
+      folders,
+      addFolder,
+      onFolderChange: setAddFolder,
+      rows: draftRows,
+      onRowsChange: setDraftRows,
+      busy: submittingAdd,
+      error: formError,
+      onError: setFormError,
+      onClose: () => setAddingOpen(false),
+    },
+  };
+}
 const getDraftCell = (row: DraftGroupEntry, col: number) =>
   col === 0 ? row.groupId : row.groupName;
-
 export function GroupDraftGrid({
   rows,
   onChange,
@@ -58,7 +137,6 @@ export function GroupDraftGrid({
     },
     [normalizeId],
   );
-
   const grid = useSpreadsheetGrid<DraftGroupEntry>({
     rows,
     colCount: 2,
@@ -90,7 +168,6 @@ export function GroupDraftGrid({
     createEmptyRow: () => makeDraftRow(),
   });
   const b = computeGridBounds(grid.selection) ?? { minRow: 0, maxRow: 0, minCol: 0, maxCol: 0 };
-
   return (
     <>
       <div className="group-inviter-selection-toolbar flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--surface-2)] px-2.5 py-1.5 text-xs text-[var(--text-2)]">
@@ -104,28 +181,27 @@ export function GroupDraftGrid({
             已填有效{entityLabel} {rows.filter((row) => row.groupId.trim()).length} 个
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {(
-            [
-              ['清空选区 (Del)', false, () => grid.clearBounds(grid.bounds)],
-              [
-                '删除所涉整行',
-                false,
-                () => {
-                  const del = new Set(getSelectedRowIndices(grid.bounds, rows.length));
-                  if (!del.size) return;
-                  const next = rows.filter((_, i) => !del.has(i));
-                  grid.commitRows(next.length ? next : [makeDraftRow()], true);
-                },
-              ],
-              ['撤销 (Ctrl+Z)', !grid.canUndo, grid.handleUndo],
-              ['+1 行', false, () => grid.commitRows([...rows, makeDraftRow()], true)],
-            ] as const
-          ).map(([label, extraDisabled, fn]) => (
-            <Btn key={label} disabled={disabled || extraDisabled} onClick={fn}>
-              {label}
-            </Btn>
-          ))}
+        <div className={UI_ROW_SM}>
+          <Btn disabled={disabled} onClick={() => grid.clearBounds(grid.bounds)}>
+            清空选区 (Del)
+          </Btn>
+          <Btn
+            disabled={disabled}
+            onClick={() => {
+              const del = new Set(getSelectedRowIndices(grid.bounds, rows.length));
+              if (!del.size) return;
+              const next = rows.filter((_, i) => !del.has(i));
+              grid.commitRows(next.length ? next : [makeDraftRow()], true);
+            }}
+          >
+            删除所涉整行
+          </Btn>
+          <Btn disabled={disabled || !grid.canUndo} onClick={grid.handleUndo}>
+            撤销 (Ctrl+Z)
+          </Btn>
+          <Btn disabled={disabled} onClick={() => grid.commitRows([...rows, makeDraftRow()], true)}>
+            +1 行
+          </Btn>
         </div>
       </div>
       <div
@@ -187,7 +263,6 @@ export function GroupDraftGrid({
     </>
   );
 }
-
 function TargetFolderSelect({
   folders,
   value,
@@ -219,7 +294,6 @@ function TargetFolderSelect({
     </label>
   );
 }
-
 export function TargetAddModal({
   open,
   title = '添加小组',
@@ -301,11 +375,7 @@ export function TargetAddModal({
             {busy ? '正在保存…' : '保存'}
           </Btn>
         </div>
-        {error && (
-          <p className="error-note m-0 text-xs font-medium text-rose-600" role="alert">
-            {error}
-          </p>
-        )}
+        <ErrText msg={error} className="error-note m-0 text-xs font-medium text-rose-600" />
       </form>
     </BackdropModal>
   );

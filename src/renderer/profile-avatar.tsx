@@ -1,5 +1,4 @@
 import { useState } from 'react';
-
 const DOT_TONE: Record<StatusTone, string> = {
   ok: 'bg-[#1f9d55]',
   idle: 'bg-[#9aa1aa]',
@@ -7,7 +6,6 @@ const DOT_TONE: Record<StatusTone, string> = {
   warn: 'bg-[#e6a417]',
   err: 'bg-[var(--err)]',
 };
-
 function AvatarImage({ url }: { url: string }) {
   const [failed, setFailed] = useState(false);
   return failed ? (
@@ -22,7 +20,6 @@ function AvatarImage({ url }: { url: string }) {
     />
   );
 }
-
 const WhiteAvatar = () => (
   <svg
     viewBox="0 0 32 32"
@@ -33,9 +30,7 @@ const WhiteAvatar = () => (
     <path d="M5 30v-5c0-7 22-7 22 0v5z" />
   </svg>
 );
-
 export type StatusTone = 'idle' | 'ok' | 'run' | 'warn' | 'err';
-
 export function ProfileAvatar({
   url,
   online,

@@ -12,7 +12,6 @@ import {
   IconSmartphone,
 } from './icons.js';
 import { Btn, useDropdownDismiss } from './modules/shared/module-ui.js';
-
 const CONCURRENCY_SPECS = [
   [
     'browser',
@@ -37,10 +36,8 @@ const CONCURRENCY_SPECS = [
     [2, 4, 5, 8, 10],
   ],
 ] as const;
-
 const TOPBAR_BTN =
   'inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-white/15 bg-white/[0.06] px-2.5 text-xs font-medium whitespace-nowrap text-[#dfe5ee] transition-colors hover:border-white/30 hover:bg-white/15 hover:text-white';
-
 function GlobalConcurrencyPopover(p: {
   settings: AutoSchedulerGlobalSettings | null;
   onSave: (v: {
@@ -52,16 +49,14 @@ function GlobalConcurrencyPopover(p: {
     [saving, setSaving] = useState(false),
     savingRef = useRef(false),
     wrapRef = useRef<HTMLDivElement>(null);
-  const browserVal = p.settings?.browserConcurrency ?? 15,
-    bsVal = p.settings?.bluestacksConcurrency ?? 5;
+  const browserVal = Math.max(1, Math.min(50, Math.round(p.settings?.browserConcurrency ?? 15))),
+    bsVal = Math.max(1, Math.min(30, Math.round(p.settings?.bluestacksConcurrency ?? 5)));
   const [drafts, setDrafts] = useState({ browser: String(browserVal), bluestacks: String(bsVal) });
-
   useEffect(
     () => setDrafts({ browser: String(browserVal), bluestacks: String(bsVal) }),
     [browserVal, bsVal],
   );
   useDropdownDismiss(open, wrapRef, () => setOpen(false));
-
   async function applyConcurrency(nextBrowser: number, nextBs: number) {
     if (savingRef.current) return;
     const b = Math.max(1, Math.min(50, Math.round(nextBrowser))),
@@ -80,7 +75,6 @@ function GlobalConcurrencyPopover(p: {
       setSaving(false);
     }
   }
-
   return (
     <div className="relative inline-flex items-center" ref={wrapRef}>
       <button
@@ -105,7 +99,6 @@ function GlobalConcurrencyPopover(p: {
           ▾
         </span>
       </button>
-
       {open && (
         <div
           className="topbar-concurrency-popover absolute top-[calc(100%+8px)] right-0 z-50 flex w-[356px] flex-col gap-3 rounded-xl border border-[#d9e0ea] bg-white px-4 py-3.5 text-[#1c222b] shadow-2xl"
@@ -202,7 +195,6 @@ function GlobalConcurrencyPopover(p: {
     </div>
   );
 }
-
 export function WorkbenchTopbar(p: {
   version: string;
   breadcrumbText: string;
@@ -239,7 +231,6 @@ export function WorkbenchTopbar(p: {
   const availKey = avail ? `${avail.softwareVersion}:${avail.extensionVersion}` : '';
   const connOn =
     !p.error && Boolean(carrier === 'bluestacks' ? bluestacksOnlineCount : p.onlineCount);
-
   return (
     <>
       <header className="relative z-10 flex h-[52px] shrink-0 items-center gap-4 border-b border-white/5 bg-[var(--graphite)] px-4 text-[#eef1f5] max-[1120px]:gap-2.5 max-[1120px]:px-3 [@media(max-height:680px)]:h-[46px]">
@@ -252,7 +243,7 @@ export function WorkbenchTopbar(p: {
           </strong>
           <span className="shrink-0 text-[11px] tabular-nums text-[#9aa3b0]">v{p.version}</span>
           <span
-            className="inline-block h-6 max-w-[200px] truncate rounded-md border border-white/10 bg-white/[0.08] px-2.5 leading-[22px] text-xs font-semibold text-[#e6ebf2] max-[1120px]:max-w-[140px] max-[960px]:max-w-[100px]"
+            className="inline-block h-6 max-w-[360px] truncate rounded-md border border-white/10 bg-white/[0.08] px-2.5 leading-[22px] text-xs font-semibold text-[#e6ebf2] max-[1200px]:max-w-[240px] max-[960px]:max-w-[140px]"
             aria-label="当前模块"
           >
             {p.breadcrumbText}
@@ -264,39 +255,37 @@ export function WorkbenchTopbar(p: {
             role="tablist"
             aria-label="切换操作载体"
           >
-            {(
-              [
-                [
-                  'browser',
-                  '浏览器',
-                  <IconGlobe key="g" size={13} />,
-                  p.onlineCount,
-                  p.totalProfilesCount,
-                  `切换到 Chrome 浏览器工作台（在线 ${p.onlineCount}/${p.totalProfilesCount}）`,
-                ],
-                [
-                  'bluestacks',
-                  '蓝蝶',
-                  <IconSmartphone key="s" size={13} />,
-                  bluestacksOnlineCount,
-                  bluestacksTotalCount,
-                  `切换到蓝蝶模拟器工作台（在线 ${bluestacksOnlineCount}/${bluestacksTotalCount}）`,
-                ],
-              ] as const
-            ).map(([id, label, icon, online, total, title]) => (
+            {[
+              {
+                id: 'browser' as const,
+                label: '浏览器',
+                icon: <IconGlobe size={13} />,
+                on: p.onlineCount,
+                tot: p.totalProfilesCount,
+                tit: `切换到 Chrome 浏览器工作台（在线 ${p.onlineCount}/${p.totalProfilesCount}）`,
+              },
+              {
+                id: 'bluestacks' as const,
+                label: '蓝蝶',
+                icon: <IconSmartphone size={13} />,
+                on: bluestacksOnlineCount,
+                tot: bluestacksTotalCount,
+                tit: `切换到蓝蝶模拟器工作台（在线 ${bluestacksOnlineCount}/${bluestacksTotalCount}）`,
+              },
+            ].map((c) => (
               <button
-                key={id}
+                key={c.id}
                 type="button"
                 role="tab"
-                aria-selected={carrier === id}
-                className={`inline-flex h-6 items-center gap-1 rounded-[5px] border-0 px-2 text-xs whitespace-nowrap transition-colors ${carrier === id ? 'bg-[var(--brand)] font-semibold text-white' : 'bg-transparent font-medium text-[#b7c0ce] hover:bg-white/[0.08] hover:text-[#eef1f5]'}`}
-                title={title}
-                onClick={() => p.onSwitchCarrier?.(id)}
+                aria-selected={carrier === c.id}
+                className={`inline-flex h-6 items-center gap-1 rounded-[5px] border-0 px-2 text-xs whitespace-nowrap transition-colors ${carrier === c.id ? 'bg-[var(--brand)] font-semibold text-white' : 'bg-transparent font-medium text-[#b7c0ce] hover:bg-white/[0.08] hover:text-[#eef1f5]'}`}
+                title={c.tit}
+                onClick={() => p.onSwitchCarrier?.(c.id)}
               >
-                {icon}
-                <span className="max-[960px]:hidden">{label}</span>
+                {c.icon}
+                <span className="max-[960px]:hidden">{c.label}</span>
                 <span className="text-[11px] tabular-nums opacity-85">
-                  {online}/{total}
+                  {c.on}/{c.tot}
                 </span>
               </button>
             ))}

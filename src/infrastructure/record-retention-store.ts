@@ -7,8 +7,7 @@ import {
   sqliteTableExists,
 } from './persistence/sqlite-query-helpers.js';
 import { transaction } from './sqlite-transaction.js';
-
-const safeRounds = `WITH safe_rounds AS MATERIALIZED (SELECT a.job_id,a.round FROM task_run_summaries a JOIN task_plans p ON p.id=a.job_id WHERE (p.state IN ('STOPPED','COMPLETED','FAILED') OR a.round<p.round)) `;
+const safeRounds = `WITH safe_rounds AS MATERIALIZED (SELECT DISTINCT s.job_id,s.round FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE (p.state IN ('STOPPED','COMPLETED','FAILED') OR s.round<p.round)) `;
 const detailRows = `
  SELECT 'event' AS source,CAST(e.sequence AS TEXT) AS id,e.created_at AS at,'event:'||e.sequence AS key,e.job_id AS job_id FROM task_events e JOIN task_plans p ON p.id=e.job_id
  WHERE EXISTS(SELECT 1 FROM safe_rounds r WHERE r.job_id=e.job_id AND (EXISTS(SELECT 1 FROM task_steps s WHERE s.id=json_extract(e.detail,'$.stepId') AND s.job_id=r.job_id AND s.round=r.round) OR json_extract(e.detail,'$.round')=r.round OR (json_extract(e.detail,'$.stepId') IS NULL AND json_extract(e.detail,'$.round') IS NULL AND p.state IN ('STOPPED','COMPLETED','FAILED'))))
@@ -18,7 +17,6 @@ const detailRows = `
  SELECT 'bumper',operation_id,updated_at,'bumper:'||operation_id,job_id FROM group_bumper_operations WHERE status='SETTLED' AND resolution_outcome<>'ENDED_UNKNOWN'
  UNION ALL
  SELECT 'poster',operation_id,updated_at,'poster:'||operation_id,job_id FROM group_poster_operations WHERE kernel_settled=1 AND status IN ('VERIFIED','NOT_APPLIED')`;
-
 export class SqliteRecordRetention {
   constructor(private readonly db: DatabaseSync) {}
   detailHead(maximum: number): DetailBoundaryValue[] {

@@ -373,10 +373,7 @@ export async function startBridgeServer(options: BridgeServerOptions) {
       void Promise.resolve()
         .then(() => kernel?.tick())
         .catch((err: unknown) =>
-          devDiag.record({
-            level: 'WARN',
-            category: 'BRIDGE_WS',
-            event: 'KERNEL_TICK_ERROR',
+          devDiag.emit('WARN', 'BRIDGE_WS', 'KERNEL_TICK_ERROR', {
             reason: err instanceof Error ? err.message.slice(0, 200) : 'KERNEL_TICK_ERROR',
           }),
         )

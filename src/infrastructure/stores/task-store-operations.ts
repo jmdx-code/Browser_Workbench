@@ -1,8 +1,8 @@
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
-import { taskTimingEligibility } from '../../domain/system-ports.js';
 import {
   terminal,
   validateProgress,
+  type RecordProfile,
   type RuntimeProfile,
   type RuntimeSnapshotResult,
 } from '../../domain/tasks.js';
@@ -11,13 +11,14 @@ import { CombinationSchema } from '../../shared/contracts.js';
 import * as TC from '../../shared/task-contracts.js';
 import {
   isMarketplaceUnavailableSkip,
+  isSuccessfulTaskStep,
   TaskStepFailure,
   TaskStepSkip,
 } from '../../shared/task-step-outcome.js';
-import { camel, clampLimit } from '../persistence/sqlite-query-helpers.js';
+import { TaskStepV2 } from '../../shared/task-policies.js';
+import { camel } from '../persistence/sqlite-query-helpers.js';
 import { readSnapshot, transaction } from '../sqlite-transaction.js';
 import type { SqliteTaskResourceRepository } from '../task-resource-store.js';
-
 export type TaskStoreDependencies = { id(): string; now(): number; random(): number };
 type RuntimeAnchor = { seq: number; jobId: string; createdAt: number };
 type RuntimeCursorPayload = {
@@ -27,7 +28,6 @@ type RuntimeCursorPayload = {
   anchor: RuntimeAnchor | null;
   first: RuntimeAnchor | null;
 };
-
 export interface TaskStoreContext {
   readonly db: DatabaseSync;
   readonly dependencies: TaskStoreDependencies;
@@ -46,10 +46,8 @@ export interface TaskStoreContext {
   event(id: string, type: string, detail?: TC.Operation['receipt']): void;
   unlock(id: string): void;
   settings(): TC.Settings;
-  invalidateBatchTimingCache(batchId?: string): void;
   hasCloseBrowserColumn(): boolean;
 }
-
 const classifyRuntimeEvent = (t: string): TC.RuntimeEvent['category'] =>
   t === 'STOPPED' || t === 'COMPLETED' || t === 'FAILED'
     ? 'PLAN_TERMINAL'
@@ -58,7 +56,6 @@ const classifyRuntimeEvent = (t: string): TC.RuntimeEvent['category'] =>
       : t.startsWith('OPERATION_') || t.startsWith('CHILD_PAGE_') || t.startsWith('BROWSE_')
         ? 'OPERATION_EVENT'
         : 'PLAN_STATE';
-
 function decodeRuntimeCursor(raw: string): RuntimeCursorPayload | null {
   try {
     const obj = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<
@@ -96,7 +93,6 @@ function decodeRuntimeCursor(raw: string): RuntimeCursorPayload | null {
     return null;
   }
 }
-
 const applyStepCheckpoint = (
   ctx: TaskStoreContext,
   id: string,
@@ -108,53 +104,53 @@ const applyStepCheckpoint = (
   ctx.stmt('UPDATE task_steps SET progress=? WHERE id=?').run(JSON.stringify(next), step.id);
   ctx.event(id, 'CHECKPOINT', { stepId: step.id, revision: next.revision });
 };
-
-const activateCurrentStep = (ctx: TaskStoreContext, id: string) => {
-  ctx
+const activateCurrentStep = (ctx: TaskStoreContext, id: string) =>
+  void ctx
     .stmt("UPDATE task_steps SET status='ACTIVE' WHERE id=?")
     .run(ctx.currentStep(ctx.getPlan(id)).id);
-};
-
 export function buildTaskRuntimeSnapshot(
   ctx: TaskStoreContext,
   options: TC.RuntimeRequest = {},
 ): RuntimeSnapshotResult {
   return readSnapshot(ctx.db, () => {
-    const st = ctx.stmt;
-    const high = Number(st('SELECT coalesce(max(sequence),0) AS n FROM task_events').get()?.n ?? 0);
-    const anchor = (seq: number): RuntimeAnchor | null => {
-      const r = st('SELECT sequence,job_id,created_at FROM task_events WHERE sequence=?').get(seq);
-      return r
-        ? { seq: Number(r.sequence), jobId: String(r.job_id), createdAt: Number(r.created_at) }
-        : null;
-    };
-    const firstRow = st('SELECT sequence FROM task_events ORDER BY sequence LIMIT 1').get();
-    const first = firstRow ? anchor(Number(firstRow.sequence)) : null,
-      prev = options.cursor ? decodeRuntimeCursor(options.cursor) : null;
-    const resetRequired = Boolean(
-      options.cursor &&
-      (!prev ||
-        prev.epoch !== ctx.instanceEpoch ||
-        prev.seq > high ||
-        JSON.stringify(prev.first) !== JSON.stringify(first) ||
-        JSON.stringify(prev.anchor) !== JSON.stringify(anchor(prev.seq))),
-    );
-    const after = resetRequired ? 0 : (prev?.seq ?? options.afterSequence ?? 0);
+    const st = ctx.stmt,
+      high = Number(st('SELECT coalesce(max(sequence),0) AS n FROM task_events').get()?.n ?? 0),
+      anchor = (seq: number): RuntimeAnchor | null => {
+        const r = st('SELECT sequence,job_id,created_at FROM task_events WHERE sequence=?').get(
+          seq,
+        );
+        return r
+          ? { seq: Number(r.sequence), jobId: String(r.job_id), createdAt: Number(r.created_at) }
+          : null;
+      };
+    const firstRow = st('SELECT sequence FROM task_events ORDER BY sequence LIMIT 1').get(),
+      first = firstRow ? anchor(Number(firstRow.sequence)) : null,
+      prev = options.cursor ? decodeRuntimeCursor(options.cursor) : null,
+      resetRequired = Boolean(
+        options.cursor &&
+        (!prev ||
+          prev.epoch !== ctx.instanceEpoch ||
+          prev.seq > high ||
+          JSON.stringify(prev.first) !== JSON.stringify(first) ||
+          JSON.stringify(prev.anchor) !== JSON.stringify(anchor(prev.seq))),
+      ),
+      tailFloor = Math.max(0, high - 50),
+      after = resetRequired ? tailFloor : (prev?.seq ?? options.afterSequence ?? tailFloor);
     if (after > high)
       throw new ProductError('RUNTIME_CURSOR_INVALID', '任务游标已失效，请重新读取', 409);
-    const evSql =
-      'SELECT sequence,job_id,type,created_at FROM task_events WHERE sequence>? ORDER BY sequence LIMIT ?';
     const events: TC.RuntimeEvent[] = [],
-      rows = st(evSql).all(after, options.limit ?? 100);
+      rows = st(
+        'SELECT sequence,job_id,type,created_at FROM task_events WHERE sequence>? ORDER BY sequence LIMIT ?',
+      ).all(after, options.limit ?? 100);
     let bytes = 2,
       scanned = after;
     for (const row of rows) {
       const event = TC.TaskRuntimeEvent.parse({
-        ...camel(row),
-        detail: null,
-        category: classifyRuntimeEvent(String(row.type)),
-      });
-      const size = Buffer.byteLength(JSON.stringify(event)) + 1;
+          ...camel(row),
+          detail: null,
+          category: classifyRuntimeEvent(String(row.type)),
+        }),
+        size = Buffer.byteLength(JSON.stringify(event)) + 1;
       if (bytes + size > (options.maxBytes ?? 65536)) {
         if (!events.length)
           throw new ProductError('RUNTIME_EVENT_TOO_LARGE', '事件摘要超过本页预算', 413);
@@ -164,18 +160,11 @@ export function buildTaskRuntimeSnapshot(
       bytes += size;
       scanned = event.sequence;
     }
-    const plans = ctx.livePlans();
-    const roundSteps = plans.flatMap((p) => ctx.steps(p.id, p.round));
-    const terminalIds = [
-      ...new Set(events.filter((e) => e.category === 'PLAN_TERMINAL').map((e) => e.jobId)),
-    ];
-    const cursorObj = {
-      v: 4,
-      epoch: ctx.instanceEpoch,
-      seq: scanned,
-      anchor: anchor(scanned),
-      first,
-    };
+    const plans = ctx.livePlans(),
+      terminalIds = [
+        ...new Set(events.filter((e) => e.category === 'PLAN_TERMINAL').map((e) => e.jobId)),
+      ],
+      cursorObj = { v: 4, epoch: ctx.instanceEpoch, seq: scanned, anchor: anchor(scanned), first };
     return {
       settings: ctx.settings(),
       plans,
@@ -183,7 +172,7 @@ export function buildTaskRuntimeSnapshot(
         const s = ctx.currentStepForPlan(p.id, p.round, p.position);
         return s ? [s] : [];
       }),
-      roundSteps,
+      roundSteps: plans.flatMap((p) => ctx.steps(p.id, p.round)),
       recentTerminalPlans: terminalIds
         .map((id) => ctx.getPlan(id))
         .filter((p) => terminal(p.state)),
@@ -201,7 +190,6 @@ export function buildTaskRuntimeSnapshot(
     };
   });
 }
-
 export function assignTaskBatch(
   ctx: TaskStoreContext,
   input: TC.Assignment,
@@ -220,8 +208,9 @@ export function assignTaskBatch(
     }
     if (req.profileIds.some((id) => !runtime.has(id)))
       throw new ProductError('PROFILE_NOT_FOUND', '分配中包含不存在的资料', 404);
-    const verSql = 'SELECT body FROM combination_versions WHERE combination_id=? AND version=?';
-    const saved = ctx.stmt(verSql).get(req.combinationId, req.version);
+    const saved = ctx
+      .stmt('SELECT body FROM combination_versions WHERE combination_id=? AND version=?')
+      .get(req.combinationId, req.version);
     if (!saved) throw new ProductError('COMBINATION_VERSION_NOT_FOUND', '保存版本不存在', 404);
     const snapshot = CombinationSchema.parse(JSON.parse(String(saved.body)) as unknown),
       resourceRevision = ctx.resources.assertAssignment(req, snapshot);
@@ -230,37 +219,30 @@ export function assignTaskBatch(
     ctx
       .stmt('INSERT INTO task_batches VALUES(?,?,?)')
       .run(req.requestId, serialized, ctx.dependencies.now());
-    ctx.invalidateBatchTimingCache(req.requestId);
-    if (req.timing) {
-      if (req.timing.mode === 'at' && req.timing.startAt < ctx.dependencies.now())
-        throw new ProductError('SCHEDULE_PAST_TIME', '请选择未来的启动时间', 409);
-      ctx
-        .stmt('INSERT INTO task_batch_timing VALUES(?,?)')
-        .run(req.requestId, JSON.stringify(req.timing));
-    }
-    const hasClose = ctx.hasCloseBrowserColumn();
-    const insSql = hasClose
-      ? "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at,close_browser_on_finish) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?,?)"
-      : "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?)";
-    const ins = ctx.stmt(insSql),
+    const hasClose = ctx.hasCloseBrowserColumn(),
+      ins = ctx.stmt(
+        hasClose
+          ? "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at,close_browser_on_finish) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?,?)"
+          : "INSERT INTO task_plans(id,batch_id,profile_id,combination_id,version,account_id,snapshot,state,reason,round,position,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'QUEUED','',1,0,?,?)",
+      ),
       snapJson = JSON.stringify(snapshot);
     return req.profileIds.map((profileId) => {
       const profile = runtime.get(profileId);
       if (!profile) throw new ProductError('PROFILE_NOT_FOUND', '资料不存在', 404);
       const id = ctx.dependencies.id(),
         now = ctx.dependencies.now(),
-        acct = profile.account.state === 'logged-in' ? profile.account.id : null;
-      const args = [
-        id,
-        req.requestId,
-        profileId,
-        req.combinationId,
-        req.version,
-        acct,
-        snapJson,
-        now,
-        now,
-      ];
+        acct = profile.account.state === 'logged-in' ? profile.account.id : null,
+        args = [
+          id,
+          req.requestId,
+          profileId,
+          req.combinationId,
+          req.version,
+          acct,
+          snapJson,
+          now,
+          now,
+        ];
       if (hasClose) args.push(req.closeBrowserOnFinish ? 1 : 0);
       ins.run(...args);
       const plan = ctx.getPlan(id);
@@ -274,14 +256,11 @@ export function assignTaskBatch(
     });
   });
 }
-
 export function claimTaskPlanForProfile(
   ctx: TaskStoreContext,
   profileId: string,
   accountId: string | null,
-  releaseScheduledFn: () => void,
 ): TC.Plan | null {
-  releaseScheduledFn();
   return transaction(ctx.db, () => {
     const plan = ctx.plansForProfile(profileId, ['QUEUED'])[0];
     if (!plan) return null;
@@ -289,19 +268,6 @@ export function claimTaskPlanForProfile(
       ctx.stmt("SELECT count(*) AS c FROM task_plans WHERE state='RUNNING'").get()?.c ?? 0,
     );
     if (runCnt >= ctx.settings().maxConcurrentProfiles) return null;
-    const timing = taskTimingEligibility(
-      plan.timing,
-      ctx.dependencies.now(),
-      plan.timingReleased === true,
-    );
-    if (timing !== 'OPEN') {
-      const reason = timing === 'MISSED' ? 'SCHEDULE_MISSED' : 'SCHEDULE_WAITING';
-      if (timing === 'MISSED') {
-        ctx.state(plan.id, 'FAILED', reason);
-        ctx.unlock(plan.id);
-      } else if (plan.reason !== reason) ctx.state(plan.id, 'QUEUED', reason);
-      return null;
-    }
     if (plan.accountId && accountId && accountId !== plan.accountId) {
       ctx.state(plan.id, 'STOPPED', 'ACCOUNT_CHANGED');
       ctx.unlock(plan.id);
@@ -309,8 +275,9 @@ export function claimTaskPlanForProfile(
     }
     const resolvedAccountId = accountId ?? plan.accountId ?? null;
     if (resolvedAccountId) {
-      const lockSql = 'SELECT job_id FROM task_account_locks WHERE account_id=?';
-      const existingLock = ctx.stmt(lockSql).get(resolvedAccountId);
+      const existingLock = ctx
+        .stmt('SELECT job_id FROM task_account_locks WHERE account_id=?')
+        .get(resolvedAccountId);
       if (existingLock && String(existingLock.job_id) !== plan.id) {
         if (plan.reason !== 'ACCOUNT_BUSY') ctx.state(plan.id, 'QUEUED', 'ACCOUNT_BUSY');
         return null;
@@ -319,9 +286,11 @@ export function claimTaskPlanForProfile(
         .stmt('INSERT OR IGNORE INTO task_account_locks VALUES(?,?)')
         .run(resolvedAccountId, plan.id);
     }
-    const updSql =
-      'UPDATE task_plans SET account_id=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?';
-    ctx.stmt(updSql).run(resolvedAccountId, plan.id);
+    ctx
+      .stmt(
+        'UPDATE task_plans SET account_id=?,control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
+      )
+      .run(resolvedAccountId, plan.id);
     const step = ctx.currentStep(plan);
     if (step.status === 'PENDING')
       ctx.stmt("UPDATE task_steps SET status='ACTIVE' WHERE id=?").run(step.id);
@@ -329,15 +298,18 @@ export function claimTaskPlanForProfile(
     return ctx.getPlan(plan.id);
   });
 }
-
-export function bindTaskPlanAccount(ctx: TaskStoreContext, id: string, accountId: string): TC.Plan {
-  return transaction(ctx.db, () => {
+const withActivePlan = (ctx: TaskStoreContext, id: string, fn: (plan: TC.Plan) => void): TC.Plan =>
+  transaction(ctx.db, () => {
     const plan = ctx.getPlan(id);
-    if (terminal(plan.state)) return plan;
+    if (!terminal(plan.state)) fn(plan);
+    return ctx.getPlan(id);
+  });
+export function bindTaskPlanAccount(ctx: TaskStoreContext, id: string, accountId: string): TC.Plan {
+  return withActivePlan(ctx, id, (plan) => {
     if (plan.accountId && plan.accountId !== accountId) {
       ctx.state(id, 'STOPPED', 'ACCOUNT_CHANGED');
       ctx.unlock(id);
-      return ctx.getPlan(id);
+      return;
     }
     const existingLock = ctx
       .stmt('SELECT job_id FROM task_account_locks WHERE account_id=?')
@@ -348,10 +320,16 @@ export function bindTaskPlanAccount(ctx: TaskStoreContext, id: string, accountId
     ctx
       .stmt('UPDATE task_plans SET account_id=?,updated_at=? WHERE id=?')
       .run(accountId, ctx.dependencies.now(), id);
-    return ctx.getPlan(id);
   });
 }
-
+export const requeueBusyAccountPlan = (ctx: TaskStoreContext, id: string): TC.Plan =>
+  withActivePlan(ctx, id, (plan) => {
+    const step = ctx.currentStepForPlan(id, plan.round, plan.position);
+    if (step?.status === 'ACTIVE')
+      ctx.stmt("UPDATE task_steps SET status='PENDING' WHERE id=?").run(step.id);
+    ctx.unlock(id);
+    ctx.state(id, 'QUEUED', 'ACCOUNT_BUSY');
+  });
 function advanceStepPosition(ctx: TaskStoreContext, plan: TC.Plan): void {
   const id = plan.id;
   if (plan.position + 1 < plan.snapshot.steps.length) {
@@ -378,7 +356,6 @@ function advanceStepPosition(ctx: TaskStoreContext, plan: TC.Plan): void {
     activateCurrentStep(ctx, id);
   }
 }
-
 export function updateTaskStepProgress(
   ctx: TaskStoreContext,
   id: string,
@@ -393,24 +370,18 @@ export function updateTaskStepProgress(
       applyStepCheckpoint(ctx, id, step, progress);
   });
 }
-
-function transitionTaskStepDirect(
+const transitionTaskStepDirect = (
   ctx: TaskStoreContext,
   id: string,
   stepId: string,
   apply: (step: TC.StepInstance) => void,
-): TC.Plan {
-  return transaction(ctx.db, () => {
-    const plan = ctx.getPlan(id);
-    if (terminal(plan.state)) return plan;
+): TC.Plan =>
+  withActivePlan(ctx, id, (plan) => {
     const step = ctx.currentStep(plan, stepId);
-    if (['COMPLETED', 'FAILED', 'SKIPPED'].includes(step.status)) return plan;
+    if (['COMPLETED', 'FAILED', 'SKIPPED'].includes(step.status)) return;
     apply(step);
     advanceStepPosition(ctx, ctx.getPlan(id));
-    return ctx.getPlan(id);
   });
-}
-
 export const completeTaskStepDirect = (
   ctx: TaskStoreContext,
   id: string,
@@ -422,42 +393,89 @@ export const completeTaskStepDirect = (
     ctx.stmt("UPDATE task_steps SET status='COMPLETED' WHERE id=?").run(stepId);
     ctx.event(id, 'STEP_COMPLETED', { stepId });
   });
-
 function recordStepFailure(
   ctx: TaskStoreContext,
   id: string,
   stepId: string,
   reason: string,
   businessResult: 'NOT_APPLICABLE' | 'PUBLISHED' | 'NOT_PUBLISHED' | 'UNKNOWN',
+  stepType?: TC.StepInstance['spec']['type'],
 ) {
-  const submissionPhase =
-    businessResult === 'NOT_APPLICABLE'
-      ? 'NOT_APPLICABLE'
-      : businessResult === 'NOT_PUBLISHED'
-        ? 'BEFORE_SUBMIT'
-        : businessResult === 'PUBLISHED'
-          ? 'RESULT_CONFIRMED'
-          : 'UNKNOWN';
-  const outcome = TaskStepFailure.parse({
-    version: 1,
-    kind: 'FAILED',
-    reason: (reason || 'STEP_FAILED').slice(0, 200),
-    endedAt: ctx.dependencies.now(),
-    submissionPhase,
-    businessResult,
-  });
+  const resolvedType = stepType ?? ctx.steps(id).find((s) => s.id === stepId)?.spec.type ?? 'feed',
+    normalizedReason = (reason || 'STEP_FAILED').slice(0, 200),
+    effectiveBusinessResult: 'NOT_APPLICABLE' | 'PUBLISHED' | 'NOT_PUBLISHED' | 'UNKNOWN' =
+      resolvedType === 'post'
+        ? businessResult === 'NOT_APPLICABLE'
+          ? /PUBLISH_RESULT_UNCONFIRMED|SUBMIT_DISPATCHED|OPERATION_RESULT_UNCONFIRMED|UNKNOWN/i.test(
+              normalizedReason,
+            )
+            ? 'UNKNOWN'
+            : 'NOT_PUBLISHED'
+          : businessResult
+        : 'NOT_APPLICABLE',
+    submissionPhase =
+      effectiveBusinessResult === 'NOT_APPLICABLE'
+        ? 'NOT_APPLICABLE'
+        : effectiveBusinessResult === 'NOT_PUBLISHED'
+          ? 'BEFORE_SUBMIT'
+          : effectiveBusinessResult === 'PUBLISHED'
+            ? 'RESULT_CONFIRMED'
+            : 'UNKNOWN',
+    outcome = TaskStepFailure.parse({
+      version: 1,
+      kind: 'FAILED',
+      reason: normalizedReason,
+      endedAt: ctx.dependencies.now(),
+      submissionPhase,
+      businessResult: effectiveBusinessResult,
+    });
   ctx
     .stmt("UPDATE task_steps SET status='FAILED',outcome=? WHERE id=?")
     .run(JSON.stringify(outcome), stepId);
   ctx.event(id, 'STEP_FAILED', { stepId, outcome });
 }
-
+export function convergeRemainingStepsToTerminal(
+  ctx: TaskStoreContext,
+  id: string,
+  reason: string,
+  skipStepId?: string,
+): void {
+  const now = ctx.dependencies.now();
+  for (const step of ctx.steps(id)) {
+    if (skipStepId && step.id === skipStepId) continue;
+    if (step.status === 'ACTIVE') {
+      recordStepFailure(
+        ctx,
+        id,
+        step.id,
+        reason,
+        step.spec.type === 'post' ? 'UNKNOWN' : 'NOT_APPLICABLE',
+        step.spec.type,
+      );
+    } else if (step.status === 'PENDING') {
+      const outcome = TaskStepSkip.parse({
+        version: 1,
+        kind: 'SKIPPED',
+        reason: reason === 'USER_STOP' ? 'USER_STOP' : 'FEATURE_UNAVAILABLE',
+        endedAt: now,
+      });
+      ctx
+        .stmt("UPDATE task_steps SET status='SKIPPED',outcome=? WHERE id=?")
+        .run(JSON.stringify(outcome), step.id);
+      ctx.event(id, 'STEP_SKIPPED', { stepId: step.id, outcome });
+    }
+  }
+}
 export const skipTaskStepDirect = (
   ctx: TaskStoreContext,
   id: string,
   stepId: string,
   reason:
-    'DEPENDENCY_FAILED' | 'RESOURCE_EXHAUSTED' | 'FEATURE_UNAVAILABLE' | 'MARKETPLACE_UNAVAILABLE',
+    | 'DEPENDENCY_FAILED'
+    | 'RESOURCE_EXHAUSTED'
+    | 'FEATURE_UNAVAILABLE'
+    | 'MARKETPLACE_UNAVAILABLE'
+    | 'USER_STOP',
   dependencyStepId?: string,
 ): TC.Plan =>
   transitionTaskStepDirect(ctx, id, stepId, () => {
@@ -473,7 +491,6 @@ export const skipTaskStepDirect = (
       .run(JSON.stringify(outcome), stepId);
     ctx.event(id, 'STEP_SKIPPED', { stepId, outcome });
   });
-
 export const failTaskStepDirect = (
   ctx: TaskStoreContext,
   id: string,
@@ -481,83 +498,147 @@ export const failTaskStepDirect = (
   reason: string,
   businessResult: 'NOT_APPLICABLE' | 'PUBLISHED' | 'NOT_PUBLISHED' | 'UNKNOWN' = 'NOT_APPLICABLE',
 ): TC.Plan =>
-  transitionTaskStepDirect(ctx, id, stepId, () =>
-    recordStepFailure(ctx, id, stepId, reason, businessResult),
+  transitionTaskStepDirect(ctx, id, stepId, (step) =>
+    recordStepFailure(ctx, id, stepId, reason, businessResult, step.spec.type),
   );
-
-export function stopTaskPlanDirect(
+export const stopTaskPlanDirect = (
   ctx: TaskStoreContext,
   id: string,
   reason = 'USER_STOP',
-): TC.Plan {
-  const sql =
-    "UPDATE task_plans SET control_mode='stop',control_request_id=NULL,control_confirmed=1 WHERE id=?";
-  return transaction(ctx.db, () => {
-    const plan = ctx.getPlan(id);
-    if (terminal(plan.state)) return plan;
-    ctx.stmt(sql).run(id);
-    ctx.state(id, 'STOPPED', (reason || 'USER_STOP').slice(0, 200));
+): TC.Plan =>
+  withActivePlan(ctx, id, () => {
+    const bounded = (reason || 'USER_STOP').slice(0, 200);
+    convergeRemainingStepsToTerminal(ctx, id, bounded);
+    ctx
+      .stmt(
+        "UPDATE task_plans SET control_mode='stop',control_request_id=NULL,control_confirmed=1 WHERE id=?",
+      )
+      .run(id);
+    ctx.state(id, 'STOPPED', bounded);
     ctx.unlock(id);
-    return ctx.getPlan(id);
   });
-}
-
-export function failTaskPlanDirect(ctx: TaskStoreContext, id: string, reason: string): TC.Plan {
-  const sql =
-    'UPDATE task_plans SET control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?';
-  return transaction(ctx.db, () => {
-    const plan = ctx.getPlan(id);
-    if (terminal(plan.state)) return plan;
+export const failTaskPlanDirect = (ctx: TaskStoreContext, id: string, reason: string): TC.Plan =>
+  withActivePlan(ctx, id, (plan) => {
     const bounded = (reason || 'TASK_FAILED').slice(0, 200),
       step = ctx.currentStepForPlan(id, plan.round, plan.position);
     if (step && (step.status === 'ACTIVE' || step.status === 'PENDING'))
-      recordStepFailure(ctx, id, step.id, bounded, 'NOT_APPLICABLE');
-    ctx.stmt(sql).run(id);
+      recordStepFailure(
+        ctx,
+        id,
+        step.id,
+        bounded,
+        step.spec.type === 'post' ? 'UNKNOWN' : 'NOT_APPLICABLE',
+        step.spec.type,
+      );
+    convergeRemainingStepsToTerminal(ctx, id, bounded, step?.id);
+    ctx
+      .stmt(
+        'UPDATE task_plans SET control_mode=NULL,control_request_id=NULL,control_confirmed=0 WHERE id=?',
+      )
+      .run(id);
     ctx.state(id, 'FAILED', bounded);
     ctx.unlock(id);
-    return ctx.getPlan(id);
+  });
+export function queryTaskRecordsPage(
+  ctx: TaskStoreContext,
+  input: unknown,
+  profiles: readonly RecordProfile[],
+): TC.TaskRecordsResponse {
+  return readSnapshot(ctx.db, () => {
+    const req = TC.TaskRecordsRequest.parse(input ?? {}),
+      profileMap = new Map(profiles.map((p) => [p.id, p])),
+      sql = `SELECT s.*, p.profile_id, p.combination_id, p.version AS plan_version, p.state AS plan_state, p.reason AS plan_reason, p.snapshot, p.created_at AS plan_created_at, p.updated_at AS plan_updated_at FROM task_steps s JOIN task_plans p ON p.id=s.job_id WHERE ${req.profileId ? 'p.profile_id=? AND ' : ''}NOT EXISTS(SELECT 1 FROM task_record_deletions d WHERE d.step_id=s.id) ORDER BY p.updated_at DESC, p.rowid DESC, s.round DESC, s.position ASC`,
+      rows = req.profileId ? ctx.stmt(sql).all(req.profileId) : ctx.stmt(sql).all(),
+      q = req.query?.trim().toLowerCase() ?? '',
+      allRows: TC.TaskRecord[] = [],
+      counts = { all: 0, running: 0, completed: 0, failed: 0, review: 0 },
+      filtered: TC.TaskRecord[] = [];
+    for (const r of rows) {
+      const step = TaskStepV2.parse(
+          camel(
+            {
+              id: r.id,
+              job_id: r.job_id,
+              round: r.round,
+              position: r.position,
+              status: r.status,
+              spec: r.spec,
+              progress: r.progress,
+              outcome: r.outcome,
+            },
+            '',
+            'spec,progress,outcome',
+            'outcome',
+          ),
+        ),
+        snapshot = CombinationSchema.parse(JSON.parse(String(r.snapshot)) as unknown),
+        profileId = String(r.profile_id),
+        prof = profileMap.get(profileId),
+        profText = [prof?.browserName, prof?.alias, prof?.account?.name, prof?.account?.id]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase(),
+        ps = String(r.plan_state) as TC.Plan['state'],
+        planState: TC.Plan['state'] = [
+          'QUEUED',
+          'RUNNING',
+          'STOPPED',
+          'COMPLETED',
+          'FAILED',
+        ].includes(ps)
+          ? ps
+          : 'STOPPED',
+        row = TC.buildTaskRecord(
+          step,
+          step.jobId,
+          profileId,
+          String(r.combination_id),
+          snapshot.name,
+          Number(r.plan_version),
+          planState,
+          String(r.plan_reason ?? ''),
+          Number(r.plan_created_at),
+          Number(r.plan_updated_at),
+        );
+      if (
+        q &&
+        !`${row.combinationName} ${row.type} ${row.planReason} ${row.profileId} ${profText}`
+          .toLowerCase()
+          .includes(q)
+      )
+        continue;
+      allRows.push(row);
+      counts.all++;
+      const running =
+          (row.status === 'ACTIVE' || row.status === 'PENDING') &&
+          ['QUEUED', 'RUNNING'].includes(row.planState),
+        completed = isSuccessfulTaskStep(row.type, row.status, row.outcome),
+        failed = row.status === 'FAILED',
+        review = row.outcome?.kind === 'FAILED' && row.outcome.businessResult === 'UNKNOWN';
+      if (running) counts.running++;
+      if (completed) counts.completed++;
+      if (failed) counts.failed++;
+      if (review) counts.review++;
+      if (
+        req.status === 'all' ||
+        (req.status === 'running'
+          ? running
+          : req.status === 'completed'
+            ? completed
+            : req.status === 'failed'
+              ? failed
+              : review)
+      )
+        filtered.push(row);
+    }
+    const offset = req.cursor ? Math.max(0, Number.parseInt(req.cursor, 10) || 0) : 0,
+      page = filtered.slice(offset, offset + req.limit),
+      nextOffset = offset + page.length;
+    return TC.TaskRecords.parse({
+      records: page,
+      nextCursor: nextOffset < filtered.length ? String(nextOffset) : null,
+      total: filtered.length,
+      counts,
+    });
   });
 }
-
-export function readTaskOperation(ctx: TaskStoreContext, id: string): TC.Operation {
-  const sql =
-    'SELECT o.id,o.job_id,o.step_id,o.action,b.body AS binding,o.status,o.receipt,o.checkpoint_applied,o.disposition,o.created_at,o.updated_at FROM task_outbox o LEFT JOIN task_dispatch_bindings b ON b.operation_id=o.id WHERE o.id=?';
-  const row = ctx.stmt(sql).get(id);
-  if (!row) throw new ProductError('OPERATION_NOT_FOUND', '任务指令不存在', 404);
-  return TC.TaskOperation.parse(
-    camel(row, 'checkpoint_applied', 'action,binding,receipt,disposition', 'disposition'),
-  );
-}
-
-export const listTaskOperationsBySql = (
-  ctx: TaskStoreContext,
-  sql: string,
-  ...params: Array<string | number>
-): TC.Operation[] =>
-  ctx
-    .stmt(sql)
-    .all(...params)
-    .map((row) => readTaskOperation(ctx, String(row.id)));
-
-export function findTaskOperation(
-  ctx: TaskStoreContext,
-  jobId: string,
-  operationId: string,
-): TC.Operation | null {
-  const row = ctx
-    .stmt('SELECT id FROM task_outbox WHERE id=? AND job_id=?')
-    .get(operationId, jobId);
-  return row ? readTaskOperation(ctx, String(row.id)) : null;
-}
-
-export const listRecentTaskOperations = (
-  ctx: TaskStoreContext,
-  id: string,
-  limit: number,
-): TC.Operation[] =>
-  listTaskOperationsBySql(
-    ctx,
-    'SELECT id FROM task_outbox WHERE job_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?',
-    id,
-    clampLimit(limit, 1, 100),
-  ).reverse();

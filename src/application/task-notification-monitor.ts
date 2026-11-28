@@ -7,7 +7,6 @@ import {
   type Preferences,
   type NotificationEvent,
 } from '../shared/workspace-preferences.js';
-
 export class TaskNotificationMonitor {
   private cursor: number;
   constructor(

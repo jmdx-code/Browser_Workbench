@@ -4,7 +4,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { api } from '../src/renderer/api.js';
 import { UnifiedTargetPicker } from '../src/renderer/modules/shared/unified-target-picker.js';
-import { BluestacksInviterPage } from '../src/renderer/modules/bluestacks-inviter-page.js';
+import { InviterWorkspacePage } from '../src/renderer/inviter-workspace-page.js';
 import { GroupPosterPage } from '../src/renderer/group-poster-page.js';
 import { PosterSettings } from '../src/shared/group-poster.js';
 
@@ -103,14 +103,15 @@ describe('Unified Group & Page Picker + BlueStacks Inviter/Poster parity', () =>
     expect(onChange).toHaveBeenCalledWith(['3017439278594998']);
   });
 
-  it('BluestacksInviterPage uses unified FinderTargetList with real avatars, folders, and numeric IDs', async () => {
+  it('InviterWorkspacePage (bluestacks) uses unified FinderTargetList with real avatars, folders, and numeric IDs', async () => {
     await act(async () => {
       root.render(
-        <BluestacksInviterPage
+        <InviterWorkspacePage
+          carrier="bluestacks"
           bluestacksState={null}
           onBluestacksState={() => {}}
-          selected={new Set()}
-          groups={[
+          selectedTargetIds={new Set()}
+          fallbackGroups={[
             {
               id: '3017439278594998',
               name: 'Grace Group',
@@ -122,7 +123,8 @@ describe('Unified Group & Page Picker + BlueStacks Inviter/Poster parity', () =>
               updatedAt: 0,
             },
           ]}
-          inviterState={null}
+          state={null}
+          onRefresh={async () => {}}
           onMessage={() => {}}
         />,
       );
@@ -180,7 +182,6 @@ describe('Unified Group & Page Picker + BlueStacks Inviter/Poster parity', () =>
             running: false,
             statusText: '',
             total: 0,
-            dailyStats: [],
             profileCounts: {},
             pendingReviewOperations: [],
             tasks: [],

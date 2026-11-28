@@ -1,15 +1,9 @@
 import type { Inspection } from '../shared/profile-inspection.js';
-
 export interface InspectionReaderPort {
   read(signal?: AbortSignal): Promise<{ results: Inspection[] }>;
   request(ids: string[]): Promise<{ results: Inspection[] }>;
 }
-export interface InspectionReadState {
-  rows: Inspection[];
-  available: boolean;
-  error: string;
-}
-
+export type InspectionReadState = { rows: Inspection[]; available: boolean; error: string };
 // One presentation reader shared by sidebar and details. No browser action is retried here.
 export class InspectionReader {
   private revision = 0;

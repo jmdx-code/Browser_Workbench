@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
-import type { Page, Response } from 'playwright-core';
+import type { Page } from 'playwright-core';
 import { sleepAbortable } from '../application/workboard.js';
 import {
   audienceTarget,
@@ -27,7 +27,6 @@ import type { BrowserSessionLease } from './browser-session-lease.js';
 import { readFacebookAILabel } from './facebook-ai-label-reader.js';
 import { readFacebookBackground } from './facebook-background-reader.js';
 import { readFacebookComposerAudience } from './facebook-composer-audience.js';
-import { parseFacebookJsonChunks } from './facebook-group-session.js';
 import { readFacebookPostPage } from './facebook-post-page-reader.js';
 import { parseNativeStoryCreation } from './facebook-story-native-result.js';
 import { readFacebookStoryPage } from './facebook-story-page-reader.js';
@@ -38,8 +37,15 @@ import { FilesystemResourceMaterialVerifier } from './resource-material-verifier
 import { StoryVideoCaptionDeriver } from './story-video-caption-deriver.js';
 import { checkKnownFacebookVideoPath } from './video-metadata.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
+import {
+  checkDirectPostRiskLimit,
+  extractTimelinePostId,
+  recordDirectPostOutcome,
+  waitForSubmitGraphqlConfirmation,
+} from './active-account-runtime/direct-post-ledger.js';
 type DirectPostStepResult =
   | { kind: 'COMPLETED'; published: number }
+  | { kind: 'DAILY_LIMIT_SKIP'; published: number; reason: string | null }
   | { kind: 'SKIP_EXHAUSTED'; published: 0 }
   | { kind: 'FAIL_EXHAUSTED'; published: number };
 interface ExecuteDirectPostStepOptions {
@@ -69,6 +75,21 @@ const selectorOf = (t: { scope?: string | undefined; css: string }): string =>
     await lease.execOp(label, async () => {
       const loc = lease.page.locator(selector).first();
       await loc.waitFor({ state, timeout: state === 'attached' ? 10_000 : 8_000 });
+      if (state === 'visible') {
+        await loc
+          .evaluate((el) => {
+            if (!(el instanceof HTMLElement)) return;
+            const banner = document.querySelector<HTMLElement>('[role="banner"]');
+            const minTop = banner
+              ? Math.max(56, Math.min(120, Math.round(banner.getBoundingClientRect().bottom))) + 8
+              : 68;
+            const r = el.getBoundingClientRect();
+            if (r.top < minTop || r.bottom > window.innerHeight - 16) {
+              el.scrollIntoView({ block: 'center', inline: 'nearest' });
+            }
+          })
+          .catch(() => {});
+      }
       await op(loc);
     });
   },
@@ -112,10 +133,7 @@ const selectorOf = (t: { scope?: string | undefined; css: string }): string =>
     const scopedAnyFileSel = `${scope} input[type="file"]`;
     let count = await lease.page.locator(scopedAnyFileSel).count();
     if (count === 0) {
-      devDiag.record({
-        level: 'WARN',
-        category: 'TASK_RUNNER',
-        event: 'POST_TIMELINE_MEDIA_INPUT_FALLBACK_CLICK',
+      devDiag.emit('WARN', 'TASK_RUNNER', 'POST_TIMELINE_MEDIA_INPUT_FALLBACK_CLICK', {
         reason: 'COMPOSER_FILE_INPUT_ABSENT_OPENING_MEDIA_DRAWER',
         data: { accountId: lease.accountId, format },
       });
@@ -201,46 +219,6 @@ async function pollUntilReady<T>(
   }
   throw Error(errorCode);
 }
-function decodeBase64StoryPostId(storyId: string): string | null {
-  try {
-    const decoded = Buffer.from(storyId, 'base64').toString('utf8');
-    const match = /^S:_I\d{1,30}:(\d{1,30})(?::(\d{1,30}))?$/.exec(decoded);
-    return match?.[1] ?? null;
-  } catch {
-    return null;
-  }
-}
-function extractTimelinePostId(body: string): { postId: string | null; error: string | null } {
-  for (const rawObj of parseFacebookJsonChunks(body) ?? []) {
-    if (!rawObj || typeof rawObj !== 'object') continue;
-    const obj = rawObj as Record<string, unknown>;
-    if (Array.isArray(obj.errors) && obj.errors.length > 0) {
-      const firstErr = obj.errors[0] as Record<string, unknown> | undefined;
-      const msg =
-        (typeof firstErr?.summary === 'string' && firstErr.summary) ||
-        (typeof firstErr?.message === 'string' && firstErr.message) ||
-        'FACEBOOK_POST_SUBMISSION_REJECTED';
-      return { postId: null, error: msg.slice(0, 180) };
-    }
-    const data = obj.data as Record<string, unknown> | undefined;
-    const create = data?.story_create as Record<string, unknown> | undefined;
-    if (!create) continue;
-    if (typeof create.post_id === 'string' && /^\d{1,30}$/.test(create.post_id)) {
-      return { postId: create.post_id, error: null };
-    }
-    if (typeof create.story_id === 'string') {
-      const decoded = decodeBase64StoryPostId(create.story_id);
-      if (decoded) return { postId: decoded, error: null };
-    }
-    const story = create.story as Record<string, unknown> | undefined;
-    if (typeof story?.id === 'string') {
-      const decoded = decodeBase64StoryPostId(story.id);
-      if (decoded) return { postId: decoded, error: null };
-      return { postId: story.id.slice(0, 120), error: null };
-    }
-  }
-  return { postId: null, error: null };
-}
 async function publishTimelinePost(
   lease: BrowserSessionLease,
   step: StepInstance,
@@ -251,9 +229,7 @@ async function publishTimelinePost(
 ): Promise<string> {
   if (step.spec.type !== 'post') throw Error('FACEBOOK_POST_STEP_REQUIRED');
   const mediaPaths = effective.media.map((item) => item.source);
-  if (mediaPaths.length > 0) {
-    await lease.reconnectWithFiles(mediaPaths);
-  }
+  if (mediaPaths.length > 0) await lease.reconnectWithFiles(mediaPaths);
   await navigateToUrl(lease, 'timeline-home', 'https://www.facebook.com/');
   const openerTarget = await pollUntilReady(
     lease,
@@ -375,9 +351,7 @@ async function publishTimelinePost(
     }
     const surface = postPage.surface;
     if (surface?.advance) {
-      if (aiReading?.phase === 'composer') {
-        await applyAILabelSetting(lease, aiLabel);
-      }
+      if (aiReading?.phase === 'composer') await applyAILabelSetting(lease, aiLabel);
       if (surface.advance.enabled) {
         await clickSelector(lease, 'advance-composer', selectorOf(surface.advance));
         await sleepAbortable(1000, lease.signal);
@@ -398,9 +372,10 @@ async function publishTimelinePost(
     await sleepAbortable(1200, lease.signal);
   }
   if (!submitSelector) throw Error('FACEBOOK_POST_SUBMIT_NOT_READY');
+  const sel = submitSelector;
   return await waitForSubmitGraphqlConfirmation(
     lease,
-    submitSelector,
+    () => clickSelector(lease, 'submit-publish', sel),
     'ComposerStoryCreateMutation',
     (body) => extractTimelinePostId(body),
   );
@@ -441,9 +416,7 @@ async function publishStoryPost(
       uploadPath = path.join(tempDir, derived.name);
       usedDerivedCaption = true;
     }
-    if (uploadPath) {
-      await lease.reconnectWithFiles([uploadPath]);
-    }
+    if (uploadPath) await lease.reconnectWithFiles([uploadPath]);
     await navigateToUrl(lease, 'story-create-nav', 'https://www.facebook.com/stories/create/');
     let story = await pollUntilReady(
       lease,
@@ -473,13 +446,10 @@ async function publishStoryPost(
         await clickSelector(lease, `story-privacy:${decision.action}`, selectorOf(decision.target));
         if (decision.action === 'open') {
           checkpoint = checkpoint === 'OPEN_INITIAL' ? 'SELECT_FRIENDS' : 'CLOSE_VERIFIED';
-        } else if (decision.action === 'selectFriends') {
-          checkpoint = 'SAVE';
-        } else if (decision.action === 'save' || decision.action === 'saveChange') {
+        } else if (decision.action === 'selectFriends') checkpoint = 'SAVE';
+        else if (decision.action === 'save' || decision.action === 'saveChange') {
           checkpoint = 'OPEN_SAVED';
-        } else if (decision.action === 'close') {
-          checkpoint = 'READY';
-        }
+        } else if (decision.action === 'close') checkpoint = 'READY';
         await sleepAbortable(700, lease.signal);
       }
       story = await readFacebookStoryPage(lease.page, lease.guard);
@@ -555,9 +525,7 @@ async function publishStoryPost(
         await sleepAbortable(700, lease.signal);
       }
     }
-    if (aiLabel !== 'preserve-current') {
-      await applyAILabelSetting(lease, aiLabel);
-    }
+    if (aiLabel !== 'preserve-current') await applyAILabelSetting(lease, aiLabel);
     const submitSelector = await pollUntilReady(
       lease,
       20,
@@ -575,7 +543,7 @@ async function publishStoryPost(
     );
     return await waitForSubmitGraphqlConfirmation(
       lease,
-      submitSelector,
+      () => clickSelector(lease, 'submit-publish', submitSelector),
       'StoriesCreateMutation',
       (body, res) => {
         const created = parseNativeStoryCreation(body, res.status(), lease.accountId);
@@ -584,52 +552,6 @@ async function publishStoryPost(
     );
   } finally {
     if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
-  }
-}
-async function waitForSubmitGraphqlConfirmation(
-  lease: BrowserSessionLease,
-  submitSelector: string,
-  friendlyName: string,
-  parseBody: (body: string, res: Response) => { postId: string | null; error: string | null },
-): Promise<string> {
-  const page: Page = lease.page;
-  let resolvedPostId: string | null = null,
-    rejectedError: string | null = null;
-  const pending = new Set<Promise<void>>();
-  const onResponse = (res: Response) => {
-    if (!res.request().url().includes('/api/graphql')) return;
-    const params = new URLSearchParams(res.request().postData() ?? '');
-    if (
-      params.get('fb_api_req_friendly_name') !== friendlyName ||
-      params.get('av') !== lease.accountId
-    )
-      return;
-    const task = (async () => {
-      try {
-        const parsed = parseBody(await res.text(), res);
-        if (parsed.error) rejectedError ??= parsed.error;
-        if (parsed.postId) resolvedPostId ??= parsed.postId;
-      } catch {}
-    })();
-    pending.add(task);
-    void task.finally(() => pending.delete(task));
-  };
-  page.on('response', onResponse);
-  try {
-    await clickSelector(lease, 'submit-publish', submitSelector);
-    for (const deadline = Date.now() + 120_000; Date.now() < deadline;) {
-      lease.guard();
-      if (resolvedPostId) return resolvedPostId;
-      if (rejectedError) throw Error(rejectedError);
-      assertSafeUrl(page.url());
-      await sleepAbortable(300, lease.signal);
-    }
-    if (pending.size > 0) await Promise.allSettled([...pending]);
-    if (resolvedPostId) return resolvedPostId;
-    if (rejectedError) throw Error(rejectedError);
-    throw Error('PUBLISH_RESULT_UNCONFIRMED');
-  } finally {
-    page.off('response', onResponse);
   }
 }
 export async function executeDirectPostStep(
@@ -651,6 +573,16 @@ export async function executeDirectPostStep(
   let published = step.progress.published;
   while (published < step.spec.count) {
     lease.guard();
+    const riskLimit = await checkDirectPostRiskLimit(store, lease.profileId);
+    if (!riskLimit.allowed) {
+      devDiag.emit('INFO', 'TASK_RUNNER', 'ACTIVE_POST_DAILY_LIMIT_SKIP', {
+        profileId: lease.profileId,
+        planId: plan.id,
+        stepId: step.id,
+        reason: riskLimit.reason ?? undefined,
+      });
+      return { kind: 'DAILY_LIMIT_SKIP', published, reason: riskLimit.reason };
+    }
     let publishedThisRound = false;
     for (const row of candidateRows) {
       lease.guard();
@@ -669,6 +601,31 @@ export async function executeDirectPostStep(
         claimed = true;
       }
       let downloadDir: string | null = null;
+      const attemptStartedAt = Date.now();
+      let captionPreview = (row.text ?? '').slice(0, 120);
+      const recordOutcome = (
+        outcome:
+          | { status: 'success'; postId: string }
+          | { status: 'failed'; errorReason: string; failAt: number },
+      ) =>
+        recordDirectPostOutcome(store, {
+          profileId: lease.profileId,
+          accountId: lease.accountId,
+          destination,
+          captionPreview,
+          durationMs: Date.now() - attemptStartedAt,
+          ...(outcome.status === 'success'
+            ? {
+                status: 'success' as const,
+                postId: outcome.postId,
+                sourceLogId: `active:${plan.id}:${step.id}:${outcome.postId}`,
+              }
+            : {
+                status: 'failed' as const,
+                errorReason: outcome.errorReason,
+                sourceLogId: `active-fail:${plan.id}:${step.id}:${outcome.failAt}`,
+              }),
+        });
       try {
         downloadDir = path.join(dataDirectory, 'drive-cache', randomUUID());
         const downloader = new PublicDriveDownloader(downloadDir);
@@ -679,6 +636,7 @@ export async function executeDirectPostStep(
           checkKnownFacebookVideoPath,
         );
         const material = await verifier.snapshot(row, lease.guard);
+        captionPreview = material.text.slice(0, 120);
         const effective = resourceEffectiveRow(row, material);
         if (
           await store.tasks.hasAccountPublishedFingerprint(lease.accountId, material.fingerprint)
@@ -709,6 +667,7 @@ export async function executeDirectPostStep(
           allowRepeat: step.spec.allowRepeat,
           resourceOrigin: origin,
         });
+        await recordOutcome({ status: 'success', postId });
         if (!step.spec.allowRepeat) {
           await store.resourceTables.removePublishedRow(plan.combinationId, row, Date.now());
         }
@@ -716,6 +675,15 @@ export async function executeDirectPostStep(
         publishedThisRound = true;
         await options.onProgress?.({ ...step.progress, published });
         break;
+      } catch (err) {
+        if (!lease.signal.aborted) {
+          await recordOutcome({
+            status: 'failed',
+            errorReason: err instanceof Error ? err.message : String(err ?? 'STEP_FAILED'),
+            failAt: attemptStartedAt,
+          });
+        }
+        throw err;
       } finally {
         if (claimed) claimedSourceKeys.delete(usageKey);
         if (downloadDir && row.media.some((item) => item.kind === 'drive')) {
@@ -728,9 +696,7 @@ export async function executeDirectPostStep(
         ? { kind: 'SKIP_EXHAUSTED', published: 0 }
         : { kind: 'FAIL_EXHAUSTED', published };
     }
-    if (published < step.spec.count) {
-      await sleepAbortable(2500, lease.signal);
-    }
+    if (published < step.spec.count) await sleepAbortable(2500, lease.signal);
   }
   return { kind: 'COMPLETED', published };
 }

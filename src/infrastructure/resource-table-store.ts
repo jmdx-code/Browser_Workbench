@@ -13,7 +13,7 @@ import {
   hasResource,
   ResourceTableRepository as CompatibleResourceTableRepository,
 } from '../domain/resource-table.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { readSnapshot, transaction } from './sqlite-transaction.js';
 import { ResourceMaterialPostIntent } from '../shared/material-index.js';
 import { AttemptVerdict } from '../shared/material-post.js';
@@ -23,7 +23,6 @@ import {
   type ResourceUsageFact,
 } from '../domain/resource-material-rules.js';
 import * as Q from './persistence/sqlite-query-helpers.js';
-
 export class SqliteResourceTableRepository implements ResourceTableRepository {
   private usageCache: {
     dataVersion: number;
@@ -140,7 +139,7 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
           }
         }
         if (!merged)
-          throw new ProductError(
+          failError(
             'RESOURCE_REVISION_CONFLICT',
             '资源表已在其他窗口修改，当前内容保留；请重新打开核对',
             409,
@@ -238,5 +237,4 @@ export class SqliteResourceTableRepository implements ResourceTableRepository {
     return structuredClone(result);
   }
 }
-
 type ResourceTableRepository = SynchronousRepository<CompatibleResourceTableRepository>;

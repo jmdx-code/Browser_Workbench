@@ -7,9 +7,8 @@ import type { Combination } from '../shared/contracts.js';
 import type { TaskResourceRepository as CompatibleTaskResourceRepository } from '../domain/resource-material-rules.js';
 import { needsResourceTable } from '../domain/resource-material-rules.js';
 import { hasResource } from '../domain/resource-table.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { SqliteResourceTableRepository } from './resource-table-store.js';
-
 export class SqliteTaskResourceRepository implements TaskResourceRepository {
   private readonly tables: SqliteResourceTableRepository;
   constructor(private readonly db: DatabaseSync) {
@@ -59,16 +58,11 @@ export class SqliteTaskResourceRepository implements TaskResourceRepository {
   snapshot(jobId: string) {
     const binding = this.binding(jobId);
     if (!binding)
-      throw new ProductError(
-        'RESOURCE_BINDING_REQUIRED',
-        '原计划没有固定资源版本，不能按最新资源补配',
-        409,
-      );
+      failError('RESOURCE_BINDING_REQUIRED', '原计划没有固定资源版本，不能按最新资源补配', 409);
     return TaskResourceSnapshot.parse({
       binding,
       table: this.tables.readVersion(binding.combinationId, binding.resourceRevision),
     });
   }
 }
-
 type TaskResourceRepository = SynchronousRepository<CompatibleTaskResourceRepository>;

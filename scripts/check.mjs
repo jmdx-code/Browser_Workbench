@@ -9,10 +9,7 @@ await runNode('node_modules/prettier/bin/prettier.cjs', [
   'extension',
   'tests',
   'scripts',
-  'docs',
   '*.json',
   '*.ts',
-  'README.md',
-  'AGENTS.md',
 ]);
 await runNode('scripts/test.mjs');

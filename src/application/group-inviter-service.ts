@@ -1,19 +1,24 @@
 import type { Awaitable } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import {
   isTargetIncomplete,
   type BumperRefreshResult,
   type BumperTarget,
 } from '../shared/group-bumper.js';
+import type { CheckDailyRiskLimitFn } from '../shared/daily-risk-limits.js';
 import {
   GroupInviterState,
+  InviterRunSummarySchema,
   StartGroupInviterRequest,
   StopGroupInviterProfilesRequest,
   type GroupInviteLogRow,
   type GroupInviterProfileStat,
   type GroupInviterSettings,
+  type InviterGroupOutcome,
   type InviterGroupRow,
+  type InviterRecordsQuery,
+  type InviterRecordsResponse,
 } from '../shared/group-inviter.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
 import type { ProfileTaskResultValue } from '../shared/task-contracts.js';
@@ -33,19 +38,18 @@ import {
   sleepMs,
 } from './module-worker-pool.js';
 import { Workboard } from './workboard.js';
-
+type InviteEntryInput = {
+  profileId: string;
+  accountId: string;
+  friendId: string;
+  friendName: string;
+  groupId: string;
+  invitedAt?: number;
+};
 export interface GroupInviterRepository {
   hasInvitesForOperation?(opId: string, profileId?: string, accountId?: string): Awaitable<boolean>;
-  reserveInvites?(
-    opId: string,
-    entries: ReadonlyArray<{
-      profileId: string;
-      accountId: string;
-      friendId: string;
-      friendName: string;
-      groupId: string;
-    }>,
-  ): Awaitable<void>;
+  reserveInvites?(opId: string, entries: ReadonlyArray<InviteEntryInput>): Awaitable<void>;
+  releasePendingInvites?(opId: string): Awaitable<number>;
   saveProfileResult?(result: ProfileTaskResultValue): Awaitable<void>;
   listGroups(): Awaitable<InviterGroupRow[]>;
   upsertGroups(input: unknown): Awaitable<InviterGroupRow[]>;
@@ -57,17 +61,7 @@ export interface GroupInviterRepository {
   getSettings(): Awaitable<GroupInviterSettings>;
   saveSettings(input: unknown): Awaitable<GroupInviterSettings>;
   getInvitedFriendIdsForGroup(groupId: string): Awaitable<Set<string>>;
-  recordInvites(
-    entries: ReadonlyArray<{
-      profileId: string;
-      accountId: string;
-      friendId: string;
-      friendName: string;
-      groupId: string;
-      invitedAt?: number;
-    }>,
-    operationId?: string,
-  ): Awaitable<number>;
+  recordInvites(entries: ReadonlyArray<InviteEntryInput>, operationId?: string): Awaitable<number>;
   getTotalInvitedByProfile(): Awaitable<Map<string, number>>;
   listLogs(filter?: {
     groupId?: string;
@@ -78,15 +72,15 @@ export interface GroupInviterRepository {
     beforeId?: string;
     limit?: number;
   }): Awaitable<GroupInviteLogRow[]>;
+  queryEnrichedLogs?(query?: InviterRecordsQuery): Awaitable<InviterRecordsResponse>;
+  deleteLogs?(input: unknown): Awaitable<{ deleted: number }>;
 }
-
 export interface GroupInviterRunCallbacks {
   reportBatchResult?(profileId: string, confirmed: number, pending: number): Awaitable<void>;
   isCancelled(profileId?: string): boolean;
   setProfileStatus(profileId: string, status: string): Awaitable<void>;
   addSessionInvited(profileId: string, count: number): Awaitable<void>;
 }
-
 export interface GroupInviterBrowserRunner {
   retryStop?(profileId: string): Promise<void>;
   isAvailable(): boolean;
@@ -99,24 +93,25 @@ export interface GroupInviterBrowserRunner {
     callbacks: GroupInviterRunCallbacks,
   ): Promise<void>;
 }
-
 export interface ActiveRunState {
   id: string;
   startedAt: number;
   finishedAt: number | null;
   cancelled: boolean;
+  closeBrowserOnFinish?: boolean;
   cancelledProfiles: Set<string>;
   activeProfiles: Set<string>;
   statusText: string;
   sessionCounts: Map<string, number>;
   profileStatus: Map<string, string>;
+  profileNames: Map<string, string>;
   submittedProfiles: Map<string, number>;
   failedProfiles: Set<string>;
   unconfirmedStops: Set<string>;
+  groupResults: InviterGroupOutcome[];
   workersFinished: boolean;
   runningBatches: number;
 }
-
 export interface InviterRuntimeState {
   readonly repo: GroupInviterRepository;
   readonly runner?: GroupInviterBrowserRunner;
@@ -127,21 +122,20 @@ export interface InviterRuntimeState {
   admittingProfiles: Set<string>;
   startingCancelled: Set<string>;
   startGeneration: number;
-  slotsInUse: number;
-  maxConcurrentProfiles: number;
   scheduledRunningProfiles: Set<string>;
   scheduledCancelledProfiles: Set<string>;
+  scheduledPlaySound?: boolean;
+  featureExecution?: FeatureExecutionRegistry;
   profileLifecycle?: ProfileLifecyclePort;
   workboard: Workboard;
   workerPromises: Map<string, Promise<void>>;
+  checkDailyRiskLimit?: CheckDailyRiskLimitFn;
   isProfileRunning(profileId: string): boolean;
 }
-
 export const buildStaggeredGroupQueues = (
   profileIds: readonly string[],
   groups: readonly InviterGroupRow[],
 ) => buildStaggeredQueues(profileIds, groups);
-
 export class GroupInviterService {
   private readonly rt: InviterRuntimeState;
   private readonly avatarFetching = new Set<string>();
@@ -149,7 +143,6 @@ export class GroupInviterService {
   private avatarRefreshStatusText = '';
   private avatarRefreshAbort: AbortController | null = null;
   private featureExecution?: FeatureExecutionRegistry;
-
   constructor(
     private readonly repo: GroupInviterRepository,
     private readonly runner?: GroupInviterBrowserRunner,
@@ -170,40 +163,54 @@ export class GroupInviterService {
       admittingProfiles: new Set(),
       startingCancelled: new Set(),
       startGeneration: 0,
-      slotsInUse: 0,
-      maxConcurrentProfiles: 4,
       scheduledRunningProfiles: new Set(),
       scheduledCancelledProfiles: new Set(),
-      workboard: new Workboard(),
+      workboard: new Workboard({ browserConcurrency: 100, bluestacksConcurrency: 50 }),
       workerPromises: new Map(),
       isProfileRunning: (pid) => this.isProfileRunning(pid),
     };
   }
-
-  setFeatureExecutionRegistry = (registry: FeatureExecutionRegistry) =>
-    void (this.featureExecution = registry);
+  private externalWorkboard = false;
+  setFeatureExecutionRegistry = (registry: FeatureExecutionRegistry) => {
+    this.featureExecution = registry;
+    this.rt.featureExecution = registry;
+  };
   setProfileLifecycle = (lifecycle: ProfileLifecyclePort) =>
     void (this.rt.profileLifecycle = lifecycle);
-  setWorkboard = (workboard: Workboard) => void (this.rt.workboard = workboard);
-
-  private async readSettings(): Promise<GroupInviterSettings> {
-    const settings = await this.repo.getSettings();
-    this.rt.maxConcurrentProfiles = Math.max(1, settings.maxConcurrentProfiles);
-    return settings;
+  setWorkboard = (workboard: Workboard) => {
+    this.externalWorkboard = true;
+    this.rt.workboard = workboard;
+  };
+  getWorkboard = () => this.rt.workboard;
+  setCheckDailyRiskLimit = (fn: CheckDailyRiskLimitFn) => void (this.rt.checkDailyRiskLimit = fn);
+  async syncMaxConcurrency(maxConcurrentProfiles: number): Promise<void> {
+    const capped = Math.max(1, Math.min(50, Math.round(maxConcurrentProfiles)));
+    this.rt.workboard.browserPermits.setLimit(capped);
+    const current = await this.repo.getSettings();
+    if (current.maxConcurrentProfiles !== capped) {
+      await this.repo.saveSettings({ maxConcurrentProfiles: capped });
+    }
   }
-
+  queryEnrichedLogs = async (query: InviterRecordsQuery = {}): Promise<InviterRecordsResponse> =>
+    (await this.repo.queryEnrichedLogs?.(query)) ?? { records: [], total: 0, hasMore: false };
+  deleteLogs = async (input: unknown): Promise<{ deleted: number }> =>
+    (await this.repo.deleteLogs?.(input)) ?? { deleted: 0 };
+  private async readSettings(): Promise<GroupInviterSettings> {
+    const s = await this.repo.getSettings();
+    if (!this.externalWorkboard)
+      this.rt.workboard.setConcurrencyLimits({ browserConcurrency: s.maxConcurrentProfiles });
+    return s;
+  }
   hasActiveExecution = () =>
     this.rt.activeRun !== null ||
     this.rt.startingProfiles.size > 0 ||
     this.rt.admittingProfiles.size > 0 ||
     this.rt.scheduledRunningProfiles.size > 0;
-
   isProfileRunning = (profileId: string) =>
     this.rt.admittingProfiles.has(profileId) ||
     this.rt.startingProfiles.has(profileId) ||
     this.rt.scheduledRunningProfiles.has(profileId) ||
     this.rt.activeRun?.activeProfiles.has(profileId) === true;
-
   async state(): Promise<GroupInviterState> {
     const [groups, settings, totalsByProfile] = await Promise.all([
       this.repo.listGroups(),
@@ -233,15 +240,19 @@ export class GroupInviterService {
         ...(status ? { status } : {}),
       };
     }
+    const finishedLast =
+      this.rt.lastRun && this.rt.lastRun.finishedAt !== null ? this.rt.lastRun : null;
+    const playSoundOnComplete =
+      this.rt.scheduledRunningProfiles.size > 0 && this.rt.scheduledPlaySound !== undefined
+        ? this.rt.scheduledPlaySound
+        : settings.playSoundOnComplete;
     return GroupInviterState.parse({
       groups,
       invitesPerGroup: settings.invitesPerGroup,
       maxConcurrentProfiles: settings.maxConcurrentProfiles,
-      playSoundOnComplete: settings.playSoundOnComplete,
-      running:
-        this.rt.activeRun !== null ||
-        this.rt.startingProfiles.size > 0 ||
-        this.rt.admittingProfiles.size > 0,
+      playSoundOnComplete,
+      closeBrowserOnFinish: settings.closeBrowserOnFinish ?? false,
+      running: this.hasActiveExecution(),
       groupAvatarRefreshing: this.groupAvatarRefreshing || this.avatarFetching.size > 0,
       ...(this.avatarRefreshStatusText
         ? { avatarRefreshStatusText: this.avatarRefreshStatusText }
@@ -253,16 +264,30 @@ export class GroupInviterService {
         ? '正在自动启动所选离线浏览器…'
         : this.rt.startingProfiles.size
           ? '正在准备…'
-          : (run?.statusText ?? '就绪'),
+          : this.rt.activeRun
+            ? this.rt.activeRun.statusText
+            : this.rt.scheduledRunningProfiles.size > 0
+              ? '定时任务执行中…'
+              : (this.rt.lastRun?.statusText ?? '就绪'),
       profileCounts,
+      ...(finishedLast
+        ? {
+            lastRunSummary: InviterRunSummarySchema.parse({
+              runId: finishedLast.id,
+              invitedTotal: [...finishedLast.sessionCounts.values()].reduce((a, b) => a + b, 0),
+              pendingTotal: [...finishedLast.submittedProfiles.values()].reduce((a, b) => a + b, 0),
+              failedProfiles: [...finishedLast.failedProfiles],
+              finishedAt: finishedLast.finishedAt ?? Date.now(),
+              groupResults: finishedLast.groupResults,
+            }),
+          }
+        : {}),
     });
   }
-
   private async runAndState(fn: () => unknown): Promise<GroupInviterState> {
     await fn();
     return this.state();
   }
-
   addGroups = (input: unknown) =>
     this.runAndState(async () => {
       await this.repo.upsertGroups(input);
@@ -272,9 +297,9 @@ export class GroupInviterService {
   updateSettings = (input: unknown) =>
     this.runAndState(async () => {
       const saved = await this.repo.saveSettings(input);
-      this.rt.maxConcurrentProfiles = Math.max(1, saved.maxConcurrentProfiles);
+      if (!this.externalWorkboard)
+        this.rt.workboard.setConcurrencyLimits({ browserConcurrency: saved.maxConcurrentProfiles });
     });
-
   async logs(
     search = '',
     before?: number,
@@ -302,14 +327,12 @@ export class GroupInviterService {
       )
       .slice(0, safeLimit);
   }
-
   private finishRun(run: ActiveRunState): void {
     if (!run.workersFinished || run.runningBatches > 0 || run.activeProfiles.size) return;
     run.finishedAt = Date.now();
     this.rt.lastRun = run;
     if (this.rt.activeRun === run) this.rt.activeRun = null;
   }
-
   private saveProfileResult(run: ActiveRunState, profileId: string): Promise<void> {
     return persistProfileTaskResult(this.repo.saveProfileResult?.bind(this.repo), {
       profileId,
@@ -328,7 +351,6 @@ export class GroupInviterService {
       skippedSteps: 0,
     });
   }
-
   private async retryUnconfirmedStops(run: ActiveRunState, ids: readonly string[]): Promise<void> {
     for (const id of ids) {
       if (!run.unconfirmedStops.has(id) || !this.runner?.retryStop) continue;
@@ -344,7 +366,6 @@ export class GroupInviterService {
     }
     this.finishRun(run);
   }
-
   private stopTargets = (profileIds?: readonly string[]) =>
     this.runAndState(async () => {
       const isAll = !profileIds;
@@ -379,20 +400,14 @@ export class GroupInviterService {
           run.profileStatus.set(pid, '正在停止…');
           if (isAll) this.rt.workboard.abortCarrier(pid, 'USER_STOP');
           else
-            devDiag.record({
-              level: 'INFO',
-              category: 'GROUP_INVITER',
-              event: 'GROUP_INVITER_STOP_PROFILE',
+            devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_STOP_PROFILE', {
               profileId: pid,
               data: { runId: run.id },
             });
         }
         if (isAll) {
           run.statusText = '正在停止…';
-          devDiag.record({
-            level: 'INFO',
-            category: 'GROUP_INVITER',
-            event: 'GROUP_INVITER_STOP_ALL',
+          devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_STOP_ALL', {
             data: { runId: run.id, profiles: targetPids },
           });
           await this.retryUnconfirmedStops(run, [...run.unconfirmedStops]);
@@ -414,11 +429,9 @@ export class GroupInviterService {
           6_000,
         );
     });
-
   stop = () => this.stopTargets();
   stopProfiles = (input: unknown) =>
     this.stopTargets(StopGroupInviterProfilesRequest.parse(input).profileIds);
-
   start = (input: unknown) =>
     this.runAndState(async () => {
       const req = StartGroupInviterRequest.parse(input);
@@ -431,7 +444,7 @@ export class GroupInviterService {
         this.rt.admittingProfiles.size > 0 ||
         (this.rt.activeRun && !candidateProfiles.length)
       )
-        throw new ProductError(
+        failError(
           'GROUP_INVITER_ALREADY_RUNNING',
           '小组邀请人正在运行中，请等待完成或先点击停止',
           409,
@@ -462,35 +475,25 @@ export class GroupInviterService {
         for (const id of candidateProfiles) this.rt.admittingProfiles.delete(id);
         admittedBatch = new Set(admission.admittedProfileIds);
         this.rt.startingProfiles = admittedBatch;
-
-        if (
-          req.invitesPerGroup !== undefined ||
-          req.maxConcurrentProfiles !== undefined ||
-          req.playSoundOnComplete !== undefined
-        ) {
-          const saved = await this.repo.saveSettings({
-            ...(req.invitesPerGroup !== undefined ? { invitesPerGroup: req.invitesPerGroup } : {}),
-            ...(req.maxConcurrentProfiles !== undefined
-              ? { maxConcurrentProfiles: req.maxConcurrentProfiles }
-              : {}),
-            ...(req.playSoundOnComplete !== undefined
-              ? { playSoundOnComplete: req.playSoundOnComplete }
-              : {}),
-          });
-          this.rt.maxConcurrentProfiles = Math.max(1, saved.maxConcurrentProfiles);
-        }
+        const settingsPatch: Record<string, unknown> = {};
+        for (const k of [
+          'invitesPerGroup',
+          'maxConcurrentProfiles',
+          'playSoundOnComplete',
+          'closeBrowserOnFinish',
+        ] as const)
+          if (req[k] !== undefined) settingsPatch[k] = req[k];
+        if (Object.keys(settingsPatch).length) await this.repo.saveSettings(settingsPatch);
         const settings = await this.readSettings();
+        const closeBrowserOnFinish = Boolean(
+          req.closeBrowserOnFinish ?? settings.closeBrowserOnFinish,
+        );
         const allGroups = new Map((await this.repo.listGroups()).map((g) => [g.groupId, g]));
-        const selectedGroups = req.groupIds
+        const selectedGroups = [...new Set(req.groupIds)]
           .map((id) => allGroups.get(id))
           .filter((g): g is InviterGroupRow => g !== undefined);
         if (!selectedGroups.length)
-          throw new ProductError(
-            'GROUP_INVITER_GROUPS_EMPTY',
-            '未找到选中的小组，请刷新后重试',
-            404,
-          );
-
+          failError('GROUP_INVITER_GROUPS_EMPTY', '未找到选中的小组，请刷新后重试', 404);
         const profileStatus = new Map<string, string>();
         for (const item of [...admission.skippedBusy, ...admission.skippedOffline])
           profileStatus.set(
@@ -510,7 +513,7 @@ export class GroupInviterService {
         }
         if (!admission.admittedProfileIds.length) {
           const firstFail = [...launchFailureReasons.values()][0]?.replace(/^跳过：/, '');
-          throw new ProductError(
+          failError(
             'GROUP_INVITER_PROFILES_UNAVAILABLE',
             skippedBusy > 0 && skippedOffline > 0
               ? `所选浏览器中 ${skippedBusy} 个正在执行其他任务、${skippedOffline} 个未连接${firstFail ? `（${firstFail}）` : ''}，无法启动`
@@ -535,7 +538,6 @@ export class GroupInviterService {
         ].filter(Boolean);
         const makeStatus = (n: number) =>
           `正在运行：${n} 个账号 × ${selectedGroups.length} 个小组（每组最多 ${settings.invitesPerGroup} 人）${skippedNotes.length ? `（已自动${skippedNotes.join('、')}）` : ''}`;
-
         let run = this.rt.activeRun;
         if (run) {
           for (const id of candidateProfiles) {
@@ -550,6 +552,7 @@ export class GroupInviterService {
           }
           run.workersFinished = false;
           run.runningBatches += 1;
+          if (closeBrowserOnFinish) run.closeBrowserOnFinish = true;
           run.statusText = makeStatus(run.activeProfiles.size);
         } else {
           run = {
@@ -557,24 +560,24 @@ export class GroupInviterService {
             startedAt: Date.now(),
             finishedAt: null,
             cancelled: false,
+            closeBrowserOnFinish,
             cancelledProfiles: new Set(),
             activeProfiles: new Set(eligibleProfiles),
             statusText: makeStatus(eligibleProfiles.length),
             sessionCounts: new Map(candidateProfiles.map((id) => [id, 0])),
             submittedProfiles: new Map(),
             profileStatus,
+            profileNames: new Map(),
             failedProfiles: new Set(),
             unconfirmedStops: new Set(),
+            groupResults: [],
             workersFinished: false,
             runningBatches: 1,
           };
           this.assertStartAllowed();
           this.rt.activeRun = run;
         }
-        devDiag.record({
-          level: 'INFO',
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_START',
+        devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_START', {
           data: {
             runId: run.id,
             eligibleProfiles,
@@ -598,10 +601,7 @@ export class GroupInviterService {
             finishRun: (r) => this.finishRun(r),
           },
         ).catch((error: unknown) =>
-          devDiag.record({
-            level: 'ERROR',
-            category: 'GROUP_INVITER',
-            event: 'GROUP_INVITER_RUN_ERROR',
+          devDiag.emit('ERROR', 'GROUP_INVITER', 'GROUP_INVITER_RUN_ERROR', {
             reason: errMsg(error, 'UNKNOWN').slice(0, 200),
           }),
         );
@@ -618,9 +618,12 @@ export class GroupInviterService {
         }
       }
     });
-
   private async fetchMissingAvatars(selectedIds?: readonly string[]): Promise<void> {
-    if (!this.refreshAvatars && !this.runner) return;
+    const refreshFn = this.refreshAvatars;
+    if (!refreshFn) {
+      if (selectedIds !== undefined) this.avatarRefreshStatusText = '当前未启用小组资料刷新服务';
+      return;
+    }
     if (this.hasActiveExecution())
       return void (this.avatarRefreshStatusText =
         '运行中暂不刷新头像，停止任务后可点击「刷新头像」补齐');
@@ -638,8 +641,6 @@ export class GroupInviterService {
       return;
     }
     this.avatarRefreshStatusText = `正在刷新 ${missing.length} 个小组资料…`;
-    const refreshFn = this.refreshAvatars;
-    if (!refreshFn) return;
     for (const g of missing) this.avatarFetching.add(g.groupId);
     const targets: BumperTarget[] = missing.map((g) => ({
       id: g.groupId,
@@ -662,15 +663,15 @@ export class GroupInviterService {
         void (this.avatarRefreshStatusText = aborted
           ? '已停止刷新小组头像'
           : formatAvatarRefreshSummary(res, '项', '刷新小组头像完成')),
-      onError: (_err, aborted) => {
-        if (aborted) this.avatarRefreshStatusText = '已停止刷新小组头像';
-      },
+      onError: (_err, aborted) =>
+        void (this.avatarRefreshStatusText = aborted
+          ? '已停止刷新小组头像'
+          : '刷新小组头像失败，请稍后重试'),
       onFinally: () => {
         for (const g of missing) this.avatarFetching.delete(g.groupId);
       },
     });
   }
-
   refreshGroups = (ids?: readonly string[]) =>
     this.runAndState(() => Promise.race([this.fetchMissingAvatars(ids), sleepMs(20)]));
   stopRefreshGroups = () =>

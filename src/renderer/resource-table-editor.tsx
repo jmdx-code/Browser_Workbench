@@ -36,13 +36,9 @@ import {
 } from './matrix-grid.js';
 import { Btn, errMsg, useShowModal } from './modules/shared/module-ui.js';
 import { resourceMatches, type ResourceFilter } from './resource-filter.js';
-import { FileLocationButton, UI_INPUT_SM, UI_SELECT_SM } from './ui/primitives.js';
-
-export interface ResourceEditorHandle {
-  persist(): Promise<boolean>;
-}
+import { FileLocationButton, UI_INPUT_SM, UI_ROW_BT, UI_SELECT_SM } from './ui/primitives.js';
+export type ResourceEditorHandle = { persist(): Promise<boolean> };
 type ObservationRow = z.infer<typeof ResourceSourceRow>;
-
 const mkOpts = (vals: readonly string[]) => vals.map((v) => ({ value: v, label: v }));
 const FILTER_OPTIONS: [ResourceFilter, string][] = [
   ['all', '全部行'],
@@ -63,7 +59,6 @@ const COLS = [
 ] as const;
 const createId = () => globalThis.crypto.randomUUID();
 const isSelectCol = (col: number) => col >= 2 && col <= 4;
-
 function rowStatusDisplay(
   row: ResourceRowValue,
   obs: ObservationRow | undefined,
@@ -99,7 +94,6 @@ function rowStatusDisplay(
     title: '来源已核验可用',
   };
 }
-
 function ResourceRowPreview({
   combinationId,
   revision,
@@ -121,7 +115,6 @@ function ResourceRowPreview({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const file = row.media[index];
-
   useEffect(() => {
     const ac = new AbortController();
     let disposed = false;
@@ -147,7 +140,6 @@ function ResourceRowPreview({
       if (url) URL.revokeObjectURL(url);
     };
   }, [combinationId, revision, row, index, file, attempt]);
-
   return (
     <dialog
       ref={dialog}
@@ -246,7 +238,6 @@ function ResourceRowPreview({
     </dialog>
   );
 }
-
 export function ResourceTableEditor({
   combination,
   onClose,
@@ -282,13 +273,11 @@ export function ResourceTableEditor({
   const [filePickRow, setFilePickRow] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
-
   const dirty = useMemo(
     () => !loading && JSON.stringify(rows) !== savedJson,
     [loading, rows, savedJson],
   );
   const busy = loading || saving || checking || downloading;
-
   const loadTable = useCallback(async () => {
     setLoading(true);
     setError('');
@@ -306,12 +295,10 @@ export function ResourceTableEditor({
       setLoading(false);
     }
   }, [combination.id]);
-
   useEffect(() => {
     void loadTable();
     return () => streamAbortRef.current?.abort();
   }, [loadTable]);
-
   const applyCell = useCallback(
     (
       current: ResourceRowValue[],
@@ -329,7 +316,6 @@ export function ResourceTableEditor({
     },
     [],
   );
-
   const grid = useSpreadsheetGrid<ResourceRowValue>({
     rows,
     colCount: 5,
@@ -356,7 +342,6 @@ export function ResourceTableEditor({
     onError: setError,
     createEmptyRow: () => emptyResourceRow(createId()),
   });
-
   const persist = useCallback(async (): Promise<boolean> => {
     const latest = grid.commitEdit();
     setSaving(true);
@@ -381,9 +366,7 @@ export function ResourceTableEditor({
       setSaving(false);
     }
   }, [combination.id, grid, onSaved, revision]);
-
   useImperativeHandle(ref, () => ({ persist }), [persist]);
-
   const fillMediaFiles = (startRow: number, files: FileList | null) => {
     const paths = parseElectronFilePaths(files);
     if (!paths.length) return setError('浏览器环境无法读取本地绝对路径，请手动粘贴或拖动链接');
@@ -393,7 +376,6 @@ export function ResourceTableEditor({
       setError(errMsg(e, '填充本机文件失败'));
     }
   };
-
   const mergeSelectedImages = () => {
     const indices = getSelectedRowIndices(grid.bounds, rows.length);
     if (indices.length < 2) return setError('请先选中至少两行再合并图片');
@@ -417,7 +399,6 @@ export function ResourceTableEditor({
     );
     setNotice(`已合并 ${imagesOnly.length} 张图片到第 ${targetIdx + 1} 行`);
   };
-
   async function runStreamOp(kind: 'check' | 'download') {
     if (dirty && !(await persist())) return;
     streamAbortRef.current?.abort();
@@ -468,7 +449,6 @@ export function ResourceTableEditor({
       setDownloadProgress(null);
     }
   }
-
   const visibleEntries = useMemo(
     () =>
       rows
@@ -509,7 +489,6 @@ export function ResourceTableEditor({
     ['撤销', grid.handleUndo, busy || !grid.canUndo],
     ['重做', grid.handleRedo, busy || !grid.canRedo],
   ];
-
   return (
     <div className="resource-editor-shell fixed inset-0 z-75 flex flex-col bg-slate-950/40 p-4 backdrop-blur-[2px]">
       <div className="flex min-h-0 flex-1 flex-col gap-3 rounded-2xl border border-[var(--line)] bg-white p-4 shadow-2xl">
@@ -537,7 +516,6 @@ export function ResourceTableEditor({
             <Btn onClick={() => (dirty ? setConfirmDiscard(true) : onClose())}>关闭</Btn>
           </div>
         </div>
-
         {confirmDiscard && (
           <div className="notice-banner is-warn flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
             <span>当前有未保存修改，确定放弃修改吗？</span>
@@ -562,8 +540,7 @@ export function ResourceTableEditor({
             复制粘贴剪切 · Ctrl+Z/Y 撤销重做 · 拖拽右下角绿点向下填充 · 点击行号预览该行媒体
           </div>
         )}
-
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className={UI_ROW_BT}>
           <div className="resource-toolbar-group flex flex-wrap items-center gap-1.5">
             {toolbarButtons.map(([label, onClick, dis, v]) => (
               <Btn key={label} v={v ?? 'default'} disabled={dis ?? busy} onClick={onClick}>
@@ -613,7 +590,6 @@ export function ResourceTableEditor({
             </Btn>
           </div>
         </div>
-
         {error && (
           <div
             className="alert-banner is-error rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs leading-relaxed text-rose-700"
@@ -638,7 +614,6 @@ export function ResourceTableEditor({
             e.target.value = '';
           }}
         />
-
         <div
           ref={grid.wrapRef}
           className="resource-matrix-scroll relative min-h-0 flex-1 overflow-auto rounded-xl border border-[#e0e5ec] bg-white focus:outline-none"
@@ -722,7 +697,6 @@ export function ResourceTableEditor({
             </tbody>
           </table>
         </div>
-
         {previewRow && previewRowIdx !== null && (
           <ResourceRowPreview
             combinationId={combination.id}

@@ -13,10 +13,8 @@ import {
 } from 'lucide-react';
 import { IconBack, IconChevron, IconChevronDown } from './icons.js';
 import type { FeatureModuleId, FeatureNavItem } from './modules/module-contracts.js';
-
 const RAIL_COLLAPSED_KEY = 'workbench.nav-rail-collapsed.v1';
 const RAIL_CLOSED_KEY = 'workbench.nav-rail-closed-groups.v1';
-
 const ICON_MAP: Record<FeatureNavItem['icon'], LucideIcon> = {
   'auto-scheduler': CalendarClock,
   records: ClipboardList,
@@ -36,7 +34,6 @@ const ICON_MAP: Record<FeatureNavItem['icon'], LucideIcon> = {
   'sheets-schedule': Table2,
   'sheets-records': Table2,
 };
-
 function readInitialClosedGroups(): Set<string> {
   try {
     const parsed: unknown = JSON.parse(window.localStorage.getItem(RAIL_CLOSED_KEY) || '[]');
@@ -47,7 +44,6 @@ function readInitialClosedGroups(): Set<string> {
     return new Set();
   }
 }
-
 const BADGE_TONE = {
   run: 'text-[#8ab4ff] bg-[rgba(47,111,237,0.32)]',
   err: 'text-white bg-[var(--err)]',
@@ -62,7 +58,6 @@ const MINI_DOT_TONE = {
 } as const;
 const GRP_PILL =
   'h-4 min-w-4 px-1.5 rounded-full text-[10px] font-bold inline-flex items-center justify-center shrink-0 ';
-
 export function FeatureNavRail({
   activeModule,
   carrier = 'browser',
@@ -82,7 +77,6 @@ export function FeatureNavRail({
     }
   });
   const [closedGroups, setClosedGroups] = useState<Set<string>>(readInitialClosedGroups);
-
   useEffect(() => {
     try {
       window.localStorage.setItem(RAIL_COLLAPSED_KEY, collapsed ? '1' : '0');
@@ -93,7 +87,6 @@ export function FeatureNavRail({
       window.localStorage.setItem(RAIL_CLOSED_KEY, JSON.stringify([...closedGroups].sort()));
     } catch {}
   }, [closedGroups]);
-
   const navGroups = (
     [
       [
@@ -108,7 +101,6 @@ export function FeatureNavRail({
   )
     .map(([key, label, pred]) => ({ key, label, items: items.filter(pred) }))
     .filter((g) => g.items.length > 0);
-
   const toggleGroup = (key: string) =>
     setClosedGroups((prev) => {
       const next = new Set(prev);
@@ -116,7 +108,6 @@ export function FeatureNavRail({
       else next.add(key);
       return next;
     });
-
   return (
     <nav
       className={`feature-nav-rail flex min-h-0 shrink-0 flex-col border-r border-white/[0.06] bg-[#1f242c] text-[#c8d0dc] select-none transition-[width] duration-150 ${

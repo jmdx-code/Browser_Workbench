@@ -88,6 +88,7 @@ const CLEARED_TOKENS = {
 };
 export class GoogleOAuthManager implements GoogleOAuthPort {
   private pendingSession: PendingAuthSession | null = null;
+  private lastRedirectUri: string | null = null;
   private refreshInFlight: Promise<string> | null = null;
   private authEpoch = 0;
   constructor(
@@ -117,6 +118,7 @@ export class GoogleOAuthManager implements GoogleOAuthPort {
     this.authEpoch++;
     this.refreshInFlight = null;
     const existing = await this.repo.getAuthConfig();
+    if (existing.clientId !== parsed.clientId) this.lastRedirectUri = null;
     return this.buildStatus(
       await this.repo.saveAuthConfig({
         ...parsed,
@@ -141,6 +143,7 @@ export class GoogleOAuthManager implements GoogleOAuthPort {
       });
     });
     const redirectUri = `http://127.0.0.1:${port}/oauth2/callback`;
+    this.lastRedirectUri = redirectUri;
     const params = new URLSearchParams({
       client_id: auth.clientId,
       redirect_uri: redirectUri,
@@ -205,7 +208,10 @@ export class GoogleOAuthManager implements GoogleOAuthPort {
     const trimmed = codeOrCallbackUrl.trim();
     if (!trimmed) failAuth('GOOGLE_AUTH_CODE_EMPTY', '请粘贴授权完成后的回调链接或授权码');
     let code = trimmed;
-    let redirectUri = this.pendingSession?.redirectUri ?? 'http://127.0.0.1';
+    let redirectUri =
+      this.pendingSession?.redirectUri ??
+      this.lastRedirectUri ??
+      'http://127.0.0.1/oauth2/callback';
     if (/^https?:\/\//i.test(trimmed)) {
       let u: URL;
       try {
@@ -216,9 +222,22 @@ export class GoogleOAuthManager implements GoogleOAuthPort {
       const extracted = u.searchParams.get('code');
       if (!extracted) return failAuth('GOOGLE_AUTH_CODE_MISSING', '回调链接中未找到 code 参数');
       code = extracted;
-      redirectUri = `${u.origin}${u.pathname}`;
+      const normalizedPath = u.pathname && u.pathname !== '/' ? u.pathname : '/oauth2/callback';
+      const fallbackPort =
+        !u.port && u.hostname === '127.0.0.1'
+          ? (this.pendingSession?.redirectUri ?? this.lastRedirectUri)
+          : null;
+      if (fallbackPort) {
+        try {
+          const fb = new URL(fallbackPort);
+          redirectUri = `${fb.origin}${normalizedPath}`;
+        } catch {
+          redirectUri = `${u.origin}${normalizedPath}`;
+        }
+      } else redirectUri = `${u.origin}${normalizedPath}`;
     }
     const saved = await this.exchangeCodeForTokens(code, redirectUri);
+    this.lastRedirectUri = null;
     await this.closePendingSession();
     return this.buildStatus(saved);
   }
@@ -376,6 +395,7 @@ export class GoogleOAuthManager implements GoogleOAuthPort {
   async revokeAuth(): Promise<GoogleAuthStatus> {
     this.authEpoch++;
     this.refreshInFlight = null;
+    this.lastRedirectUri = null;
     await this.closePendingSession();
     const auth = await this.repo.getAuthConfig();
     const token = auth.refreshToken ?? auth.accessToken;

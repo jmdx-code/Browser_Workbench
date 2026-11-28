@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { FeatureExecutionRegistry } from '../../application/feature-execution-registry.js';
 import { admitProfilesForStart } from '../../application/profile-start-admission.js';
 import type { TaskService } from '../../application/task-service.js';
@@ -5,20 +6,19 @@ import type { TaskTestService } from '../../application/task-test-service.js';
 import type { WorkspaceService } from '../../application/workspace-service.js';
 import { ProductError } from '../../domain/workspace.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
-import { TASK_CAPACITY_HEADER } from '../../shared/task-policies.js';
-import {
-  AssignTasks,
-  SchedulerSettings,
-  TaskCommandRequest,
-  TaskHistoryRequest,
-} from '../../shared/task-contracts.js';
-import {
-  TASK_CONTRACT_HEADER,
-  assertTaskCapacity,
-  assertTaskContract,
-  needSvc,
-  type RouteBase,
-} from '../task-contract-version.js';
+import { AssignTasks, SchedulerSettings, TaskCommandRequest } from '../../shared/task-contracts.js';
+import { TaskTestRequest } from '../../shared/task-tests.js';
+export interface RouteBase {
+  req: IncomingMessage;
+  res: ServerResponse;
+  route: string;
+  input: unknown;
+  json: (res: ServerResponse, status: number, body: unknown) => void;
+}
+export function needSvc<T>(v: T | undefined, code: string, msg: string): T {
+  if (!v) throw new ProductError(code, msg, 409);
+  return v;
+}
 export interface TaskRouteContext extends RouteBase {
   service: WorkspaceService;
   tasks?: TaskService;
@@ -35,40 +35,36 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
     ok = (body: unknown) => (json(res, 200, body), true),
     fail = (code: string, msg: string): never => {
       throw new ProductError(code, msg, 409);
-    },
-    contractHeader = req.headers[TASK_CONTRACT_HEADER],
-    capHeader = req.headers[TASK_CAPACITY_HEADER];
+    };
   if (req.method === 'GET') {
     if (!tasks) return false;
-    if (route === '/api/workspace/tasks') {
-      assertTaskCapacity(capHeader, await tasks.settings());
-      const overview = await tasks.overview();
-      return (assertTaskContract(contractHeader, [], overview.plans), ok(overview));
-    }
+    if (route === '/api/workspace/tasks') return ok(await tasks.overview());
     if (route === '/api/workspace/tasks/capabilities') return ok(await tasks.capabilities());
     if (route === '/api/workspace/tasks/runtime') {
-      assertTaskCapacity(capHeader, await tasks.settings());
       if (req.aborted || res.destroyed) return true;
       if (req.headers['x-workbench-runtime-contract'] !== '2')
         fail('TASK_CONTRACT_UPGRADE_REQUIRED', '任务读取接口已更新，请刷新软件页面');
-      const cursor = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor'),
-        overview = await tasks.runtimeOverview(cursor ? { cursor } : {});
-      return (
-        assertTaskContract(contractHeader, overview.currentSteps, overview.plans),
-        ok(overview)
-      );
+      const cursor = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor');
+      return ok(await tasks.runtimeOverview(cursor ? { cursor } : {}));
     }
     return false;
   }
   if (req.method !== 'POST') return false;
-  if (route === '/api/workspace/tasks/test')
-    return ok(await (taskTests ?? fail('TASKS_UNAVAILABLE', '测试执行服务尚未加载')).start(input));
+  if (route === '/api/workspace/tasks/test') {
+    const svc = needSvc(taskTests, 'TASKS_UNAVAILABLE', '测试执行服务尚未加载'),
+      parsed = TaskTestRequest.parse(input),
+      reservedIds = fe
+        ? (await fe.tryReserve('active-accounts', parsed.profileIds)).reservedIds
+        : parsed.profileIds;
+    try {
+      return ok(await svc.start(parsed));
+    } finally {
+      fe?.releaseReservation('active-accounts', reservedIds);
+    }
+  }
   if (route === '/api/workspace/tasks/settings') {
     const svc = needTasks('任务设置服务未启用');
-    return (
-      assertTaskCapacity(capHeader, SchedulerSettings.parse(input)),
-      ok(await svc.setSettings(input))
-    );
+    return ok(await svc.setSettings(SchedulerSettings.parse(input)));
   }
   if (route === '/api/workspace/tasks/command') {
     const svc = needTasks('任务执行服务未启用'),
@@ -76,34 +72,15 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
     await service.requireProfiles(value.plans.map((p) => p.profileId));
     return ok(await svc.command(value));
   }
-  if (route === '/api/workspace/tasks/history') {
-    const svc = needTasks('任务记录服务未启用'),
-      value = TaskHistoryRequest.parse(input);
-    await service.requireProfiles([value.profileId]);
-    const history = await svc.history(value);
-    return (assertTaskContract(contractHeader, history.steps), ok(history));
-  }
   if (route === '/api/workspace/tasks/records') {
     const svc = needTasks('任务记录服务未启用');
     if (req.aborted || res.destroyed) return true;
-    assertTaskContract(contractHeader, []);
-    if (req.headers['x-workbench-records-contract'] !== '1')
-      fail('TASK_CONTRACT_UPGRADE_REQUIRED', '记录分页接口已更新，请刷新软件页面');
-    const records = await svc.records(input, (await service.snapshot()).profiles);
-    return (assertTaskContract(contractHeader, records.records), ok(records));
+    return ok(await svc.records(input, (await service.snapshot()).profiles));
   }
   if (route !== '/api/workspace/tasks/start') return false;
   const svc = needTasks('任务执行服务未启用'),
     value = AssignTasks.parse(input),
-    previous = await svc.plansForBatch(value.requestId),
-    saved = (await service.snapshot()).combinations.find(
-      (r) => r.id === value.combinationId,
-    )?.saved;
-  assertTaskContract(
-    contractHeader,
-    [],
-    previous.length ? previous : saved ? [{ snapshot: saved }] : [],
-  );
+    previous = await svc.plansForBatch(value.requestId);
   await service.requireProfiles(value.profileIds);
   if (previous.length) return ok(await svc.start(value));
   const reservedIds = fe
@@ -111,7 +88,7 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
     : value.profileIds;
   const reservedSet = new Set(reservedIds);
   try {
-    const checkOnline = !value.timing && typeof ctx.isProfileOnline === 'function',
+    const checkOnline = typeof ctx.isProfileOnline === 'function',
       launchableSet = new Set<string>();
     if (checkOnline && ctx.profileLifecycle && ctx.isProfileOnline) {
       const offline: string[] = [];
@@ -144,7 +121,7 @@ export async function handleTaskRoutes(ctx: TaskRouteContext): Promise<boolean> 
     if (!admission.admittedProfileIds.length)
       fail(
         admission.skippedBusy.length > 0
-          ? 'PROFILE_GROUP_INVITER_BUSY'
+          ? 'PROFILE_BUSY'
           : admission.alreadyRunningIds.length > 0 && !admission.skippedOffline.length
             ? 'PROFILE_PLAN_BUSY'
             : 'PROFILE_OFFLINE',

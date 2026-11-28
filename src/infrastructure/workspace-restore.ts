@@ -14,7 +14,6 @@ import {
 import { workspaceSchemaVersion } from './workspace-store.js';
 import { bridgeSchemaVersion } from '../bridge/store.js';
 import { FilesystemWorkspaceBackupWriter } from './workspace-backup-writer.js';
-
 const names = ['workspace.sqlite', 'journal.sqlite'] as const;
 const PendingRestore = z
   .object({
@@ -27,7 +26,6 @@ const PendingRestore = z
 type Pending = z.infer<typeof PendingRestore>;
 const pendingFile = (dataDir: string) => path.join(dataDir, 'pending-restore.json');
 const stageDirectory = (dataDir: string, id: string) => path.join(dataDir, 'data-restores', id);
-
 async function savePending(dataDir: string, value: Pending) {
   const tmp = pendingFile(dataDir) + '.' + randomUUID() + '.tmp';
   await writeFile(tmp, JSON.stringify(PendingRestore.parse(value), null, 2), {
@@ -110,7 +108,6 @@ async function inspect(directory: string) {
     jn.close();
   }
 }
-
 export class FilesystemWorkspaceRestore implements WorkspaceRestorePort {
   constructor(private readonly dataDir: string) {}
   async inspect(directory: string) {
@@ -154,7 +151,6 @@ export class FilesystemWorkspaceRestore implements WorkspaceRestorePort {
     return this.status();
   }
 }
-
 async function renameWithWindowsRetry(fromPath: string, toPath: string): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -170,7 +166,6 @@ async function renameWithWindowsRetry(fromPath: string, toPath: string): Promise
   }
   throw lastErr;
 }
-
 async function replacePair(
   dataDir: string,
   source: string,
@@ -207,7 +202,6 @@ async function replacePair(
     await checkpoint(name);
   }
 }
-
 export async function applyPendingWorkspaceRestore(
   dataDir: string,
   softwareVersion: string,

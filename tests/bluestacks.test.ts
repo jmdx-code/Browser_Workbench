@@ -44,7 +44,7 @@ import {
   isPrintableAscii,
   quoteForAndroidInputText,
 } from '../src/infrastructure/bluestacks-win32.js';
-import { SaveAutoScheduleInput, estimatePipelineMinutes } from '../src/shared/auto-scheduler.js';
+import { SaveAutoScheduleInput } from '../src/shared/auto-scheduler.js';
 import {
   isValidTotpSecret,
   maskLoginAccountLabel,
@@ -443,7 +443,6 @@ test('BluestacksService enforces portrait resolution, concurrency cap, and confi
     ],
     todayCounts: async () => ({}),
     total: async () => 0,
-    weeklyDailyCounts: async () => [],
   };
 
   const devices: BluestacksDeviceController = {
@@ -1671,7 +1670,6 @@ test('Auto-Scheduler 6-step BlueStacks schema & Cloud Sheets BlueStacks binding 
       timeZone: 'Asia/Shanghai',
     },
     steps: [
-      { id: randomUUID(), type: 'bluestacks-quick-browse', target: 'feed', durationMinutes: 2 },
       { id: randomUUID(), type: 'bluestacks-active-combination', combinationId: comboId },
       {
         id: randomUUID(),
@@ -1696,9 +1694,7 @@ test('Auto-Scheduler 6-step BlueStacks schema & Cloud Sheets BlueStacks binding 
       },
     ],
   });
-  assert.equal(sched.steps.length, 6);
-  const est = estimatePipelineMinutes(sched.steps, () => 8);
-  assert.ok(est >= 20, `expected combined estimate >= 20m, got ${est}`);
+  assert.equal(sched.steps.length, 5);
 
   const defaultRecordsCfg = PostRecordsSheetConfig.parse({});
   assert.deepEqual(defaultRecordsCfg.bumperBluestacksFolderIds, []);
@@ -1935,7 +1931,6 @@ test('BluestacksService.startBatchLogin orchestrates auto-launch, auto-APK, skip
     targets: () => [],
     todayCounts: () => ({}),
     total: () => 0,
-    weeklyDailyCounts: () => [],
   };
 
   const devices: BluestacksDeviceController = {
@@ -2188,7 +2183,6 @@ test('BluestacksService.startHealthCheck classifies healthy, landscape, missing-
     targets: () => [],
     todayCounts: () => ({}),
     total: () => 0,
-    weeklyDailyCounts: () => [],
   };
 
   const devices: BluestacksDeviceController = {
@@ -2495,14 +2489,14 @@ test('BlueStacks daily risk limits persist across restarts, aggregate all 4 acti
     assert.match(stAfter.activeProfileCounts?.[idA]?.status ?? '', /自动休眠保护/);
     assert.match(stAfter.activeProfileCounts?.[idB]?.status ?? '', /自动休眠保护/);
 
-    // Scheduled step on limited idA must return softIssue=true & hardBlocked=false (never banned!)
+    // Scheduled step on limited idA must return softIssue=false & hardBlocked=false (never banned!)
     const schedRes = await service.runScheduledActiveStep({
       instanceId: idA,
       quickStep: { type: 'feed', durationMinutes: 1 },
       onProgress: () => {},
     });
     assert.equal(schedRes.hardBlocked, false);
-    assert.equal(schedRes.softIssue, true);
+    assert.equal(schedRes.softIssue, false);
     assert.match(schedRes.status, /自动休眠保护/);
   } finally {
     store.close();
@@ -2566,7 +2560,6 @@ test('BluestacksService.runDirectPosterForSheet auto-launches, switches to manag
     targets: () => [],
     todayCounts: () => ({}),
     total: () => 0,
-    weeklyDailyCounts: () => [],
   };
   const devices: BluestacksDeviceController = {
     getOnlineKeys: () => new Set(inst.online ? [inst.instanceKey] : []),
@@ -2674,7 +2667,7 @@ test('BluestacksService.runDirectPosterForSheet auto-launches, switches to manag
   assert.deepEqual(receivedPosts, [{ isTimeline: true, postId: '12345' }]);
 });
 
-test('closeBlueStacksPids sends WM_CLOSE + UIA confirmation with 22s graceful wait instead of premature kill', async () => {
+test('closeBlueStacksPids sends WM_CLOSE + UIA confirmation with 6s graceful wait instead of premature kill', async () => {
   if (process.platform !== 'win32') return;
   const calls: Array<{ exe: string; args: string[]; timeoutMs?: number }> = [];
   await closeBlueStacksPids(
@@ -2696,7 +2689,8 @@ test('closeBlueStacksPids sends WM_CLOSE + UIA confirmation with 22s graceful wa
   assert.match(script, /Pid = 22222; Hwnd = \[Int64\]0/);
   assert.match(script, /0x0010/); // WM_CLOSE
   assert.match(script, /InvokePattern/); // UIA confirmation dialog handler
-  assert.match(script, /AddSeconds\(22\)/); // generous graceful wait
+  assert.match(script, /AddSeconds\(3\.5\)/);
+  assert.match(script, /AddSeconds\(6\)/); // bounded graceful wait
   assert.doesNotMatch(script, /reboot\s+-p/);
 });
 
@@ -2810,7 +2804,6 @@ test('BluestacksService manual tasks auto-launch closed portrait instances while
           ],
     todayCounts: () => ({}),
     total: () => 0,
-    weeklyDailyCounts: () => [],
   };
 
   const devices: BluestacksDeviceController = {

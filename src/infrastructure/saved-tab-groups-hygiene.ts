@@ -166,12 +166,7 @@ function parseSstEntries(block: Buffer): Array<{ key: Buffer; val: Buffer }> {
   }
   return entries;
 }
-interface InternalEntry {
-  userKey: string;
-  valType: 0 | 1;
-  seq: bigint;
-  val: Buffer;
-}
+type InternalEntry = { userKey: string; valType: 0 | 1; seq: bigint; val: Buffer };
 function readLdbFile(filePath: string): InternalEntry[] {
   const buf = fs.readFileSync(filePath);
   if (buf.length < LEVELDB_SST_FOOTER_SIZE) throw Error('LEVELDB_SST_TOO_SMALL');
@@ -386,12 +381,7 @@ interface ParsedSavedGroup {
   updatedAt: bigint;
   localGroupId: string | null;
 }
-interface ParsedSavedTab {
-  key: string;
-  guid: string;
-  groupGuid: string;
-  url: string;
-}
+type ParsedSavedTab = { key: string; guid: string; groupGuid: string; url: string };
 function isWorkbenchOrphanTabUrl(url: string): boolean {
   const t = url.trim().toLowerCase();
   return (
@@ -580,10 +570,7 @@ export function cleanupProfileSavedTabGroups(
     appendWalDeletions(path.join(levelDbDir, targetLog.name), maxSeq + 1n, deleteKeys);
     return baseResult;
   } catch (err) {
-    devDiag.record({
-      level: 'WARN',
-      category: 'BRIDGE_WS',
-      event: 'SAVED_TAB_GROUPS_HYGIENE_SKIPPED',
+    devDiag.emit('WARN', 'BRIDGE_WS', 'SAVED_TAB_GROUPS_HYGIENE_SKIPPED', {
       reason: err instanceof Error ? err.message.slice(0, 160) : 'UNKNOWN',
       data: { profileDir: path.basename(profileDir), mode },
     });

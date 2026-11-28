@@ -45,6 +45,7 @@ export const TaskStepSkip = strictObj({
     'RESOURCE_EXHAUSTED',
     'FEATURE_UNAVAILABLE',
     'MARKETPLACE_UNAVAILABLE',
+    'USER_STOP',
   ]),
   dependencyStepId: Id.optional(),
   ...stopFields,

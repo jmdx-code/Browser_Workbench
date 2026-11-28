@@ -9,10 +9,8 @@ import {
   type DetailBoundaryValue,
   type RecordCleanup,
 } from '../shared/data-cleanup.js';
-
 type Files = { name: string; bytes: number; modified: number; identity: string }[];
 const yieldTick = () => new Promise<void>((resolve) => setImmediate(resolve));
-
 export class DataCleanupService {
   private progressValue = { running: false, current: 0, total: 0 };
   private busy = false;
@@ -27,7 +25,6 @@ export class DataCleanupService {
       count: number;
     }
   >();
-
   constructor(
     private readonly repository: {
       reclaimHiddenRounds?(maximum?: number): Awaitable<number>;
@@ -69,7 +66,6 @@ export class DataCleanupService {
       ): Awaitable<number>;
     },
   ) {}
-
   progress() {
     return { ...this.progressValue };
   }
@@ -91,7 +87,6 @@ export class DataCleanupService {
       this.busy = false;
     }
   }
-
   private async retainResultsAndDetails(settings: CleanupConfiguration) {
     if (this.repository.pruneResults) {
       await this.drainBatches(
@@ -117,7 +112,6 @@ export class DataCleanupService {
     if (this.repository.reclaimHiddenRounds)
       await this.drainBatches(() => this.repository.reclaimHiddenRounds?.(100) ?? 0);
   }
-
   assertNotResetting() {
     if (this.resetting)
       throw new ProductError('RESET_PENDING', '工作台正在重置，请等待重新打开', 409);
@@ -134,7 +128,6 @@ export class DataCleanupService {
     this.assertIdle();
     return await this.repository.saveSettings(SaveCleanupSettings.parse(input));
   }
-
   async preview(input: unknown) {
     this.assertIdle();
     const selection = CleanupSelection.parse(input);
@@ -158,7 +151,6 @@ export class DataCleanupService {
     this.tickets.set(ticket.token, ticket);
     return { token: ticket.token, expiresAt: ticket.expiresAt, kind: selection.kind, ...count };
   }
-
   async execute(input: unknown) {
     const request = ExecuteCleanup.parse(input);
     this.assertIdle();
@@ -180,17 +172,12 @@ export class DataCleanupService {
         }
         let deleted = 0;
         while (deleted < ticket.count) {
-          const n = await this.repository.removeBatch(
-            ticket.selection.scope,
-            Math.min(100, ticket.count - deleted),
-          );
+          const batchLimit = Math.min(100, ticket.count - deleted);
+          const n = await this.repository.removeBatch(ticket.selection.scope, batchLimit);
           deleted += n;
-          this.progressValue.current = deleted;
+          this.progressValue.current = Math.min(ticket.count, deleted);
           await yieldTick();
-          if (n < 100) break;
-        }
-        if (this.repository.purgeExpiredFeatureOperations) {
-          deleted += await this.repository.purgeExpiredFeatureOperations(ticket.selection.scope);
+          if (n < batchLimit) break;
         }
         return {
           deleted,
@@ -202,7 +189,6 @@ export class DataCleanupService {
       }
     });
   }
-
   async automatic() {
     if (this.busy || this.resetting) return;
     const settings = await this.repository.settings();
@@ -226,9 +212,8 @@ export class DataCleanupService {
         };
         await this.drainBatches(
           () => this.repository.removeBatch(scope, 100),
-          (n) => n === 100,
+          (n) => n >= 100,
         );
-        await this.repository.purgeExpiredFeatureOperations?.(scope);
       }
       await this.retainResultsAndDetails(settings);
       if (settings.automaticLogs) {
@@ -237,7 +222,6 @@ export class DataCleanupService {
       }
     });
   }
-
   async compact() {
     this.assertIdle();
     this.assertAvailable();
@@ -246,7 +230,6 @@ export class DataCleanupService {
       return await this.repository.compact();
     });
   }
-
   async resetStatus() {
     try {
       this.assertIdle();
@@ -266,7 +249,6 @@ export class DataCleanupService {
       };
     }
   }
-
   async resetAll(input: unknown) {
     ResetWorkspace.parse(input);
     this.assertIdle();

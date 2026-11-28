@@ -1,4 +1,4 @@
-import { ProductError } from '../domain/workspace.js';
+import { failError } from '../domain/workspace.js';
 import type {
   GoogleOAuthPort,
   GoogleSheetsApiPort,
@@ -101,18 +101,14 @@ export class GoogleSheetsRestClient implements GoogleSheetsApiPort {
           ? errObj.message
           : rawText.slice(0, 200) || `HTTP ${resp.status}`;
       if (resp.status === 403)
-        throw new ProductError(
+        failError(
           'GOOGLE_SHEETS_FORBIDDEN',
           `无权访问该 Google 表格（请确认已用当前授权 Gmail 拥有编辑权限）：${errMsg}`,
           403,
         );
       if (resp.status === 404)
-        throw new ProductError(
-          'GOOGLE_SHEETS_NOT_FOUND',
-          `找不到该 Google 表格或工作表标签：${errMsg}`,
-          404,
-        );
-      throw new ProductError(
+        failError('GOOGLE_SHEETS_NOT_FOUND', `找不到该 Google 表格或工作表标签：${errMsg}`, 404);
+      failError(
         'GOOGLE_SHEETS_API_ERROR',
         `Google Sheets 接口错误 (${resp.status})：${errMsg}`,
         resp.status >= 400 && resp.status < 500 ? resp.status : 502,

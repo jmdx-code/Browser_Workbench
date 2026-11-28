@@ -279,33 +279,3 @@ test('native committed AI switch outranks stale FDSSwitch child props during a s
       assert.equal(read().value, true);
     },
   ));
-import { projectFacebookPostEffects } from '../src/infrastructure/facebook-post-effect-reader.js';
-test('creator video thumbnail in its own attachment card is not a second uploaded image', () =>
-  dom(
-    '<section role="dialog"><form><div role="textbox" contenteditable="true"></div><input type="file" multiple accept="image/*,video/*"><div role="form"><div role="list"><div role="listitem"><img alt="video thumbnail"><span>0:12</span><button role="button" aria-label="移除视频"></button></div></div></div><button role="button" aria-label="发布"></button></form></section>',
-    () => {
-      const r = projectFacebookPostEffects();
-      assert.ok(r.composer);
-      assert.deepEqual(
-        r.composer.media.map((m) => m.kind),
-        ['video'],
-      );
-      const video = r.composer.media[0];
-      assert.ok(video && video.kind === 'video');
-      assert.equal(video.durationSeconds, 12);
-      assert.equal(r.composer.media[0]?.ready, false);
-    },
-    '/post/create',
-  ));
-test('a photo in another list item is retained beside a video card so mixed input cannot masquerade as one video', () =>
-  dom(
-    '<section role="dialog"><form><div role="textbox" contenteditable="true"></div><input type="file" multiple accept="image/*,video/*"><div role="form"><div role="list"><div role="listitem"><img alt="thumbnail"><span>0:12</span><button role="button" aria-label="移除视频"></button></div><div role="listitem"><img alt="original.png"></div></div></div><button role="button" aria-label="发布"></button></form></section>',
-    () => {
-      const r = projectFacebookPostEffects();
-      assert.deepEqual(
-        r.composer?.media.map((m) => m.kind),
-        ['image', 'video'],
-      );
-    },
-    '/post/create',
-  ));

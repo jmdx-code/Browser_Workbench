@@ -3,16 +3,19 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { productDataDirectory } from '../infrastructure/paths.js';
+type PowerLockMode = 'none' | 'prevent-app-suspension' | 'prevent-display-sleep';
 type HostingStatus = {
   runningCount: number;
   autoMonitorCount: number;
   keepAwake?: boolean;
+  powerLockMode?: PowerLockMode;
   summary: string;
 };
 const EMPTY_HOSTING: HostingStatus = {
   runningCount: 0,
   autoMonitorCount: 0,
   keepAwake: false,
+  powerLockMode: 'none',
   summary: '',
 };
 export function resolveSoftwareVersion(root: string): string {
@@ -85,11 +88,7 @@ export function breakawayFromMsixSandboxIfNeeded(smokeFile: string | undefined):
     const launched = spawnSync(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps],
-      {
-        stdio: 'ignore',
-        windowsHide: true,
-        timeout: 8000,
-      },
+      { stdio: 'ignore', windowsHide: true, timeout: 8000 },
     );
     if (launched.status === 0) app.exit(0);
   } catch {}
@@ -97,8 +96,7 @@ export function breakawayFromMsixSandboxIfNeeded(smokeFile: string | undefined):
 export class DesktopTrayAndPower {
   private tray: Tray | null = null;
   private activePowerBlockerId: number | null = null;
-  private activePowerLockMode: 'none' | 'prevent-app-suspension' | 'prevent-display-sleep' = 'none';
-  private schedulerPowerLockMode = 'none';
+  private activePowerLockMode: PowerLockMode = 'none';
   private hostingStatus: HostingStatus = { ...EMPTY_HOSTING };
   constructor(
     private readonly root: string,
@@ -112,10 +110,10 @@ export class DesktopTrayAndPower {
     const keepAwake =
         this.hostingStatus.runningCount > 0 ||
         (this.hostingStatus.keepAwake ?? this.hostingStatus.autoMonitorCount > 0),
-      desired: 'none' | 'prevent-app-suspension' | 'prevent-display-sleep' =
-        this.schedulerPowerLockMode === 'prevent-display-sleep'
+      desired: PowerLockMode =
+        this.hostingStatus.powerLockMode === 'prevent-display-sleep'
           ? 'prevent-display-sleep'
-          : this.schedulerPowerLockMode === 'prevent-app-suspension' || keepAwake
+          : this.hostingStatus.powerLockMode === 'prevent-app-suspension' || keepAwake
             ? 'prevent-app-suspension'
             : 'none',
       active =
@@ -133,10 +131,6 @@ export class DesktopTrayAndPower {
       this.activePowerBlockerId = null;
     }
   }
-  applyPowerLockMode(mode: string): void {
-    this.schedulerPowerLockMode = mode;
-    this.syncEffectivePowerLock();
-  }
   private syncAndRefresh(): void {
     this.syncEffectivePowerLock();
     this.updateTrayMenu();
@@ -147,7 +141,6 @@ export class DesktopTrayAndPower {
   }
   resetOnControllerExit(): void {
     this.hostingStatus = { ...EMPTY_HOSTING };
-    this.schedulerPowerLockMode = 'none';
     this.syncAndRefresh();
   }
   updateTrayMenu(): void {

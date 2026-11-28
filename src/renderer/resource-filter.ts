@@ -2,7 +2,6 @@ import type { ResourceRowValue } from '../shared/resource-table.js';
 import type { z } from 'zod';
 import type { ResourceSourceRow } from '../shared/resource-source.js';
 import { hasResource, resourceSupportsDestination } from '../domain/resource-table.js';
-
 export type ResourceFilter =
   'all' | 'attention' | 'unchecked' | 'verified' | 'duplicate' | 'drive' | 'post' | 'story';
 // Display-only observation filters. They do not reserve, download, consume or grant publishing.

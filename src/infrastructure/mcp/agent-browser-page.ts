@@ -1,5 +1,4 @@
 import type { KernelBridge } from '../kernel-bridge.js';
-
 export type AgentBrowserConnection = Awaited<ReturnType<KernelBridge['connectAgentBrowser']>>;
 export type AgentBrowserPage = AgentBrowserConnection['page'];
 export type AgentBrowserActionKind =
@@ -14,7 +13,6 @@ export type AgentBrowserActionKind =
   | 'upload_files'
   | 'wait_for_text'
   | 'bring_to_front';
-
 export interface AgentBrowserActParams {
   profileId: string;
   action: AgentBrowserActionKind;
@@ -61,13 +59,11 @@ export interface PageObservation {
   tablePreview: string[][];
   visibleText: string;
 }
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const isTransientNav = (e: unknown) =>
   ['Execution context was destroyed', 'Cannot find context', 'Inspected target navigated'].some(
     (s) => (e instanceof Error ? e.message : String(e)).includes(s),
   );
-
 async function evalHiddenDom(
   page: AgentBrowserPage,
   selector: string,
@@ -152,7 +148,6 @@ async function evalHiddenDom(
     await sleep(120);
   }
 }
-
 export async function scrollPageOrContainer(page: AgentBrowserPage, deltaY: number) {
   return page.evaluate((dy: number) => {
     const docEl = document.scrollingElement || document.documentElement || document.body;
@@ -178,13 +173,11 @@ export async function scrollPageOrContainer(page: AgentBrowserPage, deltaY: numb
     return { scrolledTarget: 'none' as const, scrollY: Math.round(scrollY || 0) };
   }, deltaY);
 }
-
 const GATE_REASONS: Record<'captcha' | 'checkpoint' | 'login', [boolean, string]> = {
   captcha: [true, '检测到 CAPTCHA 挑战，请调用 bring_to_front 让用户手动完成'],
   checkpoint: [true, '检测到账号双重验证 / Checkpoint 页面，请用户手动验证'],
   login: [false, '当前处于登录页面，建议交由用户在浏览器窗口自行登录'],
 };
-
 export async function detectHumanGate(page: AgentBrowserPage): Promise<HumanGateStatus> {
   const kind = await page
     .evaluate(() => {
@@ -233,7 +226,6 @@ export async function detectHumanGate(page: AgentBrowserPage): Promise<HumanGate
     ? { required: hit[0], kind, reason: hit[1] }
     : { required: false, kind: null, reason: null };
 }
-
 function domObserveScript(p: {
   maxElements: number;
   includeTextChars: number;
@@ -357,7 +349,6 @@ function domObserveScript(p: {
       rawText.length > p.includeTextChars ? `${rawText.slice(0, p.includeTextChars)}…` : rawText,
   };
 }
-
 export async function observePageDom(
   page: AgentBrowserPage,
   opts?: { maxElements?: number; includeTextChars?: number; selectorScope?: string },
@@ -374,7 +365,6 @@ export async function observePageDom(
   ]);
   return { ...dom, humanGate, elementsCount: dom.elements.length };
 }
-
 export async function observeWithNavRetry(
   page: AgentBrowserPage,
   opts?: { maxElements?: number; includeTextChars?: number; selectorScope?: string },
@@ -388,7 +378,6 @@ export async function observeWithNavRetry(
     return observePageDom(page, opts);
   }
 }
-
 export async function executeAgentBrowserAction(
   page: AgentBrowserPage,
   input: AgentBrowserActParams,
@@ -423,7 +412,6 @@ export async function executeAgentBrowserAction(
         .catch(() => false)
     : false;
   if (capTarget) throw new Error('CAPTCHA_HUMAN_REQUIRED: 目标属于人机验证组件，禁止自动点击');
-
   const isHidden = await page
     .evaluate(() => document.visibilityState === 'hidden')
     .catch(() => false);

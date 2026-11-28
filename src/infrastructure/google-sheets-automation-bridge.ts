@@ -104,6 +104,82 @@ export class GoogleSheetsAutomationBridge implements SheetAutomationBridgePort {
       signal: input.signal,
     });
   }
+  async switchProfilePageIdentity(input: {
+    profileId: string;
+    targetPageId: string;
+    targetPageName?: string;
+  }): Promise<boolean> {
+    const { kernel, peer } = this.requireOnlinePeer(input.profileId, '切换专页浏览器离线或未就绪');
+    const guard = () => {
+      if (this.core.peers.get(input.profileId) !== peer || !peer.online || !peer.synced)
+        throw new Error('浏览器连接已断开');
+    };
+    const normId = input.targetPageId.trim().toLowerCase();
+    const normName = (input.targetPageName ?? '').trim().toLowerCase();
+    const idle = await kernel.inspectIdleFacebookPage(peer, guard, false, true).catch(() => null);
+    if (idle?.actor.accountId.trim().toLowerCase() === normId) return true;
+    const { reading: switched } = await kernel.readFacebookMetadataPage(
+      peer,
+      guard,
+      async (page) => {
+        await page
+          .goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 25_000 })
+          .catch(() => null);
+        await wait(1200);
+        guard();
+        const menuOpened = await page
+          .evaluate(() => {
+            const btn = Array.from(
+              document.querySelectorAll<HTMLElement>('[role="banner"] [role="button"][aria-label]'),
+            ).find((el) =>
+              /个人主页|你的主页|帳號|账号|account|your profile/i.test(
+                el.getAttribute('aria-label') ?? '',
+              ),
+            );
+            if (!btn) return false;
+            btn.click();
+            return true;
+          })
+          .catch(() => false);
+        if (!menuOpened) return false;
+        await wait(1000);
+        const clicked = await page
+          .evaluate(
+            ({ idLower, nameLower }: { idLower: string; nameLower: string }) => {
+              const items = Array.from(
+                document.querySelectorAll<HTMLElement>(
+                  '[role="dialog"] [role="button"], [role="menu"] [role="menuitem"], [role="dialog"] a[href]',
+                ),
+              );
+              const hit = items.find((el) => {
+                const href = (el.getAttribute('href') ?? '').toLowerCase();
+                const txt = `${el.getAttribute('aria-label') ?? ''} ${el.textContent ?? ''}`
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .toLowerCase();
+                return (
+                  (idLower && href.includes(idLower)) || (nameLower && txt.includes(nameLower))
+                );
+              });
+              if (!hit) return false;
+              hit.click();
+              return true;
+            },
+            { idLower: normId, nameLower: normName },
+          )
+          .catch(() => false);
+        if (clicked) {
+          await wait(2500);
+          await kernel.observeExternalPageAccount?.(input.profileId, page, null)?.catch(() => {});
+        }
+        return clicked;
+      },
+      undefined,
+      30_000,
+      { initialUrl: 'https://www.facebook.com/', forceNewTemporaryTab: true },
+    );
+    return Boolean(switched);
+  }
   async publishScheduledMaterial(input: {
     profileId: string;
     material: PosterMaterial;

@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { Id, NonNegInt, PosInt, addIssue, strictObj } from './contracts.js';
-import { OwnedTabProof } from './kernel-state.js';
 import { ResourceTable } from './resource-table.js';
 import { TaskStep } from './task-contracts.js';
 export {
@@ -30,29 +29,6 @@ export const TaskStepV2 = TaskStep.superRefine((value, issue) => {
       addIssue(issue, 'MARKETPLACE_SKIP_STEP_REQUIRED');
   }
 });
-// Audit evidence only. A recorded role never grants input or permission to close a tab.
-export const TaskChildPageLifecycle = strictObj({
-  version: z.literal(1),
-  role: z.literal('publication-result'),
-  ownershipId: Id,
-  parent: OwnedTabProof,
-  child: OwnedTabProof.nullable(),
-  state: z.enum(['REQUESTED', 'READY', 'CLOSED']),
-}).superRefine((v, ctx) => {
-  const c = v.child;
-  if (
-    v.ownershipId === v.parent.ownershipId ||
-    (v.state === 'REQUESTED' ? c !== null : c === null) ||
-    (c &&
-      (c.ownershipId !== v.ownershipId ||
-        c.profileId !== v.parent.profileId ||
-        c.browserSessionEpoch !== v.parent.browserSessionEpoch ||
-        c.tabId === v.parent.tabId ||
-        c.targetId === v.parent.targetId))
-  )
-    addIssue(ctx, 'TASK_CHILD_PAGE_SCOPE_INVALID');
-});
-export type ChildPageLifecycle = z.infer<typeof TaskChildPageLifecycle>;
 const MARKETPLACE_MIN_BRIDGE = '0.3.19';
 export function marketplaceBridgeSupported(
   version: string | null | undefined,

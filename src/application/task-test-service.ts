@@ -11,7 +11,6 @@ import {
   taskTestModules,
   taskTestStep,
 } from '../shared/task-tests.js';
-
 // Single-task testing creates an ordinary immutable combination and original assignment.
 // Original plans contain the result/stop history. No second execution or test ledger exists.
 export class TaskTestService {
@@ -104,17 +103,27 @@ export class TaskTestService {
       (id) => !rejected.some((item) => item.profileId === id),
     );
     if (!eligible.length) return TaskTestResult.parse({ plans: [], rejected });
+    const allCombos = await this.workspace.repository.combinations();
+    const existingQuickSlot =
+      allCombos.find((row) => row.saved?.note === note) ??
+      allCombos.find((row) => row.saved?.note.startsWith(TEST_COMBINATION_NOTE));
+    const nextCombo = CombinationSchema.parse({
+      name: '单项测试 · ' + module.name,
+      note,
+      steps: [taskTestStep(request, crypto.randomUUID())],
+      randomOrder: false,
+      loop: { mode: 'finite', rounds: 1 },
+    });
     const combination =
-      (await this.workspace.repository.combinations()).find((row) => row.saved?.note === note) ??
-      (await this.workspace.repository.createCombination(
-        CombinationSchema.parse({
-          name: '单项测试 · ' + module.name,
-          note,
-          steps: [taskTestStep(request, crypto.randomUUID())],
-          randomOrder: false,
-          loop: { mode: 'finite', rounds: 1 },
-        }),
-      ));
+      existingQuickSlot && existingQuickSlot.saved?.note === note
+        ? existingQuickSlot
+        : existingQuickSlot && this.workspace.repository.saveCombination
+          ? await this.workspace.repository.saveCombination(
+              existingQuickSlot.id,
+              existingQuickSlot.revision,
+              nextCombo,
+            )
+          : await this.workspace.repository.createCombination(nextCombo);
     const { plans } = await this.tasks.start({
       requestId: request.requestId,
       combinationId: combination.id,

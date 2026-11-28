@@ -3,7 +3,6 @@ import type { Profile, Step } from '../shared/contracts.js';
 import type {
   Assignment,
   Event,
-  Operation,
   Plan,
   ProfileTaskResultValue,
   Progress,
@@ -11,12 +10,16 @@ import type {
   RuntimeRequest,
   Settings,
   StepInstance,
-  TaskRecord,
   TaskRecordsResponse,
 } from '../shared/task-contracts.js';
 import type { ResourceOrigin } from '../shared/resource-materials.js';
-import type { RecordProfile } from './task-record-projection.js';
 import { ProductError } from './workspace.js';
+export type RecordProfile = {
+  id: string;
+  alias?: string | null;
+  browserName?: string | null;
+  account?: { state?: string; id?: string | null; name?: string | null } | null;
+};
 export type RuntimeSnapshotResult = {
   settings: Settings;
   plans: Plan[];
@@ -56,8 +59,6 @@ export interface DirectPublicationInput {
   resourceOrigin?: ResourceOrigin;
 }
 export interface TaskRepository {
-  hiddenRecordIds?(): Awaitable<string[]>;
-  finalRecords?(id: string, round: number): Awaitable<TaskRecord[] | null>;
   recordsPage?(input: unknown, profiles: readonly RecordProfile[]): Awaitable<TaskRecordsResponse>;
   settings(): Awaitable<Settings>;
   setSettings(value: Settings): Awaitable<void>;
@@ -65,9 +66,7 @@ export interface TaskRepository {
   batchExists(batchId: string): Awaitable<boolean>;
   plansForBatch(batchId: string): Awaitable<Plan[]>;
   plansForProfile(profileId: string, states?: readonly Plan['state'][]): Awaitable<Plan[]>;
-  historyPlans?(profileId: string, selectedId?: string): Awaitable<Plan[]>;
   hasProfilePlanInStates(profileId: string, states: readonly Plan['state'][]): Awaitable<boolean>;
-  hasPlanOrOperation?(jobId: string, operationId: string): Awaitable<boolean>;
   list(): Awaitable<Plan[]>;
   livePlans(): Awaitable<Plan[]>;
   get(id: string): Awaitable<Plan>;
@@ -79,6 +78,7 @@ export interface TaskRepository {
   cacheStateToken?(): Awaitable<string | null>;
   claimPlanForProfile(profileId: string, accountId: string | null): Awaitable<Plan | null>;
   bindPlanAccount(id: string, accountId: string): Awaitable<Plan>;
+  requeueBusyAccountPlan?(id: string): Awaitable<Plan>;
   updateStepProgress(id: string, stepId: string, progress: Progress): Awaitable<void>;
   completeStepDirect(id: string, stepId: string, finalProgress?: Progress): Awaitable<Plan>;
   skipStepDirect(
@@ -88,7 +88,8 @@ export interface TaskRepository {
       | 'DEPENDENCY_FAILED'
       | 'RESOURCE_EXHAUSTED'
       | 'FEATURE_UNAVAILABLE'
-      | 'MARKETPLACE_UNAVAILABLE',
+      | 'MARKETPLACE_UNAVAILABLE'
+      | 'USER_STOP',
     dependencyStepId?: string,
   ): Awaitable<Plan>;
   failStepDirect(
@@ -107,10 +108,6 @@ export interface TaskRepository {
   noteQueuedWait?(id: string, reason: string): Awaitable<void>;
   noteRunningWait?(id: string, reason: string): Awaitable<void>;
   recoverOnStartup(preserveFutureSchedules?: boolean): Awaitable<void>;
-  operations(id: string): Awaitable<Operation[]>;
-  recentOperations?(id: string, limit: number): Awaitable<Operation[]>;
-  findOperation?(jobId: string, operationId: string): Awaitable<Operation | null>;
-  blockingOperations?(id: string): Awaitable<Operation[]>;
 }
 export const terminal = (state: Plan['state']) =>
   ['STOPPED', 'COMPLETED', 'FAILED'].includes(state);

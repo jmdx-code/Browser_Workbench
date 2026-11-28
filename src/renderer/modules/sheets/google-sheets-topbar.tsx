@@ -6,34 +6,31 @@ import type {
   PostRecordsSheetConfig,
   PostScheduleSheetConfig,
   ScheduleExecutionCarrier,
-  SheetGridSnapshot,
 } from '../../../shared/google-sheets.js';
 import { api } from '../../api.js';
-import { IconRefresh } from '../../icons.js';
-import { UI_INPUT_SM, UI_SELECT_SM } from '../../ui/primitives.js';
+import { UI_INPUT_SM, UI_ROW_SM, UI_SELECT_SM } from '../../ui/primitives.js';
 import { Btn, Chk } from '../shared/module-ui.js';
-import { RecordsAccountGroupDropdown, ScheduleBluestacksDropdown } from './sheet-config-modal.js';
-
+import {
+  RecordsAccountGroupDropdown,
+  ScheduleBluestacksDropdown,
+  SchedulePolicyDropdown,
+} from './sheet-config-modal.js';
 export function GoogleSheetsTopbar(p: {
   kind: GoogleSheetKind;
   title: string;
   addLabel: string;
   activeLink: GoogleSheetLink | null;
-  activeGrid: SheetGridSnapshot | null;
   allRecordLinks: readonly GoogleSheetLink[];
   profileGroups: readonly Group[];
   profiles: readonly Profile[];
   bluestacksState?: BluestacksState | null;
   isAuthorized: boolean;
-  isMinimalGridKind: boolean;
   isRunning: boolean;
   isAutoEnabled: boolean;
-  gridLoading: boolean;
   busyAction: string | null;
   stoppingLink: boolean;
   patchingConfig: boolean;
   machineNameDraft: string;
-  onRefreshGrid: (id: string) => void;
   onOpenConnect: () => void;
   onOpenConnectRecordForSchedule: (id: string) => void;
   onOpenImportModal: () => void;
@@ -66,7 +63,6 @@ export function GoogleSheetsTopbar(p: {
   } = p;
   const ctrlCls = `${UI_SELECT_SM} max-w-[175px]`,
     busy = Boolean(busyAction);
-
   const autoRunPair = (
     onLbl: string,
     offLbl: string,
@@ -79,7 +75,10 @@ export function GoogleSheetsTopbar(p: {
   ) =>
     activeLink && (
       <>
-        <span className="h-[18px] w-px bg-[var(--line)]" aria-hidden="true" />
+        <span
+          className="hidden h-[18px] w-px bg-[var(--line)] min-[1440px]:inline-block"
+          aria-hidden="true"
+        />
         <Btn
           className={`inline-flex items-center gap-1.5 font-semibold ${isAutoEnabled ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'text-[var(--muted)]'}`}
           disabled={busy || patchingConfig || !isAuthorized}
@@ -105,7 +104,6 @@ export function GoogleSheetsTopbar(p: {
         )}
       </>
     );
-
   return (
     <header className="flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-white px-3 py-2 shadow-xs">
       <div className="flex items-center gap-1.5">
@@ -122,21 +120,6 @@ export function GoogleSheetsTopbar(p: {
             ↗
           </a>
         )}
-        {p.isMinimalGridKind && activeLink && isAuthorized && (
-          <Btn
-            v="icon"
-            disabled={p.gridLoading}
-            aria-label="刷新表格"
-            title={
-              p.activeGrid
-                ? `刷新表格（同步于 ${new Date(p.activeGrid.fetchedAt).toLocaleTimeString()}）`
-                : '刷新表格'
-            }
-            onClick={() => p.onRefreshGrid(activeLink.id)}
-          >
-            <IconRefresh size={13} className={p.gridLoading ? 'animate-spin' : undefined} />
-          </Btn>
-        )}
         {activeLink && isRunning && (
           <span className="inline-flex items-center rounded-full bg-[var(--brand-soft)] px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap text-[var(--brand)]">
             {activeLink.runtime.activeJobText || '执行中…'}
@@ -151,7 +134,7 @@ export function GoogleSheetsTopbar(p: {
           </span>
         )}
       </div>
-      <div className="flex flex-wrap items-center gap-1.5">
+      <div className={UI_ROW_SM}>
         {!activeLink ? (
           <Btn v="primary" disabled={!isAuthorized} onClick={p.onOpenConnect}>
             + {p.addLabel}
@@ -242,6 +225,11 @@ export function GoogleSheetsTopbar(p: {
                     onChange={(patch) => p.onPatchScheduleConfig(activeLink.id, patch)}
                   />
                 )}
+                <SchedulePolicyDropdown
+                  link={activeLink}
+                  disabled={busy || patchingConfig}
+                  onChange={(patch) => p.onPatchScheduleConfig(activeLink.id, patch)}
+                />
                 {autoRunPair(
                   '自动发帖：已开启',
                   '开启自动发帖',

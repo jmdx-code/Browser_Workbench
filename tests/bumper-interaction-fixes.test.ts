@@ -7,8 +7,10 @@ import type { KernelBridge } from '../src/infrastructure/kernel-bridge.js';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { projectGroupBumper } from '../src/infrastructure/group-bumper-effects.js';
 import {
+  confirmedBumperGraphQL,
   GroupBumperBrowserAdapter,
   revealBumperControlIfNeeded,
+  typeBumperComment,
 } from '../src/infrastructure/group-bumper-runner.js';
 import { dismissUnexpectedFacebookOverlays } from '../src/infrastructure/facebook-overlay-dismisser.js';
 import { BumperSettings } from '../src/shared/group-bumper.js';
@@ -1030,4 +1032,253 @@ it('moves an in-viewport control above an edge chat window without closing the c
   expect(top + 32).toBeLessThan(180);
   expect(scroll).toHaveBeenCalledTimes(1);
   expect(chat.isConnected).toBe(true);
+});
+
+it('W3 P0-3: typeBumperComment sends Shift+Enter for newlines, inserts emoji cleanly, and reads back <img alt> emojis', async () => {
+  const editor = document.createElement('div');
+  editor.setAttribute('role', 'textbox');
+  editor.setAttribute('contenteditable', 'true');
+  document.body.appendChild(editor);
+  setRect(editor, { left: 40, top: 200, width: 300, height: 40 });
+  const keysPressed: string[] = [];
+  let currentLine = document.createElement('p');
+  editor.appendChild(currentLine);
+
+  const box = {
+    evaluate: async (fn: (el: HTMLElement) => unknown) => fn(editor),
+    click: async () => {},
+    // Lexical renders emoji as <img alt="🙏"> so innerText omits the emoji!
+    innerText: async () => editor.textContent ?? '',
+    press: async (k: string) => {
+      keysPressed.push(k);
+    },
+    pressSequentially: async () => {},
+  } as unknown as Locator;
+
+  const page = {
+    keyboard: {
+      type: async (ch: string) => {
+        keysPressed.push(`type:${ch}`);
+        currentLine.appendChild(document.createTextNode(ch));
+      },
+      insertText: async (ch: string) => {
+        keysPressed.push(`insert:${ch}`);
+        const img = document.createElement('img');
+        img.setAttribute('alt', ch);
+        currentLine.appendChild(img);
+      },
+      press: async (k: string) => {
+        keysPressed.push(`kpress:${k}`);
+        if (k === 'Shift+Enter') {
+          currentLine = document.createElement('p');
+          editor.appendChild(currentLine);
+        }
+      },
+    },
+  } as unknown as Page;
+
+  await typeBumperComment(page, box, 'Hi\n🙏', 0);
+  expect(keysPressed).toContain('kpress:Shift+Enter');
+  expect(keysPressed).toContain('insert:🙏');
+  expect(keysPressed).not.toContain('Enter');
+  expect(keysPressed).not.toContain('kpress:Enter');
+});
+
+it('W3 P0-3 & P1: confirmedBumperGraphQL accepts CometUFICreateCommentMutation/ufi2_comment_create, and long-press falls back to Like when dock fails to open', async () => {
+  const fbId = btoa('feedback:' + postId);
+  expect(
+    confirmedBumperGraphQL({
+      actorId: '10000000009',
+      feedbackId: fbId,
+      kind: 'comment',
+      comment: 'Line 1 🙏',
+      variables: { input: { feedback_id: fbId, message: { text: 'Line 1 🙏' } } },
+      status: 200,
+      body: JSON.stringify({
+        data: {
+          ufi2_comment_create: {
+            feedback: { id: fbId },
+            feedback_comment_edge: {
+              node: {
+                id: 'c-ufi2-1',
+                author: { id: '10000000009' },
+                body: { text: 'Line 1 🙏' },
+              },
+            },
+          },
+        },
+      }),
+    }),
+  ).toBe(true);
+
+  // When reaction dock fails to open (no CometUFIReactionsMenuDock in DOM), fall back to Like
+  const main = document.querySelector('main');
+  const article = document.createElement('div');
+  article.setAttribute('role', 'article');
+  article.innerHTML = `
+    <a href="https://www.facebook.com/groups/${group}/user/${author}/">Target Page</a>
+    <a href="https://www.facebook.com/groups/${group}/posts/${postId}/">1h</a>
+    <div id="like-btn" role="button" data-ad-rendering-role="like_button" aria-pressed="false" aria-label="赞">赞</div>
+  `;
+  main?.appendChild(article);
+  [article, ...Array.from(article.querySelectorAll('*'))].forEach((el) =>
+    setRect(el, { left: 40, top: 240, width: 120, height: 36 }),
+  );
+  attachFiberChain(article, [
+    {
+      name: 'CometFeedUnitCard.react',
+      props: {
+        feedUnit: {
+          id: btoa('Uzpf:VK:' + postId),
+          creation_time: Math.floor(Date.now() / 1000) - 600,
+          feedback: { id: fbId },
+        },
+      },
+    },
+  ]);
+
+  let likeClicked = 0;
+  const nativeEvents = bumperNativeEvents();
+  const page = {
+    url: () => `https://www.facebook.com/groups/${group}/?sorting_setting=CHRONOLOGICAL`,
+    viewportSize: () => ({ width: 933, height: 602 }),
+    goto: async () => null,
+    waitForURL: async () => {},
+    on: nativeEvents.on,
+    off: nativeEvents.off,
+    mouse: { wheel: async () => {}, move: async () => {} },
+    keyboard: { type: async () => {}, insertText: async () => {} },
+    evaluate: async (fn: Function, arg?: unknown) => {
+      if (fn.name === 'projectGroupInvitationState')
+        return {
+          accountId: '10000000009',
+          ready: true,
+          visible: true,
+          verificationRequired: false,
+        };
+      return fn(arg);
+    },
+    locator: (selector: string) => ({
+      first() {
+        return this;
+      },
+      hover: async () => {},
+      evaluate: async (fn: Function, arg?: unknown) => {
+        const el = document.querySelector(selector);
+        if (!el) throw Error('Element not found: ' + selector);
+        return fn(el, arg);
+      },
+      click: async () => {
+        const el = document.querySelector<HTMLElement>(selector);
+        if (!el) throw Error('Element not found: ' + selector);
+        if (el.id === 'like-btn') {
+          likeClicked++;
+          el.setAttribute('aria-pressed', 'true');
+          nativeEvents.like('10000000009', fbId, BUMPER_REACTION_IDS.like);
+        }
+      },
+    }),
+  };
+  const proof = {
+    ownershipId: '00000000-0000-4000-8000-000000000001',
+    profileId: 'p',
+    browserSessionEpoch: 'session',
+    tabId: 1,
+    targetId: 't',
+  };
+  const conn = {
+    stopRequestId: '00000000-0000-4000-8000-000000000055',
+    revokeInput: () => {},
+    browser: { contexts: () => [{ pages: () => [page] }] },
+    context: async () => ({ accountId: '10000000009' }),
+    execute: async (binding: unknown, work: () => Promise<unknown>) => ({
+      binding,
+      value: await work(),
+    }),
+    reconcile: async () => {},
+    get nativeMutationCalls() {
+      return { input: likeClicked };
+    },
+    close: async () => {},
+    retryClose: async () => {},
+  };
+  const kernel = {
+    withSummary: async (_p: unknown, run: (port: unknown) => unknown) =>
+      run({
+        inventory: async () => ({
+          tabs: [{ state: 'READY', proof }],
+          workspaceMain: proof,
+          operations: [],
+        }),
+      }),
+    inspectFacebookIdentity: async () => ({ actor: { accountId: '10000000009' }, proof }),
+    inspectIdleFacebookPage: async () => ({ actor: { accountId: '10000000009' }, proof }),
+    connectFacebook: async () => conn,
+  };
+  const recorded: unknown[] = [];
+  const repo = {
+    getOperation: async () => null,
+    listOperationsByProfile: async () => [],
+    prepareOperation: async (i: unknown) => i,
+    setOperationResolution: async (_id: string, r: unknown) => r,
+    markOperationSettled: async () => {},
+    markOperationReview: async () => {},
+    confirmSubmission: async (_id: string, r: unknown, _cid: unknown, res: unknown) => {
+      recorded.push(r);
+      return res;
+    },
+    eligibility: async () => ({ today: 0, allowed: true, duplicate: false }),
+    pickComment: async () => null,
+    record: async () => true,
+    updateAvatar: async () => {},
+    applyResolvedTargetMetadata: async () => false,
+  };
+  const runner = new GroupBumperBrowserAdapter(
+    repo as never,
+    () => kernel as never,
+    () =>
+      ({
+        peers: new Map([
+          ['p', { online: true, synced: true, epoch: 'epoch', profileId: 'p', capabilities: [] }],
+        ]),
+      }) as never,
+    async () => false,
+    0,
+  );
+  await runner.run(
+    'p',
+    [
+      {
+        id: group,
+        name: group,
+        avatarUrl: null,
+        folderId: null,
+        sortOrder: 0,
+        totalBumpedCount: 0,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ],
+    [
+      {
+        id: author,
+        name: 'Target Page',
+        avatarUrl: null,
+        folderId: null,
+        sortOrder: 0,
+        totalBumpedCount: 0,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ],
+    BumperSettings.parse({
+      likeProbability: 100,
+      commentProbability: 0,
+      useLongPressReaction: true,
+      reactionTypes: ['care'],
+    }),
+    { cancelled: () => false, status: () => {}, added: () => {} },
+  );
+  expect(likeClicked).toBe(1);
+  expect(recorded.length).toBe(1);
 });

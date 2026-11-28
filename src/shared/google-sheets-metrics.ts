@@ -14,12 +14,7 @@ type LibrarySyncRowInput = {
   displayValues?: string[];
   isHintRow: boolean;
 };
-type LocalLibraryItem = {
-  id: string;
-  category: string;
-  name: string;
-  avatarCellValue: string;
-};
+type LocalLibraryItem = { id: string; category: string; name: string; avatarCellValue: string };
 type LibrarySyncDiffPlan = {
   cellUpdates: Array<{ rowNumber: number; colIndex: number; value: string }>;
   appends: string[][];

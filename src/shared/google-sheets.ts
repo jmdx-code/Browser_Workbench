@@ -23,6 +23,15 @@ export const GoogleSheetKind = z.enum([
 ]);
 export type GoogleSheetKind = z.infer<typeof GoogleSheetKind>;
 export const PAGE_TIMELINE_SYNTHETIC_GROUP_ID = '__page_timeline__';
+export const UNGROUPED_BUCKET_ID = 'ungrouped';
+export const includesUngroupedBucket = (
+  groupIds: readonly string[],
+  includeUngrouped?: boolean,
+): boolean => Boolean(includeUngrouped) || groupIds.includes(UNGROUPED_BUCKET_ID);
+export const resolveEffectiveInstanceIds = (
+  primary?: readonly string[],
+  alias?: readonly string[],
+): string[] => [...new Set([...(primary ?? []), ...(alias ?? [])])];
 export const SheetImageHostPreference = z.enum(['auto', 'gyazo', 'drive']);
 export type SheetImageHostPreference = z.infer<typeof SheetImageHostPreference>;
 const StrArr = z.array(trimReq(120));
@@ -98,6 +107,8 @@ export const PostScheduleSheetConfig = strictObj({
   executionCarrier: ScheduleExecutionCarrier.default('browser'),
   bluestacksFolderIds: StrArr.max(100).default([]),
   bluestacksInstanceIds: StrArr.max(500).default([]),
+  selectedInstanceIds: StrArr.max(500).optional(),
+  includeUngrouped: optBool,
   closeBluestacksOnFinish: boolT,
 });
 export type PostScheduleSheetConfig = z.infer<typeof PostScheduleSheetConfig>;
@@ -108,6 +119,8 @@ export const PostRecordsSheetConfig = strictObj({
   bumperProfileIds: StrArr.max(500).default([]),
   bumperBluestacksFolderIds: StrArr.max(100).default([]),
   bumperBluestacksIds: StrArr.max(500).default([]),
+  selectedInstanceIds: StrArr.max(500).optional(),
+  includeUngrouped: optBool,
   bumperSettings: BumperSettings.default(() => BumperSettings.parse({})),
   commentPool: z.array(trimReq(1000)).max(2000).default([]),
   collectMetricsOnThisPc: boolF,
@@ -116,11 +129,20 @@ export const PostRecordsSheetConfig = strictObj({
   semiActiveAfterIdlePolls: intRange(1, 30).default(5),
 });
 export type PostRecordsSheetConfig = z.infer<typeof PostRecordsSheetConfig>;
+export const sheetScheduleRetryFields = {
+  attemptCount: NonNegInt.optional(),
+  nextRetryAt: NumNull.optional(),
+  lastError: StrNull.optional(),
+};
+export const SheetScheduleRetryMeta = z.object(sheetScheduleRetryFields);
+export type SheetScheduleRetryMeta = z.infer<typeof SheetScheduleRetryMeta>;
 export const SheetPollingModeSchema = z.enum(['idle', 'active', 'semi_active']);
 export const GoogleSheetLinkRuntime = z.object({
   lastSyncedAt: NumNull.default(null),
   lastSyncSummary: z.string().default(''),
   lastError: StrNull.default(null),
+  attemptCount: NonNegInt.optional(),
+  nextRetryAt: NumNull.optional(),
   pollingMode: SheetPollingModeSchema.default('idle'),
   consecutiveIdlePolls: NonNegInt.default(0),
   nextPollAt: NumNull.default(null),

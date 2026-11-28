@@ -22,7 +22,7 @@ export const WorkspaceInvalidationEvent = strictObj({
 });
 export type WorkspaceInvalidationEvent = z.infer<typeof WorkspaceInvalidationEvent>;
 const READ_ONLY_POST_ROUTES = new Set(
-  '/api/workspace/tasks/records /api/workspace/tasks/history /api/workspace/resource-tables/read /api/workspace/data-cleanup/preview /api/workspace/post-bump-records/list /api/workspace/diagnostics/snapshot /api/workspace/diagnostics/reveal'.split(
+  '/api/workspace/tasks/records /api/workspace/resource-tables/read /api/workspace/data-cleanup/preview /api/workspace/post-bump-records/list /api/workspace/diagnostics/snapshot /api/workspace/diagnostics/reveal'.split(
     ' ',
   ),
 );
@@ -50,6 +50,8 @@ const ROUTE_TOPICS: ReadonlyArray<[string, WorkspaceEventTopic[]]> = [
     ],
   ],
   ['/api/workspace/post-bump-records', ['records', 'workspace', 'tasks']],
+  ['/api/workspace/browser-risk-limits', ['records', 'workspace']],
+  ['/api/workspace/inviter-records', ['records', 'group-inviter', 'workspace']],
   ['/api/workspace/cleanup', ['records', 'workspace', 'tasks']],
 ];
 export function inferEventTopicsForRoute(route: string): WorkspaceEventTopic[] {

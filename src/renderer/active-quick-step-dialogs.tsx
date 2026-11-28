@@ -7,18 +7,10 @@ import type { Combination, Step } from '../shared/contracts.js';
 import type { BumperTarget } from '../shared/group-bumper.js';
 import { taskTestModules, TaskTestRequest, type TestRequest } from '../shared/task-tests.js';
 import { api } from './api.js';
-import { Btn, Chk, CtrlNum, useBusyTask, useShowModal } from './modules/shared/module-ui.js';
-import { StepConfigFields, type FeedModeValue } from './step-config-fields.js';
-import {
-  UI_COUNT_CHIP,
-  UI_DANGER_TEXT,
-  UI_DIALOG_CARD,
-  UI_INPUT_SM,
-  UI_UNIT_FIELD,
-} from './ui/primitives.js';
-
+import { Chk, NativeFormDialog, useBusyTask } from './modules/shared/module-ui.js';
+import { Num, StepConfigFields, type FeedModeValue } from './step-config-fields.js';
+import { UI_COUNT_CHIP, UI_INPUT_SM } from './ui/primitives.js';
 export type BrowseModule = TestRequest['module'];
-
 export const BROWSER_INSTANT_MODULES = taskTestModules.filter(
   (
     item,
@@ -27,73 +19,50 @@ export const BROWSER_INSTANT_MODULES = taskTestModules.filter(
     type: NonNullable<(typeof taskTestModules)[number]['type']>;
   } => item.id !== 'post' && item.id !== 'story' && item.type !== null,
 );
-
-export const BLUESTACKS_QUICK_ACTIONS: ReadonlyArray<{
-  type: BluestacksQuickActiveStepType;
-  name: string;
-  dot: string;
-  detail: string;
-  dur?: boolean;
-  likes?: boolean;
-  accepts?: boolean;
-  comp?: boolean;
-}> = [
-  {
-    type: 'feed',
-    name: '浏览首页',
-    dot: 'bg-emerald-500',
-    detail: '按设定时长与点赞上限刷 FB Lite 首页推荐流',
+const bsAct = (
+  type: BluestacksQuickActiveStepType,
+  name: string,
+  dot: string,
+  detail: string,
+  flags: { dur?: boolean; likes?: boolean; accepts?: boolean; comp?: boolean },
+) => ({ type, name, dot, detail, ...flags });
+export const BLUESTACKS_QUICK_ACTIONS: ReadonlyArray<ReturnType<typeof bsAct>> = [
+  bsAct('feed', '浏览首页', 'bg-emerald-500', '按设定时长与点赞上限刷 FB Lite 首页推荐流', {
     dur: true,
     likes: true,
-  },
-  {
-    type: 'video',
-    name: '浏览 Reels',
-    dot: 'bg-violet-500',
-    detail: '按设定时长与点赞上限刷 FB Lite Reels 短视频',
+  }),
+  bsAct('video', '浏览 Reels', 'bg-violet-500', '按设定时长与点赞上限刷 FB Lite Reels 短视频', {
     dur: true,
     likes: true,
-  },
-  {
-    type: 'marketplace',
-    name: '浏览商城',
-    dot: 'bg-amber-500',
-    detail: '按设定时长浏览 FB Lite Marketplace 商品（个人号支持）',
-    dur: true,
-  },
-  {
-    type: 'friends',
-    name: '接受好友',
-    dot: 'bg-sky-500',
-    detail: '按时长或通过上限确认 FB Lite 好友请求（个人号支持）',
-    dur: true,
-    accepts: true,
-  },
-  {
-    type: 'post',
-    name: '发时间线',
-    dot: 'bg-pink-500',
-    detail: '向当前 FB Lite 个人或专页时间线发布文案/本地媒体',
+  }),
+  bsAct(
+    'marketplace',
+    '浏览商城',
+    'bg-amber-500',
+    '按设定时长浏览 FB Lite Marketplace 商品（个人号支持）',
+    { dur: true },
+  ),
+  bsAct(
+    'friends',
+    '接受好友',
+    'bg-sky-500',
+    '按时长或通过上限确认 FB Lite 好友请求（个人号支持）',
+    { dur: true, accepts: true },
+  ),
+  bsAct('post', '发时间线', 'bg-pink-500', '向当前 FB Lite 个人或专页时间线发布文案/本地媒体', {
     comp: true,
-  },
-  {
-    type: 'story',
-    name: '发布快拍',
-    dot: 'bg-pink-500',
-    detail: '向当前 FB Lite 账号发布本地图片或视频快拍',
+  }),
+  bsAct('story', '发布快拍', 'bg-pink-500', '向当前 FB Lite 账号发布本地图片或视频快拍', {
     comp: true,
-  },
+  }),
 ];
-
 type BluestacksStepSupport = 'supported' | 'degraded' | 'unsupported';
-
 export function bluestacksStepSupport(step: Step): BluestacksStepSupport {
   if (step.type === 'post') return 'unsupported';
   if (step.type === 'friends' && step.friendAction === 'add_suggested') return 'unsupported';
   if (step.type === 'feed' && step.feedMode && step.feedMode !== 'home') return 'degraded';
   return 'supported';
 }
-
 export function evaluateBluestacksCombination(saved: Combination): {
   enabled: boolean;
   reason: string;
@@ -141,9 +110,7 @@ export function evaluateBluestacksCombination(saved: Combination): {
   }
   return { enabled: true, reason: '', supportedCount, totalCount, hasPartialUnsupported };
 }
-
 const EXPLORE_MODES: readonly FeedModeValue[] = ['random_profile', 'random_page', 'search_pages'];
-
 function defaultStepForModule(module: BrowseModule): Step {
   const id = '00000000-0000-4000-8000-000000000001';
   if (module === 'friends' || module === 'add_friends')
@@ -186,7 +153,6 @@ function defaultStepForModule(module: BrowseModule): Step {
     skipSponsored: true,
   };
 }
-
 function stepToTestRequest(
   module: BrowseModule,
   step: Step,
@@ -247,7 +213,6 @@ function stepToTestRequest(
       : {}),
   };
 }
-
 export function TaskTestDialog(p: {
   module: BrowseModule;
   count: number;
@@ -255,13 +220,11 @@ export function TaskTestDialog(p: {
   onSubmit: (value: Omit<TestRequest, 'profileIds'>) => Promise<void>;
   onClose: () => void;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null),
-    pending = useRef<{ key: string; id: string } | null>(null);
+  const pending = useRef<{ key: string; id: string } | null>(null);
   const [step, setStep] = useState<Step>(() => defaultStepForModule(p.module)),
     [closeBrowserOnFinish, setCloseBrowserOnFinish] = useState(p.defaultCloseBrowser),
     [libraryPages, setLibraryPages] = useState<BumperTarget[]>([]);
   const { busy, error, setError, run } = useBusyTask();
-  useShowModal(dialog);
   useEffect(() => {
     if (p.module !== 'explore_pages') return;
     let alive = true;
@@ -287,89 +250,39 @@ export function TaskTestDialog(p: {
     const { profileIds: _ids, ...value } = parsed.data;
     void run(() => p.onSubmit(value), '启动失败', p.onClose);
   };
+  const title = BROWSER_INSTANT_MODULES.find((item) => item.id === p.module)?.name ?? '';
   return (
-    <dialog
-      ref={dialog}
-      className={`${UI_DIALOG_CARD} w-[min(480px,calc(100vw-32px))]`}
-      onCancel={(e) => {
-        e.preventDefault();
-        if (!busy) p.onClose();
-      }}
+    <NativeFormDialog
+      ariaLabel={title}
+      title={title}
+      className="w-[min(480px,calc(100vw-32px))]"
+      busy={busy}
+      error={error}
+      submitLabel={busy ? '启动中…' : '开始执行'}
+      onClose={p.onClose}
+      onSubmit={submit}
     >
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h3 className="m-0 text-base font-semibold text-slate-900">
-          {BROWSER_INSTANT_MODULES.find((item) => item.id === p.module)?.name}
-        </h3>
+      <div className="-mt-2 flex justify-end">
         <span className={UI_COUNT_CHIP}>{p.count} 个浏览器</span>
       </div>
-      <div className="mb-3">
-        <StepConfigFields
-          step={step}
-          libraryPages={libraryPages}
-          disabled={busy}
-          showFeedModeSelector={p.module === 'explore_pages'}
-          showFriendActionSelector={false}
-          feedModeOptions={EXPLORE_MODES}
-          onChange={(patch) => setStep((prev) => ({ ...prev, ...patch }) as Step)}
-        />
-      </div>
+      <StepConfigFields
+        step={step}
+        libraryPages={libraryPages}
+        disabled={busy}
+        showFeedModeSelector={p.module === 'explore_pages'}
+        showFriendActionSelector={false}
+        feedModeOptions={EXPLORE_MODES}
+        onChange={(patch) => setStep((prev) => ({ ...prev, ...patch }) as Step)}
+      />
       <Chk
-        className="mb-3"
         label="完毕后关闭浏览器"
         checked={closeBrowserOnFinish}
         disabled={busy}
         onChange={setCloseBrowserOnFinish}
       />
-      {error && (
-        <p className={`${UI_DANGER_TEXT} mb-3`} role="alert">
-          {error}
-        </p>
-      )}
-      <footer className="flex justify-end gap-2 border-t border-[var(--line)] pt-3">
-        <Btn sm={false} disabled={busy} onClick={p.onClose}>
-          取消
-        </Btn>
-        <Btn v="primary" sm={false} disabled={busy} onClick={submit}>
-          {busy ? '启动中…' : '开始执行'}
-        </Btn>
-      </footer>
-    </dialog>
+    </NativeFormDialog>
   );
 }
-
-function NumUnitField(p: {
-  label: string;
-  aria: string;
-  unit: string;
-  min: number;
-  max: number;
-  def: number;
-  val: number;
-  disabled: boolean;
-  onChange: (next: number) => void;
-}) {
-  return (
-    <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
-      <span>{p.label}</span>
-      <div className={UI_UNIT_FIELD}>
-        <CtrlNum
-          aria={p.aria}
-          className="h-full min-w-0 flex-1 border-0 bg-transparent px-2 text-xs text-[var(--text)] focus:outline-none disabled:bg-slate-50"
-          min={p.min}
-          max={p.max}
-          def={p.def}
-          val={p.val}
-          disabled={p.disabled}
-          onChange={p.onChange}
-        />
-        <span className="border-l border-[var(--line)] bg-slate-50 px-2 text-[11px] leading-8 font-medium text-[var(--text-3)] select-none">
-          {p.unit}
-        </span>
-      </div>
-    </label>
-  );
-}
-
 export function BluestacksQuickStepDialog(p: {
   stepType: BluestacksQuickActiveStepType;
   instanceIds: string[];
@@ -381,7 +294,6 @@ export function BluestacksQuickStepDialog(p: {
   }) => Promise<void>;
   onClose: () => void;
 }) {
-  const dialog = useRef<HTMLDialogElement>(null);
   const def =
     BLUESTACKS_QUICK_ACTIONS.find((a) => a.type === p.stepType) ?? BLUESTACKS_QUICK_ACTIONS[0];
   const [durationMinutes, setDurationMinutes] = useState(p.stepType === 'friends' ? 15 : 3);
@@ -391,8 +303,6 @@ export function BluestacksQuickStepDialog(p: {
   const [mediaPath, setMediaPath] = useState('');
   const [closeWindowOnFinish, setCloseWindowOnFinish] = useState(p.defaultCloseWindow);
   const { busy, error, setError, run } = useBusyTask();
-  useShowModal(dialog);
-
   const labelCls = 'flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]';
   const submit = () => {
     if (busy) return;
@@ -417,58 +327,55 @@ export function BluestacksQuickStepDialog(p: {
     if (!parsed.success) return setError(parsed.error.issues[0]?.message ?? '参数不正确');
     void run(() => p.onSubmit(payload), '启动蓝蝶快捷活跃失败', p.onClose);
   };
-
   return (
-    <dialog
-      ref={dialog}
-      className={`${UI_DIALOG_CARD} w-[min(460px,calc(100vw-32px))]`}
-      onCancel={(e) => {
-        e.preventDefault();
-        if (!busy) p.onClose();
-      }}
+    <NativeFormDialog
+      ariaLabel={def?.name ?? ''}
+      title={def?.name ?? ''}
+      className="w-[min(460px,calc(100vw-32px))]"
+      busy={busy}
+      error={error}
+      submitLabel={busy ? '启动中…' : '开始执行'}
+      onClose={p.onClose}
+      onSubmit={submit}
     >
-      <div className="mb-3 flex items-center justify-between gap-2">
-        <h3 className="m-0 text-base font-semibold text-slate-900">{def?.name}</h3>
+      <div className="-mt-2 flex justify-end">
         <span className={UI_COUNT_CHIP}>{p.instanceIds.length} 台蓝蝶</span>
       </div>
-      <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2.5 max-[600px]:grid-cols-1">
+      <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 max-[600px]:grid-cols-1">
         {def?.dur && (
-          <NumUnitField
-            label="浏览时长"
+          <Num
+            l="浏览时长"
             aria="持续时长"
-            unit="分钟"
+            u="分钟"
             min={1}
             max={60}
-            def={3}
             val={durationMinutes}
-            disabled={busy}
-            onChange={setDurationMinutes}
+            dis={busy}
+            set={setDurationMinutes}
           />
         )}
         {def?.likes && (
-          <NumUnitField
-            label="点赞上限"
+          <Num
+            l="点赞上限"
             aria="最多点赞次数"
-            unit="次"
+            u="次"
             min={0}
             max={50}
-            def={2}
             val={maxLikes}
-            disabled={busy}
-            onChange={setMaxLikes}
+            dis={busy}
+            set={setMaxLikes}
           />
         )}
         {def?.accepts && (
-          <NumUnitField
-            label="通过上限"
+          <Num
+            l="通过上限"
             aria="最多通过人数"
-            unit="人"
+            u="人"
             min={1}
             max={50}
-            def={3}
             val={maxAccepts}
-            disabled={busy}
-            onChange={setMaxAccepts}
+            dis={busy}
+            set={setMaxAccepts}
           />
         )}
         {def?.comp && p.stepType === 'post' && (
@@ -499,25 +406,11 @@ export function BluestacksQuickStepDialog(p: {
         )}
       </div>
       <Chk
-        className="mb-3"
         label="完毕后关闭蓝蝶窗口"
         checked={closeWindowOnFinish}
         disabled={busy}
         onChange={setCloseWindowOnFinish}
       />
-      {error && (
-        <p className={`${UI_DANGER_TEXT} mb-3`} role="alert">
-          {error}
-        </p>
-      )}
-      <footer className="flex justify-end gap-2 border-t border-[var(--line)] pt-3">
-        <Btn sm={false} disabled={busy} onClick={p.onClose}>
-          取消
-        </Btn>
-        <Btn v="primary" sm={false} disabled={busy} onClick={submit}>
-          {busy ? '启动中…' : '开始执行'}
-        </Btn>
-      </footer>
-    </dialog>
+    </NativeFormDialog>
   );
 }

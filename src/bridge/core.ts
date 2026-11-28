@@ -319,12 +319,7 @@ export class Core {
       idle: boolean,
       reason: KernelProfileIdleInspection['reason'],
       unresolvedCount = 0,
-    ): KernelProfileIdleInspection => ({
-      idle,
-      reason,
-      unresolvedCount,
-      legacyFixtureCount: 0,
-    });
+    ): KernelProfileIdleInspection => ({ idle, reason, unresolvedCount, legacyFixtureCount: 0 });
     if (!peer || !this.current(peer)) return res(false, 'PEER_OFFLINE', unresolved.length);
     if (this.kernelOwners.has(peer.profileId)) return res(false, 'KERNEL_OWNED');
     if (this.queuedIntents.get(peer.profileId)) return res(false, 'QUEUED_INTENTS');
@@ -341,10 +336,7 @@ export class Core {
   async claimFixtureKernel(peer: Peer, owner: string): Promise<void> {
     const admission = this.evaluateKernelAdmission(peer, []);
     if (!admission.idle) {
-      devDiag.record({
-        level: 'WARN',
-        category: 'KERNEL_RPC',
-        event: 'KERNEL_PROFILE_NOT_IDLE',
+      devDiag.emit('WARN', 'KERNEL_RPC', 'KERNEL_PROFILE_NOT_IDLE', {
         profileId: peer.profileId,
         reason: admission.reason,
         data: {

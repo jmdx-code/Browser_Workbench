@@ -4,50 +4,45 @@ import type { PosterTask } from '../../shared/group-poster.js';
 import * as M from './mcp-context.js';
 import { createBluestacksTools } from './tools-bluestacks.js';
 import { createBumperAndInviterTools } from './tools-bumper-inviter.js';
-
 const enrichPosterTask = (t: PosterTask) => ({
   ...t,
   ...M.pick(t, 'scheduledAt@ createdAt@ startedAt@ finishedAt@'),
 });
-
-async function prepareMaterials(
+const prepareMaterials = (
   deps: M.WorkbenchMcpDependencies,
   ids: readonly string[],
   withMat: boolean,
-) {
-  return Promise.all(
+) =>
+  Promise.all(
     ids.map(async (id) => {
       try {
         const mat = await deps.groupPosterService.prepareMaterialById(id);
         const ready = mat?.cacheStatus === 'ready';
         const error = mat?.cacheError ?? null;
-        return withMat
-          ? error && !mat
-            ? { id, ok: false, error }
-            : { id, ok: mat !== null && ready, material: mat }
-          : { id, ready, error };
+        if (!withMat) return { id, ready, error };
+        return error && !mat
+          ? { id, ok: false, error }
+          : { id, ok: Boolean(mat && ready), material: mat };
       } catch (err) {
         const error = M.errMsg(err);
         return withMat ? { id, ok: false, error } : { id, ready: false, error };
       }
     }),
   );
-}
-
 async function handleSaveMaterial(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const poster = deps.groupPosterService;
   return M.act(M.strArg(args.action) || 'save', {
-    save_settings: async () => {
-      const cur = (await poster.state()).settings;
-      return {
-        settings: (
-          await poster.saveSettings({
-            ...cur,
-            ...M.pickTypes(M.objArg(args.settings), 'maxConcurrentProfiles:n maxPostsPerAccount:n'),
-          })
-        ).settings,
-      };
-    },
+    save_settings: async () => ({
+      settings: (
+        await poster.saveSettings({
+          ...(await poster.state()).settings,
+          ...M.pickTypes(
+            M.objArg(args.settings),
+            'maxConcurrentProfiles:n maxPostsPerAccount:n closeBrowserOnFinish:b',
+          ),
+        })
+      ).settings,
+    }),
     delete: async () => {
       const ids = M.strArrArg(args.ids);
       M.req(ids.length > 0, 'IDS_REQUIRED', '请提供要删除的素材 ids');
@@ -89,7 +84,6 @@ async function handleSaveMaterial(deps: M.WorkbenchMcpDependencies, args: Record
     },
   });
 }
-
 async function handlePosterDispatch(
   deps: M.WorkbenchMcpDependencies,
   args: Record<string, unknown>,
@@ -126,8 +120,37 @@ async function handlePosterDispatch(
       ...M.pick(await poster.state(), 'running statusText profileCounts'),
     };
   }
+  if (action === 'resolve_pending') {
+    const operationId = M.strArg(args.operationId);
+    M.req(operationId, 'OPERATION_ID_REQUIRED', 'resolve_pending 需要提供 operationId');
+    const resolution = args.resolution;
+    M.req(
+      resolution === 'confirmed' || resolution === 'not_applied',
+      'RESOLUTION_REQUIRED',
+      'resolution 必须为 confirmed 或 not_applied',
+    );
+    const note = M.strArg(args.note) || M.strArg(args.reason);
+    const st = await poster.resolvePendingOperation({
+      operationId,
+      resolution,
+      ...(note ? { note } : {}),
+    });
+    return {
+      ok: true,
+      operationId,
+      resolution,
+      pendingReviewOperations: st.pendingReviewOperations ?? [],
+      statusText: st.statusText,
+    };
+  }
   const rawTasks = Array.isArray(args.tasks) ? args.tasks : [];
   M.req(rawTasks.length > 0, 'TASKS_REQUIRED', 'create_tasks 需要提供至少 1 条任务定义 tasks');
+  if (rawTasks.length > 1) {
+    const immediateMatIds = [
+      ...new Set(rawTasks.map((i) => M.strArg(M.objArg(i).materialId)).filter(Boolean)),
+    ];
+    if (immediateMatIds.length > 1) await prepareMaterials(deps, immediateMatIds, false);
+  }
   const hasImmediate = rawTasks.some((i) => {
     try {
       return M.parseFlexibleScheduleTime(M.objArg(i).scheduledAt).mode === 'immediate';
@@ -153,9 +176,9 @@ async function handlePosterDispatch(
   const enriched = await M.buildEnrichedProfiles(deps);
   const schedulerSvc = deps.getAutoSchedulerService?.();
   const outcomes: Array<Record<string, unknown>> = [];
-  for (let idx = 0; idx < rawTasks.length; idx++) {
-    if (typeof rawTasks[idx] !== 'object' || rawTasks[idx] === null) continue;
-    const rec = M.objArg(rawTasks[idx]);
+  for (let index = 0; index < rawTasks.length; index++) {
+    if (typeof rawTasks[index] !== 'object' || rawTasks[index] === null) continue;
+    const rec = M.objArg(rawTasks[index]);
     const materialId = M.strArg(rec.materialId);
     const groupIds = M.extractGroupIds(rec.groupIds);
     const accountMode: 'selected' | 'all_online' =
@@ -187,7 +210,7 @@ async function handlePosterDispatch(
           },
         );
         outcomes.push({
-          index: idx,
+          index,
           ok: true,
           created: true,
           scheduledViaAutoScheduler: true,
@@ -204,10 +227,14 @@ async function handlePosterDispatch(
         accountMode,
         profileIds,
         scheduledAt: sched.scheduledAt,
+        closeBrowserOnFinish:
+          typeof rec.closeBrowserOnFinish === 'boolean'
+            ? rec.closeBrowserOnFinish
+            : args.closeBrowserOnFinish === true,
       });
       const created = (currentState.tasks ?? []).find((t) => !beforeIds.has(t.id)) ?? null;
       outcomes.push({
-        index: idx,
+        index,
         ok: true,
         created: created !== null,
         allAlreadyPostedSkipped: created === null,
@@ -216,7 +243,7 @@ async function handlePosterDispatch(
         statusText: currentState.statusText,
       });
     } catch (err) {
-      outcomes.push({ index: idx, ok: false, materialId, error: M.errMsg(err) });
+      outcomes.push({ index, ok: false, materialId, error: M.errMsg(err) });
     }
   }
   return {
@@ -227,7 +254,6 @@ async function handlePosterDispatch(
     ...M.pick(await poster.state(), 'running statusText profileCounts'),
   };
 }
-
 export function createPosterAndModuleTools(
   deps: M.WorkbenchMcpDependencies,
 ): M.McpToolDefinition[] {
@@ -235,14 +261,14 @@ export function createPosterAndModuleTools(
     M.reg(
       'wb_poster_state',
       '查询「小组发帖」模块真实状态与任务队列。',
-      M.sp('includeGroups:b:是否返回共享小组列表'),
+      'includeGroups:b:是否返回共享小组列表',
       async (args) => {
         const st = await deps.groupPosterService.state();
         const postedByMat = st.postedGroupIdsByMaterial ?? {};
         return {
           ...M.pick(
             st,
-            'running statusText settings profileCounts dailyStats activeGroupsByMaterial pendingReviewOperations#',
+            'running statusText settings profileCounts activeGroupsByMaterial pendingReviewOperations#',
           ),
           totalPostedAllTime: st.total,
           groupsCount: st.groups.length,
@@ -275,7 +301,9 @@ export function createPosterAndModuleTools(
             '贴文素材列表',
           ),
           settings: M.O('发帖设置', {
-            properties: M.sp('maxConcurrentProfiles:n(1,50)|maxPostsPerAccount:n(1,200)'),
+            properties: M.sp(
+              'maxConcurrentProfiles:n(1,50)|maxPostsPerAccount:n(1,200)|closeBrowserOnFinish:b:任务完成后自动关闭浏览器',
+            ),
           }),
         },
       ),
@@ -283,14 +311,14 @@ export function createPosterAndModuleTools(
     ),
     M.reg(
       'wb_poster_dispatch',
-      '派发、取消、删除或停止「小组发帖」任务。',
+      '派发、取消、删除、停止「小组发帖」任务或处理待核对操作。',
       M.sp(
-        '@taskId|@profileIds|action:e(create_tasks cancel_task delete_task stop_all stop_profiles):调度动作|autoAddMissingGroups:b:未入库小组自动补入',
+        '@taskId|@profileIds|action:e(create_tasks cancel_task delete_task stop_all stop_profiles resolve_pending):调度动作|autoAddMissingGroups:b:未入库小组自动补入|closeBrowserOnFinish:b:任务完成后关闭浏览器|operationId:s:待核对操作ID|resolution:e(not_applied confirmed):待核对处理结论|note:s:核对备注',
         {
           tasks: M.A(
             M.O(undefined, {
               properties: M.sp(
-                'materialId:s:素材ID|groupIds:sa:目标小组ID/链接|accountMode:e(selected all_online):账号选择模式|profileIds:sa:浏览器ID列表|scheduledAt:u(string number null):定时时间',
+                'materialId:s:素材ID|groupIds:sa:目标小组ID/链接|accountMode:e(selected all_online):账号选择模式|profileIds:sa:浏览器ID列表|scheduledAt:u(string number null):定时时间|closeBrowserOnFinish:b:任务完成后关闭浏览器',
               ),
               required: ['materialId', 'groupIds'],
             }),
@@ -303,7 +331,7 @@ export function createPosterAndModuleTools(
     M.reg(
       'wb_poster_logs',
       '查询「小组发帖」已落盘回执日志与待核对记录。',
-      M.sp('@search|@limit|materialId:s:按素材ID过滤'),
+      '@search|@limit|materialId:s:按素材ID过滤',
       async (args) => {
         const limit = M.clampInt(args.limit, 50, 1, 200);
         const [rows, st] = await Promise.all([

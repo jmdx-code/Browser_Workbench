@@ -10,26 +10,10 @@ import {
   type RefObject,
 } from 'react';
 import { copyTextToClipboard } from './clipboard.js';
-
-export interface GridRange {
-  startRow: number;
-  startCol: number;
-  endRow: number;
-  endCol: number;
-}
-export interface GridBounds {
-  minRow: number;
-  maxRow: number;
-  minCol: number;
-  maxCol: number;
-}
-export interface EditingCell {
-  row: number;
-  col: number;
-  value: string;
-}
+export type GridRange = { startRow: number; startCol: number; endRow: number; endCol: number };
+export type GridBounds = { minRow: number; maxRow: number; minCol: number; maxCol: number };
+export type EditingCell = { row: number; col: number; value: string };
 export type GridDragMode = 'cells' | 'rows' | 'fill' | null;
-
 export const computeGridBounds = (r: GridRange | null): GridBounds | null =>
   r
     ? {
@@ -43,23 +27,19 @@ export const isCellInGridBounds = (b: GridBounds | null, r: number, c: number) =
   Boolean(b && r >= b.minRow && r <= b.maxRow && c >= b.minCol && c <= b.maxCol);
 export const isRowInGridBounds = (b: GridBounds | null, r: number, cols: number) =>
   Boolean(b && r >= b.minRow && r <= b.maxRow && b.minCol === 0 && b.maxCol >= cols - 1);
-
 export function getSelectedRowIndices(b: GridBounds | null, rowCount: number): number[] {
   if (!b) return [];
   const out: number[] = [];
   for (let r = Math.max(0, b.minRow); r <= Math.min(rowCount - 1, b.maxRow); r += 1) out.push(r);
   return out;
 }
-
 function isFillPreviewCell(endRow: number | null, b: GridBounds | null, r: number, c: number) {
   if (endRow === null || !b || c < b.minCol || c > b.maxCol) return false;
   return endRow > b.maxRow
     ? r > b.maxRow && r <= endRow
     : endRow < b.minRow && r < b.minRow && r >= endRow;
 }
-
 const quoteGridCell = (v: string) => (/[\t\r\n"]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-
 export function expandFillDownTsv<TRow>(
   rows: readonly TRow[],
   b: GridBounds,
@@ -75,20 +55,24 @@ export function expandFillDownTsv<TRow>(
     (tpl[i % tpl.length] ?? []).map(quoteGridCell).join('\t'),
   ).join('\n');
 }
-
+type DesktopWinMaybe = Window & {
+  workbenchDesktop?: { materialFilePath?: (file: File) => string };
+};
+export function resolveElectronFilePath(file: File): string {
+  const fromBridge =
+    typeof window !== 'undefined'
+      ? (window as DesktopWinMaybe).workbenchDesktop?.materialFilePath?.(file)?.trim()
+      : '';
+  if (fromBridge) return fromBridge;
+  return (file as File & { path?: string }).path?.trim() ?? '';
+}
 export const parseElectronFilePaths = (files: FileList | null): string[] =>
-  files
-    ? Array.from(files)
-        .map((f) => (f as File & { path?: string }).path?.trim() ?? '')
-        .filter(Boolean)
-    : [];
-
+  files ? Array.from(files).map(resolveElectronFilePath).filter(Boolean) : [];
 function syncTextareaHeight(el: HTMLTextAreaElement | null): void {
   if (!el) return;
   el.style.height = 'auto';
   el.style.height = `${Math.max(el.scrollHeight, 24)}px`;
 }
-
 export function useSpreadsheetGrid<TRow>(opts: {
   rows: TRow[];
   colCount: number;
@@ -138,7 +122,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
   selectionRef.current = selection;
   fillEndRowRef.current = fillEndRow;
   optsRef.current = opts;
-
   const bounds = computeGridBounds(selection);
   const syncCounts = useCallback(
     () => setHistCounts([historyRef.current.undo.length, historyRef.current.redo.length]),
@@ -159,7 +142,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [onRowsChange, syncCounts, undoLimit],
   );
-
   const stepHistory = useCallback(
     (dir: 'undo' | 'redo') => {
       const src = historyRef.current[dir];
@@ -177,7 +159,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [disabled, onRowsChange, syncCounts, undoLimit],
   );
-
   const canEditCell = useCallback(
     (r: number, c: number) =>
       !disabled &&
@@ -197,7 +178,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [canEditCell, getCellValue],
   );
-
   const commitEdit = useCallback((): TRow[] => {
     const active = editingRef.current;
     if (!active) return rowsRef.current;
@@ -216,7 +196,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     if (nextRows !== cur) commitRows(nextRows, true);
     return nextRows;
   }, [commitRows, getCellValue]);
-
   const cancelEdit = useCallback(() => {
     setEditing(null);
     wrapRef.current?.focus();
@@ -241,7 +220,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [commitRows, disabled, isEditableCell],
   );
-
   const moveCursor = useCallback(
     (dRow: number, dCol: number, expand = false) => {
       const total = rowsRef.current.length;
@@ -262,7 +240,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [colCount, commitRows, disabled],
   );
-
   const doCopy = useCallback(
     async (b: GridBounds, isCut: boolean) => {
       const { onCopyRange, copyRangeText } = optsRef.current;
@@ -276,7 +253,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [onError],
   );
-
   const applyPastedText = useCallback(
     (text: string) => {
       const { pasteTsv } = optsRef.current;
@@ -295,7 +271,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [commitRows, disabled, onError],
   );
-
   const handlePaste = useCallback(
     (e: ReactClipboardEvent) => {
       if (editingRef.current || disabled || !optsRef.current.pasteTsv) return;
@@ -306,7 +281,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [applyPastedText, disabled],
   );
-
   useEffect(() => {
     if (!editing) return;
     if (isSelectCol?.(editing.col)) editSelectRef.current?.focus();
@@ -317,7 +291,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
       editInputRef.current.setSelectionRange(len, len);
     }
   }, [editing?.row, editing?.col, isSelectCol]);
-
   useEffect(() => {
     const onUp = () => {
       if (dragModeRef.current === 'fill') {
@@ -341,7 +314,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     window.addEventListener('mouseup', onUp);
     return () => window.removeEventListener('mouseup', onUp);
   }, [commitRows, disabled, onError]);
-
   const beginSelMouseDown = useCallback(
     (e: ReactMouseEvent, row: number, col: number, mode: 'cells' | 'rows') => {
       if (e.button !== 0) return;
@@ -382,7 +354,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     e.stopPropagation();
     dragModeRef.current = 'fill';
   }, []);
-
   const handleCellMouseEnter = useCallback(
     (row: number, col: number) => {
       const m = dragModeRef.current;
@@ -393,7 +364,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [colCount],
   );
-
   const handleGridKeyDown = useCallback(
     (e: ReactKeyboardEvent) => {
       if (editingRef.current) return;
@@ -466,7 +436,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [canEditCell, clearBounds, colCount, doCopy, isSelectCol, moveCursor, startEdit, stepHistory],
   );
-
   const handleEditKeyDown = useCallback(
     (e: ReactKeyboardEvent<HTMLElement>) => {
       if (e.key === 'Escape') {
@@ -486,7 +455,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
     },
     [cancelEdit, commitEdit, moveCursor],
   );
-
   const getCellProps = (rIdx: number, col: number) => {
     const isEditing = editing?.row === rIdx && editing.col === col;
     return {
@@ -508,7 +476,6 @@ export function useSpreadsheetGrid<TRow>(opts: {
       onEditKeyDown: handleEditKeyDown,
     };
   };
-
   return {
     selection,
     setSelection,
@@ -540,12 +507,7 @@ export function useSpreadsheetGrid<TRow>(opts: {
     getCellProps,
   };
 }
-
-export interface GridSelectOption {
-  value: string;
-  label: string;
-}
-
+export type GridSelectOption = { value: string; label: string };
 export function MatrixDataCell(props: {
   className?: string;
   displayClassName?: string;
@@ -588,6 +550,11 @@ export function MatrixDataCell(props: {
     .join(' ');
   const editorCls =
     'h-full min-h-[28px] w-full rounded-none border-2 border-[#2f6fed] bg-white px-2 py-1 text-xs text-[var(--text)] outline-none';
+  const sharedEdit = {
+    value: props.editValue ?? '',
+    onBlur: props.onEditBlur,
+    onKeyDown: props.onEditKeyDown,
+  };
   return (
     <td
       className={cls || undefined}
@@ -604,10 +571,8 @@ export function MatrixDataCell(props: {
           <select
             ref={props.editSelectRef}
             className={editorCls}
-            value={props.editValue ?? ''}
+            {...sharedEdit}
             onChange={(e) => props.onEditChange?.(e.target.value)}
-            onBlur={props.onEditBlur}
-            onKeyDown={props.onEditKeyDown}
           >
             {(props.selectOptions ?? []).map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -619,23 +584,19 @@ export function MatrixDataCell(props: {
           <input
             autoFocus
             className={editorCls}
-            value={props.editValue ?? ''}
+            {...sharedEdit}
             onChange={(e) => props.onEditChange?.(e.target.value)}
-            onBlur={props.onEditBlur}
-            onKeyDown={props.onEditKeyDown}
           />
         ) : (
           <textarea
             ref={props.editInputRef}
             className="block min-h-[28px] w-full resize-none overflow-hidden rounded-none border-2 border-[#2f6fed] bg-white px-2 py-1 text-xs leading-snug text-[var(--text)] outline-none"
-            value={props.editValue ?? ''}
             rows={1}
+            {...sharedEdit}
             onChange={(e) => {
               syncTextareaHeight(e.currentTarget);
               props.onEditChange?.(e.target.value);
             }}
-            onBlur={props.onEditBlur}
-            onKeyDown={props.onEditKeyDown}
           />
         )
       ) : props.children !== undefined ? (

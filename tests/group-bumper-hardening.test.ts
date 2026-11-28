@@ -292,14 +292,9 @@ it('fatal identity change is not swallowed by the operation wrapper', async () =
   expect(stop).toHaveBeenCalledOnce();
 });
 
-it.each([
-  ['time_sort', false],
-  ['random_browse', false],
-  ['time_sort', true],
-  ['random_browse', true],
-] as const)(
-  '%s keeps exploring with scanOnly=%s and isolates one target failure',
-  async (mode, scanOnly) => {
+it.each(['time_sort', 'random_browse'] as const)(
+  '%s keeps exploring and isolates one target failure',
+  async (mode) => {
     vi.useFakeTimers();
     let scrolls = 0,
       current = '',
@@ -486,7 +481,6 @@ it.each([
         maxPostsPerGroupPage: 2,
       },
       {
-        executionMode: scanOnly ? 'scan_only' : 'live',
         cancelled: () => false,
         status: () => {},
         added: () => {},
@@ -495,14 +489,8 @@ it.each([
     await vi.runAllTimersAsync();
     await work;
     expect(scrolls).toBeGreaterThan(0);
-    if (scanOnly) {
-      expect(clicked.filter((id) => /^\d+$/.test(id))).toEqual([]);
-      expect(recorded).toEqual([]);
-      expect(metadataWrites).toBe(0);
-    } else {
-      expect(clicked).toContain('600000002');
-      expect(recorded).toEqual(['600000002']);
-    }
+    expect(clicked).toContain('600000002');
+    expect(recorded).toEqual(['600000002']);
     expect(close).toHaveBeenCalledOnce();
   },
 );
@@ -1154,17 +1142,6 @@ it('reports transparent 0-bump reasons and throws when all groups fail to enter'
   const failExpect = expect(failWork).rejects.toThrow(/全部小组执行异常：小组暂无可访问帖子/);
   await vi.runAllTimersAsync();
   await failExpect;
-
-  const scanFail = adapter.run(
-    'p',
-    [mkTarget(group)],
-    [mkTarget(author)],
-    { ...BumperSettings.parse({}), searchMode: 'time_sort' },
-    { executionMode: 'scan_only', cancelled: () => false, status: () => {}, added: () => {} },
-  );
-  const scanFailExpected = expect(scanFail).rejects.toThrow(/全部小组执行异常/);
-  await vi.runAllTimersAsync();
-  await scanFailExpected;
 
   // 2. no_author reports '已完成 · 0 次（小组内未扫到目标主页帖子）'
   mode = 'no_author';

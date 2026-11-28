@@ -79,7 +79,6 @@ test('record cleanup removes only ended display rows and preserves receipts and 
     const sStep = store.tasks.steps(second.plan.id)[0]!;
     store.tasks.claimPlanForProfile(second.profile.id, second.profile.account.id);
     const service = new TaskService(store.tasks);
-    const before = await service.records({ limit: 1 });
     const scope = { stepIds: [fStep.id, sStep.id] };
     assert.deepEqual(store.dataCleanup.preview(scope), { eligible: 1, protected: 1, bytes: 0 });
     assert.equal(store.dataCleanup.removeBatch(scope), 1);
@@ -87,11 +86,8 @@ test('record cleanup removes only ended display rows and preserves receipts and 
     const after = await service.records({ limit: 100 });
     assert.equal(after.total, 1);
     assert.ok(after.records.every((row) => row.stepId === sStep.id));
-    assert.deepEqual(after.records, (await service.recordsLegacy({ limit: 100 })).records);
     assert.throws(() => store.tasks.get(first.plan.id), /任务计划不存在/);
-    assert.deepEqual((await service.history({ profileId: first.profile.id })).plans, []);
-    if (before.nextCursor)
-      await assert.rejects(service.records({ limit: 1, cursor: before.nextCursor }), /记录已变化/);
+    assert.deepEqual(store.tasks.plansForProfile(first.profile.id), []);
     assert.equal(store.dataCleanup.settings().historyRetentionDays, null);
     store.dataCleanup.saveSettings({ expectedRevision: 0, historyRetentionDays: 7 });
     assert.throws(

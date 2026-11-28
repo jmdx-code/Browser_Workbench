@@ -395,48 +395,8 @@ export function extractBumperPosts(
       authorAvatarUrl ??= imageURL(link);
       if (authorAvatarUrl) break;
     }
-    const sourceEvidence =
-      input.audit && posts.length < 3
-        ? {
-            frames: [
-              {
-                component: primaryCard?.name ?? null,
-                storyId: storyKey,
-                postId,
-                nativePostId: primaryNative.post_id ?? null,
-                nativeActorId: primaryActorId || null,
-                feedbackId,
-                creationTime: created,
-                controls: controls.slice(0, 24).map((el) => ({
-                  role: el.getAttribute('role'),
-                  label: el.getAttribute('aria-label'),
-                  renderingRole: el.getAttribute('data-ad-rendering-role'),
-                  disabled: el.getAttribute('aria-disabled'),
-                  html: el.outerHTML.slice(0, 1200),
-                  belongs: belongsToStory(el),
-                  commentRow: commentRow(el),
-                  commentAncestors: chain(el)
-                    .filter((f) => /CometUFIComment/.test(f.name))
-                    .map((f) => f.name),
-                  feedback: chain(el)
-                    .filter((f) => /ReactButton|Reaction|UFI/.test(f.name))
-                    .map((f) => ({
-                      name: f.name,
-                      keys: Object.keys(f.props).slice(0, 35),
-                      feedback: {
-                        id: obj(f.props.feedback).id ?? obj(f.props.feedback).__id ?? null,
-                      },
-                    }))
-                    .slice(0, 12),
-                })),
-              },
-            ],
-            parents: [{ tag: article.tagName, role: article.getAttribute('role') }],
-          }
-        : undefined;
     posts.push({
       postId,
-      ...(sourceEvidence ? { sourceEvidence } : {}),
       postUrl:
         input.groupId === '-'
           ? 'https://www.facebook.com/' +

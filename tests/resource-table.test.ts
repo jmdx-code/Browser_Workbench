@@ -299,14 +299,6 @@ test('authenticated HTTP saves 200 long captions beyond old JSON budget without 
       assert.ok(cookie);
       assert.equal(
         (await fetch(server.origin + '/api/workspace', { headers: { cookie } })).status,
-        409,
-      );
-      assert.equal(
-        (
-          await fetch(server.origin + '/api/workspace', {
-            headers: { cookie, 'x-workbench-workspace-contract': '2' },
-          })
-        ).status,
         200,
       );
       const post = (route: string, body: unknown, authenticated = true, origin = server.origin) =>

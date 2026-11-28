@@ -9,7 +9,7 @@ import {
   type ResourceSummaryValue,
   type ResourceUsageSummaryValue,
 } from '../shared/resource-table.js';
-import { ProductError } from './workspace.js';
+import { ProductError, failError } from './workspace.js';
 export interface ResourceTableRepository {
   read(combinationId: string): Awaitable<ResourceTableValue>;
   readVersion(combinationId: string, revision: number): Awaitable<ResourceTableValue>;
@@ -390,7 +390,7 @@ export function fillRowsWithMedia<Row extends { background: 'color' | 'plain' },
       cursor++;
     }
     if (cursor >= maxRows)
-      throw new ProductError(
+      failError(
         'RESOURCE_ROWS',
         maxRows === 500 ? '最多 500 行，本批次尚未添加' : `最多${maxRows}行，本批次尚未添加`,
       );

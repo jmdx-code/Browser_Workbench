@@ -142,6 +142,15 @@ export class PersistenceClient {
       get: (_target, key) => {
         // A remote repository is not a thenable or a serializable state snapshot.
         if (key === 'then' || typeof key !== 'string') return undefined;
+        if (key === 'bind')
+          return (_thisArg: unknown, ...boundArgs: unknown[]) =>
+            (...callArgs: unknown[]) =>
+              invoke(...boundArgs, ...callArgs);
+        if (key === 'call')
+          return (_thisArg: unknown, ...callArgs: unknown[]) => invoke(...callArgs);
+        if (key === 'apply')
+          return (_thisArg: unknown, argArray?: unknown[]) =>
+            invoke(...(Array.isArray(argArray) ? argArray : []));
         if (['__proto__', 'prototype', 'constructor', 'db'].includes(key))
           throw Error('PERSISTENCE_MEMBER_REJECTED');
         return this.proxy([...path, key]);

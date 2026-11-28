@@ -1,3 +1,4 @@
+import type { createRelativePostAge } from '../../shared/relative-post-age.js';
 import type { BumperSurface, ProjectGroupBumperInput } from '../group-bumper-effects.js';
 import type { DomEvalRuntime, DomFiberFrame, DOMRecord } from '../shared-dom-eval-runtime.js';
 export type RecordValue = DOMRecord;
@@ -21,6 +22,7 @@ export interface BumperDomRuntime extends DomEvalRuntime {
 export function createBumperDomRuntime(
   createDomRt: () => DomEvalRuntime,
   input: ProjectGroupBumperInput,
+  createAge?: typeof createRelativePostAge,
 ): BumperDomRuntime {
   const domRt = createDomRt();
   const { record, obj, text, chain, relayRecord, clearDataAttrs } = domRt;
@@ -34,32 +36,9 @@ export function createBumperDomRuntime(
       depth + 1,
     );
   };
-  const age = (value: string): number | null => {
-    const v = value.trim().toLowerCase();
-    if (/^(?:just now|刚刚|剛剛|vừa xong|เมื่อสักครู่|ယခုလေးတင်)$/u.test(v)) return 0;
-    if (/^(?:yesterday|昨天|hôm qua|เมื่อวาน|မနေ့က)$/u.test(v)) return 24;
-    const m =
-      /^(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|分钟|分鐘|phút|นาที|မိနစ်|hours?|h|小时|小時|giờ|ชั่วโมง|နာရီ|days?|d|天|ngày|วัน|ရက်)(?:\b|$)/u.exec(
-        v,
-      );
-    if (m)
-      return (
-        Number(m[1]) *
-        (/^(?:m|分钟|分鐘|phút|นาที|မိနစ်)/u.test(m[2] ?? '')
-          ? 1 / 60
-          : /^(?:h|小时|小時|giờ|ชั่วโมง|နာရီ)/u.test(m[2] ?? '')
-            ? 1
-            : 24)
-      );
-    if (
-      !/\d{4}|\d{1,2}[/:月日]|\b(?:mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(
-        v,
-      )
-    )
-      return null;
-    const n = Date.parse(value);
-    return Number.isFinite(n) && n <= Date.now() ? Math.max(0, (Date.now() - n) / 3600000) : null;
-  };
+  const ageParser = createAge ? createAge() : null;
+  const age = (value: string): number | null =>
+    ageParser ? ageParser.relativePostAge(value) : null;
   const decodeId = (id: unknown): string | null => {
     if (typeof id !== 'string') return null;
     try {
@@ -226,7 +205,7 @@ export function createBumperDomRuntime(
   const isTopLevelCommentEditor = (el: Element) => {
     if (
       !el.matches(
-        '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"],textarea',
+        '[role="textbox"][contenteditable="true"],[role="textbox"][contenteditable="plaintext-only"],div[contenteditable="true"][data-lexical-editor="true"],div[contenteditable="plaintext-only"][data-lexical-editor="true"],textarea',
       ) ||
       el.closest('[role="banner"]')
     )
@@ -242,7 +221,9 @@ export function createBumperDomRuntime(
       return false;
     return frames.some(
       (f) =>
-        (/CometUFIComposerInputWithActionsForLexical/.test(f.name) &&
+        (/CometUFIComposer(?:InputWithActionsForLexical|InputWithActions|Inner|Input)?|LexicalComposer/.test(
+          f.name,
+        ) &&
           (f.props.commentAction === 'ADD' || f.props.commentAction == null) &&
           (f.props.depth === 0 || f.props.depth == null)) ||
         (/CometUFICommentRow/.test(f.name) &&

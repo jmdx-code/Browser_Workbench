@@ -11,44 +11,44 @@ import {
 } from '../../shared/bluestacks.js';
 import { api } from '../api.js';
 import { copyTextToClipboard } from '../clipboard.js';
-import { UI_CARD, UI_MUTED, UI_SELECT_SM, UI_TEXTAREA } from '../ui/primitives.js';
+import { UI_CARD, UI_MUTED, UI_ROW_BT, UI_SELECT_SM, UI_TEXTAREA } from '../ui/primitives.js';
+import {
+  BATCH_RESULT_PILL_CLS,
+  BatchStatusPill,
+  BluestacksBatchResultList,
+  type BatchTone,
+} from './bluestacks-batch-result-list.js';
 import {
   Btn,
   Chk,
   CtrlNum,
   DataTbl,
   NativeModalShell,
-  ProgressBar,
   SegTabs,
-  TonePill,
   useBusyTask,
 } from './shared/module-ui.js';
-
-const STATUS_META: Record<BluestacksBatchLoginItemStatus, [string, string, string]> = {
-  queued: ['排队中', '#475569', 'rgba(100,116,139,0.12)'],
-  running: ['执行中', '#1d4ed8', 'rgba(59,130,246,0.14)'],
-  succeeded: ['已登录', '#15803d', 'rgba(34,197,94,0.14)'],
-  skipped: ['已跳过', '#64748b', 'rgba(148,163,184,0.16)'],
-  verification: ['需验证', '#b45309', 'rgba(245,158,11,0.16)'],
-  restricted: ['受限/封禁', '#b91c1c', 'rgba(239,68,68,0.14)'],
-  failed: ['失败', '#b91c1c', 'rgba(239,68,68,0.14)'],
-  stopped: ['已停止', '#64748b', 'rgba(148,163,184,0.16)'],
+const STATUS_META: Record<BluestacksBatchLoginItemStatus, [string, BatchTone]> = {
+  queued: ['排队中', 'slate'],
+  running: ['执行中', 'blue'],
+  succeeded: ['已登录', 'green'],
+  skipped: ['已跳过', 'muted'],
+  verification: ['需验证', 'amber'],
+  restricted: ['受限/封禁', 'red'],
+  failed: ['失败', 'red'],
+  stopped: ['已停止', 'muted'],
 };
-
-const PILL_CLS =
-  'inline-flex items-center rounded-full border border-[var(--line)] bg-white px-2.5 py-0.5 text-xs font-medium text-[var(--text-2)]';
-
+const STATE_LABELS: Record<string, string> = {
+  'missing-app': '未装 FB Lite',
+  'logged-out': '未登录',
+  verification: '需验证',
+  restricted: '已受限',
+};
 function instanceStateLabel(i: BluestacksInstance): string {
   if (!isBluestacksPortraitResolution(i.fbWidth, i.fbHeight))
     return `横屏 ${i.fbWidth}×${i.fbHeight}`;
   if (i.accountState === 'logged-in') return i.accountName ? `已登录 (${i.accountName})` : '已登录';
-  if (i.accountState === 'missing-app') return '未装 FB Lite';
-  if (i.accountState === 'logged-out') return '未登录';
-  if (i.accountState === 'verification') return '需验证';
-  if (i.accountState === 'restricted') return '已受限';
-  return i.online ? '在线未检测' : '离线未检测';
+  return STATE_LABELS[i.accountState] ?? (i.online ? '在线未检测' : '离线未检测');
 }
-
 function batchActionNote(
   inst: BluestacksInstance,
   policy: BluestacksLoginExistingPolicy,
@@ -59,10 +59,8 @@ function batchActionNote(
     return policy === 'skip' ? '已登录将跳过' : '清旧会话覆盖重登';
   if (inst.accountState === 'missing-app')
     return autoInstall ? '自动装 APK + 登录' : '缺少 APK 将失败';
-  if (!inst.online) return autoLaunch ? '自动开机 + 登录' : '离线将跳过';
-  return '自动登录';
+  return inst.online ? '自动登录' : autoLaunch ? '自动开机 + 登录' : '离线将跳过';
 }
-
 export function BluestacksBatchLoginModal({
   state,
   selected,
@@ -93,11 +91,9 @@ export function BluestacksBatchLoginModal({
   }));
   const { busy, error, notice, setError, setNotice, run } = useBusyTask();
   const fileInputRef = useRef<HTMLInputElement>(null);
-
   useEffect(() => {
     if (batchLogin?.running) setTab('progress');
   }, [batchLogin?.running]);
-
   const parsed = useMemo(() => parseBatchLoginText(rawText), [rawText]);
   const eligiblePortrait = useMemo(
     () =>
@@ -121,52 +117,49 @@ export function BluestacksBatchLoginModal({
       ).length,
     [state.instances, selected],
   );
-
-  const pairedRows = useMemo(() => {
-    const count = Math.min(eligiblePortrait.length, parsed.entries.length);
-    return Array.from({ length: count }, (_, idx) => {
-      const inst = eligiblePortrait[idx];
-      const cred = parsed.entries[idx];
-      return inst && cred
-        ? {
-            inst,
-            cred,
-            actionNote: batchActionNote(
+  const pairedRows = useMemo(
+    () =>
+      Array.from({ length: Math.min(eligiblePortrait.length, parsed.entries.length) }, (_, idx) => {
+        const inst = eligiblePortrait[idx],
+          cred = parsed.entries[idx];
+        return inst && cred
+          ? {
               inst,
-              opts.ifAlreadyLoggedIn,
-              opts.autoInstallApk,
-              opts.autoLaunch,
-            ),
-          }
-        : null;
-    }).filter((r): r is NonNullable<typeof r> => r !== null);
-  }, [
-    eligiblePortrait,
-    parsed.entries,
-    opts.ifAlreadyLoggedIn,
-    opts.autoInstallApk,
-    opts.autoLaunch,
-  ]);
-
+              cred,
+              actionNote: batchActionNote(
+                inst,
+                opts.ifAlreadyLoggedIn,
+                opts.autoInstallApk,
+                opts.autoLaunch,
+              ),
+            }
+          : null;
+      }).filter((r): r is NonNullable<typeof r> => r !== null),
+    [
+      eligiblePortrait,
+      parsed.entries,
+      opts.ifAlreadyLoggedIn,
+      opts.autoInstallApk,
+      opts.autoLaunch,
+    ],
+  );
   function handleImportFile(file: File | undefined) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       const text = typeof reader.result === 'string' ? reader.result : '';
-      if (text.trim()) {
-        setRawText(text);
-        setNotice(`已读取文件「${file.name}」（仅驻留内存，不会落盘保存）`);
-        setError('');
-      }
+      if (!text.trim()) return;
+      setRawText(text);
+      setNotice(`已读取文件「${file.name}」（仅驻留内存，不会落盘保存）`);
+      setError('');
     };
     reader.readAsText(file, 'utf-8');
   }
-
   function handleStart() {
     if (busy || batchLogin?.running) return;
     if (parsed.errors.length > 0)
       return setError(`输入中存在 ${parsed.errors.length} 处格式错误，请先修正后再启动`);
-    if (pairedRows.length === 0)
+    if (!pairedRows.length)
       return setError('请先勾选至少 1 台竖屏蓝蝶实例，并粘贴至少 1 条有效账号密码');
     void run(async () => {
       const next = await api.bluestacksAction('batch-login/start', {
@@ -183,7 +176,11 @@ export function BluestacksBatchLoginModal({
       setTab('progress');
     }, '启动批量自动登录失败');
   }
-
+  const handleStop = () =>
+    void run(
+      async () => onChange(await api.bluestacksAction('batch-login/stop', {})),
+      '停止批量登录失败',
+    );
   async function copyIssueReport() {
     if (!batchLogin) return;
     const issueRows = batchLogin.items.filter((i) =>
@@ -197,13 +194,8 @@ export function BluestacksBatchLoginModal({
       () => setNotice('复制失败'),
     );
   }
-
-  const pct =
-    batchLogin && batchLogin.total > 0
-      ? Math.round((batchLogin.completed / batchLogin.total) * 100)
-      : 0;
   const hasApk = Boolean(state.config.apkPath?.trim() || state.config.detectedApkPath?.trim());
-
+  const totpCount = parsed.entries.filter((e) => Boolean(e.totpSecret)).length;
   return (
     <NativeModalShell
       title="蓝蝶批量一键自动登录（支持 2FA）"
@@ -226,10 +218,7 @@ export function BluestacksBatchLoginModal({
                   : `上次战报 (${batchLogin.succeeded}/${batchLogin.total})`,
               ],
             ]}
-            onChange={(next) => {
-              if (next === 'setup' && batchLogin.running) return;
-              setTab(next);
-            }}
+            onChange={(next) => !(next === 'setup' && batchLogin.running) && setTab(next)}
           />
         )
       }
@@ -270,7 +259,7 @@ export function BluestacksBatchLoginModal({
                   disabled={
                     busy ||
                     Boolean(batchLogin?.running) ||
-                    pairedRows.length === 0 ||
+                    !pairedRows.length ||
                     parsed.errors.length > 0
                   }
                   onClick={handleStart}
@@ -283,17 +272,7 @@ export function BluestacksBatchLoginModal({
                 <Btn sm={false} onClick={onClose}>
                   后台运行
                 </Btn>
-                <Btn
-                  v="danger"
-                  sm={false}
-                  disabled={busy}
-                  onClick={() =>
-                    void run(
-                      async () => onChange(await api.bluestacksAction('batch-login/stop', {})),
-                      '停止批量登录失败',
-                    )
-                  }
-                >
+                <Btn v="danger" sm={false} disabled={busy} onClick={handleStop}>
                   {busy ? '正在停止…' : '停止批量登录'}
                 </Btn>
               </>
@@ -318,17 +297,16 @@ export function BluestacksBatchLoginModal({
                   （已自动剔除 {selectedLandscapeCount} 台横屏实例）
                 </span>
               )}
-              {eligiblePortrait.length === 0 && (
+              {!eligiblePortrait.length && (
                 <span className={`${UI_MUTED} ml-2`}>
                   请先在左侧勾选蓝蝶窗口，或点击右侧快捷选中
                 </span>
               )}
             </div>
             <Btn
-              disabled={idlePortrait.length === 0}
+              disabled={!idlePortrait.length}
               onClick={() => {
-                if (idlePortrait.length === 0)
-                  return setNotice('当前没有空闲或未登录的竖屏蓝蝶实例');
+                if (!idlePortrait.length) return setNotice('当前没有空闲或未登录的竖屏蓝蝶实例');
                 onSelect(new Set(idlePortrait.map((i) => i.id)));
                 setNotice(`已自动勾选 ${idlePortrait.length} 台未登录/未检测竖屏蓝蝶`);
               }}
@@ -337,7 +315,7 @@ export function BluestacksBatchLoginModal({
             </Btn>
           </div>
           <div className="flex flex-col gap-1.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className={UI_ROW_BT}>
               <label className="text-[13px] font-semibold text-slate-900">
                 粘贴账号清单（支持多行 <code>账号:/密码:/totp:</code> 或{' '}
                 <code>账号|密码|2FA密钥</code> / Tab / CSV）
@@ -348,20 +326,11 @@ export function BluestacksBatchLoginModal({
                   type="file"
                   accept=".txt,.csv,.tsv"
                   className="hidden"
-                  onChange={(e) => {
-                    handleImportFile(e.target.files?.[0]);
-                    e.target.value = '';
-                  }}
+                  onChange={(e) => (handleImportFile(e.target.files?.[0]), (e.target.value = ''))}
                 />
                 <Btn onClick={() => fileInputRef.current?.click()}>导入 .txt / .csv</Btn>
                 {rawText && (
-                  <Btn
-                    v="ghost"
-                    onClick={() => {
-                      setRawText('');
-                      setError('');
-                    }}
-                  >
+                  <Btn v="ghost" onClick={() => (setRawText(''), setError(''))}>
                     清空
                   </Btn>
                 )}
@@ -369,23 +338,24 @@ export function BluestacksBatchLoginModal({
             </div>
             <textarea
               value={rawText}
-              onChange={(e) => {
-                setRawText(e.target.value);
-                setError('');
-              }}
+              onChange={(e) => (setRawText(e.target.value), setError(''))}
               rows={6}
               spellCheck={false}
               placeholder={
                 '示例 1（多行标签，密码含冒号/逗号也不受影响）：\n账号: demo@example.com\n密码: My:Pass,123\ntotp: JBSW Y3DP EHPK 3PXP\n\n示例 2（单行管道或 Excel 复制粘贴）：\ndemo2@example.com|Pass456|JBSWY3DPEHPK3PXP'
               }
-              className={`${UI_TEXTAREA} font-mono`}
+              className={`${UI_TEXTAREA} min-h-[168px] shrink-0 font-mono`}
             />
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className={PILL_CLS}>已解析有效账号 {parsed.entries.length} 条</span>
-              <span className={PILL_CLS}>
-                含 2FA 密钥 {parsed.entries.filter((e) => Boolean(e.totpSecret)).length} 条
-              </span>
-              <span className={PILL_CLS}>本次可配对 {pairedRows.length} 台</span>
+              {[
+                `已解析有效账号 ${parsed.entries.length} 条`,
+                `含 2FA 密钥 ${totpCount} 条`,
+                `本次可配对 ${pairedRows.length} 台`,
+              ].map((lbl) => (
+                <span key={lbl} className={BATCH_RESULT_PILL_CLS}>
+                  {lbl}
+                </span>
+              ))}
               {parsed.entries.length > eligiblePortrait.length && eligiblePortrait.length > 0 && (
                 <span className={UI_MUTED}>
                   另有 {parsed.entries.length - eligiblePortrait.length}{' '}
@@ -478,7 +448,7 @@ export function BluestacksBatchLoginModal({
                     </td>
                     <td className="px-2.5 py-2">
                       {row.cred.totpSecret ? (
-                        <TonePill label="已配置" color="#15803d" bg="rgba(34,197,94,0.14)" />
+                        <BatchStatusPill label="已配置" tone="green" />
                       ) : (
                         <span className={UI_MUTED}>无</span>
                       )}
@@ -491,66 +461,57 @@ export function BluestacksBatchLoginModal({
           )}
         </>
       ) : batchLogin ? (
-        <>
-          <div className={`${UI_CARD} flex flex-col gap-2.5 bg-[var(--surface-2)] px-3.5 py-3`}>
-            <div className="flex flex-wrap items-center justify-between gap-2.5">
-              <strong className="text-[13px] font-semibold text-slate-900">
-                {batchLogin.statusText}
-              </strong>
-              <span className={UI_MUTED}>{pct}%</span>
-            </div>
-            <ProgressBar pct={pct} active={batchLogin.running} />
-            <div className="flex flex-wrap gap-2 text-xs">
-              {(
-                [
-                  ['总计', batchLogin.total, ''],
-                  ['成功', batchLogin.succeeded, 'text-emerald-700'],
-                  ['跳过', batchLogin.skipped, ''],
-                  ['需验证', batchLogin.verification, 'text-amber-700'],
-                  ['受限', batchLogin.restricted, 'text-rose-700'],
-                  ['失败', batchLogin.failed, 'text-rose-700'],
-                ] as const
-              ).map(([lbl, cnt, cls]) => (
-                <span key={lbl} className={`${PILL_CLS} ${cls}`}>
-                  {lbl} {cnt}
-                </span>
-              ))}
-            </div>
-          </div>
-          <DataTbl
-            headers={['蓝蝶窗口', '掩码账号', '状态', '实时步骤 / 识别结果']}
-            rows={batchLogin.items}
-            empty="暂无批量登录记录"
-            renderRow={(item) => {
-              const [label, color, bg] = STATUS_META[item.status];
-              return (
-                <tr key={item.instanceId}>
-                  <td className="px-2.5 py-2 font-medium">{item.instanceName}</td>
-                  <td className="px-2.5 py-2 font-mono">
-                    {item.maskedAccount}
-                    {item.hasTotp && (
-                      <span className="ml-1.5">
-                        <TonePill label="2FA" color="#1d4ed8" bg="rgba(59,130,246,0.12)" />
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-2.5 py-2">
-                    <TonePill label={label} color={color} bg={bg} />
-                  </td>
-                  <td className="px-2.5 py-2 text-[var(--text-2)]">
-                    {item.stepText}
-                    {item.accountName && item.status === 'succeeded' && (
-                      <span className={`${UI_MUTED} ml-1.5`}>
-                        ({item.accountName}
-                        {item.numericAccountId ? ` · ${item.numericAccountId}` : ''})
-                      </span>
-                    )}
-                  </td>
-                </tr>
-              );
-            }}
-          />
-        </>
+        <BluestacksBatchResultList
+          summaryCard
+          showSummaryHeader
+          total={batchLogin.total}
+          completed={batchLogin.completed}
+          running={batchLogin.running}
+          statusText={batchLogin.statusText}
+          onCancel={handleStop}
+          canceling={busy}
+          cancelLabel="中止执行"
+          pills={[
+            ['总计', batchLogin.total],
+            ['成功', batchLogin.succeeded, 'text-emerald-700'],
+            ['跳过', batchLogin.skipped],
+            ['需验证', batchLogin.verification, 'text-amber-700'],
+            ['受限', batchLogin.restricted, 'text-rose-700'],
+            ['失败', batchLogin.failed, 'text-rose-700'],
+            ...(batchLogin.stopped > 0 ? ([['已停止', batchLogin.stopped]] as const) : []),
+          ]}
+          headers={['蓝蝶窗口', '掩码账号', '状态', '实时步骤 / 识别结果']}
+          rows={batchLogin.items}
+          empty="暂无批量登录记录"
+          renderRow={(item) => {
+            const [label, tone] = STATUS_META[item.status];
+            return (
+              <tr key={item.instanceId}>
+                <td className="px-2.5 py-2 font-medium">{item.instanceName}</td>
+                <td className="px-2.5 py-2 font-mono">
+                  {item.maskedAccount}
+                  {item.hasTotp && (
+                    <span className="ml-1.5">
+                      <BatchStatusPill label="2FA" tone="blue" />
+                    </span>
+                  )}
+                </td>
+                <td className="px-2.5 py-2">
+                  <BatchStatusPill label={label} tone={tone} />
+                </td>
+                <td className="px-2.5 py-2 text-[var(--text-2)]">
+                  {item.stepText}
+                  {item.accountName && item.status === 'succeeded' && (
+                    <span className={`${UI_MUTED} ml-1.5`}>
+                      ({item.accountName}
+                      {item.numericAccountId ? ` · ${item.numericAccountId}` : ''})
+                    </span>
+                  )}
+                </td>
+              </tr>
+            );
+          }}
+        />
       ) : (
         <div className={`${UI_MUTED} p-6 text-center`}>暂无批量登录记录</div>
       )}

@@ -1,10 +1,7 @@
 import { z } from 'zod';
 import { Id, sReq, trimReq } from './contracts.js';
 import { extractFacebookGroupId, extractFacebookPageId } from './facebook-target-id.js';
-export interface SelectByIdsCandidate {
-  id: string;
-  keys: string[];
-}
+export type SelectByIdsCandidate = { id: string; keys: string[] };
 const GROUP_KINDS = new Set(['shared_groups', 'inviter_groups', 'bumper_groups', 'groups']);
 export function normalizeTargetToken(kind: TargetListKind | 'profiles', raw: string): string {
   const trimmed = raw.trim();

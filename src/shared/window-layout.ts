@@ -103,6 +103,7 @@ export const WindowLayoutOverview = strictObj({
   managed: z.array(strictObj({ profileId: Id, rect: WindowRect })).max(100),
   error: z.string(),
   movedCount: NonNegInt.optional(),
+  failedProfiles: z.array(Id).max(100).optional(),
   recovery: z
     .array(
       strictObj({

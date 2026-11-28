@@ -16,29 +16,15 @@ import type { BumperState } from '../../shared/group-bumper.js';
 import type { GroupInviterState } from '../../shared/group-inviter.js';
 import type { PosterState } from '../../shared/group-poster.js';
 import type { TaskRuntimeOverview } from '../../shared/task-contracts.js';
-
+import { taskReasonDescription } from '../../shared/task-issues.js';
 type RuntimeOverview = z.infer<typeof TaskRuntimeOverview>;
-
 type ProjectedStep = NonNullable<RuntimeOverview['roundSteps']>[number];
-
-const describeCombinationStep = (s: Step): string =>
-  s.type === 'feed'
-    ? `浏览首页 (${s.durationMinutes}分)`
-    : s.type === 'video'
-      ? `浏览 Reels (${s.durationMinutes}分)`
-      : s.type === 'marketplace'
-        ? `浏览商城 (${s.durationMinutes}分)`
-        : s.type === 'friends'
-          ? s.friendAction === 'add_suggested'
-            ? `加推荐好友 (${s.maxAccepts}人)`
-            : `接受好友 (${s.acceptMode === 'all' ? '全部' : `${s.maxAccepts}个`})`
-          : s.destination === 'story'
-            ? '发布快拍'
-            : '发时间线贴';
-
-const describeProjectedStep = (s: ProjectedStep): string => {
-  const mins =
-    s.budget?.kind === 'time' ? Math.max(1, Math.round(s.budget.milliseconds / 60_000)) : 3;
+const describeStepFields = (
+  s: Pick<ProjectedStep, 'type' | 'feedMode' | 'friendAction' | 'destination'>,
+  mins: number,
+  acceptCount: number,
+  acceptSuffix = `${acceptCount}个`,
+): string => {
   if (s.type === 'feed')
     return s.feedMode === 'random_profile'
       ? `逛他人时间线 (${mins}分)`
@@ -49,15 +35,32 @@ const describeProjectedStep = (s: ProjectedStep): string => {
           : `浏览首页 (${mins}分)`;
   if (s.type === 'video') return `浏览 Reels (${mins}分)`;
   if (s.type === 'marketplace') return `浏览商城 (${mins}分)`;
-  if (s.type === 'friends') {
-    const cnt = s.budget?.kind === 'friends' ? s.budget.count : null;
+  if (s.type === 'friends')
     return s.friendAction === 'add_suggested'
-      ? `加推荐好友 (${cnt ?? 3}人)`
-      : `接受好友 (${s.budget?.kind === 'friends' && s.budget.mode === 'all' ? '全部' : `${cnt ?? 5}个`})`;
-  }
+      ? `加推荐好友 (${acceptCount}人)`
+      : `接受好友 (${acceptSuffix})`;
   return s.destination === 'story' ? '发布快拍' : '发时间线贴';
 };
-
+const describeCombinationStep = (s: Step): string =>
+  describeStepFields(
+    s as Pick<ProjectedStep, 'type' | 'feedMode' | 'friendAction' | 'destination'>,
+    'durationMinutes' in s ? s.durationMinutes : 3,
+    s.type === 'friends' ? s.maxAccepts : 5,
+    s.type === 'friends' && s.acceptMode === 'all' ? '全部' : undefined,
+  );
+const describeProjectedStep = (s: ProjectedStep): string => {
+  const mins =
+    s.budget?.kind === 'time' ? Math.max(1, Math.round(s.budget.milliseconds / 60_000)) : 3;
+  const cnt =
+    (s.budget?.kind === 'friends' ? s.budget.count : null) ??
+    (s.friendAction === 'add_suggested' ? 3 : 5);
+  return describeStepFields(
+    s,
+    mins,
+    cnt,
+    s.budget?.kind === 'friends' && s.budget.mode === 'all' ? '全部' : undefined,
+  );
+};
 const formatRunningStepMeta = (
   planState: RuntimeOverview['plans'][number]['state'],
   cur: ProjectedStep | undefined,
@@ -71,13 +74,30 @@ const formatRunningStepMeta = (
   }
   return parts.join(' · ');
 };
-
 export interface LiveRunStepItem {
   label: string;
-  state: 'done' | 'running' | 'pending';
+  state: 'done' | 'running' | 'pending' | 'failed';
   meta?: string | undefined;
 }
-
+function resolveSchedulerStepIndex<T>(
+  totalSteps: readonly T[],
+  currentStep: string,
+  stepLabel: (s: T) => string,
+): number {
+  const m = /^步骤\s+(\d+)\/(\d+)/.exec(currentStep.trim());
+  if (m) {
+    const idx = Number(m[1]) - 1;
+    if (idx >= 0 && idx < totalSteps.length) return idx;
+  }
+  const exact = totalSteps.findIndex((s) => stepLabel(s) === currentStep);
+  if (exact >= 0) return exact;
+  const afterDot = currentStep.split('·').slice(1).join('·').trim();
+  if (afterDot) {
+    const bySuffix = totalSteps.findIndex((s) => stepLabel(s) === afterDot);
+    if (bySuffix >= 0) return bySuffix;
+  }
+  return -1;
+}
 export interface LiveRunCard {
   key: string;
   carrier: 'browser' | 'bluestacks';
@@ -98,7 +118,6 @@ export interface LiveRunCard {
   schedulerRunId?: string | undefined;
   bsModuleAction?: string | undefined;
 }
-
 export function buildLiveRunCards(p: {
   profiles: readonly Profile[];
   runtime: RuntimeOverview | null;
@@ -116,7 +135,14 @@ export function buildLiveRunCards(p: {
   const comboMap = new Map(p.combinations.map((c) => [c.id, c]));
   const covered = new Set<string>();
   const profLabel = (pid: string) => profileDisplayName(profileMap.get(pid), pid.slice(0, 8));
-
+  const stepMap = new Map(
+    (p.runtime?.currentSteps ?? []).map((s) => [`${s.jobId}:${s.position}`, s]),
+  );
+  const activePlanByProfile = new Map<string, RuntimeOverview['plans'][number]>();
+  for (const pl of p.runtime?.plans ?? []) {
+    if (['QUEUED', 'RUNNING'].includes(pl.state) && !activePlanByProfile.has(pl.profileId))
+      activePlanByProfile.set(pl.profileId, pl);
+  }
   for (const run of (p.autoScheduler?.activeRuns ?? []) as readonly AutoScheduleRun[]) {
     const schedule = p.autoScheduler?.schedules.find((s) => s.id === run.scheduleId);
     const items = [...(run.items ?? [])]
@@ -139,7 +165,12 @@ export function buildLiveRunCards(p: {
         s.type === 'active-combination' || s.type === 'bluestacks-active-combination'
           ? (comboMap.get(s.combinationId)?.saved?.name ?? '活跃组合')
           : formatStepShortLabel(s);
-      const currentIdx = totalSteps.findIndex((s) => stepLabel(s) === item.currentStep);
+      const currentIdx = resolveSchedulerStepIndex(totalSteps, item.currentStep, stepLabel);
+      const delegatedPlan =
+        run.carrier === 'browser' ? activePlanByProfile.get(item.targetId) : undefined;
+      const delegatedStep = delegatedPlan
+        ? stepMap.get(`${delegatedPlan.id}:${delegatedPlan.position}`)
+        : undefined;
       const steps: LiveRunStepItem[] =
         totalSteps.length > 0
           ? totalSteps.map((s, idx) => {
@@ -155,11 +186,13 @@ export function buildLiveRunCards(p: {
                     : idx === 0
                       ? 'running'
                       : 'pending';
-              return {
-                label: stepLabel(s),
-                state: st,
-                meta: st === 'running' ? item.summary || '执行中' : undefined,
-              };
+              const activeMeta =
+                st === 'running'
+                  ? s.type === 'active-combination' && delegatedPlan
+                    ? `${formatRunningStepMeta(delegatedPlan.state, delegatedStep)} · 第 ${delegatedPlan.position + 1}/${delegatedPlan.snapshot.steps.length} 项`
+                    : item.summary || '执行中'
+                  : undefined;
+              return { label: stepLabel(s), state: st, meta: activeMeta };
             })
           : [
               {
@@ -184,10 +217,6 @@ export function buildLiveRunCards(p: {
       });
     }
   }
-
-  const stepMap = new Map(
-    (p.runtime?.currentSteps ?? []).map((s) => [`${s.jobId}:${s.position}`, s]),
-  );
   const roundStepsMap = new Map<string, ProjectedStep[]>();
   for (const rs of p.runtime?.roundSteps ?? []) {
     const arr = roundStepsMap.get(rs.jobId) ?? [];
@@ -195,21 +224,31 @@ export function buildLiveRunCards(p: {
     roundStepsMap.set(rs.jobId, arr);
   }
   for (const arr of roundStepsMap.values()) arr.sort((a, b) => a.position - b.position);
-
   for (const plan of p.runtime?.plans ?? []) {
     if (!['QUEUED', 'RUNNING'].includes(plan.state)) continue;
+    if (covered.has(`browser:${plan.profileId}`)) continue;
     covered.add(`browser:${plan.profileId}`);
     const actualSteps = roundStepsMap.get(plan.id);
     const steps: LiveRunStepItem[] =
       actualSteps && actualSteps.length > 0
         ? actualSteps.map((rs) => {
+            const isFailed = rs.status === 'FAILED';
             const isDone = rs.status === 'COMPLETED' || rs.status === 'SKIPPED';
-            const isCur = !isDone && rs.position === plan.position;
+            const isCur = !isDone && !isFailed && rs.position === plan.position;
             const cur = isCur ? (stepMap.get(`${plan.id}:${rs.position}`) ?? rs) : undefined;
+            const failMeta = isFailed
+              ? rs.outcome?.kind === 'FAILED'
+                ? (taskReasonDescription(rs.outcome.reason)?.summary ?? '失败')
+                : '失败'
+              : undefined;
             return {
               label: describeProjectedStep(rs),
-              state: isDone ? 'done' : isCur ? 'running' : 'pending',
-              ...(isCur ? { meta: formatRunningStepMeta(plan.state, cur) } : {}),
+              state: isFailed ? 'failed' : isDone ? 'done' : isCur ? 'running' : 'pending',
+              ...(isCur
+                ? { meta: formatRunningStepMeta(plan.state, cur) }
+                : failMeta
+                  ? { meta: failMeta }
+                  : {}),
             };
           })
         : plan.snapshot.steps.map((spec, idx) => {
@@ -248,7 +287,6 @@ export function buildLiveRunCards(p: {
       },
     });
   }
-
   const addMod = (pid: string, title: string, statusText: string, summary?: string) => {
     if (covered.has(`browser:${pid}`)) return;
     covered.add(`browser:${pid}`);
@@ -274,7 +312,6 @@ export function buildLiveRunCards(p: {
     if (s.running) addMod(pid, '小组邀请人', s.status || '邀请中', `本轮 ${s.sessionInvited} 人`);
   for (const a of p.googleSheets?.activeProfiles ?? [])
     addMod(a.profileId, `云表协同 · ${a.title}`, a.status);
-
   for (const [title, action, counts] of [
     ['蓝蝶活跃账号', 'active/stop', p.bluestacks?.activeProfileCounts],
     ['蓝蝶小组发帖', 'poster/stop', p.bluestacks?.posterProfileCounts],
@@ -301,6 +338,10 @@ export function buildLiveRunCards(p: {
                 meta: stat.status || `本轮 ${stat.session}`,
               },
             ];
+      const closeOnFinish =
+        'closeOnFinish' in stat && typeof stat.closeOnFinish === 'boolean'
+          ? stat.closeOnFinish
+          : undefined;
       cards.push({
         key: `bs:${action}:${id}`,
         carrier: 'bluestacks',
@@ -309,6 +350,7 @@ export function buildLiveRunCards(p: {
         title,
         subtitle: '模拟器运行中',
         statusText: stat.status || '执行中',
+        ...(closeOnFinish !== undefined ? { closeOnFinish } : {}),
         steps: statSteps,
         stopKind: 'bluestacks-module',
         bsModuleAction: action,

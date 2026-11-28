@@ -11,7 +11,6 @@ import type {
 } from '../shared/google-sheets.js';
 import type { BumperSettings, BumperTarget } from '../shared/group-bumper.js';
 import type { PosterLog, PosterMaterial } from '../shared/group-poster.js';
-
 export interface StoredGoogleAuthDataPort {
   clientId: string;
   clientSecret: string;
@@ -24,7 +23,6 @@ export interface StoredGoogleAuthDataPort {
   scopes: string[];
   lastError: string | null;
 }
-
 export interface SheetImageCachePortRecord {
   contentHash: string;
   host: 'gyazo' | 'drive';
@@ -34,7 +32,6 @@ export interface SheetImageCachePortRecord {
   byteSize: number;
   createdAt: number;
 }
-
 export interface SheetScheduleItemPortRecord {
   linkId: string;
   resourceCode: string;
@@ -52,9 +49,11 @@ export interface SheetScheduleItemPortRecord {
   targetGroupCount: number;
   postedGroupCount: number;
   errorMessage: string | null;
+  attemptCount?: number;
+  nextRetryAt?: number | null;
+  lastError?: string | null;
   updatedAt: number;
 }
-
 export interface SheetRecordPostPortRecord {
   linkId: string;
   postCode: string;
@@ -77,7 +76,6 @@ export interface SheetRecordPostPortRecord {
   createdAt: number;
   updatedAt: number;
 }
-
 export interface GoogleSheetsRepositoryPort {
   getAuthConfig(): StoredGoogleAuthDataPort;
   saveAuthConfig(patch: Partial<StoredGoogleAuthDataPort>): StoredGoogleAuthDataPort;
@@ -124,7 +122,6 @@ export interface GoogleSheetsRepositoryPort {
   }): SheetSyncLogEntry;
   listLogs(limit?: number, linkId?: string | null): SheetSyncLogEntry[];
 }
-
 export interface GoogleOAuthPort {
   status(): Promise<GoogleAuthStatus>;
   importCredentialsJson(rawJson: string): Promise<GoogleAuthStatus>;
@@ -135,12 +132,7 @@ export interface GoogleOAuthPort {
   invalidateAccessToken?(expectedToken?: string): Promise<void>;
   shutdown(): Promise<void>;
 }
-
-export interface SheetValuesDualRead {
-  formulaRows: string[][];
-  formattedRows: string[][];
-}
-
+export type SheetValuesDualRead = { formulaRows: string[][]; formattedRows: string[][] };
 export interface GoogleSheetsApiPort {
   getSpreadsheetMeta(spreadsheetId: string): Promise<SpreadsheetMeta>;
   readSheetValues(spreadsheetId: string, sheetName: string): Promise<SheetValuesDualRead>;
@@ -168,7 +160,6 @@ export interface GoogleSheetsApiPort {
     columnTitle: string,
   ): Promise<number>;
 }
-
 export interface SheetImageHostTestResult {
   remoteUrl: string;
   host: 'gyazo' | 'drive';
@@ -176,16 +167,13 @@ export interface SheetImageHostTestResult {
   tokenCount?: number;
   fallbackFromGyazo?: boolean;
 }
-
 export interface SheetImageHostPort {
-  uploadDataUrlOrUrl(input: { source: string; filenameHint: string }): Promise<{
-    remoteUrl: string;
-    host: 'gyazo' | 'drive';
-    cached: boolean;
-  } | null>;
+  uploadDataUrlOrUrl(input: {
+    source: string;
+    filenameHint: string;
+  }): Promise<{ remoteUrl: string; host: 'gyazo' | 'drive'; cached: boolean } | null>;
   testUpload(): Promise<SheetImageHostTestResult>;
 }
-
 export interface DirectPostBumpItem {
   postCode: string;
   postUrl: string;
@@ -195,7 +183,6 @@ export interface DirectPostBumpItem {
   pageId: string;
   pageName: string;
 }
-
 export interface DirectPostBumpResult {
   postCode: string;
   postUrl: string;
@@ -204,25 +191,31 @@ export interface DirectPostBumpResult {
   commented: boolean;
   skippedReason?: string;
 }
-
 export interface ScrapedPostMetrics {
   postCode: string;
   postUrl: string;
   likes: number | null;
   comments: number | null;
   needsAuthFallback?: boolean;
+  unavailable?: boolean;
   error?: string;
 }
-
 export interface SheetAutomationBridgePort {
   publishScheduledMaterial(input: {
     profileId: string;
     material: PosterMaterial;
     targets: BumperTarget[];
+    targetPageId?: string;
+    targetPageName?: string;
     onPosted: (log: PosterLog, isTimeline: boolean) => Promise<void>;
     onStatus: (text: string) => void;
     cancelled: () => boolean;
   }): Promise<{ postedCount: number; timelinePosted: boolean; error?: string }>;
+  switchProfilePageIdentity?(input: {
+    profileId: string;
+    targetPageId: string;
+    targetPageName?: string;
+  }): Promise<boolean>;
   prepareMaterialMedia(mediaSource: string): Promise<{
     localFilePath: string;
     mediaKind: 'image' | 'video';

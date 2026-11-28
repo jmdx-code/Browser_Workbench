@@ -3,7 +3,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Step } from '../../src/shared/contracts.js';
-import type { Timing } from '../../src/shared/task-timing.js';
 import type { RuntimeProfile } from '../../src/domain/tasks.js';
 import { WorkspaceStore } from '../../src/infrastructure/workspace-store.js';
 
@@ -42,7 +41,6 @@ export function assignSamplePlan(
   options?: {
     steps?: Step[];
     profile?: RuntimeProfile;
-    timing?: Timing;
     expectedResourceRevision?: number;
     closeBrowserOnFinish?: boolean;
   },
@@ -70,7 +68,6 @@ export function assignSamplePlan(
       combinationId: combo.id,
       version: combo.version,
       profileIds: [profile.id],
-      ...(options?.timing ? { timing: options.timing } : {}),
       ...(options?.expectedResourceRevision !== undefined
         ? { expectedResourceRevision: options.expectedResourceRevision }
         : {}),

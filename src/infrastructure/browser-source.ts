@@ -88,10 +88,7 @@ export class BridgeProfileSource implements BrowserProfileSource {
     const peer = this.core.peers.get(id);
     if (peer) {
       try {
-        peer.send({
-          type: 'PROFILE_REMOVED',
-          connectionEpoch: peer.epoch,
-        });
+        peer.send({ type: 'PROFILE_REMOVED', connectionEpoch: peer.epoch });
       } catch {
         // Ignore send errors on closing peer.
       }

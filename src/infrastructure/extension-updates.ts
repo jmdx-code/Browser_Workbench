@@ -88,16 +88,9 @@ export class ExtensionUpdates {
   }
 }
 export async function extensionReloadTasksBusy(
-  tasks: Pick<TaskRepository, 'plansForProfile'> &
-    Partial<Pick<TaskRepository, 'blockingOperations'>>,
+  tasks: Pick<TaskRepository, 'plansForProfile'>,
   profileId: string,
 ): Promise<boolean> {
   const plans = await tasks.plansForProfile(profileId);
-  if (plans.some((plan) => plan.state === 'RUNNING')) return true;
-  if (typeof tasks.blockingOperations === 'function') {
-    for (const plan of plans) {
-      if ((await tasks.blockingOperations(plan.id)).length > 0) return true;
-    }
-  }
-  return false;
+  return plans.some((plan) => plan.state === 'RUNNING');
 }

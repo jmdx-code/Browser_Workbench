@@ -1,6 +1,5 @@
 import type { SessionClosePort, NativeStopReceipt } from '../domain/system-ports.js';
 import { Id } from '../shared/contracts.js';
-
 // A failed attempt remains cached until an explicit retry of the same original request.
 // No input, lease renewal, new ownership or task resume is available through this port.
 export class SessionCloser {

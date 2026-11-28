@@ -57,8 +57,8 @@ export function detectHomeTabBar(root: LiteXmlNode | null): DetectedHomeTabBar |
         const match = rows.find(
           (r) =>
             r[0] &&
-            Math.abs(r[0].bounds.y1 - n.bounds.y1) <= 14 &&
-            Math.abs(r[0].bounds.h - n.bounds.h) <= 14,
+            Math.abs(r[0].bounds.y1 - n.bounds.y1) <= 16 &&
+            Math.abs(r[0].bounds.h - n.bounds.h) <= 16,
         );
         if (match) {
           if (!match.some((x) => Math.abs(x.bounds.x1 - n.bounds.x1) < 35)) match.push(n);
@@ -67,26 +67,29 @@ export function detectHomeTabBar(root: LiteXmlNode | null): DetectedHomeTabBar |
       return rows;
     };
   const specs = [
-    { hint: 'personal' as const, y2Max: 235, wMin: 125, wMax: 175, ok: (n: number) => n >= 5 },
-    { hint: 'page' as const, y2Max: 215, wMin: 200, wMax: 250, ok: (n: number) => n === 4 },
+    { hint: 'personal' as const, y2Max: 255, wMin: 115, wMax: 195, ok: (n: number) => n >= 5 },
+    { hint: 'page' as const, y2Max: 255, wMin: 196, wMax: 265, ok: (n: number) => n === 4 },
   ];
   for (const s of specs) {
     const cands = all.filter(
       (n) =>
         n.clickable &&
-        n.bounds.y1 >= 24 &&
+        n.bounds.y1 >= 20 &&
         n.bounds.y2 <= s.y2Max &&
         n.bounds.w >= s.wMin &&
         n.bounds.w <= s.wMax &&
-        n.bounds.h >= 46 &&
-        n.bounds.h <= 98,
+        n.bounds.h >= 40 &&
+        n.bounds.h <= 110,
     );
     for (const row of groupByRow(cands)) {
       if (!s.ok(row.length)) continue;
       const sorted = [...row].sort((a, b) => a.bounds.x1 - b.bounds.x1);
+      const first = sorted[0];
+      const last = sorted[sorted.length - 1];
+      if (!first || !last || last.bounds.x2 - first.bounds.x1 < 660) continue;
       return {
         identityHint: s.hint,
-        collapsed: (sorted[0]?.bounds.y1 ?? 100) < 75,
+        collapsed: first.bounds.y1 < 75,
         tabs: sorted.map((n) => n.bounds),
       };
     }
@@ -228,26 +231,37 @@ export function extractActionBars(root: LiteXmlNode | null): LitePostActionBar[]
     likeCandidates = all.filter(
       (n) =>
         n.clickable &&
-        n.longClickable &&
-        n.bounds.x1 <= 24 &&
-        Math.abs(n.bounds.x2 - 300) <= 24 &&
-        n.bounds.h >= 42 &&
-        n.bounds.h <= 84 &&
-        n.bounds.y1 >= 115 &&
+        n.bounds.x1 <= 36 &&
+        span(n.bounds.x2, 240, 340) &&
+        span(n.bounds.h, 38, 92) &&
+        n.bounds.y1 >= 100 &&
         n.bounds.y2 <= maxSafeY,
     );
   for (const like of likeCandidates) {
-    const findPeer = (x1: number, x2: number) =>
+    const findPeer = (x1Min: number, x1Max: number, x2Min: number, x2Max: number) =>
       all.find(
         (n) =>
           n.clickable &&
-          Math.abs(n.bounds.y1 - like.bounds.y1) <= 8 &&
-          Math.abs(n.bounds.x1 - x1) <= 24 &&
-          Math.abs(n.bounds.x2 - x2) <= 24,
+          n !== like &&
+          Math.abs(n.bounds.y1 - like.bounds.y1) <= 12 &&
+          Math.abs(n.bounds.h - like.bounds.h) <= 14 &&
+          span(n.bounds.x1, x1Min, x1Max) &&
+          span(n.bounds.x2, x2Min, x2Max),
       );
-    const comment = findPeer(300, 600),
-      share = findPeer(600, 900);
-    if (comment && share && !actionBars.some((ab) => Math.abs(ab.y1 - like.bounds.y1) < 20))
+    const comment = findPeer(260, 345, 555, 640),
+      share = findPeer(560, 645, 855, 900);
+    if (!comment || !share) continue;
+    const widths = [like.bounds.w, comment.bounds.w, share.bounds.w],
+      isBalancedTriad =
+        Math.max(...widths) - Math.min(...widths) <= 24 &&
+        comment.bounds.x1 - like.bounds.x2 <= 14 &&
+        share.bounds.x1 - comment.bounds.x2 <= 14 &&
+        share.bounds.x2 - like.bounds.x1 >= 840,
+      hasLikeCue = like.longClickable || /赞|讚|like/i.test(`${like.contentDesc} ${like.text}`);
+    if (
+      (hasLikeCue || isBalancedTriad) &&
+      !actionBars.some((ab) => Math.abs(ab.y1 - like.bounds.y1) < 20)
+    )
       actionBars.push({
         y1: like.bounds.y1,
         y2: like.bounds.y2,
@@ -258,40 +272,90 @@ export function extractActionBars(root: LiteXmlNode | null): LitePostActionBar[]
   }
   return actionBars.sort((a, b) => a.y1 - b.y1);
 }
+function findCardAvatarNode(headerNode: LiteXmlNode): LiteXmlNode | undefined {
+  const isAvatar = (c: LiteXmlNode) =>
+    c.bounds.x1 <= 48 &&
+    span(c.bounds.x2, 62, 126) &&
+    span(c.bounds.w, 38, 96) &&
+    span(c.bounds.h, 38, 96) &&
+    c.bounds.y1 >= 80 &&
+    c.bounds.cy >= 106;
+  const direct = headerNode.children.find(isAvatar);
+  if (direct) return direct;
+  for (const child of headerNode.children) {
+    if (child.bounds.x1 <= 48 && child.bounds.x2 <= 135) {
+      const nested = child.children.find(isAvatar);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+function findCardMoreMenuNode(
+  headerNode: LiteXmlNode,
+  avatarNode: LiteXmlNode,
+  second: LiteXmlNode,
+): LiteXmlNode | null {
+  const secondSet = new Set(flattenLiteNodes(second));
+  const isMoreCand = (c: LiteXmlNode) =>
+    c !== headerNode &&
+    c !== avatarNode &&
+    !secondSet.has(c) &&
+    c.clickable &&
+    c.bounds.x1 >= 740 &&
+    c.bounds.x2 <= 900 &&
+    c.bounds.w <= 125 &&
+    c.bounds.h <= 115 &&
+    c.bounds.cy >= 106;
+  const direct = headerNode.children.filter(isMoreCand);
+  const cands = direct.length > 0 ? direct : flattenLiteNodes(headerNode).filter(isMoreCand);
+  if (cands.length === 0) return null;
+  const semantic = cands.find((c) =>
+    /more|更多|选项|菜單|菜单|menu/i.test(`${c.contentDesc} ${c.text}`),
+  );
+  if (semantic) return semantic;
+  // When both "..." and "X" sit side-by-side in FB Lite 524 headers, "..." sits left of "X".
+  return [...cands].sort((a, b) => a.bounds.x1 - b.bounds.x1)[0] ?? null;
+}
 export function extractPostCards(root: LiteXmlNode | null): LitePostCard[] {
   if (!root) return [];
   const { feedNodes: all, maxSafeY } = selectMainFeedScope(root),
+    homeTabBottom = detectHomeTabBar(root)?.tabs[0]?.y2 ?? -1,
     headers: LitePostHeader[] = [];
   for (const node of all) {
     const b = node.bounds;
     if (
-      b.x1 > 4 ||
-      b.x2 < 896 ||
-      !span(b.h, 66, 118) ||
-      b.y1 < 76 ||
+      b.x1 > 24 ||
+      b.x2 < 876 ||
+      !span(b.h, 58, 150) ||
+      b.y1 < 72 ||
       b.y2 > maxSafeY ||
       node.children.length < 2
     )
       continue;
-    const avatarNode = node.children.find(
-      (c) =>
-        c.bounds.x1 <= 42 &&
-        span(c.bounds.x2, 66, 118) &&
-        span(c.bounds.w, 42, 88) &&
-        span(c.bounds.h, 42, 88) &&
-        c.bounds.y1 >= 84 &&
-        c.bounds.cy >= 110,
-    );
-    const second = node.children.find((c) => c !== avatarNode && span(c.bounds.x1, 78, 134));
+    const avatarNode = findCardAvatarNode(node);
+    const second = avatarNode
+      ? node.children.find(
+          (c) =>
+            c !== avatarNode &&
+            c.bounds.x1 >= avatarNode.bounds.x2 - 4 &&
+            c.bounds.x1 <= 150 &&
+            c.bounds.w >= 140,
+        )
+      : undefined;
     if (avatarNode && second) {
-      const sortedSub = [...second.children].sort((a, bSub) => a.bounds.y1 - bSub.bounds.y1),
-        nameNode =
+      const moreNode = findCardMoreMenuNode(node, avatarNode, second);
+      if (!moreNode) continue;
+      const sortedSub = flattenLiteNodes(second)
+        .filter((c) => c !== second)
+        .sort((a, bSub) => a.bounds.y1 - bSub.bounds.y1);
+      if (homeTabBottom > 0 && b.y1 <= homeTabBottom + 40 && sortedSub.length <= 1) continue;
+      const nameNode =
           sortedSub.find(
-            (c) => c.clickable && c.bounds.x1 <= 124 && c.bounds.y1 <= second.bounds.y1 + 18,
+            (c) => c.clickable && c.bounds.x1 <= 145 && c.bounds.y1 <= second.bounds.y1 + 22,
           ) ?? sortedSub[0],
         authorNameBounds = nameNode
           ? makeRect(
-              Math.max(84, nameNode.bounds.x1 - 4),
+              Math.max(80, nameNode.bounds.x1 - 4),
               Math.max(b.y1, nameNode.bounds.y1 - 4),
               Math.min(820, nameNode.bounds.x2 + 12),
               Math.min(b.y2, nameNode.bounds.y2 + 6),
@@ -300,19 +364,8 @@ export function extractPostCards(root: LiteXmlNode | null): LitePostCard[] {
         tsNode = sortedSub.findLast((c) => c.bounds.y1 >= second.bounds.y1 + 18),
         tsY1 = tsNode ? tsNode.bounds.y1 - 4 : nameNode ? nameNode.bounds.y2 - 2 : b.y1 + 46,
         tsY2 = tsNode ? tsNode.bounds.y2 + 4 : tsY1 + 32,
-        tsX2 = tsNode ? Math.min(420, Math.max(190, tsNode.bounds.x2 + 28)) : 320,
-        timestampBounds = makeRect(84, tsY1, tsX2, Math.min(b.y2 + 6, tsY2)),
-        moreNode =
-          node.children.find(
-            (c) =>
-              c !== avatarNode &&
-              c !== second &&
-              c.clickable &&
-              c.bounds.x1 >= 790 &&
-              c.bounds.x2 <= 900 &&
-              c.bounds.cy >= 110,
-          ) ?? null;
-      if (!moreNode) continue;
+        tsX2 = tsNode ? Math.min(760, Math.max(220, tsNode.bounds.x2 + 28)) : 320,
+        timestampBounds = makeRect(80, tsY1, tsX2, Math.min(b.y2 + 6, tsY2));
       if (!headers.some((h) => Math.abs(h.bounds.y1 - b.y1) < 25))
         headers.push({
           bounds: b,

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ReactNode,
+} from 'react';
 import {
   maskGyazoToken,
   parseGyazoTokenList,
@@ -9,252 +17,267 @@ import {
 import { api } from '../../api.js';
 import { copyTextToClipboard } from '../../clipboard.js';
 import { ConfirmDialog } from '../../confirm-dialog.js';
-import { UI_CARD, UI_INPUT_SM, UI_MUTED, UI_TEXTAREA } from '../../ui/primitives.js';
+import { UI_CARD, UI_INPUT_SM, UI_MUTED, UI_ROW, UI_TEXTAREA } from '../../ui/primitives.js';
 import { Btn, errMsg, InFld, NoticeBanner, SelFld } from '../shared/module-ui.js';
 import { clearGoogleSheetsGridCache } from './google-sheets-page.js';
-
 interface Draft {
   preferredHost: SheetImageHostPreference;
   defaultMachineName: string;
   gyazoTokens: string[];
 }
+type StepId = 1 | 2 | 3;
+type Tone = 'ok' | 'warn' | 'info' | 'neutral';
+const TONE: Record<Tone, string> = {
+  ok: 'bg-emerald-50 text-emerald-700',
+  warn: 'bg-amber-50 text-amber-700',
+  info: 'bg-sky-50 text-sky-700',
+  neutral: 'bg-slate-100 text-slate-600',
+};
+const ROW = 'flex flex-wrap items-center justify-between gap-2';
+const FILE_LBL =
+  'relative inline-flex h-7 cursor-pointer items-center rounded-md bg-[var(--brand)] px-2.5 text-xs font-semibold text-white hover:bg-[var(--brand-hover)]';
+const CHIP = 'rounded border border-[var(--line)] bg-white px-2 py-0.5 font-mono text-[11px]';
+const CFM = {
+  revoke: [
+    '确认断开 Google 账号授权',
+    '断开后将暂停自动同步、排贴与顶贴，确定断开吗？',
+    '确认断开授权',
+  ],
+  'clear-token': [
+    '确认清空全部 Gyazo Token',
+    '清空后将回退至 Google 网盘图床，确定清空吗？',
+    '确认清空',
+  ],
+} as const;
 const sameDraft = (a: Draft | null, b: Draft) =>
   a !== null &&
   a.preferredHost === b.preferredHost &&
   a.defaultMachineName === b.defaultMachineName &&
   a.gyazoTokens.length === b.gyazoTokens.length &&
   a.gyazoTokens.every((t, i) => t === b.gyazoTokens[i]);
-const cloneDraft = (d: Draft): Draft => ({ ...d, gyazoTokens: [...d.gyazoTokens] });
-
+function Step(p: {
+  id: StepId;
+  title: string;
+  badge: string;
+  tone: Tone;
+  open: boolean;
+  toggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <section className={`${UI_CARD} overflow-hidden`}>
+      <button
+        type="button"
+        aria-expanded={p.open}
+        onClick={p.toggle}
+        className="flex w-full cursor-pointer items-center justify-between gap-2 px-3 py-2 text-left hover:bg-slate-50"
+      >
+        <span className="text-xs font-semibold text-[var(--text)]">{`${p.id}. ${p.title}`}</span>
+        <span className="flex items-center gap-2">
+          <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${TONE[p.tone]}`}>
+            {p.badge}
+          </span>
+          <span className="text-[11px] text-[var(--muted)]">{p.open ? '收起' : '展开'}</span>
+        </span>
+      </button>
+      <div className={p.open ? 'flex flex-col gap-2 border-t border-[var(--line)] p-3' : 'hidden'}>
+        {p.children}
+      </div>
+    </section>
+  );
+}
 export function GoogleSheetsAuthPanel({ onChanged }: { onChanged?: () => void }) {
-  const [auth, setAuth] = useState<GoogleAuthStatus | null>(null),
-    [imageHost, setImageHost] = useState<SheetImageHostStatus | null>(null),
-    [loading, setLoading] = useState(true),
-    [busy, setBusy] = useState(false),
-    [testingHost, setTestingHost] = useState(false),
-    [feedback, setFeedback] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null),
-    [credText, setCredText] = useState(''),
-    [showPasteCred, setShowPasteCred] = useState(false),
-    [authUrl, setAuthUrl] = useState<string | null>(null),
-    [manualCode, setManualCode] = useState(''),
-    [showManualBox, setShowManualBox] = useState(false),
-    [preferredHost, setPreferredHost] = useState<SheetImageHostPreference>('auto'),
-    [gyazoTokensText, setGyazoTokensText] = useState(''),
-    [maskTokensView, setMaskTokensView] = useState(false),
-    [machineName, setMachineName] = useState('电脑1号'),
-    [autoSaveState, setAutoSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle'),
-    [autoSaveError, setAutoSaveError] = useState<string | null>(null),
-    [testImageUrl, setTestImageUrl] = useState<string | null>(null),
-    [confirmAction, setConfirmAction] = useState<'revoke' | 'clear-token' | null>(null);
-
-  const pollInFlight = useRef(false),
-    initRef = useRef(false),
-    lastSavedRef = useRef<Draft | null>(null),
-    latestRef = useRef<Draft>({
-      preferredHost: 'auto',
-      defaultMachineName: '电脑1号',
-      gyazoTokens: [],
-    }),
-    saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null),
-    saveQueueRef = useRef<Promise<void>>(Promise.resolve()),
-    mountedRef = useRef(true);
-
-  const parsedTokens = useMemo(() => parseGyazoTokenList(gyazoTokensText), [gyazoTokensText]);
-  const makeDraft = (o?: Partial<Draft>): Draft => ({
-    preferredHost: o?.preferredHost ?? preferredHost,
-    defaultMachineName: o?.defaultMachineName ?? (machineName.trim() || '电脑1号'),
-    gyazoTokens: o?.gyazoTokens ?? parsedTokens,
+  const [auth, setAuth] = useState<GoogleAuthStatus | null>(null);
+  const [hostStat, setHostStat] = useState<SheetImageHostStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [ui, setUi] = useState({
+    busy: false,
+    testing: false,
+    paste: false,
+    manual: false,
+    mask: false,
   });
-  const saveImageHost = (d: Draft) =>
-    api.googleSheetsSaveImageHost({
-      preferredHost: d.preferredHost,
-      defaultMachineName: d.defaultMachineName,
-      gyazoAccessTokens: d.gyazoTokens,
-    });
-  latestRef.current = makeDraft();
-
-  const load = useCallback(async () => {
-    try {
-      const [ov, tok] = await Promise.all([
-        api.googleSheetsOverview(),
-        api.googleSheetsImageHostTokens().catch(() => ({ tokens: [] as string[] })),
-      ]);
-      if (!mountedRef.current) return;
-      setAuth(ov.auth);
-      setImageHost(ov.imageHost);
-      setAuthUrl(ov.auth.pendingAuthUrl);
-      const m = ov.imageHost.defaultMachineName || '电脑1号',
-        t = parseGyazoTokenList(tok.tokens);
-      setPreferredHost(ov.imageHost.preferredHost);
-      setMachineName(m);
-      setGyazoTokensText(t.join('\n'));
-      const snap: Draft = {
-        preferredHost: ov.imageHost.preferredHost,
-        defaultMachineName: m,
-        gyazoTokens: t,
-      };
-      lastSavedRef.current = snap;
-      latestRef.current = snap;
-      initRef.current = true;
-    } catch (e) {
-      if (mountedRef.current)
-        setFeedback({ tone: 'err', text: errMsg(e, '读取 Google 授权配置失败') });
-    } finally {
-      if (mountedRef.current) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    void load();
-    return () => {
-      mountedRef.current = false;
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-      const p = latestRef.current;
-      if (initRef.current && !sameDraft(lastSavedRef.current, p)) {
-        lastSavedRef.current = cloneDraft(p);
-        void saveImageHost(p).catch(() => {});
-      }
-    };
-  }, [load]);
-
-  const flushSaveDraft = useCallback(
-    (override?: Draft): Promise<void> => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-      const target = override ?? latestRef.current;
-      if (!initRef.current || sameDraft(lastSavedRef.current, target)) return saveQueueRef.current;
-      const task = saveQueueRef.current
-        .catch(() => {})
-        .then(async () => {
-          if (sameDraft(lastSavedRef.current, target)) return;
-          if (mountedRef.current) {
-            setAutoSaveState('saving');
-            setAutoSaveError(null);
-          }
-          try {
-            const next = await saveImageHost(target);
-            lastSavedRef.current = cloneDraft(target);
-            if (mountedRef.current) {
-              setImageHost(next);
-              setAutoSaveState('saved');
-              setAutoSaveError(null);
-              onChanged?.();
-            }
-          } catch (e) {
-            if (mountedRef.current) {
-              const m = errMsg(e, '自动保存失败');
-              setAutoSaveState('error');
-              setAutoSaveError(m);
-              setFeedback({ tone: 'err', text: m });
-            }
-          }
+  const [steps, setSteps] = useState<Record<StepId, boolean>>({ 1: true, 2: false, 3: false });
+  const [fb, setFb] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
+  const [cred, setCred] = useState('');
+  const [code, setCode] = useState('');
+  const [form, setForm] = useState({
+    host: 'auto' as SheetImageHostPreference,
+    machine: '电脑1号',
+    tokens: '',
+  });
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [testUrl, setTestUrl] = useState<string | null>(null);
+  const [cfmKey, setCfmKey] = useState<'revoke' | 'clear-token' | null>(null);
+  const refs = useRef({
+    poll: false,
+    init: false,
+    mounted: true,
+    saved: null as Draft | null,
+    latest: { preferredHost: 'auto', defaultMachineName: '电脑1号', gyazoTokens: [] } as Draft,
+    timer: null as ReturnType<typeof setTimeout> | null,
+  });
+  const ok = useCallback((text: string) => setFb({ tone: 'ok', text }), []);
+  const fail = useCallback(
+    (e: unknown, def: string) => setFb({ tone: 'err', text: errMsg(e, def) }),
+    [],
+  );
+  const tokens = useMemo(() => parseGyazoTokenList(form.tokens), [form.tokens]);
+  const toDraft = (f = form): Draft => ({
+    preferredHost: f.host,
+    defaultMachineName: f.machine.trim() || '电脑1号',
+    gyazoTokens: parseGyazoTokenList(f.tokens),
+  });
+  refs.current.latest = toDraft();
+  const saveNow = useCallback(
+    async (override?: Draft) => {
+      const r = refs.current;
+      if (r.timer) clearTimeout(r.timer);
+      r.timer = null;
+      const target = override ?? r.latest;
+      if (!r.init || sameDraft(r.saved, target)) return;
+      r.saved = target;
+      if (r.mounted) setSaveState('saving');
+      try {
+        const next = await api.googleSheetsSaveImageHost({
+          preferredHost: target.preferredHost,
+          defaultMachineName: target.defaultMachineName,
+          gyazoAccessTokens: target.gyazoTokens,
         });
-      saveQueueRef.current = task;
-      return task;
+        if (r.mounted) {
+          setHostStat(next);
+          setSaveState('saved');
+          onChanged?.();
+        }
+      } catch (e) {
+        r.saved = null;
+        if (r.mounted) {
+          setSaveState('error');
+          fail(e, '自动保存失败');
+        }
+      }
     },
-    [onChanged],
+    [fail, onChanged],
   );
-
-  const scheduleAutoSave = useCallback(
-    (nextDraft: Draft, delayMs = 450) => {
-      latestRef.current = nextDraft;
-      if (!initRef.current) return;
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-      if (sameDraft(lastSavedRef.current, nextDraft)) return;
-      setAutoSaveState('saving');
-      setAutoSaveError(null);
-      if (delayMs <= 0) return void flushSaveDraft(nextDraft);
-      saveTimerRef.current = setTimeout(() => {
-        saveTimerRef.current = null;
-        void flushSaveDraft(nextDraft);
-      }, delayMs);
-    },
-    [flushSaveDraft],
-  );
-
+  const queueDraft = (nf: typeof form, ms = 450) => {
+    setForm(nf);
+    const next = toDraft(nf),
+      r = refs.current;
+    r.latest = next;
+    if (!r.init || sameDraft(r.saved, next)) return;
+    if (r.timer) clearTimeout(r.timer);
+    r.timer = null;
+    setSaveState('saving');
+    if (ms <= 0) void saveNow(next);
+    else r.timer = setTimeout(() => void saveNow(next), ms);
+  };
+  useEffect(() => {
+    const r = refs.current;
+    r.mounted = true;
+    void Promise.all([
+      api.googleSheetsOverview(),
+      api.googleSheetsImageHostTokens().catch(() => ({ tokens: [] as string[] })),
+    ])
+      .then(([ov, tok]) => {
+        if (!r.mounted) return;
+        const m = ov.imageHost.defaultMachineName || '电脑1号',
+          t = parseGyazoTokenList(tok.tokens),
+          snap: Draft = {
+            preferredHost: ov.imageHost.preferredHost,
+            defaultMachineName: m,
+            gyazoTokens: t,
+          };
+        setAuth(ov.auth);
+        setHostStat(ov.imageHost);
+        setSteps({
+          1: !ov.auth.hasCredentials,
+          2: ov.auth.hasCredentials && !ov.auth.authorized,
+          3: ov.auth.authorized,
+        });
+        setForm({ host: ov.imageHost.preferredHost, machine: m, tokens: t.join('\n') });
+        r.saved = snap;
+        r.latest = snap;
+        r.init = true;
+      })
+      .catch((e) => r.mounted && fail(e, '读取 Google 授权配置失败'))
+      .finally(() => r.mounted && setLoading(false));
+    return () => {
+      r.mounted = false;
+      if (r.timer) clearTimeout(r.timer);
+      if (r.init && !sameDraft(r.saved, r.latest)) void saveNow(r.latest);
+    };
+  }, [fail, saveNow]);
+  const authUrl = auth?.pendingAuthUrl ?? null;
   useEffect(() => {
     if (!authUrl || auth?.authorized) return;
-    const timer = setInterval(() => {
-      if (pollInFlight.current) return;
-      pollInFlight.current = true;
+    const t = setInterval(() => {
+      if (refs.current.poll) return;
+      refs.current.poll = true;
       void api
         .googleSheetsOverview()
         .then((ov) => {
-          if (!mountedRef.current) return;
+          if (!refs.current.mounted) return;
           setAuth(ov.auth);
-          setImageHost(ov.imageHost);
+          setHostStat(ov.imageHost);
           if (ov.auth.authorized) {
-            setAuthUrl(null);
-            setFeedback({
-              tone: 'ok',
-              text: `授权成功：${ov.auth.authorizedEmail ?? 'Google 账号已连接'}`,
-            });
+            setSteps({ 1: false, 2: false, 3: true });
+            ok(`授权成功：${ov.auth.authorizedEmail ?? 'Google 账号已连接'}`);
             onChanged?.();
           }
         })
         .catch(() => {})
         .finally(() => {
-          pollInFlight.current = false;
+          refs.current.poll = false;
         });
     }, 2500);
-    return () => clearInterval(timer);
-  }, [authUrl, auth?.authorized, onChanged]);
-
-  async function runBusy(work: () => Promise<void>, fb: string) {
-    setBusy(true);
-    setFeedback(null);
+    return () => clearInterval(t);
+  }, [authUrl, auth?.authorized, ok, onChanged]);
+  const runBusy = async (work: () => Promise<void>, def: string) => {
+    setUi((s) => ({ ...s, busy: true }));
+    setFb(null);
     try {
       await work();
     } catch (e) {
-      setFeedback({ tone: 'err', text: errMsg(e, fb) });
+      fail(e, def);
     } finally {
-      setBusy(false);
+      setUi((s) => ({ ...s, busy: false }));
     }
-  }
-  async function startAndCopyAuthUrl(prefix?: string) {
+  };
+  const startAndCopy = async (prefix?: string) => {
     const res = await api.googleSheetsStartAuth();
-    setAuth(res.status);
-    setAuthUrl(res.authUrl);
+    setAuth({ ...res.status, pendingAuthUrl: res.authUrl });
+    setSteps((s) => ({ ...s, 1: false, 2: true }));
     const copied = await copyTextToClipboard(res.authUrl).then(
       () => true,
       () => false,
     );
     const tail = copied
-      ? '已自动生成并复制授权链接到剪贴板！请直接粘贴到目标 Gmail 浏览器打开完成授权。'
-      : '已自动生成授权链接（未能自动写入剪贴板，请点击下方「复制链接」）。';
-    setFeedback({
-      tone: 'ok',
-      text: prefix
-        ? `${prefix}，${tail}`
-        : copied
-          ? '已生成并自动复制授权链接！请粘贴到目标 Gmail 浏览器打开并同意授权。'
-          : '已生成授权链接，请点击下方「复制链接」到目标 Gmail 浏览器打开。',
-    });
-  }
-  async function importAndStartAuth(rawJson: string, label: string) {
-    setAuth(await api.googleSheetsImportCredentials(rawJson));
+      ? '已自动生成并复制授权链接！请粘贴到目标 Gmail 浏览器打开并同意授权。'
+      : '已生成授权链接，请点击「再次复制」到目标 Gmail 浏览器打开。';
+    ok(prefix ? `${prefix}，${tail}` : tail);
+  };
+  const importAndStart = async (raw: string, label: string) => {
+    setAuth(await api.googleSheetsImportCredentials(raw));
     onChanged?.();
-    await startAndCopyAuthUrl(label);
-  }
-  async function onPickCredFile(e: ChangeEvent<HTMLInputElement>) {
+    await startAndCopy(label);
+  };
+  const onPickFile = (e: ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     e.target.value = '';
     if (f)
-      await runBusy(
-        async () => importAndStartAuth(await f.text(), `已导入授权文件（${f.name}）`),
+      void runBusy(
+        async () => importAndStart(await f.text(), `已导入授权文件（${f.name}）`),
         '导入失败',
       );
-  }
-  async function handleTestImageHost() {
-    setTestingHost(true);
-    setFeedback(null);
-    setTestImageUrl(null);
+  };
+  const onTestHost = async () => {
+    setUi((s) => ({ ...s, testing: true }));
+    setFb(null);
+    setTestUrl(null);
     try {
-      await flushSaveDraft();
+      await saveNow();
       const res = await api.googleSheetsTestImageHost();
-      setTestImageUrl(res.remoteUrl);
+      setTestUrl(res.remoteUrl);
       const lbl =
         res.host === 'gyazo'
           ? res.tokenIndex !== undefined && (res.tokenCount ?? 0) > 1
@@ -263,339 +286,274 @@ export function GoogleSheetsAuthPanel({ onChanged }: { onChanged?: () => void })
           : res.fallbackFromGyazo
             ? 'Gyazo 失败，已自动切换 Google 网盘兜底'
             : 'Google 网盘自建';
-      setFeedback({ tone: 'ok', text: `图床上传测试成功（${lbl}）` });
+      ok(`图床上传测试成功（${lbl}）`);
     } catch (e) {
-      setFeedback({ tone: 'err', text: errMsg(e, '测试上传失败') });
+      fail(e, '测试上传失败');
     } finally {
-      setTestingHost(false);
+      setUi((s) => ({ ...s, testing: false }));
     }
-  }
-
+  };
+  const onConfirm = () => {
+    if (cfmKey === 'revoke') {
+      return void runBusy(async () => {
+        setCfmKey(null);
+        setAuth(await api.googleSheetsRevokeAuth());
+        clearGoogleSheetsGridCache();
+        setSteps({ 1: false, 2: true, 3: false });
+        ok('已断开 Google 授权');
+        onChanged?.();
+      }, '断开失败');
+    }
+    setCfmKey(null);
+    const nf = { ...form, tokens: '' };
+    setForm(nf);
+    setUi((s) => ({ ...s, mask: false }));
+    void saveNow(toDraft(nf)).then(() => ok('已清空 Gyazo Token，将自动使用 Google 网盘兜底'));
+  };
   if (loading) return <p className={UI_MUTED}>正在读取 Google 表格授权配置…</p>;
-
+  const togStep = (s: StepId) => setSteps((p) => ({ ...p, [s]: !p[s] }));
+  const togUi = (k: 'paste' | 'manual' | 'mask') => setUi((p) => ({ ...p, [k]: !p[k] }));
+  const cached = hostStat?.cachedImageCount ?? 0;
+  const step3Bdg =
+    saveState === 'saving'
+      ? '自动保存中…'
+      : saveState === 'error'
+        ? '保存失败'
+        : saveState === 'saved'
+          ? `已自动保存 · 缓存 ${cached}`
+          : `已缓存去重 ${cached} 张`;
+  const tokHint =
+    tokens.length > 1
+      ? ` · 已配置 ${tokens.length} 个 · 自动轮询`
+      : tokens.length === 1
+        ? ' · 已配置 1 个'
+        : ' · 留空用网盘兜底';
+  const authBdg = auth?.authorized
+    ? `已授权${auth.authorizedEmail ? ` · ${auth.authorizedEmail}` : ''}`
+    : authUrl
+      ? '等待回传…'
+      : '未授权';
+  const cfm = cfmKey ? CFM[cfmKey] : null;
+  const doPaste = () =>
+    void runBusy(async () => {
+      await importAndStart(cred, '已保存凭据');
+      setCred('');
+      togUi('paste');
+    }, '保存失败');
+  const doManual = () =>
+    void runBusy(async () => {
+      const next = await api.googleSheetsCompleteManualAuth(code);
+      setAuth(next);
+      setCode('');
+      togUi('manual');
+      setSteps({ 1: false, 2: false, 3: true });
+      ok(`授权成功：${next.authorizedEmail ?? 'Google 账号已连接'}`);
+      onChanged?.();
+    }, '手动验证失败');
+  const doCopy = () =>
+    authUrl &&
+    void copyTextToClipboard(authUrl).then(
+      () => ok('已复制授权链接'),
+      (e) => fail(e, '复制失败'),
+    );
   return (
-    <div className="flex flex-col gap-3">
-      {feedback && <NoticeBanner tone={feedback.tone}>{feedback.text}</NoticeBanner>}
-      <section className={`${UI_CARD} flex flex-col gap-3 p-4`}>
-        <div className="flex flex-wrap items-start justify-between gap-2.5">
-          <div>
-            <h3 className="m-0 text-sm font-semibold">1. Google 账号授权</h3>
-            <p className={`${UI_MUTED} m-0 mt-0.5`}>
-              选择或粘贴 OAuth JSON 后将自动生成并复制授权链接，直接粘贴到目标 Gmail
-              浏览器打开即可完成授权。
-            </p>
-          </div>
-          <span
-            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[11px] font-semibold whitespace-nowrap ${auth?.authorized ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}
-          >
-            {auth?.authorized
-              ? `已授权${auth.authorizedEmail ? ` · ${auth.authorizedEmail}` : ''}`
-              : '未授权'}
+    <div className="flex flex-col gap-2">
+      {fb && <NoticeBanner tone={fb.tone}>{fb.text}</NoticeBanner>}
+      <Step
+        id={1}
+        title="导入 OAuth 凭证"
+        badge={auth?.hasCredentials ? (auth.clientIdHint ?? '已载入') : '未导入'}
+        tone={auth?.hasCredentials ? 'ok' : 'warn'}
+        open={steps[1]}
+        toggle={() => togStep(1)}
+      >
+        <div className={ROW}>
+          <span className={UI_MUTED}>
+            选择「桌面应用」credentials.json 自动导入并复制授权链接。
           </span>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-dashed border-[var(--line-strong)] bg-slate-50 px-3 py-2.5">
-          <div className="flex flex-col gap-0.5 text-xs">
-            <strong>OAuth 凭据文件（credentials.json）</strong>
-            <span className={UI_MUTED}>
-              {auth?.hasCredentials
-                ? `已载入：${auth.clientIdHint ?? 'Desktop OAuth Client'}`
-                : '从 Google Cloud Console 下载「桌面应用」JSON，选中即自动生成并复制授权链接'}
-            </span>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="relative inline-flex h-7 shrink-0 cursor-pointer items-center justify-center gap-1.5 overflow-hidden rounded-md border border-[var(--brand)] bg-[var(--brand)] px-2.5 text-xs font-semibold whitespace-nowrap text-white transition-colors hover:bg-[var(--brand-hover)]">
+          <div className="flex items-center gap-2">
+            <label className={FILE_LBL}>
               选择 JSON 并生成链接
               <input
                 type="file"
                 accept=".json,application/json"
-                disabled={busy}
+                disabled={ui.busy}
                 className="absolute inset-0 cursor-pointer opacity-0"
-                onChange={(e) => void onPickCredFile(e)}
+                onChange={onPickFile}
               />
             </label>
-            <Btn v="ghost" disabled={busy} onClick={() => setShowPasteCred((v) => !v)}>
-              {showPasteCred ? '收起粘贴框' : '粘贴 JSON'}
+            <Btn v="ghost" disabled={ui.busy} onClick={() => togUi('paste')}>
+              {ui.paste ? '收起粘贴' : '粘贴 JSON'}
             </Btn>
+          </div>
+        </div>
+        {ui.paste && (
+          <div className="flex flex-col gap-2 rounded-md border border-[var(--line)] bg-slate-50 p-2">
+            <textarea
+              rows={3}
+              className="w-full rounded border border-[var(--line-strong)] bg-white p-2 font-mono text-[11px]"
+              placeholder='粘贴 credentials.json 内容，例如 {"installed":{"client_id":...}}'
+              value={cred}
+              onChange={(e) => setCred(e.target.value)}
+            />
+            <Btn v="primary" disabled={ui.busy || !cred.trim()} onClick={doPaste}>
+              导入并自动生成复制链接
+            </Btn>
+          </div>
+        )}
+      </Step>
+      <Step
+        id={2}
+        title="完成 Google 授权"
+        badge={authBdg}
+        tone={auth?.authorized ? 'ok' : authUrl ? 'info' : 'warn'}
+        open={steps[2]}
+        toggle={() => togStep(2)}
+      >
+        <div className={ROW}>
+          <span className={UI_MUTED}>
+            {auth?.hasCredentials
+              ? '将链接粘贴到目标 Gmail 的 Chrome 打开并同意授权。'
+              : '请先在第 1 步导入 OAuth 凭据。'}
+          </span>
+          <div className="flex items-center gap-2">
             {auth?.hasCredentials && (
               <Btn
-                disabled={busy}
-                onClick={() => void runBusy(() => startAndCopyAuthUrl(), '生成授权链接失败')}
+                disabled={ui.busy}
+                onClick={() => void runBusy(() => startAndCopy(), '生成授权链接失败')}
               >
-                {auth?.authorized ? '重新授权' : '重新生成链接'}
+                {auth.authorized ? '重新授权' : '生成/刷新链接'}
               </Btn>
             )}
             {auth?.authorized && (
-              <Btn v="danger" disabled={busy} onClick={() => setConfirmAction('revoke')}>
+              <Btn v="danger" disabled={ui.busy} onClick={() => setCfmKey('revoke')}>
                 断开授权
               </Btn>
             )}
           </div>
         </div>
-        {showPasteCred && (
-          <div className="flex flex-col gap-2 rounded-lg border border-[var(--line)] bg-slate-50 p-2.5">
-            <textarea
-              rows={4}
-              className="w-full rounded-md border border-[var(--line-strong)] bg-white p-2 font-mono text-[11px] text-[var(--text)] focus:border-[var(--brand)] focus:outline-none"
-              placeholder='粘贴完整的 Google OAuth credentials.json 内容，例如 {"installed":{"client_id":...}}'
-              value={credText}
-              onChange={(e) => setCredText(e.target.value)}
-            />
-            <div>
-              <Btn
-                v="primary"
-                disabled={busy || !credText.trim()}
-                onClick={() =>
-                  void runBusy(async () => {
-                    await importAndStartAuth(credText, '已保存 Google OAuth 凭据');
-                    setCredText('');
-                    setShowPasteCred(false);
-                  }, '保存失败')
-                }
-              >
-                导入并自动生成复制链接
-              </Btn>
-            </div>
-          </div>
-        )}
         {authUrl && (
-          <div className="flex flex-col gap-2 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-xs">
-            <div className="flex items-center justify-between gap-2">
-              <strong>授权链接（已自动复制，等待浏览器回传…）</strong>
-              <Btn
-                v="primary"
-                onClick={() =>
-                  void copyTextToClipboard(authUrl)
-                    .then(() =>
-                      setFeedback({
-                        tone: 'ok',
-                        text: '已复制授权链接，请粘贴到指定邮箱浏览器打开',
-                      }),
-                    )
-                    .catch((e) => setFeedback({ tone: 'err', text: errMsg(e, '复制失败') }))
-                }
-              >
+          <div className="flex flex-col gap-2 rounded-md border border-sky-200 bg-sky-50 p-2 text-xs">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                readOnly
+                value={authUrl}
+                className={`${UI_INPUT_SM} min-w-0 flex-1 font-mono text-[11px]`}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <Btn v="primary" onClick={doCopy}>
                 再次复制
               </Btn>
-            </div>
-            <input
-              type="text"
-              readOnly
-              value={authUrl}
-              className={`${UI_INPUT_SM} w-full font-mono text-[11px]`}
-              onFocus={(e) => e.currentTarget.select()}
-            />
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs text-sky-900/80">
-                直接粘贴到登录了目标 Gmail 的 Chrome 浏览器打开，点击同意后本软件会自动完成连接。
-              </span>
-              <Btn v="ghost" onClick={() => setShowManualBox((v) => !v)}>
-                {showManualBox ? '收起手动回填' : '跨机/手动回填'}
+              <Btn v="ghost" onClick={() => togUi('manual')}>
+                {ui.manual ? '收起回填' : '手动回填'}
               </Btn>
             </div>
-            {showManualBox && (
+            {ui.manual && (
               <div className="flex items-center gap-2">
                 <input
                   type="text"
                   className={`${UI_INPUT_SM} min-w-0 flex-1`}
-                  placeholder="粘贴浏览器跳转后的完整 http://127.0.0.1:.../oauth2/callback?code=... 或授权码"
-                  value={manualCode}
-                  onChange={(e) => setManualCode(e.target.value)}
+                  placeholder="粘贴回调 URL 或授权码"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
                 />
-                <Btn
-                  v="primary"
-                  disabled={busy || !manualCode.trim()}
-                  onClick={() =>
-                    void runBusy(async () => {
-                      const next = await api.googleSheetsCompleteManualAuth(manualCode);
-                      setAuth(next);
-                      setAuthUrl(null);
-                      setManualCode('');
-                      setShowManualBox(false);
-                      setFeedback({
-                        tone: 'ok',
-                        text: `授权成功：${next.authorizedEmail ?? 'Google 账号已连接'}`,
-                      });
-                      onChanged?.();
-                    }, '手动验证失败')
-                  }
-                >
+                <Btn v="primary" disabled={ui.busy || !code.trim()} onClick={doManual}>
                   提交完成授权
                 </Btn>
               </div>
             )}
           </div>
         )}
-        {auth?.lastError && <p className="m-0 text-xs text-rose-700">最近错误：{auth.lastError}</p>}
-      </section>
-
-      <section className={`${UI_CARD} flex flex-col gap-3 p-4`}>
-        <div className="flex flex-wrap items-start justify-between gap-2.5">
-          <div>
-            <h3 className="m-0 text-sm font-semibold">2. 永久图床与本机标识</h3>
-            <p className={`${UI_MUTED} m-0 mt-0.5`}>
-              修改后自动立即保存，无需点保存按钮；支持填多个 Gyazo Token 自动轮询与失效切换。
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {autoSaveState === 'saving' && (
-              <span className="inline-flex items-center rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-700">
-                自动保存中…
-              </span>
-            )}
-            {autoSaveState === 'saved' && (
-              <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
-                已自动保存
-              </span>
-            )}
-            {autoSaveState === 'error' && (
-              <span
-                className="inline-flex items-center rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-700"
-                title={autoSaveError ?? undefined}
-              >
-                保存失败
-              </span>
-            )}
-            <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-600">
-              已缓存去重 {imageHost?.cachedImageCount ?? 0} 张
-            </span>
-          </div>
-        </div>
-        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        {auth?.lastError && (
+          <p className="m-0 text-xs text-rose-700">{`最近错误：${auth.lastError}`}</p>
+        )}
+      </Step>
+      <Step
+        id={3}
+        title="图床测试"
+        badge={step3Bdg}
+        tone={saveState === 'error' ? 'warn' : saveState === 'saved' ? 'ok' : 'neutral'}
+        open={steps[3]}
+        toggle={() => togStep(3)}
+      >
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <InFld
-            label="默认本机名称（发帖记录右侧顶贴列名）"
+            label="默认本机名称（发帖记录顶贴列名）"
             maxLength={60}
-            value={machineName}
+            value={form.machine}
             placeholder="例如：电脑1号"
-            onVal={(v) => {
-              setMachineName(v);
-              scheduleAutoSave(makeDraft({ defaultMachineName: v.trim() || '电脑1号' }), 450);
-            }}
-            onBlur={() => void flushSaveDraft()}
+            onVal={(v) => queueDraft({ ...form, machine: v })}
+            onBlur={() => void saveNow()}
           />
           <SelFld
             label="图床托管策略"
-            value={preferredHost}
-            onVal={(v) => {
-              const h = v as SheetImageHostPreference;
-              setPreferredHost(h);
-              scheduleAutoSave(makeDraft({ preferredHost: h }), 0);
-            }}
+            value={form.host}
+            onVal={(v) => queueDraft({ ...form, host: v as SheetImageHostPreference }, 0)}
           >
             <option value="auto">自动（优先 Gyazo，失效切网盘）</option>
             <option value="gyazo">仅 Gyazo 图床</option>
             <option value="drive">仅 Google 网盘</option>
           </SelFld>
           <div className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)] sm:col-span-2">
-            <div className="flex items-center justify-between gap-2">
-              <span>
-                Gyazo Access Token 轮询池（每行一个，修改后自动保存
-                {parsedTokens.length > 1
-                  ? ` · 已配置 ${parsedTokens.length} 个 · 自动轮询 + 失效切换`
-                  : parsedTokens.length === 1
-                    ? ' · 已配置 1 个'
-                    : ' · 留空自动用 Google 网盘兜底'}
-                ）
-              </span>
-              {parsedTokens.length > 0 && (
-                <div className="flex items-center gap-1.5">
-                  <Btn
-                    v="ghost"
-                    className="h-6 px-2 text-[11px]"
-                    onClick={() => setMaskTokensView((v) => !v)}
-                  >
-                    {maskTokensView ? '编辑明文' : '隐藏明文'}
+            <div className={ROW}>
+              <span>{`Gyazo Token 轮询池（自动保存${tokHint}）`}</span>
+              {tokens.length > 0 && (
+                <span className="flex items-center gap-1.5">
+                  <Btn v="ghost" className="h-6 px-2 text-[11px]" onClick={() => togUi('mask')}>
+                    {ui.mask ? '编辑明文' : '隐藏明文'}
                   </Btn>
                   <Btn
                     v="ghost"
                     className="h-6 px-2 text-[11px]"
-                    disabled={testingHost}
-                    onClick={() => setConfirmAction('clear-token')}
+                    disabled={ui.testing}
+                    onClick={() => setCfmKey('clear-token')}
                   >
                     清空全部
                   </Btn>
-                </div>
+                </span>
               )}
             </div>
-            {maskTokensView && parsedTokens.length > 0 ? (
+            {ui.mask && tokens.length > 0 ? (
               <div className="flex flex-wrap gap-1.5 rounded-md border border-[var(--line)] bg-slate-50 p-2">
-                {parsedTokens.map((t, idx) => (
+                {tokens.map((t, i) => (
                   <span
-                    key={`${idx}-${t.slice(0, 4)}`}
-                    className="rounded border border-[var(--line)] bg-white px-2 py-0.5 font-mono text-[11px]"
-                  >
-                    #{idx + 1} · {maskGyazoToken(t) ?? '••••••'}
-                  </span>
+                    key={`${i}-${t.slice(0, 4)}`}
+                    className={CHIP}
+                  >{`#${i + 1} · ${maskGyazoToken(t) ?? '••••••'}`}</span>
                 ))}
               </div>
             ) : (
               <textarea
-                rows={Math.max(3, Math.min(6, parsedTokens.length + 1))}
+                rows={Math.max(2, Math.min(5, tokens.length + 1))}
                 className={`${UI_TEXTAREA} gs-token-textarea font-mono text-[11px]`}
                 spellCheck={false}
-                placeholder={
-                  '粘贴 1 个或多个 Gyazo Access Token，每行一个（输入或粘贴后自动立即保存）。\n支持多 Token 轮流上传，某个失效/限流时自动切到下一个。'
-                }
-                value={gyazoTokensText}
-                onChange={(e) => {
-                  setGyazoTokensText(e.target.value);
-                  scheduleAutoSave(
-                    makeDraft({ gyazoTokens: parseGyazoTokenList(e.target.value) }),
-                    450,
-                  );
-                }}
-                onBlur={() => void flushSaveDraft()}
+                placeholder="每行一个 Gyazo Access Token（修改后自动保存）。"
+                value={form.tokens}
+                onChange={(e) => queueDraft({ ...form, tokens: e.target.value })}
+                onBlur={() => void saveNow()}
               />
             )}
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Btn disabled={testingHost || busy} onClick={() => void handleTestImageHost()}>
-            {testingHost ? '测试上传中…' : '测试图床上传'}
+        <div className={UI_ROW}>
+          <Btn disabled={ui.testing || ui.busy} onClick={() => void onTestHost()}>
+            {ui.testing ? '测试上传中…' : '测试图床上传'}
           </Btn>
-          {testImageUrl && (
+          {testUrl && (
             <span className={`${UI_MUTED} max-w-[420px] truncate text-[11px]`}>
-              测试直链：<code>{testImageUrl}</code>
+              测试直链：<code>{testUrl}</code>
             </span>
           )}
         </div>
-      </section>
-
-      {confirmAction && (
+      </Step>
+      {cfm && (
         <ConfirmDialog
-          title={
-            confirmAction === 'revoke' ? '确认断开 Google 账号授权' : '确认清空全部 Gyazo Token'
-          }
-          description={
-            confirmAction === 'revoke'
-              ? '断开后所有已连接的 Google 表格将暂停自动同步、排贴与顶贴，直到重新完成 OAuth 授权。确定断开吗？'
-              : '清空后将自动回退至免配置的 Google 网盘图床（已上传缓存直链不受影响）。确定清空吗？'
-          }
-          label={confirmAction === 'revoke' ? '确认断开授权' : '确认清空'}
-          onClose={() => setConfirmAction(null)}
-          onConfirm={
-            confirmAction === 'revoke'
-              ? () =>
-                  runBusy(async () => {
-                    setConfirmAction(null);
-                    setAuth(await api.googleSheetsRevokeAuth());
-                    clearGoogleSheetsGridCache();
-                    setAuthUrl(null);
-                    setFeedback({ tone: 'ok', text: '已断开 Google 授权' });
-                    onChanged?.();
-                  }, '断开失败')
-              : async () => {
-                  setConfirmAction(null);
-                  setGyazoTokensText('');
-                  setMaskTokensView(false);
-                  const d = makeDraft({ gyazoTokens: [] });
-                  latestRef.current = d;
-                  await flushSaveDraft(d);
-                  setFeedback({
-                    tone: 'ok',
-                    text: '已清空 Gyazo Token，将自动使用 Google 网盘兜底',
-                  });
-                }
-          }
+          title={cfm[0]}
+          description={cfm[1]}
+          label={cfm[2]}
+          onClose={() => setCfmKey(null)}
+          onConfirm={onConfirm}
         />
       )}
     </div>

@@ -7,6 +7,7 @@ import {
 import type { MaterialDraft } from '../../domain/poster-material-table.js';
 import { ConfirmDialog } from '../confirm-dialog.js';
 import { IconClock, IconPlay } from '../icons.js';
+import { parseElectronFilePaths, resolveElectronFilePath } from '../matrix-grid.js';
 import { toggleSet } from '../selection.js';
 import {
   formatCreatedDate,
@@ -17,18 +18,10 @@ import {
   useSerialVideoThumbnailGenerator,
 } from './poster-material-modals.js';
 import { Btn, Chk } from './shared/module-ui.js';
-import { UI_CHECKBOX, UI_INPUT_SM, UI_SELECT_SM } from '../ui/primitives.js';
-
-export { PosterTaskDispatchModal } from './poster-task-dispatch-modal.js';
-export { PosterMaterialDetailModal } from './poster-material-detail-modal.js';
+import { UI_CHECKBOX, UI_INPUT_SM, UI_ROW, UI_SELECT_SM } from '../ui/primitives.js';
+export { PosterTaskDispatchModal, SharedPosterGroupsList } from './poster-task-dispatch-modal.js';
+export { PendingReviewModal, PosterMaterialDetailModal } from './poster-material-detail-modal.js';
 export { PosterMaterialEditModal } from './poster-material-modals.js';
-
-const resolveLocalFilePath = (file: File) =>
-  (
-    window.workbenchDesktop?.materialFilePath?.(file) ||
-    ((file as File & { path?: string }).path ?? '')
-  ).trim();
-
 const BATCH_OPTS = [
   ['bg:color', '文字背景：设为彩贴'],
   ['bg:plain', '文字背景：设为普通文字'],
@@ -36,7 +29,6 @@ const BATCH_OPTS = [
   ['ai:off', 'AI 声明：设为关闭'],
   ['ai:default', 'AI 声明：设为默认'],
 ] as const;
-
 function PosterTaskBanner(p: {
   title: string;
   ariaLabel: string;
@@ -95,7 +87,6 @@ function PosterTaskBanner(p: {
     </div>
   );
 }
-
 export function PosterMaterialCardGrid(p: {
   rows: readonly MaterialDraft[];
   state: PosterState | null;
@@ -105,6 +96,7 @@ export function PosterMaterialCardGrid(p: {
   selectedCardIds?: ReadonlySet<string> | undefined;
   onSelectedCardIdsChange?: ((next: Set<string>) => void) | undefined;
   onOpenDispatch: (row: MaterialDraft) => void;
+  onOpenBatchDispatch?: ((rows: MaterialDraft[]) => void) | undefined;
   onQuickScheduleMaterial?: ((row: MaterialDraft) => void) | undefined;
   onOpenDetail: (row: MaterialDraft) => void;
   onEditCard: (row: MaterialDraft) => void;
@@ -143,26 +135,24 @@ export function PosterMaterialCardGrid(p: {
     if (p.onSelectedCardIdsChange) p.onSelectedCardIdsChange(next);
     else setUncontrolledIds(next);
   };
-
   const validRows = rows.filter(hasPosterMaterialContent);
   useSerialVideoThumbnailGenerator(validRows, p.onThumbnailSaved, {
     persistedIds: p.persistedIds,
     paused: p.pauseThumbnailGeneration,
   });
-
   const q = query.trim().toLowerCase();
   const visibleRows = validRows.filter(
     (r) =>
       !q || `${r.caption}\n${r.mediaSource}\n${r.localFilePath ?? ''}`.toLowerCase().includes(q),
   );
-  const selectedVisibleIds = visibleRows.filter((r) => selectedIds.has(r.id)).map((r) => r.id);
+  const selectedVisibleRows = visibleRows.filter((r) => selectedIds.has(r.id));
+  const selectedVisibleIds = selectedVisibleRows.map((r) => r.id);
   const activeTasks = (state?.tasks ?? []).filter(
     (t) => t.status === 'running' || t.status === 'scheduled',
   );
   const issueTasks = (state?.tasks ?? [])
     .filter((t) => t.status === 'failed' || t.status === 'partial')
     .slice(0, 5);
-
   const handleBatchPatch = (val: string) => {
     if (!val || !selectedVisibleIds.length || !onBatchUpdateCards) return;
     if (val.startsWith('bg:'))
@@ -174,21 +164,20 @@ export function PosterMaterialCardGrid(p: {
         aiLabel: val === 'ai:on' ? 'on' : val === 'ai:off' ? 'off' : 'default',
       });
   };
-
   return (
     <div
       className="flex flex-col gap-3"
       onDragOver={(e) => e.dataTransfer?.types?.includes('Files') && e.preventDefault()}
       onDrop={(e) => {
-        const f = Array.from(e.dataTransfer?.files ?? []);
-        if (!f.length) return;
+        const files = e.dataTransfer?.files;
+        if (!files?.length) return;
         e.preventDefault();
-        const paths = f.map(resolveLocalFilePath).filter(Boolean);
+        const paths = parseElectronFilePaths(files);
         if (paths.length) p.onAddLocalFiles(paths);
       }}
     >
       <div className="poster-cards-toolbar flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-slate-50/80 px-3 py-2">
-        <div className="flex flex-wrap items-center gap-2">
+        <div className={UI_ROW}>
           <Chk
             className="font-medium text-slate-700"
             label={`全选 (${selectedVisibleIds.length}/${visibleRows.length})`}
@@ -229,7 +218,7 @@ export function PosterMaterialCardGrid(p: {
             className="hidden"
             onChange={(e) => {
               const paths = Array.from(e.target.files ?? [])
-                .map(resolveLocalFilePath)
+                .map(resolveElectronFilePath)
                 .filter(Boolean);
               e.target.value = '';
               if (paths.length) p.onAddLocalFiles(paths);
@@ -237,6 +226,16 @@ export function PosterMaterialCardGrid(p: {
           />
           {selectedVisibleIds.length > 0 && (
             <>
+              {p.onOpenBatchDispatch && (
+                <Btn
+                  v="primary"
+                  disabled={busy}
+                  onClick={() => p.onOpenBatchDispatch?.(selectedVisibleRows)}
+                  title="为勾选的多条贴文素材批量创建并启动发帖任务"
+                >
+                  <IconPlay size={12} /> 批量发帖 ({selectedVisibleIds.length})
+                </Btn>
+              )}
               <select
                 aria-label="批量修改已选贴文"
                 className={UI_SELECT_SM}
@@ -273,7 +272,6 @@ export function PosterMaterialCardGrid(p: {
           表格编辑
         </Btn>
       </div>
-
       <PosterTaskBanner
         title="进行中 / 定时发帖任务"
         ariaLabel="当前进行中与定时发帖任务"
@@ -300,7 +298,6 @@ export function PosterMaterialCardGrid(p: {
           ) : null
         }
       />
-
       {visibleRows.length === 0 ? (
         <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 p-8 text-center text-xs text-[var(--text-3)]">
           {validRows.length === 0
@@ -310,18 +307,20 @@ export function PosterMaterialCardGrid(p: {
       ) : (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(235px,1fr))] gap-3">
           {visibleRows.map((row, index) => {
-            const badge = posterRowBadge(row);
-            const postedCount = Math.max(
-              state?.postedGroupIdsByMaterial?.[row.id]?.length ?? 0,
-              row.usedCount ?? 0,
-            );
-            const activeGroups = state?.activeGroupsByMaterial?.[row.id] ?? [];
-            const postingCount = activeGroups.filter((a) => a.state === 'posting').length;
-            const queuedCount = activeGroups.filter((a) => a.state === 'queued').length;
-            const scheduledCount = (state?.tasks ?? []).filter(
-              (t) => t.materialId === row.id && t.status === 'scheduled',
-            ).length;
-            const isChecked = selectedIds.has(row.id);
+            const badge = posterRowBadge(row),
+              postedCount = Math.max(
+                state?.postedGroupIdsByMaterial?.[row.id]?.length ?? 0,
+                row.usedCount ?? 0,
+              ),
+              activeGroups = state?.activeGroupsByMaterial?.[row.id] ?? [],
+              postingCount = activeGroups.filter((a) => a.state === 'posting').length,
+              queuedCount = activeGroups.filter((a) => a.state === 'queued').length,
+              scheduledCount = (state?.tasks ?? []).filter(
+                (t) => t.materialId === row.id && t.status === 'scheduled',
+              ).length,
+              isChecked = selectedIds.has(row.id),
+              pillCls =
+                'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap shadow-2xs';
             return (
               <article
                 key={row.id}
@@ -348,13 +347,13 @@ export function PosterMaterialCardGrid(p: {
                     <div className="flex flex-wrap items-center gap-1">
                       {row.aiLabel && row.aiLabel !== 'default' && (
                         <span
-                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap shadow-2xs ${row.aiLabel === 'on' ? 'bg-violet-100 text-violet-800' : 'bg-slate-200 text-slate-700'}`}
+                          className={`${pillCls} ${row.aiLabel === 'on' ? 'bg-violet-100 text-violet-800' : 'bg-slate-200 text-slate-700'}`}
                         >
                           {row.aiLabel === 'on' ? 'AI声明:开' : 'AI声明:关'}
                         </span>
                       )}
                       <span
-                        className={`poster-status-badge inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap shadow-2xs ${badge.cls}`}
+                        className={`poster-status-badge ${pillCls} ${badge.cls}`}
                         title={badge.title}
                       >
                         {badge.text}
@@ -391,9 +390,7 @@ export function PosterMaterialCardGrid(p: {
                   className="line-clamp-3 min-h-[48px] flex-1 px-2.5 py-2 text-xs leading-relaxed text-slate-800"
                   title={row.caption || row.mediaSource}
                 >
-                  {row.caption.trim() ? (
-                    row.caption
-                  ) : (
+                  {row.caption.trim() || (
                     <span className="text-[var(--text-3)]">（仅画面媒体，无文字文案）</span>
                   )}
                 </div>
@@ -444,7 +441,6 @@ export function PosterMaterialCardGrid(p: {
           })}
         </div>
       )}
-
       {previewRow && (
         <PosterMediaPreviewModal row={previewRow} onClose={() => setPreviewRow(null)} />
       )}

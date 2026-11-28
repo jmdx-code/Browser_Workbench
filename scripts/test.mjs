@@ -28,4 +28,11 @@ await runNode('node_modules/vitest/vitest.mjs', [
   'tests/finder-list-ui.test.tsx',
   'tests/unified-target-picker.test.tsx',
   'tests/cycle3-hardening.test.tsx',
+  'tests/records-ui.test.tsx',
+  'tests/w2-active-ui.test.tsx',
+  'tests/w3-poster-bumper-ui.test.tsx',
+  'tests/w4-ui.test.tsx',
+  'tests/w5-bluestacks-ui.test.tsx',
+  'tests/w6-google-sheets-ui.test.tsx',
+  'tests/w7-ui-ux-fixes.test.tsx',
 ]);

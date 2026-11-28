@@ -1,4 +1,7 @@
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import os from 'node:os';
+import { promisify } from 'node:util';
 import {
   access,
   copyFile,
@@ -22,17 +25,43 @@ import { mediaReference } from '../../domain/resource-table.js';
 import type { PosterMediaKind } from '../../shared/group-poster.js';
 import type { MediaRuntimeComponent } from '../media-runtime-component.js';
 import {
+  encodeImageBufferToPosterThumbnail,
   generatePosterImageThumbnail,
   generatePosterVideoThumbnail,
   removePosterCachedFileIfSafe,
 } from '../poster-media-thumbnail.js';
 import { PublicDriveDownloader } from '../public-drive-download.js';
+const execFileAsync = promisify(execFile);
+const VIDEO_BADGE_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" rx="16" fill="#1e293b"/><circle cx="160" cy="90" r="34" fill="#334155" stroke="#64748b" stroke-width="2"/><polygon points="150,73 150,107 179,90" fill="#f8fafc"/></svg>';
+let fallbackBadge: Promise<string | null> | null = null;
+async function systemFfmpegThumb(filePath: string): Promise<string | null> {
+  const bins = [process.env.FFMPEG_PATH?.trim(), 'ffmpeg'].filter((v): v is string => Boolean(v));
+  for (const bin of new Set(bins)) {
+    const tmpFrame = path.join(os.tmpdir(), `wb-poster-thumb-${randomUUID()}.png`);
+    const args = ['-y', '-ss', '0.1', '-i', filePath, '-frames:v', '1', '-f', 'image2', tmpFrame];
+    try {
+      await execFileAsync(bin, args, { timeout: 10_000, windowsHide: true });
+      const thumb = await generatePosterImageThumbnail(tmpFrame);
+      if (thumb) return thumb;
+    } catch {
+      // Try next ffmpeg candidate
+    } finally {
+      await rm(tmpFrame, { force: true }).catch(() => {});
+    }
+  }
+  return null;
+}
 const bytesMatch = (buf: Buffer, offset: number, sig: readonly number[]) =>
   sig.every((b, i) => buf[offset + i] === b);
 const range416 = (total: number): PosterMediaStreamChunk => ({
   status: 416,
   headers: { 'Content-Range': `bytes */${total}`, 'Accept-Ranges': 'bytes' },
 });
+const touchFile = (filePath: string) => {
+  const now = new Date();
+  return utimes(filePath, now, now).catch(() => {});
+};
 export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
   private static readonly SOURCE_DEDUP_TTL_MS = 20 * 60_000;
   private static readonly ACTIVE_REF_TTL_MS = 6 * 60 * 60_000;
@@ -66,32 +95,18 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
     await mkdir(hashDir, { recursive: true });
     const safeExt = /^\.[A-Za-z0-9]{1,8}$/.test(ext) ? ext.toLowerCase() : '.bin';
     const dest = path.join(hashDir, `${digestHex.toLowerCase()}${safeExt}`);
-    let alreadyExists = false;
-    try {
-      const existingStat = await stat(dest);
-      alreadyExists = existingStat.isFile() && existingStat.size > 0;
-    } catch {}
-    if (alreadyExists) {
-      const now = new Date();
-      await utimes(dest, now, now).catch(() => {});
-    } else {
-      try {
-        await rename(sourceFile, dest);
-      } catch {
+    const existingStat = await stat(dest).catch(() => null);
+    if (existingStat?.isFile() && existingStat.size > 0) await touchFile(dest);
+    else {
+      await rename(sourceFile, dest).catch(async () => {
         const tmpDest = `${dest}.${randomUUID().slice(0, 8)}.tmp`;
         await copyFile(sourceFile, tmpDest);
-        try {
-          await rename(tmpDest, dest);
-        } catch {
-          await unlink(tmpDest).catch(() => {});
-        }
-      }
+        await rename(tmpDest, dest).catch(() => unlink(tmpDest).catch(() => {}));
+      });
     }
-    if (cleanupFolder) {
-      await rm(cleanupFolder, { recursive: true, force: true }).catch(() => {});
-    } else if (path.resolve(sourceFile) !== path.resolve(dest)) {
+    if (cleanupFolder) await rm(cleanupFolder, { recursive: true, force: true }).catch(() => {});
+    else if (path.resolve(sourceFile) !== path.resolve(dest))
       await unlink(sourceFile).catch(() => {});
-    }
     return dest;
   }
   async prepare(
@@ -112,8 +127,7 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
         Date.now() - cached.cachedAt <= FilesystemPosterMediaPreparer.SOURCE_DEDUP_TTL_MS
       ) {
         if (await this.verifyExists(cached.localFilePath)) {
-          const now = new Date();
-          await utimes(cached.localFilePath, now, now).catch(() => {});
+          await touchFile(cached.localFilePath);
           this.acquireCacheRef(cached.localFilePath);
           return handleFileAction(cached.localFilePath, cached.mediaKind);
         }
@@ -141,28 +155,32 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
     }
     const resolved = path.resolve(trimmed);
     await access(resolved);
-    const mediaKind: PosterMediaKind = /\.(?:mp4|mov|webm|mkv|avi)$/i.test(resolved)
-      ? 'video'
-      : 'image';
-    return handleFileAction(resolved, mediaKind);
+    return handleFileAction(
+      resolved,
+      /\.(?:mp4|mov|webm|mkv|avi)$/i.test(resolved) ? 'video' : 'image',
+    );
   }
-  async verifyExists(localFilePath: string): Promise<boolean> {
-    try {
-      await access(localFilePath);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  async generateThumbnail(
-    localFilePath: string,
-    mediaKind: PosterMediaKind,
-  ): Promise<string | null> {
-    if (mediaKind === 'image') return await generatePosterImageThumbnail(localFilePath);
-    if (mediaKind === 'video')
-      return await generatePosterVideoThumbnail(localFilePath, this.mediaComponent);
-    return null;
-  }
+  verifyExists = (localFilePath: string): Promise<boolean> =>
+    access(localFilePath).then(
+      () => true,
+      () => false,
+    );
+  generateThumbnail = async (localFilePath: string, mediaKind: PosterMediaKind) => {
+    if (mediaKind === 'image') return generatePosterImageThumbnail(localFilePath);
+    if (
+      mediaKind !== 'video' ||
+      !(await stat(localFilePath).then(
+        (s) => s.isFile(),
+        () => false,
+      ))
+    )
+      return null;
+    return (
+      (await generatePosterVideoThumbnail(localFilePath, this.mediaComponent)) ??
+      (await systemFfmpegThumb(localFilePath)) ??
+      (await (fallbackBadge ??= encodeImageBufferToPosterThumbnail(Buffer.from(VIDEO_BADGE_SVG))))
+    );
+  };
   async removeCachedDriveFile(localFilePath: string): Promise<boolean> {
     const key = path.resolve(localFilePath);
     const now = Date.now();
@@ -201,10 +219,12 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
       }
       const fileId = /(?:\/file\/d\/|[?&]id=)([A-Za-z0-9_-]{10,})/.exec(trimmed)?.[1];
       if (!fileId) throw publicErr;
-      const metaRes = await this.request(
-        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=name,mimeType&supportsAllDrives=true`,
-        { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(20_000) },
-      );
+      const driveGet = (q: string, ms: number) =>
+        this.request(
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${q}&supportsAllDrives=true`,
+          { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(ms) },
+        );
+      const metaRes = await driveGet('fields=name,mimeType', 20_000);
       if (metaRes.status === 403 || metaRes.status === 404) {
         throw new Error(
           '该 Google 网盘素材未公开共享且当前授权无权读取私有网盘（请将素材设为「知道链接的任何人可查看」，或在菜单里重新授权 Google 读取私有网盘）',
@@ -213,10 +233,7 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
       const metaJson = metaRes.ok
         ? ((await metaRes.json().catch(() => ({}))) as { name?: string; mimeType?: string })
         : {};
-      const dlRes = await this.request(
-        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
-        { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120_000) },
-      );
+      const dlRes = await driveGet('alt=media', 120_000);
       if (!dlRes.ok) throw publicErr;
       const contentType = (
         dlRes.headers.get('content-type') ||
@@ -234,17 +251,18 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
       const origExt = metaJson.name ? path.extname(metaJson.name).toLowerCase() : '';
       const isVideo =
         contentType.startsWith('video/') || /\.(?:mp4|mov|webm|mkv|avi)$/i.test(origExt);
+      const imgExt = contentType.includes('png')
+        ? '.png'
+        : contentType.includes('webp')
+          ? '.webp'
+          : contentType.includes('gif')
+            ? '.gif'
+            : '.jpg';
       const ext = isVideo
-        ? origExt && /\.(?:mp4|mov|webm|mkv|avi)$/i.test(origExt)
+        ? /\.(?:mp4|mov|webm|mkv|avi)$/i.test(origExt)
           ? origExt
           : '.mp4'
-        : contentType.includes('png')
-          ? '.png'
-          : contentType.includes('webp')
-            ? '.webp'
-            : contentType.includes('gif')
-              ? '.gif'
-              : '.jpg';
+        : imgExt;
       const maxOAuthMediaBytes = isVideo ? 512 * 1024 * 1024 : 32 * 1024 * 1024;
       const hashDir = path.join(this.cacheDir, 'by-hash');
       await mkdir(hashDir, { recursive: true });
@@ -259,10 +277,8 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
         if (!dlRes.body) throw publicErr;
         const reader = dlRes.body.getReader();
         try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = Buffer.from(value);
+          for (let res = await reader.read(); !res.done; res = await reader.read()) {
+            const chunk = Buffer.from(res.value);
             totalBytes += chunk.byteLength;
             if (totalBytes > maxOAuthMediaBytes) {
               await reader.cancel().catch(() => {});
@@ -287,11 +303,8 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
         const targetPath = path.join(hashDir, `${hasher.digest('hex')}${ext}`);
         if (await this.verifyExists(targetPath)) {
           await rm(tmpPath, { force: true }).catch(() => {});
-          const now = new Date();
-          await utimes(targetPath, now, now).catch(() => {});
-        } else {
-          await rename(tmpPath, targetPath);
-        }
+          await touchFile(targetPath);
+        } else await rename(tmpPath, targetPath);
         this.sourceToDedupPath.set(trimmed, {
           localFilePath: targetPath,
           mediaKind,
@@ -305,7 +318,7 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
           isTemporaryCache: true,
         };
       } catch (streamErr) {
-        if (fh) await fh.close().catch(() => {});
+        await fh?.close().catch(() => {});
         await rm(tmpPath, { force: true }).catch(() => {});
         throw streamErr;
       }
@@ -323,18 +336,15 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
         .filter(Boolean)
         .map((p) => path.resolve(p).toLowerCase()),
     );
-    const isProtected = (filePath: string) => {
-      const resolved = path.resolve(filePath);
-      return this.activeCacheRefs.has(resolved) || resolvedProtected.has(resolved.toLowerCase());
-    };
-    for (const [k, v] of this.activeCacheRefs.entries()) {
+    const isProtected = (p: string) =>
+      this.activeCacheRefs.has(path.resolve(p)) ||
+      resolvedProtected.has(path.resolve(p).toLowerCase());
+    for (const [k, v] of this.activeCacheRefs.entries())
       if (now - v.lastTouchedAt > FilesystemPosterMediaPreparer.ACTIVE_REF_TTL_MS)
         this.activeCacheRefs.delete(k);
-    }
-    for (const [k, v] of this.sourceToDedupPath.entries()) {
+    for (const [k, v] of this.sourceToDedupPath.entries())
       if (now - v.cachedAt > FilesystemPosterMediaPreparer.SOURCE_DEDUP_TTL_MS)
         this.sourceToDedupPath.delete(k);
-    }
     const tryRemoveFile = async (p: string) => {
       try {
         if ((await stat(p)).mtimeMs < cutoff && !isProtected(p)) {
@@ -348,9 +358,8 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
         const full = path.join(this.cacheDir, ent.name);
         if (ent.isFile()) await tryRemoveFile(full);
         else if (ent.isDirectory() && ent.name === 'by-hash') {
-          for (const sub of await readdir(full, { withFileTypes: true }).catch(() => [])) {
+          for (const sub of await readdir(full, { withFileTypes: true }).catch(() => []))
             if (sub.isFile()) await tryRemoveFile(path.join(full, sub.name));
-          }
         } else if (ent.isDirectory()) {
           try {
             if ((await stat(full)).mtimeMs < cutoff) {
@@ -365,22 +374,20 @@ export class FilesystemPosterMediaPreparer implements PosterMediaPreparerPort {
   }
   private hasValidMediaHeader(head: Buffer, mediaKind: PosterMediaKind): boolean {
     if (head.byteLength < 12) return false;
-    if (mediaKind === 'image') {
-      return (
-        bytesMatch(head, 0, [0x89, 0x50, 0x4e, 0x47]) ||
-        bytesMatch(head, 0, [0xff, 0xd8, 0xff]) ||
-        bytesMatch(head, 0, [0x47, 0x49, 0x46, 0x38]) ||
-        (bytesMatch(head, 0, [0x52, 0x49, 0x46, 0x46]) &&
-          bytesMatch(head, 8, [0x57, 0x45, 0x42, 0x50])) ||
-        bytesMatch(head, 0, [0x42, 0x4d])
-      );
-    }
-    return (
-      bytesMatch(head, 4, [0x66, 0x74, 0x79, 0x70]) ||
-      bytesMatch(head, 0, [0x1a, 0x45, 0xdf, 0xa3]) ||
-      (bytesMatch(head, 0, [0x52, 0x49, 0x46, 0x46]) &&
-        bytesMatch(head, 8, [0x41, 0x56, 0x49, 0x20]))
-    );
+    const isRiff = bytesMatch(head, 0, [0x52, 0x49, 0x46, 0x46]);
+    return mediaKind === 'image'
+      ? (
+          [
+            [0x89, 0x50, 0x4e, 0x47],
+            [0xff, 0xd8, 0xff],
+            [0x47, 0x49, 0x46, 0x38],
+            [0x42, 0x4d],
+          ] as const
+        ).some((sig) => bytesMatch(head, 0, sig)) ||
+          (isRiff && bytesMatch(head, 8, [0x57, 0x45, 0x42, 0x50]))
+      : bytesMatch(head, 4, [0x66, 0x74, 0x79, 0x70]) ||
+          bytesMatch(head, 0, [0x1a, 0x45, 0xdf, 0xa3]) ||
+          (isRiff && bytesMatch(head, 8, [0x41, 0x56, 0x49, 0x20]));
   }
   async readMediaRange(
     localFilePath: string,

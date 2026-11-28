@@ -9,12 +9,35 @@ import {
 import { api } from './api.js';
 import { Btn, Chk, errMsg, NativeFormDialog, useBusyTask } from './modules/shared/module-ui.js';
 import { UI_DANGER_TEXT, UI_INPUT_SM, UI_MUTED } from './ui/primitives.js';
-
 type Selection = z.infer<typeof CleanupSelection>;
 const SETTINGS_ROW = 'flex flex-wrap items-center gap-2 text-xs';
-const isIntInRange = (v: string, min: number, max: number) =>
+export const isIntInRange = (v: string, min: number, max: number) =>
   Number.isInteger(Number(v)) && Number(v) >= min && Number(v) <= max;
-
+export const StatusAlerts = ({
+  err,
+  notice,
+  noticeClass,
+  children,
+}: {
+  err?: string;
+  notice?: string;
+  noticeClass?: string;
+  children?: ReactNode;
+}) => (
+  <>
+    {err && (
+      <p role="alert" className={UI_DANGER_TEXT}>
+        {err}
+      </p>
+    )}
+    {notice && (
+      <p role="status" className={noticeClass}>
+        {notice}
+      </p>
+    )}
+    {children}
+  </>
+);
 export function CleanupDialog({
   selection,
   onClose,
@@ -33,7 +56,6 @@ export function CleanupDialog({
   );
   const { busy, error, setError, run } = useBusyTask();
   const submittingRef = useRef(false);
-
   useEffect(() => {
     if (!busy) return;
     let disposed = false,
@@ -59,7 +81,6 @@ export function CleanupDialog({
       activeCtrl?.abort();
     };
   }, [busy]);
-
   useEffect(() => {
     if (initialPreview) return;
     const ctrl = new AbortController();
@@ -68,7 +89,6 @@ export function CleanupDialog({
       .then(setPreview, (e: unknown) => !ctrl.signal.aborted && setError(errMsg(e, '预览失败')));
     return () => ctrl.abort();
   }, [selectionKey]);
-
   const handleConfirm = () => {
     if (submittingRef.current || busy) return;
     submittingRef.current = true;
@@ -109,7 +129,18 @@ export function CleanupDialog({
       submittingRef.current = false;
     });
   };
-
+  const submitLabel = busy
+    ? `清理中 ${progress.current} / ${progress.total || preview?.eligible || 0}…`
+    : error && !preview
+      ? '重新预览'
+      : '确认清理';
+  const body = preview
+    ? selection.kind === 'records'
+      ? `即将清理 ${preview.eligible} 条已结束的任务记录（正在运行或待核对的任务会自动保留，不受影响）。`
+      : `即将清理 ${preview.eligible} 个日志文件，预计释放 ${(preview.bytes / 1024 / 1024).toFixed(2)} MB。`
+    : error
+      ? '清理未完成。你可以重新预览后再试，或关闭此窗口。'
+      : '正在检查可清理的记录…';
   return (
     <NativeFormDialog
       ariaLabel="确认清理数据"
@@ -118,29 +149,14 @@ export function CleanupDialog({
       error={error}
       danger
       submitDisabled={preview !== null ? !preview.eligible : !error}
-      submitLabel={
-        busy
-          ? `清理中 ${progress.current} / ${progress.total || preview?.eligible || 0}…`
-          : error && !preview
-            ? '重新预览'
-            : '确认清理'
-      }
+      submitLabel={submitLabel}
       onClose={onClose}
       onSubmit={handleConfirm}
     >
-      <p>
-        {preview
-          ? selection.kind === 'records'
-            ? `即将清理 ${preview.eligible} 条已结束的任务记录（正在运行或待核对的任务会自动保留，不受影响）。`
-            : `即将清理 ${preview.eligible} 个日志文件，预计释放 ${(preview.bytes / 1024 / 1024).toFixed(2)} MB。`
-          : error
-            ? '清理未完成。你可以重新预览后再试，或关闭此窗口。'
-            : '正在检查可清理的记录…'}
-      </p>
+      <p>{body}</p>
     </NativeFormDialog>
   );
 }
-
 export function RecordCleanupActions({
   stepIds = [],
   selectedCount,
@@ -163,7 +179,6 @@ export function RecordCleanupActions({
     [selection, setSelection] = useState<Selection | null>(null),
     [prepared, setPrepared] = useState<z.infer<typeof CleanupPreview> | undefined>(undefined);
   const { busy, error: notice, setError: setNotice, run } = useBusyTask();
-
   useEffect(() => {
     if (!showRetention) return;
     const ctrl = new AbortController();
@@ -178,7 +193,6 @@ export function RecordCleanupActions({
     );
     return () => ctrl.abort();
   }, [showRetention, setNotice]);
-
   const valid = (v: string, max: number) => v.trim() === '' || isIntInRange(v, 1, max);
   const scopeProfile = profileId ? { profileId } : {};
   const open = (next: Selection) => {
@@ -213,7 +227,6 @@ export function RecordCleanupActions({
       setPrepared(preview);
       setSelection(sel);
     }, '保存失败');
-
   return (
     <div className="py-[10px]">
       <div className="flex flex-wrap items-center justify-between gap-3 [&_[role=tablist]]:m-0 [&_[role=tablist]]:gap-[5px]">
@@ -293,11 +306,7 @@ export function RecordCleanupActions({
           </Btn>
         </div>
       )}
-      {notice && (
-        <p role="status" className={UI_MUTED + ' mt-1'}>
-          {notice}
-        </p>
-      )}
+      <StatusAlerts notice={notice} noticeClass={UI_MUTED + ' mt-1'} />
       {selection && (
         <CleanupDialog
           selection={selection}
@@ -315,8 +324,10 @@ export function RecordCleanupActions({
     </div>
   );
 }
-
-export function DataCleanupPanel() {
+export function DataCleanupPanel({
+  logRetentionDays,
+  settingsRevision = 0,
+}: { logRetentionDays?: number; settingsRevision?: number } = {}) {
   const [selection, setSelection] = useState<Selection | null>(null),
     [settings, setSettings] = useState<CleanupConfiguration | null>(null),
     [form, setForm] = useState({
@@ -339,7 +350,6 @@ export function DataCleanupPanel() {
   const { busy, error, setError, run } = useBusyTask();
   const setField = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) =>
     setForm((prev) => ({ ...prev, [k]: v }));
-
   useEffect(() => {
     const ctrl = new AbortController();
     void Promise.all([api.cleanupSettings(ctrl.signal), api.resetStatus(ctrl.signal)]).then(
@@ -361,8 +371,7 @@ export function DataCleanupPanel() {
       (e: unknown) => !ctrl.signal.aborted && setError(errMsg(e, '清理设置读取失败')),
     );
     return () => ctrl.abort();
-  }, [setError]);
-
+  }, [setError, settingsRevision]);
   const act = (work: () => Promise<string>) => {
     setNotice('');
     void run(async () => setNotice(await work()), '操作未确认');
@@ -375,7 +384,20 @@ export function DataCleanupPanel() {
     !isIntInRange(form.detailMaxCount, 1, 100000) ||
     (form.maxCount.trim() !== '' && !isIntInRange(form.maxCount, 1, 100000)) ||
     (form.automatic && !isIntInRange(form.days, 1, 3650));
-
+  const numInputs = [
+    ['days', '活动记录保留天数', undefined, undefined, 3650, !form.automatic],
+    ['maxCount', '活动任务最终记录（次）', '自动保留最大条数', '不限', 100000, false],
+    ['bumperMaxCount', '顶贴最终记录（条）', '顶贴最终记录（条）', undefined, 1000000, false],
+    ['posterMaxCount', '发帖最终记录（条）', '发帖最终记录（条）', undefined, 1000000, false],
+    [
+      'detailMaxCount',
+      '详细执行流水（条，全软件合计）',
+      '详细执行流水（条，全软件合计）',
+      undefined,
+      100000,
+      false,
+    ],
+  ] as const;
   return (
     <section aria-label="数据清理">
       <h3>数据清理</h3>
@@ -408,36 +430,11 @@ export function DataCleanupPanel() {
         className={`${SETTINGS_ROW} [&_input[type=number]]:w-[84px] [&_label]:inline-flex [&_label]:items-center [&_label]:gap-1.5`}
       >
         <Chk
-          label="同时按天数清理活动记录"
+          label="自动按天数清理活动任务记录"
           checked={form.automatic}
           onChange={(v) => setField('automatic', v)}
         />
-        <label>
-          保留天数{' '}
-          <input
-            type="number"
-            className={UI_INPUT_SM}
-            min="1"
-            max="3650"
-            value={form.days}
-            disabled={!form.automatic}
-            onChange={(e) => setField('days', e.target.value)}
-          />
-        </label>
-        {(
-          [
-            ['maxCount', '活动任务最终记录（次）', '自动保留最大条数', '不限', 100000],
-            ['bumperMaxCount', '顶贴最终记录（条）', '顶贴最终记录（条）', undefined, 1000000],
-            ['posterMaxCount', '发帖最终记录（条）', '发帖最终记录（条）', undefined, 1000000],
-            [
-              'detailMaxCount',
-              '详细执行流水（条，全软件合计）',
-              '详细执行流水（条，全软件合计）',
-              undefined,
-              100000,
-            ],
-          ] as const
-        ).map(([key, label, aria, placeholder, max]) => (
+        {numInputs.map(([key, label, aria, placeholder, max, disabled]) => (
           <label key={key}>
             {label}{' '}
             <input
@@ -447,6 +444,7 @@ export function DataCleanupPanel() {
               max={max}
               aria-label={aria}
               placeholder={placeholder}
+              disabled={disabled}
               value={form[key]}
               onChange={(e) => setField(key, e.target.value)}
             />
@@ -454,7 +452,7 @@ export function DataCleanupPanel() {
         ))}
         <Chk
           className="w-full"
-          label="同时自动清理诊断日志（使用上方日志保留天数）"
+          label={`自动清理过期运行与诊断日志（按「运行与诊断日志保留天数」${logRetentionDays ?? settings?.logRetentionDays ?? 14} 天）`}
           checked={form.autoLogs}
           onChange={(v) => setField('autoLogs', v)}
         />
@@ -510,12 +508,7 @@ export function DataCleanupPanel() {
         </Btn>
       </div>
       {status && !status.available && <p className={UI_MUTED}>{status.reason}</p>}
-      {notice && <p role="status">{notice}</p>}
-      {error && (
-        <p role="alert" className={UI_DANGER_TEXT}>
-          {error}
-        </p>
-      )}
+      <StatusAlerts err={error} notice={notice} />
       {selection && (
         <CleanupDialog
           selection={selection}
@@ -527,7 +520,6 @@ export function DataCleanupPanel() {
     </section>
   );
 }
-
 function ResetDialog({ onClose }: { onClose(): void }) {
   const submittingRef = useRef(false);
   const [phrase, setPhrase] = useState(''),

@@ -22,20 +22,3 @@ export function sameFacebookNativeResultUrl(actual: string, expected: string) {
     return false;
   }
 }
-export function facebookNativeResultUrl(
-  accountId: string,
-  nativePostId: string,
-  videoId?: string | null,
-) {
-  if (
-    !/^\d{1,30}$/.test(accountId) ||
-    !/^\d{1,30}$/.test(nativePostId) ||
-    (videoId !== undefined && videoId !== null && !/^\d{1,30}$/.test(videoId))
-  )
-    throw Error('NATIVE_RESULT_ID_REQUIRED');
-  if (videoId) return 'https://www.facebook.com/reel/' + videoId;
-  const url = new URL('https://www.facebook.com/permalink.php');
-  url.searchParams.set('story_fbid', nativePostId);
-  url.searchParams.set('id', accountId);
-  return url.href;
-}

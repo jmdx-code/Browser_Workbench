@@ -9,7 +9,7 @@ import type { Core } from '../bridge/core.js';
 import type { CompatibleRepository } from '../domain/persistence.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
 import { PAGE_TIMELINE_SYNTHETIC_GROUP_ID } from '../shared/google-sheets.js';
-import type { PosterActionKind, PosterSettings } from '../shared/group-poster.js';
+import { stripAnsi, type PosterActionKind, type PosterSettings } from '../shared/group-poster.js';
 import { kernelOperationPending } from '../shared/kernel-state.js';
 import type { Binding } from '../shared/task-execution.js';
 import {
@@ -66,30 +66,27 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     private readonly posterRepo?: CompatibleRepository<SqliteGroupPosterRepository>,
     private onAccountAbnormal?: GlobalAccountAbnormalReporter,
   ) {}
-  ready(profileId: string): boolean {
+  ready = (profileId: string) => {
     const peer = this.getCore()?.peers.get(profileId);
     return !!this.getKernel() && !!peer?.online && peer.synced && !this.connections.has(profileId);
-  }
-  hasPendingReconnectStop(profileId: string): boolean {
+  };
+  hasPendingReconnectStop = (profileId: string) => {
     const staleStop = this.closing.get(profileId);
     const peer = this.getCore()?.peers.get(profileId);
     return Boolean(staleStop?.failed && (!peer || !peer.online || !peer.synced));
-  }
+  };
   onlineProfileIds(): string[] {
     const core = this.getCore();
     if (!core || !this.getKernel()) return [];
-    const ids: string[] = [];
-    for (const [id, peer] of core.peers.entries()) {
-      if (peer.online && peer.synced) ids.push(id);
-    }
-    return ids;
+    return Array.from(core.peers.entries())
+      .filter(([, p]) => p.online && p.synced)
+      .map(([id]) => id);
   }
   async busy(profileId: string): Promise<boolean> {
     const staleStop = this.closing.get(profileId);
     const livePeer = this.getCore()?.peers.get(profileId);
-    if (staleStop?.failed && livePeer?.online && livePeer.synced) {
+    if (staleStop?.failed && livePeer?.online && livePeer.synced)
       await this.stop(profileId).catch(() => {});
-    }
     if (this.connections.has(profileId) || (await this.isBusy(profileId))) return true;
     const kernel = this.getKernel();
     const peer = this.getCore()?.peers.get(profileId);
@@ -97,8 +94,9 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     try {
       await recoverBumperOperations(kernel, peer, this.bumperRepo, () => {});
       if (this.posterRepo) await recoverPosterOperations(kernel, peer, this.posterRepo, () => {});
-      const s = await kernel.withSummary(peer, (port) => port.inventory());
-      return s.operations.some(kernelOperationPending);
+      return (await kernel.withSummary(peer, (port) => port.inventory())).operations.some(
+        kernelOperationPending,
+      );
     } catch {
       return false;
     }
@@ -154,15 +152,19 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     };
     callbacks.status('正在整理浏览器工作区…');
     await recoverAll(guard);
-    let prepared: Awaited<ReturnType<typeof prepareFacebookWorkspace>>;
-    try {
-      prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
-    } catch (prepErr) {
+    const prepared = await prepareFacebookWorkspace(
+      kernel,
+      peer,
+      undefined,
+      guard,
+      undefined,
+      true,
+    ).catch(async (prepErr) => {
       if (!FacebookGroupSessionHelper.isTransientPrepareError(prepErr)) throw prepErr;
       await wait(Math.max(10, Math.round(500 * this.paceScale)));
       guard();
-      prepared = await prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
-    }
+      return prepareFacebookWorkspace(kernel, peer, undefined, guard, undefined, true);
+    });
     if (prepared.inventory.operations.some(kernelOperationPending)) await recoverAll(guard);
     callbacks.status('读取当前登录账号/专页身份…');
     await FacebookGroupSessionHelper.waitPeerPaused(peer, guard, 10_000);
@@ -198,6 +200,8 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
       const initialPage = conn.browser.contexts()[0]?.pages()[0];
       if (!initialPage) throw Error('任务页面不存在');
       let page = initialPage;
+      const getPage = () => page;
+      const getConn = () => conn;
       const backgroundAllowed =
         peer.capabilities?.includes('kernel-background-presentation-v1') === true ||
         conn.taskRendering === true;
@@ -265,7 +269,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
           stepId,
           actionDigest: posterDigest({ purpose: 'group-poster', actionKind, label, accountId }),
         };
-        if (this.posterRepo) {
+        if (this.posterRepo)
           await this.posterRepo.prepareOperation({
             binding,
             runId: callbacks.runId,
@@ -274,7 +278,6 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             groupName: currentContext.groupName,
             materialId: currentContext.materialId || undefined,
           });
-        }
         const countMutations = () =>
           Object.values(conn.nativeMutationCalls ?? {}).reduce((n, c) => n + c, 0);
         const before = countMutations();
@@ -303,20 +306,19 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             outcome,
             evidenceDigest: posterDigest({ binding, label, ok: outcome === 'VERIFIED' }),
           };
-          if (this.posterRepo)
-            await this.posterRepo.setOperationResolution(operationId, resolution);
+          await this.posterRepo?.setOperationResolution(operationId, resolution);
           if (!reconcile) return false;
           await conn.reconcile(binding, resolution);
-          if (this.posterRepo) await this.posterRepo.markOperationKernelSettled(operationId);
+          await this.posterRepo?.markOperationKernelSettled(operationId);
           return true;
         };
-        if (executed && executed.value.ok) {
+        if (executed?.value.ok) {
           await settleOp('VERIFIED', true);
           return executed.value.value;
         }
-        const failureError = executed && !executed.value.ok ? executed.value.error : execThrown,
-          sessionAlive =
-            this.connections.get(profileId) === conn && Boolean(peer.online && peer.synced);
+        const failureError = executed && !executed.value.ok ? executed.value.error : execThrown;
+        const sessionAlive =
+          this.connections.get(profileId) === conn && Boolean(peer.online && peer.synced);
         if (executed && countMutations() === before && sessionAlive) {
           try {
             await settleOp('NOT_APPLIED', true);
@@ -358,21 +360,24 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             grantedFiles.add(material.localFilePath);
             await reconnectAfterUncertainOp();
           }
-          const setupResult = await preparePosterTargetSurface({
-            page,
+          const baseArgs = {
+            getPage,
             accountId,
+            isPageTimeline,
+            identityMeta,
+            paceScale: this.paceScale,
+            callbacks,
+            guard,
+            execOp,
+          };
+          const setupResult = await preparePosterTargetSurface({
+            ...baseArgs,
             rawGroupId,
             initialEffectiveGroupId: effectiveGroupId,
             initialEffectiveGroupName: effectiveGroupName,
             groupAvatarUrl: group.avatarUrl,
-            isPageTimeline,
-            identityMeta,
-            paceScale: this.paceScale,
             bumperRepo: this.bumperRepo,
-            callbacks,
-            guard,
             paceWait,
-            execOp,
             updateContext: (patch) => {
               currentContext = { ...currentContext, ...patch };
             },
@@ -381,75 +386,59 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
           effectiveGroupId = setupResult.effectiveGroupId;
           effectiveGroupName = setupResult.effectiveGroupName;
           await openAndFillPosterComposer({
-            page,
-            accountId,
+            ...baseArgs,
             groupDisplayName: group.name,
             effectiveGroupName,
-            isPageTimeline,
             material,
-            identityMeta,
-            paceScale: this.paceScale,
-            callbacks,
-            guard,
-            execOp,
           });
           await waitMediaAndSubmitPost({
+            ...baseArgs,
             profileId,
-            page,
-            conn,
+            getConn,
             peer,
             kernel,
             core,
-            accountId,
             accountName,
             jobId,
             stepId,
             effectiveGroupId,
             effectiveGroupName,
-            isPageTimeline,
             groupAvatarUrl: group.avatarUrl,
             resolvedGroupAvatar: setupResult.resolvedGroupAvatar,
             surface: setupResult.surface,
             material,
-            identityMeta,
-            paceScale: this.paceScale,
             posterRepo: this.posterRepo,
-            callbacks,
             markedPendingReviewRef,
-            guard,
             assertIdentity,
-            execOp,
             stopProfile: () => this.stop(profileId),
             reconnectAfterUncertainOp,
           });
           if (!isPageTimeline) consecutiveGroupComposerFailures = 0;
           await paceWait(1800 + Math.floor(Math.random() * 1200));
         } catch (err) {
-          await dismissPosterDialogsOnError(page, this.paceScale);
-          const msg = err instanceof Error ? err.message : String(err);
-          callbacks.onTargetError?.(rawGroupId, msg);
-          const connectionLost = this.connections.get(profileId) !== conn;
-          if (err instanceof PosterAccountRestrictedError || connectionLost) {
+          await dismissPosterDialogsOnError(getPage(), this.paceScale);
+          const msg = stripAnsi(err instanceof Error ? err.message : String(err));
+          if (
+            err instanceof PosterAccountRestrictedError ||
+            this.connections.get(profileId) !== conn
+          ) {
             if (!markedPendingReviewRef.value) callbacks.returnTaskOnRestriction(task);
-            throw err;
+            throw err instanceof Error ? err : Error(msg);
           }
           if (
             !isPageTimeline &&
-            /发帖弹窗未打开|未开放发帖框|发帖弹窗中未找到文字输入框|发小组受限/i.test(msg)
+            /发帖弹窗未打开|未开放发帖框|发帖弹窗中未找到文字输入框|发小组受限/i.test(msg) &&
+            ++consecutiveGroupComposerFailures >= 2
           ) {
-            consecutiveGroupComposerFailures++;
-            if (consecutiveGroupComposerFailures >= 2) {
-              callbacks.returnTaskOnRestriction(task);
-              throw new PosterAccountRestrictedError(
-                '发小组受限 · 连续多个小组无法打开发帖框，已自动停止发小组',
-                { scope: 'feature_action' },
-              );
-            }
+            callbacks.returnTaskOnRestriction(task);
+            throw new PosterAccountRestrictedError(
+              '发小组受限 · 连续多个小组无法打开发帖框，已自动停止发小组',
+              { scope: 'feature_action' },
+            );
           }
+          callbacks.onTargetError?.(rawGroupId, msg);
           callbacks.status(
-            isPageTimeline
-              ? `专页时间线发布失败 · ${msg.slice(0, 48)}`
-              : `跳过小组 ${effectiveGroupName} · ${msg.slice(0, 48)}`,
+            `${isPageTimeline ? '专页时间线发布失败' : `跳过小组 ${effectiveGroupName}`} · ${msg.slice(0, 48)}`,
           );
           await paceWait(1000);
         }
@@ -457,7 +446,7 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
     } catch (outerErr) {
       const currentPage = currentConn?.browser.contexts()[0]?.pages()[0];
       if (currentPage) {
-        if (outerErr instanceof PosterAccountRestrictedError) {
+        if (outerErr instanceof PosterAccountRestrictedError)
           await reportGlobalRouteAbnormalIfNeeded({
             profileId,
             page: currentPage,
@@ -467,30 +456,25 @@ export class GroupPosterBrowserAdapter implements GroupPosterBrowserPort {
             fallbackScope: outerErr.scope,
             fallbackState: outerErr.abnormalState,
           });
-        } else {
+        else
           await kernel.observeExternalPageAccount?.(profileId, currentPage, null)?.catch(() => {});
-        }
       }
       throw outerErr;
     } finally {
-      await this.stop(profileId).catch((stopErr) => {
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'POSTER_STOP_FINALIZE_FAILED',
+      await this.stop(profileId).catch((stopErr) =>
+        devDiag.emit('WARN', 'BRIDGE_WS', 'POSTER_STOP_FINALIZE_FAILED', {
           profileId,
           reason: stopErr instanceof Error ? stopErr.message : 'STOP_FAILED',
-        });
-      });
+        }),
+      );
       if (
         this.posterRepo &&
         core?.peers.get(profileId) === peer &&
         peer.online &&
         peer.synced &&
         peer.phase === 'PAUSED'
-      ) {
+      )
         await recoverPosterOperations(kernel, peer, this.posterRepo, () => {}).catch(() => {});
-      }
     }
   }
 }

@@ -4,33 +4,17 @@ import type { Awaitable } from '../../domain/persistence.js';
 import { sameTabProof } from '../../domain/task-tabs.js';
 import type { Peer } from '../../bridge/core.js';
 import { sampleFacebookPage } from '../../application/kernel-gates.js';
-import type { KernelExecutor } from '../../application/kernel-executor.js';
 import { FacebookNativeIdentityRead } from '../../shared/facebook-native-identity.js';
-import { FacebookPostEffects } from '../../shared/facebook-post-observation.js';
-import {
-  facebookNativeResultUrl,
-  sameFacebookNativeResultUrl,
-} from '../../shared/facebook-result-route.js';
 import { kernelFacebookReadURL } from '../../shared/kernel-policy.js';
 import { KernelJsonObject, KernelTargetInfo } from '../../shared/kernel-protocol.js';
-import {
-  KernelPersistentState,
-  OwnedTabProof,
-  kernelOperationPending,
-  type KernelState,
-  type TabProof,
-} from '../../shared/kernel-state.js';
+import { OwnedTabProof, kernelOperationPending, type TabProof } from '../../shared/kernel-state.js';
 import {
   PageReadRequest,
   type PageProjection,
   type PageProjectionRequest,
 } from '../../shared/page-read.js';
 import { devDiag } from '../../shared/dev-diagnostics.js';
-import { TaskChildPageLifecycle, type ChildPageLifecycle } from '../../shared/task-policies.js';
 import { TaskWindowSnapshot, type Rect, type TaskWindow } from '../../shared/window-layout.js';
-import { projectFacebookPostEffects } from '../facebook-post-effect-reader.js';
-import { projectFacebookReelResult } from '../facebook-reel-result-reader.js';
-import { missingFacebookDefaultContext } from '../facebook-task-document-ready.js';
 import { endInvitationSetupOperations } from '../facebook-workspace-preparation.js';
 import type { KernelBridge } from '../kernel-bridge.js';
 import { extractInPageActorAvatarDom } from '../shared-dom-eval-runtime.js';
@@ -191,10 +175,7 @@ export async function recoverStuckWorkspaceTabImpl(
       const url = typeof result.url === 'string' ? result.url : 'https://www.facebook.com/';
       const targetChanged = result.targetChanged === true;
       session.record('stuck-tab-recovered-to-home:' + (targetChanged ? 'rebound' : 'same-target'));
-      devDiag.record({
-        level: 'INFO',
-        category: 'BRIDGE_WS',
-        event: 'STUCK_WORKSPACE_TAB_RECOVERED',
+      devDiag.emit('INFO', 'BRIDGE_WS', 'STUCK_WORKSPACE_TAB_RECOVERED', {
         profileId: peer.profileId,
         data: { tabId: freshProof.tabId, targetChanged },
       });
@@ -532,168 +513,4 @@ export async function readFacebookPageImpl(
     session.fail('FACEBOOK_READ_FAILED');
     throw error;
   }
-}
-export async function readOwnedFacebookNativeResult(
-  executor: KernelExecutor,
-  inventory: () => Promise<KernelState>,
-  originalProof: ReturnType<typeof OwnedTabProof.parse>,
-  accountId: string,
-  nativePostId: string,
-  guard: () => Awaitable<void>,
-  options: {
-    now?: () => number;
-    wait?: () => Promise<void>;
-    videoId?: string | null;
-    accept?: (effects: ReturnType<typeof FacebookPostEffects.parse>) => boolean;
-    lifecycle?: (value: ChildPageLifecycle) => void;
-    observe?: (v: {
-      elapsedMilliseconds: number;
-      route: 'result' | 'blank' | 'other';
-      ready: string;
-      posts: number;
-      actorMatches: boolean;
-      mediaReady: boolean;
-      matches: boolean;
-    }) => void;
-  } = {},
-) {
-  if (!/^\d{1,30}$/.test(accountId) || !/^\d{1,30}$/.test(nativePostId))
-    throw Error('NATIVE_RESULT_ID_REQUIRED');
-  const now = options.now ?? Date.now,
-    wait = options.wait ?? (() => new Promise<void>((r) => setTimeout(r, 250))),
-    readInv = async () => {
-      await guard();
-      const s = KernelPersistentState.parse(await inventory());
-      await guard();
-      return s;
-    };
-  const initial = await readInv(),
-    primary = initial.tabs.find((r) => r.ownershipId === originalProof.ownershipId);
-  if (
-    initial.profileId !== originalProof.profileId ||
-    primary?.state !== 'READY' ||
-    !primary.proof ||
-    !sameTabProof(primary.proof, originalProof) ||
-    initial.tabs.some(
-      (r) => r.ownershipId !== originalProof.ownershipId && !['CLOSED', 'LOST'].includes(r.state),
-    )
-  )
-    throw Error('NATIVE_RESULT_OWNER_NOT_IDLE');
-  const url = new URL(facebookNativeResultUrl(accountId, nativePostId, options.videoId)),
-    ownershipId = randomUUID(),
-    lifecycle = async (state: ChildPageLifecycle['state'], child: ChildPageLifecycle['child']) => {
-      await guard();
-      options.lifecycle?.(
-        TaskChildPageLifecycle.parse({
-          version: 1,
-          role: 'publication-result',
-          ownershipId,
-          parent: originalProof,
-          child,
-          state,
-        }),
-      );
-      await guard();
-    };
-  await lifecycle('REQUESTED', null);
-  const created = await executor.create(url.href, ownershipId, Boolean(options.videoId));
-  let proof: ReturnType<typeof OwnedTabProof.parse> | null = null;
-  const createdProofMatches = (c: ReturnType<typeof OwnedTabProof.parse>) =>
-    c.ownershipId === ownershipId &&
-    c.tabId === created.tabId &&
-    c.profileId === originalProof.profileId &&
-    c.browserSessionEpoch === originalProof.browserSessionEpoch &&
-    c.targetId !== originalProof.targetId &&
-    c.tabId !== originalProof.tabId;
-  let reading: null | ReturnType<typeof FacebookPostEffects.parse> = null;
-  const budget = options.videoId ? 90_000 : 30_000;
-  try {
-    const opened = await readInv(),
-      candidate = OwnedTabProof.parse(
-        opened.tabs.find((r) => r.ownershipId === ownershipId && r.state === 'READY')?.proof,
-      );
-    if (!createdProofMatches(candidate)) throw Error('NATIVE_RESULT_PROOF_MISMATCH');
-    proof = candidate;
-    await lifecycle('READY', proof);
-    const attached = await executor.attach(proof.tabId);
-    await guard();
-    if (attached.targetId !== proof.targetId) throw Error('NATIVE_RESULT_TARGET_CHANGED');
-    const started = now();
-    if (!Number.isSafeInteger(started) || started < 0) throw Error('NATIVE_RESULT_CLOCK_INVALID');
-    let sawResultDocument = false;
-    for (let reads = 0; reads < budget / 250; reads++) {
-      await guard();
-      const clock = now();
-      if (!Number.isSafeInteger(clock) || clock < started || clock - started >= budget) break;
-      let reply;
-      try {
-        reply = await executor.send({ tabId: proof.tabId }, 'Runtime.evaluate', {
-          expression: `JSON.stringify((${(options.videoId ? projectFacebookReelResult : projectFacebookPostEffects).toString()})(${options.videoId ? '' : '"result-dialog"'}))`,
-          returnByValue: true,
-        });
-      } catch (error) {
-        await guard();
-        if (
-          !missingFacebookDefaultContext(error) &&
-          !(error instanceof Error && error.message === 'KERNEL_INITIAL_DOCUMENT_PENDING')
-        )
-          throw error;
-        await wait();
-        await guard();
-        continue;
-      }
-      await guard();
-      if (reply.exceptionDetails) throw Error('NATIVE_RESULT_PROJECTION_FAILED');
-      const text = KernelJsonObject.parse(reply.result).value;
-      if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > 96 * 1024)
-        throw Error('NATIVE_RESULT_PROJECTION_BUDGET');
-      const effects = FacebookPostEffects.parse(JSON.parse(text)),
-        sameResult = sameFacebookNativeResultUrl(effects.url, url.href),
-        matches =
-          sameResult &&
-          effects.ready !== 'loading' &&
-          effects.posts.length > 0 &&
-          (!options.accept || options.accept(effects));
-      try {
-        options.observe?.({
-          elapsedMilliseconds: clock - started,
-          route: sameResult ? 'result' : effects.url === 'about:blank' ? 'blank' : 'other',
-          ready: effects.ready,
-          posts: effects.posts.length,
-          actorMatches: effects.posts.some((post) => post.accountId === accountId),
-          mediaReady: effects.posts.some((post) => post.videoReady),
-          matches,
-        });
-      } catch {}
-      if (!sameResult && (effects.url !== 'about:blank' || sawResultDocument)) break;
-      if (sameResult) sawResultDocument = true;
-      if (matches) {
-        reading = effects;
-        break;
-      }
-      await wait();
-      await guard();
-    }
-  } finally {
-    const current = await readInv(),
-      owned = current.tabs.find((r) => r.ownershipId === ownershipId);
-    if (
-      !owned?.proof ||
-      !createdProofMatches(owned.proof) ||
-      (proof !== null && !sameTabProof(owned.proof, proof)) ||
-      !['READY', 'CLOSED'].includes(owned.state)
-    )
-      throw Error('NATIVE_RESULT_CLOSE_OWNER_CHANGED');
-    proof ??= owned.proof;
-    if (owned.state === 'READY') {
-      await executor.remove(proof.tabId);
-      await guard();
-    }
-    const ended = await readInv(),
-      closed = ended.tabs.find((r) => r.ownershipId === ownershipId);
-    if (closed?.state !== 'CLOSED' || !closed.proof || !sameTabProof(closed.proof, proof))
-      throw Error('NATIVE_RESULT_CLOSE_UNCONFIRMED');
-    await lifecycle('CLOSED', proof);
-  }
-  return reading;
 }

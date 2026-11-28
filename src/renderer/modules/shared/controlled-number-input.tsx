@@ -6,13 +6,8 @@ import {
   type CSSProperties,
   type Ref,
 } from 'react';
-
 import { UI_INPUT_SM } from '../../ui/primitives.js';
-
-export interface ControlledNumberInputHandle {
-  flush(): Promise<number>;
-}
-
+export type ControlledNumberInputHandle = { flush(): Promise<number> };
 export function ControlledNumberInput({
   value,
   min,
@@ -47,26 +42,20 @@ export function ControlledNumberInput({
   const inFlightCommitRef = useRef<Promise<unknown> | null>(null);
   const textRef = useRef<string>(text);
   textRef.current = text;
-
   useEffect(() => {
     latestCommittedRef.current = value;
-    if (!focusedRef.current && Number.isFinite(value)) {
-      setText(String(value));
-    }
+    if (!focusedRef.current && Number.isFinite(value)) setText(String(value));
   }, [value]);
-
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const onCommitRef = useRef(onCommit);
   onCommitRef.current = onCommit;
-
   useEffect(
     () => () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     },
     [],
   );
-
   function clampNumber(raw: number): number {
     const fallback = Number.isFinite(defaultValue)
       ? (defaultValue as number)
@@ -76,45 +65,40 @@ export function ControlledNumberInput({
     const candidate = Number.isFinite(raw) ? raw : fallback;
     return Math.min(max, Math.max(min, Math.round(candidate)));
   }
-
   function runCommit(clamped: number): Promise<unknown> {
     const commitFn = onCommitRef.current;
     if (!commitFn) return Promise.resolve();
     const p = Promise.resolve(commitFn(clamped)).finally(() => {
-      if (inFlightCommitRef.current === p) {
-        inFlightCommitRef.current = null;
-      }
+      if (inFlightCommitRef.current === p) inFlightCommitRef.current = null;
     });
     inFlightCommitRef.current = p;
     return p;
   }
-
-  async function flush(): Promise<number> {
+  function commitCurrent(awaitCommit: true): Promise<number>;
+  function commitCurrent(awaitCommit: false): number;
+  function commitCurrent(awaitCommit: boolean): Promise<number> | number {
     const hadPendingTimer = timerRef.current !== null;
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
     const rawText = textRef.current;
-    const raw = rawText.trim() === '' ? Number.NaN : Number(rawText);
-    const clamped = clampNumber(raw);
+    const clamped = clampNumber(rawText.trim() === '' ? Number.NaN : Number(rawText));
     setText(String(clamped));
     textRef.current = String(clamped);
     const valueChanged = clamped !== latestCommittedRef.current;
     if (hadPendingTimer || valueChanged || rawText !== String(clamped)) {
       latestCommittedRef.current = clamped;
       if (valueChanged) onChangeRef.current?.(clamped);
-      await runCommit(clamped);
-    } else if (inFlightCommitRef.current) {
-      await inFlightCommitRef.current;
+      const pending = runCommit(clamped);
+      return awaitCommit ? pending.then(() => clamped) : clamped;
     }
-    return clamped;
+    return awaitCommit && inFlightCommitRef.current
+      ? inFlightCommitRef.current.then(() => clamped)
+      : clamped;
   }
-
-  useImperativeHandle(ref, () => ({
-    flush,
-  }));
-
+  const flush = () => commitCurrent(true);
+  useImperativeHandle(ref, () => ({ flush }));
   return (
     <input
       type="number"
@@ -142,9 +126,7 @@ export function ControlledNumberInput({
           clearTimeout(timerRef.current);
           timerRef.current = null;
         }
-        if (nextText.trim() === '') {
-          return;
-        }
+        if (nextText.trim() === '') return;
         const parsed = Number(nextText);
         if (Number.isFinite(parsed)) {
           const clamped = clampNumber(parsed);
@@ -161,22 +143,7 @@ export function ControlledNumberInput({
       }}
       onBlur={() => {
         focusedRef.current = false;
-        const hadPendingTimer = timerRef.current !== null;
-        if (timerRef.current) {
-          clearTimeout(timerRef.current);
-          timerRef.current = null;
-        }
-        const rawText = textRef.current;
-        const raw = rawText.trim() === '' ? Number.NaN : Number(rawText);
-        const clamped = clampNumber(raw);
-        setText(String(clamped));
-        textRef.current = String(clamped);
-        const valueChanged = clamped !== latestCommittedRef.current;
-        if (hadPendingTimer || valueChanged || rawText !== String(clamped)) {
-          latestCommittedRef.current = clamped;
-          if (valueChanged) onChangeRef.current?.(clamped);
-          void runCommit(clamped);
-        }
+        commitCurrent(false);
       }}
     />
   );

@@ -52,10 +52,8 @@ import {
 import { devDiag } from './shared/dev-diagnostics.js';
 import type { ProfileLifecyclePort } from './shared/profile-lifecycle.js';
 import { LayoutDisplays } from './shared/window-layout.js';
-
 const controllerLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 controllerLoopDelay.enable();
-
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
 const extensionSources = [
@@ -79,16 +77,12 @@ if (
 ) {
   await syncProductAiWorkspaceDirectory({ rootDir: root, softwareVersion }).catch(
     (err: unknown) => {
-      devDiag.record({
-        level: 'WARN',
-        category: 'SYSTEM',
-        event: 'AI_WORKSPACE_SYNC_FAILED',
+      devDiag.emit('WARN', 'SYSTEM', 'AI_WORKSPACE_SYNC_FAILED', {
         reason: err instanceof Error ? err.message : 'SYNC_FAILED',
       });
     },
   );
 }
-
 let layoutDisplays = LayoutDisplays.parse(JSON.parse(process.env.WORKBENCH_DISPLAYS ?? '[]'));
 const dataDir = await canonicalDataDirectory(
   process.env.WORKBENCH_DATA_DIR ?? process.env.BRIDGE_TEST_DATA_DIR ?? productDataDirectory(),
@@ -105,7 +99,6 @@ const browserLabels = new LocalBrowserLabels([
 const graphAvatar = new GraphAvatar(() => process.env.WORKBENCH_GRAPH_AVATAR_TOKEN);
 const port = Number(process.env.WORKBENCH_PORT ?? process.env.BRIDGE_TEST_PORT ?? 18767);
 const binding = await reserveControllerPort(port);
-
 let repository: WorkspaceStore;
 let persistence: PersistenceClient;
 let restoreRequested = false;
@@ -150,8 +143,12 @@ try {
   await releaseControllerPort(binding.server);
   throw error;
 }
-
-const workboard = new Workboard();
+const initialSchedulerSettings = await repository.autoScheduler.settings();
+const workboard = new Workboard({
+  browserConcurrency: initialSchedulerSettings.browserConcurrency,
+  bluestacksConcurrency: initialSchedulerSettings.bluestacksConcurrency,
+  launchStaggerMs: initialSchedulerSettings.launchStaggerSeconds * 1000,
+});
 const eventHub = new WorkspaceEventHub();
 let shuttingDown = false;
 let windowLayout: WindowLayoutService | undefined;
@@ -177,7 +174,6 @@ let agentBrowserManagerRef: AgentBrowserManager | undefined;
 let autoInspectSweepRef: (() => Promise<void>) | undefined;
 let mcpHttpHandler:
   ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>) | undefined;
-
 let bridge: Awaited<ReturnType<typeof startBridgeServer>>;
 try {
   await repository.tasks.recoverOnStartup(!restoreRequested);
@@ -186,10 +182,7 @@ try {
       try {
         await extensionUpdates?.automatic(peer);
       } catch (error) {
-        devDiag.record({
-          level: 'WARN',
-          category: 'BRIDGE_WS',
-          event: 'EXTENSION_AUTO_RELOAD_FAILED',
+        devDiag.emit('WARN', 'BRIDGE_WS', 'EXTENSION_AUTO_RELOAD_FAILED', {
           profileId: peer.profileId,
           reason: error instanceof Error ? error.message : 'RELOAD_FAILED',
         });
@@ -355,6 +348,23 @@ try {
       .join('|');
     const todaySig = JSON.stringify(await repository.postBumpRecords.todayStats());
     const activeSig = [...activeIds].sort().join(',');
+    const schedulerSig = autoSchedulerServiceRef?.activeRunDigest() ?? '';
+    const inviterState = groupInviterServiceRef
+      ? await groupInviterServiceRef.state().catch(() => null)
+      : null;
+    const inviterCountsSig = inviterState
+      ? Object.entries(inviterState.profileCounts)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(
+            ([pid, c]) =>
+              `${pid}:${c.sessionInvited}:${c.totalInvited}:${Boolean(c.running)}:${c.status ?? ''}`,
+          )
+          .join('|')
+      : '';
+    const inviterSummary = inviterState?.lastRunSummary;
+    const inviterSig = inviterState
+      ? `${inviterState.running}:${inviterState.runId ?? ''}:${inviterState.startedAt ?? ''}:${inviterState.finishedAt ?? ''}:${inviterState.statusText}:${inviterCountsSig}:${inviterSummary ? `${inviterSummary.runId}:${inviterSummary.finishedAt}:${inviterSummary.invitedTotal}:${inviterSummary.pendingTotal}:${inviterSummary.failedProfiles.length}` : ''}`
+      : activeSig;
     return {
       workspace: peerSig,
       'runtime-summary': activeSig,
@@ -363,11 +373,11 @@ try {
         ? { 'group-bumper': `${activeSig}:${todaySig}` }
         : {}),
       ...(activeIds.includes('group-poster') ? { 'group-poster': `${activeSig}:${todaySig}` } : {}),
-      ...(activeIds.includes('group-inviter') ? { 'group-inviter': activeSig } : {}),
+      'group-inviter': inviterSig,
       ...(activeIds.some((id) => id.startsWith('bluestacks-'))
         ? { bluestacks: `${activeSig}:${todaySig}` }
         : {}),
-      ...(activeIds.includes('auto-scheduler') ? { 'auto-scheduler': activeSig } : {}),
+      'auto-scheduler': `${activeSig}:${schedulerSig}`,
       ...(activeIds.includes('google-sheets')
         ? { 'google-sheets': `${activeSig}:${todaySig}` }
         : {}),
@@ -379,7 +389,6 @@ try {
   await releaseControllerPort(binding.server);
   throw error;
 }
-
 const notifications = await TaskNotificationMonitor.open(
   repository,
   async () => await repository.preferences(),
@@ -404,13 +413,9 @@ void runtimeLog
     (await repository.maintenanceSettings()).logRetentionDays,
   )
   .catch(() => {});
-devDiag.record({
-  level: 'INFO',
-  category: 'SYSTEM',
-  event: 'SOFTWARE_STARTED',
+devDiag.emit('INFO', 'SYSTEM', 'SOFTWARE_STARTED', {
   data: { softwareVersion, port, logFilePath: devDiagWriter.filePath },
 });
-
 const cleanupTimer = setInterval(() => {
   void dataCleanup?.automatic().catch(() => {});
 }, 60000);
@@ -452,7 +457,6 @@ const startupAvatarLocalization = scheduleStartupAccountAvatarLocalization({
   isShuttingDown: () => shuttingDown,
   graphAvatarLookup: (accountId) => graphAvatar.lookup(accountId),
 });
-
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;

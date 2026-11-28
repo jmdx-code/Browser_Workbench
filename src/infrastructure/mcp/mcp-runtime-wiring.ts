@@ -37,7 +37,6 @@ import {
 import { AgentBrowserManager } from './agent-browser-manager.js';
 import type { WorkbenchMcpDependencies } from './mcp-context.js';
 import { createWorkbenchMcpHttpHandler } from './mcp-server.js';
-
 export interface McpRuntimeWiringInput {
   softwareVersion: string;
   extensionVersion: string;
@@ -66,7 +65,6 @@ export interface McpRuntimeWiringInput {
   reloadExtensions: (ids?: string[]) => Promise<ReloadResult>;
   withMutation: <T>(work: () => Promise<T>) => Promise<T>;
 }
-
 export function createBluestacksRuntime(
   repository: WorkspaceStorePort,
   featureExecution: FeatureExecutionRegistry,
@@ -111,25 +109,33 @@ export function createBluestacksRuntime(
       listCombinations: () => repository.combinations(),
       listPosterMaterials: () => repository.groupPoster.materials(),
       hasGroupPostedMaterial: (gid, mid) => repository.groupPoster.hasGroupPostedMaterial(gid, mid),
+      recordActiveProgress: (d) =>
+        repository.activityStats.recordDailyActivity({
+          carrier: 'bluestacks',
+          profileId: d.profileId,
+          accountId: d.accountId,
+          durationMsDelta: d.durationMsDelta,
+          friendsDelta: d.friendsDelta,
+          likesDelta: 0,
+          actionsDelta: 0,
+          at: d.at,
+        }),
       ...(ensurePosterMaterialLocal && { ensurePosterMaterialLocal }),
     },
   );
   return { ocrClient, service };
 }
-
 export function schedulePosterDriveCacheCleanup(groupPosterService: GroupPosterService): void {
   const run = () => void groupPosterService.cleanupExpiredDriveCache().catch(() => {});
   const t1 = setTimeout(run, 30_000).unref();
   const t2 = setInterval(run, 6 * 3600_000).unref();
   process.once('exit', () => (clearTimeout(t1), clearInterval(t2)));
 }
-
 export function openDesktopExtensionDirViaParent(): void {
   if (!process.parentPort)
     throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中打开插件目录', 409);
   process.parentPort.postMessage({ type: 'OPEN_EXTENSION_DIRECTORY' });
 }
-
 export async function openDesktopAiWorkspaceViaParent(rootDir: string, softwareVersion: string) {
   if (!process.parentPort)
     throw new ProductError('UPDATE_DESKTOP_REQUIRED', '请在桌面工作台中打开 AI 专属工作夹', 409);
@@ -137,7 +143,6 @@ export async function openDesktopAiWorkspaceViaParent(rootDir: string, softwareV
   process.parentPort.postMessage({ type: 'OPEN_AI_WORKSPACE_DIRECTORY', directory });
   return { directory };
 }
-
 export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
   profileLifecycle: BrowserLifecycleManager;
   agentBrowserManager: AgentBrowserManager;
@@ -160,7 +165,6 @@ export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
       if (peer?.online) await input.getMainKernel()?.releaseIdleForExtension(peer);
     },
   });
-
   void Promise.all([repository.profileLaunchBindings(), store.profileList()])
     .then(([bindings, rows]) => {
       browserLabels.hydrateBindings(bindings, new Set(rows.map((r) => String(r.profileId))));
@@ -184,7 +188,6 @@ export function wireLifecycleAndMcpRuntime(input: McpRuntimeWiringInput): {
       }
     })
     .catch(() => {});
-
   input.groupBumperService.setProfileLifecycle(profileLifecycle);
   input.groupPosterService.setProfileLifecycle(profileLifecycle);
   input.groupInviterService.setProfileLifecycle(profileLifecycle);

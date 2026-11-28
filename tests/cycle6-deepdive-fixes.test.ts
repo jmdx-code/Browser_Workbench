@@ -36,7 +36,6 @@ import type { ProfileLifecyclePort } from '../src/shared/profile-lifecycle.js';
 const tempDirs: Array<{ dir: string; store?: WorkspaceStore }> = [];
 const P001 = '00000000-0000-4000-8000-000000000201';
 const SCHED_1 = '00000000-0000-4000-8000-000000000301';
-const SCHED_2 = '00000000-0000-4000-8000-000000000302';
 const STEP_1 = '00000000-0000-4000-8000-000000000401';
 const STEP_2 = '00000000-0000-4000-8000-000000000402';
 const MAT_UUID = '00000000-0000-4000-8000-000000000501';
@@ -67,7 +66,7 @@ afterEach(() => {
 });
 
 describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
-  it('AutoScheduler computeDueScheduleTriggers never back-fires slots earlier than createdAt/updatedAt and clamps prewarm jitter', () => {
+  it('AutoScheduler computeDueScheduleTriggers never back-fires slots earlier than armedAt/createdAt', () => {
     // 2026-11-22 13:30:19 Asia/Shanghai (created 90 min AFTER the 12:00 slot!)
     const createdAt = new Date('2026-11-22T13:30:19+08:00').getTime();
     const tickNow = createdAt + 5_000;
@@ -81,13 +80,12 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['12:00', '19:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
       },
-      prewarm: { enabled: false, leadMinutes: 60, steps: [] },
-      steps: [{ id: STEP_1, type: 'quick-browse', target: 'feed', durationMinutes: 5 }],
+      steps: [{ id: STEP_1, type: 'active-combination', combinationId: MAT_UUID }],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: 60,
       sortOrder: 0,
+      armedAt: createdAt,
       createdAt,
       updatedAt: createdAt,
     });
@@ -95,34 +93,10 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
     const due = computeDueScheduleTriggers(rule, tickNow, new Set());
     assert.equal(due.length, 0, 'Must NOT back-fire the 12:00 slot created at 13:30');
 
-    // Verify prewarm jitter clamp: main slot at 19:00, leadMinutes=20, jitterMinutes=20
-    const ruleWithJitter = AutoSchedule.parse({
-      ...rule,
-      id: SCHED_2,
-      trigger: {
-        weekdays: [1, 2, 3, 4, 5, 6, 7],
-        times: ['19:00'],
-        timeZone: 'Asia/Shanghai',
-        jitterMinutes: 20,
-      },
-      prewarm: {
-        enabled: true,
-        leadMinutes: 20,
-        steps: [{ id: STEP_2, type: 'quick-browse', target: 'feed', durationMinutes: 3 }],
-      },
-      createdAt: new Date('2026-11-22T10:00:00+08:00').getTime(),
-      updatedAt: new Date('2026-11-22T10:00:00+08:00').getTime(),
-    });
-    const atPrewarmCheck = new Date('2026-11-22T18:52:00+08:00').getTime();
-    const duePrewarm = computeDueScheduleTriggers(ruleWithJitter, atPrewarmCheck, new Set()).filter(
-      (d) => d.phase === 'prewarm',
-    );
-    for (const trigger of duePrewarm) {
-      assert.ok(
-        trigger.scheduledFor < trigger.mainScheduledFor,
-        'Clamped prewarm scheduledFor must remain strictly before mainScheduledFor',
-      );
-    }
+    const atEvening = new Date('2026-11-22T19:02:00+08:00').getTime();
+    const dueEvening = computeDueScheduleTriggers(rule, atEvening, new Set());
+    assert.equal(dueEvening.length, 1);
+    assert.equal(dueEvening[0]?.scheduledFor, new Date('2026-11-22T19:00:00+08:00').getTime());
   });
 
   it('BluestacksGroupPosterStep schema rejects empty groupIds unless postToTimeline is true', () => {
@@ -135,9 +109,7 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
         weekdays: [1, 2, 3, 4, 5],
         times: ['10:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
       },
-      prewarm: { enabled: false as const, leadMinutes: 90, steps: [] },
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: 60,
     };
@@ -230,7 +202,9 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
       ready: () => profileOnlineFlag,
       busy: async () => profileBusyFlag || pendingReconnectStopFlag,
       hasPendingReconnectStop: () => pendingReconnectStopFlag && !profileOnlineFlag,
-      runProfileWorker: async () => {},
+      runProfileWorker: async (_id, _m, _s, cb) => {
+        while (!cb.cancelled()) await new Promise((r) => setTimeout(r, 5));
+      },
       stop: async () => {},
     };
     const fakeMedia: PosterMediaPreparerPort = {
@@ -264,53 +238,61 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
       },
     };
     service.setProfileLifecycle(fakeLifecycle);
+    try {
+      await assert.rejects(
+        service.createTask({
+          materialId: mat.id,
+          groupIds: ['1001'],
+          accountMode: 'selected',
+          profileIds: [P001],
+        }),
+        /已全部发过该贴文/,
+      );
 
-    await assert.rejects(
-      service.createTask({
+      store.groupPoster.upsertTargets({ items: [{ id: '1002', name: 'Group Two' }] });
+      await service.createTask({
         materialId: mat.id,
-        groupIds: ['1001'],
+        groupIds: ['1002'],
         accountMode: 'selected',
         profileIds: [P001],
-      }),
-      /已全部发过该贴文/,
-    );
+      });
+      for (let i = 0; i < 60 && launchedOfflineIds.length === 0; i++)
+        await new Promise((r) => setTimeout(r, 5));
+      assert.deepEqual(
+        launchedOfflineIds,
+        [P001],
+        'dispatchTask must wake offline Chrome when only holding a pending reconnect-stop',
+      );
+      await service.stop();
 
-    store.groupPoster.upsertTargets({ items: [{ id: '1002', name: 'Group Two' }] });
-    await service.createTask({
-      materialId: mat.id,
-      groupIds: ['1002'],
-      accountMode: 'selected',
-      profileIds: [P001],
-    });
-    assert.deepEqual(
-      launchedOfflineIds,
-      [P001],
-      'dispatchTask must wake offline Chrome when only holding a pending reconnect-stop',
-    );
-    await service.stop();
-
-    store.groupPoster.upsertTargets({ items: [{ id: '1003', name: 'Group Three' }] });
-    profileOnlineFlag = true;
-    profileBusyFlag = true;
-    const now = Date.now();
-    await service.createTask({
-      materialId: mat.id,
-      groupIds: ['1003'],
-      accountMode: 'selected',
-      profileIds: [P001],
-      scheduledAt: now + 60_000,
-    });
-    const tasksBefore = store.groupPoster.listTasks(10);
-    const schedTask = tasksBefore.find((t) => t.groupIds.includes('1003'));
-    assert.ok(schedTask);
-    await service.tickScheduledTasks((schedTask.scheduledAt ?? now) + 1000);
-    const afterTask = store.groupPoster.listTasks(10).find((t) => t.id === schedTask.id);
-    assert.equal(afterTask?.status, 'scheduled', 'Transient busy scheduled task must be deferred');
-    assert.ok(
-      (afterTask?.scheduledAt ?? 0) > now,
-      'Deferred scheduled task must move scheduledAt forward',
-    );
-    await service.shutdown();
+      store.groupPoster.upsertTargets({ items: [{ id: '1003', name: 'Group Three' }] });
+      profileOnlineFlag = true;
+      profileBusyFlag = true;
+      const now = Date.now();
+      await service.createTask({
+        materialId: mat.id,
+        groupIds: ['1003'],
+        accountMode: 'selected',
+        profileIds: [P001],
+        scheduledAt: now + 60_000,
+      });
+      const tasksBefore = store.groupPoster.listTasks(10);
+      const schedTask = tasksBefore.find((t) => t.groupIds.includes('1003'));
+      assert.ok(schedTask);
+      await service.tickScheduledTasks((schedTask.scheduledAt ?? now) + 1000);
+      const afterTask = store.groupPoster.listTasks(10).find((t) => t.id === schedTask.id);
+      assert.equal(
+        afterTask?.status,
+        'scheduled',
+        'Transient busy scheduled task must be deferred',
+      );
+      assert.ok(
+        (afterTask?.scheduledAt ?? 0) > now,
+        'Deferred scheduled task must move scheduledAt forward',
+      );
+    } finally {
+      await service.shutdown().catch(() => {});
+    }
   });
 
   it('BluestacksService.startPoster splits groups atomically across 3 emulators with zero duplicate spam and honors DB dedup', async () => {
@@ -402,7 +384,6 @@ describe('Cycle 6 Deep-Dive Fixes Regression Suite', () => {
       targets: () => groups,
       todayCounts: () => ({}),
       total: () => 0,
-      weeklyDailyCounts: () => [],
     };
     const devices: BluestacksDeviceController = {
       getOnlineKeys: () => new Set(instances.map((i) => i.instanceKey)),

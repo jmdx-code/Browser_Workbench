@@ -49,4 +49,3 @@ export const FacebookPostEffects = strictObj({
     )
     .max(20),
 });
-export type PostEffects = z.infer<typeof FacebookPostEffects>;

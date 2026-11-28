@@ -1,7 +1,6 @@
 import { lstat, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { open as openZip, type Entry, type ZipFile } from 'yauzl';
-
 export type ExcelTemporalKind = 'date' | 'time' | 'datetime';
 export interface TableReadOptions {
   sheet?: string | number | undefined;
@@ -21,7 +20,6 @@ export interface TableReadResult {
   hasMore: boolean;
   rows: Array<Record<string, string>>;
 }
-
 const DATE_FMTS = new Set([14, 15, 16, 17, 27, 28, 29, 30, 31, 36, 50, 51, 52, 53, 54, 57, 58]);
 const TIME_FMTS = new Set([18, 19, 20, 21, 32, 33, 45, 46, 47, 55, 56]);
 const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -46,7 +44,6 @@ const clipCell = (v: unknown, max = 2000) => {
           : String(v);
   return s.length > max ? `${s.slice(0, max)}…` : s;
 };
-
 async function readZipEntriesAsUtf8(filePath: string, predicate: (fileName: string) => boolean) {
   const zip = await new Promise<ZipFile>((res, rej) =>
     openZip(filePath, { lazyEntries: true, autoClose: true }, (e, z) =>
@@ -88,7 +85,6 @@ async function readZipEntriesAsUtf8(filePath: string, predicate: (fileName: stri
   });
   return out;
 }
-
 function parseStylesTemporalMap(stylesXml: string): Array<ExcelTemporalKind | null> {
   if (!stylesXml) return [];
   const custom = new Map<number, ExcelTemporalKind | null>();
@@ -121,7 +117,6 @@ function parseStylesTemporalMap(stylesXml: string): Array<ExcelTemporalKind | nu
           : null;
   });
 }
-
 export function formatExcelSerialValue(
   serial: number,
   kind: ExcelTemporalKind,
@@ -141,7 +136,6 @@ export function formatExcelSerialValue(
   const datePart = `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
   return kind === 'date' && remSec === 0 ? datePart : `${datePart} ${fmtHms(remSec)}`;
 }
-
 function parseWorksheetXml(
   xml: string,
   shared: readonly string[],
@@ -187,7 +181,6 @@ function parseWorksheetXml(
   }
   return rows;
 }
-
 function parseDelimitedText(text: string, delimiter: string): string[][] {
   const cleaned = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const rows: string[][] = [];
@@ -214,7 +207,6 @@ function parseDelimitedText(text: string, delimiter: string): string[][] {
   flush();
   return rows;
 }
-
 async function readXlsxGrid(resolved: string, sheetOpt?: string | number) {
   const need = new Set([
     'xl/workbook.xml',
@@ -278,7 +270,6 @@ async function readXlsxGrid(resolved: string, sheetOpt?: string | number) {
     ),
   };
 }
-
 export async function readSpreadsheetOrTableFile(
   rawFilePath: string,
   options?: TableReadOptions,

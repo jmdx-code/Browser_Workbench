@@ -153,33 +153,6 @@ interface MarketplaceFilter {
 const filterOf = (value: string | MarketplaceFilter): MarketplaceFilter =>
   typeof value === 'string' ? { keyword: value } : value;
 export const MARKETPLACE_HOME = 'https://www.facebook.com/marketplace/';
-export function facebookMarketplaceURL(
-  value: string | MarketplaceFilter,
-  nativeCategoryURL?: string,
-): string {
-  const filter = filterOf(value);
-  if (filter.categoryId && !nativeCategoryURL) return MARKETPLACE_HOME;
-  const url = new URL(
-    nativeCategoryURL ??
-      (filter.keyword.trim() ? 'https://www.facebook.com/marketplace/search/' : MARKETPLACE_HOME),
-  );
-  if (
-    nativeCategoryURL &&
-    (!matchesMarketplaceSearch(nativeCategoryURL, {
-      keyword: '',
-      categoryId: filter.categoryId,
-    }) ||
-      !filter.categoryId)
-  )
-    throw Error('MARKETPLACE_NATIVE_CATEGORY_REQUIRED');
-  if (filter.keyword.trim()) url.searchParams.set('query', filter.keyword.trim());
-  for (const name of ['minPrice', 'maxPrice'] as const) {
-    const price = filter[name];
-    if (price === undefined) url.searchParams.delete(name);
-    else url.searchParams.set(name, String(price));
-  }
-  return url.href;
-}
 export function facebookMarketplaceItemURL(value: string): string | null {
   if (facebookBrowseSurface(value) !== 'marketplace') return null;
   const url = new URL(value);

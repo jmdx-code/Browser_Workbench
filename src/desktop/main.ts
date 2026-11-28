@@ -185,13 +185,17 @@ function handleControllerMessage(service: UtilityProcess, message: unknown): voi
       num = (k: string) => (typeof m[k] === 'number' ? (m[k] as number) : 0),
       handlers: Record<string, () => void> = {
         OPEN_EXTENSION_DIRECTORY: () => void shell.openPath(productExtensionDirectory()),
-        SET_POWER_LOCK: () =>
-          void (typeof m.mode === 'string' && trayAndPower.applyPowerLockMode(m.mode)),
         SET_HOSTING_STATUS: () =>
           trayAndPower.setHostingStatus({
             runningCount: num('runningCount'),
             autoMonitorCount: num('autoMonitorCount'),
             keepAwake: typeof m.keepAwake === 'boolean' ? m.keepAwake : undefined,
+            powerLockMode:
+              m.powerLockMode === 'prevent-display-sleep' ||
+              m.powerLockMode === 'prevent-app-suspension' ||
+              m.powerLockMode === 'none'
+                ? m.powerLockMode
+                : undefined,
             summary: str('summary'),
           }),
         OPEN_AI_WORKSPACE_DIRECTORY: () => {
@@ -381,9 +385,8 @@ async function spawnControllerProcess(
       notify(`控制服务意外退出（错误码 ${code}），正在自动恢复…`);
       setTimeout(() => {
         void spawnControllerProcess(false, dataDir, avatarToken)
-          .then(async (recovered) => {
-            if (window && !window.isDestroyed())
-              await window.loadURL(recovered.origin + '/workbench/');
+          .then(async (r) => {
+            if (window && !window.isDestroyed()) await window.loadURL(r.origin + '/workbench/');
           })
           .catch(() => {
             dialog.showErrorBox(
@@ -485,11 +488,10 @@ function attachMainWindowHandlers(win: BrowserWindow, origin: string) {
     closeTimer: NodeJS.Timeout | null = null,
     closeChoicePending = false,
     closeGuardOpen = false;
-  const resetCloseFlags = () => {
-      restartRequested = false;
-      forceQuitRequested = false;
+  const showBox = (opts: Electron.MessageBoxOptions) => dialog.showMessageBox(win, opts),
+    resetCloseFlags = () => {
+      restartRequested = forceQuitRequested = false;
     },
-    showBox = (opts: Electron.MessageBoxOptions) => dialog.showMessageBox(win, opts),
     runGuardedDialog = async (
       isOpen: () => boolean,
       setOpen: (v: boolean) => void,
@@ -681,9 +683,7 @@ async function smoke(
   await closed;
   const afterClose = await fetchWs(),
     combos = (
-      (await afterClose.json()) as {
-        combinations?: Array<{ saved?: { name?: string } }>;
-      } | null
+      (await afterClose.json()) as { combinations?: Array<{ saved?: { name?: string } }> } | null
     )?.combinations,
     closePersisted =
       Array.isArray(combos) && combos.some((r) => r?.saved?.name === '桌面关闭保存验收');

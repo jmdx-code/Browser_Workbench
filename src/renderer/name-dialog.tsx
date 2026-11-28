@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react';
 import { Btn, useShowModal } from './modules/shared/module-ui.js';
 import { UI_DIALOG_CARD, UI_INPUT } from './ui/primitives.js';
-
 export function NameDialog({
   title,
   initial,

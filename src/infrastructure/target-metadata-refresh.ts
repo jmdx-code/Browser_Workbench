@@ -1,9 +1,6 @@
 import type { BumperRefreshResult, BumperTarget } from '../shared/group-bumper.js';
 import type { GroupBumperBrowserAdapter } from './group-bumper-runner.js';
-export interface TargetMetadataRefreshOptions {
-  signal?: AbortSignal;
-  onUpdated?: () => void;
-}
+export type TargetMetadataRefreshOptions = { signal?: AbortSignal; onUpdated?: () => void };
 export type TargetMetadataRefreshAdapter = Pick<GroupBumperBrowserAdapter, 'refreshTargetBatch'> & {
   hasMetadataReads?(): boolean;
 };
@@ -32,9 +29,7 @@ export class TargetMetadataRefreshService {
     options?: TargetMetadataRefreshOptions,
   ): Promise<BumperRefreshResult> {
     const previous = this.controllers.get(kind);
-    if (previous) {
-      previous.abort(new Error('FACEBOOK_METADATA_BATCH_ABORTED'));
-    }
+    if (previous) previous.abort(new Error('FACEBOOK_METADATA_BATCH_ABORTED'));
     const controller = new AbortController();
     this.controllers.set(kind, controller);
     const externalSignal = options?.signal;
@@ -42,11 +37,8 @@ export class TargetMetadataRefreshService {
       controller.abort(new Error('FACEBOOK_METADATA_BATCH_ABORTED'));
     };
     if (externalSignal) {
-      if (externalSignal.aborted) {
-        onExternalAbort();
-      } else {
-        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
-      }
+      if (externalSignal.aborted) onExternalAbort();
+      else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
     }
     try {
       return await this.adapter.refreshTargetBatch(kind, items, {
@@ -55,9 +47,7 @@ export class TargetMetadataRefreshService {
       });
     } finally {
       externalSignal?.removeEventListener('abort', onExternalAbort);
-      if (this.controllers.get(kind) === controller) {
-        this.controllers.delete(kind);
-      }
+      if (this.controllers.get(kind) === controller) this.controllers.delete(kind);
     }
   }
 }

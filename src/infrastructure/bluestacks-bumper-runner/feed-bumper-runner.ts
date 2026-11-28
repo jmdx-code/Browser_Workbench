@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { devDiag } from '../../shared/dev-diagnostics.js';
 import {
   relativePostAge,
+  resolveEffectiveBsAccountId,
   type BluestacksBumperMode,
   type BluestacksInstance,
 } from '../../shared/bluestacks.js';
@@ -19,6 +20,7 @@ import {
   extractActionBars,
   extractPostCards,
   findSeeMoreButtonNode,
+  flattenLiteNodes,
   getRegionSignature,
   isReactionButtonActive,
   makeCanonicalRect,
@@ -27,9 +29,11 @@ import {
   type LitePostActionBar,
   type LitePostCard,
   type LiteXmlNode,
+  type OcrRecognizer,
 } from '../bluestacks-vision.js';
 import {
   buildGroupUrl,
+  emitBumperCommentSkipped,
   enterAndVerifyGroup,
   enterAndVerifyPage,
   executeBarActions,
@@ -47,10 +51,12 @@ interface FeedScanCtx {
   ctx: BluestacksBumperContext;
   ops: ScreenOps;
   inst: BluestacksInstance;
+  accountId: string;
   instanceId: string;
   isPageMode: boolean;
   sourceMode: BumperScope;
   group: BumperTarget;
+  targetGroupsById: ReadonlyMap<string, BumperTarget>;
   activeFeed: BumperTarget | null;
   mutablePages: BumperTarget[];
   settings: BumperSettings;
@@ -73,9 +79,67 @@ interface FeedScanCtx {
   signal: AbortSignal;
   callbacks: { status(text: string, today?: number): void; added(today: number): void };
 }
+async function buildStableFallbackPostId(
+  groupId: string,
+  targetId: string,
+  authorName: string,
+  card: LitePostCard,
+  xml: LiteXmlNode | null,
+  png: Buffer,
+  cardSig: Float32Array | null,
+  ocr: OcrRecognizer,
+): Promise<string> {
+  const normAuthor = (authorName || targetId).replace(/\s+/g, '').toLowerCase(),
+    bodyTop = card.header.bounds.y2,
+    bodyBottom = card.actionBar?.y1 ?? card.cardBounds.y2;
+  let snippet = flattenLiteNodes(xml)
+    .filter(
+      (n) =>
+        n.bounds.y1 >= bodyTop - 4 &&
+        n.bounds.y2 <= bodyBottom + 4 &&
+        (n.text.trim() || n.contentDesc.trim()),
+    )
+    .map((n) => `${n.text} ${n.contentDesc}`)
+    .join('')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+    .slice(0, 160);
+  if (!snippet) {
+    const ocrTop = Math.max(108, Math.min(1440, bodyTop - 8)),
+      ocrBottom = Math.min(bodyBottom, ocrTop + 260);
+    if (ocrBottom - ocrTop >= 36)
+      snippet = (
+        await ocr
+          .recognizeBounds(png, makeCanonicalRect(18, ocrTop, 882, ocrBottom))
+          .catch(() => '')
+      )
+        .replace(/\s+/g, '')
+        .toLowerCase()
+        .slice(0, 160);
+  }
+  if (!snippet) {
+    if (cardSig?.length) {
+      const step = Math.max(1, Math.floor(cardSig.length / 64)),
+        quant: number[] = [];
+      for (let i = 0; i < cardSig.length; i += step)
+        quant.push(Math.round((cardSig[i] ?? 0) * 1000));
+      snippet = quant.join(',');
+    } else snippet = 'empty';
+  }
+  return sha256NumericId(`${groupId}:${targetId}:${normAuthor}:${snippet}`);
+}
+function decodeGroupIdFromPostUrl(postUrl: string): string {
+  const raw = postUrl ? (/\/groups\/([^/?#]+)\//i.exec(postUrl)?.[1]?.trim() ?? '') : '';
+  if (!raw) return '';
+  try {
+    return decodeURIComponent(raw).trim();
+  } catch {
+    return raw;
+  }
+}
 async function processBumperCard(
   sc: FeedScanCtx,
-  scrollIdx: number,
+  _scrollIdx: number,
   cards: LitePostCard[],
   cardIdx: number,
   xml: LiteXmlNode | null,
@@ -88,28 +152,8 @@ async function processBumperCard(
   scrolledDuringCards: boolean;
   png: Buffer;
 }> {
-  const {
-    ctx,
-    ops,
-    inst,
-    instanceId,
-    isPageMode,
-    sourceMode,
-    group,
-    activeFeed,
-    mutablePages,
-    settings,
-    maxPostsPerTarget,
-    expectedFeedUrl,
-    seenFingerprints,
-    seenCardSigs,
-    scannedPerTarget,
-    stats,
-    syncStreamSound,
-    signal,
-    callbacks,
-  } = sc;
-  const { serial, fbWidth: sw, fbHeight: sh, accountId } = inst;
+  const { ctx, ops, inst, accountId, group, activeFeed, settings, stats, callbacks } = sc,
+    { serial, fbWidth: sw, fbHeight: sh } = inst;
   let scrolledDuringCards = false;
   const cont = (newCard = true, action: 'continue' | 'break-cards' | 'return' = 'continue') => ({
     action,
@@ -126,25 +170,25 @@ async function processBumperCard(
       bodyProbeY2 - bodyProbeY1 >= 48
         ? await getRegionSignature(png, makeCanonicalRect(18, bodyProbeY1, 882, bodyProbeY2))
         : null;
-  if (cardSig && seenCardSigs.some((prev) => signatureSimilarity(cardSig, prev) >= 0.988))
+  if (cardSig && sc.seenCardSigs.some((prev) => signatureSimilarity(cardSig, prev) >= 0.988))
     return cont(false);
-  if (cardSig) seenCardSigs.push(cardSig);
+  if (cardSig) sc.seenCardSigs.push(cardSig);
   stats.cardsSeen++;
-  if (!isPageMode && settings.searchMode !== 'random_browse') {
-    let timeText = await ctx.ocr.recognizeBounds(png, card.header.timestampBounds),
-      ageHours = relativePostAge(timeText);
-    if (ageHours === null) {
-      timeText = await ctx.ocr.recognizeBounds(
-        png,
-        makeCanonicalRect(
-          card.header.timestampBounds.x1,
-          Math.max(0, card.header.timestampBounds.y1 - 6),
-          card.header.timestampBounds.x2,
-          Math.min(1600, card.header.timestampBounds.y2 + 6),
+  if (!sc.isPageMode && settings.searchMode !== 'random_browse') {
+    const tb = card.header.timestampBounds;
+    let ageHours = relativePostAge(await ctx.ocr.recognizeBounds(png, tb));
+    if (ageHours === null)
+      ageHours = relativePostAge(
+        await ctx.ocr.recognizeBounds(
+          png,
+          makeCanonicalRect(
+            tb.x1,
+            Math.max(0, tb.y1 - 6),
+            Math.min(820, Math.max(tb.x2 + 120, 560)),
+            Math.min(1600, tb.y2 + 6),
+          ),
         ),
       );
-      ageHours = relativePostAge(timeText);
-    }
     if (ageHours === null || ageHours > settings.maxPostAgeHours) {
       if (ageHours === null) stats.ageNullSkips++;
       else {
@@ -158,24 +202,21 @@ async function processBumperCard(
     consecutiveExpired = 0;
   }
   const match =
-    isPageMode && activeFeed
+    sc.isPageMode && activeFeed
       ? await matchPageTimelinePost(ctx, png, card, activeFeed, inst.accountName)
       : await matchPostTarget(
           ctx,
           png,
           card,
-          activeFeed ? [activeFeed] : mutablePages,
+          activeFeed ? [activeFeed] : sc.mutablePages,
           Boolean(activeFeed),
         );
-  if (!match) {
-    stats.targetMismatchSkips++;
-    return cont();
-  }
+  if (!match) return (stats.targetMismatchSkips++, cont());
   const { target } = match;
-  if ((scannedPerTarget.get(target.id) ?? 0) >= maxPostsPerTarget) return cont();
+  if ((sc.scannedPerTarget.get(target.id) ?? 0) >= sc.maxPostsPerTarget) return cont();
   const needAvatar = !isLocalAvatar(target.avatarUrl),
     needName =
-      isPageMode &&
+      sc.isPageMode &&
       isPlaceholderTargetName(target.name, target.id) &&
       match.authorName.trim().length > 0 &&
       !isPlaceholderTargetName(match.authorName, target.id);
@@ -192,13 +233,10 @@ async function processBumperCard(
       if (needName) target.name = match.authorName.trim();
     }
   }
-  const earlyWantSound = await syncStreamSound(),
-    nextVisibleCard = cards[cardIdx + 1],
+  const earlyWantSound = await sc.syncStreamSound(),
     earlyMaxY = card.actionBar
       ? card.actionBar.y1 + 16
-      : nextVisibleCard
-        ? nextVisibleCard.header.bounds.y1
-        : 1600;
+      : (cards[cardIdx + 1]?.header.bounds.y1 ?? 1600);
   png = (
     await syncVideoSpeakerIfVisible(
       ops,
@@ -211,31 +249,57 @@ async function processBumperCard(
     )
   ).png;
   let postId = '',
-    postUrl = '';
+    postUrl = '',
+    effectiveGroup = group;
   const moreBounds = card.header.moreMenuBounds;
   if (moreBounds) {
     callbacks.status(`正在提取帖子链接 · ${target.name}`);
     try {
-      const rawClipUrl = await ctx.devices.copyLinkFromMoreMenu(serial, moreBounds, sw, sh, signal);
+      const rawClipUrl = await ctx.devices.copyLinkFromMoreMenu(
+        serial,
+        moreBounds,
+        sw,
+        sh,
+        sc.signal,
+      );
       if (rawClipUrl) {
         const resolved = await resolveSharePostUrl(
           rawClipUrl,
-          isPageMode ? target.id : group.id,
-          sourceMode,
+          sc.isPageMode ? target.id : group.id,
+          sc.sourceMode,
         );
         postId = resolved.postId;
         postUrl = resolved.postUrl;
       }
     } catch (linkErr) {
-      const msg = linkErr instanceof Error ? linkErr.message : String(linkErr);
+      const m = linkErr instanceof Error ? linkErr.message : String(linkErr);
       if (
-        signal?.aborted ||
+        sc.signal?.aborted ||
         /TASK_STOPPED|device\s+offline|device\s+'.*'\s+not\s+found|cannot\s+connect\s+to\s+daemon/i.test(
-          msg,
+          m,
         )
       )
         throw linkErr;
     }
+  }
+  const actualGroupId = decodeGroupIdFromPostUrl(postUrl);
+  if (!sc.isPageMode && actualGroupId && actualGroupId !== group.id) {
+    const matchedGroup = sc.targetGroupsById.get(actualGroupId);
+    if (!matchedGroup) {
+      stats.targetMismatchSkips++;
+      devDiag.emit('WARN', 'TASK_RUNNER', 'BLUESTACKS_BUMPER_FOREIGN_GROUP_SKIPPED', {
+        data: {
+          instanceId: sc.instanceId,
+          expectedGroupId: group.id,
+          actualGroupId,
+          postId,
+          postUrl,
+          targetId: target.id,
+        },
+      });
+      return cont();
+    }
+    effectiveGroup = matchedGroup;
   }
   let workingActionBar: LitePostActionBar | null = card.actionBar,
     workingXml: LiteXmlNode | null = xml,
@@ -250,55 +314,40 @@ async function processBumperCard(
       scrolledDuringCards = true;
       const { xml: nextXml, png: nextPng } = await recoverToFeedIfNeeded(
           ops,
-          expectedFeedUrl,
-          (txt) => callbacks.status(txt),
+          sc.expectedFeedUrl,
+          callbacks.status,
         ),
         nextCards = extractPostCards(nextXml),
         nextBars = extractActionBars(nextXml),
         hadBarAboveBefore = prevStepBars.some((b) => b.y1 < currentHeaderY),
-        candidateShifted = nextCards.find(
+        cand = nextCards.find(
           (nc) =>
             nc.header.bounds.y1 <= currentHeaderY - 180 &&
             nc.header.bounds.y1 >= currentHeaderY - 920,
         ),
-        topUnparentedBar = nextBars[0],
-        hasUnparentedBarAboveCandidate = Boolean(
-          candidateShifted &&
-          topUnparentedBar &&
-          topUnparentedBar.y1 >= 115 &&
-          topUnparentedBar.y1 < candidateShifted.header.bounds.y1,
+        topBar = nextBars[0],
+        hasBarAbove = Boolean(
+          cand && topBar && topBar.y1 >= 115 && topBar.y1 < cand.header.bounds.y1,
         );
-      if (
-        candidateShifted &&
-        (hadBarAboveBefore || currentHeaderY >= 960 || !hasUnparentedBarAboveCandidate)
-      ) {
-        currentHeaderY = candidateShifted.header.bounds.y1;
+      if (cand && (hadBarAboveBefore || currentHeaderY >= 960 || !hasBarAbove)) {
+        currentHeaderY = cand.header.bounds.y1;
         prevStepBars = nextBars;
-        workingHeaderBottomY = candidateShifted.header.bounds.y2;
+        workingHeaderBottomY = cand.header.bounds.y2;
         workingHeaderOnScreen = true;
-        if (candidateShifted.actionBar) {
-          workingActionBar = candidateShifted.actionBar;
-          workingXml = nextXml;
-          workingPng = nextPng;
-        }
+        if (cand.actionBar)
+          [workingActionBar, workingXml, workingPng] = [cand.actionBar, nextXml, nextPng];
         continue;
       }
+      prevStepBars = nextBars;
       if (currentHeaderY >= 960) {
         currentHeaderY -= 680;
-        prevStepBars = nextBars;
         continue;
       }
       currentHeaderY = -100;
-      prevStepBars = nextBars;
       workingHeaderBottomY = 106;
       workingHeaderOnScreen = false;
-      if (topUnparentedBar) {
-        const firstNextHeaderY = nextCards[0]?.header.bounds.y1 ?? 1600;
-        if (topUnparentedBar.y1 >= 115 && topUnparentedBar.y1 < firstNextHeaderY) {
-          workingActionBar = topUnparentedBar;
-          workingXml = nextXml;
-          workingPng = nextPng;
-        }
+      if (topBar && topBar.y1 >= 115 && topBar.y1 < (nextCards[0]?.header.bounds.y1 ?? 1600)) {
+        [workingActionBar, workingXml, workingPng] = [topBar, nextXml, nextPng];
       }
     }
   }
@@ -307,21 +356,36 @@ async function processBumperCard(
     return cont();
   }
   if (!postId) {
-    postId = sha256NumericId(`${group.id}:${target.id}:${scrollIdx}:${card.header.bounds.y1}`);
-    postUrl = isPageMode
+    postId = await buildStableFallbackPostId(
+      effectiveGroup.id,
+      target.id,
+      match.authorName,
+      card,
+      xml,
+      png,
+      cardSig,
+      ctx.ocr,
+    );
+    postUrl = sc.isPageMode
       ? `https://www.facebook.com/${encodeURIComponent(target.id)}`
-      : `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(target.id)}/`;
+      : `https://www.facebook.com/groups/${encodeURIComponent(effectiveGroup.id)}/user/${encodeURIComponent(target.id)}/`;
   }
-  if (seenFingerprints.has(postId)) return cont();
-  seenFingerprints.add(postId);
-  const scannedCount = scannedPerTarget.get(target.id) ?? 0;
-  if (scannedCount >= maxPostsPerTarget) return cont();
-  if (isPageMode) scannedPerTarget.set(target.id, scannedCount + 1);
+  if (sc.seenFingerprints.has(postId)) return cont();
+  sc.seenFingerprints.add(postId);
+  const scannedCount = sc.scannedPerTarget.get(target.id) ?? 0;
+  if (scannedCount >= sc.maxPostsPerTarget) return cont();
+  if (sc.isPageMode) sc.scannedPerTarget.set(target.id, scannedCount + 1);
   while (ctx.postClaims.has(postId)) await ops.wait(100);
   ctx.postClaims.add(postId);
   let reservedCommentId: string | null = null;
   try {
-    const q = await ctx.repo.eligibility(accountId, instanceId, postId, Date.now(), sourceMode);
+    const q = await ctx.repo.eligibility(
+      accountId,
+      sc.instanceId,
+      postId,
+      Date.now(),
+      sc.sourceMode,
+    );
     if (q.today >= settings.dailyMaxLikesPerAccount) {
       stats.quotaSkips++;
       callbacks.status(`今日已达上限 (${q.today}/${settings.dailyMaxLikesPerAccount})`, q.today);
@@ -337,7 +401,7 @@ async function processBumperCard(
       doLike = !alreadyLiked && Math.random() * 100 < settings.likeProbability,
       chosenComment =
         Math.random() * 100 < settings.commentProbability
-          ? await ctx.repo.pickComment(postId, Math.random(), [...ctx.commentClaims], sourceMode)
+          ? await ctx.repo.pickComment(postId, Math.random(), [...ctx.commentClaims], sc.sourceMode)
           : null;
     if (chosenComment) {
       reservedCommentId = chosenComment.id;
@@ -349,10 +413,10 @@ async function processBumperCard(
     }
     const record: BumperLog = {
       id: randomUUID(),
-      profileId: instanceId,
+      profileId: sc.instanceId,
       accountId,
-      groupId: isPageMode ? '-' : group.id,
-      groupName: isPageMode ? '专页主页' : group.name,
+      groupId: sc.isPageMode ? '-' : effectiveGroup.id,
+      groupName: sc.isPageMode ? '专页主页' : effectiveGroup.name,
       pageId: target.id,
       pageName: target.name,
       postId,
@@ -360,22 +424,25 @@ async function processBumperCard(
       liked: false,
       commentText: null,
       bumpedAt: Date.now(),
-      sourceMode,
+      sourceMode: sc.sourceMode,
     };
     let credited = false;
     const persistRecord = async (consumedCommentId?: string) => {
       await ctx.repo.recordBump(record, consumedCommentId);
       if (!credited) {
         credited = true;
-        if (!isPageMode)
-          scannedPerTarget.set(target.id, (scannedPerTarget.get(target.id) ?? 0) + 1);
+        if (!sc.isPageMode)
+          sc.scannedPerTarget.set(target.id, (sc.scannedPerTarget.get(target.id) ?? 0) + 1);
         callbacks.added(
-          (await ctx.repo.eligibility(accountId, instanceId, postId, Date.now(), sourceMode)).today,
+          (await ctx.repo.eligibility(accountId, sc.instanceId, postId, Date.now(), sc.sourceMode))
+            .today,
         );
       }
     };
-    const actionTargetLabel = isPageMode ? target.name : `${group.name} · ${target.name}`,
-      liveWantSound = await syncStreamSound(),
+    const actionTargetLabel = sc.isPageMode
+        ? target.name
+        : `${effectiveGroup.name} · ${target.name}`,
+      liveWantSound = await sc.syncStreamSound(),
       syncedVideo = await syncVideoSpeakerIfVisible(
         ops,
         workingXml,
@@ -390,7 +457,7 @@ async function processBumperCard(
       callbacks.status(`正在观看视频 · ${actionTargetLabel}`, q.today);
       await ops.wait(liveWantSound ? 2800 : 1100);
     }
-    const { didLike, didComment } = await executeBarActions(
+    const { didLike, didComment, commentSkippedReason } = await executeBarActions(
       ops,
       workingActionBar,
       settings,
@@ -404,6 +471,14 @@ async function processBumperCard(
           q.today,
         ),
     );
+    if (chosenComment && !didComment)
+      emitBumperCommentSkipped(commentSkippedReason, {
+        instanceId: sc.instanceId,
+        groupId: effectiveGroup.id,
+        pageId: target.id,
+        postId,
+        commentId: chosenComment.id,
+      });
     if (didLike) {
       record.liked = true;
       await persistRecord(undefined);
@@ -438,7 +513,7 @@ export async function runFeedBumperFlow(
   callbacks.status('正在校验模拟器连接与 FB Lite 账号登录状态…');
   const inst = await ctx.devices.ensureReadyAndLoggedIn(instanceId, signal),
     ops = createScreenOps(ctx.devices, ctx.ocr, inst, signal),
-    { accountId } = inst;
+    accountId = resolveEffectiveBsAccountId(inst);
   ops.guard();
   let lastAppliedStreamSound: boolean | null = null;
   const syncStreamSound = async (): Promise<boolean> => {
@@ -460,20 +535,18 @@ export async function runFeedBumperFlow(
   await syncStreamSound();
   ops.guard();
   const mutablePages = pages.map((p) => ({ ...p })),
-    outerGroups: readonly BumperTarget[] = isPageMode
-      ? [
-          {
-            id: '-',
-            name: '专页主页',
-            avatarUrl: null,
-            folderId: null,
-            sortOrder: 0,
-            totalBumpedCount: 0,
-            createdAt: 0,
-            updatedAt: 0,
-          },
-        ]
-      : groups;
+    targetGroupsById = new Map(groups.map((g) => [g.id, g])),
+    pageRoot: BumperTarget = {
+      id: '-',
+      name: '专页主页',
+      avatarUrl: null,
+      folderId: null,
+      sortOrder: 0,
+      totalBumpedCount: 0,
+      createdAt: 0,
+      updatedAt: 0,
+    },
+    outerGroups: readonly BumperTarget[] = isPageMode ? [pageRoot] : groups;
   const checkDailyQuota = async (): Promise<number | null> => {
     const q = await ctx.repo.eligibility(accountId, instanceId, '', Date.now(), sourceMode);
     if (q.today < settings.dailyMaxLikesPerAccount) return q.today;
@@ -514,12 +587,23 @@ export async function runFeedBumperFlow(
       let activeFeed = feed;
       try {
         if (isPageMode && activeFeed)
-          activeFeed = await enterAndVerifyPage(ctx, ops, inst, activeFeed, signal, (txt) =>
-            callbacks.status(txt),
+          activeFeed = await enterAndVerifyPage(
+            ctx,
+            ops,
+            inst,
+            activeFeed,
+            signal,
+            callbacks.status,
           );
         else if (activeFeed)
-          activeFeed = await openPageGroupFeed(ctx, ops, inst, group, activeFeed, signal, (txt) =>
-            callbacks.status(txt),
+          activeFeed = await openPageGroupFeed(
+            ctx,
+            ops,
+            inst,
+            group,
+            activeFeed,
+            signal,
+            callbacks.status,
           );
         else if (extractPostCards(await ops.xml()).length === 0)
           await ops.swipe(115, 1180, 115, 580, 520, 1300);
@@ -534,10 +618,25 @@ export async function runFeedBumperFlow(
           : activeFeed
             ? `https://www.facebook.com/groups/${encodeURIComponent(group.id)}/user/${encodeURIComponent(activeFeed.id)}/`
             : buildGroupUrl(group.id, settings.searchMode);
-      const seenFingerprints = new Set<string>(),
-        seenCardSigs: Float32Array[] = [],
-        scannedPerTarget = new Map<string, number>(),
-        feedStats = {
+      const scanCtx: FeedScanCtx = {
+        ctx,
+        ops,
+        inst,
+        accountId,
+        instanceId,
+        isPageMode,
+        sourceMode,
+        group,
+        targetGroupsById,
+        activeFeed,
+        mutablePages,
+        settings,
+        maxPostsPerTarget,
+        expectedFeedUrl,
+        seenFingerprints: new Set<string>(),
+        seenCardSigs: [],
+        scannedPerTarget: new Map<string, number>(),
+        stats: {
           cardsSeen: 0,
           ageNullSkips: 0,
           ageExpiredSkips: 0,
@@ -546,7 +645,12 @@ export async function runFeedBumperFlow(
           quotaSkips: 0,
           missingActionBarSkips: 0,
           bumped: 0,
-        };
+        },
+        syncStreamSound,
+        signal,
+        callbacks,
+      };
+      const { seenCardSigs, scannedPerTarget, stats: feedStats } = scanCtx;
       let emptyScrolls = 0,
         consecutiveExpired = 0,
         prevScrollDidAlign = false;
@@ -583,27 +687,6 @@ export async function runFeedBumperFlow(
         let newCardsInScroll = 0,
           scrolledDuringCards = false;
         await syncStreamSound();
-        const scanCtx: FeedScanCtx = {
-          ctx,
-          ops,
-          inst,
-          instanceId,
-          isPageMode,
-          sourceMode,
-          group,
-          activeFeed,
-          mutablePages,
-          settings,
-          maxPostsPerTarget,
-          expectedFeedUrl,
-          seenFingerprints,
-          seenCardSigs,
-          scannedPerTarget,
-          stats: feedStats,
-          syncStreamSound,
-          signal,
-          callbacks,
-        };
         for (let cardIdx = 0; cardIdx < cards.length && !scrolledDuringCards; cardIdx++) {
           ops.guard();
           const res = await processBumperCard(
@@ -668,10 +751,7 @@ export async function runFeedBumperFlow(
         );
       }
       if (feedStats.bumped === 0) {
-        devDiag.record({
-          level: 'WARN',
-          category: 'TASK_RUNNER',
-          event: 'BLUESTACKS_BUMPER_FEED_ZERO_BUMPS',
+        devDiag.emit('WARN', 'TASK_RUNNER', 'BLUESTACKS_BUMPER_FEED_ZERO_BUMPS', {
           data: {
             instanceId,
             mode,

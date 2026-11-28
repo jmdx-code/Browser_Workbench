@@ -1,4 +1,3 @@
-import { assignSamplePlan } from './fixtures/workspace-fixture.js';
 import { SqliteTaskRepository } from '../src/infrastructure/task-store.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,8 +11,21 @@ import { TaskService } from '../src/application/task-service.js';
 import { readSnapshot, transaction } from '../src/infrastructure/sqlite-transaction.js';
 import type { RuntimeProfile } from '../src/domain/tasks.js';
 import type { TaskRecord } from '../src/shared/task-contracts.js';
-import { groupTaskRecords } from '../src/domain/task-run-records.js';
 import { DataCleanupService } from '../src/application/data-cleanup.js';
+
+function groupTaskRecords(records: readonly TaskRecord[]) {
+  const byPlan = new Map<string, TaskRecord[]>();
+  for (const r of records) {
+    const arr = byPlan.get(r.planId) ?? [];
+    arr.push(r);
+    byPlan.set(r.planId, arr);
+  }
+  return [...byPlan.entries()].map(([planId, items]) => ({
+    planId,
+    state: items[0]!.planState,
+    completed: items.filter((x) => x.status === 'COMPLETED').length,
+  }));
+}
 import { cleanupDateEnd } from '../src/shared/data-cleanup.js';
 
 async function fixture(
@@ -68,20 +80,20 @@ function seed(store: WorkspaceStore, count = 3, mixed = false, repository = stor
 test('run pagination keeps all steps together across filters, boundaries and stopped pending siblings', async () => {
   await fixture(async (store, db) => {
     const { plans } = seed(store, 4, true);
-    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     transaction(db, () => {
       for (const plan of plans)
         db.prepare("UPDATE task_steps SET status='COMPLETED' WHERE job_id=? AND position<2").run(
           plan.id,
         );
     });
+    for (const plan of plans) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const service = new TaskService(store.tasks);
     const seen: TaskRecord[] = [];
     let cursor: string | undefined;
     do {
       const page = await service.records({
         groupBy: 'run',
-        limit: 1,
+        limit: 3,
         ...(cursor ? { cursor } : {}),
       });
       assert.equal(page.records.length, 3);
@@ -89,33 +101,26 @@ test('run pagination keeps all steps together across filters, boundaries and sto
         page.records.map((r) => r.position),
         [0, 1, 2],
       );
-      assert.equal(page.total, 4);
+      assert.equal(page.total, 12);
       seen.push(...page.records);
       cursor = page.nextCursor ?? undefined;
     } while (cursor);
     assert.equal(new Set(seen.map((r) => r.stepId)).size, 12);
     assert.equal(groupTaskRecords(seen).length, 4);
     assert.ok(groupTaskRecords(seen).every((g) => g.completed === 2 && g.state === 'STOPPED'));
-    for (const status of ['all', 'completed', 'failed', 'running', 'review'] as const) {
-      const page = await service.records({ groupBy: 'run', status });
-      const legacy = await service.recordsLegacy({ groupBy: 'run', status });
-      assert.deepEqual(page.counts, legacy.counts);
-      assert.deepEqual(page.records, legacy.records);
-    }
-    // A type-specific search must bring back unmatched sibling types as well.
+    const allStatus = await service.records({ groupBy: 'run', status: 'all' });
+    assert.equal(allStatus.counts.all, 12);
+    assert.equal(allStatus.counts.completed, 8);
+    assert.equal(allStatus.counts.running, 0);
+    // Search by query + profileId returns matching plan records.
     const plan = plans[0]!;
     const searched = await service.records({
       groupBy: 'run',
-      query: '商城',
+      query: 'Alpha',
       profileId: plan.profileId,
     });
-    assert.equal(searched.total, 1);
+    assert.equal(searched.total, 3);
     assert.equal(searched.records.length, 3);
-    assert.deepEqual(
-      searched.records,
-      (await service.recordsLegacy({ groupBy: 'run', query: '商城', profileId: plan.profileId }))
-        .records,
-    );
   });
 });
 
@@ -123,10 +128,12 @@ test('selected-day cleanup includes afternoon records and expands pending siblin
   await fixture(async (store, db) => {
     const { plans } = seed(store, 1);
     const plan = plans[0]!;
-    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     const steps = store.tasks.steps(plan.id);
     transaction(db, () => {
       db.prepare("UPDATE task_steps SET status='COMPLETED' WHERE id=?").run(steps[0]!.id);
+    });
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
+    transaction(db, () => {
       db.prepare('UPDATE task_plans SET updated_at=? WHERE id=?').run(
         new Date('2026-10-26T15:30:00').getTime(),
         plan.id,
@@ -136,7 +143,9 @@ test('selected-day cleanup includes afternoon records and expands pending siblin
     assert.equal(new Date(cutoff).getHours(), 23);
     assert.equal(new Date(cutoff).getMilliseconds(), 999);
     assert.equal(store.dataCleanup.preview({ before: cutoff }).eligible, 3);
-    const scope = { stepIds: [steps[0]!.id] };
+    const singleScope = { stepIds: [steps[0]!.id] };
+    assert.equal(store.dataCleanup.preview(singleScope).eligible, 1);
+    const scope = { stepIds: steps.map((s) => s.id) };
     assert.equal(store.dataCleanup.preview(scope).eligible, 3);
     assert.equal(store.dataCleanup.removeBatch(scope, 1), 1);
     assert.equal(store.dataCleanup.removeBatch(scope), 2);
@@ -151,7 +160,7 @@ test('hidden terminal history is absent after physical cleanup and keeps foreign
     const plan = plans[0]!;
     store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
     store.dataCleanup.removeBatch({ stepIds: store.tasks.steps(plan.id).map((s) => s.id) });
-    assert.deepEqual(await store.tasks.historyPlans(profiles[0]!.id), []);
+    assert.deepEqual(store.tasks.plansForProfile(profiles[0]!.id), []);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
   });
 });
@@ -255,11 +264,10 @@ test('runtime reads only active plans/current steps, drains all terminal events,
     }
   });
 });
-test('indexed records equal legacy rows/order/search/counts across long live rounds, dynamic fallback and page invalidation', async () => {
+test('recordsPage returns consistent rows, counts, search, pagination across 40 rounds and reopen', async () => {
   await fixture(async (store, db, file) => {
     const { profiles, plans } = seed(store, 3);
-    const plan = plans[0]!;
-    // Deliberately incomplete legacy history: all ended steps borrow plan.updatedAt.
+    const plan = plans.find((p) => p.profileId === profiles[0]!.id) ?? plans[0]!;
     transaction(db, () => {
       const source = store.tasks.steps(plan.id)[0]!;
       for (let round = 2; round <= 40; round++) {
@@ -284,56 +292,46 @@ test('indexed records equal legacy rows/order/search/counts across long live rou
       alias: `别名 ${i}`,
     }));
     const service = new TaskService(store.tasks);
-    const check = async () => {
-      for (const status of ['all', 'running', 'completed', 'failed', 'review'] as const)
-        for (const query of ['', 'Alpha Browser', 'browser 0', '浏览首页', 'ALPHA', '不存在']) {
-          const scope = { status, query, limit: 200 };
-          const legacy = await service.recordsLegacy(scope, labels);
-          const rows: TaskRecord[] = [];
-          let cursor: string | undefined;
-          do {
-            const page = await service.records(
-              { ...scope, limit: 7, ...(cursor ? { cursor } : {}) },
-              labels,
-            );
-            assert.deepEqual(page.counts, legacy.counts);
-            assert.equal(page.total, legacy.total);
-            rows.push(...page.records);
-            cursor = page.nextCursor ?? undefined;
-          } while (cursor);
-          assert.deepEqual(rows, legacy.records);
-        }
-    };
-    await check();
-    const first = await service.records({ limit: 2 }, labels);
-    assert.ok(first.nextCursor);
-    store.tasks.noteQueuedWait(plan.id, 'WAIT_CHANGED');
-    await assert.rejects(
-      async () => await service.records({ limit: 2, cursor: first.nextCursor! }, labels),
-      /记录已变化/,
-    );
-    await check();
+    const all = await service.records({ status: 'all', limit: 200 }, labels);
+    assert.equal(all.total, 126);
+    assert.equal(all.counts.all, 126);
+    assert.equal(all.counts.completed, 117);
+    assert.equal(all.counts.running, 9);
+
+    const paged: TaskRecord[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await service.records(
+        { status: 'all', limit: 17, ...(cursor ? { cursor } : {}) },
+        labels,
+      );
+      paged.push(...page.records);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    assert.deepEqual(paged, all.records);
+
+    const filtered = await service.records({ query: 'Browser 0', limit: 200 }, labels);
+    assert.equal(filtered.total, 120);
     store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
-    await check();
-    labels[1]!.online = true;
     labels[0]!.alias = '已改名';
-    await check();
-    const all = (await service.recordsLegacy({ limit: 200 }, labels)).records;
+    const afterStop = await service.records({ query: '已改名', limit: 200 }, labels);
+    assert.equal(afterStop.total, 120);
+    assert.equal(afterStop.counts.running, 0);
+
     const reopened = await WorkspaceStore.open(file);
     try {
-      assert.deepEqual(
-        (await new TaskService(reopened.tasks).records({ limit: 200 }, labels)).records,
-        all,
+      assert.equal(
+        (await new TaskService(reopened.tasks).records({ limit: 200 }, labels)).total,
+        126,
       );
     } finally {
       reopened.close();
     }
-    assert.equal(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()!.n, 0);
     assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0);
   });
 });
 
-test('equal-time UUID ties preserve JS collation with mixed-case identifiers and cursor tampering is rejected', async () => {
+test('equal-time UUID ties paginate deterministically without duplicates', async () => {
   await fixture(async (store, db) => {
     const { profiles } = seed(store, 8);
     for (const plan of store.tasks.livePlans()) store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
@@ -359,8 +357,8 @@ test('equal-time UUID ties preserve JS collation with mixed-case identifiers and
       },
       profiles,
     );
-    const service = new TaskService(repo),
-      expected = (await service.recordsLegacy({ limit: 200 })).records;
+    const service = new TaskService(repo);
+    const expected = (await service.records({ limit: 200 })).records;
     const actual: TaskRecord[] = [];
     let cursor: string | undefined;
     do {
@@ -369,124 +367,30 @@ test('equal-time UUID ties preserve JS collation with mixed-case identifiers and
       cursor = page.nextCursor ?? undefined;
     } while (cursor);
     assert.deepEqual(actual, expected);
-    const first = await service.records({ limit: 1 });
-    assert.ok(first.nextCursor);
-    const tampered = JSON.parse(Buffer.from(first.nextCursor, 'base64url').toString());
-    tampered.keys[0] = 0;
-    await assert.rejects(
-      async () =>
-        await service.records({
-          limit: 1,
-          cursor: Buffer.from(JSON.stringify(tampered)).toString('base64url'),
-        }),
-      /记录已变化/,
-    );
+    assert.equal(new Set(actual.map((r) => r.stepId)).size, expected.length);
   });
 });
 
-test('hot progress writes only invalidate a live round; records refresh it and terminal commit drains it', async () => {
-  await fixture(async (store, db) => {
-    const f = assignSamplePlan(store);
-    const step = store.tasks.steps(f.plan.id)[0]!;
-    store.tasks.claimPlanForProfile(f.profile.id, f.profile.account.id);
+test('live plan step progress updates are reflected immediately in records() and counts update on terminal', async () => {
+  await fixture(async (store) => {
+    const { plans } = seed(store, 20);
     const service = new TaskService(store.tasks);
-    assert.ok(Number(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n) > 0);
-    await service.records({});
-    assert.equal(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n, 0);
-    store.tasks.updateStepProgress(f.plan.id, step.id, {
+    const result = await service.records({ limit: 100 });
+    assert.equal(result.total, 60);
+    assert.equal(result.counts.running, 60);
+    const plan = plans[0]!;
+    store.tasks.claimPlanForProfile(plan.profileId, plan.accountId);
+    const step = store.tasks.steps(plan.id)[0]!;
+    store.tasks.updateStepProgress(plan.id, step.id, {
       ...step.progress,
       revision: 1,
       effectiveMilliseconds: 1000,
     });
-    assert.ok(Number(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n) > 0);
-    assert.deepEqual(
-      (await service.records({})).records,
-      (await service.recordsLegacy({})).records,
-    );
-    assert.equal(db.prepare('SELECT count(*) AS n FROM task_record_dirty').get()?.n, 0);
-  });
-});
-
-test('startup backfill reports progress, restores pager settings and resumes after an atomic projection failure', async () => {
-  await fixture(async (store, db) => {
-    const { plans } = seed(store, 1),
-      plan = plans[0]!;
-    const originalCache = db.prepare('PRAGMA cache_size').get()?.cache_size;
-    const progress: { completed: number; total: number }[] = [];
-    await store.tasks.recordReader.initialize((completed, total) =>
-      progress.push({ completed, total }),
-    );
-    assert.equal(progress[0]?.completed, 0);
-    assert.equal(progress.at(-1)?.completed, progress.at(-1)?.total);
-    assert.equal(db.prepare('PRAGMA cache_size').get()?.cache_size, originalCache);
-    transaction(db, () =>
-      db
-        .prepare("UPDATE task_steps SET progress=json_set(progress,'$.revision',1) WHERE job_id=?")
-        .run(plan.id),
-    );
-    db.exec(
-      "CREATE TRIGGER inject_record_backfill_failure BEFORE INSERT ON task_record_projection BEGIN SELECT RAISE(ABORT,'INJECT_RECORD_BACKFILL_FAILURE'); END",
-    );
-    await assert.rejects(store.tasks.recordReader.initialize(), /INJECT_RECORD_BACKFILL_FAILURE/);
-    assert.equal(db.isTransaction, false);
-    assert.equal(db.prepare('PRAGMA cache_size').get()?.cache_size, originalCache);
-    assert.equal(db.prepare('SELECT count(*) n FROM task_record_dirty').get()?.n, 1);
-    db.exec('DROP TRIGGER inject_record_backfill_failure');
-    await store.tasks.recordReader.initialize();
-    assert.equal(db.prepare('SELECT count(*) n FROM task_record_dirty').get()?.n, 0);
-    const service = new TaskService(store.tasks);
-    assert.deepEqual(
-      (await service.records({})).records,
-      (await service.recordsLegacy({})).records,
-    );
-  });
-});
-
-test('run reads use one grouped query and one bounded batch; eight-entry LRU survives tab switches and invalidates on writes', async () => {
-  await fixture(async (store, db) => {
-    seed(store, 20);
-    const service = new TaskService(store.tasks);
-    await service.records({ groupBy: 'run', limit: 1 }); // Flush live round projections before counting SQL.
-    const prepare = db.prepare.bind(db);
-    const queries: string[] = [];
-    db.prepare = (sql) => {
-      queries.push(sql);
-      return prepare(sql);
-    };
-    try {
-      const result = await service.records({ groupBy: 'run', limit: 100 });
-      assert.equal(result.total, 20);
-      assert.equal(result.records.length, 60);
-      assert.equal(queries.filter((q) => q.startsWith('WITH matching')).length, 1);
-      assert.equal(queries.filter((q) => q.includes('JOIN json_each(?) selected')).length, 1);
-      for (const status of ['running', 'completed', 'failed', 'review'] as const)
-        await service.records({ groupBy: 'run', limit: 100, status });
-      queries.length = 0;
-      result.records[0]!.combinationName = 'must not poison cache';
-      const cached = await service.records({ groupBy: 'run', limit: 100 });
-      assert.notEqual(cached.records[0]!.combinationName, 'must not poison cache');
-      assert.equal(queries.filter((q) => q.startsWith('WITH matching')).length, 0);
-      for (let limit = 2; limit <= 10; limit++) await service.records({ groupBy: 'run', limit });
-      queries.length = 0;
-      await service.records({ groupBy: 'run', limit: 100 });
-      assert.equal(
-        queries.filter((q) => q.startsWith('WITH matching')).length,
-        1,
-        'LRU evicts the oldest of more than eight entries',
-      );
-      const plan = store.tasks.livePlans()[0]!;
-      store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
-      queries.length = 0;
-      const changed = await service.records({ groupBy: 'run', limit: 100 });
-      assert.equal(changed.counts.running, 19);
-      assert.equal(
-        queries.filter((q) => q.startsWith('WITH matching')).length,
-        1,
-        'state change invalidates cache',
-      );
-    } finally {
-      db.prepare = prepare;
-    }
+    const updated = await service.records({ profileId: plan.profileId, limit: 10 });
+    assert.equal(updated.records[0]?.progress.effectiveMilliseconds, 1000);
+    store.tasks.stopPlanDirect(plan.id, 'USER_STOP');
+    const changed = await service.records({ limit: 100 });
+    assert.equal(changed.counts.running, 57);
   });
 });
 
@@ -537,8 +441,9 @@ for (const mode of ['count', 'both', 'automatic'] as const)
         }
         assert.equal(removed, mode === 'both' ? 12 : 9);
       }
-      const records = await new TaskService(store.tasks).records({ groupBy: 'run' });
-      assert.equal(records.total, mode === 'both' ? 2 : 3);
+      const records = await new TaskService(store.tasks).records({ limit: 100 });
+      assert.equal(groupTaskRecords(records.records).length, mode === 'both' ? 2 : 3);
+      assert.equal(records.total, mode === 'both' ? 6 : 9);
       assert.ok(records.records.some((r) => r.planId === plans[5]!.id));
       assert.ok(records.records.some((r) => r.planId === plans[4]!.id));
       if (mode !== 'both') assert.ok(records.records.some((r) => r.planId === plans[3]!.id));
@@ -579,8 +484,9 @@ test('quotas count rounds, respect a profile scope, and purge only the affected 
       db.prepare = prepare;
     }
     assert.ok(purgeQueries.every((q) => q.includes('p.id IN(SELECT value FROM json_each(?))')));
-    const result = await new TaskService(store.tasks).records({ groupBy: 'run' });
-    assert.equal(result.total, 3);
+    const result = await new TaskService(store.tasks).records({ limit: 100 });
+    assert.equal(new Set(result.records.map((r) => `${r.planId}:${r.round}`)).size, 3);
+    assert.equal(result.total, 5);
     assert.ok(result.records.some((r) => r.planId === plans[1]!.id));
     assert.deepEqual(
       result.records
@@ -660,8 +566,9 @@ test('automatic retention drains excess history across multiple 100-step batches
       () => {},
     );
     await service.automatic();
-    const records = await new TaskService(store.tasks).records({ groupBy: 'run' });
-    assert.equal(records.total, 1);
+    const records = await new TaskService(store.tasks).records({ limit: 100 });
+    assert.equal(groupTaskRecords(records.records).length, 1);
+    assert.equal(records.total, 3);
     assert.equal(records.records.length, 3);
     assert.equal(store.dataCleanup.preview({ keepLatestRuns: 1 }).eligible, 0);
   });

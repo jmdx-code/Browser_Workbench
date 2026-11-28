@@ -57,7 +57,6 @@ test('single-task testing keeps exact browser selection and original batch ident
     assert.equal(result.plans[0]?.profileId, firstProfile.id);
     assert.equal(result.rejected[0]?.profileId, secondProfile.id);
     assert.equal(result.plans[0]?.snapshot.steps[0]?.type, 'feed');
-    assert.equal((await store.tasks.operations(result.plans[0]!.id)).length, 0);
     secondProfile.online = true;
     secondProfile.synced = true;
     const retried = await tests.start(request);

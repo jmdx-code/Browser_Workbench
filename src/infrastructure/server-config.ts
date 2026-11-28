@@ -29,11 +29,7 @@ export async function loadServerConfig(root: string) {
     })
     .strict()
     .parse(await read('config/execution-acceptance.json'));
-  return {
-    softwareVersion,
-    identity,
-    executionAcceptance,
-  };
+  return { softwareVersion, identity, executionAcceptance };
 }
 export type ExecutionAcceptance = Awaited<
   ReturnType<typeof loadServerConfig>

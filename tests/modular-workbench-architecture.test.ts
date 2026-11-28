@@ -6,14 +6,14 @@ import type { GroupBumperService } from '../src/application/group-bumper-service
 import type { GroupInviterService } from '../src/application/group-inviter-service.js';
 import type { WorkspaceService } from '../src/application/workspace-service.js';
 import { workspaceApi } from '../src/http/workspace-api.js';
+import { ProductError } from '../src/domain/workspace.js';
 import {
   projectProfileActivity,
   projectProfileActivitiesMap,
   projectSelectionControls,
 } from '../src/renderer/modules/profile-activity-projector.js';
-import { buildUnifiedActivityFeed } from '../src/renderer/modules/unified-activity-records.js';
 import type { Profile } from '../src/shared/contracts.js';
-import type { TaskRecord, TaskRuntimeOverview } from '../src/shared/task-contracts.js';
+import type { TaskRuntimeOverview } from '../src/shared/task-contracts.js';
 import type { z } from 'zod';
 
 function makeProfile(id: string, name: string): Profile {
@@ -130,185 +130,6 @@ test('profile-activity-projector prioritizes active module stats, background run
   assert.equal(controls.isProfileBusy(p3.id), false);
 });
 
-test('unified-activity-records aggregates 3 modules and filters by profileId, moduleFilter, statusFilter, and query', () => {
-  const p1 = makeProfile('10000000-0000-4000-8000-000000000001', 'Alpha 浏览器');
-  const p2 = makeProfile('10000000-0000-4000-8000-000000000002', 'Beta 浏览器');
-
-  const taskRecord: TaskRecord = {
-    stepId: '30000000-0000-4000-8000-000000000001',
-    planId: '20000000-0000-4000-8000-000000000001',
-    profileId: p1.id,
-    combinationId: '40000000-0000-4000-8000-000000000001',
-    combinationName: '早间日常养号',
-    combinationVersion: 1,
-    round: 1,
-    position: 0,
-    type: 'video',
-    status: 'COMPLETED',
-    planState: 'COMPLETED',
-    planReason: '',
-    progress: {
-      revision: 1,
-      effectiveMilliseconds: 180000,
-      likes: 2,
-      published: 0,
-      cursor: null,
-    },
-    budget: { kind: 'time', milliseconds: 180000 },
-    outcome: undefined,
-    startedAt: 1700000100000,
-    finishedAt: 1700000280000,
-    planCreatedAt: 1700000090000,
-    planUpdatedAt: 1700000280000,
-  };
-
-  const feedAll = buildUnifiedActivityFeed({
-    profiles: [p1, p2],
-    taskRecords: [taskRecord],
-    inviterState: {
-      groups: [
-        {
-          groupId: 'g100',
-          groupName: '跨境卖家交流群',
-          avatarUrl: null,
-          folderId: null,
-          sortOrder: 0,
-          totalInvitedCount: 5,
-          createdAt: 1,
-          updatedAt: 1,
-        },
-      ],
-      invitesPerGroup: 20,
-      running: true,
-      runId: 'run-1',
-      startedAt: 1700000500000,
-      finishedAt: null,
-      statusText: '运行中',
-      profileCounts: {
-        [p2.id]: { sessionInvited: 3, totalInvited: 10, status: '正在邀请好友…' },
-      },
-    },
-    inviterLogs: [
-      {
-        id: '50000000-0000-4000-8000-000000000001',
-        profileId: p1.id,
-        accountId: 'fb_p1',
-        friendId: 'friend_99',
-        friendName: 'Alice Wang',
-        groupId: 'g100',
-        invitedAt: 1700000300000,
-      },
-    ],
-    bumperState: {
-      groups: [],
-      pages: [],
-      settings: {
-        searchMode: 'time_sort',
-        maxPostAgeHours: 24,
-        maxPostsPerGroupPage: 5,
-        maxPostsPerPage: 3,
-        maxConcurrentProfiles: 4,
-        dailyMaxLikesPerAccount: 20,
-        maxLikesPerPost: 10,
-        likeProbability: 100,
-        commentProbability: 30,
-        consumeCommentOnUse: false,
-      },
-      comments: [],
-      total: 1,
-      running: false,
-      statusText: '空闲',
-      profileCounts: {
-        [p2.id]: { today: 0, session: 0, status: '风控受限：触发 368 拦截', running: false },
-      },
-    },
-    bumperLogs: [
-      {
-        id: 'bump-1',
-        profileId: p1.id,
-        accountId: 'fb_p1',
-        groupId: 'g200',
-        groupName: '好物推荐组',
-        pageId: 'page_1',
-        pageName: '官方专页',
-        postId: 'post_888',
-        postUrl: 'https://www.facebook.com/groups/g200/posts/post_888/',
-        liked: true,
-        commentText: '写得太好了！',
-        bumpedAt: 1700000400000,
-      },
-    ],
-    now: 1700000600000,
-  });
-
-  assert.equal(feedAll.items.length, 5);
-  assert.equal(feedAll.moduleCounts.all, 5);
-  assert.equal(feedAll.moduleCounts['active-accounts'], 1);
-  assert.equal(feedAll.moduleCounts['group-inviter'], 2);
-  assert.equal(feedAll.moduleCounts['group-bumper'], 2);
-  assert.equal(feedAll.items[0]?.status, 'running');
-  assert.equal(feedAll.items[0]?.moduleId, 'group-inviter');
-
-  const feedP1 = buildUnifiedActivityFeed({
-    profiles: [p1, p2],
-    taskRecords: [taskRecord],
-    inviterLogs: [
-      {
-        id: '50000000-0000-4000-8000-000000000001',
-        profileId: p1.id,
-        accountId: 'fb_p1',
-        friendId: 'friend_99',
-        friendName: 'Alice Wang',
-        groupId: 'g100',
-        invitedAt: 1700000300000,
-      },
-    ],
-    bumperLogs: [
-      {
-        id: 'bump-1',
-        profileId: p1.id,
-        accountId: 'fb_p1',
-        groupId: 'g200',
-        groupName: '好物推荐组',
-        pageId: 'page_1',
-        pageName: '官方专页',
-        postId: 'post_888',
-        postUrl: 'https://www.facebook.com/groups/g200/posts/post_888/',
-        liked: true,
-        commentText: '写得太好了！',
-        bumpedAt: 1700000400000,
-      },
-    ],
-    profileId: p1.id,
-  });
-  assert.equal(feedP1.items.length, 3);
-  assert.ok(feedP1.items.every((item) => item.profileId === p1.id));
-
-  const feedSearch = buildUnifiedActivityFeed({
-    profiles: [p1, p2],
-    taskRecords: [taskRecord],
-    bumperLogs: [
-      {
-        id: 'bump-1',
-        profileId: p1.id,
-        accountId: 'fb_p1',
-        groupId: 'g200',
-        groupName: '好物推荐组',
-        pageId: 'page_1',
-        pageName: '官方专页',
-        postId: 'post_888',
-        postUrl: 'https://www.facebook.com/groups/g200/posts/post_888/',
-        liked: true,
-        commentText: '写得太好了！',
-        bumpedAt: 1700000400000,
-      },
-    ],
-    query: '写得太好了',
-  });
-  assert.equal(feedSearch.items.length, 1);
-  assert.equal(feedSearch.items[0]?.moduleId, 'group-bumper');
-});
-
 test('projectSelectionControls isProfileBusy recognizes active-accounts, group-inviter, and group-bumper simultaneously', () => {
   const pActive = makeProfile('10000000-0000-4000-8000-000000000011', '活跃账号运行中');
   const pInviter = makeProfile('10000000-0000-4000-8000-000000000012', '邀请人运行中');
@@ -401,32 +222,54 @@ test('split workspaceApi routes respond for group-inviter, group-bumper, diagnos
     repository: {},
   } as unknown as WorkspaceService;
 
+  const manageCalls: Array<{ action: string; input: unknown }> = [];
+  const bumperStopCalls: Array<{ profileIds?: string[]; mode?: string }> = [];
+  const makeBumperState = () => ({
+    groups: [],
+    pages: [],
+    settings: {
+      searchMode: 'time_sort',
+      maxPostAgeHours: 24,
+      maxPostsPerGroupPage: 5,
+      maxPostsPerPage: 3,
+      maxConcurrentProfiles: 4,
+      dailyMaxLikesPerAccount: 20,
+      maxLikesPerPost: 10,
+      likeProbability: 100,
+      commentProbability: 30,
+      consumeCommentOnUse: false,
+    },
+    comments: [],
+    total: 0,
+    running: true,
+    statusText: '运行中',
+    profileCounts: {
+      [p1.id]: { today: 1, session: 1, status: '正在顶贴', running: true },
+    },
+  });
+  const allowedManage = new Set([
+    'comments',
+    'page-comments',
+    'settings',
+    'page-settings',
+    'groups/add',
+    'pages/add',
+  ]);
   const fakeBumper = {
-    state: async () => ({
-      groups: [],
-      pages: [],
-      settings: {
-        searchMode: 'time_sort',
-        maxPostAgeHours: 24,
-        maxPostsPerGroupPage: 5,
-        maxPostsPerPage: 3,
-        maxConcurrentProfiles: 4,
-        dailyMaxLikesPerAccount: 20,
-        maxLikesPerPost: 10,
-        likeProbability: 100,
-        commentProbability: 30,
-        consumeCommentOnUse: false,
-      },
-      comments: [],
-      total: 0,
-      running: true,
-      statusText: '运行中',
-      profileCounts: {
-        [p1.id]: { today: 1, session: 1, status: '正在顶贴', running: true },
-      },
-    }),
+    state: async () => makeBumperState(),
     logs: async () => [],
     isProfileRunning: (id: string) => id === p1.id,
+    stop: async (profileIds?: string[], mode?: string) => {
+      bumperStopCalls.push({ profileIds, mode });
+      return makeBumperState();
+    },
+    manage: async (action: string, input: unknown) => {
+      manageCalls.push({ action, input });
+      if (!allowedManage.has(action)) {
+        throw new ProductError('BUMPER_ACTION_UNKNOWN', '未知的小组顶贴操作', 404);
+      }
+      return makeBumperState();
+    },
   } as unknown as GroupBumperService;
 
   const fakeInviter = {
@@ -527,6 +370,45 @@ test('split workspaceApi routes respond for group-inviter, group-bumper, diagnos
     const revealBody = (await revealRes.json()) as { revealed: boolean; fileName: string };
     assert.equal(revealBody.revealed, true);
     assert.equal(revealedFile, 'workbench-feedback.zip');
+
+    for (const [sub, payload] of [
+      ['comments', { texts: ['hello'], consumeCommentOnUse: true }],
+      ['page-comments', { texts: ['page hello'], consumeCommentOnUse: false }],
+      ['settings', { likeProbability: 80 }],
+      ['page-settings', { likeProbability: 90 }],
+      ['groups/add', { items: [{ id: '123456', name: 'Test Group' }] }],
+      ['pages/add', { items: [{ id: '654321', name: 'Test Page' }] }],
+    ] as const) {
+      const manageRes = await fetch(`${baseUrl}/api/workspace/group-bumper/${sub}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(manageRes.status, 200);
+    }
+    assert.deepEqual(
+      manageCalls.map((c) => c.action),
+      ['comments', 'page-comments', 'settings', 'page-settings', 'groups/add', 'pages/add'],
+    );
+
+    const stopRes = await fetch(`${baseUrl}/api/workspace/group-bumper/stop`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(stopRes.status, 200);
+    assert.equal(bumperStopCalls.length, 1);
+    assert.deepEqual(bumperStopCalls[0], { profileIds: undefined, mode: 'group-bumper' });
+    assert.equal(manageCalls.length, 6);
+
+    const unknownRes = await fetch(`${baseUrl}/api/workspace/group-bumper/nonexistent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(unknownRes.status, 404);
+    const unknownBody = (await unknownRes.json()) as { code: string };
+    assert.equal(unknownBody.code, 'BUMPER_ACTION_UNKNOWN');
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

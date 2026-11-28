@@ -13,9 +13,7 @@ import { errMsg } from './modules/shared/module-ui.js';
 import type { useFeatureModulesPolling } from './modules/shared/use-feature-module-polling.js';
 import type { useTasks } from './use-tasks.js';
 import { WorkspaceReader } from './workspace-reader.js';
-
 export type WorkspaceEventListener = (topics: ReadonlySet<WorkspaceEventTopic>) => void;
-
 function usePollingReader<
   R extends { refresh: (force?: boolean) => Promise<void>; dispose: () => void },
 >(enabled: boolean, sseConnected: boolean, pollMs: number, create: () => R) {
@@ -51,7 +49,6 @@ function usePollingReader<
   }, [enabled, sseConnected, pollMs]);
   return reader;
 }
-
 export function useWorkspace(sseConnected = false) {
   const [workspace, setWorkspace] = useState<Workspace | null>(null),
     [error, setError] = useState('');
@@ -74,7 +71,6 @@ export function useWorkspace(sseConnected = false) {
     ),
   };
 }
-
 export function useInspections(enabled = true, sseConnected = false) {
   const [state, setState] = useState<InspectionReadState>({
     rows: [],
@@ -101,7 +97,6 @@ export function useInspections(enabled = true, sseConnected = false) {
   }, []);
   return { ...state, refresh, request };
 }
-
 export function useWorkspaceEvents(onInvalidate: WorkspaceEventListener): { connected: boolean } {
   const [connected, setConnected] = useState(false),
     listenerRef = useRef(onInvalidate);
@@ -159,7 +154,6 @@ export function useWorkspaceEvents(onInvalidate: WorkspaceEventListener): { conn
   }, []);
   return { connected };
 }
-
 export function useWorkbenchActions(p: {
   mutate: (work: () => Promise<unknown>) => Promise<void>;
   refresh: (force?: boolean) => Promise<void>;
@@ -183,7 +177,6 @@ export function useWorkbenchActions(p: {
     setGoogleSheets,
     setBluestacks,
   } = mods;
-
   const checkProfiles = useCallback(
     (ids: string[]) =>
       void mutate(async () => {
@@ -201,7 +194,6 @@ export function useWorkbenchActions(p: {
       }),
     [inspections, mutate, refresh],
   );
-
   const commandPlans = useCallback(
     (command: TaskCommand['command'], plans: TaskCommand['plans']) =>
       void mutate(async () => {
@@ -212,7 +204,6 @@ export function useWorkbenchActions(p: {
       }),
     [mutate, tasks],
   );
-
   const stopModules = useCallback(
     async (ids: string[]) => {
       const uniqueIds = [...new Set(ids)];
@@ -276,7 +267,6 @@ export function useWorkbenchActions(p: {
       setGoogleSheets,
     ],
   );
-
   const stopProfilesUnified = useCallback(
     (planTargets: TaskCommand['plans'], moduleProfileIds: string[]) =>
       void mutate(async () => {
@@ -311,7 +301,6 @@ export function useWorkbenchActions(p: {
       }),
     [mutate, tasks, stopModules],
   );
-
   const handleSaveGlobalConcurrency = useCallback(
     async (patch: { browserConcurrency?: number; bluestacksConcurrency?: number }) => {
       try {
@@ -341,7 +330,6 @@ export function useWorkbenchActions(p: {
     },
     [autoScheduler?.settings, setAutoScheduler, setMessage, tasks, mods],
   );
-
   const handleStopCard = useCallback(
     (c: LiveRunCard) => {
       if (c.stopKind === 'plan' && c.planTarget) return stopProfilesUnified([c.planTarget], []);
@@ -366,7 +354,6 @@ export function useWorkbenchActions(p: {
     },
     [mutate, setAutoScheduler, setBluestacks, stopProfilesUnified],
   );
-
   const handleStopAllCards = useCallback(
     () =>
       void mutate(async () => {
@@ -392,7 +379,6 @@ export function useWorkbenchActions(p: {
       }),
     [liveRunCards, mutate, setAutoScheduler, setBluestacks, stopModules, tasks],
   );
-
   return {
     checkProfiles,
     commandPlans,

@@ -33,13 +33,9 @@ export class DevDiagnosticsFileWriter {
     }, this.filePath);
   }
   enqueue(entry: DevDiagEntry): void {
-    if (this.queue.length >= 2000) {
-      this.queue.shift();
-    }
+    if (this.queue.length >= 2000) this.queue.shift();
     this.queue.push(entry);
-    if (!this.paused && !this.activeFlush) {
-      void this.flush();
-    }
+    if (!this.paused && !this.activeFlush) void this.flush();
   }
   async flush(): Promise<void> {
     if (this.activeFlush) {
@@ -51,9 +47,7 @@ export class DevDiagnosticsFileWriter {
     try {
       await run;
     } finally {
-      if (this.activeFlush === run) {
-        this.activeFlush = null;
-      }
+      if (this.activeFlush === run) this.activeFlush = null;
     }
   }
   private async drain(): Promise<void> {
@@ -79,9 +73,7 @@ export class DevDiagnosticsFileWriter {
   private async rotateIfNeeded(): Promise<void> {
     try {
       const info = await stat(this.filePath);
-      if (info.size >= this.maxLogBytes) {
-        await rename(this.filePath, this.prevFilePath);
-      }
+      if (info.size >= this.maxLogBytes) await rename(this.filePath, this.prevFilePath);
     } catch {
       // Ignore missing file or rename race.
     }

@@ -11,9 +11,10 @@ export const MaterialCacheOverview = strictObj({
   entries: z.array(MaterialCacheEntry).max(200),
   truncated: z.boolean(),
 });
-export const MaterialCacheCleanRequest = strictObj({
-  stageIds: z.array(Id).min(1).max(50),
-}).refine((value) => new Set(value.stageIds).size === value.stageIds.length, '缓存不能重复');
+export const MaterialCacheCleanRequest = strictObj({ stageIds: z.array(Id).min(1).max(50) }).refine(
+  (value) => new Set(value.stageIds).size === value.stageIds.length,
+  '缓存不能重复',
+);
 export const MaterialCacheCleanResult = strictObj({
   results: z.array(strictObj({ stageId: Id, cleaned: z.boolean(), reason: sMax(200) })).max(50),
 });

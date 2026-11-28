@@ -1,20 +1,13 @@
-import type { CompatibleRepository } from '../../domain/persistence.js';
-import { devDiag } from '../../shared/dev-diagnostics.js';
 import {
   isCompleteNumericId,
   isPlaceholderTargetName,
-  type BumperSettings,
   type BumperTarget,
 } from '../../shared/group-bumper.js';
-import type { InFlightBumperCoordinator } from '../facebook-group-session.js';
 import { bumperAuthorMatch, type BumperPost, readGroupBumper } from '../group-bumper-effects.js';
-import type { SqliteGroupBumperRepository } from '../group-bumper-store.js';
 import {
   BUMPER_DEBUGGER_CANCELED_MESSAGE,
   BumperFatalError,
-  type BumperGroupFeedContext,
-  type BumperRunCallbacks,
-  type BumperRunStats,
+  type BumperFeedStepContext,
   type BumperSurface,
   buildBumperTargetUrl,
   canonicalBumperPageIdFromURL,
@@ -23,14 +16,12 @@ import {
   verifyBumperPageAlias,
   wait,
 } from './bumper-core.js';
-import type { BumperGroupSurfaceHelpers } from './bumper-group-setup.js';
 import { closeBumperShareDialogIfOpen } from './bumper-post-comment-share.js';
 import {
   executeBumperPostActions,
   isForeignPagePost,
   navigateViaSearchEntry,
 } from './bumper-post-flow.js';
-import type { BumperSessionRuntime } from './bumper-session.js';
 const matchPageOwnerId = (posts: readonly BumperPost[], feed: BumperTarget, accountId: string) =>
   posts.find(
     (p) =>
@@ -40,21 +31,12 @@ const matchPageOwnerId = (posts: readonly BumperPost[], feed: BumperTarget, acco
         (!isPlaceholderTargetName(feed.name, feed.id) &&
           p.authorName.trim().toLowerCase() === feed.name.trim().toLowerCase())),
   )?.authorId;
-export async function runBumperFeedsForGroup(input: {
-  profileId: string;
-  paceScale: number;
-  repo: CompatibleRepository<SqliteGroupBumperRepository>;
-  inFlightCoordinator: InFlightBumperCoordinator;
-  commentClaims: Set<string>;
-  settings: BumperSettings;
-  callbacks: BumperRunCallbacks;
-  session: BumperSessionRuntime;
-  groupCtx: BumperGroupFeedContext;
-  groupHelpers: BumperGroupSurfaceHelpers;
-  stats: BumperRunStats;
-  initialFeed: BumperSurface | undefined;
-  initialSurface: BumperSurface | undefined;
-}): Promise<'continue' | 'quota_reached'> {
+export async function runBumperFeedsForGroup(
+  input: BumperFeedStepContext & {
+    initialFeed: BumperSurface | undefined;
+    initialSurface: BumperSurface | undefined;
+  },
+): Promise<'continue' | 'quota_reached'> {
   const {
     profileId,
     paceScale,
@@ -293,7 +275,7 @@ export async function runBumperFeedsForGroup(input: {
         session.guard();
         await session.assertIdentity();
         const activePage = session.getPage();
-        if (scroll === 0 && isPageBumperMode && !session.scanOnly && !hasRecoveredInFeed) {
+        if (scroll === 0 && isPageBumperMode && !hasRecoveredInFeed) {
           const refreshedSurface = await readGroupBumper(activePage, {
             groupId: groupCtx.effectiveGroupId,
             ...(feed ? { pageId: resolvedPageId } : {}),
@@ -302,34 +284,14 @@ export async function runBumperFeedsForGroup(input: {
             refreshedSurface && refreshedSurface.posts.length > 0 ? refreshedSurface : initialFeed;
         } else {
           surface =
-            scroll === 0 && !feed && !session.scanOnly && !hasRecoveredInFeed
+            scroll === 0 && !feed && !hasRecoveredInFeed
               ? initialFeed
               : await readGroupBumper(activePage, {
                   groupId: groupCtx.effectiveGroupId,
                   ...(feed ? { pageId: resolvedPageId } : {}),
-                  audit: session.scanOnly && scroll === 0,
                 });
         }
         if (!surface) throw Error('页面未就绪');
-        if (session.scanOnly && scroll === 0)
-          devDiag.record({
-            category: 'GROUP_BUMPER',
-            event: 'BUMPER_SCAN_SAMPLE',
-            profileId,
-            data: {
-              runId: session.runId,
-              groupId: group.id,
-              pageId: feed?.id ?? null,
-              resolvedPageId: resolvedPageId ?? null,
-              posts: surface.posts.slice(0, 15).map((p) => ({
-                postId: p.postId,
-                authorId: p.authorId,
-                authorAliases: p.authorAliases,
-                ageHours: p.ageHours,
-                sourceEvidence: p.sourceEvidence,
-              })),
-            },
-          });
         if (feed && surface.pageAvatarUrl)
           await session.updateAvatar('pages', feed.id, surface.pageAvatarUrl);
         if (
@@ -420,24 +382,6 @@ export async function runBumperFeedsForGroup(input: {
             fresh++;
             noteAge(post);
             stats.matchedAuthorPosts++;
-            if (session.scanOnly)
-              devDiag.record({
-                category: 'GROUP_BUMPER',
-                event: 'BUMPER_SCAN_MATCH',
-                profileId,
-                data: {
-                  runId: session.runId,
-                  groupId: group.id,
-                  pageId: target.id,
-                  resolvedPageId: resolvedPageId ?? target.id,
-                  postId: post.postId,
-                  authorId: post.authorId,
-                  ageHours: post.ageHours,
-                  liked: post.liked,
-                  hasLikeControl: post.likeCSS !== null,
-                  sourceEvidence: post.sourceEvidence,
-                },
-              });
             if (post.authorAvatarUrl)
               await session.updateAvatar('pages', target.id, post.authorAvatarUrl);
             if (post.authorName.trim() && (!target.name.trim() || target.name === target.id)) {
@@ -480,6 +424,14 @@ export async function runBumperFeedsForGroup(input: {
             resumableRef,
           });
           if (postOutcome === 'quota_reached') return 'quota_reached';
+          if (callbacks.shouldStopAfterCurrentPost?.()) {
+            stats.quotaReached = true;
+            return 'quota_reached';
+          }
+        }
+        if (callbacks.shouldStopAfterCurrentPost?.()) {
+          stats.quotaReached = true;
+          return 'quota_reached';
         }
         if (!isPageBumperMode && oldPosts >= 3) break;
         if ((feed ? [feed] : pages).every((p) => (counts.get(p.id) ?? 0) >= maxScanForTarget))

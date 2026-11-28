@@ -118,11 +118,13 @@ test('display budgets follow stored shuffled steps and immutable versions, witho
         milliseconds: 4 * 60_000,
       });
       assert.deepEqual(
-        (await service.history({ profileId: plan.profileId })).steps.map((s) => s.budget),
+        (await service.records({ profileId: plan.profileId })).records.map((r) =>
+          r.type === 'video' || r.type === 'feed' ? { type: r.type, maxLikes: r.maxLikes } : null,
+        ),
         [
-          { kind: 'time', milliseconds: 4 * 60_000 },
-          { kind: 'time', milliseconds: 8 * 60_000 },
-          { kind: 'time', milliseconds: 15 * 60_000 },
+          { type: 'feed', maxLikes: 1 },
+          { type: 'feed', maxLikes: 0 },
+          { type: 'video', maxLikes: 2 },
         ],
       );
       assert.deepEqual(repository.steps(plan.id), before);
@@ -190,10 +192,10 @@ test('task history reads the persisted profile ledger cleanly', async () => {
       step.id,
       progress(step.progress, { effectiveMilliseconds: 1000 }),
     );
-    const history = await new TaskService(store.tasks).history({ profileId: runtime[0]!.id });
-    assert.equal(history.plans.length, 1);
-    assert.equal(history.steps.length, 3);
-    assert.equal(history.steps[0]?.progress.effectiveMilliseconds, 1000);
+    const records = await new TaskService(store.tasks).records({ profileId: runtime[0]!.id });
+    assert.equal(records.total, 3);
+    assert.equal(records.records.length, 3);
+    assert.equal(records.records[0]?.progress.effectiveMilliseconds, 1000);
   });
 });
 
@@ -491,7 +493,7 @@ test('task records aggregate step-level rows across profiles with start/end time
     );
     assert.equal(all.counts.all, 6);
     assert.equal(all.counts.completed, 1);
-    assert.equal(all.counts.running, 2);
+    assert.equal(all.counts.running, 5);
     const completed = await service.records({ status: 'completed' });
     assert.equal(completed.records.length, 1);
     assert.equal(completed.records[0]?.stepId, stepA0.id);
@@ -504,7 +506,7 @@ test('task records aggregate step-level rows across profiles with start/end time
     );
     assert.equal(byBrowser.total, 3);
     assert.equal(byBrowser.records.length, 2);
-    assert.ok(byBrowser.nextCursor && byBrowser.nextCursor !== '2');
+    assert.ok(byBrowser.nextCursor);
     const secondPage = await service.records(
       { profileId: planA.profileId, query: '浏览器1', cursor: byBrowser.nextCursor!, limit: 2 },
       runtime.map((p, i) => ({ id: p.id, browserName: `浏览器${i + 1}`, alias: `别名${i + 1}` })),

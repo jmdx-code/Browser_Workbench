@@ -508,7 +508,6 @@ describe('Cycle 5 Top-Down Fixes Regression Suite', () => {
       targets: () => [],
       todayCounts: () => ({}),
       total: () => 0,
-      weeklyDailyCounts: () => [],
     };
     const devices: BluestacksDeviceController = {
       getOnlineKeys: () => new Set(liveInstances.filter((x) => x.online).map((x) => x.instanceKey)),
@@ -686,7 +685,6 @@ describe('Cycle 5 Top-Down Fixes Regression Suite', () => {
       targets: () => [],
       todayCounts: () => ({}),
       total: () => 0,
-      weeklyDailyCounts: () => [],
     };
     const devices: BluestacksDeviceController = {
       getOnlineKeys: () => new Set(liveInstances.map((x) => x.instanceKey)),

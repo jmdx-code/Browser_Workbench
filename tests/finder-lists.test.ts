@@ -225,7 +225,7 @@ test('missing reveal capability auto reloads same version once and show returns 
     peer.capabilities = [];
     await updates.automatic(peer);
     assert.equal(messages.length, 1);
-    const windows = new BridgeBrowserWindow(core, { list: () => [] });
+    const windows = new BridgeBrowserWindow(core, { list: () => [], livePlans: () => [] });
     await assert.rejects(
       windows.show(id, ''),
       (e) =>

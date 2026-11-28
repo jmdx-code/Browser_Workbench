@@ -317,7 +317,6 @@ test('queued daily admission consolidates extra READY pages and reuses a legacy 
     assert.equal(consolidated, 1);
     assert.equal(inspected, 1);
     assert.equal(f.workspace.tasks.get(plan.id).state, 'QUEUED');
-    assert.equal(f.workspace.tasks.operations(plan.id).length, 0);
     assert.equal(f.requests.includes('create'), false);
   } finally {
     await f.close();
@@ -610,7 +609,6 @@ test('private queued bootstrap admits only its original untouched queue; public 
         const result = await work;
         assert.equal(result?.actor.accountId, '10000000000001');
         assert.equal(f.workspace.tasks.get(plan.id).state, 'QUEUED');
-        assert.equal(f.workspace.tasks.operations(plan.id).length, 0);
         assert.equal(result.closedRecord?.state, 'CLOSED');
         assert.equal(f.requests.filter((kind) => kind === 'create').length, 1);
         assert.equal(f.requests.includes('remove'), true);

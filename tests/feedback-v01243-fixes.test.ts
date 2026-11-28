@@ -11,7 +11,6 @@ import { taskReasonDescription } from '../src/shared/task-issues.js';
 import { bridgeCapabilities, bridgeHelloCapabilities } from '../src/shared/bridge-capabilities.js';
 import { KernelRequest } from '../src/shared/kernel-wire.js';
 import type { KernelJsonObject } from '../src/shared/kernel-protocol.js';
-import { navigateFacebookBoundPage } from '../src/infrastructure/facebook-bound-navigation.js';
 import {
   awaitFacebookTaskDocument,
   FACEBOOK_TASK_DOCUMENT_READ,
@@ -19,7 +18,6 @@ import {
 import { FacebookGroupSessionHelper } from '../src/infrastructure/facebook-group-session.js';
 import { KernelJournal } from '../src/application/kernel-journal.js';
 import { ChromeKernelBackend } from '../extension/kernel-backend.js';
-import { devDiag } from '../src/shared/dev-diagnostics.js';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -89,51 +87,6 @@ test('Fix #1 & #5: transient navigation/kernel faults are recoverable & session-
   );
   assert.ok(taskReasonDescription('FACEBOOK_TASK_DOCUMENT_ERROR_PAGE')?.summary.includes('错误页'));
   assert.ok(taskReasonDescription('KERNEL_READ_FENCED')?.summary.includes('读取'));
-
-  // navigateFacebookBoundPage distinguishes errorText vs isDownload and records detail in devDiag
-  const recorded: Array<{ event: string; reason?: string; data?: Record<string, unknown> }> = [];
-  devDiag.setSink((entry) =>
-    recorded.push({ event: entry.event, reason: entry.reason, data: entry.data }),
-  );
-  try {
-    await assert.rejects(
-      navigateFacebookBoundPage(
-        {
-          send: async (): Promise<KernelJsonObject> => ({
-            frameId: 'main',
-            errorText: 'net::ERR_TIMED_OUT',
-          }),
-        },
-        7,
-        'https://www.facebook.com/reels/',
-        'https://www.facebook.com/',
-        () => {},
-        { wait: async () => {} },
-      ),
-      /^Error: FACEBOOK_NAVIGATION_REJECTED$/,
-    );
-    await assert.rejects(
-      navigateFacebookBoundPage(
-        {
-          send: async (): Promise<KernelJsonObject> => ({
-            frameId: 'main',
-            isDownload: true,
-          }),
-        },
-        7,
-        'https://www.facebook.com/reels/',
-        'https://www.facebook.com/',
-        () => {},
-        { wait: async () => {} },
-      ),
-      /^Error: FACEBOOK_NAVIGATION_DOWNLOAD_REJECTED$/,
-    );
-  } finally {
-    devDiag.setSink(null);
-  }
-  const detail = recorded.find((e) => e.event === 'FACEBOOK_NAVIGATION_REJECTED_DETAIL');
-  assert.ok(detail);
-  assert.equal(detail.data?.errorText, 'net::ERR_TIMED_OUT');
 });
 
 test('Fix #2: awaitFacebookTaskDocument classifies chrome-error:// as ERROR_PAGE and only sends Page.stopLoading on stuck retained browse tabs', async () => {
@@ -647,7 +600,6 @@ test('v0.1.267: diagnostic snapshot includes sanitized BlueStacks + postBumpReco
           records: [{ id: 'rec-1', recordType: 'bump', status: 'success' }],
           total: 1,
           hasMore: false,
-          dailyStats: [],
           statusCounts: { total: 1, confirmed: 1, pending: 0, failed: 0 },
         }),
       } as never,

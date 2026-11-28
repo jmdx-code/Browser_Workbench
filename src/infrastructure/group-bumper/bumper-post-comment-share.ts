@@ -8,6 +8,7 @@ import {
 import {
   BumperFatalError,
   digest,
+  normalizeBumperComment,
   observeBumperGraphql,
   observeBumperStoryShareGraphql,
   pollWithGuard,
@@ -17,6 +18,7 @@ import {
 import {
   type BumperPostCtx,
   dismissFeatureOrJoinCSS,
+  readBumperComposerText,
   revealBumperControlIfNeeded,
   typeBumperComment,
 } from './bumper-post-flow.js';
@@ -25,31 +27,35 @@ export async function closeBumperShareDialogIfOpen(
   session: BumperSessionRuntime,
   verifyCloseWithTimeoutMs?: number,
 ): Promise<void> {
-  const page = session.getPage();
-  if (!(await readBumperShareDialog(page).catch(() => null))?.open) return;
+  if (!(await readBumperShareDialog(session.getPage()).catch(() => null))?.open) return;
   await session
     .op(
       '关闭分享弹窗',
       async () => {
-        const latestDlg = await readBumperShareDialog(page).catch(() => null);
+        const activePage = session.getPage();
+        const latestDlg = await readBumperShareDialog(activePage).catch(() => null);
         if (!latestDlg?.open) return false;
         if (latestDlg.closeButtonCSS)
-          await page
+          await activePage
             .locator(latestDlg.closeButtonCSS)
             .first()
             .click({ timeout: 3000 })
             .catch(() => {});
-        else await page.keyboard.press('Escape').catch(() => {});
+        else await activePage.keyboard.press('Escape').catch(() => {});
         return true;
       },
       verifyCloseWithTimeoutMs
         ? async () => {
             for (const end = Date.now() + verifyCloseWithTimeoutMs; Date.now() < end;) {
               session.guard();
-              if (!(await readBumperShareDialog(page).catch(() => null))?.open) return true;
+              if (!(await readBumperShareDialog(session.getPage()).catch(() => null))?.open)
+                return true;
               await wait(120);
             }
-            await page.keyboard.press('Escape').catch(() => {});
+            await session
+              .getPage()
+              .keyboard.press('Escape')
+              .catch(() => {});
             return true;
           }
         : async () => true,
@@ -77,7 +83,6 @@ export async function runBumperPostComment(
       checkPost,
       persist,
     } = ctx,
-    page = session.getPage(),
     chosen = activePostState.chosen;
   if (doLike && chosen && activePostState.commentProgress === 'NOT_SENT')
     await session.paceWait(3500 + Math.floor(Math.random() * 4001));
@@ -90,7 +95,7 @@ export async function runBumperPostComment(
         '展开评论',
         async () => {
           const clickBtn = async (css: string) => {
-            const btn = page.locator(css).first();
+            const btn = session.getPage().locator(css).first();
             await revealBumperControlIfNeeded(btn, paceScale);
             await btn.click({ timeout: 4000 });
           };
@@ -129,10 +134,11 @@ export async function runBumperPostComment(
     await session.op(
       '填写评论',
       async () => {
+        const activePage = session.getPage();
         try {
           await typeBumperComment(
-            page,
-            page.locator(editor).first(),
+            activePage,
+            activePage.locator(editor).first(),
             chosen.text,
             paceScale,
             session.guard,
@@ -142,8 +148,8 @@ export async function runBumperPostComment(
           const retriedEditor = (await checkPost()).commentCSS;
           if (!retriedEditor) throw err;
           await typeBumperComment(
-            page,
-            page.locator(retriedEditor).first(),
+            activePage,
+            activePage.locator(retriedEditor).first(),
             chosen.text,
             paceScale,
             session.guard,
@@ -153,7 +159,7 @@ export async function runBumperPostComment(
       },
       async () => true,
     );
-    const native = observeBumperGraphql(page, {
+    const native = observeBumperGraphql(session.getPage(), {
       actorId: session.accountId,
       feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
       kind: 'comment',
@@ -173,15 +179,71 @@ export async function runBumperPostComment(
         await session.op(
           '发送评论',
           async () => {
+            const activePage = session.getPage();
             const activeEditor = (await checkPost().catch(() => null))?.commentCSS ?? editor;
-            return (
-              await page.locator(activeEditor).first().press('Enter', { timeout: 4000 }),
-              true
-            );
+            const box = activePage.locator(activeEditor).first();
+            await revealBumperControlIfNeeded(box, paceScale).catch(() => {});
+            await box
+              .evaluate((el) => (el instanceof HTMLElement ? el.focus() : undefined))
+              .catch(() => {});
+            await box.press('Enter', { timeout: 4000 });
+            if (paceScale > 0) await wait(Math.min(500, Math.round(500 * paceScale)));
+            if (
+              !native.confirmed() &&
+              !native.failed() &&
+              !native.restricted() &&
+              normalizeBumperComment(await readBumperComposerText(box)).includes(
+                normalizeBumperComment(chosen.text),
+              )
+            ) {
+              const clickedSubmit = await box
+                .evaluate((el) => {
+                  const excludeRx =
+                    /sticker|gif|emoji|photo|video|camera|attach|avatar|贴图|貼圖|动图|動圖|表情|图片|圖片|照片|相机|相機/i;
+                  const submitRx =
+                    /^(?:Comment|评论|留言|发送|發送|发布|發佈|Submit|Send|Bình luận|Gửi|แสดงความคิดเห็น|ส่ง|မှတ်ချက်ပေးရန်|ပို့ရန်)$/iu;
+                  let host: HTMLElement | null = el.parentElement;
+                  for (let depth = 0; host && depth < 6; depth++, host = host.parentElement) {
+                    const btns = Array.from(
+                      host.querySelectorAll<HTMLElement>(
+                        '[role="button"],button,[data-testid*="submit" i]',
+                      ),
+                    ).filter((b) => {
+                      if (b.getAttribute('aria-disabled') === 'true' || b.hasAttribute('disabled'))
+                        return false;
+                      const r = b.getBoundingClientRect();
+                      const s = getComputedStyle(b);
+                      if (
+                        r.width <= 0 ||
+                        r.height <= 0 ||
+                        s.display === 'none' ||
+                        s.visibility === 'hidden'
+                      )
+                        return false;
+                      const lbl =
+                        `${b.getAttribute('aria-label') ?? ''} ${b.textContent ?? ''}`.trim();
+                      if (excludeRx.test(lbl)) return false;
+                      const testid = b.getAttribute('data-testid') ?? '';
+                      return /submit/i.test(testid) || submitRx.test(lbl);
+                    });
+                    if (btns.length === 1 && btns[0]) {
+                      btns[0].click();
+                      return true;
+                    }
+                  }
+                  return false;
+                })
+                .catch(() => false);
+              if (clickedSubmit)
+                diagBumperInfo(profileId, 'BUMPER_COMMENT_SUBMIT_FALLBACK_CLICK', {
+                  postId: post.postId,
+                });
+            }
+            return true;
           },
           async () => {
             const markRestricted = async (dismissCss: string | null) => {
-              await dismissFeatureOrJoinCSS(page, dismissCss, session.guard);
+              await dismissFeatureOrJoinCSS(session.getPage(), dismissCss, session.guard);
               commentRejectedByRestriction = true;
               stats.commentRestrictedInSession = true;
               return true;
@@ -194,7 +256,7 @@ export async function runBumperPostComment(
                 return markRestricted(null);
               }
               if (!checkDom) return false;
-              const s = await readGroupBumper(page, { groupId: effectiveGroupId });
+              const s = await readGroupBumper(session.getPage(), { groupId: effectiveGroupId });
               if (s.checkpointRestricted || s.restrictionReason)
                 throw new BumperFatalError(
                   '受限 · ' + (s.restrictionReason ?? '需要手机验证或操作受限'),
@@ -222,6 +284,24 @@ export async function runBumperPostComment(
             if (native.confirmed()) return confirmComment();
             if (await checkRestriction(true)) return true;
             if (native.failed()) throw Error(native.failureReason());
+            const readBackPost = await checkPost().catch(() => null);
+            const expectedNorm = normalizeBumperComment(chosen.text);
+            const domMatched = Boolean(
+              readBackPost?.comments.some(
+                (c) =>
+                  Boolean(c.id) &&
+                  !/^client:/i.test(c.id) &&
+                  (!c.authorId || c.authorId === session.accountId) &&
+                  normalizeBumperComment(c.text) === expectedNorm,
+              ),
+            );
+            if (domMatched) {
+              diagBumperInfo(profileId, 'BUMPER_COMMENT_DOM_READBACK', {
+                groupId: effectiveGroupId,
+                postId: post.postId,
+              });
+              return confirmComment();
+            }
             stats.consecutiveUnconfirmed++;
             return false;
           },
@@ -250,9 +330,9 @@ export async function runBumperPostComment(
       },
     });
   } finally {
-    const postCommentSurface = await readGroupBumper(page, { groupId: effectiveGroupId }).catch(
-      () => null,
-    );
+    const postCommentSurface = await readGroupBumper(session.getPage(), {
+      groupId: effectiveGroupId,
+    }).catch(() => null);
     if (
       postCommentSurface &&
       allowFallback &&
@@ -276,22 +356,20 @@ export async function runBumperPostStoryShare(
   doLike: boolean,
 ): Promise<void> {
   const {
-      profileId,
-      paceScale,
-      effectiveGroupId,
-      group,
-      target,
-      post,
-      todayCount,
-      callbacks,
-      session,
-      activePostState,
-      stats,
-      checkPost,
-      persist,
-    } = ctx,
-    page = session.getPage(),
-    conn = session.getConn();
+    profileId,
+    paceScale,
+    effectiveGroupId,
+    group,
+    target,
+    post,
+    todayCount,
+    callbacks,
+    session,
+    activePostState,
+    stats,
+    checkPost,
+    persist,
+  } = ctx;
   if (!activePostState.wantShareToStory || activePostState.storyShareProgress !== 'NOT_SENT')
     return;
   if (doLike || activePostState.chosen)
@@ -301,7 +379,9 @@ export async function runBumperPostStoryShare(
     const anchor =
       sharePost.likeCSS ?? sharePost.commentButtonCSS ?? sharePost.postCSS ?? post.postCSS;
     if (anchor) {
-      await revealBumperControlIfNeeded(page.locator(anchor).first(), paceScale).catch(() => {});
+      await revealBumperControlIfNeeded(session.getPage().locator(anchor).first(), paceScale).catch(
+        () => {},
+      );
       await session.paceWait(400);
       sharePost = await checkPost().catch(() => sharePost);
     }
@@ -323,8 +403,9 @@ export async function runBumperPostStoryShare(
     await session.op(
       '打开分享弹窗',
       async () => {
+        const activePage = session.getPage();
         const clickShareBtn = async (css: string) => {
-          const btn = page.locator(css).first();
+          const btn = activePage.locator(css).first();
           await revealBumperControlIfNeeded(btn, paceScale);
           await btn.click({ timeout: 4000 });
         };
@@ -341,7 +422,7 @@ export async function runBumperPostStoryShare(
           Date.now() < openEnd;
         ) {
           session.guard();
-          const dlg = await readBumperShareDialog(page).catch(() => null);
+          const dlg = await readBumperShareDialog(activePage).catch(() => null);
           if (dlg?.restricted) throw new BumperFatalError('受限 · 账号分享功能被 Facebook 限制');
           if (dlg?.open) {
             shareDialogReady = Boolean(dlg.storyButtonCSS);
@@ -349,7 +430,7 @@ export async function runBumperPostStoryShare(
           }
           await session.paceWait(200);
         }
-        const finalDlg = await readBumperShareDialog(page).catch(() => null);
+        const finalDlg = await readBumperShareDialog(activePage).catch(() => null);
         shareDialogReady = Boolean(finalDlg?.open && finalDlg.storyButtonCSS);
         return true;
       },
@@ -365,8 +446,8 @@ export async function runBumperPostStoryShare(
       return;
     }
     await session.paceWait(400 + Math.floor(Math.random() * 501));
-    const sharePressBefore = conn.submissionCalls?.mousePress,
-      native = observeBumperStoryShareGraphql(page, {
+    const sharePressBefore = session.getConn().submissionCalls?.mousePress,
+      native = observeBumperStoryShareGraphql(session.getPage(), {
         actorId: session.accountId,
         postId: post.postId,
         feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? undefined,
@@ -383,12 +464,15 @@ export async function runBumperPostStoryShare(
         await session.op(
           '分享到快拍',
           async () => {
-            const dlg = await readBumperShareDialog(page);
+            const activePage = session.getPage();
+            const activeConn = session.getConn();
+            const dlg = await readBumperShareDialog(activePage);
             if (dlg.restricted) throw new BumperFatalError(SHARE_RESTRICTED_MSG);
             if (!dlg.open || !dlg.storyButtonCSS) return false;
-            await page.locator(dlg.storyButtonCSS).first().click({ timeout: 4000 });
+            await activePage.locator(dlg.storyButtonCSS).first().click({ timeout: 4000 });
             return (
-              sharePressBefore === undefined || conn.submissionCalls.mousePress > sharePressBefore
+              sharePressBefore === undefined ||
+              activeConn.submissionCalls.mousePress > sharePressBefore
             );
           },
           async (clicked) => {
@@ -396,7 +480,7 @@ export async function runBumperPostStoryShare(
             const checkShareDone = async () => {
               if (native.restricted()) throw new BumperFatalError(SHARE_RESTRICTED_MSG);
               if (native.failed()) throw Error(native.failureReason());
-              const dlg = await readBumperShareDialog(page).catch(() => null);
+              const dlg = await readBumperShareDialog(session.getPage()).catch(() => null);
               if (dlg?.restricted) throw new BumperFatalError(SHARE_RESTRICTED_MSG);
               if (
                 native.confirmed() ||

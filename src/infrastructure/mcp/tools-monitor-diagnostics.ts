@@ -1,7 +1,6 @@
 import { open as openFile } from 'node:fs/promises';
 import { devDiag, type DevDiagLevel } from '../../shared/dev-diagnostics.js';
 import * as M from './mcp-context.js';
-
 const MODULES =
   'active-accounts group-poster group-bumper page-bumper group-inviter bluestacks-bumper bluestacks-page-bumper auto-scheduler google-sheets';
 const MOD_MAP: Record<string, string> = {
@@ -16,7 +15,6 @@ const MOD_MAP: Record<string, string> = {
 };
 const DONE_PLAN = new Set(['STOPPED', 'COMPLETED', 'FAILED']);
 const DONE_POST = new Set(['completed', 'partial', 'failed', 'cancelled']);
-
 async function readTailJsonlLines(filePath: string, maxBytes = 262_144) {
   const h = await openFile(filePath, 'r').catch(() => null);
   if (!h) return [];
@@ -44,7 +42,6 @@ async function readTailJsonlLines(filePath: string, maxBytes = 262_144) {
     await h.close().catch(() => {});
   }
 }
-
 async function readSimpleStatus(
   deps: M.WorkbenchMcpDependencies,
   mod: string,
@@ -67,10 +64,16 @@ async function readSimpleStatus(
     const svc = deps.getGoogleSheetsService?.();
     M.req(svc, 'GOOGLE_SHEETS_UNAVAILABLE', 'Google 云表协同服务尚未初始化', 503);
     const ov = await svc.overview();
+    const errorLinks = ov.links
+      .filter((l) => Boolean(l.runtime.lastError))
+      .map((l) => ({ id: l.id, title: l.title, lastError: l.runtime.lastError }));
     return {
       running: svc.hasActiveExecution(),
       payload: {
         ...M.pick(ov, 'runningScheduleCount runningRecordsCount'),
+        authError: ov.auth.lastError,
+        errorLinksCount: errorLinks.length,
+        ...(errorLinks.length > 0 && { errorLinks }),
         recentLogs: ov.logs.slice(0, 15),
       },
     };
@@ -110,7 +113,6 @@ async function readSimpleStatus(
     },
   };
 }
-
 async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const rawMod = M.strArg(args.module) || 'group-poster';
   const mod = MOD_MAP[rawMod] ?? (MODULES.split(' ').includes(rawMod) ? rawMod : '');
@@ -157,7 +159,6 @@ async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<
     new Set((st?.pendingReviewOperations ?? []).map((o) => o.id));
   const hasNewPend = (st: { pendingReviewOperations?: Array<{ id: string }> }, seen: Set<string>) =>
     wakeOnAnomaly && (st.pendingReviewOperations ?? []).some((o) => !seen.has(o.id));
-
   if (mod === 'active-accounts') {
     const svc = deps.taskService;
     M.req(svc, 'TASKS_UNAVAILABLE', '活跃账号任务执行服务未启用', 503);
@@ -177,12 +178,6 @@ async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<
         (p) => matchP(p) && (fPlans || fPids || !DONE_PLAN.has(p.state)),
       );
       if (tracked.every((p) => DONE_PLAN.has(p.state))) return done('completed');
-      if (
-        tracked.every(
-          (p) => p.state === 'QUEUED' && p.timing?.mode === 'at' && isFut(p.timing.startAt),
-        )
-      )
-        return done('scheduled_in_future');
       return wakeOnAnomaly && ov.plans.some((p) => p.state === 'FAILED' && !initFail.has(p.id))
         ? done('failure_detected')
         : false;
@@ -199,7 +194,6 @@ async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<
         .map((p) => M.mapActivePlan(p, 'id profileId reason')),
     });
   }
-
   if (mod === 'group-poster') {
     const initSt = await deps.groupPosterService.state();
     const initRestr = new Set(
@@ -260,7 +254,6 @@ async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<
       newVerifiedPosts: newPosts,
     });
   }
-
   if (mod === 'group-bumper' || mod === 'page-bumper') {
     const bumper = deps.getGroupBumperService();
     M.req(bumper, 'BUMPER_UNAVAILABLE', '顶贴服务未加载', 503);
@@ -298,22 +291,17 @@ async function handleWaitForTask(deps: M.WorkbenchMcpDependencies, args: Record<
       pendingReviewOperations: finalSt.pendingReviewOperations ?? [],
     });
   }
-
   const wake = await pollWake(async (done) =>
     !(await readSimpleStatus(deps, mod, since)).running ? done('completed') : false,
   );
   const fin = await readSimpleStatus(deps, mod, since);
   return finish(wake, !fin.running, fin.payload);
 }
-
 async function handleDiagnose(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const action = M.strArg(args.action) || 'inspect';
   if (action === 'reload_extensions') {
     M.req(deps.reloadExtensions, 'RELOAD_UNAVAILABLE', '当前环境不支持扩展热重载', 503);
-    const rawIds = M.collectRawIds(args, 'profileIds', 'profileId');
-    const reloadResult = await deps.reloadExtensions(
-      rawIds.length > 0 ? await M.resolveProfileIds(deps, rawIds) : undefined,
-    );
+    const reloadResult = await deps.reloadExtensions(await M.resolveCollectedPids(deps, args));
     await M.sleep(1500);
     return {
       reloadResult,
@@ -377,9 +365,9 @@ async function handleDiagnose(deps: M.WorkbenchMcpDependencies, args: Record<str
     deps.bluestacksService.state(false),
     deps.taskService ? deps.taskService.overview() : Promise.resolve(null),
   ]);
-  const bridgeUnresolvedByProfile: Record<string, unknown[]> = {};
-  const outdatedExtensions: Array<Record<string, unknown>> = [];
-  const profilesWithIssues: M.EnrichedProfileSummary[] = [];
+  const bridgeUnresolvedByProfile: Record<string, unknown[]> = {},
+    outdatedExtensions: Array<Record<string, unknown>> = [],
+    profilesWithIssues: M.EnrichedProfileSummary[] = [];
   for (const p of profiles) {
     if (p.unresolvedCount > 0) bridgeUnresolvedByProfile[p.id] = await deps.store.unresolved(p.id);
     if (!p.online) continue;
@@ -424,7 +412,6 @@ async function handleDiagnose(deps: M.WorkbenchMcpDependencies, args: Record<str
     recentDiagnostics,
   };
 }
-
 export function createMonitorAndDiagnosticTools(
   deps: M.WorkbenchMcpDependencies,
 ): M.McpToolDefinition[] {
@@ -441,9 +428,7 @@ export function createMonitorAndDiagnosticTools(
       '诊断日志、未决命令、扩展热重载与导出诊断包。',
       M.sp(
         '@profileId|@profileIds|@search|@limit|action:e(inspect tail_log_file reload_extensions export_package):诊断动作|note:s:诊断包备注',
-        {
-          levels: M.A(M.E('INFO WARN ERROR SLOW WAIT SNAPSHOT'), '日志级别过滤'),
-        },
+        { levels: M.A(M.E('INFO WARN ERROR SLOW WAIT SNAPSHOT'), '日志级别过滤') },
       ),
       (args) => handleDiagnose(deps, args),
     ),

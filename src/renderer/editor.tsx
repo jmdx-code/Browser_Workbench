@@ -15,16 +15,19 @@ import {
   newPostStep,
   normalizeCombinationResources,
 } from './modules/module-contracts.js';
-import { Btn, Chk, errMsg } from './modules/shared/module-ui.js';
+import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
+import { Btn, Chk, InFld, errMsg } from './modules/shared/module-ui.js';
 import { StepConfigFields } from './step-config-fields.js';
-import { UI_CARD, UI_COUNT_CHIP, UI_INPUT } from './ui/primitives.js';
-
+import {
+  UI_CARD,
+  UI_COUNT_CHIP,
+  UI_HINT,
+  UI_INPUT,
+  UI_ROW,
+  UI_UNIT_FIELD,
+} from './ui/primitives.js';
 export { newCombination, normalizeCombinationResources };
-
-const normalizeForEditor = (v: Combination): Combination => ({
-  ...normalizeCombinationResources(v),
-  loop: { mode: 'finite', rounds: 1 },
-});
+const normalizeForEditor = (v: Combination): Combination => normalizeCombinationResources(v);
 const FEED_LABELS: Record<string, string> = {
   random_profile: '逛他人时间线',
   random_page: '逛公共专页',
@@ -45,7 +48,6 @@ const stepHeadingLabel = (step: Step) =>
         : step.type === 'video'
           ? '浏览 Reels'
           : (FEED_LABELS[step.feedMode ?? 'home'] ?? '浏览首页');
-
 const STEP_BORDER_TONE: Record<Step['type'], string> = {
   feed: 'border-l-emerald-500',
   video: 'border-l-violet-500',
@@ -53,7 +55,6 @@ const STEP_BORDER_TONE: Record<Step['type'], string> = {
   friends: 'border-l-sky-500',
   post: 'border-l-pink-500',
 };
-
 const STEP_PRESETS: ReadonlyArray<[string, (id: string) => Step]> = [
   [
     '浏览 Reels',
@@ -111,9 +112,7 @@ const STEP_PRESETS: ReadonlyArray<[string, (id: string) => Step]> = [
   ['发布快拍', (id) => newPostStep(id, 'story')],
   ['随机发帖', (id) => newPostStep(id, 'post')],
 ];
-
 const BS_SUPPORTED_PRESETS = new Set(['浏览 Reels', '浏览首页', '浏览商城', '接受好友']);
-
 export function Editor(p: {
   carrier?: 'browser' | 'bluestacks' | undefined;
   initial: SavedCombination | null;
@@ -130,6 +129,14 @@ export function Editor(p: {
   resourceUsageLoaded: boolean;
 }) {
   const isBs = p.carrier === 'bluestacks';
+  const rawInitial = p.initial?.saved ?? p.initialValue;
+  const hadLegacyDirectoryMode = Boolean(
+    rawInitial?.steps.some(
+      (s) =>
+        s.type === 'post' &&
+        (s.resourceMode === 'directory' || Boolean(s.resourceDirectory.trim())),
+    ),
+  );
   const startTargetCount = isBs
     ? (p.selectedTargetCount ?? 0)
     : (p.selectedTargetCount ?? p.selectedProfiles.length);
@@ -137,14 +144,13 @@ export function Editor(p: {
   const currentRowRef = useRef<SavedCombination | null>(p.initial);
   currentRowRef.current = currentRow;
   const [value, setValue] = useState<Combination>(() =>
-    normalizeForEditor(p.initial?.saved ?? p.initialValue ?? newCombination()),
+    normalizeForEditor(rawInitial ?? newCombination()),
   );
   const valueRef = useRef(value);
   valueRef.current = value;
-  const [dirty, setDirty] = useState(false),
+  const [dirty, setDirty] = useState(hadLegacyDirectoryMode),
     [busy, setBusy] = useState(false),
     [libraryPages, setLibraryPages] = useState<BumperTarget[]>([]);
-
   const hasSearchPagesStep = value.steps.some(
     (s) => s.type === 'feed' && s.feedMode === 'search_pages',
   );
@@ -159,9 +165,18 @@ export function Editor(p: {
       alive = false;
     };
   }, [hasSearchPagesStep, libraryPages.length]);
-
   const generation = useRef(0),
     saving = useRef(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented || busy || saving.current) return;
+      if (document.querySelector('dialog[open], [role="dialog"], [role="alertdialog"]')) return;
+      e.preventDefault();
+      p.onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [busy, p.onClose]);
   const change = (next: Combination | ((prev: Combination) => Combination)) => {
     generation.current++;
     setValue((prev) => {
@@ -181,7 +196,6 @@ export function Editor(p: {
       steps[index] = dst;
       return { ...prev, steps };
     });
-
   async function save(mode: 'save' | 'start' | 'resources') {
     if (mode === 'resources' && currentRowRef.current) return p.onResources(currentRowRef.current);
     if (saving.current) return;
@@ -214,7 +228,6 @@ export function Editor(p: {
     if (mode === 'start' && p.onSavedAndStart) await p.onSavedAndStart(savedRow);
     p.onClose();
   }
-
   return (
     <section className="mx-auto flex max-w-[920px] flex-col">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -233,34 +246,30 @@ export function Editor(p: {
         )}
       </div>
       <div className="combination-fields mb-4 grid grid-cols-[minmax(180px,1fr)_minmax(220px,2fr)] gap-3 max-[640px]:grid-cols-1">
-        <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
-          <span>名称</span>
-          <input
-            maxLength={80}
-            className={`${UI_INPUT} w-full`}
-            value={value.name}
-            onChange={(e) => change((c) => ({ ...c, name: e.target.value }))}
-          />
-        </label>
-        <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
-          <span>备注</span>
-          <input
-            maxLength={300}
-            className={`${UI_INPUT} w-full`}
-            value={value.note}
-            onChange={(e) => change((c) => ({ ...c, note: e.target.value }))}
-            placeholder="可选"
-          />
-        </label>
+        <InFld
+          label="名称"
+          maxLength={80}
+          className={`${UI_INPUT} w-full`}
+          value={value.name}
+          onVal={(name) => change((c) => ({ ...c, name }))}
+        />
+        <InFld
+          label="备注"
+          maxLength={300}
+          className={`${UI_INPUT} w-full`}
+          value={value.note}
+          placeholder="可选"
+          onVal={(note) => change((c) => ({ ...c, note }))}
+        />
       </div>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-white px-3.5 py-2.5 shadow-2xs">
-        <div className="flex flex-wrap items-center gap-2">
+        <div className={UI_ROW}>
           <strong className="flex items-center gap-2 text-[13px] font-semibold text-[var(--text)]">
             <span>步骤</span>
             <span className={UI_COUNT_CHIP}>{value.steps.length}</span>
           </strong>
           {isBs && (
-            <span className="text-[11px] text-[var(--text-3)]">
+            <span className={UI_HINT}>
               与浏览器端共用组合库 · 蓝蝶支持首页 / Reels / 商城 / 接受好友
             </span>
           )}
@@ -283,6 +292,14 @@ export function Editor(p: {
           )}
         </div>
       </div>
+      {hadLegacyDirectoryMode && (
+        <div
+          role="status"
+          className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs leading-relaxed text-amber-900"
+        >
+          旧版「本地目录」发帖资源模式已下线，系统已自动切换为「组合资源表」模式；保存此组合后将完成迁移，请点击下方「管理资源」检查或导入发帖素材。
+        </div>
+      )}
       {!isBs && value.steps.some((s) => s.type === 'post') && (
         <div
           className={`${UI_CARD} mb-3 flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5`}
@@ -398,11 +415,90 @@ export function Editor(p: {
         ))}
       </div>
       <footer className="editor-footer sticky -bottom-8 -mx-6 mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)] bg-[#eef0f3]/90 px-6 py-3 backdrop-blur-sm max-[1080px]:-mx-3.5 max-[1080px]:px-3.5">
-        <Chk
-          label="随机执行顺序"
-          checked={value.randomOrder}
-          onChange={(randomOrder) => change((c) => ({ ...c, randomOrder }))}
-        />
+        <div className="flex flex-wrap items-center gap-3">
+          <Chk
+            label="随机执行顺序"
+            checked={value.randomOrder}
+            onChange={(randomOrder) => change((c) => ({ ...c, randomOrder }))}
+          />
+          <div
+            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-white p-0.5 text-xs"
+            role="radiogroup"
+            aria-label="循环模式"
+          >
+            {(
+              [
+                ['single', '单轮 (1次)', false],
+                ['multi', '指定轮数', false],
+                ['until-stopped', '持续循环', isBs],
+              ] as const
+            ).map(([modeKey, label, modeDisabled]) => {
+              const activeMode =
+                value.loop.mode === 'until-stopped'
+                  ? 'until-stopped'
+                  : value.loop.rounds > 1
+                    ? 'multi'
+                    : 'single';
+              const active = activeMode === modeKey;
+              return (
+                <button
+                  key={modeKey}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  disabled={busy || modeDisabled}
+                  title={
+                    modeDisabled
+                      ? '蓝蝶模拟器暂不支持持续循环模式'
+                      : modeKey === 'until-stopped'
+                        ? '持续循环（直到手动停止）'
+                        : undefined
+                  }
+                  className={`h-6 cursor-pointer rounded-md border-0 px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                    active
+                      ? 'bg-[var(--brand)] font-semibold text-white'
+                      : 'bg-transparent text-[var(--text-2)] hover:bg-slate-100 hover:text-[var(--text)]'
+                  }`}
+                  onClick={() => {
+                    if (modeKey === 'single')
+                      change((c) => ({ ...c, loop: { mode: 'finite', rounds: 1 } }));
+                    else if (modeKey === 'multi')
+                      change((c) => ({
+                        ...c,
+                        loop: {
+                          mode: 'finite',
+                          rounds:
+                            c.loop.mode === 'finite' && c.loop.rounds >= 2 ? c.loop.rounds : 2,
+                        },
+                      }));
+                    else change((c) => ({ ...c, loop: { mode: 'until-stopped' } }));
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+            {value.loop.mode === 'finite' && value.loop.rounds > 1 && (
+              <div className={`${UI_UNIT_FIELD} ml-0.5 h-6`}>
+                <ControlledNumberInput
+                  ariaLabel="循环轮数"
+                  className="h-full w-11 border-0 bg-transparent px-1.5 text-center text-xs font-semibold tabular-nums text-[var(--text)] focus:outline-none"
+                  min={2}
+                  max={20}
+                  debounceMs={0}
+                  defaultValue={2}
+                  value={value.loop.rounds}
+                  disabled={busy}
+                  onChange={(rounds) => change((c) => ({ ...c, loop: { mode: 'finite', rounds } }))}
+                />
+                <span className="border-l border-[var(--line)] bg-slate-50 px-1.5 text-[11px] leading-6 font-medium text-[var(--text-3)] select-none">
+                  轮
+                </span>
+              </div>
+            )}
+          </div>
+          {value.loop.mode === 'until-stopped' && <span className={UI_HINT}>直到手动停止</span>}
+        </div>
         <div className="flex items-center gap-2">
           <Btn sm={false} disabled={busy} onClick={p.onClose}>
             返回

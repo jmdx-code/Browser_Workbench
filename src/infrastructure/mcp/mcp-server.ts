@@ -12,7 +12,6 @@ import { createAgentBrowserTools } from './tools-browser.js';
 import { createMonitorAndDiagnosticTools } from './tools-monitor-diagnostics.js';
 import { createPosterAndModuleTools } from './tools-poster-modules.js';
 import { createWorkspaceAndTargetTools } from './tools-workspace-targets.js';
-
 const PROTOCOL_VERSIONS = new Set(['2025-06-18', '2025-03-26', '2024-11-05']);
 const NON_MUTATION_TOOLS = new Set(
   'wb_browser_open wb_browser_observe wb_browser_act wb_browser_screenshot wb_browser_close wb_inspect_profiles wb_wait_for_task'.split(
@@ -43,7 +42,6 @@ const sendJson = (res: http.ServerResponse, status: number, payload: unknown): t
   res.end(JSON.stringify(payload));
   return true;
 };
-
 async function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -56,7 +54,6 @@ async function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promis
   if (!raw) throw new Error('MCP_EMPTY_BODY');
   return JSON.parse(raw) as unknown;
 }
-
 export function buildWorkbenchMcpTools(deps: WorkbenchMcpDependencies): McpToolDefinition[] {
   return [
     ...createWorkspaceAndTargetTools(deps),
@@ -66,7 +63,6 @@ export function buildWorkbenchMcpTools(deps: WorkbenchMcpDependencies): McpToolD
     ...createAgentBrowserTools(deps),
   ];
 }
-
 export function isLocalMcpRequestAllowed(
   req: http.IncomingMessage,
   expectedPort: number,
@@ -91,14 +87,12 @@ export function isLocalMcpRequestAllowed(
     return { allowed: false, reason: 'ORIGIN_REJECTED' };
   return { allowed: true };
 }
-
 export function createWorkbenchMcpHttpHandler(
   deps: WorkbenchMcpDependencies,
   expectedPort: number,
 ) {
   const tools = buildWorkbenchMcpTools(deps);
   const byName = new Map(tools.map((t) => [t.name, t]));
-
   const dispatch = async (rawMsg: unknown): Promise<JsonRpcResponse | null> => {
     if (typeof rawMsg !== 'object' || rawMsg === null || Array.isArray(rawMsg))
       return rpcErr(null, -32600, 'Invalid Request');
@@ -133,7 +127,6 @@ export function createWorkbenchMcpHttpHandler(
       });
     if (msg.method !== 'tools/call')
       return rpcErr(rpcId, -32601, `Method not found: ${msg.method}`);
-
     const name = typeof p.name === 'string' ? p.name.trim() : '';
     const tool = byName.get(name);
     if (!tool) return rpcErr(rpcId, -32602, `Unknown MCP tool: ${name}`);
@@ -145,10 +138,7 @@ export function createWorkbenchMcpHttpHandler(
         !skipLock && deps.withMutation
           ? await deps.withMutation(() => tool.handler(args))
           : await tool.handler(args);
-      devDiag.record({
-        level: result.isError ? 'WARN' : 'INFO',
-        category: 'HTTP_API',
-        event: 'MCP_TOOL_CALL',
+      devDiag.emit(result.isError ? 'WARN' : 'INFO', 'HTTP_API', 'MCP_TOOL_CALL', {
         durationMs: Date.now() - t0,
         data: { tool: name, isError: Boolean(result.isError) },
       });
@@ -156,10 +146,7 @@ export function createWorkbenchMcpHttpHandler(
     } catch (err) {
       const code = err instanceof ProductError ? err.code : 'TOOL_EXECUTION_ERROR';
       const msgText = err instanceof Error ? err.message : String(err);
-      devDiag.record({
-        level: 'WARN',
-        category: 'HTTP_API',
-        event: 'MCP_TOOL_ERROR',
+      devDiag.emit('WARN', 'HTTP_API', 'MCP_TOOL_ERROR', {
         durationMs: Date.now() - t0,
         reason: code,
         data: { tool: name, message: msgText.slice(0, 400) },
@@ -167,7 +154,6 @@ export function createWorkbenchMcpHttpHandler(
       return rpcOk(rpcId, errorResult(code, msgText));
     }
   };
-
   return async (req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> => {
     const check = isLocalMcpRequestAllowed(req, expectedPort);
     if (!check.allowed) return sendJson(res, 403, { error: check.reason ?? 'FORBIDDEN' });

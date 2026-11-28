@@ -1,12 +1,6 @@
 import { extractGroupId } from '../shared/group-inviter.js';
 export { extractGroupId } from '../shared/group-inviter.js';
-
-export interface DraftGroupEntry {
-  key: string;
-  groupId: string;
-  groupName: string;
-}
-
+export type DraftGroupEntry = { key: string; groupId: string; groupName: string };
 function groupPair(line: string, normalizeId = extractGroupId): [string, string] | null {
   const explicit = /^([^\t,，|]+)[\t,，|]+(.*)$/.exec(line);
   if (explicit) {
@@ -23,7 +17,6 @@ function groupPair(line: string, normalizeId = extractGroupId): [string, string]
   }
   return null;
 }
-
 export function parseGroupClipboard(text: string): string[][] {
   const rows: string[][] = [];
   let row: string[] = [],

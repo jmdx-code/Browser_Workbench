@@ -1,12 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { z } from 'zod';
 import { computeCascadeRects, computeMultiDisplayTilePlan } from '../../domain/window-layout.js';
-import {
-  bluestacksDisplayTitle,
-  type BluestacksInstance,
-  type BluestacksState,
-} from '../../shared/bluestacks.js';
-import type { Profile } from '../../shared/contracts.js';
+import { bluestacksDisplayTitle, type BluestacksState } from '../../shared/bluestacks.js';
+import { profileDisplayName, type Group, type Profile } from '../../shared/contracts.js';
 import {
   defaultWindowLayout,
   WindowLayoutOverview,
@@ -16,59 +12,80 @@ import {
   type WindowLayoutPreset,
 } from '../../shared/window-layout.js';
 import { api } from '../api.js';
-import { IconGlobe, IconSmartphone, IconWindow } from '../icons.js';
+import { IconAlertTriangle, IconGlobe, IconSmartphone } from '../icons.js';
+import { PageHeader, UI_INPUT_SM, UI_ROW, UI_SELECT_SM, UiSwitch } from '../ui/primitives.js';
+import { Btn, errMsg, NoticeBanner, SegTabs } from './shared/module-ui.js';
 import {
-  PageHeader,
-  UI_CARD,
-  UI_INPUT,
-  UI_INPUT_SM,
-  UI_SELECT,
-  UI_SELECT_SM,
-  UiSwitch,
-} from '../ui/primitives.js';
-import { Btn, errMsg, Fld, NoticeBanner, SegTabs } from './shared/module-ui.js';
+  mapBluestacksToScopeOptions,
+  mapProfilesToScopeOptions,
+  TargetScopeBar,
+} from './shared/target-scope-bar.js';
 import {
-  clampInt,
+  BluestacksWindowLayoutSection,
   computeDisplayBounds,
   getTargetProfileIds,
   normalizeTileConfigs,
+  readStoredBsLayout,
+  saveStoredBsLayout,
   WindowLayoutPreviewCanvas,
   WindowLayoutSettingsPanel,
 } from './window-layout-preview-canvas.js';
-
-const CASCADE_KEYS = [
-  'cascadeWidth',
-  'cascadeHeight',
-  'cascadeStepX',
-  'cascadeStepY',
-  'cascadeStartX',
-  'cascadeStartY',
-] as const;
-const pickCascade = (s: Pick<LayoutSettings, (typeof CASCADE_KEYS)[number]>) =>
-  Object.fromEntries(CASCADE_KEYS.map((k) => [k, s[k]])) as Pick<
+const pickCascade = (
+  s: Pick<
     LayoutSettings,
-    (typeof CASCADE_KEYS)[number]
-  >;
-
+    | 'cascadeWidth'
+    | 'cascadeHeight'
+    | 'cascadeStepX'
+    | 'cascadeStepY'
+    | 'cascadeStartX'
+    | 'cascadeStartY'
+  >,
+) => ({
+  cascadeWidth: s.cascadeWidth,
+  cascadeHeight: s.cascadeHeight,
+  cascadeStepX: s.cascadeStepX,
+  cascadeStepY: s.cascadeStepY,
+  cascadeStartX: s.cascadeStartX,
+  cascadeStartY: s.cascadeStartY,
+});
 type OverviewData = z.infer<typeof WindowLayoutOverview>;
 const EMPTY_SET = new Set<string>();
-
+function EmptyScopeBanner(p: { msg: string; onPick: () => void; onAll: () => void }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50/90 px-3.5 py-2.5 text-xs text-amber-900">
+      <span>{p.msg}</span>
+      <div className={UI_ROW}>
+        <Btn onClick={p.onPick}>去勾选</Btn>
+        <Btn v="primary" onClick={p.onAll}>
+          切为全部在线
+        </Btn>
+      </div>
+    </div>
+  );
+}
 export function WindowLayoutPage(p: {
   profiles: Profile[];
+  profileGroups?: readonly Group[];
   selectedProfileIds?: Set<string>;
+  onSelectProfiles?: (next: Set<string>) => void;
   bluestacks?: BluestacksState | null;
   bluestacksState?: BluestacksState | null;
   selectedBluestacksIds?: ReadonlySet<string>;
+  onSelectBluestacks?: (next: Set<string>) => void;
   onRefreshBluestacks?: () => Promise<unknown>;
   onBluestacksState?: (next: BluestacksState) => void;
   initialCarrier?: 'browser' | 'bluestacks';
+  onCarrierChange?: (carrier: 'browser' | 'bluestacks') => void;
   onNotify?: (message: string) => void;
   onMessage?: (message: string) => void;
 }) {
   const {
     profiles,
+    profileGroups = [],
     selectedProfileIds = EMPTY_SET,
-    selectedBluestacksIds,
+    onSelectProfiles,
+    selectedBluestacksIds = EMPTY_SET,
+    onSelectBluestacks,
     onRefreshBluestacks,
     onBluestacksState,
   } = p;
@@ -80,27 +97,36 @@ export function WindowLayoutPage(p: {
   const [targetKind, setTargetKind] = useState<'browser' | 'bluestacks'>(
     p.initialCarrier ?? 'browser',
   );
+  useEffect(() => {
+    if (p.initialCarrier) setTargetKind(p.initialCarrier);
+  }, [p.initialCarrier]);
   const [overview, setOverview] = useState<OverviewData | null>(null);
   const [settings, setSettings] = useState<LayoutSettings>(defaultWindowLayout);
-  const [bsScope, setBsScope] = useState<'selected' | 'all_online'>('selected');
-  const [bsColumns, setBsColumns] = useState(4),
-    [bsGap, setBsGap] = useState(8);
-  const [busy, setBusy] = useState(false),
-    [error, setError] = useState(''),
-    [presetName, setPresetName] = useState('');
-
+  const initialBs = useMemo(readStoredBsLayout, []);
+  const [bsScope, setBsScope] = useState<'selected' | 'all_online'>(initialBs.scope);
+  const [bsColumns, setBsColumns] = useState(initialBs.columns);
+  const [bsGap, setBsGap] = useState(initialBs.gap);
+  const [bsDisplayId, setBsDisplayId] = useState(initialBs.displayId);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [presetName, setPresetName] = useState('');
+  const [scopePulse, setScopePulse] = useState(false);
+  const scopeBarRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    saveStoredBsLayout({ scope: bsScope, columns: bsColumns, gap: bsGap, displayId: bsDisplayId });
+  }, [bsScope, bsColumns, bsGap, bsDisplayId]);
   const bsOnline = useMemo(
     () => (effectiveBsState?.instances ?? []).filter((i) => i.online),
     [effectiveBsState?.instances],
   );
-  const bsTargetIds = useMemo(() => {
-    const picked =
-      bsScope === 'selected' && selectedBluestacksIds?.size
+  const bsTargetIds = useMemo(
+    () =>
+      (bsScope === 'selected'
         ? bsOnline.filter((i) => selectedBluestacksIds.has(i.id))
-        : [];
-    return (picked.length > 0 ? picked : bsOnline).map((i) => i.id);
-  }, [bsOnline, selectedBluestacksIds, bsScope]);
-
+        : bsOnline
+      ).map((i) => i.id),
+    [bsOnline, selectedBluestacksIds, bsScope],
+  );
   async function runBusy(work: () => Promise<void>) {
     setBusy(true);
     setError('');
@@ -114,7 +140,6 @@ export function WindowLayoutPage(p: {
       setBusy(false);
     }
   }
-
   const loadSnapshot = () =>
     runBusy(async () => {
       const v = await api.windowLayout(),
@@ -134,11 +159,9 @@ export function WindowLayoutPage(p: {
       });
       if (v.error) setError(windowLayoutMessage(v.error));
     });
-
   useEffect(() => {
     void loadSnapshot();
   }, []);
-
   const displays = overview?.displays ?? [],
     mode = settings.mode ?? 'cascade',
     tileGap = settings.tileGap ?? 8,
@@ -151,8 +174,8 @@ export function WindowLayoutPage(p: {
   );
   const onlineProfiles = useMemo(() => profiles.filter((pr) => pr.online), [profiles]);
   const targetIds = useMemo(
-    () => getTargetProfileIds(profiles, selectedProfileIds, applyScope, applySort),
-    [profiles, selectedProfileIds, applyScope, applySort],
+    () => getTargetProfileIds(profiles, selectedProfileIds, applyScope, applySort, profileGroups),
+    [profiles, selectedProfileIds, applyScope, applySort, profileGroups],
   );
   const secondaryDisplay = useMemo(
     () => displays.find((d) => !d.primary) ?? displays[1],
@@ -162,6 +185,20 @@ export function WindowLayoutPage(p: {
     let i = 0;
     return new Map(displays.map((d) => [d.id, d.primary ? '主显示器' : `副显示器 ${++i}`]));
   }, [displays]);
+  const selectedBsDisplay = useMemo(
+    () =>
+      displays.find((d) => d.id === bsDisplayId) ?? displays.find((d) => d.primary) ?? displays[0],
+    [displays, bsDisplayId],
+  );
+  const bsTileEst = useMemo(() => {
+    if (!selectedBsDisplay) return null;
+    const cols = Math.max(1, Math.min(10, bsColumns)),
+      rows = Math.max(1, Math.ceil(Math.max(1, bsTargetIds.length || cols) / cols));
+    return {
+      width: Math.floor((selectedBsDisplay.workArea.width - bsGap * (cols + 1)) / cols),
+      height: Math.floor((selectedBsDisplay.workArea.height - bsGap * (rows + 1)) / rows),
+    };
+  }, [selectedBsDisplay, bsColumns, bsGap, bsTargetIds.length]);
   const previewCount = Math.max(1, targetIds.length || 6);
   const previewTilePlan = useMemo(
     () =>
@@ -212,8 +249,14 @@ export function WindowLayoutPage(p: {
       setSettings(u.settings);
       emitMsg(msg);
     });
+  const emptySelectionMsg = () =>
+    applyScope === 'selected'
+      ? selectedProfileIds.size > 0
+        ? '已勾选的浏览器当前均未在线'
+        : '请先勾选至少一个在线浏览器'
+      : '当前没有在线浏览器窗口';
   const handleApply = (override?: { mode?: 'tile' | 'cascade'; targetDisplayId?: string }) => {
-    if (targetIds.length === 0) return emitMsg('当前没有在线浏览器窗口');
+    if (targetIds.length === 0) return emitMsg(emptySelectionMsg());
     return runBusy(async () => {
       await api.windowLayout({ action: 'configure', settings: cleanSave(settings) });
       const u = await api.windowLayout({
@@ -223,20 +266,21 @@ export function WindowLayoutPage(p: {
         ...(override?.targetDisplayId ? { targetDisplayId: override.targetDisplayId } : {}),
       });
       setOverview(u);
-      const c = u.movedCount ?? targetIds.length;
+      const c = u.movedCount ?? targetIds.length,
+        failCount = u.failedProfiles?.length ?? 0;
       emitMsg(
-        override?.targetDisplayId
+        (override?.targetDisplayId
           ? `已将 ${c} 个窗口移到副屏并整理`
-          : `已按「${(override?.mode ?? mode) === 'tile' ? '平铺' : '堆叠'}」整理 ${c} 个浏览器窗口`,
+          : `已按「${(override?.mode ?? mode) === 'tile' ? '平铺' : '堆叠'}」整理 ${c} 个浏览器窗口`) +
+          (failCount > 0 ? `（另有 ${failCount} 个窗口移动失败）` : ''),
       );
     });
   };
   const handleFocusAll = () => {
-    const ids = onlineProfiles.map((pr) => pr.id);
-    if (ids.length === 0) return emitMsg('当前没有在线浏览器窗口');
+    if (targetIds.length === 0) return emitMsg(emptySelectionMsg());
     return runBusy(async () => {
-      setOverview(await api.windowLayout({ action: 'focus_all', profileIds: ids }));
-      emitMsg(`已唤醒并置顶 ${ids.length} 个浏览器窗口`);
+      setOverview(await api.windowLayout({ action: 'focus_all', profileIds: targetIds }));
+      emitMsg(`已唤醒并置顶 ${targetIds.length} 个浏览器窗口`);
     });
   };
   async function handleSavePreset() {
@@ -290,21 +334,61 @@ export function WindowLayoutPage(p: {
       void onRefreshBluestacks?.();
       emitMsg(msg);
     });
-
+  const focusScopeBar = () => {
+    scopeBarRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    setScopePulse(true);
+    setTimeout(() => setScopePulse(false), 1200);
+    scopeBarRef.current?.querySelector<HTMLElement>('button, select')?.focus();
+  };
+  const isBs = targetKind === 'bluestacks';
+  const scopeItems = useMemo(
+    () =>
+      isBs ? mapBluestacksToScopeOptions(effectiveBsState) : mapProfilesToScopeOptions(profiles),
+    [isBs, effectiveBsState, profiles],
+  );
+  const scopeGroups = useMemo(
+    () =>
+      isBs
+        ? (effectiveBsState?.folders ?? []).map((f) => ({ id: f.id, name: f.name }))
+        : profileGroups,
+    [isBs, effectiveBsState?.folders, profileGroups],
+  );
+  const failedProfileLabels = useMemo(() => {
+    const failed = overview?.failedProfiles ?? [];
+    if (!failed.length) return [];
+    const byId = new Map(profiles.map((pr) => [pr.id, profileDisplayName(pr)]));
+    return failed.map((id) => byId.get(id) ?? id.slice(0, 8));
+  }, [overview?.failedProfiles, profiles]);
+  const emptySel = isBs
+    ? bsScope === 'selected' && selectedBluestacksIds.size === 0
+    : applyScope === 'selected' && selectedProfileIds.size === 0;
+  const offlineSel = isBs
+    ? bsScope === 'selected' && selectedBluestacksIds.size > 0 && bsTargetIds.length === 0
+    : applyScope === 'selected' && selectedProfileIds.size > 0 && targetIds.length === 0;
+  const emptyBannerMsg = emptySel
+    ? `当前作用范围为「仅已勾选${isBs ? '蓝蝶' : '浏览器'}」，但尚未勾选任何${isBs ? '蓝蝶窗口' : '浏览器'}。`
+    : offlineSel
+      ? `已勾选 ${isBs ? selectedBluestacksIds.size : selectedProfileIds.size} ${isBs ? '台蓝蝶' : '个浏览器'}，但当前均未${isBs ? '开机在线' : '在线'}。`
+      : null;
   return (
     <div className="mx-auto flex w-full max-w-[1380px] flex-col gap-4">
       <PageHeader
         title="窗口排版"
         subtitle={
-          targetKind === 'bluestacks'
+          isBs
             ? `统一平铺当前在线的蓝蝶模拟器窗口（当前在线 ${bsOnline.length} 台 · 待排版 ${bsTargetIds.length} 台）`
-            : `管理所有已安装桥接扩展的 Chrome 窗口位置（当前在线 ${onlineProfiles.length} 个 · 待排版 ${targetIds.length} 个）`
+            : applyScope === 'selected'
+              ? `仅管理已勾选的 Chrome 窗口位置（已勾选 ${selectedProfileIds.size} 个 · 在线待排版 ${targetIds.length} 个）`
+              : `管理所有已安装桥接扩展的 Chrome 窗口位置（当前在线 ${onlineProfiles.length} 个 · 待排版 ${targetIds.length} 个）`
         }
         actions={
-          <div className="flex flex-wrap items-center gap-2">
+          <div className={UI_ROW}>
             <SegTabs
               value={targetKind}
-              onChange={setTargetKind}
+              onChange={(next) => {
+                setTargetKind(next);
+                p.onCarrierChange?.(next);
+              }}
               options={[
                 [
                   'browser',
@@ -315,25 +399,38 @@ export function WindowLayoutPage(p: {
                 [
                   'bluestacks',
                   <>
-                    <IconSmartphone size={13} /> 蓝蝶窗口 ({bsOnline.length})
+                    {' '}
+                    <IconSmartphone size={13} /> 蓝蝶窗口 ({bsOnline.length}){' '}
                   </>,
                 ],
               ]}
             />
-            {targetKind === 'bluestacks' ? (
+            {isBs ? (
               <Btn
                 v="primary"
                 sm={false}
                 disabled={busy || bsTargetIds.length === 0}
                 onClick={() =>
                   bsTargetIds.length === 0
-                    ? emitMsg('当前没有可排版的在线蓝蝶窗口')
+                    ? emitMsg(
+                        emptySel ? '请先勾选至少一个在线蓝蝶窗口' : '当前没有可排版的在线蓝蝶窗口',
+                      )
                     : runBs(
                         'instances/arrange',
                         {
                           instanceIds: bsTargetIds,
                           columns: Math.max(1, Math.min(10, bsColumns)),
                           gap: Math.max(0, Math.min(48, bsGap)),
+                          ...(selectedBsDisplay
+                            ? {
+                                monitorBounds: {
+                                  left: selectedBsDisplay.workArea.x,
+                                  top: selectedBsDisplay.workArea.y,
+                                  width: selectedBsDisplay.workArea.width,
+                                  height: selectedBsDisplay.workArea.height,
+                                },
+                              }
+                            : {}),
                         },
                         `已整齐平铺 ${bsTargetIds.length} 个蓝蝶模拟器窗口`,
                       )
@@ -353,10 +450,10 @@ export function WindowLayoutPage(p: {
                 </Btn>
                 <Btn
                   sm={false}
-                  disabled={busy || onlineProfiles.length === 0}
+                  disabled={busy || targetIds.length === 0}
                   onClick={() => void handleFocusAll()}
                 >
-                  全部置顶
+                  {applyScope === 'selected' ? `置顶已选 (${targetIds.length})` : '全部置顶'}
                 </Btn>
                 {secondaryDisplay && (
                   <Btn
@@ -375,93 +472,67 @@ export function WindowLayoutPage(p: {
           </div>
         }
       />
+      <div
+        ref={scopeBarRef}
+        className={
+          scopePulse ? 'rounded-lg ring-2 ring-[var(--brand)] ring-offset-2 transition-shadow' : ''
+        }
+      >
+        <TargetScopeBar
+          carrier={targetKind}
+          items={scopeItems}
+          groups={scopeGroups}
+          selectedIds={isBs ? selectedBluestacksIds : selectedProfileIds}
+          onSelect={isBs ? onSelectBluestacks : onSelectProfiles}
+        />
+      </div>
       {error && <NoticeBanner tone="err">{error}</NoticeBanner>}
-      {targetKind === 'bluestacks' ? (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(320px,380px)_minmax(0,1fr)]">
-          <section className={`${UI_CARD} flex min-w-0 flex-col gap-3 p-4`}>
-            <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-slate-900">
-              <IconSmartphone size={15} /> 蓝蝶网格排版参数
-            </span>
-            <Fld label="作用范围">
-              <select
-                className={UI_SELECT}
-                value={bsScope}
-                onChange={(e) =>
-                  setBsScope(e.target.value === 'all_online' ? 'all_online' : 'selected')
-                }
-              >
-                <option value="selected">已勾选蓝蝶（未选则全部在线）</option>
-                <option value="all_online">全部在线蓝蝶</option>
-              </select>
-            </Fld>
-            <div className="grid grid-cols-2 gap-3">
-              <Fld label="每行窗口列数">
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  className={UI_INPUT}
-                  value={bsColumns}
-                  onChange={(e) => setBsColumns(clampInt(e.target.value, 1, 10, 4))}
-                />
-              </Fld>
-              <Fld label="窗口间距 (px)">
-                <input
-                  type="number"
-                  min={0}
-                  max={48}
-                  className={UI_INPUT}
-                  value={bsGap}
-                  onChange={(e) => setBsGap(clampInt(e.target.value, 0, 48, 8))}
-                />
-              </Fld>
-            </div>
-            <p className="m-0 text-[11px] leading-relaxed text-slate-500">
-              蓝蝶窗口按当前桌面分辨率自动适配纵横比网格排版（默认每行 {bsColumns} 台，间距 {bsGap}{' '}
-              px）。
-            </p>
-          </section>
-          <section className={`${UI_CARD} flex min-w-0 flex-col gap-3 p-4`}>
-            <span className="text-sm font-semibold text-slate-900">
-              在线蓝蝶窗口列表 ({bsOnline.length})
-            </span>
-            {bsOnline.length === 0 ? (
-              <div className="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-3 text-xs text-amber-800">
-                当前暂无已开机的蓝蝶模拟器窗口。启动任意蓝蝶实例后，可在此一键网格平铺或置前定位。
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {bsOnline.map((inst: BluestacksInstance) => (
-                  <div
-                    key={inst.id}
-                    className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50/70 px-3 py-2 text-xs"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate font-medium text-slate-900">
-                        {bluestacksDisplayTitle(inst)}
-                      </div>
-                      <div className="truncate text-[11px] text-slate-500">
-                        {inst.accountName || inst.instanceKey} · 端口 {inst.adbPort}
-                      </div>
-                    </div>
-                    <Btn
-                      disabled={busy}
-                      onClick={() =>
-                        runBs(
-                          'instances/show',
-                          { instanceId: inst.id },
-                          `已前置显示 ${bluestacksDisplayTitle(inst)}`,
-                        )
-                      }
-                    >
-                      <IconWindow size={12} /> 置前
-                    </Btn>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
+      {!isBs && failedProfileLabels.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900"
+          role="alert"
+        >
+          <IconAlertTriangle size={14} className="shrink-0 text-amber-700" />
+          <span>
+            部分窗口排版失败（{failedProfileLabels.length} 个）：{failedProfileLabels.join('、')}
+            。请确认对应窗口未处于最小化/全屏状态且桥接扩展已在线。
+          </span>
         </div>
+      )}
+      {emptyBannerMsg && (
+        <EmptyScopeBanner
+          msg={emptyBannerMsg}
+          onPick={focusScopeBar}
+          onAll={() =>
+            isBs
+              ? setBsScope('all_online')
+              : setSettings((pr) => ({ ...pr, applyScope: 'all_online' }))
+          }
+        />
+      )}
+      {isBs ? (
+        <BluestacksWindowLayoutSection
+          bsScope={bsScope}
+          setBsScope={setBsScope}
+          bsColumns={bsColumns}
+          setBsColumns={setBsColumns}
+          bsGap={bsGap}
+          setBsGap={setBsGap}
+          displays={displays}
+          displayLabels={displayLabels}
+          selectedBsDisplay={selectedBsDisplay}
+          setBsDisplayId={setBsDisplayId}
+          bsTileEst={bsTileEst}
+          bsOnline={bsOnline}
+          busy={busy}
+          onShowInstance={(inst) =>
+            runBs(
+              'instances/show',
+              { instanceId: inst.id },
+              `已前置显示 ${bluestacksDisplayTitle(inst)}`,
+            )
+          }
+        />
       ) : (
         <>
           <section className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-white px-4 py-3 shadow-xs">
@@ -486,7 +557,7 @@ export function WindowLayoutPage(p: {
                     }))
                   }
                 >
-                  <option value="selected">已勾选浏览器（未选则全部在线）</option>
+                  <option value="selected">仅已勾选浏览器</option>
                   <option value="all_online">全部在线浏览器</option>
                 </select>
               </label>
@@ -512,7 +583,7 @@ export function WindowLayoutPage(p: {
                 onCheckedChange={(checked) => setSettings((pr) => ({ ...pr, enabled: checked }))}
               />
             </div>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className={UI_ROW}>
               {(settings.presets ?? []).map((preset) => (
                 <div
                   key={preset.id}

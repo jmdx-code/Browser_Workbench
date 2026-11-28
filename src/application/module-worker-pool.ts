@@ -1,4 +1,5 @@
 import type { Awaitable } from '../domain/persistence.js';
+import type { CheckDailyRiskLimitFn, DailyRiskActionKind } from '../shared/daily-risk-limits.js';
 import type { BumperRefreshResult, BumperTarget } from '../shared/group-bumper.js';
 import type { PostBumpRecordsPort } from '../shared/post-bump-records.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
@@ -8,23 +9,68 @@ import {
   admitProfilesForStart,
   type ProfileStartAdmissionResult,
 } from './profile-start-admission.js';
-import type { Workboard } from './workboard.js';
-
+import { throwIfAborted, type CarrierKind, type Workboard } from './workboard.js';
 export const HARD_BLOCK_MSG_RE =
   /未登录|登录失效|退出登录|账号受限|封号|封禁|停用|账号异常|验证页面|手机验证|身份验证|需验证|安全验证|checkpoint|login/i;
-
 export const randIntInRange = (min: number, max: number) =>
   Math.floor(min + Math.random() * (max - min + 1));
-
+export async function pickRandomFreeJob<T extends { group: { id: string } }>(
+  queue: T[],
+  activeGroupIds: ReadonlySet<string>,
+  isAborted: () => boolean,
+  sleepInterval: () => Promise<void>,
+  shouldSkip: (job: T) => Awaitable<boolean>,
+): Promise<T | null> {
+  while (queue.length && !isAborted()) {
+    const freeIdx = queue.flatMap((c, i) => (activeGroupIds.has(c.group.id) ? [] : [i]));
+    if (!freeIdx.length) {
+      await sleepInterval();
+      continue;
+    }
+    const idx = freeIdx[Math.floor(Math.random() * freeIdx.length)] ?? 0;
+    const [job] = queue.splice(idx, 1);
+    if (job && !(await shouldSkip(job))) return job;
+  }
+  return null;
+}
 export const errMsg = (err: unknown, fallback?: string): string =>
   err instanceof Error ? err.message : (fallback ?? String(err));
-
+export const createEnsureOnlineLaunch =
+  (
+    lifecycle: ProfileLifecyclePort | undefined,
+    isReady: (id: string) => Awaitable<boolean>,
+    onAttempt?: () => void,
+  ) =>
+  async (id: string) => {
+    if (!lifecycle) return { ok: false as const, reason: '离线或未就绪' };
+    onAttempt?.();
+    const res = await lifecycle.ensureProfilesOnline([id]).catch((e: unknown) => ({
+      startedIds: [] as string[],
+      failed: [{ profileId: id, reason: errMsg(e, '浏览器自动启动失败') }],
+    }));
+    if (await isReady(id)) return { ok: true as const };
+    const fail = res.failed.find((f) => f.profileId === id)?.reason;
+    return { ok: false as const, reason: fail ?? '浏览器已启动但插件未连接就绪' };
+  };
+export async function acquireOnlineBrowserPermit(
+  workboard: Workboard,
+  profileId: string,
+  signal: AbortSignal,
+  isReady: () => Awaitable<boolean>,
+  lifecycle: ProfileLifecyclePort | undefined,
+  onWake?: () => void,
+): Promise<{ releasePermit: () => void; online: boolean }> {
+  const releasePermit = await workboard.acquireCarrierPermit('browser', profileId, signal);
+  const online = await workboard.runStaggeredLaunch(signal, () =>
+    ensureBrowserProfileOnline(profileId, isReady, lifecycle, onWake),
+  );
+  return { releasePermit, online };
+}
 export const ignoreError = (work: Awaitable<unknown>): Promise<void> =>
   Promise.resolve(work).then(
     () => undefined,
     () => undefined,
   );
-
 export function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) return new Promise((r) => void setTimeout(r, ms).unref?.());
   if (signal.aborted) return Promise.resolve();
@@ -41,7 +87,6 @@ export function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
     signal.addEventListener('abort', onAbort, { once: true });
   });
 }
-
 export function shuffleArray<T>(items: readonly T[]): T[] {
   const copy = [...items];
   for (let i = copy.length - 1; i > 0; i--) {
@@ -55,7 +100,19 @@ export function shuffleArray<T>(items: readonly T[]): T[] {
   }
   return copy;
 }
-
+/** Stable partition placing already-online targets ahead of offline targets so permits reuse live windows first. */
+export async function sortTargetsOnlineFirst<T>(
+  targets: readonly T[],
+  isOnline: (target: T) => Awaitable<boolean>,
+): Promise<T[]> {
+  const online: T[] = [];
+  const offline: T[] = [];
+  for (const target of targets) {
+    if (await isOnline(target)) online.push(target);
+    else offline.push(target);
+  }
+  return [...online, ...offline];
+}
 export function buildStaggeredQueues<T>(
   profileIds: readonly string[],
   targets: readonly T[],
@@ -74,7 +131,6 @@ export function buildStaggeredQueues<T>(
   });
   return result;
 }
-
 export function buildProfileCountMap<T extends { today: number }>(
   counts: Record<string, number>,
   runtimeMap: ReadonlyMap<string, T>,
@@ -88,28 +144,6 @@ export function buildProfileCountMap<T extends { today: number }>(
     out[id] = { ...stat, today: mergeToday(counts[id], stat.today) };
   return out;
 }
-
-export async function acquireConcurrencySlot(options: {
-  isFull: () => boolean;
-  isAborted: () => boolean;
-  onQueued?: () => void;
-  waitStep: () => Promise<void>;
-  acquire: () => void;
-}): Promise<boolean> {
-  let queued = false;
-  while (options.isFull()) {
-    if (options.isAborted()) return false;
-    if (!queued) {
-      queued = true;
-      options.onQueued?.();
-    }
-    await options.waitStep();
-  }
-  if (options.isAborted()) return false;
-  options.acquire();
-  return true;
-}
-
 export async function awaitWorkersSettled(
   promises: ReadonlyArray<Promise<void> | undefined>,
   timeoutMs?: number,
@@ -120,7 +154,6 @@ export async function awaitWorkersSettled(
     await Promise.race([Promise.allSettled(pending), sleepMs(timeoutMs)]);
   else await Promise.allSettled(pending);
 }
-
 export async function persistProfileTaskResult(
   saveFn: ((result: ProfileTaskResultValue) => Awaitable<void>) | undefined,
   result: ProfileTaskResultValue,
@@ -132,31 +165,90 @@ export async function persistProfileTaskResult(
     /* ignore persistence errors during worker finalization */
   }
 }
-
 export function recordPostBumpFailure(
   port: PostBumpRecordsPort | undefined,
   input: Parameters<PostBumpRecordsPort['insert']>[0],
 ): void {
   if (port) void ignoreError(port.insert(input));
 }
-
-export async function launchOfflineProfileInSlot(
-  profileId: string,
-  profileLifecycle: ProfileLifecyclePort | undefined,
-  workboard: Workboard,
-  signal: AbortSignal,
-  isReady: (id: string) => Awaitable<boolean>,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  if (!profileLifecycle) return { ok: true };
-  const res = await workboard.launchPermits.run(signal, () =>
-    profileLifecycle.ensureProfilesOnline([profileId]),
+/** Enforce: check busy & daily limit -> stagger wait -> acquire permit & launch. */
+export async function acquireCarrierSlotAndLaunch(options: {
+  carrierKind: CarrierKind;
+  carrierId: string;
+  moduleId: string;
+  workboard: Workboard;
+  signal: AbortSignal;
+  featureExecution?: FeatureExecutionRegistry | undefined;
+  checkDailyLimit?: (() => Awaitable<{ allowed: boolean; reason: string | null }>) | undefined;
+  isReady: (id: string) => Awaitable<boolean>;
+  launch: (id: string) => Awaitable<{ ok: true } | { ok: false; reason: string }>;
+  staggerMs?: number | undefined;
+  onQueued?: (() => void) | undefined;
+  onLaunching?: (() => void) | undefined;
+}): Promise<
+  { ok: true; releasePermit: () => void } | { ok: false; skipped: boolean; reason: string }
+> {
+  const checkBusyAndLimit = async (): Promise<{
+    ok: false;
+    skipped: true;
+    reason: string;
+  } | null> => {
+    if (
+      options.featureExecution &&
+      (await options.featureExecution.isProfileBusy(options.carrierId, options.moduleId))
+    ) {
+      return { ok: false, skipped: true, reason: '跳过：当前目标正在执行其他任务' };
+    }
+    if (options.checkDailyLimit) {
+      const limit = await options.checkDailyLimit();
+      if (!limit.allowed) {
+        return { ok: false, skipped: true, reason: limit.reason ?? '已达今日安全日限额，自动跳过' };
+      }
+    }
+    return null;
+  };
+  throwIfAborted(options.signal);
+  const preCheck = await checkBusyAndLimit();
+  if (preCheck) return preCheck;
+  const sem =
+    options.carrierKind === 'browser'
+      ? options.workboard.browserPermits
+      : options.workboard.bluestacksPermits;
+  if (
+    sem.used >= sem.max &&
+    !options.workboard.hasCarrierPermit(options.carrierKind, options.carrierId)
+  ) {
+    options.onQueued?.();
+  }
+  const releasePermit = await options.workboard.acquireCarrierPermit(
+    options.carrierKind,
+    options.carrierId,
+    options.signal,
   );
-  const fail = res.failed.find((f) => f.profileId === profileId);
-  if (fail || !(await isReady(profileId)))
-    return { ok: false, reason: `跳过：${fail?.reason ?? '浏览器启动后未就绪'}` };
-  return { ok: true };
+  try {
+    const postWaitCheck = await checkBusyAndLimit();
+    if (postWaitCheck) {
+      releasePermit();
+      return postWaitCheck;
+    }
+    if (!(await options.isReady(options.carrierId))) {
+      options.onLaunching?.();
+      const launched = await options.workboard.runStaggeredLaunch(
+        options.signal,
+        () => Promise.resolve(options.launch(options.carrierId)),
+        options.staggerMs,
+      );
+      if (!launched.ok) {
+        releasePermit();
+        return { ok: false, skipped: false, reason: launched.reason };
+      }
+    }
+    return { ok: true, releasePermit };
+  } catch (error) {
+    releasePermit();
+    throw error;
+  }
 }
-
 export async function runTrackedScheduledWorker<T>(
   workers: Map<string, Promise<unknown>>,
   profileId: string,
@@ -169,7 +261,6 @@ export async function runTrackedScheduledWorker<T>(
     if (workers.get(profileId) === work) workers.delete(profileId);
   }
 }
-
 export async function admitAndPlanBrowserLaunch(options: {
   launchCandidates: readonly string[];
   admitIds: () => Awaitable<readonly string[]>;
@@ -239,20 +330,24 @@ export async function admitAndPlanBrowserLaunch(options: {
     : { admittedProfileIds: [], alreadyRunningIds: [], skippedBusy: [], skippedOffline: [] };
   return { pendingLaunchSet, launchFailureReasons, admission };
 }
-
 export async function ensureBrowserProfileOnline(
   profileId: string,
   isReady: () => Awaitable<boolean>,
   profileLifecycle?: ProfileLifecyclePort,
   onWaking?: () => void,
+  workboard?: Workboard,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   if (!(await isReady()) && profileLifecycle) {
     onWaking?.();
-    await profileLifecycle.ensureProfilesOnline([profileId]);
+    if (workboard) {
+      await workboard.runStaggeredLaunch(signal, () =>
+        profileLifecycle.ensureProfilesOnline([profileId]),
+      );
+    } else await profileLifecycle.ensureProfilesOnline([profileId]);
   }
   return Boolean(await isReady());
 }
-
 export function pumpQueuedWorkers<TWork extends { targetId: string }>(options: {
   queue: TWork[];
   getCapacity: () => number;
@@ -280,7 +375,6 @@ export function pumpQueuedWorkers<TWork extends { targetId: string }>(options: {
       });
   }
 }
-
 export async function runConcurrentQueue<T>(
   items: readonly T[],
   concurrency: number,
@@ -301,7 +395,6 @@ export async function runConcurrentQueue<T>(
   };
   await Promise.all(Array.from({ length: workerCount }, worker));
 }
-
 export function linkAbortSignal(external?: AbortSignal) {
   const controller = new AbortController();
   const onAbort = () => controller.abort(new Error('TASK_STOPPED'));
@@ -316,7 +409,6 @@ export function linkAbortSignal(external?: AbortSignal) {
     detach: () => external?.removeEventListener('abort', onAbort),
   };
 }
-
 export function extractRiskAbortReason(signal: AbortSignal, err: unknown): string | null {
   for (const v of [signal.reason, err]) {
     const m = v instanceof Error ? v.message : typeof v === 'string' ? v : '';
@@ -324,7 +416,6 @@ export function extractRiskAbortReason(signal: AbortSignal, err: unknown): strin
   }
   return null;
 }
-
 export function formatAvatarRefreshSummary(
   res: BumperRefreshResult | void,
   unit = '项',
@@ -340,7 +431,28 @@ export function formatAvatarRefreshSummary(
     (res.error ? `（${res.error}）` : '')
   );
 }
-
+export const checkRiskLimitSafe = (
+  fn: CheckDailyRiskLimitFn | undefined,
+  targetId: string,
+  action: DailyRiskActionKind,
+): Promise<{ allowed: boolean; reason: string | null }> =>
+  fn
+    ? Promise.resolve(fn(targetId, action)).catch(() => ({ allowed: true, reason: null }))
+    : Promise.resolve({ allowed: true, reason: null });
+export async function closeIdleProfileAfterFinish(
+  lifecycle: ProfileLifecyclePort | undefined,
+  profileId: string,
+  wait: (ms: number) => Promise<void> = sleepMs,
+): Promise<void> {
+  if (!lifecycle) return;
+  const opts = { timeoutMs: 12_000, stopTasksFirst: false };
+  const first = await lifecycle.closeProfile(profileId, opts).catch(() => null);
+  if (first?.ok) return;
+  await wait(800).catch(() => {});
+  await lifecycle
+    .closeProfile(profileId, { timeoutMs: 10_000, stopTasksFirst: false })
+    .catch(() => {});
+}
 export async function runTargetAvatarRefresh(options: {
   targets: BumperTarget[];
   refresh: (signal: AbortSignal) => Promise<BumperRefreshResult | void>;

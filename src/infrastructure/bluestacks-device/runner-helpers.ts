@@ -7,8 +7,10 @@ import {
   detectHomeTabBar,
   findTextInputNode,
   flattenLiteNodes,
+  isGalleryCameraTile,
   isReactionButtonActive,
   isSolidBlueButton,
+  makeCanonicalRect,
   type LiteXmlNode,
   type OcrRecognizer,
   type RectBounds,
@@ -308,72 +310,50 @@ export function isTaskStoppedError(err: unknown, signal?: AbortSignal): boolean 
 export function sha256NumericId(seed: string): string {
   return BigInt('0x' + createHash('sha256').update(seed).digest('hex').slice(0, 14)).toString(10);
 }
-export async function captureScreenAndXml(
+const captureScreenAndXml = async (
   devices: Pick<RunnerDevicePort, 'dumpXml' | 'screencap'>,
   serial: string,
   sw: number,
   sh: number,
   signal?: AbortSignal,
-): Promise<{ xml: LiteXmlNode | null; png: Buffer }> {
+) => {
   const [xml, png] = await Promise.all([
     devices.dumpXml(serial, sw, sh, signal),
     devices.screencap(serial, signal),
   ]);
   return { xml, png };
-}
-export async function detectAbnormalScreenCompat(
+};
+const detectAbnormalScreenCompat = async (
   devices: Pick<RunnerDevicePort, 'detectAbnormalScreen' | 'isLoginOrLoggedOutXml'>,
   serial: string,
   xml: LiteXmlNode | null,
   png: Buffer | undefined,
   signal: AbortSignal,
-): Promise<'logged-out' | 'restricted' | 'verification' | null> {
-  if (typeof devices.detectAbnormalScreen === 'function')
-    return await devices.detectAbnormalScreen(serial, xml, png, signal);
-  if (typeof devices.isLoginOrLoggedOutXml === 'function' && devices.isLoginOrLoggedOutXml(xml))
-    return 'logged-out';
-  return null;
-}
-export function abnormalAccountErrorMessage(
-  abnormal: 'logged-out' | 'restricted' | 'verification',
-): string {
-  return abnormal === 'logged-out'
-    ? 'FB Lite 账号已退出登录'
-    : abnormal === 'verification'
-      ? 'FB Lite 账号触发安全验证 (Checkpoint)'
-      : 'FB Lite 账号已被封禁或停用';
-}
-export async function assertHealthyScreen(
+) =>
+  typeof devices.detectAbnormalScreen === 'function'
+    ? await devices.detectAbnormalScreen(serial, xml, png, signal)
+    : typeof devices.isLoginOrLoggedOutXml === 'function' && devices.isLoginOrLoggedOutXml(xml)
+      ? 'logged-out'
+      : null;
+const assertHealthyScreen = async (
   devices: Pick<RunnerDevicePort, 'detectAbnormalScreen' | 'isLoginOrLoggedOutXml'>,
   serial: string,
   xml: LiteXmlNode | null,
   png: Buffer,
   signal: AbortSignal,
-): Promise<void> {
-  const abnormal = await detectAbnormalScreenCompat(devices, serial, xml, png, signal);
-  if (abnormal) throw new Error(abnormalAccountErrorMessage(abnormal));
-}
-export async function openDeepLinkAndInspect(
-  devices: RunnerDevicePort,
-  inst: Pick<BluestacksInstance, 'serial' | 'fbWidth' | 'fbHeight'>,
-  url: string,
-  waitMs: number,
-  signal: AbortSignal,
-): Promise<{ xml: LiteXmlNode | null; png: Buffer }> {
-  const { serial, fbWidth: sw, fbHeight: sh } = inst;
-  await devices.openDeepLink(serial, url, sw, sh, signal);
-  await abortableWait(waitMs, signal);
-  const { xml, png } = await captureScreenAndXml(devices, serial, sw, sh, signal);
-  await assertHealthyScreen(devices, serial, xml, png, signal);
-  return { xml, png };
-}
-export async function ocrCompact(
-  ocr: OcrRecognizer,
-  png: Buffer,
-  rect: RectBounds,
-): Promise<string> {
-  return (await ocr.recognizeBounds(png, rect)).replace(/\s+/g, '');
-}
+) => {
+  const abn = await detectAbnormalScreenCompat(devices, serial, xml, png, signal);
+  if (abn)
+    throw new Error(
+      abn === 'logged-out'
+        ? 'FB Lite 账号已退出登录'
+        : abn === 'verification'
+          ? 'FB Lite 账号触发安全验证 (Checkpoint)'
+          : 'FB Lite 账号已被封禁或停用',
+    );
+};
+const ocrCompact = async (ocr: OcrRecognizer, png: Buffer, rect: RectBounds) =>
+  (await ocr.recognizeBounds(png, rect)).replace(/\s+/g, '');
 export function filterClickableNodes(
   root: LiteXmlNode | null,
   pred: (n: LiteXmlNode) => boolean,
@@ -385,41 +365,6 @@ export function filterClickableNodes(
 }
 const waitAfter = (op: Promise<unknown>, waitMs: number, signal: AbortSignal) =>
   op.then(() => (waitMs > 0 ? abortableWait(waitMs, signal) : undefined));
-export const tapAndWait = (
-  devices: Pick<RunnerDevicePort, 'tap900'>,
-  serial: string,
-  x: number,
-  y: number,
-  sw: number,
-  sh: number,
-  waitMs: number,
-  signal: AbortSignal,
-): Promise<void> => waitAfter(devices.tap900(serial, x, y, sw, sh, signal), waitMs, signal);
-export const swipeAndWait = (
-  devices: Pick<RunnerDevicePort, 'swipe900'>,
-  serial: string,
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
-  durationMs: number,
-  sw: number,
-  sh: number,
-  waitMs: number,
-  signal: AbortSignal,
-): Promise<void> =>
-  waitAfter(devices.swipe900(serial, x1, y1, x2, y2, durationMs, sw, sh, signal), waitMs, signal);
-export const backAndWait = (
-  devices: Pick<RunnerDevicePort, 'keyevent'>,
-  serial: string,
-  waitMs: number,
-  signal: AbortSignal,
-): Promise<void> =>
-  waitAfter(
-    devices.keyevent(serial, 4, signal).catch(() => null),
-    waitMs,
-    signal,
-  );
 export async function findOcrNode(
   ocr: OcrRecognizer,
   png: Buffer,
@@ -433,20 +378,6 @@ export async function findOcrNode(
     if (pattern.test(text)) return { node, text };
   }
   return null;
-}
-export async function tapLikeAndVerify(
-  devices: Pick<RunnerDevicePort, 'tap900' | 'screencap'>,
-  serial: string,
-  bounds: RectBounds,
-  sw: number,
-  sh: number,
-  waitMs: number,
-  signal: AbortSignal,
-): Promise<{ ok: boolean; afterPng: Buffer }> {
-  await devices.tap900(serial, bounds.cx, bounds.cy, sw, sh, signal);
-  await abortableWait(waitMs, signal);
-  const afterPng = await devices.screencap(serial, signal);
-  return { ok: await isReactionButtonActive(afterPng, bounds), afterPng };
 }
 export async function dismissComposerWithDiscard(
   devices: Pick<RunnerDevicePort, 'keyevent' | 'screencap' | 'dumpXml' | 'tap900'>,
@@ -479,6 +410,49 @@ export async function dismissComposerWithDiscard(
     await abortableWait(500, signal).catch(() => null);
   }
 }
+export const GALLERY_NEXT_RE =
+  /继续|繼續|continue|下一步|完成|确定|確定|next|done|ရှေ့ဆက်|tiếp|ถัดไป/i;
+const GALLERY_CAMERA_RE = /相机|相機|camera|拍照|录像|錄影|ကင်မရာ|máyảnh|กล้อง/i;
+export function extractGalleryGridTiles(root: LiteXmlNode | null): LiteXmlNode[] {
+  const all = flattenLiteNodes(root);
+  const explicit = all.filter(
+    (n) =>
+      (/gallery_item_image/i.test(n.resourceId) || /GalleryImageView/i.test(n.className)) &&
+      n.bounds.y1 >= 95 &&
+      n.bounds.y2 <= 1495 &&
+      n.bounds.w >= 100 &&
+      n.bounds.w <= 450 &&
+      n.bounds.h >= 100 &&
+      n.bounds.h <= 480,
+  );
+  const raw =
+    explicit.length > 0
+      ? explicit
+      : all.filter(
+          (n) =>
+            n.clickable &&
+            n.bounds.y1 >= 100 &&
+            n.bounds.y2 <= 1460 &&
+            n.bounds.w >= 100 &&
+            n.bounds.w <= 450 &&
+            n.bounds.h >= 100 &&
+            n.bounds.h <= 480,
+        );
+  const dedup: LiteXmlNode[] = [];
+  for (const n of raw) {
+    if (
+      !dedup.some(
+        (k) => Math.abs(k.bounds.x1 - n.bounds.x1) <= 8 && Math.abs(k.bounds.y1 - n.bounds.y1) <= 8,
+      )
+    ) {
+      dedup.push(n);
+    }
+  }
+  return dedup.sort(
+    (a, b) =>
+      Math.round(a.bounds.y1 / 80) - Math.round(b.bounds.y1 / 80) || a.bounds.x1 - b.bounds.x1,
+  );
+}
 export async function attachGalleryMedia(
   devices: Pick<RunnerDevicePort, 'screencap' | 'dumpXml' | 'tap900'>,
   ocr: OcrRecognizer,
@@ -496,28 +470,20 @@ export async function attachGalleryMedia(
       sh,
       signal,
     );
-    const gridTiles = flattenLiteNodes(pickerXml)
-      .filter(
-        (n) =>
-          n.clickable &&
-          n.bounds.y1 >= 160 &&
-          n.bounds.y2 <= 1250 &&
-          n.bounds.w >= 120 &&
-          n.bounds.w <= 430 &&
-          n.bounds.h >= 120 &&
-          n.bounds.h <= 460,
-      )
-      .sort(
-        (a, b) =>
-          Math.round(a.bounds.y1 / 80) - Math.round(b.bounds.y1 / 80) || a.bounds.x1 - b.bounds.x1,
-      );
+    const gridTiles = extractGalleryGridTiles(pickerXml);
     let pickedTile: LiteXmlNode | null = null;
-    for (const tile of gridTiles.slice(0, 6)) {
-      const tileTxt = (await ocr.recognizeBounds(pickerPng, tile.bounds)).replace(/\s+/g, '');
-      if (!/相机|相機|camera|拍照|录像|錄影/i.test(tileTxt)) {
-        pickedTile = tile;
-        break;
-      }
+    for (let i = 0; i < Math.min(8, gridTiles.length); i++) {
+      const tile = gridTiles[i];
+      if (!tile) continue;
+      const nodeText = `${tile.text} ${tile.contentDesc}`.replace(/\s+/g, '');
+      const tileTxt = (await ocr.recognizeBounds(pickerPng, tile.bounds).catch(() => '')).replace(
+        /\s+/g,
+        '',
+      );
+      if (GALLERY_CAMERA_RE.test(nodeText) || GALLERY_CAMERA_RE.test(tileTxt)) continue;
+      if (i === 0 && (await isGalleryCameraTile(pickerPng, tile.bounds))) continue;
+      pickedTile = tile;
+      break;
     }
     await devices.tap900(
       serial,
@@ -527,29 +493,40 @@ export async function attachGalleryMedia(
       sh,
       signal,
     );
-  } else {
-    await devices.tap900(serial, 150, 340, sw, sh, signal);
-  }
+  } else await devices.tap900(serial, 150, 340, sw, sh, signal);
   await abortableWait(1800, signal);
   const { xml: galXml, png: galPng } = await captureScreenAndXml(devices, serial, sw, sh, signal);
-  const nextBtns = flattenLiteNodes(galXml).filter(
-    (n) => n.clickable && n.bounds.x1 >= 650 && n.bounds.y1 <= 160 && n.bounds.h >= 34,
-  );
-  const nextMatch = await findOcrNode(
-    ocr,
-    galPng,
-    nextBtns,
-    /下一步|完成|确定|確定|next|done|ရှေ့ဆက်|tiếp/i,
-  );
-  if (nextMatch) {
-    await devices.tap900(
-      serial,
-      nextMatch.node.bounds.cx,
-      nextMatch.node.bounds.cy,
-      sw,
-      sh,
-      signal,
-    );
+  if (scanGrid && findTextInputNode(galXml) !== null) return true;
+  const nextBtns = flattenLiteNodes(galXml)
+    .filter(
+      (n) =>
+        n.clickable &&
+        ((n.bounds.x1 >= 560 && n.bounds.y1 <= 200 && n.bounds.h >= 34 && n.bounds.h <= 125) ||
+          (n.bounds.y1 >= 1340 &&
+            n.bounds.y2 <= 1600 &&
+            (n.bounds.x1 >= 540 || n.bounds.w >= 260) &&
+            n.bounds.h >= 38 &&
+            n.bounds.h <= 135)),
+    )
+    .sort((a, b) => b.bounds.y1 - a.bounds.y1 || b.bounds.x2 - a.bounds.x2);
+  let nextBtn =
+    nextBtns.find(
+      (n) =>
+        /multipicker_next/i.test(n.resourceId) ||
+        GALLERY_NEXT_RE.test(`${n.text} ${n.contentDesc}`.replace(/\s+/g, '')),
+    ) ??
+    (await findOcrNode(ocr, galPng, nextBtns, GALLERY_NEXT_RE))?.node ??
+    null;
+  if (!nextBtn) {
+    for (const cand of nextBtns) {
+      if (await isSolidBlueButton(galPng, cand.bounds)) {
+        nextBtn = cand;
+        break;
+      }
+    }
+  }
+  if (nextBtn) {
+    await devices.tap900(serial, nextBtn.bounds.cx, nextBtn.bounds.cy, sw, sh, signal);
     await abortableWait(scanGrid ? 2400 : 2200, signal);
     return true;
   }
@@ -572,6 +549,85 @@ export async function tapHomeTab0(
   }
   return xml;
 }
+const COMPOSER_INTERSTITIAL_RE =
+  /检查分享对象|檢查分享對象|谁能看到|誰能看到|分享对象|分享對象|所有视频帖现在都是|所有影片貼文現在都是|沿用这一设置|沿用這一設置|今后的帖子|今後的貼文|小组规则|社團規則|reviewaudience|whocansee|videosarenowreels|allvideosarenow|defaultaudience|futureposts|postaudience|grouprules|chooseaudience|selectdefaultaudience/i;
+const COMPOSER_INTERSTITIAL_CTA_RE =
+  /继续|下一步|完成|保存|确定|我同意|知道了|continue|next|done|save|ok|gotit|agree/i;
+export async function dismissComposerInterstitial(
+  devices: Pick<RunnerDevicePort, 'screencap' | 'dumpXml' | 'tap900'>,
+  ocr: OcrRecognizer,
+  serial: string,
+  sw: number,
+  sh: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  for (let step = 0; step < 4; step++) {
+    const { xml, png } = await captureScreenAndXml(devices, serial, sw, sh, signal);
+    if (findTextInputNode(xml) !== null) return true;
+    const compact = await ocrCompact(ocr, png, makeCanonicalRect(0, 40, 900, 1590));
+    if (!COMPOSER_INTERSTITIAL_RE.test(compact)) return false;
+    const bottomCtas = flattenLiteNodes(xml)
+      .filter(
+        (n) =>
+          n.clickable &&
+          n.bounds.y1 >= 1050 &&
+          n.bounds.w >= 280 &&
+          n.bounds.h >= 40 &&
+          n.bounds.h <= 145,
+      )
+      .sort((a, b) => b.bounds.y1 - a.bounds.y1);
+    let cta = (await findOcrNode(ocr, png, bottomCtas, COMPOSER_INTERSTITIAL_CTA_RE))?.node ?? null;
+    if (!cta) {
+      for (const cand of bottomCtas) {
+        if (await isSolidBlueButton(png, cand.bounds)) {
+          cta = cand;
+          break;
+        }
+      }
+    }
+    if (cta) {
+      await devices.tap900(serial, cta.bounds.cx, cta.bounds.cy, sw, sh, signal);
+    } else if (await isSolidBlueButton(png, makeCanonicalRect(40, 1515, 860, 1590))) {
+      await devices.tap900(serial, 450, 1555, sw, sh, signal);
+    } else {
+      return false;
+    }
+    await abortableWait(1500, signal);
+    for (let tick = 0; tick < 3; tick++) {
+      const { xml: postXml, png: postPng } = await captureScreenAndXml(
+        devices,
+        serial,
+        sw,
+        sh,
+        signal,
+      );
+      if (findTextInputNode(postXml) !== null) return true;
+      const postCompact = await ocrCompact(ocr, postPng, makeCanonicalRect(0, 40, 900, 1590));
+      if (COMPOSER_INTERSTITIAL_RE.test(postCompact) || detectHomeTabBar(postXml) !== null) break;
+      await abortableWait(1200, signal);
+    }
+  }
+  return findTextInputNode(await devices.dumpXml(serial, sw, sh, signal)) !== null;
+}
+export async function waitForComposerReady(
+  devices: Pick<RunnerDevicePort, 'screencap' | 'dumpXml' | 'tap900'>,
+  ocr: OcrRecognizer,
+  serial: string,
+  sw: number,
+  sh: number,
+  signal: AbortSignal,
+  maxWaitMs = 14000,
+): Promise<boolean> {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const xml = await devices.dumpXml(serial, sw, sh, signal);
+    if (findTextInputNode(xml) !== null) return true;
+    if (await dismissComposerInterstitial(devices, ocr, serial, sw, sh, signal)) return true;
+    if (detectHomeTabBar(xml) !== null) return false;
+    await abortableWait(1200, signal);
+  }
+  return findTextInputNode(await devices.dumpXml(serial, sw, sh, signal)) !== null;
+}
 export function createScreenOps(
   devices: RunnerDevicePort,
   ocr: OcrRecognizer,
@@ -591,28 +647,50 @@ export function createScreenOps(
     png: () => devices.screencap(serial, signal),
     capture: () => captureScreenAndXml(devices, serial, sw, sh, signal),
     tap: (x: number, y: number, waitMs = 0) =>
-      tapAndWait(devices, serial, x, y, sw, sh, waitMs, signal),
+      waitAfter(devices.tap900(serial, x, y, sw, sh, signal), waitMs, signal),
     swipe: (x1: number, y1: number, x2: number, y2: number, durationMs = 500, waitMs = 0) =>
-      swipeAndWait(devices, serial, x1, y1, x2, y2, durationMs, sw, sh, waitMs, signal),
-    back: (waitMs = 0) => backAndWait(devices, serial, waitMs, signal),
+      waitAfter(
+        devices.swipe900(serial, x1, y1, x2, y2, durationMs, sw, sh, signal),
+        waitMs,
+        signal,
+      ),
+    back: (waitMs = 0) =>
+      waitAfter(
+        devices.keyevent(serial, 4, signal).catch(() => null),
+        waitMs,
+        signal,
+      ),
     open: (url: string, waitMs = 0) =>
       waitAfter(devices.openDeepLink(serial, url, sw, sh, signal), waitMs, signal),
-    openInspect: (url: string, waitMs: number) =>
-      openDeepLinkAndInspect(devices, inst, url, waitMs, signal),
+    openInspect: async (url: string, waitMs: number) => {
+      await devices.openDeepLink(serial, url, sw, sh, signal);
+      await abortableWait(waitMs, signal);
+      const res = await captureScreenAndXml(devices, serial, sw, sh, signal);
+      await assertHealthyScreen(devices, serial, res.xml, res.png, signal);
+      return res;
+    },
     healthy: (xml: LiteXmlNode | null, png: Buffer) =>
       assertHealthyScreen(devices, serial, xml, png, signal),
     abnormal: (xml: LiteXmlNode | null, png?: Buffer) =>
       detectAbnormalScreenCompat(devices, serial, xml, png, signal),
     paste: (x: number, y: number, text: string) =>
       devices.pasteIntoFocused?.(serial, x, y, text, sw, sh, signal) ?? Promise.resolve(),
-    tapLike: (bounds: RectBounds, waitMs: number) =>
-      tapLikeAndVerify(devices, serial, bounds, sw, sh, waitMs, signal),
+    tapLike: async (bounds: RectBounds, waitMs: number) => {
+      await devices.tap900(serial, bounds.cx, bounds.cy, sw, sh, signal);
+      await abortableWait(waitMs, signal);
+      const afterPng = await devices.screencap(serial, signal);
+      return { ok: await isReactionButtonActive(afterPng, bounds), afterPng };
+    },
     ocr: (png: Buffer, rect: RectBounds) => ocrCompact(ocr, png, rect),
     findOcr: (png: Buffer, nodes: readonly LiteXmlNode[], pat: RegExp, requireBlue = false) =>
       findOcrNode(ocr, png, nodes, pat, requireBlue),
     attachMedia: (scanGrid: boolean) =>
       attachGalleryMedia(devices, ocr, serial, sw, sh, signal, scanGrid),
     dismissDiscard: () => dismissComposerWithDiscard(devices, ocr, serial, sw, sh, signal),
+    dismissComposerInterstitial: () =>
+      dismissComposerInterstitial(devices, ocr, serial, sw, sh, signal),
+    waitForComposerReady: (maxWaitMs = 14000) =>
+      waitForComposerReady(devices, ocr, serial, sw, sh, signal, maxWaitMs),
     tapHomeTab0: (waitMs: number) => tapHomeTab0(devices, serial, sw, sh, waitMs, signal),
   };
 }

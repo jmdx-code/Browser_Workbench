@@ -1,5 +1,5 @@
 import type { CompatibleRepository } from '../domain/persistence.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import {
   BluestacksInstanceIdsInput,
   BluestacksRiskLimitSettings,
@@ -7,6 +7,7 @@ import {
   type BluestacksInstance,
   type BluestacksState,
 } from '../shared/bluestacks.js';
+import { BumperSettings } from '../shared/group-bumper.js';
 import type { PostBumpRecordsPort } from '../shared/post-bump-records.js';
 import type { FeatureExecutionRegistry } from './feature-execution-registry.js';
 import type { Workboard } from './workboard.js';
@@ -34,6 +35,7 @@ import {
   launchInstancesOp,
   loginInstanceOp,
   showInstanceOp,
+  stopInstanceOps,
   switchIdentityOp,
 } from './bluestacks/bs-instance-ops.js';
 import { startBatchLogin, stopBatchLogin } from './bluestacks/bs-batch-login.js';
@@ -68,7 +70,6 @@ import {
   isProfileRunning as isBsProfileRunning,
   stopExtraWorkers,
 } from './bluestacks/bs-types.js';
-
 export type {
   BluestacksActiveRunnerPort,
   BluestacksActiveStepParam,
@@ -79,10 +80,8 @@ export type {
   BluestacksPosterRunnerPort,
   BluestacksServiceRepository,
 };
-
 export class BluestacksService {
   private readonly ctx: BluestacksServiceContext;
-
   constructor(
     repo: CompatibleRepository<BluestacksServiceRepository>,
     devices: BluestacksDeviceController,
@@ -147,8 +146,8 @@ export class BluestacksService {
       });
     }
   }
-
   setWorkboard = (workboard: Workboard) => void (this.ctx.workboard = workboard);
+  getWorkboard = () => this.ctx.workboard;
   setPostBumpRecords = (port: PostBumpRecordsPort) => void (this.ctx.postBumpRecords = port);
   hasExtraExecution = (kind?: ExtraExecutionKind) => hasBsExtraExecution(this.ctx, kind);
   isProfileRunning = (instanceId: string, mode?: BluestacksBumperMode) =>
@@ -156,25 +155,21 @@ export class BluestacksService {
   hasActiveExecution = (mode?: BluestacksBumperMode) => hasBsActiveExecution(this.ctx, mode);
   state = (forceDiscover = false): Promise<BluestacksState> =>
     buildServiceState(this.ctx, forceDiscover);
-
   private async runAndState(fn: () => unknown, forceDiscover = false): Promise<BluestacksState> {
     await fn();
     return this.state(forceDiscover);
   }
-
   saveRiskLimitSettings(input: unknown): Promise<BluestacksState> {
     const parsed = BluestacksRiskLimitSettings.parse(input);
     if (!this.ctx.repo.saveRiskLimitSettings)
       throw new ProductError('BLUESTACKS_RISK_UNSUPPORTED', '当前存储层暂不支持保存风控限额', 400);
     return this.runAndState(() => this.ctx.repo.saveRiskLimitSettings?.(parsed));
   }
-
   updatePaths = (input: unknown) =>
     this.runAndState(async () => {
       await this.ctx.repo.savePaths(input);
       invalidateDiscoveryCache(this.ctx);
     }, true);
-
   private async saveModeBumperSettings(
     mode: BluestacksBumperMode,
     input: unknown,
@@ -183,11 +178,6 @@ export class BluestacksService {
       mode === 'page' && this.ctx.repo.savePageBumperSettings
         ? await this.ctx.repo.savePageBumperSettings(input)
         : await this.ctx.repo.saveBumperSettings(input);
-    const otherMode: BluestacksBumperMode = mode === 'page' ? 'group' : 'page';
-    if (!this.hasActiveExecution(otherMode) || this.hasActiveExecution(mode)) {
-      this.ctx.activeConcurrencyCap = Math.max(1, saved.maxConcurrentProfiles);
-      this.ctx.workboard.bluestacksPermits.setLimit(this.ctx.activeConcurrencyCap);
-    }
     for (const q of this.ctx.queuedTasks) if (q.mode === mode) q.settings = saved;
     for (const [id, m] of this.ctx.activeWorkerModes.entries()) {
       if (m !== mode) continue;
@@ -200,26 +190,33 @@ export class BluestacksService {
     pumpWorkerPool(this.ctx);
     return this.state(false);
   }
-
   saveBumperSettings = (input: unknown) => this.saveModeBumperSettings('group', input);
   savePageBumperSettings = (input: unknown) => this.saveModeBumperSettings('page', input);
-
   async syncMaxConcurrency(maxConcurrentProfiles: number): Promise<void> {
     const capped = Math.max(1, Math.min(50, Math.round(maxConcurrentProfiles)));
-    const saved = await this.ctx.repo.savedSettings();
-    if (saved.bumperSettings.maxConcurrentProfiles !== capped)
-      await this.ctx.repo.saveBumperSettings({
-        ...saved.bumperSettings,
-        maxConcurrentProfiles: capped,
-      });
-    const pageBase = saved.pageBumperSettings ?? saved.bumperSettings;
-    if (pageBase.maxConcurrentProfiles !== capped && this.ctx.repo.savePageBumperSettings)
-      await this.ctx.repo.savePageBumperSettings({ ...pageBase, maxConcurrentProfiles: capped });
-    this.ctx.activeConcurrencyCap = capped;
     this.ctx.workboard.bluestacksPermits.setLimit(capped);
+    const saved = await this.ctx.repo.savedSettings();
+    if (saved.bumperSettings.maxConcurrentProfiles !== capped) {
+      await this.ctx.repo.saveBumperSettings(
+        BumperSettings.parse({ ...saved.bumperSettings, maxConcurrentProfiles: capped }),
+      );
+    }
+    if (
+      this.ctx.repo.savePageBumperSettings &&
+      saved.pageBumperSettings?.maxConcurrentProfiles !== capped
+    ) {
+      await this.ctx.repo.savePageBumperSettings(
+        BumperSettings.parse({
+          ...(saved.pageBumperSettings ?? saved.bumperSettings),
+          maxConcurrentProfiles: capped,
+        }),
+      );
+    }
+    for (const q of this.ctx.queuedTasks)
+      q.settings = { ...q.settings, maxConcurrentProfiles: capped };
+    for (const s of this.ctx.activeWorkerSettings.values()) s.maxConcurrentProfiles = capped;
     pumpWorkerPool(this.ctx);
   }
-
   createFolder = (input: unknown) => this.runAndState(() => this.ctx.repo.createFolder(input));
   renameFolder = (input: unknown) => this.runAndState(() => this.ctx.repo.renameFolder(input));
   deleteFolder = (input: unknown) => this.runAndState(() => this.ctx.repo.deleteFolder(input));
@@ -227,21 +224,15 @@ export class BluestacksService {
   renameInstance = (input: unknown) => this.runAndState(() => this.ctx.repo.renameInstance(input));
   reorderInstances = (input: unknown) =>
     this.runAndState(() => this.ctx.repo.reorderInstances(input));
-
   deleteInstances = (input: unknown) =>
     this.runAndState(async () => {
       const { instanceIds } = BluestacksInstanceIdsInput.parse(input);
       for (const id of instanceIds) {
         if (this.isProfileRunning(id) || (await isExternallyBusy(this.ctx, id)))
-          throw new ProductError(
-            'INSTANCE_BUSY',
-            '所选模拟器正在执行任务，请先停止后再移除记录',
-            409,
-          );
+          failError('INSTANCE_BUSY', '所选模拟器正在执行任务，请先停止后再移除记录', 409);
       }
       await this.ctx.repo.deleteInstances({ instanceIds });
     });
-
   launchInstances = (input: unknown) => this.runAndState(() => launchInstancesOp(this.ctx, input));
   closeInstances = async (input: unknown) => this.state(await closeInstancesOp(this.ctx, input));
   inspectInstances = (input: unknown) =>
@@ -275,6 +266,7 @@ export class BluestacksService {
   startInviter = (input: unknown) => this.runAndState(() => startInviter(this.ctx, input));
   stopExtra = (kind?: ExtraExecutionKind, ids?: readonly string[]) =>
     this.runAndState(() => stopExtraWorkers(this.ctx, kind, ids));
+  stopBatchOp = (ids?: readonly string[]) => this.runAndState(() => stopInstanceOps(this.ctx, ids));
   stopAllForInstances = (ids?: readonly string[]) =>
     this.runAndState(() => stopAllForInstances(this.ctx, ids));
   runScheduledHealthCheckStep = (input: Parameters<typeof runScheduledHealthCheckStep>[1]) =>

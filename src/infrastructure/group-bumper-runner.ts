@@ -1,5 +1,6 @@
 import type { GlobalAccountAbnormalReporter } from '../application/account-abnormal-reporter.js';
 import type { BumperRunner } from '../application/group-bumper-service.js';
+import { runConcurrentQueue } from '../application/module-worker-pool.js';
 import type { Core, Peer } from '../bridge/core.js';
 import type { CompatibleRepository } from '../domain/persistence.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
@@ -270,13 +271,18 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
       };
     try {
       pages = pages.map((p) => ({ ...p }));
-      for (const target of pages) {
+      const resolvedRedirects = new Array<string | null>(pages.length).fill(null);
+      await runConcurrentQueue(pages, 4, async (target, idx) => {
         session.guard();
-        const canonicalId = await readBumperPageRedirect(session.getPage(), target.id).catch(
+        resolvedRedirects[idx] = await readBumperPageRedirect(session.getPage(), target.id).catch(
           () => null,
         );
         session.guard();
-        if (canonicalId && canonicalId !== target.id) {
+      });
+      for (let i = 0; i < pages.length; i++) {
+        const target = pages[i];
+        const canonicalId = resolvedRedirects[i];
+        if (target && canonicalId && canonicalId !== target.id) {
           await session.updateMetadata('pages', target.id, { canonicalId });
           target.id = canonicalId;
         }
@@ -370,10 +376,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
           if (error instanceof BumperGroupSkipped) stats.expectedGroupSkips++;
           stats.lastGroupError = error instanceof Error ? error.message : String(error);
           callbacks.status('跳过小组 · ' + group.name + ' · ' + stats.lastGroupError);
-          devDiag.record({
-            level: 'WARN',
-            category: 'GROUP_BUMPER',
-            event: 'BUMPER_GROUP_SKIPPED',
+          devDiag.emit('WARN', 'GROUP_BUMPER', 'BUMPER_GROUP_SKIPPED', {
             profileId,
             reason: stats.lastGroupError,
             data: { groupId: group.id },
@@ -387,8 +390,7 @@ export class GroupBumperBrowserAdapter implements BumperRunner {
         stats.skippedGroups > stats.expectedGroupSkips
       )
         throw new Error(`全部小组执行异常：${stats.lastGroupError || '页面未就绪'}`);
-      if (session.scanOnly) callbacks.status('已完成 · 0 次（只读扫描，无互动）');
-      if (!stats.quotaReached && !session.scanOnly && stats.sessionBumped === 0) {
+      if (!stats.quotaReached && stats.sessionBumped === 0) {
         if (stats.matchedAuthorPosts === 0 && stats.skippedGroups > 0)
           callbacks.status(
             `已完成 · 0 次（未扫到目标帖，${stats.skippedGroups} 个小组跳过：${stats.lastGroupError}）`,

@@ -2,9 +2,7 @@ import { isBluestacksPortraitResolution } from '../../shared/bluestacks.js';
 import { extractFacebookGroupId, extractFacebookPageId } from '../../shared/facebook-target-id.js';
 import { isTargetIncomplete } from '../../shared/group-bumper.js';
 import * as M from './mcp-context.js';
-
 const cnt = <T>(arr: readonly T[], fn: (x: T) => boolean) => arr.filter(fn).length;
-
 async function handleOverview(deps: M.WorkbenchMcpDependencies) {
   const now = Date.now();
   const [
@@ -127,9 +125,11 @@ async function handleOverview(deps: M.WorkbenchMcpDependencies) {
     },
     googleSheets: sheetsOv && {
       ...M.pick(sheetsOv.auth, 'authorized authorizedEmail'),
+      authError: sheetsOv.auth.lastError,
       ...M.pick(sheetsOv, 'runningScheduleCount runningRecordsCount'),
       linksCount: sheetsOv.links.length,
       enabledLinksCount: cnt(sheetsOv.links, (l) => l.enabled),
+      errorLinksCount: cnt(sheetsOv.links, (l) => Boolean(l.runtime.lastError)),
     },
     agentBrowserSessions: deps.agentBrowser.listSessions(),
     recentWarningsAndErrors: diag.map((e) =>
@@ -137,13 +137,11 @@ async function handleOverview(deps: M.WorkbenchMcpDependencies) {
     ),
   };
 }
-
 const KNOWN_GATE_ERRORS = new Set([
   'FACEBOOK_ACCOUNT_LOGGED_OUT',
   'FACEBOOK_ACCOUNT_VERIFICATION_REQUIRED',
   'FACEBOOK_ACCOUNT_RESTRICTED',
 ]);
-
 async function handleInspectProfiles(
   deps: M.WorkbenchMcpDependencies,
   args: Record<string, unknown>,
@@ -254,7 +252,6 @@ async function handleInspectProfiles(
     profiles: (await M.buildEnrichedProfiles(deps)).filter((p) => idSet.has(p.id)),
   };
 }
-
 async function handleManageTargets(
   deps: M.WorkbenchMcpDependencies,
   args: Record<string, unknown>,
@@ -361,7 +358,6 @@ async function handleManageTargets(
     ),
   });
 }
-
 export function createWorkspaceAndTargetTools(
   deps: M.WorkbenchMcpDependencies,
 ): M.McpToolDefinition[] {
@@ -418,9 +414,7 @@ export function createWorkspaceAndTargetTools(
       '管理共享 Facebook 小组库与专页库。',
       M.sp(
         '@search|action:e(list add delete refresh stop_refresh list_folders):操作|kind:e(groups pages):目标库|folderId:s:文件夹ID|incompleteOnly:b:仅未补齐|limit:n(1,500):条数上限|rawText:s:多行链接ID|ids:sa:目标ID列表|waitRefreshSeconds:n(0,60):刷新等待秒数',
-        {
-          items: M.arrObj('idOrUrl:s:链接或 ID|name:s:名称|folderId:s', '新增列表', 'idOrUrl'),
-        },
+        { items: M.arrObj('idOrUrl:s:链接或 ID|name:s:名称|folderId:s', '新增列表', 'idOrUrl') },
       ),
       (args) => handleManageTargets(deps, args),
       { req: 'action kind' },

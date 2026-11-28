@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile, mkdir, stat, open, copyFile, rename, rm, writeFile } from 'node:fs/promises';
 import { extractPinnedMediaArchive } from './pinned-media-archive.js';
-import { ProductError } from '../domain/workspace.js';
+import { failError } from '../domain/workspace.js';
 const root = path.resolve(fileURLToPath(new URL('../../../', import.meta.url)));
 type Descriptor = {
   platform: string;
@@ -69,11 +69,7 @@ export class MediaRuntimeComponent {
   }
   assertIdle() {
     if (this.busy)
-      throw new ProductError(
-        'MEDIA_COMPONENT_BUSY',
-        '视频文字组件正在安装，请等待或取消后再重置数据',
-        409,
-      );
+      failError('MEDIA_COMPONENT_BUSY', '视频文字组件正在安装，请等待或取消后再重置数据', 409);
   }
   cancel() {
     this.abort?.abort();
@@ -221,7 +217,7 @@ export class MediaRuntimeComponent {
     return (this.verified ??= (async () => {
       const d = await this.descriptor();
       if (d.platform !== this.platform || !(await this.present(d)))
-        throw new ProductError(
+        failError(
           'MEDIA_COMPONENT_REQUIRED',
           '此视频快拍含文字，请先在菜单“可选组件”安装视频文字组件；普通视频和其他任务不需要安装',
           409,

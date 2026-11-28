@@ -13,7 +13,7 @@ import type { GroupPosterService } from '../../application/group-poster-service.
 import type { ProfileInspectionService } from '../../application/profile-inspection.js';
 import type { TaskService } from '../../application/task-service.js';
 import type { WorkspaceService } from '../../application/workspace-service.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import { someAsync } from '../../shared/async-collections.js';
 import {
   CleanupProfileTabsRequest,
@@ -39,7 +39,7 @@ import {
 } from '../../shared/profile-inspection.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
 import { TargetListCommand, TargetListKind } from '../../shared/target-list.js';
-import { needSvc, type RouteBase } from '../task-contract-version.js';
+import { needSvc, type RouteBase } from './task-routes.js';
 interface FeatureModuleRouteContext extends RouteBase {
   service: WorkspaceService;
   tasks?: TaskService | undefined;
@@ -54,6 +54,7 @@ interface FeatureModuleRouteContext extends RouteBase {
   googleSheets?: GoogleSheetsService | undefined;
   profileLifecycle?: ProfileLifecyclePort | undefined;
   featureExecution?: FeatureExecutionRegistry | undefined;
+  isCarrierBusy?: ((profileId: string) => boolean) | undefined;
 }
 const LinkIdInput = strictObj({ id: sReq(120) });
 const ImportLibraryInput = strictObj({
@@ -170,10 +171,7 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
       refresh: () => bluestacks.state(true),
       'batch-login/stop': () => bluestacks.stopBatchLogin(),
       'health-check/stop': () => bluestacks.stopHealthCheck(),
-      'bumper/stop': () => {
-        const ids = stopIds();
-        return bluestacks.stopBumper(ids, ids ? undefined : 'group');
-      },
+      'bumper/stop': () => bluestacks.stopBumper(stopIds(), 'group'),
       'bumper/stop-page': () => bluestacks.stopBumper(stopIds(), 'page'),
       'active/stop': () => bluestacks.stopExtra('active', stopIds()),
       'poster/stop': () => bluestacks.stopExtra('poster', stopIds()),
@@ -208,6 +206,7 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
             | 'triggerSchedulePoll'
             | 'triggerRecordsPoll'
             | 'refreshRecordMetrics'
+            | 'resetStuckRows'
           >
         >,
       ) =>
@@ -226,6 +225,7 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
         '/links/poll-schedule': 'triggerSchedulePoll',
         '/links/poll-records': 'triggerRecordsPoll',
         '/links/refresh-metrics': 'refreshRecordMetrics',
+        '/links/reset-stuck': 'resetStuckRows',
       }),
       '/auth/credentials': () =>
         gs.importCredentials(obj({ rawJson: sReq(200_000, 10) }).parse(input).rawJson),
@@ -320,6 +320,7 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
           'tasks/cancel': 'cancelTask',
           'tasks/delete': 'deleteTask',
           'logs/delete': 'deleteLogs',
+          'pending-operations/resolve': 'resolvePendingOperation',
         }),
         'groups/refresh-stop': () => groupPoster.stopRefreshGroups(),
         'materials/thumbnail': async () => {
@@ -407,17 +408,17 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
   if (route.startsWith('/api/workspace/group-bumper/') && groupBumper) {
     const sub = route.slice('/api/workspace/group-bumper/'.length);
     return (
-      postDispatch(sub, {
-        'scan-only': () => groupBumper.startScanOnly(input),
+      (await postDispatch(sub, {
         start: () => groupBumper.start(input),
         'start-page': () => groupBumper.startPageBumper(input),
+        'pending-operations/resolve': () => groupBumper.resolvePendingOperation(input),
         stop: () => {
-          const { profileIds } = OptionalProfileIds.parse(input);
+          const { profileIds } = OptionalProfileIds.parse(input ?? {});
           return groupBumper.stop(profileIds, profileIds ? undefined : 'group-bumper');
         },
         'stop-page': () =>
-          groupBumper.stop(OptionalProfileIds.parse(input).profileIds, 'page-bumper'),
-      }) || (cleanup?.assertNotResetting(), ok(await groupBumper.manage(sub, input)))
+          groupBumper.stop(OptionalProfileIds.parse(input ?? {}).profileIds, 'page-bumper'),
+      })) || (cleanup?.assertNotResetting(), ok(await groupBumper.manage(sub, input)))
     );
   }
   if (groupInviter && route.startsWith('/api/workspace/group-inviter/')) {
@@ -494,9 +495,30 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
       await service.requireProfiles(profileIds);
       if (!ctx.browserWindows?.cleanupTabs)
         throw new ProductError('WORKSPACE_CLEANUP_UNAVAILABLE', '浏览器标签清理功能尚未加载', 409);
-      return CleanupProfileTabsResult.parse(
-        await ctx.browserWindows.cleanupTabs(profileIds, preferActiveTab ?? false),
-      );
+      const uniqueIds = [...new Set(profileIds)];
+      const cleanableIds: string[] = [];
+      let preSkippedBusy = 0;
+      for (const id of uniqueIds) {
+        const labels = ctx.featureExecution
+          ? await ctx.featureExecution.busyModuleLabels([id])
+          : [];
+        const carrierBusy = ctx.isCarrierBusy?.(id) === true;
+        if (labels.length > 0 || carrierBusy) preSkippedBusy++;
+        else cleanableIds.push(id);
+      }
+      if (cleanableIds.length === 0) {
+        return CleanupProfileTabsResult.parse({
+          cleanedProfiles: 0,
+          closedTabs: 0,
+          skippedBusy: preSkippedBusy,
+          skippedOffline: 0,
+        });
+      }
+      const res = await ctx.browserWindows.cleanupTabs(cleanableIds, preferActiveTab ?? false);
+      return CleanupProfileTabsResult.parse({
+        ...res,
+        skippedBusy: res.skippedBusy + preSkippedBusy,
+      });
     },
     '/api/workspace/profiles/delete': async () => {
       const value = DeleteProfiles.parse(input),
@@ -504,7 +526,7 @@ export async function handleFeatureModuleRoutes(ctx: FeatureModuleRouteContext):
           ? await ctx.featureExecution.busyModuleLabels(value.profileIds)
           : [];
       if (busy.length > 0)
-        throw new ProductError(
+        failError(
           'PROFILE_TASK_ACTIVE',
           `请先停止该浏览器的运行任务（${busy.join('、')}）后再删除`,
           409,

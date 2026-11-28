@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { UpdateStatus } from '../shared/software-update.js';
 import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
-import { Btn, Chk, errMsg, useBusyTask } from './modules/shared/module-ui.js';
+import { Btn, Chk, InFld, errMsg, NoticeBanner, useBusyTask } from './modules/shared/module-ui.js';
 import { UI_BTN_PRIMARY, UI_INPUT, UI_MUTED } from './ui/primitives.js';
-
 export function useSoftwareUpdate() {
   const [status, setStatus] = useState<UpdateStatus | null>(null),
     [error, setError] = useState('');
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null),
     mountedRef = useRef(true);
-
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -18,7 +16,6 @@ export function useSoftwareUpdate() {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, []);
-
   const refresh = useCallback(async () => {
     try {
       const next = await api.softwareUpdateStatus();
@@ -40,13 +37,11 @@ export function useSoftwareUpdate() {
       if (mountedRef.current) setError(errMsg(err, '更新状态读取失败'));
     }
   }, []);
-
   useEffect(() => {
     void refresh();
     const t = setInterval(() => void refresh(), 1_800_000);
     return () => clearInterval(t);
   }, [refresh]);
-
   const apply = async () => {
     setError('');
     setStatus((s) => (s ? { ...s, applying: true } : s));
@@ -57,18 +52,30 @@ export function useSoftwareUpdate() {
       setError(errMsg(err, '更新失败'));
     }
   };
-
   return { status, setStatus, error, refresh, apply };
 }
-
 const PATH_BOX =
   'm-0 break-all rounded-md border border-[var(--line)] bg-[var(--surface-2)] px-2.5 py-2 font-mono text-[11.5px]';
-
+function PathSection(p: {
+  title: string;
+  pathText: string;
+  note: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <>
+      <strong className={p.className}>{p.title}</strong>
+      <p className={PATH_BOX}>{p.pathText}</p>
+      <div className="mt-1 flex flex-wrap gap-2">{p.children}</div>
+      <p className={UI_MUTED}>{p.note}</p>
+    </>
+  );
+}
 function ExtensionUpdateControls({ status: provided }: { status?: UpdateStatus | null }) {
   const [loaded, setLoaded] = useState<UpdateStatus | null>(null),
     [message, setMessage] = useState('');
   const { busy, run } = useBusyTask();
-
   useEffect(() => {
     if (provided) return;
     let live = true;
@@ -80,84 +87,63 @@ function ExtensionUpdateControls({ status: provided }: { status?: UpdateStatus |
       live = false;
     };
   }, [provided]);
-
   const status = provided ?? loaded;
   const act = (fn: () => Promise<string>) =>
     void run(async () => setMessage(await fn()), '操作失败').catch((e) =>
       setMessage(errMsg(e, '操作失败')),
     );
-
+  const b = (lbl: string, dis: boolean | undefined, fn: () => Promise<string>, v?: 'primary') => (
+    <Btn v={v} disabled={dis} onClick={() => act(fn)}>
+      {lbl}
+    </Btn>
+  );
   return (
     <div className="grid justify-items-start gap-[10px]">
-      <strong>固定插件目录</strong>
-      <p className={PATH_BOX}>{status?.extensionDirectory ?? '正在读取…'}</p>
-      <div className="mt-1 flex flex-wrap gap-2">
-        <Btn
-          disabled={busy || !status}
-          onClick={() =>
-            act(async () => {
-              await api.openExtensionDirectory();
-              return '已请求打开插件文件夹';
-            })
-          }
-        >
-          打开插件文件夹
-        </Btn>
-        <Btn
-          v="primary"
-          disabled={busy || !!status?.applying}
-          onClick={() =>
-            act(async () => {
-              const r = await api.reloadExtensions();
-              return `已请求热刷新 ${r.reloaded} 个插件；跳过 ${r.skippedBusy} 个忙碌、${r.skippedOffline} 个离线`;
-            })
-          }
-        >
-          一键热刷新全部插件
-        </Btn>
-      </div>
-      <p className={UI_MUTED}>
-        首次加载插件请点击顶栏「复制插件路径」加载上方目录；此后软件更新会自动同步并热刷新空闲浏览器。
-      </p>
+      <PathSection
+        title="固定插件目录"
+        pathText={status?.extensionDirectory ?? '正在读取…'}
+        note="首次加载插件可点击上方「复制插件路径」（或菜单「复制插件路径」）加载此目录；此后软件更新会自动同步并热刷新空闲浏览器。"
+      >
+        {b('复制插件路径', busy || !status?.extensionDirectory, async () => {
+          await copyTextToClipboard(status?.extensionDirectory ?? '');
+          return '已复制固定插件路径';
+        })}
+        {b('打开插件文件夹', busy || !status, async () => {
+          await api.openExtensionDirectory();
+          return '已请求打开插件文件夹';
+        })}
+        {b(
+          '一键热刷新全部插件',
+          busy || !!status?.applying,
+          async () => {
+            const r = await api.reloadExtensions();
+            return `已请求热刷新 ${r.reloaded} 个插件；跳过 ${r.skippedBusy} 个忙碌、${r.skippedOffline} 个离线`;
+          },
+          'primary',
+        )}
+      </PathSection>
       {status?.aiWorkspaceDirectory && (
-        <>
-          <strong className="mt-3 block">AI 专属工作夹（支持 Antigravity / Codex）</strong>
-          <p className={PATH_BOX}>{status.aiWorkspaceDirectory}</p>
-          <div className="mt-1 flex flex-wrap gap-2">
-            <Btn
-              disabled={busy}
-              onClick={() =>
-                act(async () => {
-                  await copyTextToClipboard(status.aiWorkspaceDirectory ?? '');
-                  return '已复制 AI 专属工作夹路径';
-                })
-              }
-            >
-              复制工作夹路径
-            </Btn>
-            <Btn
-              disabled={busy}
-              onClick={() =>
-                act(
-                  async () =>
-                    `已打开 AI 专属工作夹：${(await api.openAiWorkspaceDirectory()).directory}`,
-                )
-              }
-            >
-              打开 AI 专属工作夹
-            </Btn>
-          </div>
-          <p className={UI_MUTED}>
-            在 Antigravity 或 Codex
-            中打开该文件夹，即可仅在该窗口启用工作台控制能力，与其他项目隔离。
-          </p>
-        </>
+        <PathSection
+          className="mt-3 block"
+          title="AI 专属工作夹（支持 Antigravity / Codex）"
+          pathText={status.aiWorkspaceDirectory}
+          note="在 Antigravity 或 Codex 中打开该文件夹，即可仅在该窗口启用工作台控制能力，与其他项目隔离。"
+        >
+          {b('复制工作夹路径', busy, async () => {
+            await copyTextToClipboard(status.aiWorkspaceDirectory ?? '');
+            return '已复制 AI 专属工作夹路径';
+          })}
+          {b(
+            '打开 AI 专属工作夹',
+            busy,
+            async () => `已打开 AI 专属工作夹：${(await api.openAiWorkspaceDirectory()).directory}`,
+          )}
+        </PathSection>
       )}
       {message && <p role="status">{message}</p>}
     </div>
   );
 }
-
 export function SoftwareUpdatePanel({
   status,
   onStatus,
@@ -172,16 +158,14 @@ export function SoftwareUpdatePanel({
   const [repo, setRepo] = useState(status?.githubRepo ?? ''),
     [autoCheck, setAutoCheck] = useState(status?.autoCheck ?? true);
   const { busy, error: message, run } = useBusyTask();
-
   useEffect(() => {
     if (!status) return;
     setRepo(status.githubRepo);
     setAutoCheck(status.autoCheck);
   }, [status?.githubRepo, status?.autoCheck]);
-
   const work = (fn: () => Promise<UpdateStatus>) =>
     void run(async () => onStatus(await fn()), '更新操作失败');
-
+  const displayError = error || message || status?.error || '';
   return (
     <div className="grid justify-items-start gap-[10px]">
       <p>
@@ -192,18 +176,22 @@ export function SoftwareUpdatePanel({
         最近检查：
         {status?.lastCheckedAt ? new Date(status.lastCheckedAt).toLocaleString() : '尚未检查'}
       </p>
+      {displayError && (
+        <div className="w-full">
+          <NoticeBanner tone="err">{displayError}</NoticeBanner>
+        </div>
+      )}
       <ExtensionUpdateControls status={status} />
       <h3>GitHub 自动更新源</h3>
-      <label className="inline-flex items-center gap-2 text-xs whitespace-nowrap">
-        公开仓库 owner/repo
-        <input
-          className={`${UI_INPUT} min-w-[230px]`}
-          value={repo}
-          onChange={(e) => setRepo(e.target.value)}
-          placeholder="username/browser-workbench"
-          disabled={busy || status?.applying}
-        />
-      </label>
+      <InFld
+        label="公开仓库 owner/repo"
+        wrapClass="inline-flex items-center gap-2 text-xs whitespace-nowrap"
+        className={`${UI_INPUT} min-w-[230px]`}
+        value={repo}
+        onVal={setRepo}
+        placeholder="username/browser-workbench"
+        disabled={busy || status?.applying}
+      />
       <Chk
         label="自动检查更新"
         checked={autoCheck}
@@ -263,7 +251,6 @@ export function SoftwareUpdatePanel({
           )}
         </div>
       )}
-      {(error || message) && <p role="alert">{error || message}</p>}
     </div>
   );
 }

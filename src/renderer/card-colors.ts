@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { PreferenceUpdate, Preferences } from '../shared/workspace-preferences.js';
 import { api } from './api.js';
-
 export const cardColorNames = [
   'graphite',
   'blue',

@@ -1,5 +1,5 @@
 import type { CompatibleRepository } from '../../domain/persistence.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import {
   BumperSettings,
   StartBumper,
@@ -9,6 +9,7 @@ import {
   type BumperState,
   type BumperTarget,
 } from '../../shared/group-bumper.js';
+import type { CheckDailyRiskLimitFn } from '../../shared/daily-risk-limits.js';
 import type { PostBumpRecordsPort } from '../../shared/post-bump-records.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
 import type { FeatureExecutionRegistry } from '../feature-execution-registry.js';
@@ -19,19 +20,18 @@ import {
   type BumperRunner,
 } from '../group-bumper-service.js';
 import {
-  HARD_BLOCK_MSG_RE,
-  acquireConcurrencySlot,
+  acquireCarrierSlotAndLaunch,
   admitAndPlanBrowserLaunch,
   buildStaggeredQueues,
-  ensureBrowserProfileOnline,
+  checkRiskLimitSafe,
+  closeIdleProfileAfterFinish,
+  createEnsureOnlineLaunch,
   errMsg,
-  launchOfflineProfileInSlot,
   persistProfileTaskResult,
   recordPostBumpFailure,
-  runTrackedScheduledWorker,
+  sortTargetsOnlineFirst,
 } from '../module-worker-pool.js';
 import { Workboard, isWorkAbortError, sleepAbortable } from '../workboard.js';
-
 export function createBumperRuntime(opts: {
   repo: CompatibleRepository<BumperRepository>;
   runner: BumperRunner;
@@ -49,8 +49,6 @@ export function createBumperRuntime(opts: {
     ...opts,
     profileRunIds: new Map<string, string>(),
     profileModes: new Map<string, BumperMode>(),
-    groupSlotsInUse: 0,
-    pageSlotsInUse: 0,
     fallbackPageSettings: undefined as BumperSettings | undefined,
     liveGroupSettings: new Set<BumperSettings>(),
     livePageSettings: new Set<BumperSettings>(),
@@ -69,11 +67,15 @@ export function createBumperRuntime(opts: {
     pageStatusText: '请选择账号和目标专页',
     featureExecution: undefined as FeatureExecutionRegistry | undefined,
     profileLifecycle: undefined as ProfileLifecyclePort | undefined,
-    workboard: new Workboard(),
+    workboard: new Workboard({ browserConcurrency: 100, bluestacksConcurrency: 50 }),
     postBumpRecords: undefined as PostBumpRecordsPort | undefined,
+    checkDailyRiskLimit: undefined as CheckDailyRiskLimitFn | undefined,
     profilesForMode: (mode: BumperMode) => (mode === 'page-bumper' ? rt.pageProfiles : rt.profiles),
     modeOf: (id: string): BumperMode =>
-      rt.profileModes.get(id) ?? rt.admittingModes.get(id) ?? 'group-bumper',
+      (rt.admitting.has(id) ? rt.admittingModes.get(id) : undefined) ??
+      rt.profileModes.get(id) ??
+      rt.admittingModes.get(id) ??
+      'group-bumper',
     setStatus: (mode: BumperMode, text: string, alsoMain = false) => {
       if (mode === 'page-bumper') rt.pageStatusText = text;
       if (mode !== 'page-bumper' || alsoMain) rt.statusText = text;
@@ -110,9 +112,7 @@ export function createBumperRuntime(opts: {
   };
   return rt;
 }
-
 export type BumperRuntimeContext = ReturnType<typeof createBumperRuntime>;
-
 const persistBumperResult = (
   ctx: BumperRuntimeContext,
   profileId: string,
@@ -135,8 +135,7 @@ const persistBumperResult = (
     failedSteps: pendingPlusFailed + (failed ? 1 : 0),
     skippedSteps: skippedPosts,
   });
-
-async function resolveBumperTargetsAndSettings(
+export async function resolveBumperTargetsAndSettings(
   ctx: BumperRuntimeContext,
   mode: BumperMode,
   groupIds: readonly string[],
@@ -159,7 +158,6 @@ async function resolveBumperTargetsAndSettings(
       : await ctx.repo.settings();
   return { groups, pages, rawSettings };
 }
-
 type IssueCounts = {
   pending: number;
   failedActions: number;
@@ -167,8 +165,9 @@ type IssueCounts = {
   issueReason: string;
   skipReason: string;
 };
-
-async function runBumperSession(
+export const checkBumperQuota = (ctx: BumperRuntimeContext, id: string) =>
+  checkRiskLimitSafe(ctx.checkDailyRiskLimit, id, 'bump');
+export async function runBumperSession(
   ctx: BumperRuntimeContext,
   profileId: string,
   mode: BumperMode,
@@ -176,7 +175,6 @@ async function runBumperSession(
   groups: BumperTarget[],
   pages: BumperTarget[],
   settings: BumperSettings,
-  executionMode: 'live' | 'scan_only',
   stat: BumperProfileStat,
   isAborted: () => boolean,
   isCurrent: () => boolean,
@@ -188,6 +186,7 @@ async function runBumperSession(
   },
 ): Promise<{ failed: boolean }> {
   let failed = false;
+  let stopAfterPostReason: string | null = null;
   const counts: IssueCounts = {
     pending: 0,
     failedActions: 0,
@@ -199,8 +198,8 @@ async function runBumperSession(
   try {
     await ctx.runner.run(profileId, groups, pages, settings, {
       runId,
-      executionMode,
       cancelled: () => !isCurrent() || isAborted(),
+      shouldStopAfterCurrentPost: () => stopAfterPostReason !== null,
       status: (text, today) => {
         if (!isCurrent()) return;
         stat.status = text;
@@ -236,9 +235,21 @@ async function runBumperSession(
         if (!isCurrent()) return;
         stat.session++;
         stat.today = today;
+        if (today >= settings.dailyMaxLikesPerAccount) {
+          stopAfterPostReason ??= `今日已达上限 (${today}/${settings.dailyMaxLikesPerAccount})`;
+        }
         hooks.onStatUpdated?.();
+        if (ctx.checkDailyRiskLimit)
+          void checkBumperQuota(ctx, profileId).then((cap) => {
+            if (cap.allowed || !isCurrent() || isAborted()) return;
+            stopAfterPostReason ??= cap.reason ?? '今日已达浏览器安全日限额，自动跳过保护';
+          });
       },
     });
+    if (stopAfterPostReason && !isAborted() && isCurrent()) {
+      stat.status = stopAfterPostReason;
+      hooks.onStatUpdated?.();
+    }
     const nextStatus = hooks.formatStatus(counts);
     if (nextStatus !== null) stat.status = nextStatus;
   } catch (e) {
@@ -275,11 +286,9 @@ async function runBumperSession(
   }
   return { failed };
 }
-
 export async function startBumperRunWithMeta(
   ctx: BumperRuntimeContext,
   input: unknown,
-  executionMode: 'live' | 'scan_only',
   mode: BumperMode = 'group-bumper',
 ): Promise<{
   runId: string;
@@ -299,7 +308,6 @@ export async function startBumperRunWithMeta(
   const otherLabel = otherMode === 'page-bumper' ? '专页顶贴' : '小组顶贴';
   const targetProfiles = ctx.profilesForMode(mode);
   const otherProfiles = ctx.profilesForMode(otherMode);
-
   const { groups, pages, rawSettings } = await resolveBumperTargetsAndSettings(
     ctx,
     mode,
@@ -307,37 +315,30 @@ export async function startBumperRunWithMeta(
     req.pageIds,
   );
   if (!groups.length || !pages.length)
-    throw new ProductError(
+    failError(
       'BUMPER_TARGETS_EMPTY',
       mode === 'page-bumper' ? '请选择已保存的目标专页' : '请选择已保存的小组和目标主页',
       400,
     );
   const settings: BumperSettings = { ...rawSettings };
+  const closeBrowserOnFinish = Boolean(
+    req.closeBrowserOnFinish ||
+    (rawSettings as { closeBrowserOnFinish?: boolean }).closeBrowserOnFinish,
+  );
   const shareProb = settings.shareToStoryProbability ?? 0;
-  if (
-    executionMode === 'live' &&
-    !settings.likeProbability &&
-    !settings.commentProbability &&
-    !shareProb
-  )
+  if (!settings.likeProbability && !settings.commentProbability && !shareProb)
     throw new ProductError('BUMPER_PROBABILITY_ZERO', '点赞、留言和分享快拍概率不能同时为 0%', 400);
-  if (
-    executionMode === 'live' &&
-    settings.commentProbability > 0 &&
-    !settings.likeProbability &&
-    !shareProb
-  ) {
+  if (settings.commentProbability > 0 && !settings.likeProbability && !shareProb) {
     const commentItems = ctx.repo.comments
       ? await ctx.repo.comments(mode === 'page-bumper' ? 'page' : 'group')
       : (await ctx.summary()).comments;
     if (!commentItems.length)
-      throw new ProductError(
+      failError(
         'BUMPER_COMMENTS_EMPTY',
         '当前仅开启了留言（点赞概率 0%），但留言列表为空，请先添加留言话术',
         400,
       );
   }
-
   const candidateAdmitting = requested.filter(
     (id) => !ctx.isProfileRunningInMode(id, mode) && !ctx.admitting.has(id),
   );
@@ -352,8 +353,9 @@ export async function startBumperRunWithMeta(
     ctx.admitting.add(id);
     ctx.admittingModes.set(id, mode);
   }
-
   let admittedIds: string[] = [];
+  let runId = '';
+  const launchedWorkerIds = new Set<string>();
   try {
     const { admission, launchFailureReasons, pendingLaunchSet } = await admitAndPlanBrowserLaunch({
       launchCandidates: newlyAdmitting,
@@ -412,9 +414,8 @@ export async function startBumperRunWithMeta(
         '所选浏览器正在运行顶贴任务';
       throw new ProductError('BUMPER_NO_ELIGIBLE_PROFILES', firstReason, 409);
     }
-
     admittedIds = admission.admittedProfileIds;
-    const runId = globalThis.crypto.randomUUID();
+    runId = globalThis.crypto.randomUUID();
     for (const id of admittedIds) {
       ctx.cancelled.delete(id);
       targetProfiles.delete(id);
@@ -423,8 +424,10 @@ export async function startBumperRunWithMeta(
       ctx.profileRunIds.set(id, runId);
       ctx.starting.add(id);
     }
-
-    const eligibleIds = admittedIds.filter((id) => !ctx.cancelled.has(id));
+    const eligibleIds = await sortTargetsOnlineFirst(
+      admittedIds.filter((id) => !ctx.cancelled.has(id)),
+      (id) => ctx.runner.ready(id),
+    );
     const groupQueues = buildStaggeredQueues(eligibleIds, groups);
     const pageQueues = buildStaggeredQueues(eligibleIds, pages);
     let stagger = 0;
@@ -435,13 +438,7 @@ export async function startBumperRunWithMeta(
       if (ctx.cancelled.has(id) || ctx.workboard.isCarrierBusy(id)) continue;
       ctx.active.add(id);
       launched++;
-      const needsLaunch = pendingLaunchSet.has(id);
-      targetProfiles.set(id, {
-        today: 0,
-        session: 0,
-        status: needsLaunch ? '正在启动浏览器…' : '准备中',
-        running: true,
-      });
+      targetProfiles.set(id, { today: 0, session: 0, status: '排队等待并发槽位…', running: true });
       const delay = stagger;
       stagger += Math.round((1800 + Math.floor(Math.random() * 2001)) * ctx.staggerScale);
       const work = runBumperWorker(
@@ -452,11 +449,11 @@ export async function startBumperRunWithMeta(
         settings,
         delay,
         runId,
-        executionMode,
         mode,
-        needsLaunch,
+        closeBrowserOnFinish,
       );
       ctx.workers.set(id, work);
+      launchedWorkerIds.add(id);
       workerPromises.push(work);
       void work.finally(() => {
         if (ctx.workers.get(id) === work) ctx.workers.delete(id);
@@ -487,11 +484,15 @@ export async function startBumperRunWithMeta(
       ctx.admitting.delete(id);
       ctx.admittingModes.delete(id);
     }
-    for (const id of admittedIds) ctx.starting.delete(id);
+    for (const id of admittedIds) {
+      ctx.starting.delete(id);
+      if (runId && !launchedWorkerIds.has(id) && ctx.profileRunIds.get(id) === runId) {
+        ctx.profileModes.delete(id);
+      }
+    }
     ctx.featureExecution?.releaseReservation(mode, reservedIds);
   }
 }
-
 async function runBumperWorker(
   ctx: BumperRuntimeContext,
   id: string,
@@ -500,115 +501,145 @@ async function runBumperWorker(
   settings: BumperSettings,
   delay: number,
   runId: string,
-  executionMode: 'live' | 'scan_only',
   mode: BumperMode,
-  needsLaunch: boolean,
+  closeBrowserOnFinish: boolean,
 ): Promise<void> {
-  const targetProfiles = ctx.profilesForMode(mode);
-  const stat = targetProfiles.get(id);
-  if (!stat) throw Error('BUMPER_PROFILE_STATE_MISSING');
-  await ctx.workboard.runSoldier(
-    { carrierId: id, carrierKind: 'browser', moduleId: mode },
-    async (soldier) => {
-      let slot = false;
-      const isAborted = () => ctx.cancelled.has(id) || soldier.signal.aborted;
-      const current = () => ctx.profileRunIds.get(id) === runId;
-      try {
-        if (needsLaunch && ctx.profileLifecycle) {
-          stat.status = '正在启动浏览器…';
-          const launched = await launchOfflineProfileInSlot(
-            id,
-            ctx.profileLifecycle,
-            ctx.workboard,
-            soldier.signal,
-            (pid) => ctx.runner.ready(pid),
-          );
-          if (!launched.ok) {
-            Object.assign(stat, { status: launched.reason, running: false });
-            ctx.active.delete(id);
-            return void (await persistBumperResult(
+  try {
+    const targetProfiles = ctx.profilesForMode(mode);
+    const stat = targetProfiles.get(id);
+    if (!stat) throw Error('BUMPER_PROFILE_STATE_MISSING');
+    await ctx.workboard.runSoldier(
+      { carrierId: id, carrierKind: 'browser', moduleId: mode },
+      async (soldier) => {
+        let releasePermit: (() => void) | undefined;
+        let touchedBrowser = false;
+        const isAborted = () => ctx.cancelled.has(id) || soldier.signal.aborted;
+        const current = () => ctx.profileRunIds.get(id) === runId;
+        const finishEarly = async (status: string, cancelled: boolean, failed: boolean) => {
+          Object.assign(stat, { status, running: false });
+          ctx.active.delete(id);
+          await persistBumperResult(ctx, id, mode, runId, cancelled, failed, 0, 0, status);
+        };
+        const finishIdle = () =>
+          finishEarly(isAborted() ? '已停止' : '已完成 · 本轮 0 次', isAborted(), false);
+        try {
+          if (isAborted() || !current()) return void (await finishIdle());
+          if (await ctx.runner.busy(id))
+            return void (await finishEarly('跳过：该浏览器正在执行其他任务', false, false));
+          const cap = await checkBumperQuota(ctx, id);
+          if (!cap.allowed)
+            return void (await finishEarly(
+              cap.reason ?? '今日已达浏览器安全日限额，自动跳过保护',
+              false,
+              false,
+            ));
+          if (delay > 0 && !isAborted()) await sleepAbortable(delay, soldier.signal);
+          if (isAborted() || !current()) return void (await finishIdle());
+          const acquired = await acquireCarrierSlotAndLaunch({
+            carrierKind: 'browser',
+            carrierId: id,
+            moduleId: mode,
+            workboard: ctx.workboard,
+            signal: soldier.signal,
+            featureExecution: ctx.featureExecution,
+            checkDailyLimit: async () => {
+              if (!current()) return { allowed: false, reason: '已停止' };
+              if (await ctx.runner.busy(id))
+                return { allowed: false, reason: '跳过：该浏览器正在执行其他任务' };
+              return checkBumperQuota(ctx, id);
+            },
+            isReady: (pid) => ctx.runner.ready(pid),
+            launch: createEnsureOnlineLaunch(
+              ctx.profileLifecycle,
+              (pid) => ctx.runner.ready(pid),
+              () => void (touchedBrowser = true),
+            ),
+            onQueued: () => !isAborted() && (stat.status = '排队等待并发槽位…'),
+            onLaunching: () => !isAborted() && (stat.status = '正在启动浏览器…'),
+          });
+          if (!acquired.ok) {
+            const stopped = isAborted();
+            return void (await finishEarly(
+              stopped ? '已停止' : acquired.reason,
+              stopped,
+              !stopped && !acquired.skipped,
+            ));
+          }
+          releasePermit = acquired.releasePermit;
+          touchedBrowser = true;
+          if (!isAborted() && current()) {
+            stat.status = '准备中';
+            await runBumperSession(
               ctx,
               id,
               mode,
               runId,
-              false,
-              true,
-              0,
-              0,
-              stat.status,
-            ));
-          }
-          if (!isAborted()) stat.status = '准备中';
-        }
-        if (delay > 0 && !isAborted()) await sleepAbortable(delay, soldier.signal);
-        if (!isAborted()) {
-          slot = await acquireConcurrencySlot({
-            isFull: () =>
-              (mode === 'page-bumper' ? ctx.pageSlotsInUse : ctx.groupSlotsInUse) >=
-              Math.max(1, settings.maxConcurrentProfiles ?? 8),
-            isAborted: () => isAborted() || !current(),
-            onQueued: () => void (stat.status = '排队等待并发槽位…'),
-            waitStep: () => sleepAbortable(100, soldier.signal),
-            acquire: () =>
-              void (mode === 'page-bumper' ? ctx.pageSlotsInUse++ : ctx.groupSlotsInUse++),
-          });
-        }
-        if (slot && !isAborted()) {
-          if (stat.status === '排队等待并发槽位…') stat.status = '准备中';
-          await runBumperSession(
-            ctx,
-            id,
-            mode,
-            runId,
-            groups,
-            pages,
-            settings,
-            executionMode,
-            stat,
-            isAborted,
-            () => current() && targetProfiles.get(id) === stat,
-            {
-              pendingConfirmPrefix: '停止待确认 · ',
-              formatStatus: (c) => {
-                if (c.pending + c.failedActions > 0 && !isAborted()) {
-                  const detail = [
-                    c.pending ? `${c.pending} 项待核对` : '',
-                    c.failedActions ? `${c.failedActions} 项未完成` : '',
-                    c.skippedPosts ? `跳过 ${c.skippedPosts} 帖` : '',
-                  ]
-                    .filter(Boolean)
-                    .join(' · ');
-                  return `本轮 ${stat.session} 次已确认 · ${detail} · ${c.issueReason}`;
-                }
-                if (stat.status.startsWith('今日已达上限')) return null;
-                if (isAborted()) return '已停止';
-                if (c.skippedPosts > 0)
-                  return `已完成 · 本轮 ${stat.session} 次 · 跳过 ${c.skippedPosts} 帖（${/视频/.test(c.skipReason) ? '视频加载超时' : '帖子加载超时'}）`;
-                return stat.session > 0 || !stat.status.startsWith('已完成 · 0 次')
-                  ? `已完成 · 本轮 ${stat.session} 次`
-                  : null;
+              groups,
+              pages,
+              settings,
+              stat,
+              isAborted,
+              () => current() && targetProfiles.get(id) === stat,
+              {
+                pendingConfirmPrefix: '停止待确认 · ',
+                formatStatus: (c) => {
+                  if (c.pending + c.failedActions > 0 && !isAborted()) {
+                    const detail = [
+                      c.pending ? `${c.pending} 项待核对` : '',
+                      c.failedActions ? `${c.failedActions} 项未完成` : '',
+                      c.skippedPosts ? `跳过 ${c.skippedPosts} 帖` : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' · ');
+                    return `本轮 ${stat.session} 次已确认 · ${detail} · ${c.issueReason}`;
+                  }
+                  if (
+                    stat.status.startsWith('今日已达上限') ||
+                    stat.status.startsWith('今日已达浏览器')
+                  )
+                    return null;
+                  if (isAborted()) return '已停止';
+                  if (c.skippedPosts > 0)
+                    return `已完成 · 本轮 ${stat.session} 次 · 跳过 ${c.skippedPosts} 帖（${/视频/.test(c.skipReason) ? '视频加载超时' : '帖子加载超时'}）`;
+                  return stat.session > 0 || !stat.status.startsWith('已完成 · 0 次')
+                    ? `已完成 · 本轮 ${stat.session} 次`
+                    : null;
+                },
               },
-            },
+            );
+          } else await finishIdle();
+        } catch (err) {
+          if (!isWorkAbortError(err)) throw err;
+          await finishEarly('已停止', true, false);
+        } finally {
+          releasePermit?.();
+          const shouldClose = Boolean(
+            closeBrowserOnFinish ||
+            (settings as { closeBrowserOnFinish?: boolean }).closeBrowserOnFinish,
           );
-        } else {
-          Object.assign(stat, {
-            status: isAborted() ? '已停止' : '已完成 · 本轮 0 次',
-            running: false,
-          });
-          ctx.active.delete(id);
-          await persistBumperResult(ctx, id, mode, runId, isAborted(), false, 0, 0, stat.status);
+          if (
+            shouldClose &&
+            touchedBrowser &&
+            ctx.profileLifecycle &&
+            !ctx.admitting.has(id) &&
+            !ctx.starting.has(id) &&
+            !ctx.active.has(id) &&
+            ctx.profileRunIds.get(id) === runId &&
+            !ctx.workboard.hasCarrierPermit('browser', id) &&
+            !(await ctx.featureExecution?.isProfileBusy(id, mode))
+          ) {
+            await closeIdleProfileAfterFinish(ctx.profileLifecycle, id, (ms) =>
+              sleepAbortable(ms, undefined),
+            );
+          }
+          if (!ctx.hasActiveExecutionInMode(mode)) ctx.setStatus(mode, '本轮已结束');
         }
-      } finally {
-        if (slot) {
-          if (mode === 'page-bumper') ctx.pageSlotsInUse = Math.max(0, ctx.pageSlotsInUse - 1);
-          else ctx.groupSlotsInUse = Math.max(0, ctx.groupSlotsInUse - 1);
-        }
-        if (!ctx.hasActiveExecutionInMode(mode)) ctx.setStatus(mode, '本轮已结束');
-      }
-    },
-  );
+      },
+    );
+  } finally {
+    if (ctx.profileRunIds.get(id) === runId) ctx.profileModes.delete(id);
+  }
 }
-
 export async function stopBumperProfiles(
   ctx: BumperRuntimeContext,
   profileIds?: string[],
@@ -641,109 +672,4 @@ export async function stopBumperProfiles(
     (r): r is PromiseRejectedResult => r.status === 'rejected',
   );
   if (firstRejected) throw firstRejected.reason;
-}
-
-export async function runScheduledBumperProfileStep(
-  ctx: BumperRuntimeContext,
-  input: {
-    profileId: string;
-    mode: BumperMode;
-    groupIds: string[];
-    pageIds: string[];
-    minConcurrency: number;
-    settingsOverride?: Partial<BumperSettings>;
-    onProgress: (status: string, sessionBumps: number) => void;
-  },
-): Promise<{ bumpedCount: number; status: string; hardBlocked: boolean; softIssue: boolean }> {
-  ctx.assertAllowed();
-  const { profileId, mode, onProgress } = input;
-  const { groups, pages, rawSettings } = await resolveBumperTargetsAndSettings(
-    ctx,
-    mode,
-    input.groupIds,
-    input.pageIds,
-  );
-  const skip = (status: string) => ({
-    bumpedCount: 0,
-    status,
-    hardBlocked: false,
-    softIssue: true,
-  });
-  if (!groups.length || !pages.length)
-    return skip(
-      mode === 'page-bumper' ? '跳过：未找到已保存的目标专页' : '跳过：未找到有效的小组或专页',
-    );
-  const parsed = BumperSettings.parse({ ...rawSettings, ...(input.settingsOverride ?? {}) });
-  const settings: BumperSettings = {
-    ...parsed,
-    maxConcurrentProfiles: Math.max(parsed.maxConcurrentProfiles ?? 8, input.minConcurrency),
-  };
-  if (
-    !settings.likeProbability &&
-    !settings.commentProbability &&
-    !(settings.shareToStoryProbability ?? 0)
-  )
-    settings.likeProbability = 100;
-  if (
-    !(await ensureBrowserProfileOnline(
-      profileId,
-      () => ctx.runner.ready(profileId),
-      ctx.profileLifecycle,
-      () => onProgress('正在唤醒浏览器连接…', 0),
-    ))
-  )
-    return skip('浏览器未就绪或连接断开');
-  if (ctx.isProfileRunning(profileId)) return skip('跳过：该浏览器正在执行其他顶贴任务');
-
-  const runId = globalThis.crypto.randomUUID();
-  ctx.cancelled.delete(profileId);
-  ctx.active.add(profileId);
-  ctx.profileRunIds.set(profileId, runId);
-  ctx.profileModes.set(profileId, mode);
-  const stat: BumperProfileStat = { today: 0, session: 0, status: '准备顶贴…', running: true };
-  ctx.profilesForMode(mode).set(profileId, stat);
-  const shuffledGroups =
-    mode === 'page-bumper'
-      ? groups
-      : (buildStaggeredQueues([profileId], groups).get(profileId) ?? groups);
-  const shuffledPages = buildStaggeredQueues([profileId], pages).get(profileId) ?? pages;
-
-  let hardBlocked = false;
-  let softIssue = false;
-  await runTrackedScheduledWorker(
-    ctx.workers,
-    profileId,
-    runBumperSession(
-      ctx,
-      profileId,
-      mode,
-      runId,
-      shuffledGroups,
-      shuffledPages,
-      settings,
-      'live',
-      stat,
-      () => ctx.cancelled.has(profileId),
-      () => ctx.profileRunIds.get(profileId) === runId,
-      {
-        onStatUpdated: () => onProgress(stat.status, stat.session),
-        onFailureError: (rawMsg) => {
-          if (HARD_BLOCK_MSG_RE.test(rawMsg) && !/点赞或评论被 Facebook 限制|暂时限制/.test(rawMsg))
-            hardBlocked = true;
-          else softIssue = true;
-        },
-        formatStatus: (c) => {
-          if (c.pending + c.failedActions > 0 && !ctx.cancelled.has(profileId)) {
-            softIssue = true;
-            return `本轮 ${stat.session} 次 · 局部跳过 (${c.issueReason || '部分操作未完成'})`;
-          }
-          if (ctx.cancelled.has(profileId)) return '已停止';
-          return c.skippedPosts > 0
-            ? `已完成 · 本轮 ${stat.session} 次 · 跳过 ${c.skippedPosts} 帖`
-            : `已完成 · 本轮 ${stat.session} 次`;
-        },
-      },
-    ),
-  );
-  return { bumpedCount: stat.session, status: stat.status, hardBlocked, softIssue };
 }

@@ -7,14 +7,12 @@ import {
   ClearedMaterialUsage,
   type MaterialUsageClearRequest,
 } from '../shared/material-usage.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import { sqliteTableExists } from './persistence/sqlite-query-helpers.js';
 import { transaction } from './sqlite-transaction.js';
 import type { ResourceOrigin } from '../shared/resource-materials.js';
-
 export const materialUsageSourceKey = (resource: ResourceOrigin) =>
   'resource:' + resource.combinationId + ':' + JSON.stringify(resource.row);
-
 export class SqliteMaterialUsageRepository implements MaterialUsageRepository {
   constructor(private readonly db: DatabaseSync) {}
   snapshot() {
@@ -61,7 +59,7 @@ export class SqliteMaterialUsageRepository implements MaterialUsageRepository {
       }
       const current = this.snapshot();
       if (current.activePublishing)
-        throw new ProductError(
+        failError(
           'MATERIAL_USAGE_PUBLISHING_ACTIVE',
           '有发帖任务尚未结束，请先停止后再清空使用记录',
           409,
@@ -70,11 +68,7 @@ export class SqliteMaterialUsageRepository implements MaterialUsageRepository {
         current.generation !== request.expectedGeneration ||
         current.published !== request.expectedPublished
       ) {
-        throw new ProductError(
-          'MATERIAL_USAGE_CHANGED',
-          '素材使用记录已变化，请重新读取后确认清空',
-          409,
-        );
+        failError('MATERIAL_USAGE_CHANGED', '素材使用记录已变化，请重新读取后确认清空', 409);
       }
       const result = ClearedMaterialUsage.parse({
         requestId: request.requestId,
@@ -93,5 +87,4 @@ export class SqliteMaterialUsageRepository implements MaterialUsageRepository {
     });
   }
 }
-
 type MaterialUsageRepository = SynchronousRepository<CompatibleMaterialUsageRepository>;

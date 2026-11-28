@@ -38,20 +38,19 @@ export async function checkBumperPost(input: {
   pageOwnerAuthorId: string | null;
 }): Promise<BumperPost> {
   const {
-      session,
-      effectiveGroupId,
-      isPageBumperMode,
-      feed,
-      resolvedPageId,
-      target,
-      postId,
-      expectedFeedbackId,
-      pageOwnerAuthorId,
-    } = input,
-    page = session.getPage();
+    session,
+    effectiveGroupId,
+    isPageBumperMode,
+    feed,
+    resolvedPageId,
+    target,
+    postId,
+    expectedFeedbackId,
+    pageOwnerAuthorId,
+  } = input;
   for (let attempt = 0; ; attempt++) {
     await session.assertIdentity();
-    const s = await readGroupBumper(page, {
+    const s = await readGroupBumper(session.getPage(), {
       groupId: effectiveGroupId,
       ...(feed ? { pageId: resolvedPageId ?? feed.id } : {}),
       targetPostId: postId,
@@ -84,27 +83,27 @@ export async function runBumperPostBrowse(
   expectedFeedbackRef: { current: string | null },
 ): Promise<boolean> {
   const {
-      profileId,
-      paceScale,
-      group,
-      target,
-      post,
-      todayCount,
-      settings,
-      callbacks,
-      session,
-      activePostState,
-      checkPost,
-    } = ctx,
-    page = session.getPage(),
-    conn = session.getConn();
+    profileId,
+    paceScale,
+    group,
+    target,
+    post,
+    todayCount,
+    settings,
+    callbacks,
+    session,
+    activePostState,
+    checkPost,
+  } = ctx;
   if (!activePostState.browseDone) {
     const browseOutcome = await session.op(
       post.hasVideo ? '观看目标视频' : '浏览目标帖子',
       async (): Promise<{ ok: true } | { ok: false; skippedReason: string }> => {
+        const activePage = session.getPage();
+        const activeConn = session.getConn();
         try {
           const refreshedPost = await prepareBumperPost({
-            page,
+            page: activePage,
             readCurrent: checkPost,
             guard: session.guard,
             candidateCardCSS: post.postCSS,
@@ -119,7 +118,7 @@ export async function runBumperPostBrowse(
               return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
             };
             await watchBumperVideo({
-              page,
+              page: activePage,
               initial: refreshedPost,
               readCurrent: checkPost,
               guard: session.guard,
@@ -141,10 +140,7 @@ export async function runBumperPostBrowse(
                 );
               },
               onSummary: (summary) => {
-                devDiag.record({
-                  level: 'INFO',
-                  category: 'GROUP_BUMPER',
-                  event: 'BUMPER_VIDEO_WATCH',
+                devDiag.emit('INFO', 'GROUP_BUMPER', 'BUMPER_VIDEO_WATCH', {
                   profileId,
                   data: {
                     groupId: group.id,
@@ -169,16 +165,17 @@ export async function runBumperPostBrowse(
                 latest.videoCSS ??
                 latest.postCSS;
             if (anchor)
-              await revealBumperControlIfNeeded(page.locator(anchor).first(), paceScale).catch(
-                () => {},
-              );
+              await revealBumperControlIfNeeded(
+                activePage.locator(anchor).first(),
+                paceScale,
+              ).catch(() => {});
           }
           return { ok: true };
         } catch (watchErr) {
           if (
             !callbacks.cancelled() &&
-            !conn.hasPendingCommands &&
-            !conn.failureReason &&
+            !activeConn.hasPendingCommands &&
+            !activeConn.failureReason &&
             !session.isCanceledByUserDetach(watchErr) &&
             isDeterministicPostSkipError(watchErr)
           )
@@ -197,10 +194,7 @@ export async function runBumperPostBrowse(
       resumableRef.current = null;
       session.reportIssue({ kind: 'skipped', reason: browseOutcome.skippedReason });
       callbacks.status(`跳过慢速帖子 · ${browseOutcome.skippedReason}`, todayCount);
-      devDiag.record({
-        level: 'WARN',
-        category: 'GROUP_BUMPER',
-        event: 'BUMPER_POST_SKIPPED',
+      devDiag.emit('WARN', 'GROUP_BUMPER', 'BUMPER_POST_SKIPPED', {
         profileId,
         reason: browseOutcome.skippedReason,
         data: { groupId: group.id, postId: post.postId },
@@ -211,7 +205,7 @@ export async function runBumperPostBrowse(
     session.resetNoProgressRecoveries();
   } else {
     const refreshedPost = await prepareBumperPost({
-      page,
+      page: session.getPage(),
       readCurrent: checkPost,
       guard: session.guard,
       candidateCardCSS: post.postCSS,
@@ -225,23 +219,21 @@ export async function runBumperPostLike(
   ctx: BumperPostCtx,
 ): Promise<{ doLike: boolean; hydratedPost: BumperPost }> {
   const {
-      profileId,
-      paceScale,
-      group,
-      target,
-      post,
-      todayCount,
-      settings,
-      callbacks,
-      session,
-      groupHelpers,
-      activePostState,
-      stats,
-      checkPost,
-      persist,
-    } = ctx,
-    page = session.getPage(),
-    conn = session.getConn();
+    profileId,
+    paceScale,
+    group,
+    target,
+    post,
+    todayCount,
+    settings,
+    callbacks,
+    session,
+    groupHelpers,
+    activePostState,
+    stats,
+    checkPost,
+    persist,
+  } = ctx;
   callbacks.status(`正在顶贴 · ${group.name} · ${target.name}`, todayCount);
   let hydratedPost = await checkPost();
   if (
@@ -256,7 +248,8 @@ export async function runBumperPostLike(
       hydratedPost.postCSS ??
       post.postCSS;
     if (bottomAnchor) {
-      await page
+      await session
+        .getPage()
         .locator(bottomAnchor)
         .first()
         .evaluate((el) => el.scrollIntoView({ block: 'end', inline: 'nearest' }))
@@ -268,7 +261,7 @@ export async function runBumperPostLike(
   const readReactionPost = async () => {
     const current = await checkPost();
     if (current.reactionState !== 'unknown') return current;
-    const fresh = await readBumperReactionFromServer(page, {
+    const fresh = await readBumperReactionFromServer(session.getPage(), {
       actorId: session.accountId,
       postId: post.postId,
       feedbackId: current.feedbackId ?? '',
@@ -295,16 +288,16 @@ export async function runBumperPostLike(
       selectedReaction = settings.useLongPressReaction
         ? (reactionPool[Math.floor(Math.random() * reactionPool.length)] ?? 'care')
         : 'like',
-      expectedReactionId = BUMPER_REACTION_IDS[selectedReaction],
-      likePressBefore = conn.submissionCalls?.mousePress,
-      native = observeBumperGraphql(page, {
-        actorId: session.accountId,
-        feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
-        kind: 'like',
-        profileId,
-        postId: post.postId,
-        expectedReactionId,
-      });
+      likePressBefore = session.getConn().submissionCalls?.mousePress;
+    let activeReactionId = BUMPER_REACTION_IDS[selectedReaction];
+    const native = observeBumperGraphql(session.getPage(), {
+      actorId: session.accountId,
+      feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
+      kind: 'like',
+      profileId,
+      postId: post.postId,
+      expectedReactionId: activeReactionId,
+    });
     await trackBumperSubmissionOp({
       session,
       callKind: 'mousePress',
@@ -316,6 +309,8 @@ export async function runBumperPostLike(
         await session.op(
           '点赞',
           async () => {
+            const activePage = session.getPage();
+            const activeConn = session.getConn();
             const current = await readReactionPost();
             if (current.liked) return false;
             if (current.reactionState === 'unknown') throw Error('点赞状态暂未读清，未点击当前帖');
@@ -323,7 +318,7 @@ export async function runBumperPostLike(
             const performLikeOrReaction = async (likeSelector: string) => {
               let activeLikeSelector = likeSelector;
               const scrolled = await revealBumperControlIfNeeded(
-                page.locator(activeLikeSelector).first(),
+                activePage.locator(activeLikeSelector).first(),
                 paceScale,
               );
               if (scrolled) {
@@ -336,7 +331,7 @@ export async function runBumperPostLike(
               if (selectedReaction !== 'like') {
                 const hover = async () => {
                   session.guard();
-                  await page.locator(activeLikeSelector).first().hover({ timeout: 3000 });
+                  await activePage.locator(activeLikeSelector).first().hover({ timeout: 3000 });
                 };
                 await hover();
                 const deadline = Date.now() + Math.max(80, Math.round(1800 * (paceScale || 1)));
@@ -344,10 +339,10 @@ export async function runBumperPostLike(
                   rehovered = false;
                 do {
                   session.guard();
-                  targetBtn = await page.evaluate(projectBumperReactionTarget, {
+                  targetBtn = await activePage.evaluate(projectBumperReactionTarget, {
                     postId: post.postId,
                     feedbackId: current.feedbackId ?? '',
-                    reactionId: expectedReactionId,
+                    reactionId: activeReactionId,
                   });
                   if (targetBtn || paceScale === 0) break;
                   if (!rehovered && Date.now() > deadline - 800) {
@@ -356,19 +351,47 @@ export async function runBumperPostLike(
                   }
                   await wait(180);
                 } while (Date.now() < deadline);
-                if (!targetBtn) throw Error('所选反应按钮未就绪，未改用其他反应');
-                clickSelector = targetBtn;
+                if (!targetBtn) {
+                  const dockOpen = await activePage
+                    .evaluate(() =>
+                      Array.from(document.querySelectorAll('[role="toolbar"]')).some((el) => {
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) return false;
+                        const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+                        let cur = key
+                          ? (Reflect.get(el, key) as
+                              | { type?: { displayName?: string; name?: string }; return?: unknown }
+                              | undefined)
+                          : undefined;
+                        for (let i = 0; cur && i < 20; i++) {
+                          const n = cur.type?.displayName ?? cur.type?.name ?? '';
+                          if (/CometUFIReactionsMenuDock/.test(n)) return true;
+                          cur = cur.return as typeof cur;
+                        }
+                        return false;
+                      }),
+                    )
+                    .catch(() => false);
+                  if (dockOpen) throw Error('所选反应按钮未就绪，未改用其他反应');
+                  activeReactionId = BUMPER_REACTION_IDS.like;
+                  native.setExpectedReactionId(activeReactionId);
+                  clickSelector = activeLikeSelector;
+                  devDiag.emit('INFO', 'GROUP_BUMPER', 'BUMPER_REACTION_FALLBACK_TO_LIKE', {
+                    profileId,
+                    data: { postId: post.postId, configuredReaction: selectedReaction },
+                  });
+                } else clickSelector = targetBtn;
               }
               const beforePress = await readReactionPost();
               if (beforePress.liked) return;
               if (beforePress.reactionState === 'unknown')
                 throw Error('点赞状态暂未读清，未点击当前帖');
-              await page.locator(clickSelector).first().click({ timeout: 4000 });
+              await activePage.locator(clickSelector).first().click({ timeout: 4000 });
             };
             try {
               await performLikeOrReaction(current.likeCSS);
             } catch (error) {
-              if (conn.submissionCalls?.mousePress !== likePressBefore) throw error;
+              if (activeConn.submissionCalls?.mousePress !== likePressBefore) throw error;
               session.guard();
               const retried = await checkPost();
               if (retried.liked) return false;
@@ -376,7 +399,8 @@ export async function runBumperPostLike(
               await performLikeOrReaction(retried.likeCSS);
             }
             return (
-              likePressBefore === undefined || conn.submissionCalls.mousePress > likePressBefore
+              likePressBefore === undefined ||
+              activeConn.submissionCalls.mousePress > likePressBefore
             );
           },
           async (clicked) => {
@@ -402,7 +426,7 @@ export async function runBumperPostLike(
             await native.waitForEvidence(2000, session.guard);
             checkNative();
             if (native.confirmed()) return confirmLiked();
-            const fresh = await readBumperReactionFromServer(page, {
+            const fresh = await readBumperReactionFromServer(session.getPage(), {
               actorId: session.accountId,
               postId: post.postId,
               feedbackId: hydratedPost.feedbackId ?? post.feedbackId ?? '',
@@ -411,11 +435,9 @@ export async function runBumperPostLike(
             checkNative();
             if (
               native.confirmed() ||
-              (fresh.state === 'active' && fresh.reactionId === expectedReactionId)
+              (fresh.state === 'active' && fresh.reactionId === activeReactionId)
             ) {
-              devDiag.record({
-                category: 'GROUP_BUMPER',
-                event: 'BUMPER_LIKE_READBACK',
+              devDiag.emit('INFO', 'GROUP_BUMPER', 'BUMPER_LIKE_READBACK', {
                 profileId,
                 data: {
                   postId: post.postId,

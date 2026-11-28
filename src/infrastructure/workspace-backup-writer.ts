@@ -74,11 +74,7 @@ export class FilesystemWorkspaceBackupWriter implements WorkspaceBackupWriter {
                 refreshToken: null,
                 expiryDate: null,
               };
-              const scrubbedImg = {
-                ...img,
-                gyazoAccessToken: '',
-                gyazoAccessTokens: [],
-              };
+              const scrubbedImg = { ...img, gyazoAccessToken: '', gyazoAccessTokens: [] };
               saved
                 .prepare(
                   'UPDATE google_sheets_config SET auth_json = ?, image_host_json = ? WHERE id = 1',

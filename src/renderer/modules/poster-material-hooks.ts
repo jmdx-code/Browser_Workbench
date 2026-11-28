@@ -22,7 +22,6 @@ import {
   mergeServerMaterialsIntoDrafts,
   toMaterialInputs,
 } from './poster-material-modals.js';
-
 export function usePosterMaterials({
   state,
   selectedCardIds,
@@ -52,7 +51,7 @@ export function usePosterMaterials({
   ) => Promise<PosterState | null>;
   commitMatrixPending: () => void;
   handleThumbnailSaved: (id: string) => void;
-  ensureMaterialsPersisted: (id: string) => Promise<boolean>;
+  ensureMaterialsPersisted: (ids: string | readonly string[]) => Promise<boolean>;
   onAddLocalFiles: (paths: readonly string[]) => void;
   onDeleteCard: (id: string) => void;
   onBatchDeleteCards: (ids: readonly string[]) => void;
@@ -73,7 +72,6 @@ export function usePosterMaterials({
   onStateRef.current = onState;
   onMessageRef.current = onMessage;
   serverMaterialsRef.current = state?.materials ?? [];
-
   useEffect(() => {
     if (!state) return;
     if (!dirtyMaterials)
@@ -98,7 +96,6 @@ export function usePosterMaterials({
       }),
     );
   }, [state, dirtyMaterials]);
-
   const persistedMaterialIds = new Set((state?.materials ?? []).map((m) => m.id));
   const validMaterialIds = useMemo(
     () => drafts.filter(hasPosterMaterialContent).map((d) => d.id),
@@ -108,7 +105,6 @@ export function usePosterMaterials({
     const picked = validMaterialIds.filter((id) => selectedCardIds.has(id));
     return picked.length > 0 ? picked : validMaterialIds;
   }, [validMaterialIds, selectedCardIds]);
-
   async function persistMaterials(itemsToSave = drafts, options?: { replaceAll?: boolean }) {
     const replaceAll = options?.replaceAll ?? true;
     const latest = replaceAll
@@ -129,7 +125,6 @@ export function usePosterMaterials({
     }
     return next;
   }
-
   useEffect(() => {
     if (!dirtyMaterials || busy) return;
     const seq = editSeqRef.current;
@@ -160,7 +155,6 @@ export function usePosterMaterials({
     }, 600);
     return () => clearTimeout(timer);
   }, [drafts, dirtyMaterials, busy]);
-
   const removeCards = (ids: readonly string[]) => {
     const idSet = new Set(ids);
     const rem = drafts.filter((d) => !idSet.has(d.id) && hasPosterMaterialContent(d));
@@ -168,7 +162,6 @@ export function usePosterMaterials({
     const toRemove = ids.filter((id) => persistedMaterialIds.has(id));
     if (toRemove.length > 0) void action('materials/delete', { ids: toRemove });
   };
-
   return {
     drafts,
     setDrafts,
@@ -189,12 +182,19 @@ export function usePosterMaterials({
       setDrafts((prev) =>
         prev.map((d) => (d.id === id ? { ...d, hasThumbnail: true, updatedAt: Date.now() } : d)),
       ),
-    ensureMaterialsPersisted: async (id: string) =>
-      (!dirtyMaterials && persistedMaterialIds.has(id)) || Boolean(await persistMaterials(drafts)),
+    ensureMaterialsPersisted: async (ids: string | readonly string[]) => {
+      const list = Array.isArray(ids) ? ids : [ids];
+      return (
+        (!dirtyMaterials && list.every((id) => persistedMaterialIds.has(id))) ||
+        Boolean(await persistMaterials(drafts))
+      );
+    },
     onAddLocalFiles: (paths: readonly string[]) => {
+      const cleanPaths = paths.map((p) => p.trim()).filter(Boolean);
+      if (!cleanPaths.length) return;
       const now = Date.now();
-      const added = paths.map((p, idx): MaterialDraft => ({
-        ...createEmptyMaterialDraft(`mat-${now}-${idx}`),
+      const added = cleanPaths.map((p, idx): MaterialDraft => ({
+        ...createEmptyMaterialDraft(`mat-${now}-${idx}-${crypto.randomUUID().slice(0, 6)}`),
         mediaSource: p,
         background: 'plain',
         aiLabel: 'default',

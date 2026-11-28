@@ -1,3 +1,5 @@
+import { serializeDomEval, type createDomEvalRuntime } from '../shared-dom-eval-runtime.js';
+import { createTargetDomHelpers } from './target-meta-helpers.js';
 export interface InPageTargetProbeResult {
   href: string;
   readyState: string;
@@ -10,13 +12,25 @@ export interface InPageTargetProbeResult {
   scopedHtml: string;
   summary: string | null;
 }
-export function extractTargetCandidateInPage(input: {
+interface TargetCandidateInput {
   expectedId: string;
   targetKind: 'groups' | 'pages';
   previousHref: string;
   previousTimeOrigin?: number;
   requireNavigation?: boolean;
-}): InPageTargetProbeResult {
+}
+function extractTargetCandidateEntry(
+  _createDomRt: typeof createDomEvalRuntime,
+  createMetaHelpers: typeof createTargetDomHelpers,
+  input: TargetCandidateInput,
+): InPageTargetProbeResult {
+  const {
+    cleanTargetHeading,
+    isGenericTargetHeading,
+    extractDeepLinkTargetId,
+    isValidHttpAvatarUrl,
+    matchesTargetEntity,
+  } = createMetaHelpers();
   const { expectedId, targetKind, previousHref, previousTimeOrigin, requireNavigation } = input;
   const href = location.href;
   const readyState = document.readyState;
@@ -24,14 +38,11 @@ export function extractTargetCandidateInPage(input: {
     typeof previousTimeOrigin === 'number' &&
     previousTimeOrigin > 0 &&
     performance.timeOrigin === previousTimeOrigin;
-  const emptyResult = (
-    navigated: boolean,
-    abnormal: string | null = null,
-  ): InPageTargetProbeResult => ({
+  const emptyResult = (nav: boolean, abn: string | null = null): InPageTargetProbeResult => ({
     href,
     readyState,
-    navigated,
-    abnormal,
+    navigated: nav,
+    abnormal: abn,
     unavailableTarget: false,
     canonicalId: null,
     domName: null,
@@ -99,26 +110,15 @@ export function extractTargetCandidateInPage(input: {
     if (!prop || !content) continue;
     metaParts.push(m.outerHTML);
     if (prop === 'al:android:url' || prop === 'al:ios:url') {
-      const match =
-        targetKind === 'pages'
-          ? /fb:\/\/(?:profile|page)\/(\d+)/i.exec(content)
-          : /fb:\/\/group\/(\d+)/i.exec(content);
-      if (match?.[1]) canonicalId ??= match[1];
-    } else if (prop === 'og:title' || prop === 'twitter:title') {
-      metaTitle ??= content;
-    } else if (prop === 'og:image' || prop === 'twitter:image') {
-      if (content.startsWith('https://') && !/static\.xx\.fbcdn\.net\/rsrc\.php/i.test(content)) {
-        metaImage ??= content;
-      }
+      const deepId = extractDeepLinkTargetId(content, targetKind);
+      if (deepId) canonicalId ??= deepId;
+    } else if (prop === 'og:title' || prop === 'twitter:title') metaTitle ??= content;
+    else if (prop === 'og:image' || prop === 'twitter:image') {
+      if (isValidHttpAvatarUrl(content)) metaImage ??= content;
     }
   }
   const titleEl = document.querySelector('title');
   if (titleEl) metaParts.push(titleEl.outerHTML);
-  const isGenericHeading = (t: string) =>
-    !t ||
-    /^(?:Facebook|Notifications|通知|Chats|聊天|Groups|小组|社團|Pages|公共主页|粉絲專頁|专页|Marketplace|Watch|视频|目前无法查看此内容|目前無法查看此內容|This content isn't available|Page Not Found|找不到页面|Log into Facebook|登录 Facebook)$/i.test(
-      t,
-    );
   let domName: string | null = null;
   for (const h1 of Array.from(document.querySelectorAll('[role="main"] h1, main h1, h1'))) {
     if (
@@ -127,50 +127,32 @@ export function extractTargetCandidateInPage(input: {
       )
     )
       continue;
-    const raw = (h1.textContent || '')
-      .replace(/\s+/g, ' ')
-      .replace(/^\(\d+\+?\)\s*/, '')
-      .replace(/\s*[|-]\s*Facebook\s*$/i, '')
-      .trim();
-    if (!isGenericHeading(raw)) {
+    const raw = cleanTargetHeading(h1.textContent || '');
+    if (!isGenericTargetHeading(raw)) {
       domName = raw;
       break;
     }
   }
   if (!domName && metaTitle) {
-    const cleaned = metaTitle
-      .replace(/\s+/g, ' ')
-      .replace(/^\(\d+\+?\)\s*/, '')
-      .replace(/\s*[|-]\s*Facebook\s*$/i, '')
-      .trim();
-    if (!isGenericHeading(cleaned)) domName = cleaned;
+    const cleaned = cleanTargetHeading(metaTitle);
+    if (!isGenericTargetHeading(cleaned)) domName = cleaned;
   }
-  const isValidCdnImage = (u: string) =>
-    u.startsWith('https://') &&
-    /fbcdn\.net|fbsbx\.com/i.test(u) &&
-    !/static\.xx\.fbcdn\.net\/rsrc\.php|\/rsrc\.php\/|images\/emoji\.php/i.test(u);
-  const isSmallActorIcon = (el: Element): boolean => {
-    const svg = el.closest('svg');
-    for (const node of [el, svg]) {
-      if (!node) continue;
-      const wAttr = Number.parseFloat(node.getAttribute('width') || '');
-      const hAttr = Number.parseFloat(node.getAttribute('height') || '');
-      if (
-        (Number.isFinite(wAttr) && wAttr > 0 && wAttr <= 48) ||
-        (Number.isFinite(hAttr) && hAttr > 0 && hAttr <= 48)
-      )
-        return true;
-      const style = node.getAttribute('style') || '';
-      const wStyle = /width\s*:\s*(\d+(?:\.\d+)?)px/i.exec(style)?.[1];
-      const hStyle = /height\s*:\s*(\d+(?:\.\d+)?)px/i.exec(style)?.[1];
-      if (
-        (wStyle && Number.parseFloat(wStyle) <= 48) ||
-        (hStyle && Number.parseFloat(hStyle) <= 48)
-      )
-        return true;
-    }
-    return false;
-  };
+  const isValidCdnImage = (u: string) => isValidHttpAvatarUrl(u, { requireCdnHost: true });
+  const isSmallActorIcon = (el: Element): boolean =>
+    [el, el.closest('svg')].some((n) => {
+      if (!n) return false;
+      const small = (v: string | null | undefined) => {
+        const num = Number.parseFloat(v || '');
+        return Number.isFinite(num) && num > 0 && num <= 48;
+      };
+      const st = n.getAttribute('style') || '';
+      return (
+        small(n.getAttribute('width')) ||
+        small(n.getAttribute('height')) ||
+        small(/(?:^|;)\s*width\s*:\s*(\d+(?:\.\d+)?)px/i.exec(st)?.[1]) ||
+        small(/(?:^|;)\s*height\s*:\s*(\d+(?:\.\d+)?)px/i.exec(st)?.[1])
+      );
+    });
   const isExcludedImageZone = (el: Element) =>
     Boolean(
       el.closest(
@@ -186,9 +168,7 @@ export function extractTargetCandidateInPage(input: {
         if (skipCover && /cover/i.test(img.getAttribute('data-imgperflogname') || '')) continue;
         const src =
           (img as HTMLImageElement).currentSrc ||
-          img.getAttribute('src') ||
-          img.getAttribute('xlink:href') ||
-          img.getAttribute('href') ||
+          ['src', 'xlink:href', 'href'].map((a) => img.getAttribute(a)).find(Boolean) ||
           '';
         if (isValidCdnImage(src)) return src;
       }
@@ -221,26 +201,7 @@ export function extractTargetCandidateInPage(input: {
     const row = value as Record<string, unknown>;
     const id = String(row.id ?? row.__id ?? '');
     if (id) refs.set(id, row);
-    let matches =
-      id === expectedId ||
-      (!!canonicalId && id === canonicalId) ||
-      String(row.username ?? '').toLowerCase() === expectedId.toLowerCase() ||
-      String(row.vanity ?? '').toLowerCase() === expectedId.toLowerCase();
-    for (const key of ['url', 'profile_url', 'group_url']) {
-      if (typeof row[key] === 'string') {
-        try {
-          const u = new URL(row[key], location.origin);
-          const normPath = u.pathname.replace(/\/$/, '').toLowerCase();
-          matches ||=
-            u.origin === location.origin &&
-            (normPath === (targetKind === 'groups' ? '/groups/' : '/') + expectedId.toLowerCase() ||
-              (!!canonicalId &&
-                normPath ===
-                  (targetKind === 'groups' ? '/groups/' : '/') + canonicalId.toLowerCase()));
-        } catch {}
-      }
-    }
-    if (matches) {
+    if (matchesTargetEntity(row, targetKind, expectedId, canonicalId, location.origin)) {
       rows.push(
         Object.fromEntries(Object.entries(row).filter(([key]) => pictureKeyPattern.test(key))),
       );
@@ -272,13 +233,10 @@ export function extractTargetCandidateInPage(input: {
         if (!env || environments.has(env)) continue;
         environments.add(env);
         try {
-          const source = (
-            env as {
-              getStore(): { getSource(): { get(id: string): Record<string, unknown> | null } };
-            }
-          )
-            .getStore()
-            .getSource();
+          type RelayEnv = {
+            getStore(): { getSource(): { get(id: string): Record<string, unknown> | null } };
+          };
+          const source = (env as RelayEnv).getStore().getSource();
           const entity = source.get(canonicalId ?? expectedId);
           if (
             !entity ||
@@ -325,20 +283,18 @@ export function extractTargetCandidateInPage(input: {
         const row = refs.get(val);
         needed[val] = row;
         gather(row, depth + 1);
-      } else {
-        gather(val, depth + 1);
-      }
+      } else gather(val, depth + 1);
     }
   };
   const score = (row: Record<string, unknown>) =>
     Object.entries(row).reduce(
-      (n, [key, v]) =>
+      (n, [k, v]) =>
         n +
-        (/^(?:profile_picture|profilePic|profile_photo|cover_photo|group_cover_photo|cover_renderer|default_cover_photo|focused_image| primary_photo)/.test(
-          key,
-        ) &&
-        v &&
-        typeof v === 'object'
+        (v &&
+        typeof v === 'object' &&
+        /^(?:profile_picture|profilePic|profile_photo|cover_photo|group_cover_photo|cover_renderer|default_cover_photo|focused_image| primary_photo)/.test(
+          k,
+        )
           ? 10
           : 0),
       0,
@@ -359,10 +315,7 @@ export function extractTargetCandidateInPage(input: {
       ? '<script type="application/json">' + json.replace(/<\/script/gi, '<\\/script') + '</script>'
       : '');
   return {
-    href,
-    readyState,
-    navigated: true,
-    abnormal: null,
+    ...emptyResult(true),
     unavailableTarget,
     canonicalId,
     domName,
@@ -371,3 +324,6 @@ export function extractTargetCandidateInPage(input: {
     summary,
   };
 }
+export const extractTargetCandidateInPage = serializeDomEval<
+  (input: TargetCandidateInput) => InPageTargetProbeResult
+>('extractTargetCandidateInPage', extractTargetCandidateEntry, { createTargetDomHelpers });

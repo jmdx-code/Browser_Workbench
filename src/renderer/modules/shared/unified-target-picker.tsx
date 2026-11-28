@@ -7,7 +7,6 @@ import { buildTargetCandidates, SelectByIdsDialog } from '../../select-by-ids-di
 import { toggleSet } from '../../selection.js';
 import { UI_INPUT_SM } from '../../ui/primitives.js';
 import { Btn } from './module-ui.js';
-
 export interface UnifiedPickerItem {
   id: string;
   name: string;
@@ -17,10 +16,8 @@ export interface UnifiedPickerItem {
   folderId?: string | null | undefined;
   sortOrder?: number | undefined;
 }
-
 const LINK_BTN =
   'h-auto border-0 bg-transparent p-0 text-xs font-medium text-[var(--primary)] cursor-pointer hover:underline';
-
 export function UnifiedTargetPicker(p: {
   title: string;
   listKind?: TargetListKind | undefined;
@@ -46,7 +43,6 @@ export function UnifiedTargetPicker(p: {
   const [query, setQuery] = useState('');
   const [selectByIdsOpen, setSelectByIdsOpen] = useState(false);
   const anchorRef = useRef<string | null>(null);
-
   useEffect(() => {
     if (!listKind) return setFolders([]);
     let alive = true;
@@ -58,7 +54,6 @@ export function UnifiedTargetPicker(p: {
       alive = false;
     };
   }, [listKind]);
-
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const orderedItems = useMemo(
     () =>
@@ -100,7 +95,6 @@ export function UnifiedTargetPicker(p: {
     () => sections.flatMap((sec) => (closed.has(sec.id) ? [] : sec.rows.map((r) => r.id))),
     [sections, closed],
   );
-
   const applySelectionSet = (next: Set<string>) => {
     const orderedIds = orderedItems.filter((it) => next.has(it.id)).map((it) => it.id);
     for (const id of next) if (!orderedIds.includes(id)) orderedIds.push(id);
@@ -133,7 +127,6 @@ export function UnifiedTargetPicker(p: {
         return n;
       });
   };
-
   const selectedInPool = useMemo(
     () => items.filter((it) => selectedSet.has(it.id)).length,
     [items, selectedSet],
@@ -154,7 +147,6 @@ export function UnifiedTargetPicker(p: {
           ),
     [listKind, orderedItems],
   );
-
   return (
     <div className="mt-2 flex flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-white">
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--line)] bg-slate-50 px-2.5 py-2 text-xs">
@@ -196,7 +188,6 @@ export function UnifiedTargetPicker(p: {
           )}
         </div>
       </div>
-
       {filtered.length === 0 ? (
         <div className="p-4 text-center text-xs text-[var(--muted)]">
           {items.length === 0 ? emptyHint : '无匹配结果'}
@@ -295,7 +286,6 @@ export function UnifiedTargetPicker(p: {
           })}
         </div>
       )}
-
       {selectByIdsOpen && listKind && (
         <SelectByIdsDialog
           title={'按 ID 批量选中 · ' + title}

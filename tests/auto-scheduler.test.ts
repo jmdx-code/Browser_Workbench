@@ -7,7 +7,7 @@ import {
 } from '../src/application/auto-scheduler-service.js';
 import type { BluestacksService } from '../src/application/bluestacks-service.js';
 import { FeatureExecutionRegistry } from '../src/application/feature-execution-registry.js';
-import { syncGlobalConcurrencyToModules } from '../src/application/global-concurrency-sync.js';
+import { Workboard } from '../src/application/workboard.js';
 import type { GroupBumperService } from '../src/application/group-bumper-service.js';
 import type { GroupInviterService } from '../src/application/group-inviter-service.js';
 import type { GroupPosterService } from '../src/application/group-poster-service.js';
@@ -23,8 +23,8 @@ import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { persistenceRoutes } from '../src/infrastructure/persistence-routes.js';
 import {
   AutoSchedule,
+  AutoSchedulerGlobalSettings,
   computeDueScheduleTriggers,
-  computeEffectiveSafetyCeilingMinutes,
   computeNextRunPreview,
   computeUpcomingRunsPreview,
   isUserSavedCombination,
@@ -110,18 +110,11 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['07:30'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 120,
       },
-      prewarm: {
-        enabled: true,
-        leadMinutes: 90,
-        steps: [{ id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 15 }],
-      },
       steps: [
-        { id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 1 },
+        { id: randomUUID(), type: 'active-combination', combinationId: randomUUID() },
         { id: randomUUID(), type: 'page-bumper', pageIds: ['p1'] },
-        { id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 1 },
       ],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
@@ -167,7 +160,6 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           postedCount: 0,
           softIssues: 0,
           hardBlockReason: null,
-          seamlessHandoff: false,
           startedAt: 1000,
           finishedAt: 2000,
           updatedAt: 2000,
@@ -183,7 +175,6 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           postedCount: 0,
           softIssues: 0,
           hardBlockReason: null,
-          seamlessHandoff: false,
           startedAt: 1000,
           finishedAt: null,
           updatedAt: 1500,
@@ -199,7 +190,15 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     db.close();
   });
 
-  it('evaluates Cron prewarm + main triggers, skips expired prewarm near peak time, and computes generous dynamic safety ceilings', () => {
+  it('evaluates Cron & once triggers, skips expired once schedules, and validates global concurrency bounds', () => {
+    const settings = AutoSchedulerGlobalSettings.parse({});
+    expect(settings.browserConcurrency).toBe(15);
+    expect(settings.bluestacksConcurrency).toBe(5);
+    expect(AutoSchedulerGlobalSettings.safeParse({ browserConcurrency: 51 }).success).toBe(false);
+    expect(AutoSchedulerGlobalSettings.safeParse({ bluestacksConcurrency: 31 }).success).toBe(
+      false,
+    );
+
     const sched = AutoSchedule.parse({
       id: randomUUID(),
       name: '早高峰顶贴',
@@ -215,52 +214,48 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['07:30'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 120,
-      },
-      prewarm: {
-        enabled: true,
-        leadMinutes: 90,
-        steps: [{ id: randomUUID(), type: 'active-combination', combinationId: randomUUID() }],
       },
       steps: [
         { id: randomUUID(), type: 'active-combination', combinationId: randomUUID() },
         { id: randomUUID(), type: 'page-bumper', pageIds: ['p1', 'p2', 'p3', 'p4', 'p5'] },
-        { id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 1 },
       ],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
       sortOrder: 0,
+      armedAt: Date.parse('2026-11-17T05:00:00+08:00'),
       createdAt: 1,
       updatedAt: 1,
     });
 
-    // Heavy 40-min combination + 5 pages (~12m) + 1m = 53m -> dynamic safety ceiling should be (53*2.5)+30 = 163m (never 25m!)
-    const ceiling = computeEffectiveSafetyCeilingMinutes(sched, 'main', () => 40);
-    expect(ceiling).toBe(163);
-
-    // At 05:50 CST -> nextRun is Today 06:00 prewarm (for 07:30 main)
     const t0550 = Date.parse('2026-11-17T05:50:00+08:00');
     const preview = computeNextRunPreview(sched, t0550);
-    expect(preview.phase).toBe('prewarm');
-    expect(preview.label).toContain('06:00 预热（正点 07:30）');
+    expect(preview.label).toContain('07:30');
 
-    // At 06:05 CST -> prewarm fires normally
-    const t0605 = Date.parse('2026-11-17T06:05:00+08:00');
-    const due0605 = computeDueScheduleTriggers(sched, t0605, new Set());
-    expect(due0605).toHaveLength(1);
-    expect(due0605[0]?.phase).toBe('prewarm');
-    expect(due0605[0]?.expiredSkipReason).toBeUndefined();
+    const t0735 = Date.parse('2026-11-17T07:35:00+08:00');
+    const due0735 = computeDueScheduleTriggers(sched, t0735, new Set());
+    expect(due0735).toHaveLength(1);
+    expect(due0735[0]?.expiredSkipReason).toBeUndefined();
 
-    // If PC booted late at 07:22 CST (only 8 mins before 07:30 main stage) -> prewarm auto-skips as expired!
-    const t0722 = Date.parse('2026-11-17T07:22:00+08:00');
-    const due0722 = computeDueScheduleTriggers(sched, t0722, new Set());
-    expect(due0722).toHaveLength(1);
-    expect(due0722[0]?.phase).toBe('prewarm');
-    expect(due0722[0]?.expiredSkipReason).toContain('自动跳过过期预热');
+    // Once schedule past misfire grace window yields expiredSkipReason
+    const onceAt = Date.parse('2026-11-17T06:00:00+08:00');
+    const onceSched = AutoSchedule.parse({
+      ...sched,
+      trigger: {
+        mode: 'once',
+        onceAt,
+        weekdays: [1, 2, 3, 4, 5, 6, 7],
+        times: ['06:00'],
+        timeZone: 'Asia/Shanghai',
+        misfireGraceMinutes: 30,
+      },
+    });
+    const expiredTriggers = computeDueScheduleTriggers(onceSched, onceAt + 31 * 60_000, new Set());
+    expect(expiredTriggers).toHaveLength(1);
+    expect(expiredTriggers[0]?.expiredSkipReason).toBeTruthy();
   });
 
-  it('enforces sliding worker pool concurrency, handles soft vs hard faults, skips prewarm-banned accounts in main stage, and closes every browser', async () => {
+  it('enforces sliding worker pool concurrency, handles soft vs hard faults, skips abnormal accounts, and closes every browser', async () => {
     const db = new DatabaseSync(':memory:');
     const repo = new SqliteAutoSchedulerRepository(db);
     repo.saveSettings({
@@ -271,11 +266,11 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     });
 
     const p1 = randomUUID();
-    const p2 = randomUUID(); // Will hit hard ban in prewarm!
-    const p3 = randomUUID(); // Will hit soft restriction in main bumper, still runs closing browse & closes!
+    const p2 = randomUUID(); // Pre-marked restricted -> skipped
+    const p3 = randomUUID(); // Hits soft restriction in bumper, still executes closing active-combination & closes!
     const profilesMap = new Map<string, Profile>([
       [p1, makeProfile(p1, '账号1', 'g-morning')],
-      [p2, makeProfile(p2, '账号2-待封', 'g-morning')],
+      [p2, makeProfile(p2, '账号2-已封', 'g-morning', 'restricted')],
       [p3, makeProfile(p3, '账号3-软限', 'g-morning')],
     ]);
 
@@ -346,8 +341,26 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       }),
     };
 
-    const combos: SavedCombination[] = [];
-    const quickBrowseRuns: string[] = [];
+    const comboId = randomUUID();
+    const combos: SavedCombination[] = [
+      {
+        id: comboId,
+        version: 1,
+        revision: 0,
+        saved: {
+          name: '收尾养号',
+          note: '',
+          randomOrder: false,
+          loop: { mode: 'finite', rounds: 1 },
+          steps: [
+            { id: randomUUID(), type: 'feed', durationMinutes: 1, maxLikes: 0, minLikeCount: 0 },
+          ],
+        },
+        draft: null,
+        updatedAt: Date.now(),
+      },
+    ];
+    const comboRuns: string[] = [];
 
     const workspace = {
       snapshot: async () => ({
@@ -357,18 +370,6 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       }),
       repository: {
         combinations: async () => combos,
-        createCombination: async (spec: SavedCombination['saved']) => {
-          const created: SavedCombination = {
-            id: randomUUID(),
-            version: 1,
-            revision: 0,
-            saved: spec,
-            draft: null,
-            updatedAt: Date.now(),
-          };
-          combos.push(created);
-          return created;
-        },
       },
     } as unknown as WorkspaceService;
 
@@ -387,36 +388,21 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     const tasks = {
       settings: async () => ({ maxConcurrentProfiles: 15 }),
       setSettings: async () => ({ maxConcurrentProfiles: 15 }),
-      releaseErroredPausedPlans: async () => 0,
       livePlans: async () => [],
       stopActiveProfile: async () => true,
       start: async (req: { requestId: string; profileIds: string[] }) => {
         const pid = req.profileIds[0] ?? '';
-        quickBrowseRuns.push(pid);
+        comboRuns.push(pid);
         const planId = randomUUID();
-        if (pid === p2) {
-          const prof = profilesMap.get(p2);
-          if (prof) prof.account.state = 'restricted';
-          batchPlans.set(req.requestId, {
-            id: planId,
-            profileId: pid,
-            state: 'FAILED',
-            reason: '账号已被封禁',
-            round: 1,
-            position: 0,
-            updatedAt: Date.now(),
-          });
-        } else {
-          batchPlans.set(req.requestId, {
-            id: planId,
-            profileId: pid,
-            state: 'COMPLETED',
-            reason: '',
-            round: 1,
-            position: 0,
-            updatedAt: Date.now(),
-          });
-        }
+        batchPlans.set(req.requestId, {
+          id: planId,
+          profileId: pid,
+          state: 'COMPLETED',
+          reason: '',
+          round: 1,
+          position: 0,
+          updatedAt: Date.now(),
+        });
         return { plans: [{ id: planId, profileId: pid }] };
       },
       plansForBatch: async (reqId: string) => {
@@ -451,15 +437,15 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       stop: async () => ({}),
     } as unknown as GroupBumperService;
 
-    const powerModes: PowerLockMode[] = [];
+    const workboard = new Workboard({ browserConcurrency: 2, bluestacksConcurrency: 5 });
     const featureExecution = new FeatureExecutionRegistry();
     const service = new AutoSchedulerService(repo, {
       workspace,
+      workboard,
       tasks,
       groupBumper,
       profileLifecycle: lifecycle,
       featureExecution,
-      onPowerLockChange: (m) => powerModes.push(m),
       pollIntervalMs: 30,
     });
     await service.start();
@@ -478,52 +464,39 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['23:59'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 120,
-      },
-      prewarm: {
-        enabled: true,
-        leadMinutes: 90,
-        steps: [{ id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 5 }],
       },
       steps: [
         { id: randomUUID(), type: 'page-bumper', pageIds: ['page-1'] },
-        { id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 1 },
+        { id: randomUUID(), type: 'active-combination', combinationId: comboId },
       ],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
     });
     const schedId = stAfterSave.schedules[0]?.id ?? '';
-    expect(powerModes).toContain('prevent-app-suspension');
+    expect(stAfterSave.powerLockMode).toBe('prevent-app-suspension');
 
-    // 1) Run Prewarm: p1 & p3 succeed, p2 hits hard ban -> concurrency never exceeds 2!
-    await service.runNow({ id: schedId, phase: 'prewarm' });
-    expect(powerModes).toContain('prevent-display-sleep');
+    await service.runNow({ id: schedId });
     await waitUntil(async () => !(await service.state()).running, 8000);
 
     expect(peakOpenWindows).toBeLessThanOrEqual(2);
     expect(currentOpenWindows).toBe(0);
 
-    // 2) Run Main Stage: p2 must be auto-skipped, p3 hits soft bumper issue yet STILL executes closing 1-min quick-browse and closes cleanly!
-    quickBrowseRuns.length = 0;
-    await service.runNow({ id: schedId, phase: 'main' });
-    await waitUntil(async () => !(await service.state()).running, 8000);
-
     const finalState = await service.state();
     const mainReport = finalState.recentRuns[0];
-    expect(mainReport?.phase).toBe('main');
     expect(mainReport?.skippedCount).toBe(1); // p2 auto-skipped!
     expect(mainReport?.completedCount).toBe(2); // p1 + p3 (soft warning still counts as completed收尾!)
     expect(mainReport?.softIssueCount).toBe(1); // p3 soft warning recorded!
-    expect(quickBrowseRuns).toContain(p3); // p3 STILL ran closing 1-min feed browse after soft bumper warning!
+    expect(comboRuns).toContain(p3); // p3 STILL ran closing active-combination after soft bumper warning!
     expect(currentOpenWindows).toBe(0);
-    expect(closedIds.filter((id) => id === p3).length).toBeGreaterThanOrEqual(2);
+    expect(closedIds).toContain(p1);
+    expect(closedIds).toContain(p3);
 
     await service.shutdown();
     db.close();
   });
 
-  it('supports seamless prewarm -> main handoff without closing & reopening, plus BlueStacks auto-launch & auto-close', async () => {
+  it('supports BlueStacks auto-launch & auto-close and executes browser active-combination schedule', async () => {
     const db = new DatabaseSync(':memory:');
     const repo = new SqliteAutoSchedulerRepository(db);
     repo.saveSettings({
@@ -707,7 +680,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     await service.start();
 
     const s1 = await service.saveSchedule({
-      name: '无缝接力测试',
+      name: '浏览器主阶段测试',
       enabled: true,
       carrier: 'browser',
       targetSelector: {
@@ -720,13 +693,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['23:59'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
-      },
-      prewarm: {
-        enabled: true,
-        leadMinutes: 60,
-        steps: [{ id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 25 }],
       },
       steps: [{ id: randomUUID(), type: 'page-bumper', pageIds: ['p1'] }],
       closeWindowOnFinish: true,
@@ -734,19 +701,12 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     });
     const browserSchedId = s1.schedules[0]?.id ?? '';
 
-    // Start prewarm (stays RUNNING), then trigger main stage while prewarm is still running!
-    await service.runNow({ id: browserSchedId, phase: 'prewarm' });
-    await waitUntil(() => profileObj.online, 3000);
-    expect(closeCalls).toBe(0);
-
-    await service.runNow({ id: browserSchedId, phase: 'main' });
+    await service.runNow({ id: browserSchedId });
     await waitUntil(async () => !(await service.state()).running, 6000);
 
-    // Only closed ONCE at the end of Main Stage (NOT closed after prewarm and reopened)!
     expect(closeCalls).toBe(1);
     const afterBrowser = await service.state();
-    const mainRun = afterBrowser.recentRuns.find((r) => r.phase === 'main');
-    expect(mainRun?.items?.[0]?.seamlessHandoff).toBe(true);
+    const mainRun = afterBrowser.recentRuns.find((r) => r.scheduleId === browserSchedId);
     expect(mainRun?.items?.[0]?.bumpedCount).toBe(2);
 
     // Also verify BlueStacks schedule auto-launch + bump + auto-close!
@@ -764,10 +724,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['23:59'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       steps: [
         { id: randomUUID(), type: 'bluestacks-page-bumper', pageIds: ['p1'], enableSound: false },
       ],
@@ -775,7 +733,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       maxSafetyMinutesPerTarget: null,
     });
     const bsSched = s2.schedules.find((x) => x.carrier === 'bluestacks');
-    await service.runNow({ id: bsSched?.id ?? '', phase: 'main' });
+    await service.runNow({ id: bsSched?.id ?? '' });
     await waitUntil(async () => !(await service.state()).running, 6000);
 
     expect(bsLaunched).toBe(1);
@@ -934,16 +892,14 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['23:59'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       steps: [{ id: randomUUID(), type: 'page-bumper', pageIds: ['p1'] }],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
     });
     const schedId = saved.schedules[0]?.id ?? '';
-    await service.runNow({ id: schedId, phase: 'main' });
+    await service.runNow({ id: schedId });
     await waitUntil(async () => !(await service.state()).running, 5000);
 
     const st = await service.state();
@@ -961,7 +917,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     db.close();
   });
 
-  it('6. filters internal test combinations, includes jitter in upcoming previews, fast-stops BlueStacks without 8s hang, supports keepWindowsOpen, and clears history', async () => {
+  it('6. filters internal test combinations, computes upcoming previews, fast-stops BlueStacks without 8s hang, supports keepWindowsOpen, and clears history', async () => {
     const internalCombo = {
       id: randomUUID(),
       version: 1,
@@ -991,16 +947,13 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     expect(isUserSavedCombination(internalCombo)).toBe(false);
     expect(isUserSavedCombination(realCombo)).toBe(true);
 
-    // Upcoming preview with jitter
+    // Upcoming preview
     const previews = computeUpcomingRunsPreview(
       {
-        id: 'sched-jitter-test',
+        id: 'sched-preview-test',
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['07:00', '12:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 15,
-        prewarmEnabled: true,
-        prewarmLeadMinutes: 90,
       },
       Date.parse('2026-11-17T05:00:00+08:00'),
       3,
@@ -1081,16 +1034,14 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['22:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       steps: [{ id: randomUUID(), type: 'bluestacks-page-bumper', pageIds: ['p-1'] }],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
     });
     const schedId = saved.schedules[0]?.id ?? '';
-    await service.runNow({ id: schedId, phase: 'main' });
+    await service.runNow({ id: schedId });
     await new Promise((r) => setTimeout(r, 80));
 
     // Stop with keepWindowsOpen: true while booting — must resolve in < 1000ms (not 8000ms!) and mark 'stopped' (not 'soft_warning')
@@ -1112,50 +1063,13 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     db.close();
   });
 
-  it('synchronizes global browserConcurrency and bluestacksConcurrency to all modules on startup and update', async () => {
+  it('synchronizes global browserConcurrency and bluestacksConcurrency to Workboard on startup and update', async () => {
     const db = new DatabaseSync(':memory:');
     const repo = new SqliteAutoSchedulerRepository(db);
     repo.saveSettings({ browserConcurrency: 18, bluestacksConcurrency: 6 });
 
-    let taskCap = 100;
-    let bumperCap = 8;
-    let posterCap = 4;
-    let inviterCap = 4;
-    let bsCap = 4;
-
-    const tasks = {
-      settings: async () => ({ maxConcurrentProfiles: taskCap }),
-      setSettings: async (v: { maxConcurrentProfiles: number }) => {
-        taskCap = v.maxConcurrentProfiles;
-        return { maxConcurrentProfiles: taskCap };
-      },
-    } as unknown as TaskService;
-
-    const groupBumper = {
-      syncMaxConcurrency: async (n: number) => {
-        bumperCap = n;
-      },
-    } as unknown as GroupBumperService;
-
-    const groupPoster = {
-      syncMaxConcurrency: async (n: number) => {
-        posterCap = n;
-      },
-    } as unknown as GroupPosterService;
-
-    const groupInviter = {
-      state: async () => ({ maxConcurrentProfiles: inviterCap }),
-      updateSettings: async (v: { maxConcurrentProfiles?: number }) => {
-        if (v.maxConcurrentProfiles !== undefined) inviterCap = v.maxConcurrentProfiles;
-        return { maxConcurrentProfiles: inviterCap };
-      },
-    } as unknown as GroupInviterService;
-
-    const bluestacks = {
-      syncMaxConcurrency: async (n: number) => {
-        bsCap = n;
-      },
-    } as unknown as BluestacksService;
+    const workboard = new Workboard();
+    const observed: Array<{ browserConcurrency: number; bluestacksConcurrency: number }> = [];
 
     const workspace = {
       snapshot: async () => ({ profiles: [], groups: [], combinations: [] }),
@@ -1164,30 +1078,21 @@ describe('AutoScheduler (无人值守定时排班)', () => {
 
     const service = new AutoSchedulerService(repo, {
       workspace,
+      workboard,
       featureExecution: new FeatureExecutionRegistry(),
-      onConcurrencyChanged: (next) =>
-        syncGlobalConcurrencyToModules(next, {
-          tasks,
-          groupBumper,
-          groupPoster,
-          groupInviter,
-          bluestacks,
-        }),
+      onConcurrencyChanged: (next) => {
+        observed.push(next);
+      },
     });
 
     await service.start();
-    expect(taskCap).toBe(18);
-    expect(bumperCap).toBe(18);
-    expect(posterCap).toBe(18);
-    expect(inviterCap).toBe(18);
-    expect(bsCap).toBe(6);
+    expect(workboard.browserPermits.max).toBe(18);
+    expect(workboard.bluestacksPermits.max).toBe(6);
 
     await service.saveSettings({ browserConcurrency: 25, bluestacksConcurrency: 9 });
-    expect(taskCap).toBe(25);
-    expect(bumperCap).toBe(25);
-    expect(posterCap).toBe(25);
-    expect(inviterCap).toBe(25);
-    expect(bsCap).toBe(9);
+    expect(workboard.browserPermits.max).toBe(25);
+    expect(workboard.bluestacksPermits.max).toBe(9);
+    expect(observed.at(-1)).toEqual({ browserConcurrency: 25, bluestacksConcurrency: 9 });
 
     await service.shutdown();
     db.close();
@@ -1372,10 +1277,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1],
         times: ['08:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 60, steps: [] },
       steps: [{ id: randomUUID(), type: 'page-bumper', pageIds: ['pg1'] }],
       closeWindowOnFinish: false,
       maxSafetyMinutesPerTarget: null,
@@ -1394,10 +1297,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1],
         times: ['09:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 60, steps: [] },
       steps: [{ id: randomUUID(), type: 'page-bumper', pageIds: ['pg1'] }],
       closeWindowOnFinish: false,
       maxSafetyMinutesPerTarget: null,
@@ -1408,7 +1309,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
 
     // Run schedule 1 now -> p1 is busy in google-sheets and must be skipped; p2 runs cleanly!
     const schedId = saved2.schedules[0]?.id ?? '';
-    await service.runNow({ id: schedId, phase: 'main' });
+    await service.runNow({ id: schedId });
     await waitUntil(async () => !(await service.state()).running, 5000);
     expect(bumpedProfiles).toEqual([p2]);
 
@@ -1509,16 +1410,14 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['06:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       steps: [{ id: randomUUID(), type: 'bluestacks-health-check', autoInstallApk: true }],
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
     });
     const patrolId = patrolState.schedules[0]?.id ?? '';
-    await service.runNow({ id: patrolId, phase: 'main' });
+    await service.runNow({ id: patrolId });
     await waitUntil(async () => !(await service.state()).running, 5000);
     expect(healthChecked).toEqual([bsOk]);
 
@@ -1537,10 +1436,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         weekdays: [1, 2, 3, 4, 5, 6, 7],
         times: ['08:00'],
         timeZone: 'Asia/Shanghai',
-        jitterMinutes: 0,
         misfireGraceMinutes: 60,
       },
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       steps: [
         { id: randomUUID(), type: 'bluestacks-health-check', autoInstallApk: false },
         { id: randomUUID(), type: 'bluestacks-page-bumper', pageIds: ['pg1'] },
@@ -1549,7 +1446,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       maxSafetyMinutesPerTarget: null,
     });
     const chainId = chainState.schedules.find((s) => s.name === '先体检再顶贴')?.id ?? '';
-    await service.runNow({ id: chainId, phase: 'main' });
+    await service.runNow({ id: chainId });
     await waitUntil(async () => !(await service.state()).running, 5000);
     expect(healthChecked).toEqual([bsOk, bsBad]);
     expect(bumped).toEqual([]);
@@ -1708,10 +1605,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
             weekdays: [1, 2, 3, 4, 5, 6, 7],
             times: ['07:00'],
             timeZone: 'Asia/Shanghai',
-            jitterMinutes: 0,
             misfireGraceMinutes: 60,
           },
-          prewarm: { enabled: false, leadMinutes: 60, steps: [] },
           steps: [{ id: randomUUID(), type: 'active-combination', combinationId: comboId }],
           closeWindowOnFinish: false,
           maxSafetyMinutesPerTarget: null,
@@ -1720,7 +1615,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           s.name.includes(withCurrentStepMethod ? 'direct' : 'overview'),
         );
         expect(sched).toBeTruthy();
-        await service.runNow({ id: sched?.id ?? '', phase: 'main' });
+        await service.runNow({ id: sched?.id ?? '' });
         await waitUntil(async () => !(await service.state()).running, 4000);
         const finalState = await service.state();
         const run = finalState.recentRuns[0];
@@ -1793,10 +1688,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           weekdays: [1, 2, 3, 4, 5, 6, 7],
           times: ['07:00'],
           timeZone: 'Asia/Shanghai',
-          jitterMinutes: 0,
           misfireGraceMinutes: 60,
         },
-        prewarm: { enabled: false, leadMinutes: 60, steps: [] },
         steps: [
           {
             id: randomUUID(),
@@ -1811,7 +1704,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       const sched = saved.schedules.find((s) => s.name === '启动超时测试');
       expect(sched).toBeTruthy();
       setTimeout(() => releaseLaunch?.(), 150);
-      await serviceA.runNow({ id: sched?.id ?? '', phase: 'main' });
+      await serviceA.runNow({ id: sched?.id ?? '' });
       await waitUntil(async () => !(await serviceA.state()).running, 4000);
       const runA = (await serviceA.state()).recentRuns[0];
       expect(runA?.items[0]?.status).toBe('watchdog_timeout');
@@ -1866,10 +1759,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           weekdays: [1, 2, 3, 4, 5, 6, 7],
           times: ['07:00'],
           timeZone: 'Asia/Shanghai',
-          jitterMinutes: 0,
           misfireGraceMinutes: 60,
         },
-        prewarm: { enabled: false, leadMinutes: 60, steps: [] },
         steps: [
           { id: randomUUID(), type: 'group-bumper', groupIds: ['g1'], pageIds: ['pg1'] },
           { id: randomUUID(), type: 'page-bumper', pageIds: ['pg1'] },
@@ -1879,7 +1770,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       });
       const schedB = savedB.schedules.find((s) => s.name === '多步看门狗续跑测试');
       expect(schedB).toBeTruthy();
-      await serviceB.runNow({ id: schedB?.id ?? '', phase: 'main' });
+      await serviceB.runNow({ id: schedB?.id ?? '' });
       await waitUntil(async () => !(await serviceB.state()).running, 4000);
       expect(step2Ran).toBe(true);
       const runB = (await serviceB.state()).recentRuns.find(
@@ -1893,7 +1784,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     db.close();
   });
 
-  it('10. executes single-shot mode once and auto-disables, forwards bumper settingsOverride, and runs Browser group-inviter steps', async () => {
+  it('10. executes single-shot mode once and auto-disables on settlement, and runs Browser group-inviter steps', async () => {
     const db = new DatabaseSync(':memory:');
     const repo = new SqliteAutoSchedulerRepository(db);
     const p1 = randomUUID();
@@ -1901,7 +1792,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
     const pg1 = '200000000001';
     let nowMs = 1_800_000_000_000;
 
-    let capturedOverride: Record<string, unknown> | undefined;
+    let bumperCalls = 0;
     let inviterCall: { profileId: string; groupIds: string[]; invitesPerGroup: number } | undefined;
 
     const service = new AutoSchedulerService(repo, {
@@ -1930,8 +1821,8 @@ describe('AutoScheduler (无人值守定时排班)', () => {
         repository: { combinations: async () => [] },
       } as unknown as WorkspaceService,
       groupBumper: {
-        runScheduledProfileStep: async (inp: { settingsOverride?: Record<string, unknown> }) => {
-          capturedOverride = inp.settingsOverride;
+        runScheduledProfileStep: async () => {
+          bumperCalls += 1;
           return { bumpedCount: 3, status: 'ok', hardBlocked: false, softIssue: false };
         },
         stop: async () => ({}),
@@ -1975,28 +1866,20 @@ describe('AutoScheduler (无人值守定时排班)', () => {
           weekdays: [1, 2, 3, 4, 5, 6, 7],
           times: ['09:00'],
           timeZone: 'Asia/Shanghai',
-          jitterMinutes: 0,
           misfireGraceMinutes: 120,
         },
-        prewarm: { enabled: false, leadMinutes: 90, steps: [] },
         steps: [
           {
             id: randomUUID(),
             type: 'group-bumper',
             groupIds: [g1],
             pageIds: [pg1],
-            settingsOverride: {
-              likeProbability: 55,
-              commentProbability: 80,
-              enableSound: true,
-            },
           },
           {
             id: randomUUID(),
             type: 'group-inviter',
             groupIds: [g1],
             invitesPerGroup: 7,
-            playSoundOnComplete: false,
           },
         ],
         closeWindowOnFinish: false,
@@ -2009,11 +1892,7 @@ describe('AutoScheduler (无人值守定时排班)', () => {
       await service.tick();
       await waitUntil(async () => !(await service.state()).running, 4000);
 
-      expect(capturedOverride).toEqual({
-        likeProbability: 55,
-        commentProbability: 80,
-        enableSound: true,
-      });
+      expect(bumperCalls).toBe(1);
       expect(inviterCall).toEqual({
         profileId: p1,
         groupIds: [g1],

@@ -34,7 +34,6 @@ export const UploadStageManifest = strictObj({
     if (file.original.role !== 'video' || file.derivation?.sourceSha256 !== file.original.digest)
       addIssue(ctx, 'UPLOAD_DERIVATION_SOURCE_MISMATCH');
 });
-export type UploadManifest = z.infer<typeof UploadStageManifest>;
 // Private authenticated RPC only. Paths are software-derived verified cache files, never UI input.
 const absoluteFile = sReq(4096).refine((file) => {
   const normal = file.replaceAll('\\', '/');

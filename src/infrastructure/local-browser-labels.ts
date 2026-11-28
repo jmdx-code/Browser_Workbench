@@ -129,9 +129,7 @@ export class LocalBrowserLabels {
     for (const item of valid) {
       const folderKey = `${item.userDataDir}::${item.profileDirectory}`;
       if ((folderCount.get(folderKey) ?? 0) !== 1) continue;
-      if (!this.labels.has(item.profileId)) {
-        this.labels.set(item.profileId, item.browserName);
-      }
+      if (!this.labels.has(item.profileId)) this.labels.set(item.profileId, item.browserName);
       this.bindings.set(item.profileId, item);
       let owners = this.folderOwners.get(folderKey);
       if (!owners) {
@@ -174,9 +172,7 @@ export class LocalBrowserLabels {
     }
     const targetIds = [...new Set(ids)].filter((id) => !this.bindings.has(id));
     if (!targetIds.length) return;
-    for (const id of targetIds) {
-      this.lastAttemptAt.delete(id);
-    }
+    for (const id of targetIds) this.lastAttemptAt.delete(id);
     for (let pass = 0; pass < 6; pass++) {
       await this.refresh(ids, { forceMissingBindings: true });
       const stillScanning = targetIds.some((id) => this.inProgress.has(id));
@@ -193,11 +189,7 @@ export class LocalBrowserLabels {
     | { ok: true; updatedBinding: ProfileLaunchBinding }
     | { ok: false; errorCode: string; reason: string }
   > {
-    const fail = (errorCode: string, reason: string) => ({
-      ok: false as const,
-      errorCode,
-      reason,
-    });
+    const fail = (errorCode: string, reason: string) => ({ ok: false as const, errorCode, reason });
     let executablePath = binding.executablePath;
     if (!existsSync(executablePath)) {
       const fallbackExe = this.resolveExecutablePath(binding.browserKind);
@@ -408,9 +400,7 @@ export class LocalBrowserLabels {
             }
             owners.add(id);
             if (owners.size > 1) {
-              for (const ownerId of owners) {
-                this.bindings.delete(ownerId);
-              }
+              for (const ownerId of owners) this.bindings.delete(ownerId);
             } else if (match.executablePath) {
               const binding: ProfileLaunchBinding = {
                 profileId: id,

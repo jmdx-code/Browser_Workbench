@@ -71,9 +71,8 @@ function projectBrowsePageEntry(
   const rand = (base: number, span: number) => Math.round(base + Math.random() * span);
   const clamp = (min: number, max: number, v: number) => Math.max(min, Math.min(max, v));
   let recommendedDwellMs: number | undefined, nextScrollDeltaY: number | undefined;
-  if (friendRequestsRoute || friendSuggestionsRoute) {
-    recommendedDwellMs = rand(1600, 1900);
-  } else if (searchPagesRoute) {
+  if (friendRequestsRoute || friendSuggestionsRoute) recommendedDwellMs = rand(1600, 1900);
+  else if (searchPagesRoute) {
     recommendedDwellMs = rand(1800, 1400);
     nextScrollDeltaY = rand(360, 240);
   } else if (marketplace || itemRoute) {
@@ -97,12 +96,8 @@ function projectBrowsePageEntry(
           19500,
           Math.round(videoDurationSeconds * 1000 * ratio + (Math.random() - 0.5) * 1200),
         );
-      } else {
-        recommendedDwellMs = rand(3200, 2600);
-      }
-    } else {
-      recommendedDwellMs = roll < 0.75 ? rand(7500, 9500) : rand(3800, 2400);
-    }
+      } else recommendedDwellMs = rand(3200, 2600);
+    } else recommendedDwellMs = roll < 0.75 ? rand(7500, 9500) : rand(3800, 2400);
   } else if (feedLikeSurface) {
     if (structuralPost) {
       if (structuralPost.hasInlineVideo || (source && video)) {
@@ -134,9 +129,7 @@ function projectBrowsePageEntry(
           ),
         );
       }
-    } else {
-      recommendedDwellMs = article ? rand(2200, 1800) : 2000;
-    }
+    } else recommendedDwellMs = article ? rand(2200, 1800) : 2000;
     const targetCenterY = 56 + (innerHeight - 56) * 0.5,
       anchorRect = anchor?.getBoundingClientRect(),
       anchorCenterY = anchorRect ? anchorRect.top + anchorRect.height * 0.5 : 0;

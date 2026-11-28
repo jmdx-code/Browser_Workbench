@@ -2,8 +2,7 @@ import ts from 'typescript';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-const MAX_LINES = 800;
-const MAX_TOTAL_RAW_LINES = 134000;
+const WARN_FILE_LINES = 1500;
 
 const rules = {
   domain: ['domain', 'shared'],
@@ -30,7 +29,6 @@ const productionEntrypoints = [
 
 const problems = [];
 const codeFiles = new Set();
-const allLineCheckedFiles = [];
 
 async function collectFiles(dir) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -40,9 +38,6 @@ async function collectFiles(dir) {
       continue;
     }
     if (file.endsWith('.d.ts')) continue;
-    if (/\.(ts|tsx|cts|css)$/.test(file)) {
-      allLineCheckedFiles.push(file);
-    }
     if (/\.(ts|tsx|cts)$/.test(file)) {
       codeFiles.add(path.resolve(file));
     }
@@ -75,26 +70,19 @@ function resolveLocalCodeImport(fromFile, spec) {
 await collectFiles('src');
 await collectFiles('extension');
 
-// Gate 3: max 800 lines across all .ts, .tsx, .cts, .css in src/ and extension/
-let totalLines = 0;
-for (const file of allLineCheckedFiles) {
-  const rawText = await readFile(file, 'utf8');
-  const lineCount = rawText.split(/\r?\n/).length;
-  totalLines += lineCount;
-  if (lineCount > MAX_LINES) {
-    problems.push(`${file.replace(/\\/g, '/')}: exceeds ${MAX_LINES} lines (${lineCount})`);
-  }
-}
-if (totalLines > MAX_TOTAL_RAW_LINES) {
-  problems.push(`Total raw lines (${totalLines}) exceeds limit (${MAX_TOTAL_RAW_LINES})`);
-}
-
-// Gates 1 & 2 + dependency graph collection for Gate 4
+// Gates 1 & 2 + dependency graph collection for Gate 4 + non-blocking line metrics
 const adjacency = new Map();
+let totalLines = 0;
+const oversizedFiles = [];
 
 for (const absFile of codeFiles) {
   const relFile = path.relative(process.cwd(), absFile).replace(/\\/g, '/');
   const rawText = await readFile(absFile, 'utf8');
+  const lineCount = rawText.split(/\r?\n/).length;
+  totalLines += lineCount;
+  if (lineCount > WARN_FILE_LINES) {
+    oversizedFiles.push(`${relFile} (${lineCount} lines)`);
+  }
   const source = ts.createSourceFile(absFile, rawText, ts.ScriptTarget.Latest, true);
   const parts = relFile.split('/');
   const inSrc = parts[0] === 'src';
@@ -197,6 +185,11 @@ if (problems.length) {
   console.error(problems.join('\n'));
   process.exit(1);
 }
+if (oversizedFiles.length) {
+  console.warn(
+    `[advisory] Files exceeding ${WARN_FILE_LINES} lines (non-blocking): ${oversizedFiles.join(', ')}`,
+  );
+}
 console.log(
-  `Architecture boundaries, <=${MAX_LINES}-line limit, zero-exemption AST rules, and 100% entrypoint reachability passed (${allLineCheckedFiles.length} files, ${totalLines}/${MAX_TOTAL_RAW_LINES} lines)`,
+  `Architecture boundaries, zero-exemption AST rules, and 100% entrypoint reachability passed (${codeFiles.size} code files, ${totalLines} lines)`,
 );

@@ -1,3 +1,4 @@
+import { ActivityStatsResponseSchema, type ActivityStatsQuery } from '../shared/activity-stats.js';
 import type { AutoSchedulerState } from '../shared/auto-scheduler.js';
 import type { BluestacksState } from '../shared/bluestacks.js';
 import {
@@ -12,6 +13,10 @@ import {
   type Combination,
 } from '../shared/contracts.js';
 import { CleanupPreview, CleanupResult, CleanupSettings } from '../shared/data-cleanup.js';
+import {
+  BrowserRiskLimitsStateSchema,
+  type DailyRiskLimitSettings,
+} from '../shared/daily-risk-limits.js';
 import type {
   GoogleAuthStatus,
   GoogleSheetLink,
@@ -24,9 +29,11 @@ import type {
 import type { BumperState } from '../shared/group-bumper.js';
 import {
   GroupInviterState,
+  InviterRecordsResponseSchema,
   type AddInviterGroupsRequest,
   type DeleteInviterGroupsRequest,
   type GroupInviteLogRow,
+  type InviterRecordsQuery,
   type StartGroupInviterRequest,
   type StopGroupInviterProfilesRequest,
   type UpdateGroupInviterSettingsRequest,
@@ -75,14 +82,11 @@ import type { TargetFolder, TargetListCommand, TargetListKind } from '../shared/
 import {
   TaskCapabilities,
   TaskCommandResult,
-  TaskHistory,
-  TaskRecords,
   TaskRuntimeOverview,
   TaskStartResult,
   type Assignment,
   type TaskCommand,
 } from '../shared/task-contracts.js';
-import { TASK_CAPACITY_HEADER, TASK_CAPACITY_VERSION } from '../shared/task-policies.js';
 import { TaskTestResult, type TestRequest } from '../shared/task-tests.js';
 import {
   WindowLayoutCommand,
@@ -98,7 +102,6 @@ import {
 import { WorkspacePreferences, type PreferenceUpdate } from '../shared/workspace-preferences.js';
 import { readResourceDownloadStream } from './resource-download-stream.js';
 import { readResourceCheckStream } from './resource-source-stream.js';
-
 export class ApiError extends Error {
   constructor(
     readonly code: string,
@@ -107,10 +110,8 @@ export class ApiError extends Error {
     super(message);
   }
 }
-
 const combineTimeout = (sig: AbortSignal | undefined, ms: number): AbortSignal =>
   sig ? AbortSignal.any([sig, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
-
 async function parseJsonSafe(res: Response): Promise<unknown> {
   const text = await res.text();
   if (!text) return null;
@@ -120,19 +121,13 @@ async function parseJsonSafe(res: Response): Promise<unknown> {
     return { error: res.ok ? '服务返回格式异常' : `请求失败（HTTP ${res.status}）` };
   }
 }
-
 export async function request(
   route: string,
   input?: unknown,
   signal?: AbortSignal,
   root = '/api/workspace',
 ): Promise<unknown> {
-  const h: Record<string, string> = {
-    'x-workbench-workspace-contract': '6',
-    [TASK_CAPACITY_HEADER]: TASK_CAPACITY_VERSION,
-  };
-  if (route.startsWith('/tasks/')) h['x-workbench-task-contract'] = '5';
-  if (route === '/tasks/records') h['x-workbench-records-contract'] = '1';
+  const h: Record<string, string> = {};
   if (route.startsWith('/tasks/runtime')) h['x-workbench-runtime-contract'] = '2';
   if (input !== undefined) h['content-type'] = 'application/json';
   if (route === '/profiles/inspect' || route === '/profiles/inspection')
@@ -177,7 +172,6 @@ export async function request(
   }
   return body;
 }
-
 async function requestNdjsonStream(
   route: string,
   body: unknown,
@@ -202,7 +196,6 @@ async function requestNdjsonStream(
     throw Error(mismatchMessage);
   return res.body;
 }
-
 type Sig = AbortSignal;
 type Fail = Array<{ profileId: string; errorCode: string; reason: string }>;
 type Schema<T> = { parse: (v: unknown) => T };
@@ -214,15 +207,6 @@ type DiagSnap = {
   entryId: number;
   at: string;
 };
-type RecFilter = {
-  groupBy?: 'run';
-  profileId?: string;
-  status?: 'all' | 'running' | 'completed' | 'failed' | 'review';
-  query?: string;
-  cursor?: string;
-  limit?: number;
-};
-
 const j = <T>(r: string, b?: unknown, ms?: number, sig?: Sig, root?: string) =>
   request(r, b, ms ? combineTimeout(sig, ms) : sig, root) as Promise<T>;
 const p = async <T>(r: string, s: Schema<T>, b?: unknown, ms?: number, sig?: Sig, root?: string) =>
@@ -237,7 +221,6 @@ const qs = (params: Record<string, string | number | undefined>) => {
   const s = sp.toString();
   return s ? '?' + s : '';
 };
-
 export const api = {
   bumperState: (sig?: Sig) => j<BumperState>('/group-bumper/state', undefined, 15_000, sig),
   bumperAction: (a: string, b: unknown = {}) => j<BumperState>('/group-bumper/' + a, b, 60_000),
@@ -395,6 +378,10 @@ export const api = {
           carrier: q.carrier && q.carrier !== 'all' ? q.carrier : undefined,
           status: q.status && q.status !== 'all' ? q.status : undefined,
           search: q.search?.trim() || undefined,
+          accountQuery: q.accountQuery?.trim() || undefined,
+          groupQuery: q.groupQuery?.trim() || undefined,
+          pageQuery: q.pageQuery?.trim() || undefined,
+          postUrlQuery: q.postUrlQuery?.trim() || undefined,
           from: q.from,
           to: q.to,
           limit: q.limit,
@@ -410,6 +397,47 @@ export const api = {
     clearAll?: boolean;
     recordType?: PostBumpRecordQueryTypeValue;
   }) => j<{ deleted: number }>('/post-bump-records/delete', b, 20_000),
+  activityStats: (q: ActivityStatsQuery = {}, sig?: Sig) =>
+    p(
+      '/activity-stats' +
+        qs({
+          from: q.from,
+          to: q.to,
+          carrier: q.carrier && q.carrier !== 'all' ? q.carrier : undefined,
+          groupBy: q.groupBy,
+          search: q.search?.trim() || undefined,
+          onlyActive: q.onlyActive ? '1' : undefined,
+        }),
+      ActivityStatsResponseSchema,
+      undefined,
+      15_000,
+      sig,
+    ),
+  browserRiskLimits: (sig?: Sig) =>
+    p('/browser-risk-limits', BrowserRiskLimitsStateSchema, undefined, 15_000, sig),
+  saveBrowserRiskLimits: (b: DailyRiskLimitSettings) =>
+    p('/browser-risk-limits', BrowserRiskLimitsStateSchema, b, 20_000),
+  inviterRecords: (q: InviterRecordsQuery = {}, sig?: Sig) =>
+    p(
+      '/inviter-records' +
+        qs({
+          carrier: q.carrier && q.carrier !== 'all' ? q.carrier : undefined,
+          confirmation: q.confirmation,
+          accountQuery: q.accountQuery?.trim() || undefined,
+          groupQuery: q.groupQuery?.trim() || undefined,
+          friendQuery: q.friendQuery?.trim() || undefined,
+          from: q.from,
+          to: q.to,
+          limit: q.limit,
+          offset: q.offset,
+        }),
+      InviterRecordsResponseSchema,
+      undefined,
+      15_000,
+      sig,
+    ),
+  deleteInviterRecords: (b: { ids?: string[]; clearAll?: boolean }) =>
+    j<{ deleted: number }>('/inviter-records/delete', b, 20_000),
   runtimeSummary: (sig?: Sig) => p('/runtime-summary', RuntimeSummarySchema, undefined, 8_000, sig),
   testTask: (b: TestRequest) => p('/tasks/test', TaskTestResult, b, 65_000),
   taskCapabilities: (sig: Sig) =>
@@ -424,15 +452,6 @@ export const api = {
     ),
   startTasks: (b: Assignment) => p('/tasks/start', TaskStartResult, b, 65_000),
   commandTasks: (b: TaskCommand) => p('/tasks/command', TaskCommandResult, b, 45_000),
-  taskHistory: (profileId: string, planId: string | null, sig: Sig, round?: number) =>
-    p(
-      '/tasks/history',
-      TaskHistory,
-      { profileId, ...(planId ? { planId } : {}), ...(round ? { round } : {}) },
-      10_000,
-      sig,
-    ),
-  taskRecords: (b: RecFilter, sig?: Sig) => p('/tasks/records', TaskRecords, b, 10_000, sig),
   create: (value: Combination) => p('/combinations/create', SavedCombinationSchema, { value }),
   saveCombination: (id: string, expectedRevision: number, value: Combination) =>
     p('/combinations/save', SavedCombinationSchema, { id, expectedRevision, value }, 10_000),
@@ -590,6 +609,12 @@ export const api = {
       180_000,
     ),
   googleSheetsStopLink: (id: string) => gs<{ stopped: boolean }>('/links/stop', { id }),
+  googleSheetsResetStuckRows: (id: string) =>
+    gs<{ linkId: string; resetCount: number; rowNumbers: number[]; summary: string }>(
+      '/links/reset-stuck',
+      { id },
+      30_000,
+    ),
   googleSheetsStopProfiles: (profileIds: string[]) =>
     gs<GoogleSheetsOverview>('/stop-profiles', { profileIds }),
 };

@@ -1,10 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import type { z } from 'zod';
 import { profileDisplayName, type Profile } from '../shared/contracts.js';
 import type { UpdateStatus } from '../shared/software-update.js';
-import type { TaskRuntimeOverview } from '../shared/task-contracts.js';
 import { api } from './api.js';
 import { copyTextToClipboard } from './clipboard.js';
+import { ConfirmDialog } from './confirm-dialog.js';
 import {
   IconBack,
   IconChevron,
@@ -29,11 +28,9 @@ import {
   MediaComponentPanel,
   WorkspacePreferencesPanel,
 } from './workspace-settings-panels.js';
-
 declare const __WORKBENCH_VERSION__: string;
 declare const __BRIDGE_EXTENSION_VERSION__: string;
 type Section = 'google-sheets' | 'preferences' | 'backup' | 'logs' | 'update' | 'about';
-
 const SECTIONS: Array<[string, Array<[Section, string, string, ReactNode]>]> = [
   [
     '云表与偏好',
@@ -60,11 +57,10 @@ const SECTIONS: Array<[string, Array<[Section, string, string, ReactNode]>]> = [
     ],
   ],
 ];
-
 const QUICK_STEPS = [
   [
     '连接浏览器',
-    '点击顶栏「复制插件路径」，在 Chrome / Brave 扩展页加载即可自动连入左侧浏览器列表。',
+    '点击菜单「复制插件路径」，在 Chrome / Brave 扩展页加载即可自动连入左侧浏览器列表。',
   ],
   [
     '统一并发管理',
@@ -75,15 +71,13 @@ const QUICK_STEPS = [
     '支持定时排班、活跃账号、小组发帖、小组/专页顶贴、小组邀请人、蓝蝶模拟器和 Google 云表协同。',
   ],
   [
-    '全局执行记录',
-    '在左侧顶部「执行记录」统一查看、搜索、导出或清理各模块任务回执；点击左侧账号名可按单号筛选。',
+    '数据与记录',
+    '在左侧导航「数据与记录」查看跨载体统计面板及发帖、顶贴、邀人明细，支持自定义列与组合筛选。',
   ],
 ] as const;
-
 const MENU_GROUP_LBL = 'px-2.5 pb-1.5 text-[11px] font-bold tracking-wider text-[var(--text-3)]';
 const MENU_PANEL = 'grid justify-items-start gap-2.5';
 const MENU_DIVIDER = 'my-3.5 border-0 border-t border-[var(--line)]';
-
 function MI(p: {
   icon: ReactNode;
   title: ReactNode;
@@ -117,15 +111,11 @@ function MI(p: {
     </button>
   );
 }
-
 export function AppMenu(p: {
   profiles: Profile[];
-  selected: ReadonlySet<string>;
-  runtime: z.infer<typeof TaskRuntimeOverview> | null;
   busy: boolean;
   restartDisabled: boolean;
   onRestart: () => void;
-  onRefresh: () => void;
   onClose: () => void;
   initialSection?: 'update' | 'google-sheets' | 'logs';
   onGoogleSheetsChanged?: () => void;
@@ -139,6 +129,7 @@ export function AppMenu(p: {
 }) {
   const { profiles, busy, restartDisabled, onClose, onNotify, updateStatus, updateError = '' } = p;
   const [section, setSection] = useState<Section | null>(p.initialSection ?? null);
+  const [confirmRestart, setConfirmRestart] = useState(false);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (
@@ -154,14 +145,12 @@ export function AppMenu(p: {
     document.addEventListener('keydown', key);
     return () => document.removeEventListener('keydown', key);
   }, [section, onClose]);
-
   const title =
     section === 'update'
       ? '插件连接与更新'
       : section === 'about'
         ? '关于工作台'
         : (SECTIONS.flatMap(([, items]) => items).find(([id]) => id === section)?.[1] ?? '菜单');
-
   return (
     <SlideDrawer
       open
@@ -282,7 +271,7 @@ export function AppMenu(p: {
               hint={restartDisabled ? '有任务执行中，暂不可重启' : '重新载入本地控制服务'}
               titleAttr={restartDisabled ? '有任务正在执行或排队，请先暂停或停止' : ''}
               disabled={busy || restartDisabled}
-              onClick={p.onRestart}
+              onClick={() => setConfirmRestart(true)}
             />
           </div>
         </nav>
@@ -312,8 +301,12 @@ export function AppMenu(p: {
               <WorkspacePreferencesPanel />
             </>
           )}
-          {section === 'backup' && <WorkspaceBackupPanel />}
-          {section === 'logs' && <WorkspaceMaintenancePanel />}
+          {section === 'backup' && (
+            <WorkspaceBackupPanel onOpenMaintenance={() => setSection('logs')} />
+          )}
+          {section === 'logs' && (
+            <WorkspaceMaintenancePanel onOpenBackup={() => setSection('backup')} />
+          )}
           {section === 'update' && (
             <>
               <SoftwareUpdatePanel
@@ -397,6 +390,17 @@ export function AppMenu(p: {
             </div>
           )}
         </div>
+      )}
+      {confirmRestart && (
+        <ConfirmDialog
+          title="确认重启软件"
+          description="将重新载入本地控制服务与工作台界面，请确认当前无需保留未保存的编辑内容。"
+          label="确认重启"
+          danger={false}
+          busy={busy}
+          onClose={() => setConfirmRestart(false)}
+          onConfirm={() => p.onRestart()}
+        />
       )}
     </SlideDrawer>
   );

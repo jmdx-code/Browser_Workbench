@@ -1,15 +1,12 @@
 import * as M from './mcp-context.js';
-
 const BROWSER_ACTIONS =
   'click double_click fill type press select hover scroll upload_files wait_for_text bring_to_front';
 const LIFECYCLE_ACTIONS =
   'open close restart status cleanup_tabs show_window arrange_windows restore_windows';
 const BROWSER_ACT_SET = new Set(BROWSER_ACTIONS.split(' '));
 const LIFECYCLE_ACT_SET = new Set(LIFECYCLE_ACTIONS.split(' '));
-
 async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<string, unknown>) {
   const action = M.strArg(args.action);
-  const rawList = M.collectRawIds(args, 'profileIds', 'profileId');
   M.req(LIFECYCLE_ACT_SET.has(action), 'INVALID_ACTION', '无效的 lifecycle action');
   if (action === 'cleanup_tabs') {
     M.req(
@@ -18,10 +15,7 @@ async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<st
       '当前环境未启用标签整理服务',
       503,
     );
-    const pids =
-      rawList.length > 0
-        ? await M.resolveProfileIds(deps, rawList)
-        : (await M.buildEnrichedProfiles(deps)).filter((p) => p.online).map((p) => p.id);
+    const pids = (await M.resolveCollectedPids(deps, args, true)) ?? [];
     return {
       action,
       ...(pids.length === 0
@@ -31,9 +25,8 @@ async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<st
   }
   if (action === 'show_window') {
     M.req(deps.browserWindow, 'BROWSER_WINDOW_UNAVAILABLE', '当前环境未启用窗口显示服务', 503);
-    M.req(rawList.length > 0, 'PROFILE_IDS_REQUIRED', 'show_window 需要指定 profileId');
     const [pids, aliasMap] = await Promise.all([
-      M.resolveProfileIds(deps, rawList),
+      M.reqCollectedPids(deps, args, 'show_window 需要指定 profileId'),
       M.buildProfileDisplayNameMap(deps),
     ]);
     const items = [];
@@ -42,7 +35,18 @@ async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<st
   }
   if (action === 'arrange_windows' || action === 'restore_windows') {
     M.req(deps.windowLayout, 'WINDOW_LAYOUT_UNAVAILABLE', '当前环境未启用窗口布局服务', 503);
-    const pids = rawList.length > 0 ? await M.resolveProfileIds(deps, rawList) : undefined;
+    const pids = (await M.resolveCollectedPids(deps, args, action === 'arrange_windows'))?.slice(
+      0,
+      100,
+    );
+    if (action === 'arrange_windows') {
+      M.req(
+        Boolean(pids && pids.length > 0),
+        'WINDOW_LAYOUT_SELECTION_REQUIRED',
+        '当前没有在线浏览器窗口可整理',
+        409,
+      );
+    }
     return {
       action,
       layout: await deps.windowLayout.command({
@@ -52,8 +56,7 @@ async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<st
     };
   }
   M.req(deps.profileLifecycle, 'LIFECYCLE_UNAVAILABLE', '当前环境未启用浏览器生命周期管理器', 503);
-  M.req(rawList.length > 0, 'PROFILE_IDS_REQUIRED', '请通过 profileId 或 profileIds 指定浏览器');
-  const pids = await M.resolveProfileIds(deps, rawList);
+  const pids = await M.reqCollectedPids(deps, args);
   const timeoutMs =
     typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs)
       ? M.clampInt(args.timeoutMs, 35000, 5000, 60000)
@@ -84,15 +87,12 @@ async function handleLifecycle(deps: M.WorkbenchMcpDependencies, args: Record<st
     items,
   };
 }
-
 export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.McpToolDefinition[] {
   return [
     M.reg(
       'wb_browser_open',
       '在指定真实浏览器打开或跳转 AI 临时标签页。',
-      M.sp(
-        '@profileId|url:s:完整http/https网址|foreground:b:置顶窗口|reuseSession:b:复用AI标签页|approvedFiles:sa:允许上传文件|browseSeconds:n(1,600):拟人浏览秒数|timeoutMs:n(3000,60000):导航超时',
-      ),
+      '@profileId|url:s:完整http/https网址|foreground:b:置顶窗口|reuseSession:b:复用AI标签页|approvedFiles:sa:允许上传文件|browseSeconds:n(1,600):拟人浏览秒数|timeoutMs:n(3000,60000):导航超时',
       async (args) => {
         const url = M.strArg(args.url);
         M.req(url, 'INVALID_ARGS', 'profileId 与 url 均为必填项');
@@ -123,9 +123,7 @@ export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.Mcp
     M.reg(
       'wb_browser_observe',
       '读取 AI 标签页 DOM 结构、可交互元素与人机验证状态。',
-      M.sp(
-        '@profileId|maxElements:n(5,200):最大交互元素数|includeTextChars:n(200,16000):最大文本字数|selectorScope:s:限定容器选择器',
-      ),
+      '@profileId|maxElements:n(5,200):最大交互元素数|includeTextChars:n(200,16000):最大文本字数|selectorScope:s:限定容器选择器',
       async (args) => {
         const profileId = await M.reqSinglePid(deps, args);
         return {
@@ -141,9 +139,7 @@ export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.Mcp
     M.reg(
       'wb_browser_act',
       '在 AI 标签页执行单步交互操作。',
-      M.sp(
-        `@profileId|action:e(${BROWSER_ACTIONS}):交互动作|ref:s:元素引用编号|selector:s:选择器|text:s:输入/选择/等待文本|key:s:按键名|clearFirst:b:先清空内容|scrollDeltaY:n(-4000,4000):滚动像素值|files:sa:上传文件路径|waitMs:n(0,10000):动作后等待|timeoutMs:n(1000,30000):超时毫秒数`,
-      ),
+      `@profileId|action:e(${BROWSER_ACTIONS}):交互动作|ref:s:元素引用编号|selector:s:选择器|text:s:输入/选择/等待文本|key:s:按键名|clearFirst:b:先清空内容|scrollDeltaY:n(-4000,4000):滚动像素值|files:sa:上传文件路径|waitMs:n(0,10000):动作后等待|timeoutMs:n(1000,30000):超时毫秒数`,
       async (args) => {
         const act = M.strArg(args.action);
         M.req(BROWSER_ACT_SET.has(act), 'INVALID_ARGS', `无效的 action "${act}"`);
@@ -163,7 +159,7 @@ export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.Mcp
     M.reg(
       'wb_browser_screenshot',
       '截取当前 AI 标签页 JPEG 画面。',
-      M.sp('@profileId|fullPage:b:整页截图|quality:n(30,90):JPEG质量'),
+      '@profileId|fullPage:b:整页截图|quality:n(30,90):JPEG质量',
       async (args) => {
         const profileId = await M.reqSinglePid(deps, args);
         const shot = await deps.agentBrowser.screenshot({
@@ -185,7 +181,7 @@ export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.Mcp
     M.reg(
       'wb_browser_close',
       '关闭指定或全部 AI 浏览器会话。',
-      M.sp('@profileId|all:b:关闭全部会话'),
+      '@profileId|all:b:关闭全部会话',
       async (args) => {
         if (args.all === true) {
           const closedProfileIds = deps.agentBrowser.listSessions().map((s) => s.profileId);
@@ -206,9 +202,7 @@ export function createAgentBrowserTools(deps: M.WorkbenchMcpDependencies): M.Mcp
     M.reg(
       'wb_browser_lifecycle',
       '控制浏览器生命周期与窗口布局。',
-      M.sp(
-        `@profileId|@profileIds|action:e(${LIFECYCLE_ACTIONS}):生命周期动作|preferActiveTab:b:保留当前活动标签|timeoutMs:n(5000,60000):等待超时`,
-      ),
+      `@profileId|@profileIds|action:e(${LIFECYCLE_ACTIONS}):生命周期动作|preferActiveTab:b:保留当前活动标签|timeoutMs:n(5000,60000):等待超时`,
       (args) => handleLifecycle(deps, args),
       { req: 'action' },
     ),

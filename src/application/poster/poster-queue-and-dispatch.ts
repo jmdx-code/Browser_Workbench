@@ -1,4 +1,4 @@
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import type { BumperTarget } from '../../shared/group-bumper.js';
 import {
   CreatePosterTaskInput,
@@ -14,6 +14,7 @@ import {
   awaitWorkersSettled,
   errMsg,
   sleepMs,
+  sortTargetsOnlineFirst,
 } from '../module-worker-pool.js';
 import {
   ensurePosterMaterialPrepared,
@@ -21,7 +22,6 @@ import {
   type PosterRuntimeContext,
 } from './poster-media-and-types.js';
 import { spawnPosterWorkers } from './poster-worker-runner.js';
-
 export function buildActiveGroupsByMaterial(
   ctx: PosterRuntimeContext,
 ): Record<string, PosterActiveGroupItem[]> {
@@ -50,7 +50,6 @@ export function buildActiveGroupsByMaterial(
     });
   return result;
 }
-
 export const isItemEligibleForProfile = (item: GroupPosterTaskItem, profileId: string) =>
   !item.allowedProfileIds || item.allowedProfileIds.has(profileId);
 export const hasEligibleQueueItem = (ctx: PosterRuntimeContext, profileId: string) =>
@@ -59,11 +58,9 @@ export const hasEligibleInFlightItem = (ctx: PosterRuntimeContext, profileId: st
   [...ctx.inFlightByWorker.entries()].some(
     ([ownerId, item]) => ownerId !== profileId && isItemEligibleForProfile(item, profileId),
   );
-
 const allRunningWorkerIds = (ctx: PosterRuntimeContext) => [
   ...new Set([...ctx.active, ...ctx.starting, ...ctx.workers.keys()]),
 ];
-
 function clearQueueAndPools(ctx: PosterRuntimeContext, keepInFlight = false): void {
   ctx.taskQueue = [];
   ctx.activeGroupIds.clear();
@@ -73,7 +70,6 @@ function clearQueueAndPools(ctx: PosterRuntimeContext, keepInFlight = false): vo
   if (!keepInFlight) ctx.inFlightByWorker.clear();
   ctx.sharedFiles.clear();
 }
-
 async function mutateRunningTasks(
   ctx: PosterRuntimeContext,
   taskIds: ReadonlySet<string> | undefined,
@@ -87,7 +83,6 @@ async function mutateRunningTasks(
     await ctx.repo.saveTask?.(task);
   }
 }
-
 const dropInFlight = (ctx: PosterRuntimeContext, pid: string, extraGroupId?: string) => {
   const claimed = ctx.inFlightByWorker.get(pid);
   if (!claimed) return undefined;
@@ -96,7 +91,6 @@ const dropInFlight = (ctx: PosterRuntimeContext, pid: string, extraGroupId?: str
   if (extraGroupId) ctx.activeGroupIds.delete(extraGroupId);
   return claimed;
 };
-
 export function pruneTaskFromQueue(ctx: PosterRuntimeContext, taskId: string): void {
   ctx.taskQueue = ctx.taskQueue.filter((item) => {
     if (!item.taskIds?.has(taskId)) return true;
@@ -108,7 +102,6 @@ export function pruneTaskFromQueue(ctx: PosterRuntimeContext, taskId: string): v
     return true;
   });
 }
-
 export async function handleClaimedItemSkipped(
   ctx: PosterRuntimeContext,
   profileId: string,
@@ -120,7 +113,6 @@ export async function handleClaimedItemSkipped(
   if (!wasCancelled)
     await mutateRunningTasks(ctx, claimed.taskIds, (t) => void (t.skippedCount += 1));
 }
-
 export async function settleRunningPosterTasks(ctx: PosterRuntimeContext): Promise<void> {
   const activeWorkerIds = allRunningWorkerIds(ctx).filter((pid) => !ctx.cancelled.has(pid));
   for (const task of [...ctx.runningTasks.values()]) {
@@ -155,7 +147,6 @@ export async function settleRunningPosterTasks(ctx: PosterRuntimeContext): Promi
     await ctx.repo.saveTask?.(task);
   }
 }
-
 export async function claimNextTaskForWorker(
   ctx: PosterRuntimeContext,
   profileId: string,
@@ -171,7 +162,6 @@ export async function claimNextTaskForWorker(
   )
     await sleepMs(40);
   if (!hasEligibleQueueItem(ctx, profileId) || ctx.cancelled.has(profileId)) return null;
-
   const eligible: number[] = [];
   const nonBusy: number[] = [];
   for (let i = 0; i < ctx.taskQueue.length; i++) {
@@ -184,7 +174,6 @@ export async function claimNextTaskForWorker(
   if (!pool.length) return null;
   const [claimed] = ctx.taskQueue.splice(pool[Math.floor(Math.random() * pool.length)] ?? 0, 1);
   if (!claimed) return null;
-
   ctx.activeGroupIds.add(claimed.group.id);
   ctx.inFlightByWorker.set(profileId, claimed);
   let postedNow: boolean;
@@ -210,7 +199,6 @@ export async function claimNextTaskForWorker(
   }
   return claimed;
 }
-
 export async function handlePosterGroupIdResolved(
   ctx: PosterRuntimeContext,
   pid: string,
@@ -251,7 +239,6 @@ export async function handlePosterGroupIdResolved(
     }
   };
   if (inFlightAlreadyPosted) bumpSkip(inFlight?.taskIds);
-
   const nextQueue: GroupPosterTaskItem[] = [];
   for (const item of ctx.taskQueue) {
     if (item.group.id !== rawGroupId) {
@@ -285,7 +272,6 @@ export async function handlePosterGroupIdResolved(
   for (const t of tasksToSave) await ctx.repo.saveTask?.(t);
   return { alreadyPosted: inFlightAlreadyPosted };
 }
-
 export function returnPosterTaskOnRestriction(
   ctx: PosterRuntimeContext,
   pid: string,
@@ -306,7 +292,6 @@ export function returnPosterTaskOnRestriction(
   }
   ctx.taskQueue.push(task);
 }
-
 export async function handlePosterTaskPosted(
   ctx: PosterRuntimeContext,
   pid: string,
@@ -334,7 +319,6 @@ export async function handlePosterTaskPosted(
   });
   await settleRunningPosterTasks(ctx);
 }
-
 async function markTaskCancelled(ctx: PosterRuntimeContext, task: PosterTask): Promise<void> {
   task.status = 'cancelled';
   task.statusReason =
@@ -345,7 +329,6 @@ async function markTaskCancelled(ctx: PosterRuntimeContext, task: PosterTask): P
   ctx.runningTasks.delete(task.id);
   await ctx.repo.saveTask?.(task);
 }
-
 export async function createPosterTask(ctx: PosterRuntimeContext, input: unknown): Promise<void> {
   ctx.assertAllowed();
   const parsed = CreatePosterTaskInput.parse(input);
@@ -363,13 +346,12 @@ export async function createPosterTask(ctx: PosterRuntimeContext, input: unknown
     if (!(await ctx.repo.hasGroupPostedMaterial(g.id, material.id))) unpostedGroups.push(g);
   if (!unpostedGroups.length) {
     ctx.statusText = '所选小组已全部发过该贴文，已自动跳过重复小组';
-    throw new ProductError(
+    failError(
       'POSTER_ALL_GROUPS_ALREADY_POSTED',
       '所选小组已全部发过该贴文，已自动防重复拦截',
       409,
     );
   }
-
   const now = Date.now();
   const scheduledAtMs = parsed.scheduledAt;
   const isFuture = scheduledAtMs !== null && scheduledAtMs > now;
@@ -398,13 +380,11 @@ export async function createPosterTask(ctx: PosterRuntimeContext, input: unknown
   };
   if (isFuture) {
     await ctx.repo.saveTask?.(task);
-    ctx.ensureScheduleTimer();
     ctx.statusText = `已创建定时发帖任务 · 定于 ${new Date(scheduledAtMs).toLocaleString()} 启动`;
     return;
   }
   await dispatchPosterTask(ctx, task, false);
 }
-
 export async function dispatchPosterTask(
   ctx: PosterRuntimeContext,
   task: PosterTask,
@@ -416,15 +396,18 @@ export async function dispatchPosterTask(
     ctx.repo.settings(),
     ctx.repo.todayCounts(),
   ]);
+  const saveTaskPatch = async (patch: Partial<PosterTask>, statusText = patch.statusReason) => {
+    Object.assign(task, patch);
+    await ctx.repo.saveTask?.(task);
+    if (statusText) ctx.statusText = statusText;
+  };
   const failTask = async (reason: string, errToThrow?: unknown) => {
-    Object.assign(task, {
-      status: 'failed' as const,
+    await saveTaskPatch({
+      status: 'failed',
       statusReason: reason,
       startedAt: task.startedAt ?? Date.now(),
       finishedAt: Date.now(),
     });
-    await ctx.repo.saveTask?.(task);
-    ctx.statusText = reason;
     if (!isScheduledTrigger && errToThrow) throw errToThrow;
   };
   const material = allMaterials.find((m) => m.id === task.materialId);
@@ -433,7 +416,6 @@ export async function dispatchPosterTask(
       '失败 · 贴文素材已被删除',
       new ProductError('POSTER_MATERIAL_NOT_FOUND', '失败 · 贴文素材已被删除', 404),
     );
-
   let preparedMaterial: PosterMaterial;
   try {
     ctx.statusText = '正在检查并缓存发帖视频/图片素材…';
@@ -441,13 +423,11 @@ export async function dispatchPosterTask(
   } catch (err) {
     return failTask(`失败 · ${errMsg(err)}`, err);
   }
-
   const groupById = new Map(allGroups.map((g) => [g.id, g]));
   const resolveRequested = async () =>
     task.accountMode === 'all_online'
       ? [...new Set((await ctx.runner.onlineProfileIds?.()) ?? task.profileIds)]
       : [...new Set(task.profileIds)];
-
   if (ctx.groupAvatarRefreshing) {
     await ctx.stopRefreshGroups().catch(() => {});
     const deadline = Date.now() + 2500;
@@ -488,7 +468,6 @@ export async function dispatchPosterTask(
       await ctx.repo.saveTask?.(task);
     },
   });
-
   for (const item of [...admitted.skippedBusy, ...admitted.skippedOffline]) {
     const prev = ctx.profiles.get(item.profileId);
     ctx.profiles.set(item.profileId, {
@@ -498,7 +477,6 @@ export async function dispatchPosterTask(
       running: false,
     });
   }
-
   const usableWorkerIds = [
     ...new Set([...admitted.admittedProfileIds, ...admitted.alreadyRunningIds]),
   ];
@@ -512,15 +490,11 @@ export async function dispatchPosterTask(
         : '失败 · 当前没有在线或可用的浏览器';
     const nowMs = Date.now();
     if (isScheduledTrigger && busyOnly && nowMs - task.createdAt < 30 * 60_000) {
-      Object.assign(task, {
-        status: 'scheduled' as const,
+      return saveTaskPatch({
+        status: 'scheduled',
         scheduledAt: nowMs + 60_000,
         statusReason: `等待其他任务结束后自动重试（${failReason}）`,
       });
-      await ctx.repo.saveTask?.(task);
-      ctx.ensureScheduleTimer();
-      ctx.statusText = task.statusReason;
-      return;
     }
     return failTask(
       failReason,
@@ -529,16 +503,13 @@ export async function dispatchPosterTask(
         : new ProductError('POSTER_NO_READY_PROFILE', '所选浏览器不在线或正忙', 409),
     );
   }
-
   if (!ctx.hasActiveExecution()) clearQueueAndPools(ctx, true);
   else if (task.accountMode === 'all_online') ctx.allOnlineExcluded.clear();
   if (preparedMaterial.localFilePath) ctx.sharedFiles.add(preparedMaterial.localFilePath);
-
   for (const pid of admitted.alreadyRunningIds) {
     const cur = ctx.profiles.get(pid);
     if (cur) ctx.profiles.set(pid, { ...cur, session: 0 });
   }
-
   let effectiveTotalGroups = 0;
   const allowedSet = task.accountMode === 'all_online' ? null : new Set(usableWorkerIds);
   for (const gid of [...new Set(task.groupIds)]) {
@@ -572,36 +543,34 @@ export async function dispatchPosterTask(
     });
     effectiveTotalGroups++;
   }
-
   if (!effectiveTotalGroups) {
-    Object.assign(task, {
+    return saveTaskPatch({
       status: 'completed',
       totalGroups: 0,
       statusReason: '已完成 · 所选小组均已发过该贴文，已自动跳过',
       startedAt: Date.now(),
       finishedAt: Date.now(),
     });
-    await ctx.repo.saveTask?.(task);
-    ctx.statusText = task.statusReason;
-    return;
   }
-
-  Object.assign(task, {
-    status: 'running',
-    totalGroups: effectiveTotalGroups,
-    startedAt: Date.now(),
-    statusReason: `正在发送 (0/${effectiveTotalGroups})`,
-  });
   ctx.runningTasks.set(task.id, task);
-  await ctx.repo.saveTask?.(task);
-  ctx.statusText = `正在发帖 · 待发队列 ${ctx.taskQueue.length} 条`;
-  spawnPosterWorkers(ctx, admitted.admittedProfileIds, settings, todayCounts, pendingLaunchSet);
+  await saveTaskPatch(
+    {
+      status: 'running',
+      totalGroups: effectiveTotalGroups,
+      startedAt: Date.now(),
+      statusReason: `正在发送 (0/${effectiveTotalGroups})`,
+    },
+    `正在发帖 · 待发队列 ${ctx.taskQueue.length} 条`,
+  );
+  await launchPosterWorkers(ctx, admitted.admittedProfileIds, pendingLaunchSet, [
+    settings,
+    todayCounts,
+  ]);
   if (pendingLaunchSet.size > 0) {
     await Promise.resolve();
     await Promise.resolve();
   }
 }
-
 export async function tickScheduledPosterTasks(
   ctx: PosterRuntimeContext,
   now = Date.now(),
@@ -613,7 +582,6 @@ export async function tickScheduledPosterTasks(
       .filter((t) => t.status === 'scheduled' && t.scheduledAt !== null && t.scheduledAt <= now)
       .sort((a, b) => (a.scheduledAt ?? 0) - (b.scheduledAt ?? 0) || a.createdAt - b.createdAt);
     for (const due of dueTasks) await dispatchPosterTask(ctx, due, true);
-
     if (
       [...ctx.runningTasks.values()].some(
         (t) => t.status === 'running' && t.accountMode === 'all_online',
@@ -634,20 +602,30 @@ export async function tickScheduledPosterTasks(
           isAlreadyRunningInCurrentModule: (id) => ctx.isProfileRunning(id),
           isProfileBusyInRunner: (id) => ctx.runner.busy(id),
         });
-        if (admission.admittedProfileIds.length) {
-          const [settings, todayCounts] = await Promise.all([
-            ctx.repo.settings(),
-            ctx.repo.todayCounts(),
-          ]);
-          spawnPosterWorkers(ctx, admission.admittedProfileIds, settings, todayCounts);
-        }
+        if (admission.admittedProfileIds.length)
+          await launchPosterWorkers(ctx, admission.admittedProfileIds);
       }
     }
   } finally {
     ctx.tickingSchedule = false;
   }
 }
-
+async function launchPosterWorkers(
+  ctx: PosterRuntimeContext,
+  ids: readonly string[],
+  pendingLaunchSet?: Set<string>,
+  preset?: [
+    Awaited<ReturnType<PosterRuntimeContext['repo']['settings']>>,
+    Awaited<ReturnType<PosterRuntimeContext['repo']['todayCounts']>>,
+  ],
+) {
+  const [settings, todayCounts, ordered] = await Promise.all([
+    preset ? preset[0] : ctx.repo.settings(),
+    preset ? preset[1] : ctx.repo.todayCounts(),
+    sortTargetsOnlineFirst(ids, (id) => ctx.runner.ready(id)),
+  ]);
+  spawnPosterWorkers(ctx, ordered, settings, todayCounts, pendingLaunchSet);
+}
 export async function cancelPosterTask(ctx: PosterRuntimeContext, input: unknown): Promise<void> {
   ctx.assertAllowed();
   const { id } = PosterTaskIdInput.parse(input);
@@ -671,13 +649,8 @@ export async function cancelPosterTask(ctx: PosterRuntimeContext, input: unknown
       await stopPosterProfiles(ctx, allRunningWorkerIds(ctx));
     else if (workersToStop.length) {
       await stopPosterProfiles(ctx, workersToStop);
-      if (workersToRespawn.length && ctx.taskQueue.length) {
-        const [settings, todayCounts] = await Promise.all([
-          ctx.repo.settings(),
-          ctx.repo.todayCounts(),
-        ]);
-        spawnPosterWorkers(ctx, workersToRespawn, settings, todayCounts);
-      }
+      if (workersToRespawn.length && ctx.taskQueue.length)
+        await launchPosterWorkers(ctx, workersToRespawn);
     }
     ctx.statusText = running.statusReason;
     return;
@@ -693,21 +666,18 @@ export async function cancelPosterTask(ctx: PosterRuntimeContext, input: unknown
     ctx.statusText = '已取消定时发帖任务';
   }
 }
-
 export async function deletePosterTask(ctx: PosterRuntimeContext, input: unknown): Promise<void> {
   ctx.assertAllowed();
   const { id } = PosterTaskIdInput.parse(input);
   if (ctx.runningTasks.has(id)) await cancelPosterTask(ctx, { id });
   await ctx.repo.deleteTask?.(id);
 }
-
 export async function stopAllPoster(ctx: PosterRuntimeContext): Promise<void> {
   clearQueueAndPools(ctx);
   for (const task of [...ctx.runningTasks.values()]) await markTaskCancelled(ctx, task);
   await stopPosterProfiles(ctx, allRunningWorkerIds(ctx));
   ctx.statusText = '已停止全部发帖任务';
 }
-
 export async function stopPosterProfiles(
   ctx: PosterRuntimeContext,
   profileIds: readonly string[],

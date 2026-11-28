@@ -1,12 +1,17 @@
 import { spawn } from 'node:child_process';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Core, Peer } from '../bridge/core.js';
 import type { BridgeStorePort } from './persistence-port.js';
-import type { LocalBrowserLabels } from './local-browser-labels.js';
+import { inferBrowserBrandFromRoot, type LocalBrowserLabels } from './local-browser-labels.js';
 import { devDiag } from '../shared/dev-diagnostics.js';
-import { cleanupProfileSavedTabGroups } from './saved-tab-groups-hygiene.js';
+import {
+  cleanupProfileSavedTabGroups,
+  defaultLocalBrowserUserDataRoots,
+} from './saved-tab-groups-hygiene.js';
 import {
   buildNormalBrowserLaunchArgs,
+  type BrowserBrand,
   type EnsureProfilesOnlineResult,
   type ProfileLaunchBinding,
   type ProfileLifecycleItemResult,
@@ -264,15 +269,9 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
         stopTasksFirst: true,
       });
       if (!closed.ok) {
-        return {
-          ...closed,
-          action: 'restart',
-          elapsedMs: Math.max(0, Date.now() - startedAt),
-        };
+        return { ...closed, action: 'restart', elapsedMs: Math.max(0, Date.now() - startedAt) };
       }
-      if (!closed.alreadyInTargetState) {
-        await this.sleepFn(RESTART_SETTLE_DELAY_MS);
-      }
+      if (!closed.alreadyInTargetState) await this.sleepFn(RESTART_SETTLE_DELAY_MS);
       const opened = await this.launchUnlocked(
         profileId,
         'restart',
@@ -336,12 +335,21 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
       await this.refreshBindings();
       binding = this.opts.browserLabels.binding(profileId);
     }
-    if (!binding)
+    if (!binding) {
+      const conflict = await this.detectDuplicateBindingConflict(profileId);
+      if (conflict) {
+        return fail('PROFILE_LAUNCH_BINDING_CONFLICT', conflict.reason, {
+          launchable: false,
+          browserKind: conflict.browserKind,
+          profileDirectory: conflict.profileDirectory,
+        });
+      }
       return fail(
         'PROFILE_LAUNCH_BINDING_NOT_FOUND',
         '尚未在本机唯一识别到该已装插件浏览器的本地资料目录（或存在多副本冲突），请先手动正常打开该浏览器一次完成关联',
         { launchable: false },
       );
+    }
     const verified = await this.opts.browserLabels.verifyBindingOnDisk(binding);
     if (!verified.ok) return fail(verified.errorCode, verified.reason, { launchable: false });
     const validBinding = verified.updatedBinding;
@@ -414,7 +422,7 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
             kind: 'ERROR' as const,
             reason: err instanceof Error ? err.message : String(err),
           })),
-        this.sleepFn(6_000).then(() => 'TIMEOUT' as const),
+        this.sleepFn(3_500).then(() => 'TIMEOUT' as const),
       ]);
       if (stopOutcome !== 'STOPPED') {
         diagBridge(
@@ -550,5 +558,99 @@ export class BrowserLifecycleManager implements ProfileLifecyclePort {
         .map((id) => itemsByProfile.get(id))
         .filter((item): item is ProfileLifecycleItemResult => Boolean(item)),
     };
+  }
+  private async detectDuplicateBindingConflict(profileId: string): Promise<{
+    reason: string;
+    browserKind: BrowserBrand | null;
+    profileDirectory: string | null;
+  } | null> {
+    try {
+      const rows = await this.opts.store.profileList();
+      const rowById = new Map(rows.map((r) => [String(r.profileId), r]));
+      const labelOf = (id: string) => {
+        const row = rowById.get(id);
+        const alias = typeof row?.alias === 'string' ? row.alias.trim() : '';
+        const bName = this.opts.browserLabels.name(id)?.trim() ?? '';
+        if (alias && bName && alias !== bName) return `${alias}（${bName}）`;
+        return alias || bName || id.slice(0, 8);
+      };
+      const allIds = rows.map((r) => String(r.profileId));
+      const selfNeedle = Buffer.from(profileId);
+      for (const root of defaultLocalBrowserUserDataRoots()) {
+        let infoCache: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(await readFile(path.join(root, 'Local State'), 'utf8')) as {
+            profile?: { info_cache?: Record<string, unknown> };
+          };
+          infoCache = parsed.profile?.info_cache ?? {};
+        } catch {
+          continue;
+        }
+        const browserKind = inferBrowserBrandFromRoot(root);
+        for (const [folder, meta] of Object.entries(infoCache)) {
+          if (!/^(Default|Profile \d+)$/.test(folder)) continue;
+          const folderLabel =
+            typeof (meta as { name?: unknown } | null)?.name === 'string'
+              ? String((meta as { name: string }).name).trim()
+              : '';
+          const selfName = this.opts.browserLabels.name(profileId)?.trim();
+          if (selfName && folderLabel && selfName !== folderLabel) continue;
+          const extDirs = await readdir(path.join(root, folder, 'Local Extension Settings')).catch(
+            () => [] as string[],
+          );
+          if (!extDirs.length) continue;
+          const matchedIds = new Set<string>();
+          for (const extDir of extDirs) {
+            if (!/^[a-p]{32}$/.test(extDir)) continue;
+            const fullExt = path.join(root, folder, 'Local Extension Settings', extDir);
+            const files = (await readdir(fullExt).catch(() => [] as string[])).filter((f) =>
+              /\.(log|ldb)$/.test(f),
+            );
+            for (const file of files) {
+              const filePath = path.join(fullExt, file);
+              try {
+                if ((await stat(filePath)).size > 4 * 1024 * 1024) continue;
+                const buf = await readFile(filePath);
+                if (!buf.includes(selfNeedle)) continue;
+                matchedIds.add(profileId);
+                for (const otherId of allIds) {
+                  if (otherId !== profileId && buf.includes(Buffer.from(otherId))) {
+                    matchedIds.add(otherId);
+                  }
+                }
+              } catch {}
+            }
+          }
+          if (matchedIds.has(profileId) && matchedIds.size > 1) {
+            const others = [...matchedIds].filter((id) => id !== profileId).map(labelOf);
+            const fullDir = path.join(root, folder);
+            return {
+              browserKind,
+              profileDirectory: folder,
+              reason: `本地资料目录冲突（${fullDir}）：「${labelOf(profileId)}」与「${others.join('、')}」共用同一浏览器资料目录，已禁止启动；请移除重复资料或为其中之一使用独立资料目录`,
+            };
+          }
+        }
+      }
+      const selfName = this.opts.browserLabels.name(profileId)?.trim();
+      if (selfName) {
+        const sameNameOthers = allIds.filter(
+          (id) =>
+            id !== profileId &&
+            !this.opts.browserLabels.binding(id) &&
+            this.opts.browserLabels.name(id)?.trim() === selfName,
+        );
+        if (sameNameOthers.length > 0) {
+          return {
+            browserKind: null,
+            profileDirectory: null,
+            reason: `本地资料目录存在多副本冲突：「${labelOf(profileId)}」与「${sameNameOthers.map(labelOf).join('、')}」疑似共用同一浏览器资料目录（${selfName}），已禁止启动`,
+          };
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 }

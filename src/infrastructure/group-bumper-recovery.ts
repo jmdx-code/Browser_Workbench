@@ -4,38 +4,24 @@ import type { Awaitable, CompatibleRepository } from '../domain/persistence.js';
 import { recoverKernelModuleOperations } from './facebook-group-session.js';
 import type { SqliteGroupBumperRepository } from './group-bumper-store.js';
 import type { KernelBridge } from './kernel-bridge.js';
-export const bumperSetupLabels = [
-  '打开小组页面',
-  '打开目标贴文',
-  '打开搜索结果',
-  '打开搜索到的小组',
-  '加入小组',
-  '关闭入组欢迎弹窗',
-  '观看目标视频',
-  '浏览目标帖子',
-  '展开评论',
-  '填写评论',
-  '打开分享弹窗',
-  '关闭分享弹窗',
-  '浏览小组帖子',
-  '关闭帖子弹窗',
+const BUMPER_SETUP_PAIRS = [
+  ['打开小组页面', 'setup_navigate'],
+  ['打开目标贴文', 'setup_navigate'],
+  ['打开搜索结果', 'setup_navigate'],
+  ['打开搜索到的小组', 'setup_open_group'],
+  ['加入小组', 'setup_open_group'],
+  ['关闭入组欢迎弹窗', 'setup_welcome'],
+  ['观看目标视频', 'setup_watch'],
+  ['浏览目标帖子', 'setup_browse'],
+  ['展开评论', 'setup_expand_comment'],
+  ['填写评论', 'setup_fill_comment'],
+  ['打开分享弹窗', 'setup_open_share'],
+  ['关闭分享弹窗', 'setup_welcome'],
+  ['浏览小组帖子', 'setup_scroll'],
+  ['关闭帖子弹窗', 'setup_welcome'],
 ] as const;
-export const bumperSetupKinds = [
-  'setup_navigate',
-  'setup_navigate',
-  'setup_navigate',
-  'setup_open_group',
-  'setup_open_group',
-  'setup_welcome',
-  'setup_watch',
-  'setup_browse',
-  'setup_expand_comment',
-  'setup_fill_comment',
-  'setup_open_share',
-  'setup_welcome',
-  'setup_scroll',
-  'setup_welcome',
-] as const;
+export const bumperSetupLabels = BUMPER_SETUP_PAIRS.map((p) => p[0]);
+export const bumperSetupKinds = BUMPER_SETUP_PAIRS.map((p) => p[1]);
 export const bumperDigest = (value: unknown) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
 // Replays only persisted conclusions. It never retries page input or infers a business result.

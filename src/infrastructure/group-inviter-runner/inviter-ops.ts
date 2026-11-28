@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Locator, Page, Request, Response } from 'playwright-core';
 import type { Core } from '../../bridge/core.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import { devDiag } from '../../shared/dev-diagnostics.js';
 import { kernelOperationPending } from '../../shared/kernel-state.js';
 import type { Binding } from '../../shared/task-execution.js';
@@ -227,9 +227,7 @@ export function observeInvitationGraphQL(
         });
         for (const id of ids) confirmed.add(id);
         const chunks = (parseFacebookJsonChunks(body) ?? []).map((chunk) => describe(chunk));
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_GRAPHQL_OBSERVATION',
+        devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_GRAPHQL_OBSERVATION', {
           profileId,
           operationId,
           data: {
@@ -242,9 +240,7 @@ export function observeInvitationGraphQL(
           },
         });
       } catch (e) {
-        devDiag.record({
-          category: 'GROUP_INVITER',
-          event: 'GROUP_INVITER_GRAPHQL_OBSERVATION_FAILED',
+        devDiag.emit('INFO', 'GROUP_INVITER', 'GROUP_INVITER_GRAPHQL_OBSERVATION_FAILED', {
           profileId,
           operationId,
           reason: e instanceof Error ? e.message.slice(0, 160) : 'READ_FAILED',
@@ -264,6 +260,7 @@ export function observeInvitationGraphQL(
       submitting = false;
     },
     hasSettled: () => mutationSettled,
+    hasDispatched: () => requests.size > 0 || mutationSettled,
     confirmations: async () => {
       if (!confirmationWaited) {
         confirmationWaited = true;
@@ -279,28 +276,196 @@ export function observeInvitationGraphQL(
     },
   };
 }
+export async function revealInvitationControl(button: Locator, extraNudgePx = 0): Promise<void> {
+  const probe = (el: Element, nudge: number) => {
+    if (!(el instanceof HTMLElement)) return undefined;
+    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const dialog = el.closest('[role="dialog"]');
+    const isScrollableY = (node: HTMLElement) => {
+      const s = getComputedStyle(node);
+      return (
+        (/(?:auto|scroll|overlay)/.test(s.overflowY) ||
+          node === document.scrollingElement ||
+          node === document.documentElement) &&
+        node.scrollHeight > node.clientHeight + 4 &&
+        node.clientHeight > 0
+      );
+    };
+    const winH = window.innerHeight || 720;
+    const winW = window.innerWidth || 1280;
+    let stickyTop = 16;
+    const scanSticky = (nodes: Iterable<HTMLElement>, topCap: number, maxH: number, minW = 0) => {
+      for (const h of nodes) {
+        if (
+          h === el ||
+          h.contains(el) ||
+          el.contains(h) ||
+          (!dialog && h.closest('[role="dialog"]'))
+        )
+          continue;
+        const pos = getComputedStyle(h).position;
+        if (pos !== 'fixed' && pos !== 'sticky') continue;
+        const hr = h.getBoundingClientRect();
+        if (
+          hr.height > 0 &&
+          hr.height <= maxH &&
+          hr.top <= topCap &&
+          hr.bottom > stickyTop &&
+          hr.bottom <= winH * 0.5 &&
+          hr.width >= minW
+        )
+          stickyTop = Math.min(Math.round(winH * 0.45), Math.round(hr.bottom));
+      }
+    };
+    if (!dialog) {
+      const br = document.querySelector<HTMLElement>('[role="banner"]')?.getBoundingClientRect();
+      if (br && br.width > 0 && br.height > 0 && br.bottom > 0 && br.bottom <= winH * 0.5)
+        stickyTop = Math.max(stickyTop, Math.round(br.bottom));
+      scanSticky(
+        Array.from(
+          document.querySelectorAll<HTMLElement>(
+            '[role="banner"], header, [data-pagelet*="Header"], div',
+          ),
+        ).slice(0, 120),
+        64,
+        winH * 0.45,
+        winW * 0.35,
+      );
+    } else {
+      scanSticky(
+        Array.from(dialog.querySelectorAll<HTMLElement>('div, header')).slice(0, 60),
+        dialog.getBoundingClientRect().top + 80,
+        120,
+      );
+    }
+    const scrollContainers: HTMLElement[] = [];
+    let insideFixed = false;
+    for (let cur = el.parentElement; cur; cur = cur.parentElement) {
+      if (isScrollableY(cur)) scrollContainers.push(cur);
+      if (getComputedStyle(cur).position === 'fixed') {
+        insideFixed = true;
+        break;
+      }
+    }
+    const scrollByDelta = (dy: number) => {
+      let rem = dy;
+      for (const scroller of scrollContainers) {
+        if (Math.abs(rem) < 1) break;
+        const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        const before = scroller.scrollTop;
+        const next = Math.max(0, Math.min(maxTop, before + rem));
+        if (next !== before) {
+          scroller.scrollTop = next;
+          rem -= scroller.scrollTop - before;
+        }
+      }
+      if (!insideFixed && Math.abs(rem) >= 1) window.scrollBy(0, rem);
+    };
+    for (const scroller of scrollContainers) {
+      const sr = scroller.getBoundingClientRect();
+      const er = el.getBoundingClientRect();
+      const minTop = Math.max(sr.top + 16, stickyTop + 16);
+      const maxBot = Math.min(sr.bottom - 16, winH - 16);
+      if (er.top < minTop)
+        scroller.scrollTop = Math.max(0, scroller.scrollTop + er.top - minTop - 20);
+      else if (er.bottom > maxBot)
+        scroller.scrollTop = Math.min(
+          Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+          scroller.scrollTop + er.bottom - maxBot + 20,
+        );
+    }
+    if (!insideFixed) {
+      const er = el.getBoundingClientRect();
+      if (er.top < stickyTop + 16) window.scrollBy(0, er.top - (stickyTop + 20));
+      else if (er.bottom > winH - 16) window.scrollBy(0, er.bottom - (winH - 24));
+    }
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      const cx = Math.round(rect.left + rect.width / 2);
+      const cy = Math.round(rect.top + rect.height / 2);
+      const inViewport = cx >= 0 && cx < winW && cy >= stickyTop + 4 && cy < winH - 4;
+      const hit = inViewport ? document.elementFromPoint(cx, cy) : null;
+      const canHitCenter = Boolean(
+        inViewport && hit && (hit === el || el.contains(hit) || hit.contains(el)),
+      );
+      return { rect, cx, cy, inViewport, canHitCenter };
+    };
+    let m = measure();
+    if (!m.inViewport || !m.canHitCenter || nudge !== 0) {
+      const dy =
+        m.cy < stickyTop + 12
+          ? Math.round(m.rect.top - (stickyTop + 24))
+          : m.cy >= winH - 12
+            ? Math.round(m.rect.bottom - (winH - 28))
+            : (m.rect.top < winH * 0.45 ? -1 : 1) * (nudge || 140);
+      scrollByDelta(dy);
+      m = measure();
+    }
+    return {
+      cx: m.cx,
+      cy: m.cy,
+      stickyTop,
+      windowHeight: winH,
+      windowWidth: winW,
+      rectTop: Math.round(m.rect.top),
+      rectBottom: Math.round(m.rect.bottom),
+      inViewport: m.inViewport,
+      canHitCenter: m.canHitCenter,
+    };
+  };
+  let cur = await button.evaluate(probe, extraNudgePx);
+  if (!cur || (cur.inViewport && cur.canHitCenter && cur.cy < cur.windowHeight)) return;
+  const maybePage = (button as { page?: () => Page }).page;
+  const page = typeof maybePage === 'function' ? maybePage.call(button) : undefined;
+  if (!page?.mouse?.wheel) return;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const deltaY =
+      cur.cy >= cur.windowHeight - 8
+        ? Math.max(140, cur.rectBottom - cur.windowHeight + 48)
+        : cur.cy < cur.stickyTop + 8
+          ? Math.min(-140, cur.rectTop - cur.stickyTop - 48)
+          : (cur.rectTop < cur.windowHeight * 0.45 ? -1 : 1) * (extraNudgePx || 160);
+    await page.mouse
+      .move(
+        Math.max(12, Math.min(cur.windowWidth - 12, cur.cx)),
+        Math.max(cur.stickyTop + 12, Math.min(cur.windowHeight - 12, cur.cy)),
+      )
+      .catch(() => {});
+    await page.mouse.wheel(0, deltaY).catch(() => {});
+    await sleep(120);
+    cur = await button.evaluate(probe, 0);
+    if (!cur || (cur.inViewport && cur.canHitCenter && cur.cy < cur.windowHeight)) break;
+  }
+}
 export async function clickInvitationControl(
   button: Locator,
   validateFallback: () => Promise<boolean>,
 ) {
-  await button.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'center' }));
+  await revealInvitationControl(button, 0).catch(() => {});
   await sleep(150);
+  const retryableRe = /timeout|intercept|outside.*viewport|obscures|not visible/i;
   try {
     await button.click({ timeout: 4000 });
-  } catch (error) {
-    if (!(error instanceof Error) || !/timeout|intercept|outside.*viewport/i.test(error.message))
-      throw error;
-    if (!(await validateFallback())) return;
-    await button.evaluate((el) => {
-      if (
-        !(el instanceof HTMLElement) ||
-        !el.isConnected ||
-        el.getAttribute('aria-disabled') === 'true' ||
-        (el instanceof HTMLButtonElement && el.disabled)
-      )
-        throw Error('GROUP_INVITER_CONTROL_UNAVAILABLE');
-      HTMLElement.prototype.click.call(el);
-    });
+  } catch (firstErr) {
+    if (!(firstErr instanceof Error) || !retryableRe.test(firstErr.message)) throw firstErr;
+    await revealInvitationControl(button, 160).catch(() => {});
+    await sleep(180);
+    try {
+      await button.click({ timeout: 4000 });
+    } catch (retryErr) {
+      if (!(retryErr instanceof Error) || !retryableRe.test(retryErr.message)) throw retryErr;
+      if (!(await validateFallback())) return;
+      await button.evaluate((el) => {
+        if (
+          !(el instanceof HTMLElement) ||
+          !el.isConnected ||
+          el.getAttribute('aria-disabled') === 'true' ||
+          (el instanceof HTMLButtonElement && el.disabled)
+        )
+          throw Error('GROUP_INVITER_CONTROL_UNAVAILABLE');
+        HTMLElement.prototype.click.call(el);
+      });
+    }
   }
 }
 export function mountedInvitationSelectionMatches(
@@ -349,7 +514,7 @@ export async function collectInvitationConfirmations(input: {
       url.pathname.split('/')[2] !== input.groupId ||
       url.origin !== 'https://www.facebook.com'
     )
-      throw new ProductError(
+      failError(
         'GROUP_INVITER_RESULT_CONTEXT_CHANGED',
         '邀请核对页面发生变化，结果仍待确认，未重发',
         409,
@@ -416,9 +581,11 @@ export async function readGroupCoverAndTitle(page: Page) {
     })
     .catch(() => ({ coverSrc: null, groupTitle: null }));
 }
-export async function findNonInvitePopupCloseCoords(page: Page) {
+export async function markNonInvitePopupCloseButton(page: Page): Promise<boolean> {
   return page
     .evaluate(() => {
+      for (const old of Array.from(document.querySelectorAll('[data-wb-non-invite-close-btn]')))
+        old.removeAttribute('data-wb-non-invite-close-btn');
       const isVis = (el: Element | null) => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
@@ -447,13 +614,13 @@ export async function findNonInvitePopupCloseCoords(page: Page) {
         );
         const targetBtn = closeBtn ?? continueBtn;
         if (targetBtn) {
-          const r = targetBtn.getBoundingClientRect();
-          return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          targetBtn.setAttribute('data-wb-non-invite-close-btn', '1');
+          return true;
         }
       }
-      return null;
+      return false;
     })
-    .catch(() => null);
+    .catch(() => false);
 }
 export async function readGroupReadyDebugControls(page: Page) {
   return page.evaluate(() => ({
@@ -531,6 +698,25 @@ async function notifyPendingInviterOperations(
     });
   }
 }
+const notifyScopePending = (
+  port: KernelSummaryPort,
+  scope:
+    | { pendingSetup: Iterable<Binding> | Map<string, Binding>; pendingSubmission?: Binding }
+    | undefined,
+  boundAccountId: string,
+  failed: boolean,
+) =>
+  notifyPendingInviterOperations(
+    port,
+    scope
+      ? scope.pendingSetup instanceof Map
+        ? [...scope.pendingSetup.values()]
+        : [...scope.pendingSetup]
+      : [],
+    scope?.pendingSubmission,
+    boundAccountId,
+    failed,
+  );
 export async function retryInviterStop(input: {
   profileId: string;
   stopping: Map<string, InviterPendingStop>;
@@ -552,14 +738,7 @@ export async function retryInviterStop(input: {
     setStopId: (nextId) => {
       pending.requestId = nextId;
     },
-    onAfterConfirmStop: (port) =>
-      notifyPendingInviterOperations(
-        port,
-        pending.pendingSetup,
-        pending.pendingSubmission,
-        pending.boundAccountId,
-        true,
-      ),
+    onAfterConfirmStop: (port) => notifyScopePending(port, pending, pending.boundAccountId, true),
   });
   stopping.delete(profileId);
 }
@@ -581,24 +760,14 @@ export async function finalizeInviterConnection(input: {
     try {
       await conn.close(requestId);
     } catch (closeErr) {
-      if (typeof conn.stopOnCloseFailure === 'function') {
-        await conn.stopOnCloseFailure();
-        requestId = conn.stopRequestId ?? requestId;
-        await conn.retryClose(requestId);
-      } else {
-        throw closeErr;
-      }
+      if (typeof conn.stopOnCloseFailure !== 'function') throw closeErr;
+      await conn.stopOnCloseFailure();
+      requestId = conn.stopRequestId ?? requestId;
+      await conn.retryClose(requestId);
     }
     closeConfirmed = true;
-    const scope = scopes.get(conn);
     await kernel.withSummary(peer, (port) =>
-      notifyPendingInviterOperations(
-        port,
-        [...(scope?.pendingSetup.values() ?? [])],
-        scope?.pendingSubmission,
-        boundAccountId,
-        false,
-      ),
+      notifyScopePending(port, scopes.get(conn), boundAccountId, false),
     );
   } catch (cause) {
     if (!closeConfirmed) {

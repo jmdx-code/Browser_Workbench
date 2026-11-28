@@ -1,12 +1,10 @@
 import type { z } from 'zod';
 import type { TaskProgress, TaskStepBudget } from '../shared/task-contracts.js';
-
 type Budget = z.infer<typeof TaskStepBudget>;
 const duration = (milliseconds: number) => {
   const seconds = Math.floor(milliseconds / 1000);
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 };
-
 function MiniBar({ max, value, label }: { max: number; value: number; label: string }) {
   const pct = max > 0 ? Math.min(100, Math.max(0, Math.round((value / max) * 100))) : 0;
   return (
@@ -22,7 +20,6 @@ function MiniBar({ max, value, label }: { max: number; value: number; label: str
     </span>
   );
 }
-
 export function TaskProgressView({
   type,
   friendAction,

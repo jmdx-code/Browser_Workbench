@@ -4,7 +4,6 @@ import { randomUUID } from 'node:crypto';
 import { WindowLayoutService } from '../src/application/window-layout.js';
 import {
   fitTaskWindow,
-  taskWindowPositions,
   reservedLayoutDisplay,
   displayForRect,
   normalizeTaskWindowSize,
@@ -12,7 +11,6 @@ import {
 } from '../src/domain/window-layout.js';
 import {
   defaultWindowLayout,
-  WindowLayoutOverview,
   type LayoutScreen,
   type LayoutSettings,
   type TaskWindow,
@@ -102,35 +100,6 @@ test('new task adopts current position after manual move, resize and a new owner
   assert.equal((await f.service.snapshot()).error, '');
 });
 
-test('hidden recovery accepts current manual movement and content inset changes', async () => {
-  const f = fixture(1),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  await f.service.arrange(id);
-  const w = f.windows.get(id)!;
-  w.rect.x += 33;
-  w.rect.height += 2;
-  w.contentInsets!.top += 12;
-  await f.service.recover(id, () => {});
-  assert.equal(f.moves.length, 2);
-  assert.equal((await f.service.snapshot()).recovery[0]?.moves, 1);
-});
-
-test('recovery moves only its current task; stale or offscreen peers cannot block it', async () => {
-  const f = fixture(),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  for (const own of f.ids) await f.service.arrange(own);
-  const other = structuredClone(f.windows.get(f.ids[1]!)!);
-  const read = f.port.read;
-  f.port.read = async (own) => {
-    assert.equal(own, id);
-    return read(own);
-  };
-  await f.service.recover(id, () => {});
-  assert.deepEqual(f.windows.get(f.ids[1]!), other);
-});
-
 test('ordinary windows keep size; oversized windows shrink and fit primary or negative-origin screen', () => {
   const ordinary = { x: -1700, y: 700, width: 960, height: 720 };
   assert.deepEqual(fitTaskWindow(ordinary, screen), ordinary);
@@ -155,83 +124,10 @@ test('startup shrinks a large window without rejecting it or changing another wi
   assert.deepEqual(f.windows.get(f.ids[1]!), other);
 });
 
-test('candidate positions use nearest distance and permit overlap', () => {
-  const rect = { x: -1700, y: 700, width: 960, height: 720 };
-  const candidates = taskWindowPositions(rect, [{ rect }], screen, 8);
-  assert.ok(
-    candidates.some(
-      (r) => Math.abs(r.x - rect.x) < rect.width && Math.abs(r.y - rect.y) < rect.height,
-    ),
-  );
-  const distances = candidates.map((r) => (r.x - rect.x) ** 2 + (r.y - rect.y) ** 2);
-  assert.deepEqual(
-    distances,
-    [...distances].sort((a, b) => a - b),
-  );
-  assert.equal(new Set(candidates.map((r) => `${r.x}:${r.y}`)).size, candidates.length);
-});
-
-test('three failed positions are bounded within a recovery round despite native frame changes; visibility resets it', async () => {
-  const f = fixture(1),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  await f.service.arrange(id);
-  const move = f.port.move;
-  f.port.move = async (...args) => {
-    const after = await move(...args);
-    after.rect.width++;
-    after.rect.height++;
-    f.windows.set(args[0], structuredClone(after));
-    return after;
-  };
-  for (let i = 0; i < 3; i++) {
-    await f.service.recover(id, () => {});
-    f.service.visible(id, 0);
-  }
-  assert.equal(f.moves.length, 4);
-  await assert.rejects(
-    f.service.recover(id, () => {}),
-    /RECOVERY_EXHAUSTED/,
-  );
-  WindowLayoutOverview.parse(await f.service.snapshot());
-  assert.equal((await f.service.snapshot()).recovery[0]?.state, 'NEEDS_ATTENTION');
-  f.service.visible(id, Date.now() + 1);
-  assert.deepEqual((await f.service.snapshot()).recovery, []);
-  await f.service.recover(id, () => {});
-  assert.equal(f.moves.length, 5);
-});
-
-test('exhausted window recovery stays bounded before 15 seconds and automatically starts another round after cooldown', async (t) => {
-  let now = Date.now();
-  t.mock.method(Date, 'now', () => now);
-  const f = fixture(1),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  await f.service.arrange(id);
-  for (let i = 0; i < 3; i++) await f.service.recover(id, () => {});
-  await assert.rejects(
-    f.service.recover(id, () => {}),
-    /RECOVERY_EXHAUSTED/,
-  );
-  const moves = f.moves.length;
-  now += 14999;
-  await assert.rejects(
-    f.service.recover(id, () => {}),
-    /RECOVERY_EXHAUSTED/,
-  );
-  assert.equal(f.moves.length, moves);
-  now++;
-  await f.service.recover(id, () => {});
-  assert.equal(f.moves.length, moves + 1);
-  assert.equal((await f.service.snapshot()).recovery[0]?.moves, 1);
-  assert.equal((await f.service.snapshot()).recovery[0]?.state, 'AWAITING_VISIBILITY');
-});
-
-test('disable clears recovery without moving or restoring any window', async () => {
+test('disable clears managed windows without moving or restoring any window', async () => {
   const f = fixture();
   await f.service.command({ action: 'configure', settings: enabled });
   await f.service.command({ action: 'apply', profileIds: f.ids });
-  await f.service.recover(f.ids[0]!, () => {});
   const before = structuredClone(f.windows),
     count = f.moves.length;
   await f.service.command({ action: 'restore' });
@@ -239,23 +135,6 @@ test('disable clears recovery without moving or restoring any window', async () 
   assert.equal(f.moves.length, count);
   assert.equal(f.settings().enabled, false);
   assert.deepEqual((await f.service.snapshot()).managed, []);
-  await assert.rejects(
-    f.service.recover(f.ids[0]!, () => {}),
-    /DISABLED/,
-  );
-});
-
-test('after a covered nearby offset, the next attempt changes screen region', async () => {
-  const f = fixture(),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  for (const own of f.ids) await f.service.arrange(own);
-  const start = f.moves.length;
-  await f.service.recover(id, () => {});
-  await f.service.recover(id, () => {});
-  const a = f.moves[start]!.rect,
-    b = f.moves[start + 1]!.rect;
-  assert.ok(Math.abs(a.x - b.x) >= a.width / 2 || Math.abs(a.y - b.y) >= a.height / 2);
 });
 
 test('STOP before dispatch and during read prevents any move', async () => {
@@ -276,7 +155,7 @@ test('STOP before dispatch and during read prevents any move', async () => {
     return v;
   };
   await assert.rejects(
-    f.service.recover(id, () => {
+    f.service.arrange(id, () => {
       if (!live) throw Error('STOPPED');
     }),
     /STOPPED/,
@@ -326,30 +205,6 @@ test('queued operation checks STOP after preceding move drains', async () => {
   resume();
   await Promise.all([first, second]);
   assert.equal(f.moves.length, 1);
-});
-
-test('changed proof resets in-progress recovery and adopts the updated main tab', async () => {
-  const f = fixture(1),
-    id = f.ids[0]!;
-  await f.service.command({ action: 'configure', settings: enabled });
-  await f.service.arrange(id);
-  f.windows.get(id)!.proof.ownershipId = randomUUID();
-  await f.service.recover(id, () => {});
-  await f.service.arrange(id);
-  await f.service.recover(id, () => {});
-});
-
-test('partial manual arrange failure keeps completed moves and never auto-restores', async () => {
-  const f = fixture();
-  await f.service.command({ action: 'configure', settings: enabled });
-  const move = f.port.move;
-  f.port.move = async (...args) => {
-    if (args[0] === f.ids[1]) throw Error('NATIVE_FAILED');
-    return move(...args);
-  };
-  await assert.rejects(f.service.command({ action: 'apply', profileIds: f.ids }), /NATIVE_FAILED/);
-  assert.equal(f.moves.length, 1);
-  assert.equal((await f.service.snapshot()).managed.length, 1);
 });
 
 test('invalid saved region is clipped; missing viewport or all displays still fails without moves', async () => {
@@ -453,7 +308,7 @@ test('100 starts use current windows without capacity rejection from historical 
   assert.equal((await f.service.snapshot()).managed.length, 100);
 });
 
-test('normal task startup arranges without focusing; actual hidden recovery requests focus', async () => {
+test('normal task startup arranges without focusing', async () => {
   const f = fixture(1),
     id = f.ids[0]!;
   await f.service.command({ action: 'configure', settings: enabled });
@@ -464,8 +319,7 @@ test('normal task startup arranges without focusing; actual hidden recovery requ
     return move(...args);
   };
   await f.service.arrange(id);
-  await f.service.recover(id, () => {});
-  assert.deepEqual(focuses, [false, true]);
+  assert.deepEqual(focuses, [false]);
 });
 
 test('gridCascadeSlotRect produces uniform sizes and fixed offsets on the active display', async () => {

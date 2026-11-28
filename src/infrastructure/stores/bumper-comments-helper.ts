@@ -7,14 +7,12 @@ import * as Q from '../persistence/sqlite-query-helpers.js';
 import { syncBumperLogToPostBumpRecords } from '../post-bump-records-store.js';
 import { transaction } from '../sqlite-transaction.js';
 import type { SqliteTargetLibraryRepository } from '../target-library-store.js';
-
 export function ensureBumperCommentsSchema(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS group_bumper_comments(id TEXT PRIMARY KEY, comment_text TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'group' CHECK(scope IN ('group','page')));
     CREATE INDEX IF NOT EXISTS idx_group_bumper_comments_scope ON group_bumper_comments(scope, created_at, id);
   `);
 }
-
 export const BumperLogInputSchema = z
   .object({
     id: z.uuid(),
@@ -33,7 +31,6 @@ export const BumperLogInputSchema = z
     sourceMode: z.enum(['group', 'page']).optional(),
   })
   .strict();
-
 export function listBumperCommentsFromDb(
   db: DatabaseSync,
   scope: BumperScope = 'group',
@@ -48,7 +45,6 @@ export function listBumperCommentsFromDb(
     scope: preserveRowScope ? (r.scope === 'page' ? 'page' : 'group') : scope,
   }));
 }
-
 export function pickBumperCommentFromDb(
   db: DatabaseSync,
   postId: string,
@@ -74,7 +70,6 @@ export function pickBumperCommentFromDb(
     pool = unused.length > 0 ? unused : consumeOnUse ? [] : all;
   return pool[Math.min(pool.length - 1, Math.max(0, Math.floor(random * pool.length)))] ?? null;
 }
-
 export function queryBumperEligibilityCounts(
   db: DatabaseSync,
   accountId: string,
@@ -95,7 +90,6 @@ export function queryBumperEligibilityCounts(
     duplicate: postId ? Boolean(db.prepare(dupSql).get(postId, accountId, targetId)) : false,
   };
 }
-
 export function recordBumpEntryInDb(options: {
   db: DatabaseSync;
   targetLibrary: SqliteTargetLibraryRepository;

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import type { z } from 'zod';
+import type { BluestacksState } from '../shared/bluestacks.js';
 import type { Combination, Profile, SavedCombination } from '../shared/contracts.js';
 import type { ResourceUsageSummaryValue } from '../shared/resource-table.js';
 import type { TaskCapabilities, TaskRuntimeOverview } from '../shared/task-contracts.js';
-import { isErroredPausedPlan } from '../shared/task-issues.js';
 import type { CardColor } from './card-colors.js';
 import {
   COMBINATION_CLIPBOARD_FORMAT,
@@ -13,25 +13,25 @@ import {
 } from './combination-card.js';
 import { ConfirmDialog } from './confirm-dialog.js';
 import { IconLayers, IconPlus, IconSearch } from './icons.js';
-import { Btn, Chk, NativeFormDialog, useBusyTask } from './modules/shared/module-ui.js';
+import { Btn, Chk, Fld, InFld, NativeFormDialog, useBusyTask } from './modules/shared/module-ui.js';
 import { toggleSet } from './selection.js';
 import {
   EmptyState,
+  UI_BETWEEN,
   UI_CARD,
   UI_COUNT_CHIP,
   UI_INPUT,
   UI_MUTED,
+  UI_ROW,
   UI_TEXTAREA,
   UiSwitch,
 } from './ui/primitives.js';
-
 export {
   COMBINATION_CLIPBOARD_FORMAT,
   formatCombinationForClipboard,
   parseImportedCombination,
   stepSummary,
 } from './combination-card.js';
-
 function ImportCombinationDialog(p: {
   existingNames: ReadonlySet<string>;
   onClose: () => void;
@@ -40,7 +40,6 @@ function ImportCombinationDialog(p: {
   const [rawText, setRawText] = useState('');
   const [customName, setCustomName] = useState('');
   const { busy, error, setError, run } = useBusyTask();
-
   async function pasteFromClipboard() {
     try {
       const text = await navigator.clipboard.readText();
@@ -52,7 +51,6 @@ function ImportCombinationDialog(p: {
       setError('无法直接读取剪贴板，请在下方输入框中使用 Ctrl+V 粘贴');
     }
   }
-
   return (
     <NativeFormDialog
       title="导入任务组合"
@@ -76,24 +74,26 @@ function ImportCombinationDialog(p: {
         void run(() => p.onSubmit(parsed), '导入失败，请重试');
       }}
     >
-      <label className="mb-1 flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
-        <span>新组合名称（可选，留空则沿用原名并自动区分副本）</span>
-        <input
-          maxLength={80}
-          className={`${UI_INPUT} w-full`}
-          value={customName}
-          disabled={busy}
-          placeholder="留空自动命名"
-          onChange={(e) => setCustomName(e.target.value)}
-        />
-      </label>
-      <label className="flex flex-col gap-1 text-xs font-medium text-[var(--text-2)]">
-        <span className="flex items-center justify-between gap-2">
-          <span>组合配置数据</span>
-          <Btn disabled={busy} onClick={() => void pasteFromClipboard()}>
-            从剪贴板粘贴
-          </Btn>
-        </span>
+      <InFld
+        label="新组合名称（可选，留空则沿用原名并自动区分副本）"
+        wrapClass="mb-1"
+        maxLength={80}
+        className={`${UI_INPUT} w-full`}
+        value={customName}
+        disabled={busy}
+        placeholder="留空自动命名"
+        onVal={setCustomName}
+      />
+      <Fld
+        label={
+          <span className={UI_BETWEEN}>
+            <span>组合配置数据</span>
+            <Btn disabled={busy} onClick={() => void pasteFromClipboard()}>
+              从剪贴板粘贴
+            </Btn>
+          </span>
+        }
+      >
         <textarea
           rows={9}
           className={`${UI_TEXTAREA} font-mono`}
@@ -105,11 +105,10 @@ function ImportCombinationDialog(p: {
             if (error) setError('');
           }}
         />
-      </label>
+      </Fld>
     </NativeFormDialog>
   );
 }
-
 export function CombinationList(p: {
   carrier?: 'browser' | 'bluestacks' | undefined;
   rows: SavedCombination[];
@@ -130,6 +129,7 @@ export function CombinationList(p: {
   resourceSummaries: ResourceUsageSummaryValue[] | null;
   capabilities?: z.infer<typeof TaskCapabilities> | null;
   runtime?: z.infer<typeof TaskRuntimeOverview> | null;
+  bluestacksState?: BluestacksState | null | undefined;
   busy?: boolean;
   onStart?: (row: SavedCombination) => void;
   colorOf?: (id: string) => CardColor;
@@ -154,7 +154,6 @@ export function CombinationList(p: {
   const [confirmBatchDelete, setConfirmBatchDelete] = useState(false);
   const [deletingRow, setDeletingRow] = useState<SavedCombination | null>(null);
   const [importOpen, setImportOpen] = useState(false);
-
   useEffect(() => {
     const existing = new Set(rows.map((row) => row.id));
     setChecked((prev) => {
@@ -162,17 +161,23 @@ export function CombinationList(p: {
       return rem.size === prev.size ? prev : rem;
     });
   }, [rows]);
-
-  const inUse = new Set(
-    runtime?.plans
+  const bsComboProfiles = new Map<string, Set<string>>();
+  for (const [instId, stat] of Object.entries(p.bluestacksState?.activeProfileCounts ?? {})) {
+    if (!stat.running || !stat.combinationId) continue;
+    const set = bsComboProfiles.get(stat.combinationId) ?? new Set<string>();
+    set.add(instId);
+    bsComboProfiles.set(stat.combinationId, set);
+  }
+  const inUse = new Set([
+    ...(runtime?.plans
       .filter((x) => LIVE_COMBINATION_STATES.includes(x.state))
-      .map((x) => x.combinationId),
-  );
+      .map((x) => x.combinationId) ?? []),
+    ...bsComboProfiles.keys(),
+  ]);
   const selectedRows = rows.filter((row) => checked.has(row.id) && !inUse.has(row.id));
   const toggleRow = (id: string) => {
     if (!busy && !inUse.has(id)) setChecked((prev) => toggleSet(prev, id));
   };
-
   const query = search.trim().toLocaleLowerCase();
   const matching = rows.filter(
     (row) =>
@@ -186,8 +191,7 @@ export function CombinationList(p: {
           .filter(
             (x) =>
               selectedIds?.has(x.profileId) &&
-              !['STOPPED', 'COMPLETED', 'FAILED'].includes(x.state) &&
-              !isErroredPausedPlan(x),
+              !['STOPPED', 'COMPLETED', 'FAILED'].includes(x.state),
           )
           .map((x) => x.profileId) ?? [],
       );
@@ -200,7 +204,6 @@ export function CombinationList(p: {
       : 0;
   const eligibleImmediateCount = Math.max(0, selectedCount - busySelected);
   const selectableMatching = matching.filter((row) => !inUse.has(row.id));
-
   return (
     <section aria-label="任务组合">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -208,7 +211,7 @@ export function CombinationList(p: {
           <span>任务组合</span>
           <span className={UI_COUNT_CHIP}>{rows.length}</span>
         </h2>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className={UI_ROW}>
           {p.onCloseBrowserOnFinishChange && !managing && (
             <span
               className="toolbar-toggle inline-flex items-center"
@@ -266,7 +269,6 @@ export function CombinationList(p: {
           )}
         </div>
       </div>
-
       {managing && (
         <div
           className={`${UI_CARD} mb-4 flex flex-wrap items-center gap-3 px-3.5 py-2.5 text-xs`}
@@ -307,7 +309,6 @@ export function CombinationList(p: {
           </div>
         </div>
       )}
-
       {rows.length > 0 && !matching.length && (
         <p className={`${UI_MUTED} py-4`}>没有匹配的任务组合。</p>
       )}
@@ -327,6 +328,7 @@ export function CombinationList(p: {
             resourceSummaries={p.resourceSummaries}
             capabilities={p.capabilities}
             runtime={runtime}
+            bluestacksUsingCount={bsComboProfiles.get(row.id)?.size ?? 0}
             color={p.colorOf?.(row.id) ?? 'graphite'}
             colorSupported={p.colorSupported}
             onToggleRow={toggleRow}
@@ -341,7 +343,6 @@ export function CombinationList(p: {
           />
         ))}
       </div>
-
       {rows.length === 0 && (
         <div className="mx-auto my-10 max-w-[440px]">
           <EmptyState
@@ -362,7 +363,6 @@ export function CombinationList(p: {
           />
         </div>
       )}
-
       {importOpen && onImport && (
         <ImportCombinationDialog
           existingNames={

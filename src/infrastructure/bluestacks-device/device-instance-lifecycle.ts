@@ -53,10 +53,9 @@ async function requireSavedInstance(
   if (!existing) throw errBs('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
   return existing;
 }
-export async function discoverInstances(ctx: DeviceRuntimeContext): Promise<{
-  instances: BluestacksInstance[];
-  config: BluestacksRuntimeConfig;
-}> {
+export async function discoverInstances(
+  ctx: DeviceRuntimeContext,
+): Promise<{ instances: BluestacksInstance[]; config: BluestacksRuntimeConfig }> {
   const { config, adbPath, effectiveConfPath } = await resolveRuntimeConfig(ctx);
   let confEntries: ReturnType<typeof parseBluestacksConfContent> = [];
   if (effectiveConfPath) {
@@ -120,9 +119,10 @@ export async function discoverInstances(ctx: DeviceRuntimeContext): Promise<{
   const versionChecks = new Map<string, string | null>();
   await Promise.all(
     [...onlineSerials].map(async (serial) => {
+      const confEntry = resolvedEntries.find((e) => `127.0.0.1:${e.adbPort}` === serial);
       const [installed, size, sdk] = await Promise.all([
         probeFbLiteInstalled(ctx, serial),
-        readLiveScreenSize(ctx, serial, 900, 1600),
+        readLiveScreenSize(ctx, serial, confEntry?.fbWidth ?? 900, confEntry?.fbHeight ?? 1600),
         readGuestSdkVersion(ctx, serial),
       ]);
       installChecks.set(serial, installed);
@@ -135,7 +135,7 @@ export async function discoverInstances(ctx: DeviceRuntimeContext): Promise<{
   const sharedOpenPorts = [...openPorts].filter((p) => (portEntryCounts.get(p) ?? 0) > 1);
   if (sharedOpenPorts.length > 0) {
     const [runningWins, runningProc] = await Promise.all([
-      queryRunningBlueStacksWindows(runProcess),
+      queryRunningBlueStacksWindows(),
       readRunningHdPlayerInstances(),
     ]);
     for (const port of sharedOpenPorts) {
@@ -240,7 +240,7 @@ export async function launchInstance(
   const safeKey = existing.instanceKey.replace(/[^A-Za-z0-9_.-]/g, ''),
     sharedPort = await hasSharedPort(ctx, existing.adbPort);
   const alreadyOpen = sharedPort
-    ? Boolean(matchWinForInstance(await queryRunningBlueStacksWindows(runProcess), existing, true))
+    ? Boolean(matchWinForInstance(await queryRunningBlueStacksWindows(), existing, true))
     : await isTcpPortOpen(existing.adbPort);
   let spawnMonitor = alreadyOpen
     ? null
@@ -275,7 +275,7 @@ export async function launchInstance(
         if (sharedPort && activePort === existing.adbPort) {
           if (
             !matchWinForInstance(
-              await queryRunningBlueStacksWindows(runProcess),
+              await queryRunningBlueStacksWindows(),
               { ...existing, adbPort: activePort },
               true,
             )
@@ -318,7 +318,7 @@ export async function closeInstance(ctx: DeviceRuntimeContext, instanceId: strin
   const [{ adbPath }, sharedPort, runningWins] = await Promise.all([
     resolveRuntimeConfig(ctx),
     hasSharedPort(ctx, existing.adbPort),
-    queryRunningBlueStacksWindows(runProcess),
+    queryRunningBlueStacksWindows(),
   ]);
   const matchedWin = matchWinForInstance(runningWins, existing, sharedPort);
   const ownsLivePort =
@@ -326,9 +326,8 @@ export async function closeInstance(ctx: DeviceRuntimeContext, instanceId: strin
     (!sharedPort || matchedWin !== null || ctx.onlineInstanceKeys.has(existing.instanceKey));
   if (process.platform === 'win32') {
     const closeTargets: Array<{ pid: number; hwnd?: string | undefined }> = [];
-    if (matchedWin) {
-      closeTargets.push({ pid: matchedWin.pid, hwnd: matchedWin.hwnd });
-    } else {
+    if (matchedWin) closeTargets.push({ pid: matchedWin.pid, hwnd: matchedWin.hwnd });
+    else {
       const runningProc = await readRunningHdPlayerInstances();
       for (const pid of runningProc.pidByKey.get(safeKey) ?? []) closeTargets.push({ pid });
       if (closeTargets.length === 0 && !sharedPort && existing.adbPort > 0) {
@@ -336,10 +335,10 @@ export async function closeInstance(ctx: DeviceRuntimeContext, instanceId: strin
         if (portWin) closeTargets.push({ pid: portWin.pid, hwnd: portWin.hwnd });
       }
     }
-    if (closeTargets.length > 0) await closeBlueStacksPids(runProcess, closeTargets);
+    if (closeTargets.length > 0) await closeBlueStacksPids(undefined, closeTargets);
   }
   if (adbPath && ownsLivePort)
-    await runProcess(adbPath, ['disconnect', existing.serial], { timeoutMs: 4000 }).catch(
+    await runProcess(adbPath, ['disconnect', existing.serial], { timeoutMs: 1500 }).catch(
       () => null,
     );
   ctx.onlineInstanceKeys.delete(existing.instanceKey);
@@ -350,7 +349,7 @@ export async function showInstance(
 ): Promise<boolean> {
   const existing = await requireSavedInstance(ctx, instanceId),
     matched = matchWinForInstance(
-      await queryRunningBlueStacksWindows(runProcess),
+      await queryRunningBlueStacksWindows(),
       existing,
       await hasSharedPort(ctx, existing.adbPort),
     );
@@ -360,19 +359,23 @@ export async function showInstance(
       `未找到运行中的蓝蝶窗口 ${existing.displayName}，请先启动模拟器`,
       404,
     );
-  return focusBlueStacksWindow(runProcess, matched.hwnd, matched.pid);
+  return focusBlueStacksWindow(undefined, matched.hwnd, matched.pid);
 }
 export async function arrangeWindows(
   ctx: DeviceRuntimeContext,
   instanceIds?: readonly string[],
-  options: { columns?: number; gap?: number } = {},
+  options: {
+    columns?: number;
+    gap?: number;
+    monitorBounds?: { left: number; top: number; width: number; height: number };
+  } = {},
 ): Promise<number> {
   const allInstances = await ctx.repo.listInstances([...ctx.onlineInstanceKeys]);
   const targetInstances =
     instanceIds && instanceIds.length > 0
       ? allInstances.filter((i) => instanceIds.includes(i.id))
       : allInstances.filter((i) => i.online);
-  const wins = await queryRunningBlueStacksWindows(runProcess);
+  const wins = await queryRunningBlueStacksWindows();
   const matchedItems: Array<{ hwnd: string; pid: number }> = [];
   const usedPids = new Set<number>();
   for (const inst of targetInstances) {
@@ -386,13 +389,13 @@ export async function arrangeWindows(
   if (matchedItems.length === 0) {
     return !instanceIds || instanceIds.length === 0
       ? arrangeBlueStacksWindows(
-          runProcess,
+          undefined,
           wins.map((w) => ({ hwnd: w.hwnd, pid: w.pid })),
           options,
         )
       : 0;
   }
-  return arrangeBlueStacksWindows(runProcess, matchedItems, options);
+  return arrangeBlueStacksWindows(undefined, matchedItems, options);
 }
 export async function installFbLiteApk(
   ctx: DeviceRuntimeContext,

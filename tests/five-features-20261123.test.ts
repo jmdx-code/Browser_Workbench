@@ -23,12 +23,11 @@ import {
   facebookFriendsRouteMatches,
   facebookSearchPagesURL,
 } from '../src/shared/facebook-browse-route.js';
-import { recordMatches } from '../src/domain/task-record-projection.js';
 import { FeatureExecutionRegistry } from '../src/application/feature-execution-registry.js';
 import { WorkspaceStore } from '../src/infrastructure/workspace-store.js';
 import { SqliteGroupBumperRepository } from '../src/infrastructure/group-bumper-store.js';
 import { observeBumperStoryShareGraphql } from '../src/infrastructure/group-bumper-runner.js';
-import { stepName } from '../src/renderer/task-record-summary.js';
+import { stepName } from '../src/renderer/modules/profile-activity-projector.js';
 
 const uid = () => randomUUID();
 
@@ -466,32 +465,4 @@ test('Feature #5: detour URLs, target page parser & search_pages/random detour s
   reg.setDelegatedSubmodule('p-sched', 'active-accounts');
   assert.equal(await reg.isProfileBusy('p-sched', 'active-accounts'), false);
   assert.equal(await reg.isProfileBusyStrict('p-sched', 'active-accounts'), true);
-
-  // Record search matches new modes
-  assert.equal(
-    recordMatches(
-      {
-        combinationName: '养号',
-        profileId: 'p1',
-        type: 'friends',
-        friendAction: 'add_suggested',
-      },
-      undefined,
-      '加推荐好友',
-    ),
-    true,
-  );
-  assert.equal(
-    recordMatches(
-      {
-        combinationName: '养号',
-        profileId: 'p1',
-        type: 'feed',
-        feedMode: 'search_pages',
-      },
-      undefined,
-      '搜专页',
-    ),
-    true,
-  );
 });

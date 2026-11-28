@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ProductError } from '../../domain/workspace.js';
+import { failError } from '../../domain/workspace.js';
 import { sameTabProof } from '../../domain/task-tabs.js';
 import type { Peer } from '../../bridge/core.js';
 import { KernelExecutor } from '../../application/kernel-executor.js';
@@ -472,13 +472,14 @@ export async function connectAgentBrowserImpl(
   options: { initialUrl: string; files?: readonly string[]; foreground?: boolean },
 ) {
   const rejectUrl = () => {
-    throw new ProductError(
+    failError(
       'AGENT_BROWSER_URL_REJECTED',
       '仅支持访问合法的 http/https 网页地址（禁止访问本机管理端口或受限协议）',
       400,
     );
   };
-  if (!/^https?:\/\//i.test(options.initialUrl)) rejectUrl();
+  if (options.initialUrl !== 'about:blank' && !/^https?:\/\//i.test(options.initialUrl))
+    rejectUrl();
   const { kernelAgentBrowserURL } = await import('../../shared/kernel-policy.js');
   if (!kernelAgentBrowserURL(options.initialUrl)) rejectUrl();
   if (
@@ -487,13 +488,13 @@ export async function connectAgentBrowserImpl(
     !peer.synced ||
     peer.phase !== 'PAUSED'
   )
-    throw new ProductError(
+    failError(
       'AGENT_BROWSER_PROFILE_NOT_READY',
       `浏览器当前未就绪（online=${peer.online}, synced=${peer.synced}, phase=${peer.phase}）`,
       409,
     );
   if (!peer.capabilities?.includes('agent-browser-kernel-v1'))
-    throw new ProductError(
+    failError(
       'AGENT_BROWSER_EXTENSION_RELOAD_REQUIRED',
       '当前浏览器插件版本尚未加载 AI 浏览器内核能力，请先触发扩展热刷新后再试',
       409,

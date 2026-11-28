@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import type { DatabaseSync } from 'node:sqlite';
+import { createHash, randomUUID } from 'node:crypto';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { z } from 'zod';
 import {
   BumperOperation,
@@ -24,23 +24,19 @@ import {
   mergedAvatar,
   SqliteTargetLibraryRepository,
 } from './target-library-store.js';
-
 export { mergedAvatar };
-
 const ledgerTypeSql = (m: GB.BumperScope | 'all') =>
   m === 'page'
     ? "record_type = 'page_bump'"
     : m === 'group'
       ? "record_type = 'group_bump'"
       : "record_type IN ('group_bump', 'page_bump')";
-
 export function ensureBumperEffectsSchema(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS group_bumper_effects(log_id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, account_id TEXT NOT NULL, group_id TEXT NOT NULL, page_id TEXT NOT NULL, post_id TEXT NOT NULL, source_mode TEXT NOT NULL DEFAULT 'group', liked INTEGER NOT NULL DEFAULT 0, commented INTEGER NOT NULL DEFAULT 0, comment_digest TEXT, applied_at INTEGER NOT NULL, story_shared INTEGER NOT NULL DEFAULT 0);
     CREATE INDEX IF NOT EXISTS group_bumper_effects_post ON group_bumper_effects(post_id); CREATE INDEX IF NOT EXISTS group_bumper_effects_day ON group_bumper_effects(account_id, source_mode, applied_at); CREATE INDEX IF NOT EXISTS group_bumper_effects_week ON group_bumper_effects(source_mode, applied_at);
   `);
 }
-
 function initGroupBumperSchema(db: DatabaseSync): void {
   ensureTargetLibrarySchema(db);
   ensurePostBumpRecordsSchema(db);
@@ -80,9 +76,9 @@ function initGroupBumperSchema(db: DatabaseSync): void {
     }
   }
 }
-
 export class SqliteGroupBumperRepository {
   private readonly targetLibrary: SqliteTargetLibraryRepository;
+  private run = (sql: string, args: SQLInputValue[] = []) => Q.run(this.db, sql, ...args);
   constructor(private readonly db: DatabaseSync) {
     initGroupBumperSchema(db);
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
@@ -182,7 +178,110 @@ export class SqliteGroupBumperRepository {
       sql =
         "UPDATE group_bumper_operations SET status='PENDING_REVIEW',reason=?,updated_at=? WHERE operation_id=?";
     if (!row) throw Error('BUMPER_OPERATION_MISSING');
-    if (!row.resolution) Q.run(this.db, sql, reason, Date.now(), operationId);
+    if (!row.resolution) Q.run(this.db, sql, GB.stripAnsi(reason), Date.now(), operationId);
+  }
+  resolvePendingOperation(input: GB.ResolvePendingOperationInput): {
+    operationId: string;
+    resolution: GB.PendingOperationResolution;
+    status: 'SETTLED';
+  } {
+    const parsed = GB.ResolvePendingOperationInput.parse(input);
+    return transaction(this.db, () => {
+      const row = this.getOperation(parsed.operationId);
+      if (!row) throw Error('BUMPER_OPERATION_MISSING');
+      const targetOutcome = parsed.resolution === 'confirmed' ? 'VERIFIED' : 'NOT_APPLIED';
+      if (
+        row.status === 'SETTLED' &&
+        row.resolution &&
+        row.resolution.outcome !== 'ENDED_UNKNOWN'
+      ) {
+        if (row.resolution.outcome === targetOutcome) {
+          return {
+            operationId: parsed.operationId,
+            resolution: parsed.resolution,
+            status: 'SETTLED',
+          };
+        }
+        throw Error('BUMPER_RESOLUTION_CONFLICT');
+      }
+      const now = Date.now(),
+        note = GB.stripAnsi((parsed.note ?? parsed.reason ?? '').trim()).slice(0, 500),
+        nextReason = note || row.reason,
+        resId = randomUUID(),
+        evDigest = createHash('sha256')
+          .update(
+            JSON.stringify({
+              manualResolution: parsed.resolution,
+              operationId: parsed.operationId,
+              note,
+              at: now,
+            }),
+          )
+          .digest('hex');
+      if (parsed.resolution === 'not_applied') {
+        this.run(
+          "UPDATE group_bumper_operations SET resolution_id=?,resolution_outcome='NOT_APPLIED',evidence_digest=?,status='SETTLED',reason=?,updated_at=? WHERE operation_id=?",
+          [resId, evDigest, nextReason, now, parsed.operationId],
+        );
+        return {
+          operationId: parsed.operationId,
+          resolution: parsed.resolution,
+          status: 'SETTLED',
+        };
+      }
+      let logId = row.logId ?? null;
+      if (
+        ['submit_like', 'submit_comment', 'submit_story_share'].includes(row.actionKind) &&
+        row.postId &&
+        /^\d+$/.test(row.postId) &&
+        row.binding.accountId
+      ) {
+        logId = logId ?? randomUUID();
+        const isPage = row.groupId === '-',
+          pageId = row.pageId || (isPage ? row.binding.accountId : row.groupId) || '-',
+          postUrl =
+            row.postUrl && /^https?:\/\//i.test(row.postUrl)
+              ? row.postUrl
+              : isPage
+                ? `https://www.facebook.com/${encodeURIComponent(pageId)}/posts/${row.postId}/`
+                : `https://www.facebook.com/groups/${encodeURIComponent(row.groupId)}/posts/${row.postId}/`,
+          liked = row.actionKind === 'submit_like',
+          commentText = row.actionKind === 'submit_comment' ? (row.commentText ?? null) : null,
+          storyShared = row.actionKind === 'submit_story_share';
+        if (liked || commentText || storyShared) {
+          this.record(
+            {
+              id: logId,
+              profileId: row.binding.profileId,
+              accountId: row.binding.accountId,
+              groupId: row.groupId,
+              groupName: row.groupName,
+              pageId,
+              pageName: row.pageName ?? '',
+              postId: row.postId,
+              postUrl,
+              liked,
+              commentText,
+              ...(storyShared ? { storyShared: true } : {}),
+              bumpedAt: now,
+              sourceMode: isPage ? 'page' : 'group',
+            },
+            row.actionKind === 'submit_comment' ? (row.commentId ?? undefined) : undefined,
+          );
+        }
+      }
+      Q.run(
+        this.db,
+        "UPDATE group_bumper_operations SET log_id=COALESCE(log_id,?),resolution_id=?,resolution_outcome='VERIFIED',evidence_digest=?,status='SETTLED',reason=?,updated_at=? WHERE operation_id=?",
+        logId,
+        resId,
+        evDigest,
+        nextReason,
+        now,
+        parsed.operationId,
+      );
+      return { operationId: parsed.operationId, resolution: parsed.resolution, status: 'SETTLED' };
+    });
   }
   confirmSubmission(
     operationId: string,
@@ -295,31 +394,36 @@ export class SqliteGroupBumperRepository {
       const existing = new Map(
         listBumperCommentsFromDb(this.db, scope, true).map((r) => [r.text, r]),
       );
-      let nextTexts = new Set(texts);
-      if (baseComments) {
+      const orderedTexts = (() => {
+        if (!baseComments) return [...new Set(texts)];
         const baseIds = new Set(baseComments.map((r) => r.id)),
-          baseTexts = new Set(baseComments.map((r) => r.text));
-        nextTexts = new Set(
-          [...existing.values()]
-            .filter((r) => !baseIds.has(r.id) || nextTexts.has(r.text))
-            .map((r) => r.text),
-        );
-        for (const text of texts) if (!baseTexts.has(text)) nextTexts.add(text);
-      }
+          baseTexts = new Set(baseComments.map((r) => r.text)),
+          inputSet = new Set(texts),
+          out: string[] = [],
+          seen = new Set<string>(),
+          push = (t: string) => {
+            if (!seen.has(t)) {
+              seen.add(t);
+              out.push(t);
+            }
+          };
+        for (const text of texts) {
+          if (!baseTexts.has(text) || existing.has(text)) push(text);
+        }
+        for (const row of existing.values()) {
+          if (!baseIds.has(row.id) || inputSet.has(row.text)) push(row.text);
+        }
+        return out;
+      })();
+      const baseNow = Date.now();
       this.db.prepare('DELETE FROM group_bumper_comments WHERE scope=?').run(scope);
       const add = this.db.prepare(
         'INSERT INTO group_bumper_comments(id,comment_text,used_count,created_at,scope) VALUES(?,?,?,?,?)',
       );
-      for (const text of nextTexts) {
+      orderedTexts.forEach((text, idx) => {
         const prev = existing.get(text);
-        add.run(
-          prev?.id ?? randomUUID(),
-          text,
-          prev?.usedCount ?? 0,
-          prev?.createdAt ?? Date.now(),
-          scope,
-        );
-      }
+        add.run(prev?.id ?? randomUUID(), text, prev?.usedCount ?? 0, baseNow + idx, scope);
+      });
       if (consumeCommentOnUse !== undefined) {
         if (scope === 'page')
           this.savePageSettings({ ...this.pageSettings(), consumeCommentOnUse });
@@ -439,7 +543,7 @@ export class SqliteGroupBumperRepository {
   total = (sourceMode: GB.BumperScope | 'all' = 'all') =>
     Q.countSql(
       this.db,
-      `SELECT COUNT(*) n FROM post_bump_records WHERE ${ledgerTypeSql(sourceMode)} AND status='success'`,
+      `SELECT COUNT(*) n FROM post_bump_records WHERE ${ledgerTypeSql(sourceMode)} AND status='success' AND carrier='browser'`,
     );
   todayCounts(sourceMode: GB.BumperScope | 'all' = 'group'): Record<string, number> {
     const sql =
@@ -449,18 +553,6 @@ export class SqliteGroupBumperRepository {
         Q.s(r.profile_id),
         Q.n(r.n),
       ]),
-    );
-  }
-  weeklyDailyCounts(
-    now = Date.now(),
-    sourceMode: GB.BumperScope | 'all' = 'group',
-  ): GB.BumperDailyStat[] {
-    const { startMs, endMs } = Q.localWeekWindow(now),
-      sql =
-        "SELECT applied_at AS bumped_at FROM group_bumper_effects WHERE applied_at >= ? AND applied_at < ? AND (?='all' OR source_mode=?)";
-    return Q.collectWeeklyDailyCounts(
-      Q.allRows(this.db, sql, startMs, endMs, sourceMode, sourceMode).map((r) => Q.n(r.bumped_at)),
-      now,
     );
   }
   pendingReviewOperations(limit = 100): GB.BumperPendingOperation[] {
@@ -477,8 +569,7 @@ export class SqliteGroupBumperRepository {
                 ? 'comment'
                 : 'like',
           reason:
-            Q.s(r.reason)
-              .replace(/\u001b\[[0-9;]*m/g, '')
+            GB.stripAnsi(Q.s(r.reason))
               .split(/\r?\nCall log:/)[0]
               ?.trim() ?? '',
         }) as GB.BumperPendingOperation,
@@ -513,17 +604,17 @@ export class SqliteGroupBumperRepository {
     return transaction(this.db, () => {
       const uSql = `DELETE FROM group_bumper_effects WHERE (?=1 AND (?='all' OR source_mode=?)${ec}) OR log_id IN(SELECT value FROM json_each(?))`;
       const pSql = `DELETE FROM post_bump_records WHERE ${ledgerTypeSql(mode)} AND ((?=1${lc}) OR source_log_id IN (SELECT value FROM json_each(?)) OR id IN (SELECT value FROM json_each(?)))`;
-      const usageChanges = Number(Q.run(this.db, uSql, flag, mode, mode, idJson).changes);
-      const changes = Number(Q.run(this.db, pSql, flag, idJson, idJson).changes);
+      const usageChanges = Number(this.run(uSql, [flag, mode, mode, idJson]).changes);
+      const changes = Number(this.run(pSql, [flag, idJson, idJson]).changes);
       const oSql = `DELETE FROM group_bumper_operations WHERE (status='PENDING_REVIEW' OR resolution_outcome='ENDED_UNKNOWN') AND (?='all' OR (CASE WHEN group_id='-' THEN 'page' ELSE 'group' END)=?)${ec}`;
-      if (all) Q.run(this.db, oSql, mode, mode);
+      if (all) this.run(oSql, [mode, mode]);
       if (changes > 0 || usageChanges > 0) {
-        const gSql =
-          'UPDATE shared_facebook_groups SET bumped_count = (SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.group_id = shared_facebook_groups.group_id)';
-        const pgSql =
-          'UPDATE group_bumper_pages SET total_bumped_count = (SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.page_id = group_bumper_pages.page_id)';
-        Q.run(this.db, gSql);
-        Q.run(this.db, pgSql);
+        this.run(
+          'UPDATE shared_facebook_groups SET bumped_count = (SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.group_id = shared_facebook_groups.group_id)',
+        );
+        this.run(
+          'UPDATE group_bumper_pages SET total_bumped_count = (SELECT COUNT(*) FROM group_bumper_effects WHERE group_bumper_effects.page_id = group_bumper_pages.page_id)',
+        );
       }
       return changes;
     });

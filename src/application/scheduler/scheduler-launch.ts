@@ -2,23 +2,14 @@ import { bluestacksDisplayTitle } from '../../shared/bluestacks.js';
 import { profileDisplayName } from '../../shared/contracts.js';
 import {
   computeDueScheduleTriggers,
-  computeEffectiveSafetyCeilingMinutes,
   computeNextRunPreview,
-  estimatePipelineMinutes,
   type AutoSchedule,
-  type AutoSchedulePhase,
   type AutoScheduleRun,
   type AutoScheduleRunItem,
   type AutoSchedulerState,
 } from '../../shared/auto-scheduler.js';
-import type {
-  LiveRunTracker,
-  QueuedTargetWork,
-  SchedulerRuntimeContext,
-} from '../auto-scheduler-service.js';
-import type { WorkspaceService } from '../workspace-service.js';
-import { checkAndFinalizeRun, pumpCarrierPool } from './scheduler-pool.js';
-
+import type { LiveRunTracker, SchedulerRuntimeContext } from '../auto-scheduler-service.js';
+import { pumpCarrierPool } from './scheduler-pool.js';
 const BROWSER_ABNORMAL_LABELS: Record<string, string> = {
   'logged-out': '账号未登录',
   verification: '账号需验证 (Checkpoint)',
@@ -30,14 +21,12 @@ const BLUESTACKS_ABNORMAL_LABELS: Record<string, string> = {
   verification: '账号需验证 (Checkpoint)',
   restricted: '账号已封禁/全局受限',
 };
-
 const matchesSelector = (
   selector: AutoSchedule['targetSelector'],
   groupId: string | null,
   targetId: string,
   idSet: Set<string>,
 ) => (selector.mode === 'groups' ? Boolean(groupId && idSet.has(groupId)) : idSet.has(targetId));
-
 async function collectHandledSlotKeys(
   ctx: SchedulerRuntimeContext,
   scheduleId: string,
@@ -49,7 +38,6 @@ async function collectHandledSlotKeys(
     if (mem.startsWith(prefix)) handled.add(mem.slice(prefix.length));
   return handled;
 }
-
 const makeRunItem = (
   runId: string,
   targetId: string,
@@ -70,30 +58,10 @@ const makeRunItem = (
   postedCount: 0,
   softIssues: 0,
   hardBlockReason,
-  seamlessHandoff: false,
   startedAt: nowMs,
   finishedAt: nowMs,
   updatedAt: nowMs ?? 0,
 });
-
-async function buildCombinationMinutesMap(
-  workspace: WorkspaceService,
-): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  for (const row of await workspace.repository.combinations()) {
-    const spec = row.saved;
-    if (!spec) continue;
-    let stepSum = 0;
-    for (const s of spec.steps)
-      stepSum += s.type === 'post' ? Math.max(2, s.count * 2) : Math.max(1, s.durationMinutes);
-    map.set(
-      row.id,
-      Math.max(2, stepSum * (spec.loop.mode === 'finite' ? Math.max(1, spec.loop.rounds) : 1)),
-    );
-  }
-  return map;
-}
-
 function countMatchingTargets(
   schedule: AutoSchedule,
   profiles: ReadonlyArray<{ id: string; groupId: string | null }> | null,
@@ -116,22 +84,19 @@ function countMatchingTargets(
     ).length ?? 0
   );
 }
-
 export async function buildSchedulerState(
   ctx: SchedulerRuntimeContext,
 ): Promise<AutoSchedulerState> {
   const nowMs = ctx.now();
   ctx.pruneInMemorySlotLocks();
-  const [settings, schedules, persistedRuns, comboMap] = await Promise.all([
+  const [settings, schedules, persistedRuns] = await Promise.all([
     ctx.repo.settings(),
     ctx.repo.listSchedules(),
     ctx.repo.listRuns(20, 20),
-    buildCombinationMinutesMap(ctx.deps.workspace),
   ]);
   ctx.cachedSettings = settings;
   ctx.cachedEnabledScheduleCount = schedules.filter((s) => s.enabled).length;
   ctx.syncPowerLock();
-
   const [browserSnap, bsState] = await Promise.all([
     schedules.some((s) => s.carrier === 'browser')
       ? ctx.deps.workspace.snapshot()
@@ -140,7 +105,6 @@ export async function buildSchedulerState(
       ? ctx.deps.bluestacks.state(false)
       : Promise.resolve(null),
   ]);
-  const lookupCombo = (cid: string) => comboMap.get(cid) ?? 10;
   const views = [];
   for (const s of schedules) {
     const handled = await collectHandledSlotKeys(ctx, s.id, nowMs);
@@ -151,16 +115,6 @@ export async function buildSchedulerState(
         browserSnap?.profiles ?? null,
         bsState?.instances ?? null,
       ),
-      estimatedPrewarmMinutesPerTarget:
-        s.carrier === 'browser' && s.prewarm.enabled && s.prewarm.steps.length
-          ? estimatePipelineMinutes(s.prewarm.steps, lookupCombo)
-          : 0,
-      estimatedMainMinutesPerTarget: estimatePipelineMinutes(s.steps, lookupCombo),
-      effectivePrewarmSafetyMinutes:
-        s.carrier === 'browser' && s.prewarm.enabled
-          ? computeEffectiveSafetyCeilingMinutes(s, 'prewarm', lookupCombo)
-          : null,
-      effectiveMainSafetyMinutes: computeEffectiveSafetyCeilingMinutes(s, 'main', lookupCombo),
       nextRun: computeNextRunPreview(s, nowMs, handled),
     });
   }
@@ -182,7 +136,6 @@ export async function buildSchedulerState(
     recentRuns: persistedRuns.filter((r) => !activeIds.has(r.id)),
   };
 }
-
 export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void> {
   if (ctx.ticking || ctx.shuttingDown) return;
   try {
@@ -199,8 +152,12 @@ export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void>
       ctx.repo.listSchedules(),
     ]);
     ctx.cachedSettings = settings;
+    ctx.deps.workboard?.setConcurrencyLimits({
+      browserConcurrency: settings.browserConcurrency,
+      bluestacksConcurrency: settings.bluestacksConcurrency,
+      launchStaggerMs: settings.launchStaggerSeconds * 1000,
+    });
     ctx.cachedEnabledScheduleCount = schedules.filter((s) => s.enabled).length;
-
     for (const schedule of schedules) {
       if (!schedule.enabled) continue;
       try {
@@ -208,12 +165,11 @@ export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void>
         for (const due of computeDueScheduleTriggers(schedule, nowMs, handled)) {
           const lockKey = `${schedule.id}::${due.slotKey}`;
           if (ctx.inMemorySlotLocks.has(lockKey)) continue;
-          const launchKey = `${schedule.id}:${due.phase}`;
           if (!due.expiredSkipReason) {
             const alreadyLive = [...ctx.liveRuns.values()].some(
-              (t) => !t.cancelled && t.schedule.id === schedule.id && t.run.phase === due.phase,
+              (t) => !t.cancelled && t.schedule.id === schedule.id,
             );
-            if (ctx.launchingScheduleKeys.has(launchKey) || alreadyLive) continue;
+            if (ctx.launchingScheduleKeys.has(schedule.id) || alreadyLive) continue;
           }
           ctx.inMemorySlotLocks.add(lockKey);
           try {
@@ -223,7 +179,7 @@ export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void>
                 scheduleId: schedule.id,
                 scheduleName: schedule.name,
                 carrier: schedule.carrier,
-                phase: due.phase,
+                phase: 'main',
                 slotKey: due.slotKey,
                 triggerMode: 'cron',
                 status: 'skipped_expired',
@@ -238,21 +194,22 @@ export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void>
                 startedAt: nowMs,
                 finishedAt: nowMs,
               });
+              if (schedule.trigger.mode === 'once') {
+                await Promise.resolve(
+                  ctx.repo.toggleSchedule({ id: schedule.id, enabled: false }),
+                ).catch(() => {});
+                const latest = await Promise.resolve(ctx.repo.listSchedules()).catch(() => null);
+                if (latest) ctx.cachedEnabledScheduleCount = latest.filter((s) => s.enabled).length;
+              }
+              ctx.markMutated();
               continue;
             }
-            ctx.launchingScheduleKeys.add(launchKey);
+            ctx.launchingScheduleKeys.add(schedule.id);
             ctx.cancelledLaunchSchedules.delete(schedule.id);
             try {
-              await launchScheduleRun(
-                ctx,
-                schedule,
-                due.phase,
-                due.slotKey,
-                'cron',
-                due.scheduledFor,
-              );
+              await launchScheduleRun(ctx, schedule, due.slotKey, 'cron', due.scheduledFor);
             } finally {
-              ctx.launchingScheduleKeys.delete(launchKey);
+              ctx.launchingScheduleKeys.delete(schedule.id);
             }
           } catch {
             ctx.inMemorySlotLocks.delete(lockKey);
@@ -267,22 +224,16 @@ export async function tickScheduler(ctx: SchedulerRuntimeContext): Promise<void>
     ctx.ticking = false;
   }
 }
-
 export async function launchScheduleRun(
   ctx: SchedulerRuntimeContext,
   schedule: AutoSchedule,
-  phase: AutoSchedulePhase,
   slotKey: string,
   triggerMode: 'cron' | 'manual',
   scheduledFor: number,
 ): Promise<void> {
   const nowMs = ctx.now();
-  const comboMap = await buildCombinationMinutesMap(ctx.deps.workspace);
-  const safetyCeilingMinutes = computeEffectiveSafetyCeilingMinutes(
-    schedule,
-    phase,
-    (cid) => comboMap.get(cid) ?? 10,
-  );
+  const safetyCeilingMinutes =
+    schedule.maxSafetyMinutesPerTarget === 0 ? null : (schedule.maxSafetyMinutesPerTarget ?? 180);
   const alreadyDoneSet =
     triggerMode === 'cron'
       ? new Set(await ctx.repo.listFinishedTargetIdsForSlot(schedule.id, slotKey))
@@ -291,7 +242,6 @@ export async function launchScheduleRun(
     schedule.targetSelector.skipAbnormalAccounts && triggerMode === 'cron'
       ? new Set(await ctx.repo.listHardBlockedTargetIdsSince(schedule.id, nowMs - 18 * 3600_000))
       : new Set<string>();
-
   const selectorSet = new Set(
     schedule.targetSelector.mode === 'groups'
       ? schedule.targetSelector.groupIds
@@ -330,7 +280,6 @@ export async function launchScheduleRun(
           ? '今日前序场次已判定账号异常'
           : null),
     }));
-
   const runId = globalThis.crypto.randomUUID();
   const itemsMap = new Map<string, AutoScheduleRunItem>();
   const runnableWorks: Array<{ id: string; name: string }> = [];
@@ -342,157 +291,125 @@ export async function launchScheduleRun(
   const canAutoInstall =
     schedule.carrier === 'bluestacks' &&
     schedule.steps.some((s) => s.type === 'bluestacks-health-check' && Boolean(s.autoInstallApk));
-
+  const nonAbnormalIds: string[] = [];
+  const abnormalIds = new Set<string>();
   for (const c of candidates) {
-    const existingCtx = ctx.activeContexts.get(c.id);
-    const seamlessPrewarm =
-      phase === 'main' &&
-      schedule.carrier === 'browser' &&
-      existingCtx?.scheduleId === schedule.id &&
-      existingCtx?.phase === 'prewarm' &&
-      !existingCtx?.finished;
     if (
       schedule.targetSelector.skipAbnormalAccounts &&
       !isPureBsPatrol &&
       !(canAutoInstall && c.abnormalReason === '未安装 FB Lite') &&
       c.abnormalReason
     ) {
-      initialSkipped++;
-      itemsMap.set(
-        c.id,
-        makeRunItem(
-          runId,
-          c.id,
-          c.name,
-          nowMs,
-          'skipped',
-          '已自动跳过',
-          `自动跳过：${c.abnormalReason}`,
-          c.abnormalReason,
-        ),
-      );
-    } else if (
-      !seamlessPrewarm &&
-      (await ctx.deps.featureExecution.isProfileBusy(c.id, 'auto-scheduler'))
-    ) {
-      initialSkipped++;
-      itemsMap.set(
-        c.id,
-        makeRunItem(
-          runId,
-          c.id,
-          c.name,
-          nowMs,
-          'skipped',
-          '已自动跳过',
-          '跳过：该账号当前正在执行其他任务',
-        ),
-      );
-    } else {
-      runnableWorks.push({ id: c.id, name: c.name });
-      itemsMap.set(c.id, {
-        ...makeRunItem(runId, c.id, c.name, null, 'queued', '等待并发空位…', '已进入滑动补位队列'),
-        updatedAt: nowMs,
-      });
-    }
+      abnormalIds.add(c.id);
+    } else nonAbnormalIds.push(c.id);
   }
-
-  const phaseLabel = phase === 'prewarm' ? '提前预热场' : '正点场';
-  const run: AutoScheduleRun = {
-    id: runId,
-    scheduleId: schedule.id,
-    scheduleName: schedule.name,
-    carrier: schedule.carrier,
-    phase,
-    slotKey,
-    triggerMode,
-    status: runnableWorks.length ? 'running' : 'completed',
-    statusReason: runnableWorks.length
-      ? `${phaseLabel}运行中 · 共 ${candidates.length} 个目标`
-      : candidates.length
-        ? `${phaseLabel}已自动跳过全部 ${initialSkipped} 个异常账号`
-        : `${phaseLabel}无待跑账号（今日已完成或分组为空）`,
-    totalTargets: candidates.length,
-    completedCount: 0,
-    softIssueCount: 0,
-    hardBlockedCount: 0,
-    watchdogTimeoutCount: 0,
-    skippedCount: initialSkipped,
-    scheduledFor,
-    startedAt: nowMs,
-    finishedAt: runnableWorks.length ? null : nowMs,
-  };
-
-  if (ctx.shuttingDown || ctx.cancelledLaunchSchedules.has(schedule.id))
-    return void ctx.cancelledLaunchSchedules.delete(schedule.id);
-  await ctx.repo.saveRunWithItems(run, [...itemsMap.values()]);
-  await ctx.repo.pruneOldRuns(120);
-
-  if (triggerMode === 'cron' && phase === 'main' && schedule.trigger.mode === 'once') {
-    await Promise.resolve(ctx.repo.toggleSchedule({ id: schedule.id, enabled: false })).catch(
-      () => {},
-    );
-    const latest = await Promise.resolve(ctx.repo.listSchedules()).catch(() => null);
-    if (latest) ctx.cachedEnabledScheduleCount = latest.filter((s) => s.enabled).length;
-  }
-  if (!runnableWorks.length) return;
-
-  const tracker: LiveRunTracker = { run, schedule, items: itemsMap, cancelled: false };
-  ctx.liveRuns.set(runId, tracker);
-
-  const handoffIds = new Set<string>();
-  if (phase === 'main' && schedule.carrier === 'browser') {
-    for (const w of runnableWorks) {
-      const existingCtx = ctx.activeContexts.get(w.id);
-      if (
-        existingCtx &&
-        existingCtx.scheduleId === schedule.id &&
-        existingCtx.phase === 'prewarm' &&
-        !existingCtx.finished
-      ) {
-        existingCtx.handoffToMain = true;
-        existingCtx.abortStep();
-        handoffIds.add(w.id);
-      }
-    }
-    const affectedPrewarmRuns = new Set<string>();
-    for (let i = ctx.browserQueue.length - 1; i >= 0; i--) {
-      const qw = ctx.browserQueue[i];
-      if (!qw || qw.tracker.schedule.id !== schedule.id || qw.tracker.run.phase !== 'prewarm')
-        continue;
-      ctx.browserQueue.splice(i, 1);
-      const preItem = qw.tracker.items.get(qw.targetId);
-      if (preItem) {
-        const updatedPre: AutoScheduleRunItem = {
-          ...preItem,
-          status: 'skipped',
-          currentStep: '已并入正点场',
-          summary: '正点时间已到，直接转入正点顶贴队列',
-          finishedAt: nowMs,
+  // Atomically reserve non-abnormal targets in FeatureExecutionRegistry before queueing.
+  const reservation = nonAbnormalIds.length
+    ? await ctx.deps.featureExecution.tryReserve('auto-scheduler', nonAbnormalIds)
+    : { reservedIds: [] as string[], busyIds: [] as string[] };
+  const reservedSet = new Set(reservation.reservedIds);
+  let releasePendingReservation = true;
+  try {
+    for (const c of candidates) {
+      if (abnormalIds.has(c.id)) {
+        initialSkipped++;
+        itemsMap.set(
+          c.id,
+          makeRunItem(
+            runId,
+            c.id,
+            c.name,
+            nowMs,
+            'skipped',
+            '已自动跳过',
+            `自动跳过：${c.abnormalReason}`,
+            c.abnormalReason,
+          ),
+        );
+      } else if (!reservedSet.has(c.id)) {
+        initialSkipped++;
+        itemsMap.set(
+          c.id,
+          makeRunItem(
+            runId,
+            c.id,
+            c.name,
+            nowMs,
+            'skipped',
+            '已自动跳过',
+            '跳过：该账号当前正在执行其他任务',
+          ),
+        );
+      } else {
+        runnableWorks.push({ id: c.id, name: c.name });
+        itemsMap.set(c.id, {
+          ...makeRunItem(
+            runId,
+            c.id,
+            c.name,
+            null,
+            'queued',
+            '等待并发空位…',
+            '已进入滑动补位队列',
+          ),
           updatedAt: nowMs,
-        };
-        qw.tracker.items.set(qw.targetId, updatedPre);
-        void ctx.repo.saveRunItem(updatedPre);
-        affectedPrewarmRuns.add(qw.tracker.run.id);
+        });
       }
     }
-    for (const preRunId of affectedPrewarmRuns) void checkAndFinalizeRun(ctx, preRunId);
-  }
-
-  const targetQueue = schedule.carrier === 'browser' ? ctx.browserQueue : ctx.bluestacksQueue;
-  const priorityWorks: QueuedTargetWork[] = [];
-  for (const w of runnableWorks) {
-    const entry: QueuedTargetWork = {
-      tracker,
-      targetId: w.id,
-      targetName: w.name,
-      safetyCeilingMinutes,
-      priorityHandoff: handoffIds.has(w.id),
+    const run: AutoScheduleRun = {
+      id: runId,
+      scheduleId: schedule.id,
+      scheduleName: schedule.name,
+      carrier: schedule.carrier,
+      phase: 'main',
+      slotKey,
+      triggerMode,
+      status: runnableWorks.length ? 'running' : 'completed',
+      statusReason: runnableWorks.length
+        ? `正点场运行中 · 共 ${candidates.length} 个目标`
+        : candidates.length
+          ? `正点场已自动跳过全部 ${initialSkipped} 个异常账号`
+          : '正点场无待跑账号（今日已完成或分组为空）',
+      totalTargets: candidates.length,
+      completedCount: 0,
+      softIssueCount: 0,
+      hardBlockedCount: 0,
+      watchdogTimeoutCount: 0,
+      skippedCount: initialSkipped,
+      scheduledFor,
+      startedAt: nowMs,
+      finishedAt: runnableWorks.length ? null : nowMs,
     };
-    (entry.priorityHandoff ? priorityWorks : targetQueue).push(entry);
+    if (ctx.shuttingDown || ctx.cancelledLaunchSchedules.has(schedule.id))
+      return void ctx.cancelledLaunchSchedules.delete(schedule.id);
+    await ctx.repo.saveRunWithItems(run, [...itemsMap.values()]);
+    await ctx.repo.pruneOldRuns(120);
+    if (!runnableWorks.length) {
+      if (triggerMode === 'cron' && schedule.trigger.mode === 'once') {
+        await Promise.resolve(ctx.repo.toggleSchedule({ id: schedule.id, enabled: false })).catch(
+          () => {},
+        );
+        const latest = await Promise.resolve(ctx.repo.listSchedules()).catch(() => null);
+        if (latest) ctx.cachedEnabledScheduleCount = latest.filter((s) => s.enabled).length;
+      }
+      ctx.markMutated();
+      return;
+    }
+    // Atomically register into liveRuns + carrier queue in the same tick before releasing reservation.
+    const tracker: LiveRunTracker = { run, schedule, items: itemsMap, cancelled: false };
+    ctx.liveRuns.set(runId, tracker);
+    const targetQueue = schedule.carrier === 'browser' ? ctx.browserQueue : ctx.bluestacksQueue;
+    for (const w of runnableWorks) {
+      targetQueue.push({ tracker, targetId: w.id, targetName: w.name, safetyCeilingMinutes });
+    }
+    ctx.deps.featureExecution.releaseReservation('auto-scheduler', reservation.reservedIds);
+    releasePendingReservation = false;
+    ctx.markMutated();
+    ctx.syncPowerLock();
+    pumpCarrierPool(ctx, schedule.carrier);
+  } finally {
+    if (releasePendingReservation && reservation.reservedIds.length) {
+      ctx.deps.featureExecution.releaseReservation('auto-scheduler', reservation.reservedIds);
+    }
   }
-  if (priorityWorks.length) targetQueue.unshift(...priorityWorks);
-
-  ctx.syncPowerLock();
-  pumpCarrierPool(ctx, schedule.carrier);
 }

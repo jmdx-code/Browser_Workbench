@@ -108,8 +108,6 @@ export function buildServerKernelHooks({
   kernel.setWindowLayoutHook(
     (id, guard) => layout.arrange(id, guard),
     () => layout.isEnabled(),
-    undefined,
-    (id, at) => layout.visible(id, at),
   );
   refs.setWindowLayout(layout);
   void layout.snapshot().catch(() => {});
@@ -233,7 +231,7 @@ export function buildServerKernelHooks({
         store: repository,
         core,
         kernel,
-        profileSource: new BridgeProfileSource(core, core.store),
+        profileSource: new BridgeProfileSource(core, core.store, inspection),
         get profileLifecycle() {
           return refs.getProfileLifecycle();
         },
@@ -277,9 +275,7 @@ export function buildServerKernelHooks({
       void (async () => {
         const ids = (await core.store.profileList()).map((row) => String(row.profileId));
         const newlyBound = await browserLabels.refresh(ids);
-        if (newlyBound.length > 0) {
-          await repository.upsertProfileLaunchBindings(newlyBound);
-        }
+        if (newlyBound.length > 0) await repository.upsertProfileLaunchBindings(newlyBound);
       })().catch(() => {});
     },
     close: async () => {

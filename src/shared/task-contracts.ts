@@ -16,12 +16,10 @@ import {
 } from './contracts.js';
 import { Action } from './browser-actions.js';
 import { DispatchBinding } from './task-execution.js';
-import { TaskTiming } from './task-timing.js';
 import { TaskStepOutcome } from './task-step-outcome.js';
 const ts = { createdAt: z.number(), updatedAt: z.number() },
   errStr = sMax(200),
   cursorStr = sReq(600),
-  optNumNull = NumNull.optional(),
   TaskState = z.enum(['QUEUED', 'RUNNING', 'STOPPED', 'COMPLETED', 'FAILED']);
 export const TaskProgress = strictObj({
   revision: NonNegInt,
@@ -54,14 +52,12 @@ export const TaskPlan = strictObj({
   snapshot: CombinationSchema,
   state: TaskState,
   reason: errStr,
-  controlMode: z.enum(['pause', 'stop']).nullable(),
+  controlMode: z.literal('stop').nullable().catch(null),
   controlRequestId: Id.nullable(),
   controlConfirmed: z.boolean(),
   round: PosInt,
   position: NonNegInt,
   ...ts,
-  timing: TaskTiming.optional(),
-  timingReleased: optBool,
   closeBrowserOnFinish: optBool,
 });
 export const TaskOperation = strictObj({
@@ -82,11 +78,6 @@ export const TaskOperation = strictObj({
   receipt: z.json().nullable(),
   checkpointApplied: z.boolean(),
   disposition: OperationDisposition.optional(),
-  inertBrowseProof: strictObj({
-    verified: z.literal(true),
-    purpose: z.enum(['play', 'advance', 'dismiss', 'activate']).optional(),
-    planConfirmedStopped: z.boolean(),
-  }).optional(),
   ...ts,
 });
 export const TaskEvent = strictObj({
@@ -105,18 +96,12 @@ export const AssignTasks = strictObj({
   version: PosInt,
   profileIds: z.array(Id).min(1).max(1000),
   expectedResourceRevision: PosInt.optional(),
-  timing: TaskTiming.optional(),
   closeBrowserOnFinish: optBool,
 });
 export const TaskOverview = strictObj({
   dispatchEnabled: z.boolean(),
   settings: SchedulerSettings,
   plans: z.array(TaskPlan),
-});
-export const TaskHistoryRequest = strictObj({
-  profileId: Id,
-  planId: Id.optional(),
-  round: PosInt.optional(),
 });
 export const TaskStepBudget = z.discriminatedUnion('kind', [
   strictObj({ kind: z.literal('time'), milliseconds: PosInt }),
@@ -135,22 +120,6 @@ const stepDescriptor = {
   maxLikes: NonNegInt.optional(),
   budget: TaskStepBudget.optional(),
 };
-const HistoryPlan = TaskPlan.pick({
-  timing: true,
-  id: true,
-  combinationId: true,
-  version: true,
-  accountId: true,
-  state: true,
-  reason: true,
-  controlConfirmed: true,
-  round: true,
-  position: true,
-  createdAt: true,
-  updatedAt: true,
-})
-  .extend({ name: errStr })
-  .strict();
 const stepPick = {
   id: true as const,
   round: true as const,
@@ -159,29 +128,6 @@ const stepPick = {
   outcome: true as const,
   progress: true as const,
 };
-export const TaskHistory = strictObj({
-  detailsReclaimed: optBool,
-  profileId: Id,
-  plans: z.array(HistoryPlan).max(50),
-  selectedPlanId: Id.nullable(),
-  steps: z.array(
-    TaskStep.pick(stepPick)
-      .extend({ ...stepDescriptor, startedAt: optNumNull, finishedAt: optNumNull })
-      .strict(),
-  ),
-  operations: z
-    .array(
-      TaskOperation.pick({ id: true, stepId: true, status: true, createdAt: true, updatedAt: true })
-        .extend({ kind: sMax(40) })
-        .strict(),
-    )
-    .max(100),
-  events: z
-    .array(TaskEvent.pick({ sequence: true, type: true, createdAt: true }).strict())
-    .max(100),
-  truncated: strictObj({ plans: z.boolean(), operations: z.boolean(), events: z.boolean() }),
-});
-export type History = z.infer<typeof TaskHistory>;
 export type Plan = z.infer<typeof TaskPlan>;
 export type StepInstance = z.infer<typeof TaskStep>;
 export type Progress = z.infer<typeof TaskProgress>;
@@ -197,7 +143,7 @@ export const TaskCapabilities = strictObj({
 });
 export const TaskStartResult = strictObj({ plans: z.array(TaskPlan).max(1000) });
 export const TaskCommandRequest = strictObj({
-  command: z.enum(['pause', 'resume', 'stop']),
+  command: z.enum(['stop']),
   plans: z
     .array(
       strictObj({
@@ -312,3 +258,49 @@ export const TaskRecords = strictObj({
 });
 export type TaskRecord = z.infer<typeof TaskRecordRow>;
 export type TaskRecordsResponse = z.infer<typeof TaskRecords>;
+export function buildTaskRecord(
+  step: Pick<
+    StepInstance,
+    'id' | 'round' | 'position' | 'spec' | 'status' | 'progress' | 'outcome'
+  >,
+  planId: string,
+  profileId: string,
+  combinationId: string,
+  combinationName: string,
+  combinationVersion: number,
+  planState: Plan['state'],
+  planReason: string,
+  planCreatedAt: number,
+  planUpdatedAt: number,
+): TaskRecord {
+  const s = step.spec;
+  return {
+    stepId: step.id,
+    planId,
+    profileId,
+    combinationId,
+    combinationName,
+    combinationVersion,
+    round: step.round,
+    position: step.position,
+    type: s.type,
+    ...(s.type === 'post' && s.destination ? { destination: s.destination } : {}),
+    ...(s.type === 'friends' && s.friendAction ? { friendAction: s.friendAction } : {}),
+    ...(s.type === 'feed' && s.feedMode && s.feedMode !== 'home' ? { feedMode: s.feedMode } : {}),
+    ...(s.type === 'feed' || s.type === 'video' ? { maxLikes: s.maxLikes } : {}),
+    status: step.status,
+    planState,
+    planReason,
+    ...(step.outcome ? { outcome: step.outcome } : {}),
+    progress: step.progress,
+    startedAt: step.status !== 'PENDING' ? planCreatedAt : null,
+    finishedAt:
+      step.outcome?.kind === 'FAILED' || step.outcome?.kind === 'SKIPPED'
+        ? step.outcome.endedAt
+        : step.status === 'COMPLETED'
+          ? planUpdatedAt
+          : null,
+    planCreatedAt,
+    planUpdatedAt,
+  };
+}

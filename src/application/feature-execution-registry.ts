@@ -5,24 +5,20 @@ export interface FeatureExecutionParticipant {
   hasActiveExecution(): boolean | Promise<boolean>;
   stopProfiles?(profileIds: readonly string[]): Promise<void>;
 }
-
 export class FeatureExecutionRegistry {
   private readonly items = new Map<string, FeatureExecutionParticipant>();
   private readonly delegatedSubmodules = new Map<string, string>();
   private readonly reservations = new Map<string, string>();
   private readonly reserveLocks = new Map<string, Promise<unknown>>();
-
   setDelegatedSubmodule = (profileId: string, submoduleId: string | null) =>
     void (submoduleId
       ? this.delegatedSubmodules.set(profileId, submoduleId)
       : this.delegatedSubmodules.delete(profileId));
-
   private normalizeExcludes(exclude?: string | readonly string[]): ReadonlySet<string> | null {
     if (!exclude) return null;
     if (typeof exclude === 'string') return new Set([exclude]);
     return exclude.length ? new Set(exclude) : null;
   }
-
   private isDelegatedBypass(
     participantId: string,
     profileId: string,
@@ -36,7 +32,6 @@ export class FeatureExecutionRegistry {
         (excludes.has('auto-scheduler') && delegated === participantId)),
     );
   }
-
   private withProfileReserveLock<T>(profileId: string, run: () => Promise<T>): Promise<T> {
     const prev = this.reserveLocks.get(profileId) ?? Promise.resolve();
     const next = prev.catch(() => {}).then(run);
@@ -48,7 +43,6 @@ export class FeatureExecutionRegistry {
       .catch(() => {});
     return next;
   }
-
   async tryReserve(
     moduleId: string,
     profileIds: readonly string[],
@@ -69,12 +63,10 @@ export class FeatureExecutionRegistry {
     }
     return { reservedIds, busyIds };
   }
-
   releaseReservation(moduleId: string, profileIds: readonly string[]): void {
     for (const pid of profileIds)
       if (this.reservations.get(pid) === moduleId) this.reservations.delete(pid);
   }
-
   register = (participant: FeatureExecutionParticipant) =>
     void this.items.set(participant.id, participant);
   hasParticipant = (id: string) => this.items.has(id);
@@ -83,7 +75,6 @@ export class FeatureExecutionRegistry {
     this.checkProfileBusy(profileId, excludeModuleId, true);
   isProfileBusyStrict = (profileId: string, excludeModuleId?: string | readonly string[]) =>
     this.checkProfileBusy(profileId, excludeModuleId, false);
-
   private isReservationBlocking(
     pid: string,
     excludes: ReadonlySet<string> | null,
@@ -96,7 +87,6 @@ export class FeatureExecutionRegistry {
       ? null
       : reservedBy;
   }
-
   private async checkProfileBusy(
     profileId: string,
     excludeModuleId: string | readonly string[] | undefined,
@@ -114,7 +104,6 @@ export class FeatureExecutionRegistry {
     }
     return false;
   }
-
   async busyModuleLabels(
     profileIds: readonly string[],
     excludeModuleId?: string | readonly string[],
@@ -136,7 +125,6 @@ export class FeatureExecutionRegistry {
     }
     return [...labels];
   }
-
   private async collectActive(
     selector: (item: FeatureExecutionParticipant) => string,
     excludeModuleId?: string,
@@ -147,14 +135,12 @@ export class FeatureExecutionRegistry {
         out.push(selector(item));
     return out;
   }
-
   activeModuleLabels = (excludeModuleId?: string) =>
     this.collectActive((item) => item.label, excludeModuleId);
   activeModuleIds = (excludeModuleId?: string) =>
     this.collectActive((item) => item.id, excludeModuleId);
   hasAnyActiveExecution = async (excludeModuleId?: string) =>
     (await this.collectActive((item) => item.id, excludeModuleId)).length > 0;
-
   async stopProfilesAcrossModules(profileIds: readonly string[]): Promise<boolean> {
     const uniqueIds = [...new Set(profileIds)];
     if (!uniqueIds.length) return false;
@@ -171,7 +157,6 @@ export class FeatureExecutionRegistry {
     return stoppedAny;
   }
 }
-
 export interface FeatureExecutionFallbackServices {
   tasks?: {
     hasProfilePlanInStates(
@@ -207,9 +192,7 @@ export interface FeatureExecutionFallbackServices {
     stopExtra?(kind: 'active' | 'poster' | 'inviter', ids?: readonly string[]): Promise<unknown>;
   };
 }
-
 const ACTIVE_PLAN_STATES = ['QUEUED', 'RUNNING'] as const;
-
 export function ensureFeatureExecutionRegistry(
   existing: FeatureExecutionRegistry | undefined,
   services: FeatureExecutionFallbackServices,

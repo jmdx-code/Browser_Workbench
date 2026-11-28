@@ -1,8 +1,6 @@
 import { classifyAccountRestrictionScope } from '../shared/account-state-policy.js';
-
 export type AccountAbnormalState = 'logged-out' | 'verification' | 'restricted';
 export type AccountAbnormalScope = 'global_route' | 'feature_action';
-
 export interface GlobalAccountAbnormalReportInput {
   readonly profileId: string;
   readonly scope: AccountAbnormalScope;
@@ -12,7 +10,6 @@ export interface GlobalAccountAbnormalReportInput {
   readonly name?: string | null | undefined;
   readonly avatar?: string | null | undefined;
 }
-
 export interface GlobalAccountAbnormalReporterDeps {
   updateProfileAccountCache(
     profileId: string,
@@ -34,11 +31,9 @@ export interface GlobalAccountAbnormalReporterDeps {
     },
   ): void;
 }
-
 export type GlobalAccountAbnormalReporter = (
   input: GlobalAccountAbnormalReportInput,
 ) => Promise<boolean>;
-
 export function inferAbnormalStateFromCodeOrMessage(
   codeOrMessage: string,
   fallback: AccountAbnormalState = 'restricted',
@@ -49,7 +44,6 @@ export function inferAbnormalStateFromCodeOrMessage(
   if (/RESTRICTED|受限|停用|disabled|suspended/i.test(codeOrMessage)) return 'restricted';
   return fallback;
 }
-
 export function inferAbnormalScopeFromUrl(
   currentUrl: string | null | undefined,
   wholePageDisabledWall = false,
@@ -57,7 +51,6 @@ export function inferAbnormalScopeFromUrl(
   if (wholePageDisabledWall) return 'global_route';
   return classifyAccountRestrictionScope({ url: currentUrl ?? '', hasCUserCookie: true }).scope;
 }
-
 export function createGlobalAccountAbnormalReporter(
   deps: GlobalAccountAbnormalReporterDeps,
 ): GlobalAccountAbnormalReporter {

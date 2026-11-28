@@ -7,19 +7,13 @@ import {
   type AnyStep,
   type StepMetaItem,
 } from './auto-scheduler-step-helpers.js';
-import { IconSliders } from './icons.js';
 import { ControlledNumberInput } from './modules/shared/controlled-number-input.js';
-import { Btn, Chk } from './modules/shared/module-ui.js';
-import {
-  BumperSettingsFields,
-  summarizeBumperSettings,
-} from './modules/shared/step-settings-fields.js';
+import { Chk } from './modules/shared/module-ui.js';
 import {
   UnifiedTargetPicker,
   type UnifiedPickerItem,
 } from './modules/shared/unified-target-picker.js';
-import { UI_INPUT_SM, UI_SELECT_SM, UiSwitch } from './ui/primitives.js';
-
+import { UI_INPUT_SM, UI_MUTED, UI_SELECT_SM, UiSwitch } from './ui/primitives.js';
 export interface StepCardCtx {
   saving: boolean;
   stepMeta: readonly StepMetaItem[];
@@ -32,12 +26,9 @@ export interface StepCardCtx {
   updateStep: (index: number, next: AnyStep) => void;
   setSteps: (updater: (prev: AnyStep[]) => AnyStep[]) => void;
   setExpandedStepId: (id: string | null) => void;
-  setParamOpenStepId: (id: string | null) => void;
 }
-
 const TARGET_BTN =
   'inline-flex h-7 cursor-pointer items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition-colors';
-
 function SchedNum(p: {
   aria: string;
   val: number;
@@ -58,24 +49,21 @@ function SchedNum(p: {
         max={p.max}
         onChange={p.onChange}
       />
-      <span className="text-xs text-[var(--text-3)]">{p.unit}</span>
+      <span className={UI_MUTED}>{p.unit}</span>
     </>
   );
 }
-
 export function AutoSchedulerStepCard({
   step,
   idx,
   totalSteps,
   isOpen,
-  isParamOpen,
   ctx,
 }: {
   step: AnyStep;
   idx: number;
   totalSteps: number;
   isOpen: boolean;
-  isParamOpen: boolean;
   ctx: StepCardCtx;
 }) {
   const drawer = describeStepDrawer(step, {
@@ -85,20 +73,6 @@ export function AutoSchedulerStepCard({
   });
   const isBsCombo = step.type === 'bluestacks-active-combination';
   const isPageBumper = step.type === 'page-bumper' || step.type === 'bluestacks-page-bumper';
-  const isBsBumper =
-    step.type === 'bluestacks-group-bumper' || step.type === 'bluestacks-page-bumper';
-  const isBumper = step.type === 'group-bumper' || step.type === 'page-bumper' || isBsBumper;
-  const selectMeta =
-    step.type === 'quick-browse' || step.type === 'bluestacks-quick-browse'
-      ? [...ctx.stepMeta, { type: step.type, label: '快捷浏览（旧版）' }]
-      : ctx.stepMeta;
-  const bumperSummary = isBumper
-    ? summarizeBumperSettings(step.settingsOverride, {
-        pageMode: isPageBumper,
-        bluestacks: isBsBumper,
-      })
-    : '';
-
   const renderPickers = () => {
     type Pk = [
       string,
@@ -178,16 +152,19 @@ export function AutoSchedulerStepCard({
       />
     ));
     return specs.length > 1 ? (
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-2">{nodes}</div>
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-2 [&_.overflow-y-auto]:max-h-none [&_.overflow-y-auto]:overflow-visible">
+        {nodes}
+      </div>
     ) : (
-      nodes
+      <div className="[&_.overflow-y-auto]:max-h-none [&_.overflow-y-auto]:overflow-visible">
+        {nodes}
+      </div>
     );
   };
-
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[var(--line)] bg-[var(--surface-2)] px-[10px] py-[7px]">
       <div className="flex flex-wrap items-center gap-[7px]">
-        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--surface)] text-[11px] font-bold">
+        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--surface)] text-[11px] font-bold whitespace-nowrap">
           {idx + 1}
         </span>
         <select
@@ -201,44 +178,15 @@ export function AutoSchedulerStepCard({
             ctx.setExpandedStepId(
               ctx.stepMeta.find((m) => m.type === nextType)?.needsDrawer ? fresh.id : null,
             );
-            ctx.setParamOpenStepId(null);
           }}
         >
-          {selectMeta.map((m) => (
+          {ctx.stepMeta.map((m) => (
             <option key={m.type} value={m.type}>
               {m.label}
             </option>
           ))}
         </select>
-
         <div className="flex min-w-[140px] flex-1 flex-wrap items-center gap-1.5">
-          {(step.type === 'quick-browse' || step.type === 'bluestacks-quick-browse') && (
-            <>
-              <select
-                aria-label="浏览目标"
-                className={UI_SELECT_SM}
-                value={step.target}
-                onChange={(e) =>
-                  ctx.updateStep(idx, {
-                    ...step,
-                    target: e.target.value === 'video' ? 'video' : 'feed',
-                  })
-                }
-              >
-                <option value="feed">首页</option>
-                <option value="video">Reels</option>
-              </select>
-              <SchedNum
-                aria="浏览分钟"
-                val={step.durationMinutes}
-                min={1}
-                max={step.type === 'bluestacks-quick-browse' ? 60 : 120}
-                unit="分"
-                onChange={(durationMinutes) => ctx.updateStep(idx, { ...step, durationMinutes })}
-              />
-            </>
-          )}
-
           {(step.type === 'active-combination' || isBsCombo) &&
             (ctx.savedCombos.length > 0 ? (
               <select
@@ -266,7 +214,6 @@ export function AutoSchedulerStepCard({
             ) : (
               <span className="text-xs text-amber-700">需先新建活跃组合</span>
             ))}
-
           {step.type === 'bluestacks-health-check' && (
             <UiSwitch
               ariaLabel="缺包自动安装"
@@ -277,35 +224,15 @@ export function AutoSchedulerStepCard({
               }
             />
           )}
-
           {drawer && (
             <button
               type="button"
               className={`${TARGET_BTN} ${drawer.needsAttention ? 'border-amber-500 bg-amber-50 text-amber-700 hover:bg-amber-100/70' : 'border-[var(--line)] bg-[var(--surface)] text-[var(--text)] hover:bg-slate-100'}`}
-              onClick={() => {
-                ctx.setParamOpenStepId(null);
-                ctx.setExpandedStepId(isOpen ? null : step.id);
-              }}
+              onClick={() => ctx.setExpandedStepId(isOpen ? null : step.id)}
             >
               {drawer.text} {isOpen ? '▴' : '▾'}
             </button>
           )}
-
-          {isBumper && (
-            <button
-              type="button"
-              className={`${TARGET_BTN} ${step.settingsOverride ? 'border-[var(--brand)] bg-[var(--brand-soft)] text-[var(--brand-hover)]' : 'border-[var(--line)] bg-[var(--surface)] text-[var(--text)] hover:bg-slate-100'}`}
-              title={bumperSummary}
-              onClick={() => {
-                ctx.setExpandedStepId(null);
-                ctx.setParamOpenStepId(isParamOpen ? null : step.id);
-              }}
-            >
-              <IconSliders size={12} /> {step.settingsOverride ? bumperSummary : '默认参数'}{' '}
-              {isParamOpen ? '▴' : '▾'}
-            </button>
-          )}
-
           {(step.type === 'group-poster' || step.type === 'bluestacks-group-poster') && (
             <>
               <SchedNum
@@ -338,7 +265,6 @@ export function AutoSchedulerStepCard({
               )}
             </>
           )}
-
           {(step.type === 'group-inviter' || step.type === 'bluestacks-group-inviter') && (
             <SchedNum
               aria="每群邀请人数"
@@ -350,89 +276,44 @@ export function AutoSchedulerStepCard({
             />
           )}
         </div>
-
         {totalSteps > 1 && (
           <div className="flex items-center gap-[3px]">
-            {(
-              [
-                ['上移', idx === 0, () => ctx.setSteps((p) => moveItem(p, idx, -1)), '↑', false],
-                [
-                  '下移',
-                  idx === totalSteps - 1,
-                  () => ctx.setSteps((p) => moveItem(p, idx, 1)),
-                  '↓',
-                  false,
-                ],
-                [
-                  '删除',
-                  false,
-                  () => ctx.setSteps((p) => p.filter((_, i) => i !== idx)),
-                  '×',
-                  true,
-                ],
-              ] as const
-            ).map(([t, dis, fn, sym, danger]) => (
+            {[
+              {
+                t: '上移',
+                dis: idx === 0,
+                fn: () => ctx.setSteps((p) => moveItem(p, idx, -1)),
+                sym: '↑',
+              },
+              {
+                t: '下移',
+                dis: idx === totalSteps - 1,
+                fn: () => ctx.setSteps((p) => moveItem(p, idx, 1)),
+                sym: '↓',
+              },
+              {
+                t: '删除',
+                dis: false,
+                fn: () => ctx.setSteps((p) => p.filter((_, i) => i !== idx)),
+                sym: '×',
+                danger: true,
+              },
+            ].map((b) => (
               <button
-                key={t}
+                key={b.t}
                 type="button"
-                title={t}
-                disabled={dis}
-                onClick={fn}
-                className={`inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border border-[var(--line)] bg-[var(--surface)] text-xs text-[var(--text-2)] transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${danger ? 'hover:not-disabled:border-red-300 hover:not-disabled:bg-red-50 hover:not-disabled:text-red-600' : 'hover:not-disabled:bg-slate-100'}`}
+                title={b.t}
+                disabled={b.dis}
+                onClick={b.fn}
+                className={`inline-flex h-6 w-6 cursor-pointer items-center justify-center rounded-md border border-[var(--line)] bg-[var(--surface)] text-xs text-[var(--text-2)] transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${b.danger ? 'hover:not-disabled:border-red-300 hover:not-disabled:bg-red-50 hover:not-disabled:text-red-600' : 'hover:not-disabled:bg-slate-100'}`}
               >
-                {sym}
+                {b.sym}
               </button>
             ))}
           </div>
         )}
       </div>
-
       {isOpen && renderPickers()}
-
-      {isParamOpen && isBumper && (
-        <div className="flex flex-col gap-2.5 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2.5">
-          <div className="flex items-center justify-between gap-2 text-xs text-[var(--text-2)]">
-            <span>
-              {step.settingsOverride
-                ? '已启用步骤独立参数（仅作用于此步，覆盖全局配置）'
-                : '当前跟随全局顶贴配置，修改任意项即自动保存为此步独立参数'}
-            </span>
-            <div className="flex items-center gap-1.5">
-              {step.settingsOverride && (
-                <button
-                  type="button"
-                  className="text-xs cursor-pointer rounded-[5px] border-0 bg-transparent px-1.5 py-0.5 text-[var(--brand)] hover:bg-[var(--brand-soft)] hover:text-[var(--brand-hover)]"
-                  onClick={() => {
-                    const { settingsOverride: _removed, ...rest } = step;
-                    ctx.updateStep(idx, rest as AnyStep);
-                  }}
-                >
-                  恢复默认
-                </button>
-              )}
-              <Btn onClick={() => ctx.setParamOpenStepId(null)}>收起</Btn>
-            </div>
-          </div>
-          <BumperSettingsFields
-            pageMode={isPageBumper}
-            bluestacks={isBsBumper}
-            disabled={ctx.saving}
-            value={step.settingsOverride}
-            onChange={(nextOverride) =>
-              ctx.updateStep(
-                idx,
-                isBsBumper
-                  ? {
-                      ...step,
-                      enableSound: nextOverride.enableSound,
-                      settingsOverride: nextOverride,
-                    }
-                  : { ...step, settingsOverride: nextOverride },
-              )
-            }
-          />
-        </div>
-      )}
     </div>
   );
 }

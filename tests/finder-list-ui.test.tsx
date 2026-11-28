@@ -4,7 +4,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { FinderTargetList } from '../src/renderer/finder-target-list.js';
 import { computePopoverPlacement, PopoverMenu } from '../src/renderer/popover-menu.js';
-import { GroupInviterPage } from '../src/renderer/group-inviter-page.js';
+import { InviterWorkspacePage } from '../src/renderer/inviter-workspace-page.js';
 import { GroupBumperPage } from '../src/renderer/group-bumper-page.js';
 import { GroupPosterPage } from '../src/renderer/group-poster-page.js';
 import { BumperSettings } from '../src/shared/group-bumper.js';
@@ -13,9 +13,7 @@ import { normalizeTargetToken } from '../src/renderer/select-by-ids-dialog.js';
 import { Sidebar } from '../src/renderer/sidebar.js';
 import { FeatureNavRail } from '../src/renderer/feature-nav-rail.js';
 import { CombinationList, parseImportedCombination } from '../src/renderer/combination-list.js';
-import { TaskRecordsPage } from '../src/renderer/task-records.js';
 import { PostBumpRecordsPage } from '../src/renderer/modules/post-bump-records-page.js';
-import { UNIFIED_POST_BUMP_11_HEADERS } from '../src/shared/log-table-copy.js';
 import {
   buildFeatureNavItems,
   buildWorkbenchProjection,
@@ -49,9 +47,13 @@ it('new Story defaults to the native current audience while explicit saved Frien
 });
 vi.mock('../src/renderer/api.js', () => ({
   api: {
-    taskRecords: vi.fn(),
+    activityStats: vi.fn(),
     postBumpRecords: vi.fn(),
     deletePostBumpRecords: vi.fn(),
+    inviterRecords: vi.fn(),
+    deleteInviterRecords: vi.fn(),
+    browserRiskLimits: vi.fn(),
+    saveBrowserRiskLimits: vi.fn(),
     groupInviterLogs: vi.fn(),
     cleanupSettings: vi.fn(),
     targetFolders: vi.fn(),
@@ -169,7 +171,7 @@ describe('shared Finder UI', () => {
     await click(host.querySelector('[data-finder-id="1"]'));
     await click(host.querySelector('[aria-label="更多测试列表操作"]'));
     await click(
-      [...host.querySelectorAll('[role="menuitem"]')].find((e) =>
+      [...document.querySelectorAll('[role="menuitem"]')].find((e) =>
         e.textContent?.includes('移到：收藏'),
       ) ?? null,
     );
@@ -204,15 +206,30 @@ describe('shared Finder UI', () => {
     await mount();
     await click(host.querySelector('[data-finder-id="1"]'));
     await click(host.querySelector('[data-finder-id="2"]'));
-    const event = new Event('dragstart', { bubbles: true });
-    Object.defineProperty(event, 'dataTransfer', {
-      value: { setData: vi.fn(), setDragImage: vi.fn() },
-    });
-    await act(async () => host.querySelector('[data-finder-id="1"]')?.dispatchEvent(event));
+    const row1 = host.querySelector('[data-finder-id="1"]')!;
+    const folder = host.querySelector('.finder-folder')!;
+    vi.spyOn(folder, 'getBoundingClientRect').mockReturnValue({
+      top: 100,
+      bottom: 130,
+      left: 0,
+      right: 300,
+      width: 300,
+      height: 30,
+    } as DOMRect);
     await act(async () =>
-      host
-        .querySelector('.finder-folder')
-        ?.dispatchEvent(new Event('drop', { bubbles: true, cancelable: true })),
+      row1.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 50, clientY: 20 }),
+      ),
+    );
+    await act(async () =>
+      window.dispatchEvent(
+        new PointerEvent('pointermove', { bubbles: true, clientX: 50, clientY: 115 }),
+      ),
+    );
+    await act(async () =>
+      window.dispatchEvent(
+        new PointerEvent('pointerup', { bubbles: true, clientX: 50, clientY: 115 }),
+      ),
     );
     expect(api.targetListCommand).toHaveBeenCalledWith({
       action: 'reorder-items',
@@ -241,28 +258,48 @@ describe('shared Finder UI', () => {
     expect(nameEl.textContent).toBe('条目1');
     expect(codeEl.textContent).toBe('1');
 
-    // Mousedown on name prevents dragstart on the row
+    // Pointerdown on data-no-drag name element does not start pointer drag
     await act(async () => {
-      nameEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    });
-    const dragEvent = new Event('dragstart', { bubbles: true, cancelable: true });
-    Object.defineProperty(dragEvent, 'dataTransfer', {
-      value: { setData: vi.fn(), setDragImage: vi.fn() },
+      nameEl.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }),
+      );
     });
     await act(async () => {
-      row1.dispatchEvent(dragEvent);
+      window.dispatchEvent(
+        new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 80 }),
+      );
     });
-    expect(dragEvent.defaultPrevented).toBe(true);
+    expect(document.querySelector('[data-drag-ghost]')).toBeNull();
     await act(async () => {
-      window.dispatchEvent(new MouseEvent('mouseup'));
+      window.dispatchEvent(
+        new PointerEvent('pointerup', { bubbles: true, clientX: 20, clientY: 80 }),
+      );
     });
 
-    // Non-empty text selection blocks row click from toggling checkbox
-    const getSelectionSpy = vi
-      .spyOn(window, 'getSelection')
-      .mockReturnValue({ toString: () => '条目1' } as unknown as Selection);
+    // Non-empty text selection blocks row pointer drag and row click from toggling checkbox
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockReturnValue({
+      toString: () => '条目1',
+      removeAllRanges: () => {},
+    } as unknown as Selection);
+    await act(async () => {
+      row1.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }),
+      );
+    });
+    await act(async () => {
+      window.dispatchEvent(
+        new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 80 }),
+      );
+    });
+    expect(document.querySelector('[data-drag-ghost]')).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(
+        new PointerEvent('pointerup', { bubbles: true, clientX: 20, clientY: 80 }),
+      );
+    });
     await click(row1);
     expect(selected().has('1')).toBe(false);
+    expect(api.targetListCommand).not.toHaveBeenCalled();
     getSelectionSpy.mockRestore();
   });
 });
@@ -373,35 +410,64 @@ it('native pointerdown/up/click checkbox toggles once, preserves anchor for shif
   await click(inputs[1] as Element);
   expect([...selected()]).toEqual(['1', '3']);
 });
-it('painting cannot start HTML drag, child dragleave retains highlight and empty/unfiled accepts drops', async () => {
+it('painting cannot start pointer drag, folder highlight tracks pointer and empty/unfiled accepts drops', async () => {
   await mount();
   const cell = host.querySelector('.finder-check-cell');
   await act(async () =>
-    cell?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 })),
-  );
-  const canceled = new Event('dragstart', { bubbles: true, cancelable: true });
-  await act(async () => host.querySelector('.finder-row')?.dispatchEvent(canceled));
-  expect(canceled.defaultPrevented).toBe(true);
-  await act(async () => window.dispatchEvent(new PointerEvent('pointerup')));
-  const transfer = { setData: vi.fn(), setDragImage: vi.fn() };
-  const start = new Event('dragstart', { bubbles: true });
-  Object.defineProperty(start, 'dataTransfer', { value: transfer });
-  await act(async () => host.querySelector('.finder-row')?.dispatchEvent(start));
-  const folder = host.querySelector('.finder-folder');
-  await act(async () =>
-    folder?.dispatchEvent(new Event('dragover', { bubbles: true, cancelable: true })),
-  );
-  expect(folder?.classList.contains('is-drop')).toBe(true);
-  await act(async () =>
-    folder?.dispatchEvent(
-      new MouseEvent('dragleave', { bubbles: true, relatedTarget: folder.querySelector('button') }),
+    cell?.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 10, clientY: 10 }),
     ),
   );
-  expect(folder?.classList.contains('is-drop')).toBe(true);
   await act(async () =>
-    host
-      .querySelector('.finder-empty')
-      ?.dispatchEvent(new Event('drop', { bubbles: true, cancelable: true })),
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 10, clientY: 60 }),
+    ),
+  );
+  expect(document.querySelector('[data-drag-ghost]')).toBeNull();
+  await act(async () => window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })));
+
+  const row = host.querySelector('.finder-row')!;
+  const folder = host.querySelector('.finder-folder')!;
+  const empty = host.querySelector('.finder-empty')!;
+  vi.spyOn(folder, 'getBoundingClientRect').mockReturnValue({
+    top: 100,
+    bottom: 130,
+    left: 0,
+    right: 300,
+    width: 300,
+    height: 30,
+  } as DOMRect);
+  vi.spyOn(empty, 'getBoundingClientRect').mockReturnValue({
+    top: 140,
+    bottom: 180,
+    left: 0,
+    right: 300,
+    width: 300,
+    height: 40,
+  } as DOMRect);
+
+  await act(async () =>
+    row.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }),
+    ),
+  );
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 115 }),
+    ),
+  );
+  expect(document.querySelector('[data-drag-ghost]')).toBeTruthy();
+  expect(folder.classList.contains('is-drop')).toBe(true);
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 160 }),
+    ),
+  );
+  expect(empty.classList.contains('is-drop')).toBe(true);
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointerup', { bubbles: true, clientX: 20, clientY: 160 }),
+    ),
   );
   expect(api.targetListCommand).toHaveBeenCalledWith({
     action: 'reorder-items',
@@ -410,18 +476,32 @@ it('painting cannot start HTML drag, child dragleave retains highlight and empty
     orderedItemIds: ['1'],
   });
 });
-it('drop insertion uses final pointer coordinate even without matching dragover state', async () => {
+it('drop insertion uses final pointer coordinate even without prior pointermove over target', async () => {
   await mount();
-  const e = new Event('dragstart', { bubbles: true });
-  Object.defineProperty(e, 'dataTransfer', { value: { setData: vi.fn(), setDragImage: vi.fn() } });
-  await act(async () => host.querySelector('[data-finder-id="1"]')?.dispatchEvent(e));
-  const row = host.querySelector('[data-finder-id="2"]');
-  vi.spyOn(row as Element, 'getBoundingClientRect').mockReturnValue({
+  const row1 = host.querySelector('[data-finder-id="1"]')!;
+  const row2 = host.querySelector('[data-finder-id="2"]')!;
+  await act(async () =>
+    row1.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 20, clientY: 5 }),
+    ),
+  );
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 15 }),
+    ),
+  );
+  vi.spyOn(row2, 'getBoundingClientRect').mockReturnValue({
     top: 10,
+    bottom: 30,
+    left: 0,
+    right: 300,
+    width: 300,
     height: 20,
   } as DOMRect);
   await act(async () =>
-    row?.dispatchEvent(new MouseEvent('drop', { bubbles: true, cancelable: true, clientY: 29 })),
+    window.dispatchEvent(
+      new PointerEvent('pointerup', { bubbles: true, clientX: 20, clientY: 29 }),
+    ),
   );
   expect(api.targetListCommand).toHaveBeenCalledWith({
     action: 'reorder-items',
@@ -439,17 +519,18 @@ it('inviter add grid submits selected folder with each row', async () => {
   const add = vi.fn().mockResolvedValue(undefined);
   await act(async () =>
     root.render(
-      <GroupInviterPage
+      <InviterWorkspacePage
+        carrier="browser"
         state={{ groups: [], running: false, invitesPerGroup: 30 } as never}
         loaded={true}
-        selectedProfileIds={new Set()}
-        busy={false}
+        selectedTargetIds={new Set()}
+        externalBusy={false}
         onAddGroups={add}
         onDeleteGroups={async () => {}}
         onRefresh={async () => {}}
         onSaveInvitesPerGroup={async () => {}}
-        onStart={async () => {}}
-        onStop={async () => {}}
+        onStartBrowser={async () => {}}
+        onStopBrowser={async () => {}}
       />,
     ),
   );
@@ -578,7 +659,7 @@ it('Sidebar row menu supports repeated nudge and empty unfiled drop with child h
   await act(async () => root.render(<Render />));
   const openMenuAndClick = async (rowLabel: string, itemText: string) => {
     await click(host.querySelector(`[aria-label="更多 · ${rowLabel}"]`));
-    const item = [...host.querySelectorAll('[role="menuitem"]')].find((b) =>
+    const item = [...document.querySelectorAll('[role="menuitem"]')].find((b) =>
       b.textContent?.includes(itemText),
     );
     await click(item ?? null);
@@ -588,29 +669,50 @@ it('Sidebar row menu supports repeated nudge and empty unfiled drop with child h
   await openMenuAndClick('浏览器1', '↓ 下移');
   await openMenuAndClick('浏览器1', '↓ 下移');
   expect(api.reorderProfiles).toHaveBeenLastCalledWith(id, [ids[0], ids[2], ids[1]]);
-  const start = new Event('dragstart', { bubbles: true });
-  Object.defineProperty(start, 'dataTransfer', {
-    value: { setData: vi.fn(), setDragImage: vi.fn() },
-  });
-  await act(async () => host.querySelector('.profile-row')?.dispatchEvent(start));
+  const profileRow = host.querySelector('.profile-row')!;
   const head = [...host.querySelectorAll('.group-head')].find((e) =>
     e.textContent?.includes('未分组'),
-  );
+  )!;
+  const emptyGroup = host.querySelector('.group-empty')!;
   expect(head).toBeTruthy();
+  expect(emptyGroup).toBeTruthy();
+  vi.spyOn(head, 'getBoundingClientRect').mockReturnValue({
+    top: 100,
+    bottom: 130,
+    left: 0,
+    right: 280,
+    width: 280,
+    height: 30,
+  } as DOMRect);
+  vi.spyOn(emptyGroup, 'getBoundingClientRect').mockReturnValue({
+    top: 135,
+    bottom: 170,
+    left: 0,
+    right: 280,
+    width: 280,
+    height: 35,
+  } as DOMRect);
   await act(async () =>
-    head?.dispatchEvent(new Event('dragover', { bubbles: true, cancelable: true })),
-  );
-  expect(head?.classList.contains('is-drop')).toBe(true);
-  await act(async () =>
-    head?.dispatchEvent(
-      new MouseEvent('dragleave', { bubbles: true, relatedTarget: head.querySelector('button') }),
+    profileRow.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }),
     ),
   );
-  expect(head?.classList.contains('is-drop')).toBe(true);
   await act(async () =>
-    host
-      .querySelector('.group-empty')
-      ?.dispatchEvent(new Event('drop', { bubbles: true, cancelable: true })),
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 115 }),
+    ),
+  );
+  expect(head.classList.contains('is-drop')).toBe(true);
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointermove', { bubbles: true, clientX: 20, clientY: 150 }),
+    ),
+  );
+  expect(emptyGroup.classList.contains('is-drop')).toBe(true);
+  await act(async () =>
+    window.dispatchEvent(
+      new PointerEvent('pointerup', { bubbles: true, clientX: 20, clientY: 150 }),
+    ),
   );
   expect(api.reorderProfiles).toHaveBeenLastCalledWith(null, [ids[0]]);
 });
@@ -805,7 +907,7 @@ it('Sidebar SelectByIdsDialog matches FB ID, profile ID, and numeric browser sho
   );
   expect(host.querySelector('.bumper-warning-banner')?.textContent).toContain('留言列表为空');
   await click(host.querySelector('button[aria-label="高级参数"]'));
-  const probInput = host.querySelector<HTMLInputElement>('input[aria-label="likeProbability"]');
+  const probInput = document.querySelector<HTMLInputElement>('input[aria-label="likeProbability"]');
   expect(probInput).toBeTruthy();
   await act(async () => {
     if (probInput) {
@@ -880,6 +982,7 @@ for (const mode of ['group-bumper', 'page-bumper'] as const) {
         mode === 'page-bumper' ? 'page-comments' : 'comments',
         {
           texts: dirty ? ['used comment', 'new edit'] : [],
+          scope: mode === 'page-bumper' ? 'page' : 'group',
           consumeCommentOnUse: true,
           baseComments: dirty ? [{ id, text: 'used comment' }] : [],
         },
@@ -1114,15 +1217,6 @@ it('CombinationList uses unified isProfileBusy to disable start and schedule whe
 });
 
 it('GroupBumperPage supports ID-only paste without name and collapses low-frequency settings into 高级参数 popover', async () => {
-  const dailyStats = [
-    { date: '2026-11-01', count: 5 },
-    { date: '2026-10-31', count: 2 },
-    { date: '2026-10-30', count: 0 },
-    { date: '2026-10-29', count: 0 },
-    { date: '2026-10-28', count: 0 },
-    { date: '2026-10-27', count: 1 },
-    { date: '2026-10-26', count: 0 },
-  ];
   vi.mocked(api.bumperAction).mockResolvedValue({
     groups: [],
     pages: [],
@@ -1132,7 +1226,6 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
     running: false,
     statusText: '就绪',
     profileCounts: {},
-    dailyStats,
   });
   const onOpenRecords = vi.fn();
   await act(async () =>
@@ -1147,7 +1240,6 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
           running: false,
           statusText: '就绪',
           profileCounts: {},
-          dailyStats,
         }}
         selected={new Set()}
         onState={() => {}}
@@ -1172,7 +1264,7 @@ it('GroupBumperPage supports ID-only paste without name and collapses low-freque
   expect(host.querySelector('input[aria-label="maxPostsPerGroupPage"]')).toBeNull();
 
   await click(host.querySelector('button[aria-label="高级参数"]'));
-  const groups = host.querySelectorAll('.bumper-advanced-panel .bumper-advanced-group');
+  const groups = document.querySelectorAll('.bumper-advanced-panel .bumper-advanced-group');
   expect(groups.length).toBe(2);
   expect(groups[0]?.querySelector('input[aria-label="dailyMaxLikesPerAccount"]')).toBeTruthy();
   expect(
@@ -1337,7 +1429,6 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
     running: false,
     statusText: '请选择账号、目标小组和发帖素材',
     profileCounts: {},
-    dailyStats: [{ date: '2026-11-04', count: 2 }],
   };
   vi.mocked(api.posterAction).mockResolvedValue(posterStatePayload);
   vi.mocked(api.posterState).mockResolvedValue(posterStatePayload);
@@ -1390,7 +1481,7 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
   // 4. "刷新头像" is inside ⋯ menu and calls api.posterAction('groups/refresh', { ids: [...] })
   const moreBtn = host.querySelector('.finder-toolbar button[aria-label="更多小组列表操作"]');
   await click(moreBtn);
-  const refreshAvatarBtn = [...host.querySelectorAll('button')].find(
+  const refreshAvatarBtn = [...document.querySelectorAll('button')].find(
     (b) => b.textContent?.trim() === '刷新头像',
   );
   expect(refreshAvatarBtn).toBeTruthy();
@@ -1418,73 +1509,7 @@ it('WO-U4 UI: GroupPosterPage renders 4-char 小组列表 with 0 default selecti
   expect(videoThumb?.getAttribute('src')).toContain('id=mat-thumb-1&v=777888#t=0.1');
 });
 
-it('marketplace unavailable skip renders a green completed run and follows completed/failed tabs', async () => {
-  const row = {
-    stepId: id,
-    planId: id,
-    profileId: id,
-    combinationId: id,
-    combinationName: '商城跳过验收',
-    combinationVersion: 1,
-    round: 1,
-    position: 0,
-    type: 'marketplace' as const,
-    status: 'SKIPPED' as const,
-    planState: 'COMPLETED' as const,
-    planReason: '',
-    outcome: {
-      version: 1 as const,
-      kind: 'SKIPPED' as const,
-      reason: 'MARKETPLACE_UNAVAILABLE' as const,
-      endedAt: 2,
-    },
-    progress: { revision: 0, effectiveMilliseconds: 0, likes: 0, published: 0, cursor: null },
-    budget: { kind: 'time' as const, milliseconds: 60000 },
-    startedAt: 1,
-    finishedAt: 2,
-    planCreatedAt: 1,
-    planUpdatedAt: 2,
-  };
-  vi.mocked(api.taskRecords).mockImplementation(async (request) => ({
-    records: request.status === 'failed' ? [] : [row],
-    total: request.status === 'failed' ? 0 : 1,
-    counts: { all: 1, running: 0, completed: 1, failed: 0, review: 0 },
-    nextCursor: null,
-    viewVersion: request.status ?? 'all',
-  }));
-  vi.mocked(api.groupInviterLogs).mockResolvedValue([]);
-  vi.mocked(api.cleanupSettings).mockRejectedValue(Error('not needed by this UI scenario'));
-  vi.mocked(api.posterLogs).mockResolvedValue([]);
-  await act(async () =>
-    root.render(
-      <TaskRecordsPage
-        runtime={null}
-        profiles={[]}
-        inspections={[]}
-        loaded={true}
-        filterId={null}
-        onClearFilter={() => {}}
-        onOpen={() => {}}
-      />,
-    ),
-  );
-  expect(host.querySelectorAll('.run-record-row.tone-ok')).toHaveLength(1);
-  expect(host.querySelectorAll('.run-step-pill.pill-ok')).toHaveLength(1);
-  expect(host.textContent).toContain('当前身份不可用，已跳过');
-  const completed = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.startsWith('已完成'),
-  );
-  await click(completed ?? null);
-  expect(vi.mocked(api.taskRecords).mock.calls.at(-1)?.[0].status).toBe('completed');
-  expect(host.querySelectorAll('.run-record-row.tone-ok')).toHaveLength(1);
-  const failed = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.startsWith('失败'),
-  );
-  await click(failed ?? null);
-  expect(host.querySelectorAll('.run-record-row')).toHaveLength(0);
-});
-
-it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, DetailModal, GroupBumperPage, and TaskRecordsPage', async () => {
+it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, DetailModal, GroupBumperPage, and PostBumpRecordsPage', async () => {
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, 'clipboard', {
     value: { writeText },
@@ -1592,21 +1617,25 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
   );
   expect(onOpenPosterRecords).toHaveBeenCalledTimes(1);
 
-  // Open 详情 modal on the material card and click 批量复制全部
+  // Open 详情 modal on the material card: slim summary has 复制链接 + jump-to-records action (no embedded TSV bulk copy)
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('详情')) ?? null,
   );
-  const detailCopyBtn = [...host.querySelectorAll('button')].find((b) =>
-    b.textContent?.includes('批量复制全部'),
+  expect(host.textContent).toContain('已发确认');
+  expect(host.textContent).not.toContain('批量复制全部');
+  const copyLinkBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('复制链接'),
   );
-  expect(detailCopyBtn).toBeTruthy();
-  await click(detailCopyBtn ?? null);
+  expect(copyLinkBtn).toBeTruthy();
+  await click(copyLinkBtn ?? null);
   expect(writeText).toHaveBeenCalledTimes(1);
-  expect(writeText.mock.calls[0]?.[0]).toContain('第一行文案 第二行文案');
-  expect(writeText.mock.calls[0]?.[0]).toContain(
-    'https://www.facebook.com/groups/88001/posts/99001122/',
+  expect(writeText.mock.calls[0]?.[0]).toBe(samplePosterLog.postUrl);
+  const jumpRecordsBtn = [...host.querySelectorAll('button')].find((b) =>
+    b.textContent?.includes('前往「数据与记录」查看完整明细'),
   );
-  await click(host.querySelector('[aria-label="关闭弹窗"]'));
+  expect(jumpRecordsBtn).toBeTruthy();
+  await click(jumpRecordsBtn ?? null);
+  expect(onOpenPosterRecords).toHaveBeenCalledTimes(2);
 
   // 2. GroupBumperPage 顶贴记录跳转
   const onOpenBumperRecords = vi.fn();
@@ -1626,8 +1655,6 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
           pageBumperStatusText: '',
           total: 1,
           pageTotal: 0,
-          dailyStats: [],
-          pageDailyStats: [],
           profileCounts: {},
           pageBumperProfileCounts: {},
           pendingReviewOperations: [],
@@ -1645,7 +1672,7 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
   );
   expect(onOpenBumperRecords).toHaveBeenCalledTimes(1);
 
-  // 2b. PostBumpRecordsPage 统一账本 11 列复制 + 清空确认弹窗
+  // 2b. PostBumpRecordsPage 按当前可见列动态复制 + 单账本清空确认弹窗
   vi.mocked(api.postBumpRecords).mockResolvedValue({
     records: [
       {
@@ -1654,12 +1681,16 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
         carrier: 'browser',
         status: 'success',
         profileId: id,
+        windowName: 'Browser 8',
         accountId: samplePosterLog.accountId,
         accountName: samplePosterLog.accountName,
+        accountAvatarUrl: '',
         groupId: samplePosterLog.groupId,
         groupName: samplePosterLog.groupName,
+        groupAvatarUrl: '',
         pageId: '',
         pageName: '',
+        pageAvatarUrl: '',
         postId: samplePosterLog.postId,
         postUrl: samplePosterLog.postUrl,
         liked: false,
@@ -1670,79 +1701,31 @@ it('bulk copy buttons copy TSV post & bump records across GroupPosterPage, Detai
         sourceLogId: samplePosterLog.id,
         createdAt: samplePosterLog.postedAt,
       },
-      {
-        id: 'pbr-bump-1',
-        recordType: 'group_bump',
-        carrier: 'browser',
-        status: 'success',
-        profileId: id,
-        accountId: sampleBumperLog.accountId,
-        accountName: 'Zhang',
-        groupId: sampleBumperLog.groupId,
-        groupName: sampleBumperLog.groupName,
-        pageId: sampleBumperLog.pageId,
-        pageName: sampleBumperLog.pageName,
-        postId: sampleBumperLog.postId,
-        postUrl: sampleBumperLog.postUrl,
-        liked: true,
-        commentText: sampleBumperLog.commentText,
-        storyShared: false,
-        captionPreview: '',
-        errorReason: '',
-        sourceLogId: sampleBumperLog.id,
-        createdAt: sampleBumperLog.bumpedAt,
-      },
     ],
-    total: 2,
+    total: 1,
     hasMore: false,
-    dailyStats: [{ dateKey: '2026-11-12', label: '11-12', posts: 1, bumps: 1, failures: 0 }],
+    statusCounts: { total: 1, confirmed: 1, pending: 0, failed: 0 },
   });
-  await act(async () => root.render(<PostBumpRecordsPage onNotify={() => {}} />));
+  await act(async () =>
+    root.render(<PostBumpRecordsPage initialTab="posts" onNotify={() => {}} />),
+  );
   const copyLedgerBtn = [...host.querySelectorAll('button')].find((b) =>
     b.textContent?.includes('复制表格'),
   );
   expect(copyLedgerBtn).toBeTruthy();
   await click(copyLedgerBtn ?? null);
   expect(writeText).toHaveBeenCalledTimes(2);
-  expect(writeText.mock.calls[1]?.[0]).toContain(UNIFIED_POST_BUMP_11_HEADERS.join('\t'));
+  expect(writeText.mock.calls[1]?.[0]).toContain(samplePosterLog.postUrl);
   const clearBtn = [...host.querySelectorAll('button')].find(
-    (b) => b.textContent?.trim() === '清空',
+    (b) => b.textContent?.trim() === '清空全部',
   );
   expect(clearBtn).toBeTruthy();
   await click(clearBtn ?? null);
   expect(host.querySelector('dialog')).toBeTruthy();
-  expect(host.textContent).toContain('清空「全部记录」');
+  expect(host.textContent).toContain('防重去重账本');
   await click(
     [...host.querySelectorAll('button')].find((b) => b.textContent?.trim() === '取消') ?? null,
   );
-
-  // 3. TaskRecordsPage 执行记录页面专注于活跃账号/云表/邀人模块
-  vi.mocked(api.taskRecords).mockResolvedValue({
-    records: [],
-    total: 0,
-    counts: { all: 0, running: 0, completed: 0, failed: 0, review: 0 },
-    nextCursor: null,
-    viewVersion: 'v1',
-  });
-  vi.mocked(api.groupInviterLogs).mockResolvedValue([]);
-  vi.mocked(api.cleanupSettings).mockRejectedValue(Error('skip'));
-  await act(async () =>
-    root.render(
-      <TaskRecordsPage
-        runtime={null}
-        profiles={[profile]}
-        inspections={[]}
-        loaded={true}
-        filterId={null}
-        onClearFilter={() => {}}
-        onOpen={() => {}}
-      />,
-    ),
-  );
-  expect(host.querySelectorAll('.module-switch-btn')).toHaveLength(4);
-  expect(
-    [...host.querySelectorAll('button')].some((b) => b.textContent?.includes('批量复制贴文记录')),
-  ).toBe(false);
 });
 
 it('Sidebar header collapse button triggers onHideSidebar', async () => {
@@ -1848,7 +1831,6 @@ it('PosterMaterialCardGrid renders all 5 action buttons and ⏱ 加入排班 tri
           running: false,
           statusText: '',
           total: 2,
-          dailyStats: [],
           profileCounts: {},
           pendingReviewOperations: [],
           tasks: [],
@@ -1945,12 +1927,10 @@ it('BlueStacks Page Bumper renders nav rail item, single-column Page UI, and dis
     statusText: '请选择蓝蝶窗口、目标小组和目标主页',
     profileCounts: {},
     total: 10,
-    dailyStats: [],
     pageBumperRunning: false,
     pageBumperStatusText: '请选择蓝蝶窗口和目标专页',
     pageBumperProfileCounts: {},
     pageTotal: 4,
-    pageDailyStats: [{ date: '2026-11-13', count: 4 }],
     launchingIds: [],
     closingIds: [],
     inspectingIds: [],
@@ -2110,7 +2090,7 @@ it('PopoverMenu flips to align-start when trigger is near the left edge of .work
   }
 
   await click(host.querySelector('button[aria-label="高级参数"]'));
-  const panel = host.querySelector<HTMLElement>('.popover-panel');
+  const panel = document.querySelector<HTMLElement>('.popover-panel');
   expect(panel).toBeTruthy();
   expect(panel?.classList.contains('align-start')).toBe(true);
   expect(panel?.classList.contains('align-end')).toBe(false);
@@ -2228,7 +2208,7 @@ it('FeatureNavRail organizes 3 condensed groups (8 items total with unified 云�
   const itemLabels = [...host.querySelectorAll('.nav-rail-label')].map((el) => el.textContent);
   expect(itemLabels).toEqual([
     '定时排班',
-    '发帖顶贴记录',
+    '数据与记录',
     '窗口排版',
     '活跃账号',
     '小组发帖',
@@ -2307,7 +2287,7 @@ it('CombinationList hides version numbers, rounds, and draft ribbon; Editor remo
   expect(host.textContent).not.toContain('1 轮');
   expect(host.textContent).not.toContain('草稿');
 
-  // Imported legacy multi-round JSON normalizes cleanly to 1 round and rejects empty drafts.
+  // Imported multi-round/until-stopped JSON preserves loop cleanly and rejects empty steps.
   const imported = parseImportedCombination(
     JSON.stringify({
       format: 'wb-combination-v1',
@@ -2315,7 +2295,7 @@ it('CombinationList hides version numbers, rounds, and draft ribbon; Editor remo
     }),
     new Set(),
   );
-  expect(imported.value.loop).toEqual({ mode: 'finite', rounds: 1 });
+  expect(imported.value.loop).toEqual({ mode: 'until-stopped' });
   expect(() =>
     parseImportedCombination(
       JSON.stringify({ format: 'wb-combination-v1', combination: { ...saved, steps: [] } }),
@@ -2323,7 +2303,7 @@ it('CombinationList hides version numbers, rounds, and draft ribbon; Editor remo
     ),
   ).toThrow();
 
-  // Editor loads saved (ignoring stale draft), hides loop/round/version controls, and saves via saveCombination.
+  // Editor loads saved (ignoring stale draft), hides version controls, exposes loop radiogroup, and preserves loop on save.
   const onSaved = vi.fn().mockResolvedValue(undefined);
   const onClose = vi.fn();
   const notify = vi.fn();
@@ -2351,9 +2331,9 @@ it('CombinationList hides version numbers, rounds, and draft ribbon; Editor remo
   const nameInput = host.querySelector<HTMLInputElement>('.combination-fields input');
   expect(nameInput?.value).toBe('日常');
   expect(host.textContent).not.toContain('已保存 v7');
-  expect(host.textContent).not.toContain('指定总轮数');
-  expect(host.textContent).not.toContain('直到手动停止');
-  expect(host.textContent).not.toContain('总轮数');
+  expect(host.textContent).toContain('单轮 (1次)');
+  expect(host.textContent).toContain('指定轮数');
+  expect(host.textContent).toContain('持续循环');
   expect(host.textContent).not.toContain('直接返回将放弃未保存修改');
 
   const saveBtn = [...host.querySelectorAll('button')].find(
@@ -2458,8 +2438,9 @@ it('Active Accounts toolbar integrates close-on-finish toggle and Editor shares 
       />,
     ),
   );
-  const kwInput = host.querySelector<HTMLInputElement>('input[placeholder="留空浏览推荐"]');
-  expect(kwInput?.value).toBe('sofa');
+  expect(host.querySelector('input[placeholder="留空浏览推荐"]')).toBeNull();
+  expect(host.textContent).toContain('浏览时长');
+  expect(host.textContent).toContain('分钟');
 });
 
 it('AutoSchedulerPage renders minimalist alarm cards and table-driven editor saves smart defaults without prewarm/advanced clutter', async () => {
@@ -2559,8 +2540,7 @@ it('AutoSchedulerPage renders minimalist alarm cards and table-driven editor sav
       carrier: 'browser',
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,
-      prewarm: { enabled: false, leadMinutes: 90, steps: [] },
-      trigger: expect.objectContaining({ jitterMinutes: 0, misfireGraceMinutes: 120 }),
+      trigger: expect.objectContaining({ misfireGraceMinutes: 120 }),
     }),
   );
 });
@@ -2685,7 +2665,7 @@ it('v0.1.262: LiveRunsDrawer shows queued items + BS show, PostBumpRecordsPage s
   await click(showBsBtns[0] ?? null);
   expect(onShowBluestacks).toHaveBeenCalledWith(bsTargetRunning);
 
-  // 2. PostBumpRecordsPage statusCounts + 7-day trend date toggle + cell drill-down + 重置筛选
+  // 2. PostBumpRecordsPage status badges + clickable postUrl + filter reset
   vi.mocked(api.postBumpRecords).mockClear();
   vi.mocked(api.postBumpRecords).mockResolvedValue({
     records: [
@@ -2695,12 +2675,16 @@ it('v0.1.262: LiveRunsDrawer shows queued items + BS show, PostBumpRecordsPage s
         carrier: 'browser',
         status: 'success',
         profileId: id,
+        windowName: 'Browser Window',
         accountId: 'acc-991',
         accountName: 'Alpha Account',
+        accountAvatarUrl: '',
         groupId: 'grp-881',
         groupName: 'Alpha Group',
+        groupAvatarUrl: '',
         pageId: 'page-771',
         pageName: 'Alpha Page',
+        pageAvatarUrl: '',
         postId: 'post-661',
         postUrl: 'https://www.facebook.com/groups/grp-881/posts/post-661/',
         liked: false,
@@ -2714,37 +2698,25 @@ it('v0.1.262: LiveRunsDrawer shows queued items + BS show, PostBumpRecordsPage s
     ],
     total: 3,
     hasMore: false,
-    dailyStats: [{ dateKey: '2026-11-25', label: '11-25', posts: 2, bumps: 1, failures: 0 }],
     statusCounts: { total: 3, confirmed: 1, pending: 1, failed: 1 },
   });
-  await act(async () => root.render(<PostBumpRecordsPage onNotify={() => {}} />));
-  expect(host.textContent).toContain('已确认');
-  expect(host.textContent).toContain('待审核');
-  expect(host.textContent).toContain('失败');
+  await act(async () =>
+    root.render(<PostBumpRecordsPage initialTab="posts" onNotify={() => {}} />),
+  );
+  expect(host.textContent).toContain('Alpha Account');
+  expect(host.textContent).toContain('Alpha Group');
+  expect(
+    host.querySelector('a[href="https://www.facebook.com/groups/grp-881/posts/post-661/"]'),
+  ).toBeTruthy();
 
-  const dayBtn = [...host.querySelectorAll('button')].find(
-    (b) => b.textContent?.includes('11-25') && b.hasAttribute('aria-pressed'),
+  await click(
+    [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('筛选')) ?? null,
   );
-  expect(dayBtn).toBeTruthy();
-  await click(dayBtn ?? null);
-  expect(dayBtn?.getAttribute('aria-pressed')).toBe('true');
-  const expectedStart = new Date(2026, 10, 25, 0, 0, 0, 0).getTime();
-  const expectedEnd = new Date(2026, 10, 25, 23, 59, 59, 999).getTime();
-  expect(api.postBumpRecords).toHaveBeenLastCalledWith(
-    expect.objectContaining({ from: expectedStart, to: expectedEnd }),
-  );
-
-  const accCellBtn = [...host.querySelectorAll('button')].find(
-    (b) => b.getAttribute('title') === '点击按该账号筛选',
-  );
-  expect(accCellBtn).toBeTruthy();
-  await click(accCellBtn ?? null);
-  const resetBtn = [...host.querySelectorAll('button')].find(
-    (b) => b.textContent?.trim() === '重置筛选',
+  const resetBtn = [...document.body.querySelectorAll('button')].find(
+    (b) => b.textContent?.trim() === '重置全部',
   );
   expect(resetBtn).toBeTruthy();
   await click(resetBtn ?? null);
-  expect(dayBtn?.getAttribute('aria-pressed')).toBe('false');
 
   // 3. CombinationList renders direct 素材 (N) button when combo includes table post step
   const comboPostId = '60000000-0000-4000-8000-000000000001';

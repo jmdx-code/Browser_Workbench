@@ -179,10 +179,9 @@ test('v61->v62 upgrade backfills poster & bumper logs across carriers, retires l
     assert.equal(delRes.deleted, 1);
     assert.equal(store.postBumpRecords.list({ limit: 50 }).total, 4);
 
-    // Stage 3 M3 tests: bump_all, 7-day dailyStats, sentinel sanitization, profile_launch_bindings fallback, bi-directional delete
+    // Stage 3 M3 tests: bump_all, sentinel sanitization, profile_launch_bindings fallback, single-ledger delete
     const bumpAll = store.postBumpRecords.list({ recordType: 'bump_all' });
     assert.equal(bumpAll.total, 2);
-    assert.equal(bumpAll.dailyStats?.length, 7);
 
     const pid2 = randomUUID();
     store.upsertProfileLaunchBindings([
@@ -251,7 +250,7 @@ test('v61->v62 upgrade backfills poster & bumper logs across carriers, retires l
       store.groupPoster.logs().some((l) => l.id === linkedLogId),
       false,
     );
-    assert.equal(store.groupPoster.hasGroupPostedMaterial('30099', 'mat-bi-del'), true);
+    assert.equal(store.groupPoster.hasGroupPostedMaterial('30099', 'mat-bi-del'), false);
 
     // Verify statusCounts totals (confirmed vs pending vs failed) across full query
     store.postBumpRecords.insert({

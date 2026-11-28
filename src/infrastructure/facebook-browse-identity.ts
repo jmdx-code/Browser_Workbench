@@ -103,9 +103,7 @@ export async function readCurrentFacebookBrowseSample(
   await guard();
   const abnormalPageUrl = classifyFacebookAbnormalUrl(sample.page.url);
   if (abnormalPageUrl) throw Error(abnormalPageUrl);
-  if (sample.page.ready && !sample.page.blocked) {
-    assertNotAbnormalIdentity(sample.identity);
-  }
+  if (sample.page.ready && !sample.page.blocked) assertNotAbnormalIdentity(sample.identity);
   const identity = !sample.page.ready
     ? null
     : (() => {

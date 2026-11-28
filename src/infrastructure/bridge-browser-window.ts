@@ -1,7 +1,7 @@
 import { mapAsync } from '../shared/async-collections.js';
 import type { Core } from '../bridge/core.js';
 import type { TaskRepository } from '../domain/tasks.js';
-import { ProductError } from '../domain/workspace.js';
+import { ProductError, failError } from '../domain/workspace.js';
 import type { BrowserWindowPort } from '../shared/browser-window.js';
 import type { TabProof } from '../shared/kernel-state.js';
 import { marketplaceBridgeSupported } from '../shared/task-policies.js';
@@ -10,7 +10,7 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
   private readonly active = new Set<string>();
   constructor(
     private readonly core: Core,
-    private readonly tasks: Pick<TaskRepository, 'list'> &
+    private readonly tasks: Pick<TaskRepository, 'list' | 'livePlans'> &
       Partial<Pick<TaskRepository, 'hasProfilePlanInStates'>>,
     private readonly revealMain?: (
       profileId: string,
@@ -36,7 +36,11 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     const supportsExtraCleanup = marketplaceBridgeSupported(peer.extensionVersion, '0.3.59');
     this.active.add(profileId);
     try {
-      if (peer.phase !== 'PAUSED' || !peer.synced)
+      if (
+        peer.phase !== 'PAUSED' ||
+        !peer.synced ||
+        this.core.hasPendingControlOrOperation(profileId)
+      )
         throw new ProductError('BROWSER_BUSY', '浏览器正在执行或对账，请稍后再整理标签', 409);
       if (await this.inviterBusy(profileId))
         throw new ProductError('BROWSER_TASK_ACTIVE', '任务正在执行，请稍后再清理标签', 409);
@@ -45,7 +49,10 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
         try {
           return await this.consolidateTabs(profileId, preferActiveTab);
         } catch (error) {
-          if (error instanceof ProductError || !supportsExtraCleanup) throw error;
+          const isUnsupported =
+            error instanceof Error &&
+            error.message === 'WORKSPACE_CLEANUP_EXTENSION_UPDATE_REQUIRED';
+          if (!isUnsupported || !supportsExtraCleanup) throw error;
         }
       }
       if (supportsExtraCleanup) {
@@ -93,6 +100,7 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
               'BROWSER_CLEANUP_PENDING',
               'WORKSPACE_CLEANUP_CHANNEL_BUSY',
               'WORKSPACE_CLEANUP_OPERATION_PENDING',
+              'WORKSPACE_CLEANUP_SESSION_RECHECK_REQUIRED',
               'KERNEL_PROFILE_NOT_IDLE',
             ].includes(code) ||
             uniqueIds.length > 1
@@ -122,7 +130,7 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
           ('code' in error && error.code === 'WORKSPACE_REVEAL_EXTENSION_UPDATE_REQUIRED'))
       ) {
         await this.core.reloadExtension(profileId);
-        throw new ProductError(
+        failError(
           'WORKSPACE_REVEAL_EXTENSION_RELOADING',
           '已通知该浏览器自动刷新插件，请等待 2 秒后再次点击显示窗口',
           409,
@@ -132,19 +140,11 @@ export class BridgeBrowserWindow implements BrowserWindowPort {
     }
   }
   private async assertIdle(profileId: string, _allowPaused = false) {
-    if (
-      this.tasks.hasProfilePlanInStates
+    const hasLivePlan =
+      (this.tasks.hasProfilePlanInStates
         ? await this.tasks.hasProfilePlanInStates(profileId, ['QUEUED', 'RUNNING'])
-        : (await this.tasks.list()).some(
-            (plan) =>
-              plan.profileId === profileId &&
-              !['COMPLETED', 'FAILED', 'STOPPED'].includes(plan.state),
-          )
-    )
-      throw new ProductError(
-        'BROWSER_TASK_ACTIVE',
-        '请先停止这份浏览器的任务，再显示识别窗口',
-        409,
-      );
+        : false) || (await this.tasks.livePlans()).some((plan) => plan.profileId === profileId);
+    if (hasLivePlan)
+      failError('BROWSER_TASK_ACTIVE', '请先停止这份浏览器的任务，再显示识别窗口', 409);
   }
 }

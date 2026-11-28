@@ -99,9 +99,15 @@ const reading = z
     composer: FacebookPostEffects.shape.composer,
   })
   .strict();
-export async function readFacebookReelContent(page: Page, guard: () => Awaitable<void>) {
+export async function readVerifiedProfileReading<T extends { url: string; found: boolean }>(
+  page: Page,
+  guard: () => Awaitable<void>,
+  evaluateFn: () => unknown,
+  schema: z.ZodType<T>,
+  errorCode: string,
+): Promise<T> {
   await guard();
-  const value = reading.parse(await page.evaluate(projectFacebookReelContent));
+  const value = schema.parse(await page.evaluate(evaluateFn));
   await guard();
   const url = new URL(value.url);
   if (
@@ -109,6 +115,14 @@ export async function readFacebookReelContent(page: Page, guard: () => Awaitable
     (value.found &&
       (url.pathname !== '/profile.php' || !/^\d{1,30}$/.test(url.searchParams.get('id') ?? '')))
   )
-    throw Error('FACEBOOK_REEL_ROUTE_UNVERIFIED');
+    throw Error(errorCode);
   return value;
 }
+export const readFacebookReelContent = (page: Page, guard: () => Awaitable<void>) =>
+  readVerifiedProfileReading(
+    page,
+    guard,
+    projectFacebookReelContent,
+    reading,
+    'FACEBOOK_REEL_ROUTE_UNVERIFIED',
+  );

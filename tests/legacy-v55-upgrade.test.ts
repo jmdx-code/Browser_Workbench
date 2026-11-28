@@ -189,7 +189,7 @@ function seedSimulatedV55Database(file: string) {
         jitterMinutes: 0,
         misfireGraceMinutes: 120,
       },
-      steps: [{ id: randomUUID(), type: 'quick-browse', target: 'feed', durationMinutes: 5 }],
+      steps: [{ id: randomUUID(), type: 'active-combination', combinationId: comboId }],
       prewarm: { enabled: false, leadMinutes: 90, steps: [] },
       closeWindowOnFinish: true,
       maxSafetyMinutesPerTarget: null,

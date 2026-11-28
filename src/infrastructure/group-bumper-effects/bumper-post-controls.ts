@@ -56,7 +56,7 @@ export function extractBumperPostControls(rt: BumperDomRuntime, ctx: PostControl
       el.getAttribute('data-ad-rendering-role') === role ||
       !!el.querySelector(`[data-ad-rendering-role="${role}"]`),
     editorSel =
-      '[role="textbox"][contenteditable="true"],div[contenteditable="true"][data-lexical-editor="true"]',
+      '[role="textbox"][contenteditable="true"],[role="textbox"][contenteditable="plaintext-only"],div[contenteditable="true"][data-lexical-editor="true"],div[contenteditable="plaintext-only"][data-lexical-editor="true"]',
     findCommentBox = (root: Element) =>
       Array.from(root.querySelectorAll<HTMLElement>(editorSel)).find(
         (el) =>
@@ -110,10 +110,14 @@ export function extractBumperPostControls(rt: BumperDomRuntime, ctx: PostControl
         if (el.getAttribute('data-ad-rendering-role') === 'share_button' || !share) share = el;
       }
       if (
-        /CometUFIComposerInputWithActionsForLexicalInner/.test(f.name) &&
-        f.props.commentAction === 'ADD' &&
-        el.matches('[role="textbox"][contenteditable="true"]') &&
+        /CometUFIComposer(?:InputWithActionsForLexical|InputWithActions|Inner|Input)?/.test(
+          f.name,
+        ) &&
+        (f.props.commentAction === 'ADD' || f.props.commentAction == null) &&
+        (f.props.depth === 0 || f.props.depth == null) &&
+        el.matches(editorSel) &&
         !el.closest('[role="banner"]') &&
+        !commentRow(el) &&
         visible(el)
       )
         comment = el;

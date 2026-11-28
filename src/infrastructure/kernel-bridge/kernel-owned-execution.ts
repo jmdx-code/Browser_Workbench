@@ -1,15 +1,8 @@
-import { createHash } from 'node:crypto';
 import type { Awaitable } from '../../domain/persistence.js';
 import { sameTabProof } from '../../domain/task-tabs.js';
 import type { Peer } from '../../bridge/core.js';
 import type { KernelExecutor } from '../../application/kernel-executor.js';
-import { guardNativeInput, type NativeInputGuard } from '../../application/kernel-gates.js';
-import { Action, canonicalAction } from '../../shared/browser-actions.js';
-import type { PostEffects } from '../../shared/facebook-post-observation.js';
-import {
-  KernelOperationFileGrant,
-  type OperationFileGrant,
-} from '../../shared/kernel-file-grant.js';
+import type { NativeInputGuard } from '../../application/kernel-gates.js';
 import { kernelRequiresOperation, type KernelAccess } from '../../shared/kernel-policy.js';
 import { KernelJsonObject, type KernelBackend } from '../../shared/kernel-protocol.js';
 import {
@@ -20,7 +13,7 @@ import {
   type TabProof,
 } from '../../shared/kernel-state.js';
 import { SettlementReceipt, sameNotice } from '../../shared/settlement.js';
-import type { ChildPageLifecycle, CurrentStop } from '../../shared/task-policies.js';
+import type { CurrentStop } from '../../shared/task-policies.js';
 import {
   DispatchBinding,
   ExecutionContext,
@@ -32,8 +25,6 @@ import {
 import type { connectFixtureKernel } from '../kernel-browser.js';
 import type { openKernelRelayEndpoint } from '../kernel-relay-endpoint.js';
 import { finishKernelOperation } from '../kernel-operation-finish.js';
-import { navigateFacebookBoundPage } from '../facebook-bound-navigation.js';
-import { readOwnedFacebookNativeResult } from './kernel-page-readers.js';
 import {
   archivedNotice,
   isPeerPaused,
@@ -323,29 +314,6 @@ export function buildOwnedConnection(p: BuildOwnedConnectionParams) {
     },
     context,
     execute,
-    navigateBoundPage: async (binding: Binding, input: Action, previousUrl: string) => {
-      const action = Action.parse(input),
-        guard = async () => {
-          await assertOp(
-            binding,
-            'FACEBOOK_NAVIGATION_ORIGINAL_OPERATION_REQUIRED',
-            true,
-            () =>
-              access === 'facebook-task' &&
-              !facebook?.readonlyIdentity &&
-              action.kind === 'browseNavigate' &&
-              Boolean(proof) &&
-              action.tabId === proof?.tabId &&
-              createHash('sha256').update(canonicalAction(action)).digest('hex') ===
-                binding.actionDigest,
-          );
-          await session.inputFence?.();
-        };
-      await guard();
-      if (action.kind !== 'browseNavigate') throw Error('FACEBOOK_NAVIGATION_ACTION_REQUIRED');
-      await navigateFacebookBoundPage(executor, action.tabId, action.url, previousUrl, guard);
-      await guard();
-    },
     get executing() {
       return session.boundOperationActive;
     },
@@ -360,59 +328,6 @@ export function buildOwnedConnection(p: BuildOwnedConnectionParams) {
     },
     get failureReason() {
       return session.failureReason;
-    },
-    readPostResultAlias: async (
-      input: Binding,
-      nativePostId: string,
-      guard: () => Awaitable<void>,
-      videoId?: string | null,
-      accept?: (effects: PostEffects) => boolean,
-      lifecycle?: (value: ChildPageLifecycle) => void,
-    ) => {
-      const binding = DispatchBinding.parse(input),
-        check = async () => {
-          await guard();
-          const current = await context(binding.accountId);
-          if (
-            access !== 'facebook-task' ||
-            !proof ||
-            !current ||
-            !sameExecution(current, binding) ||
-            session.boundOperationActive ||
-            host.sessions.get(peer.profileId) !== session
-          )
-            throw Error('NATIVE_RESULT_ORIGINAL_CONTEXT_REQUIRED');
-        };
-      await check();
-      if (session.resultReading) throw Error('NATIVE_RESULT_READ_IN_PROGRESS');
-      session.resultReading = true;
-      try {
-        if (!proof) throw Error('NATIVE_RESULT_ORIGINAL_CONTEXT_REQUIRED');
-        let lastObs = '';
-        return await readOwnedFacebookNativeResult(
-          executor,
-          async () => KernelPersistentState.parse(await session.request({ kind: 'inventory' })),
-          proof,
-          binding.accountId,
-          nativePostId,
-          check,
-          {
-            videoId,
-            accept,
-            lifecycle,
-            observe: (value) => {
-              const { elapsedMilliseconds: _, ...state } = value,
-                sig = JSON.stringify(state);
-              if (sig !== lastObs) {
-                lastObs = sig;
-                session.record('result-page:' + JSON.stringify(value));
-              }
-            },
-          },
-        );
-      } finally {
-        session.resultReading = false;
-      }
     },
     enablePostNetworkObservation: async (input: Binding, guard: () => Awaitable<void>) => {
       const binding = DispatchBinding.parse(input),
@@ -433,48 +348,6 @@ export function buildOwnedConnection(p: BuildOwnedConnectionParams) {
         enableDurableMessages: true,
       });
       await check();
-    },
-    grantOperationFiles: async (input: OperationFileGrant) => {
-      if (!peer.capabilities?.includes('kernel-operation-files-v1'))
-        throw Error('KERNEL_OPERATION_FILES_CAPABILITY_REQUIRED');
-      const grant = KernelOperationFileGrant.parse(input),
-        guard = session.resourceGuard,
-        caps = peer.capabilities;
-      if (grant.manifest.sourcePaths && !caps.includes('kernel-direct-operation-files-v1'))
-        throw Error('原路径上传需要刷新桥接扩展');
-      if (grant.manifest.version === 2 && !caps.includes('kernel-derived-operation-files-v1'))
-        throw Error('KERNEL_DERIVED_FILES_EXTENSION_UPDATE_REQUIRED');
-      const assertCurrent = async () => {
-        if (
-          session.closing ||
-          session.resourceGuard !== guard ||
-          !guard ||
-          !proof ||
-          !sameTabProof(proof, grant.proof)
-        )
-          throw Error('KERNEL_FILE_GRANT_OPERATION_REJECTED');
-        await assertOp(grant.binding, 'KERNEL_FILE_GRANT_OPERATION_REJECTED', true);
-        await session.inputFence?.();
-      };
-      await assertCurrent();
-      await guardNativeInput(
-        {
-          target: { tabId: grant.proof.tabId },
-          method: 'DOM.setFileInputFiles',
-          params: { files: grant.files },
-        },
-        assertCurrent,
-        guard,
-      );
-      await assertCurrent();
-      const result = await session.request({ kind: 'grantOperationFiles', grant });
-      await assertCurrent();
-      const returned = KernelOperationFileGrant.parse(result.grant);
-      if (result.granted !== true || JSON.stringify(returned) !== JSON.stringify(grant))
-        throw Error('KERNEL_FILE_GRANT_ACK_MISMATCH');
-      await executor.grantFiles(grant, assertCurrent);
-      await assertCurrent();
-      return returned;
     },
     reconcile: async (binding: Binding, resolution: NonNullable<KernelRecord['resolution']>) => {
       if (await archivedNotice(host.core, binding, resolution)) return { binding, resolution };

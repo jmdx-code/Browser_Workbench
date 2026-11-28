@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import { Id, NonNegInt, PosInt, intRange, strictObj } from './contracts.js';
-import { TaskTimeZone } from './task-timing.js';
+import { Id, NonNegInt, PosInt, TaskTimeZone, intRange, strictObj } from './contracts.js';
 import { WindowLayoutSettings } from './window-layout.js';
 export const WorkspacePreferenceValues = strictObj({
   defaultTimeZone: TaskTimeZone.nullable(),

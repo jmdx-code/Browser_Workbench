@@ -30,23 +30,23 @@ import type { StatusTone } from '../profile-avatar.js';
 import { BluestacksBatchLoginModal } from './bluestacks-batch-login-modal.js';
 import { BluestacksSidebarDialogs, type BluestacksRowDialog } from './bluestacks-config-dialog.js';
 import { BluestacksHealthCheckModal } from './bluestacks-health-check-modal.js';
-import { BluestacksRiskDashboardModal } from './bluestacks-risk-dashboard-modal.js';
-import { Btn, errMsg } from './shared/module-ui.js';
-
+import { DailyRiskLimitModal } from './daily-risk-limit-modal.js';
+import { Btn, errMsg, FilterChip } from './shared/module-ui.js';
+import { UI_MUTED } from '../ui/primitives.js';
 type BluestacksModal =
   BluestacksRowDialog | { kind: 'batchLogin' } | { kind: 'healthCheck' } | { kind: 'risk' };
-
+type BsStatusFilter = 'all' | 'logged-in' | 'online' | 'missing-app' | 'unknown';
+const ISSUE_STATES = new Set(['missing-app', 'logged-out', 'restricted', 'verification']);
 function instanceTone(inst: BluestacksInstance, isRunning: boolean, isBusy: boolean): StatusTone {
   if (isRunning || isBusy) return 'run';
   if (!inst.online) return 'idle';
   if (
     !isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight) ||
-    ['missing-app', 'logged-out', 'restricted', 'verification'].includes(inst.accountState)
+    ISSUE_STATES.has(inst.accountState)
   )
     return 'err';
   return inst.accountState === 'logged-in' ? 'ok' : 'warn';
 }
-
 export function BluestacksSidebar(p: {
   state: BluestacksState | null;
   onChange: (next: BluestacksState) => void;
@@ -63,10 +63,10 @@ export function BluestacksSidebar(p: {
 }) {
   const { state, onChange, selected, onSelect, onError, mode = 'bluestacks-group-bumper' } = p;
   const list = useSidebarListState(selected, onSelect);
+  const [statusFilter, setStatusFilter] = useState<BsStatusFilter>('all');
   const [modal, setModal] = useState<BluestacksModal>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
-
   const instances = state?.instances ?? [];
   const folders = state?.folders ?? [];
   const onlineCount = instances.filter((i) => i.online).length;
@@ -78,7 +78,29 @@ export function BluestacksSidebar(p: {
     login: new Set(state?.loggingInIds ?? []),
     sw: new Set(state?.switchingIds ?? []),
   };
-
+  const matchesStatusFilter = (inst: BluestacksInstance, f: BsStatusFilter) =>
+    f === 'logged-in'
+      ? inst.accountState === 'logged-in'
+      : f === 'online'
+        ? inst.online || sets.launch.has(inst.id)
+        : f === 'missing-app'
+          ? inst.accountState === 'missing-app' || inst.fbLiteInstalled === false
+          : f === 'unknown'
+            ? inst.accountState === 'unknown'
+            : true;
+  const statusChips: ReadonlyArray<readonly [BsStatusFilter, string, number]> = (
+    [
+      ['all', '全部'],
+      ['logged-in', '已登录'],
+      ['online', '在线'],
+      ['missing-app', '缺APK'],
+      ['unknown', '未检测'],
+    ] as const
+  ).map(([k, l]) => [
+    k,
+    l,
+    k === 'all' ? instances.length : instances.filter((i) => matchesStatusFilter(i, k)).length,
+  ]);
   async function exec(action: string, payload: unknown = {}): Promise<boolean> {
     if (busyRef.current) return false;
     busyRef.current = true;
@@ -94,14 +116,14 @@ export function BluestacksSidebar(p: {
       setBusy(false);
     }
   }
-
   const q = list.query.trim().toLowerCase();
   const matched = instances.filter(
     (inst) =>
       (!q ||
-        `${inst.displayName} ${inst.alias ?? ''} ${inst.instanceKey} ${inst.accountName} ${inst.adbPort}`
+        `${inst.displayName} ${inst.alias ?? ''} ${inst.instanceKey} ${inst.accountName} ${inst.adbPort} ${inst.fbLiteVersion ?? ''}`
           .toLowerCase()
           .includes(q)) &&
+      matchesStatusFilter(inst, statusFilter) &&
       (list.filter === 'online'
         ? inst.online || sets.launch.has(inst.id)
         : list.filter === 'selected'
@@ -115,7 +137,6 @@ export function BluestacksSidebar(p: {
   const visibleGroups = groups.filter(
     (g) => g.id !== 'ungrouped' || instances.some((i) => !i.folderId) || !folders.length,
   );
-
   function getEffectiveStat(id: string) {
     const map = {
       'bluestacks-active': state?.activeProfileCounts?.[id],
@@ -131,7 +152,6 @@ export function BluestacksSidebar(p: {
       map['bluestacks-page-bumper']
     );
   }
-
   const { folderGroups, visibleIds } = buildSidebarViewModel({
     groups: visibleGroups,
     allItems: instances,
@@ -140,14 +160,12 @@ export function BluestacksSidebar(p: {
     isRunning: (i) => Boolean(getEffectiveStat(i.id)?.running),
     closed: list.closed,
   });
-
   async function moveInstancesTo(folderId: string | null, ids = [...selected]) {
     const inTarget = instances
       .filter((i) => i.folderId === folderId && !ids.includes(i.id))
       .map((i) => i.id);
     await exec('instances/reorder', { folderId, ids: [...ids, ...inTarget] });
   }
-
   async function nudgeInstance(id: string, direction: -1 | 1) {
     const idSet = new Set([id]);
     for (const g of groups) {
@@ -158,11 +176,9 @@ export function BluestacksSidebar(p: {
         await exec('instances/reorder', { folderId, ids: next });
     }
   }
-
   const selectedIds = [...selected];
   const anySelectedRunning = selectedIds.some((id) => Boolean(getEffectiveStat(id)?.running));
   const anySelectedOnline = selectedIds.some((id) => instances.find((x) => x.id === id)?.online);
-
   const selectionActions = [
     sa('启动', busy, () => void exec('instances/launch', { instanceIds: selectedIds }), {
       className: 'btn-launch',
@@ -193,7 +209,6 @@ export function BluestacksSidebar(p: {
       { title: '自动整齐平铺所选的蓝蝶模拟器窗口' },
     ),
   ];
-
   function renderInstanceRow(inst: BluestacksInstance) {
     const stat = getEffectiveStat(inst.id);
     const dailyStat = state?.dailyUsage?.perInstance[inst.id];
@@ -208,6 +223,7 @@ export function BluestacksSidebar(p: {
       sets.sw.has(inst.id);
     const tone = instanceTone(inst, isRunning, isActionBusy);
     const rowTitle = bluestacksDisplayTitle(inst);
+    const portrait = isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight);
     const roleTag =
       inst.accountState === 'logged-in'
         ? inst.identityType === 'page'
@@ -216,14 +232,39 @@ export function BluestacksSidebar(p: {
             ? '个人'
             : ''
         : '';
-    const subCode = inst.accountName
+    const fbVerBadge = inst.fbLiteVersion
+      ? `FB v${inst.fbLiteVersion}`
+      : inst.fbLiteInstalled === false
+        ? '缺APK'
+        : '';
+    const baseSubCode = inst.accountName
       ? roleTag
         ? `[${roleTag}] ${inst.accountName}`
         : inst.accountName
-      : isBluestacksPortraitResolution(inst.fbWidth, inst.fbHeight)
+      : portrait
         ? `:${inst.adbPort}`
         : `横屏 :${inst.adbPort}`;
+    const subCode = fbVerBadge ? `${baseSubCode} · ${fbVerBadge}` : baseSubCode;
     const isRiskSleeping = Boolean(dailyStat?.limitReached && !isRunning && !isActionBusy);
+    const stateSummary = !portrait
+      ? `横屏 ${inst.fbWidth}×${inst.fbHeight}`
+      : inst.accountState === 'missing-app' || inst.fbLiteInstalled === false
+        ? '缺 FB Lite APK'
+        : ((
+            {
+              verification: '需安全验证',
+              restricted: '账号受限',
+              'logged-out': '未登录',
+              unknown: inst.online ? '在线未检测' : '未启动 · 未检测',
+            } as Record<string, string>
+          )[inst.accountState] ?? (inst.online ? '在线就绪' : '未启动 · 已登录'));
+    const lastErrNote = inst.lastStatus?.trim() || '';
+    const idleSummary =
+      lastErrNote && !lastErrNote.includes(stateSummary)
+        ? inst.accountState === 'logged-in' && portrait && inst.fbLiteInstalled !== false
+          ? lastErrNote
+          : `${stateSummary} · ${lastErrNote}`
+        : stateSummary;
     const lineText =
       (
         [
@@ -240,7 +281,19 @@ export function BluestacksSidebar(p: {
         ] as const
       ).find(([c]) => c)?.[1] ??
       stat?.status ??
-      (tone === 'err' ? inst.lastStatus || '状态异常' : inst.online ? '在线就绪' : '未启动');
+      idleSummary;
+    const hasIssue =
+      !portrait || inst.fbLiteInstalled === false || ISSUE_STATES.has(inst.accountState);
+    const rowTaskTone =
+      isRunning || isActionBusy
+        ? 'run'
+        : isRiskSleeping
+          ? 'warn'
+          : hasIssue
+            ? inst.accountState === 'logged-out'
+              ? 'warn'
+              : 'err'
+            : tone;
     const moveTargets = selected.has(inst.id) && selected.size > 1 ? selectedIds : [inst.id];
     const menuItems: MenuItem[] = [
       ...(inst.online
@@ -300,9 +353,7 @@ export function BluestacksSidebar(p: {
     ];
     const tooltipLines = [
       `${rowTitle} (${inst.instanceKey}) · 127.0.0.1:${inst.adbPort} · ${inst.fbWidth}×${inst.fbHeight}`,
-      ...(inst.androidSdk || inst.fbLiteVersion
-        ? [`Android SDK ${inst.androidSdk ?? '?'} · FB Lite ${inst.fbLiteVersion ?? '未知'}`]
-        : []),
+      `FB Lite：${inst.fbLiteInstalled === false ? '未安装 APK' : inst.fbLiteVersion ? `v${inst.fbLiteVersion}` : '版本未知'}${inst.androidSdk ? ` · Android SDK ${inst.androidSdk}` : ''}`,
       ...(inst.numericAccountId ? [`FB 数字 ID：${inst.numericAccountId}`] : []),
       ...(inst.managedIdentities?.length
         ? [`名下身份：${inst.managedIdentities.map((m) => m.name).join(' / ')}`]
@@ -313,9 +364,11 @@ export function BluestacksSidebar(p: {
           ]
         : []),
       ...(dailyStat?.limitReason ? [`风控状态：${dailyStat.limitReason}`] : []),
-      ...(tone === 'err' && lineText ? [`状态：${lineText}`] : []),
+      `状态摘要：${lineText}`,
+      ...(lastErrNote && !String(lineText).includes(lastErrNote)
+        ? [`最近记录：${lastErrNote}`]
+        : []),
     ];
-
     return (
       <SidebarRowShell
         key={inst.id}
@@ -330,16 +383,14 @@ export function BluestacksSidebar(p: {
         toneLabel={tone === 'err' ? '异常' : inst.online ? '在线' : '未启动'}
         tooltip={tooltipLines.join('\n')}
         taskText={String(lineText)}
-        taskTone={isRunning || isActionBusy ? 'run' : isRiskSleeping ? 'warn' : tone}
+        taskTone={rowTaskTone}
         menuItems={menuItems}
         onSelect={(checked, shift) => list.selectRow(visibleIds, inst.id, checked, shift)}
         onMainClick={(shift) => list.selectRow(visibleIds, inst.id, !selected.has(inst.id), shift)}
       />
     );
   }
-
   const reached = state?.dailyUsage?.reachedLimitInstances ?? 0;
-  const totalActions = state?.dailyUsage?.totalActions ?? 0;
   const toolBtns: ReadonlyArray<
     [
       'ids' | 'risk' | 'batchLogin' | 'healthCheck',
@@ -352,8 +403,8 @@ export function BluestacksSidebar(p: {
     ['ids', '按 ID 选中'],
     [
       'risk',
-      reached > 0 ? `风控·休眠${reached}` : totalActions > 0 ? `风控(${totalActions})` : '风控看板',
-      '查看今日蓝蝶各模块动作统计并配置单号每日风控安全限额',
+      reached > 0 ? `日限额·休眠${reached}` : '日限额',
+      '配置蓝蝶全局及单号每日安全动作限额（查看今日动作请前往数据与记录）',
       reached > 0 ? 'border-[#e85d5d] bg-[#fff5f5] font-semibold text-[#c53030]' : undefined,
     ],
     [
@@ -375,12 +426,39 @@ export function BluestacksSidebar(p: {
       state?.healthCheck?.running ? 'primary' : 'default',
     ],
   ];
-
+  const runningBanners = (
+    [
+      ['batchLogin', state?.batchLogin, '批量登录', 'batch-login/stop'],
+      ['healthCheck', state?.healthCheck, '批量体检', 'health-check/stop'],
+    ] as const
+  )
+    .filter(([, job]) => job?.running)
+    .map(([kind, job, label, stop]) => ({
+      kind,
+      label: `${label} ${job?.completed ?? 0}/${job?.total ?? 0}`,
+      title: job?.statusText ?? '',
+      stop,
+    }));
   const rowDialog =
     modal && modal.kind !== 'batchLogin' && modal.kind !== 'healthCheck' && modal.kind !== 'risk'
       ? modal
       : null;
-
+  const headIcons = [
+    ['刷新蓝蝶多开列表', busy, () => void exec('refresh'), <IconRefresh key="r" />],
+    [
+      '蓝蝶路径与 APK 设置',
+      false,
+      () => setModal({ kind: 'config' }),
+      <IconSettings key="s" size={15} />,
+    ],
+    [
+      '平铺在线蓝蝶窗口',
+      busy || onlineCount === 0,
+      () => void exec('instances/arrange', {}),
+      <IconWindow key="w" size={14} />,
+      '自动整齐平铺当前在线的蓝蝶模拟器窗口',
+    ],
+  ] as const;
   return (
     <AccountsSidebarShell
       title="蓝蝶窗口"
@@ -388,59 +466,83 @@ export function BluestacksSidebar(p: {
       onlineCount={onlineCount}
       totalCount={instances.length}
       onHideSidebar={p.onHideSidebar}
-      headingActions={
-        <>
-          <Btn
-            v="icon"
-            className="h-[26px] w-[26px]"
-            title="刷新蓝蝶多开列表"
-            aria-label="刷新蓝蝶多开列表"
-            disabled={busy}
-            onClick={() => void exec('refresh')}
-          >
-            <IconRefresh />
-          </Btn>
-          <Btn
-            v="icon"
-            className="h-[26px] w-[26px]"
-            title="蓝蝶路径与 APK 设置"
-            aria-label="蓝蝶路径与 APK 设置"
-            onClick={() => setModal({ kind: 'config' })}
-          >
-            <IconSettings size={15} />
-          </Btn>
-          <Btn
-            v="icon"
-            className="h-[26px] w-[26px]"
-            title="自动整齐平铺当前在线的蓝蝶模拟器窗口"
-            aria-label="平铺在线蓝蝶窗口"
-            disabled={busy || onlineCount === 0}
-            onClick={() => void exec('instances/arrange', {})}
-          >
-            <IconWindow size={14} />
-          </Btn>
-        </>
-      }
+      headingActions={headIcons.map(([aria, dis, onClick, icon, title]) => (
+        <Btn
+          key={aria}
+          v="icon"
+          className="h-[26px] w-[26px]"
+          title={title ?? aria}
+          aria-label={aria}
+          disabled={dis}
+          onClick={onClick}
+        >
+          {icon}
+        </Btn>
+      ))}
       searchPlaceholder="搜索窗口名、备注、账号名或端口"
       list={list}
       selectAllLabel="全选当前显示的蓝蝶窗口"
       matchedIds={visibleIds}
       filterLabels={['全部', '在线', '已选']}
       extraTools={
-        <div className="mt-2 grid grid-cols-2 gap-1.5 [&_.btn]:h-[27px] [&_.btn]:justify-center [&_.btn]:px-2 [&_.btn]:text-[11.5px]">
-          {toolBtns.map(([key, label, title, className, v]) => (
-            <Btn
-              key={key}
-              v={v ?? 'default'}
-              className={className}
-              disabled={!instances.length}
-              title={title}
-              onClick={() => setModal({ kind: key })}
-            >
-              {label}
-            </Btn>
-          ))}
-        </div>
+        <>
+          <div role="group" aria-label="蓝蝶状态筛选" className="mt-1.5 flex flex-wrap gap-1 pl-2">
+            {statusChips.map(([key, label, count]) => (
+              <FilterChip
+                key={key}
+                label={label}
+                count={count}
+                active={statusFilter === key}
+                className="h-[22px]"
+                onClick={() => {
+                  setStatusFilter(key);
+                  if (list.filter !== 'all') list.setFilter('all');
+                }}
+              />
+            ))}
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-1.5 [&_.btn]:h-[27px] [&_.btn]:justify-center [&_.btn]:px-2 [&_.btn]:text-[11.5px]">
+            {toolBtns.map(([key, label, title, className, v]) => (
+              <Btn
+                key={key}
+                v={v ?? 'default'}
+                className={className}
+                disabled={!instances.length}
+                title={title}
+                onClick={() => setModal({ kind: key })}
+              >
+                {label}
+              </Btn>
+            ))}
+          </div>
+          {runningBanners.length > 0 && (
+            <div className="mt-1.5 flex flex-col gap-1">
+              {runningBanners.map((b) => (
+                <div
+                  key={b.kind}
+                  className="flex items-center justify-between gap-1.5 rounded-md border border-blue-200 bg-blue-50/80 px-2 py-1 text-[11px] text-blue-900"
+                >
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
+                    onClick={() => setModal({ kind: b.kind })}
+                    title={b.title}
+                  >
+                    {b.label}
+                  </button>
+                  <Btn
+                    v="danger"
+                    className="h-5 px-1.5 text-[10.5px]"
+                    disabled={busy}
+                    onClick={() => void exec(b.stop, {})}
+                  >
+                    中止执行
+                  </Btn>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       }
       creatingBusy={busy}
       onCreateGroup={(name) =>
@@ -459,19 +561,15 @@ export function BluestacksSidebar(p: {
           ),
         })
       }
-      onRenameGroupSubmit={async (id, name) => {
-        await exec('folders/rename', { id, name });
-      }}
-      onDeleteGroupConfirm={async (id) => {
-        await exec('folders/delete', { id });
-      }}
+      onRenameGroupSubmit={async (id, name) => void (await exec('folders/rename', { id, name }))}
+      onDeleteGroupConfirm={async (id) => void (await exec('folders/delete', { id }))}
       deleteGroupDescription="删除分组不会删除蓝蝶模拟器实例，组内实例将移入「未分组」。"
       renderRow={renderInstanceRow}
       emptyGroupText={() => '暂无匹配的蓝蝶窗口'}
       emptyListNode={
         <div className="mx-2.5 my-3.5 flex flex-col gap-2 rounded-xl border border-dashed border-[var(--line-strong)] bg-white px-3.5 py-4 [&_p]:m-0 [&_p]:text-xs [&_p]:leading-relaxed [&_p]:text-[var(--text-2)] [&_strong]:text-[13px] [&_strong]:text-[var(--text)]">
           <strong>未检测到蓝蝶多开实例</strong>
-          <p className="text-xs text-[var(--text-3)]">
+          <p className={UI_MUTED}>
             请确认已安装 BlueStacks 5，或点击下方按钮手动配置安装目录与 <code>bluestacks.conf</code>{' '}
             路径。
           </p>
@@ -512,9 +610,15 @@ export function BluestacksSidebar(p: {
             />
           )}
           {modal?.kind === 'risk' && state && (
-            <BluestacksRiskDashboardModal
-              state={state}
-              onChange={onChange}
+            <DailyRiskLimitModal
+              carrier="bluestacks"
+              targets={instances.map((inst) => ({
+                id: inst.id,
+                title: bluestacksDisplayTitle(inst),
+                subtitle: inst.accountName || inst.instanceKey || undefined,
+              }))}
+              bluestacksState={state}
+              onBluestacksChange={onChange}
               onClose={() => setModal(null)}
             />
           )}

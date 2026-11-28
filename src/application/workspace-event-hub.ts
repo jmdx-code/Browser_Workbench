@@ -2,14 +2,12 @@ import type {
   WorkspaceEventTopic,
   WorkspaceInvalidationEvent,
 } from '../shared/workspace-events.js';
-
 export interface SseClientStream {
   readonly closed: boolean;
   write(chunk: string): boolean;
   end(): void;
   onClose(cb: () => void): void;
 }
-
 export class WorkspaceEventHub {
   private readonly clients = new Set<SseClientStream>();
   private readonly pendingTopics = new Set<WorkspaceEventTopic>();
@@ -23,20 +21,17 @@ export class WorkspaceEventHub {
   private readonly coalesceMs: number;
   private readonly keepaliveMs: number;
   private readonly maxClients: number;
-
   constructor(options?: { coalesceMs?: number; keepaliveMs?: number; maxClients?: number }) {
     this.coalesceMs = options?.coalesceMs ?? 50;
     this.keepaliveMs = options?.keepaliveMs ?? 15_000;
     this.maxClients = options?.maxClients ?? 32;
   }
-
   clientCount(): number {
     return this.clients.size;
   }
   version(): number {
     return this.seq;
   }
-
   attach(stream: SseClientStream): boolean {
     if (this.closed || stream.closed) {
       stream.end();
@@ -78,7 +73,6 @@ export class WorkspaceEventHub {
     });
     return true;
   }
-
   emit(topics: WorkspaceEventTopic | readonly WorkspaceEventTopic[], reason?: string): void {
     if (this.closed || !this.clients.size) return;
     const list = typeof topics === 'string' ? [topics] : topics;
@@ -97,7 +91,6 @@ export class WorkspaceEventHub {
       this.flushTimer.unref?.();
     }
   }
-
   flushNow(): void {
     if (this.closed || !this.pendingTopics.size || !this.clients.size) {
       this.pendingTopics.clear();
@@ -118,24 +111,28 @@ export class WorkspaceEventHub {
       `event: invalidate\nid: ${payload.version}\ndata: ${JSON.stringify(payload)}\n\n`,
     );
   }
-
   startDigestMonitor(
     readTopicsDigest: () => Promise<Partial<Record<WorkspaceEventTopic, string>>>,
     intervalMs = 1000,
   ): void {
     if (this.digestTimer) clearInterval(this.digestTimer);
     let prev: Partial<Record<WorkspaceEventTopic, string>> = {};
+    let initialized = false;
     this.digestTimer = setInterval(() => {
       if (this.closed || !this.clients.size || this.digestInFlight) return;
       this.digestInFlight = true;
       void readTopicsDigest()
         .then((next) => {
-          const changed = (Object.entries(next) as [WorkspaceEventTopic, string | undefined][])
-            .filter(
-              ([topic, sig]) =>
-                sig !== undefined && prev[topic] !== undefined && prev[topic] !== sig,
-            )
-            .map(([topic]) => topic);
+          if (!initialized) {
+            prev = next;
+            initialized = true;
+            return;
+          }
+          const topics = new Set<WorkspaceEventTopic>([
+            ...(Object.keys(prev) as WorkspaceEventTopic[]),
+            ...(Object.keys(next) as WorkspaceEventTopic[]),
+          ]);
+          const changed = [...topics].filter((topic) => prev[topic] !== next[topic]);
           prev = next;
           if (changed.length) this.emit(changed, 'state-change');
         })
@@ -144,7 +141,6 @@ export class WorkspaceEventHub {
     }, intervalMs);
     this.digestTimer.unref?.();
   }
-
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -160,7 +156,6 @@ export class WorkspaceEventHub {
     }
     this.clients.clear();
   }
-
   private broadcastRaw(frame: string): void {
     for (const client of [...this.clients]) {
       if (client.closed) {

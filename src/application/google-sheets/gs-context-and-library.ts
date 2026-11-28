@@ -1,9 +1,10 @@
 import type { CompatibleRepository } from '../../domain/persistence.js';
-import { ProductError } from '../../domain/workspace.js';
+import { ProductError, failError } from '../../domain/workspace.js';
 import {
   computeLibrarySyncDiff,
   extractFacebookTargetId,
   extractImageUrlFromCell,
+  includesUngroupedBucket,
   isScientificNotationCell,
   isTemplateHintRow,
   LibraryImportMode,
@@ -19,6 +20,7 @@ import {
   type SheetImageHostConfig,
   type SheetImageHostStatus,
 } from '../../shared/google-sheets.js';
+import type { CheckDailyRiskLimitFn } from '../../shared/daily-risk-limits.js';
 import { isLocalAvatar, isTargetIncomplete } from '../../shared/group-bumper.js';
 import type { PostBumpRecordsPort } from '../../shared/post-bump-records.js';
 import type { ProfileLifecyclePort } from '../../shared/profile-lifecycle.js';
@@ -34,8 +36,8 @@ import type {
 } from '../google-sheets-ports.js';
 import type { GroupBumperService } from '../group-bumper-service.js';
 import { errMsg, ignoreError, runConcurrentQueue, sleepMs } from '../module-worker-pool.js';
+import type { Workboard } from '../workboard.js';
 import type { WorkspaceService } from '../workspace-service.js';
-
 export interface GoogleSheetsServiceDeps {
   workspace: WorkspaceService;
   groupBumper: GroupBumperService;
@@ -44,6 +46,10 @@ export interface GoogleSheetsServiceDeps {
   sheetsApi: GoogleSheetsApiPort;
   imageHost: SheetImageHostPort;
   automation?: SheetAutomationBridgePort;
+  prepareMaterialMedia?: SheetAutomationBridgePort['prepareMaterialMedia'];
+  cleanupPreparedMedia?: SheetAutomationBridgePort['cleanupPreparedMedia'];
+  workboard?: Workboard;
+  checkDailyRiskLimit?: CheckDailyRiskLimitFn;
   featureExecution?: FeatureExecutionRegistry;
   profileLifecycle?: ProfileLifecyclePort;
   assertSystemIdle?: (action: string) => void | Promise<void>;
@@ -51,17 +57,14 @@ export interface GoogleSheetsServiceDeps {
   claimVerifyDelayMs?: number;
   now?: () => number;
 }
-
 export const METRICS_AUTO_MAX_AGE_HOURS = 14 * 24;
 export const METRICS_BACKOFF_STEPS_MS = [1800_000, 7200_000, 21600_000, 86400_000] as const;
-
 export interface ActiveProfileEntry {
   linkId: string;
   kind: 'post_schedule' | 'post_records' | 'metrics';
   title: string;
   status: string;
 }
-
 export function createGoogleSheetsContext(
   repo: CompatibleRepository<GoogleSheetsRepositoryPort>,
   deps: GoogleSheetsServiceDeps,
@@ -80,6 +83,8 @@ export function createGoogleSheetsContext(
     gridEpoch: { global: 0, byLink: new Map<string, number>() },
     activeBumpFlushers: new Map<string, () => Promise<void>>(),
     activeProfiles: new Map<string, ActiveProfileEntry>(),
+    claimingProfiles: new Set<string>(),
+    recoveredStuckLinks: new Set<string>(),
     cancelledLinks: new Set<string>(),
     cancelledProfiles: new Set<string>(),
     metricsAbortByLink: new Map<string, AbortController>(),
@@ -93,9 +98,7 @@ export function createGoogleSheetsContext(
   };
   return ctx;
 }
-
 export type GoogleSheetsContext = ReturnType<typeof createGoogleSheetsContext>;
-
 export const safeAppendSheetLog = (
   ctx: GoogleSheetsContext,
   linkId: string | null,
@@ -103,7 +106,6 @@ export const safeAppendSheetLog = (
   action: string,
   summary: string,
 ) => ignoreError(ctx.repo.appendLog({ linkId, level, action, summary }));
-
 export async function recordLinkPollFailure(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink | null,
@@ -119,7 +121,6 @@ export async function recordLinkPollFailure(
   );
   await safeAppendSheetLog(ctx, link.id, 'error', action, `${prefix}：${msg}`);
 }
-
 export async function wakeBrowserProfile(
   ctx: GoogleSheetsContext,
   profileId: string,
@@ -128,7 +129,8 @@ export async function wakeBrowserProfile(
   if (!ctx.deps.profileLifecycle) return false;
   await ctx.deps.profileLifecycle.ensureProfilesOnline([profileId]).catch(() => {});
   const deadline = ctx.nowFn() + 25_000;
-  while (ctx.nowFn() < deadline) {
+  const wallDeadline = Date.now() + 25_000;
+  while (ctx.nowFn() < deadline && Date.now() < wallDeadline) {
     if (isCancelled()) return false;
     if ((await ctx.deps.workspace.snapshot()).profiles.some((p) => p.id === profileId && p.online))
       return true;
@@ -136,7 +138,6 @@ export async function wakeBrowserProfile(
   }
   return false;
 }
-
 export function buildImageHostStatus(
   config: SheetImageHostConfig,
   cachedImageCount: number,
@@ -154,31 +155,35 @@ export function buildImageHostStatus(
     cachedImageCount,
   };
 }
-
 export async function requireLink(ctx: GoogleSheetsContext, id: string): Promise<GoogleSheetLink> {
   const link = await ctx.repo.getLink(id);
   if (!link) throw new ProductError('SHEET_LINK_NOT_FOUND', '表格连接不存在', 404);
   return link;
 }
-
 export async function isProfileBusyElsewhere(ctx: GoogleSheetsContext, profileId: string) {
   return (
     ctx.activeProfiles.has(profileId) ||
+    ctx.claimingProfiles.has(profileId) ||
     Boolean(await ctx.deps.featureExecution?.isProfileBusy(profileId, 'google-sheets'))
   );
 }
-
 export async function tryClaimProfile(
   ctx: GoogleSheetsContext,
   profileId: string,
   meta: ActiveProfileEntry,
 ): Promise<boolean> {
-  if (await isProfileBusyElsewhere(ctx, profileId)) return false;
-  ctx.activeProfiles.set(profileId, { ...meta });
-  ctx.cancelledProfiles.delete(profileId);
-  return true;
+  if (ctx.activeProfiles.has(profileId) || ctx.claimingProfiles.has(profileId)) return false;
+  ctx.claimingProfiles.add(profileId);
+  try {
+    if (await ctx.deps.featureExecution?.isProfileBusy(profileId, 'google-sheets')) return false;
+    if (ctx.activeProfiles.has(profileId)) return false;
+    ctx.activeProfiles.set(profileId, { ...meta });
+    ctx.cancelledProfiles.delete(profileId);
+    return true;
+  } finally {
+    ctx.claimingProfiles.delete(profileId);
+  }
 }
-
 export function updateActiveProfileStatus(
   ctx: GoogleSheetsContext,
   profileId: string,
@@ -188,12 +193,10 @@ export function updateActiveProfileStatus(
   const current = ctx.activeProfiles.get(profileId);
   if (current?.linkId === linkId) current.status = status;
 }
-
 export function releaseProfile(ctx: GoogleSheetsContext, profileId: string, linkId: string): void {
   if (ctx.activeProfiles.get(profileId)?.linkId === linkId) ctx.activeProfiles.delete(profileId);
   ctx.cancelledProfiles.delete(profileId);
 }
-
 export function runSerializedRecordWrite(
   ctx: GoogleSheetsContext,
   key: string,
@@ -207,7 +210,6 @@ export function runSerializedRecordWrite(
   ctx.recordWriteLocks.set(key, tracked);
   return next;
 }
-
 export async function loadSheetColumnIndexMap(
   ctx: GoogleSheetsContext,
   link: GoogleSheetLink,
@@ -223,7 +225,6 @@ export async function loadSheetColumnIndexMap(
   }
   return map;
 }
-
 export const makeSheetRecordPost = (
   now: number,
   linkId: string,
@@ -254,7 +255,6 @@ export const makeSheetRecordPost = (
   ...patch,
   updatedAt: now,
 });
-
 async function resolveBoundCarriers<T extends { id: string }>(
   ctx: GoogleSheetsContext,
   items: readonly T[],
@@ -262,27 +262,29 @@ async function resolveBoundCarriers<T extends { id: string }>(
   itemIds: readonly string[],
   getFolderId: (item: T) => string | null,
   isEligible: (item: T) => boolean,
+  includeUngrouped = false,
 ): Promise<T[]> {
   const fSet = new Set(folderIds);
   const iSet = new Set(itemIds);
+  const allowUngrouped = includesUngroupedBucket(folderIds, includeUngrouped);
   const out: T[] = [];
   for (const item of items) {
     if (!isEligible(item)) continue;
     const fId = getFolderId(item);
     if (
-      ((fId !== null && fSet.has(fId)) || iSet.has(item.id)) &&
+      ((fId === null && allowUngrouped) || (fId !== null && fSet.has(fId)) || iSet.has(item.id)) &&
       !(await isProfileBusyElsewhere(ctx, item.id))
     )
       out.push(item);
   }
   return out;
 }
-
 export async function resolveBoundBumperProfiles(
   ctx: GoogleSheetsContext,
   groupIds: readonly string[],
   profileIds: readonly string[],
   includeOffline = false,
+  includeUngrouped = false,
 ) {
   const snap = await ctx.deps.workspace.snapshot();
   const eligible = await resolveBoundCarriers(
@@ -294,10 +296,10 @@ export async function resolveBoundBumperProfiles(
     (p) =>
       (p.online || includeOffline) &&
       !['restricted', 'verification', 'logged-out'].includes(p.account.state),
+    includeUngrouped,
   );
   return eligible.sort((a, b) => Number(b.online) - Number(a.online));
 }
-
 export async function resolveBoundBluestacksInstances(
   ctx: GoogleSheetsContext,
   folderIds: readonly string[],
@@ -314,10 +316,8 @@ export async function resolveBoundBluestacksInstances(
     (i) => !['restricted', 'verification', 'logged-out', 'missing-app'].includes(i.accountState),
   );
 }
-
 const currentGridEpoch = (ctx: GoogleSheetsContext, linkId: string) =>
   `${ctx.gridEpoch.global}:${ctx.gridEpoch.byLink.get(linkId) ?? 0}`;
-
 export function invalidateGridCache(ctx: GoogleSheetsContext, linkId?: string): void {
   if (linkId) {
     ctx.gridEpoch.byLink.set(linkId, (ctx.gridEpoch.byLink.get(linkId) ?? 0) + 1);
@@ -329,7 +329,6 @@ export function invalidateGridCache(ctx: GoogleSheetsContext, linkId?: string): 
     ctx.gridInFlight.clear();
   }
 }
-
 export async function readGrid(
   ctx: GoogleSheetsContext,
   linkId: string,
@@ -343,7 +342,6 @@ export async function readGrid(
     const inFlight = ctx.gridInFlight.get(linkId);
     if (inFlight) return inFlight;
   }
-
   const capturedEpoch = currentGridEpoch(ctx, linkId);
   const work = (async (): Promise<SheetGridSnapshot> => {
     const link = await requireLink(ctx, linkId);
@@ -389,7 +387,6 @@ export async function readGrid(
       ctx.gridCache.set(link.id, { snapshot, cachedAt: fetchedAt });
     return snapshot;
   })();
-
   ctx.gridInFlight.set(linkId, work);
   try {
     return await work;
@@ -397,7 +394,6 @@ export async function readGrid(
     if (ctx.gridInFlight.get(linkId) === work) ctx.gridInFlight.delete(linkId);
   }
 }
-
 async function resolveLibrarySyncBase(ctx: GoogleSheetsContext, linkId: string, kindError: string) {
   const link = await requireLink(ctx, linkId);
   if (link.kind !== 'group_library' && link.kind !== 'page_library')
@@ -408,7 +404,7 @@ async function resolveLibrarySyncBase(ctx: GoogleSheetsContext, linkId: string, 
     ? resolveGroupLibraryColumns(grid.headers)
     : resolvePageLibraryColumns(grid.headers);
   if (cols.id < 0)
-    throw new ProductError(
+    failError(
       'SHEET_HEADER_MISSING',
       `第一行表头未找到「${isGroup ? '小组id' : '专页id'}」列，请检查模板表头`,
       400,
@@ -423,7 +419,6 @@ async function resolveLibrarySyncBase(ctx: GoogleSheetsContext, linkId: string, 
     cols,
   };
 }
-
 export async function importLibraryFromSheet(
   ctx: GoogleSheetsContext,
   linkId: string,
@@ -438,7 +433,6 @@ export async function importLibraryFromSheet(
   const parsedItems: Array<{ id: string; name: string; category: string }> = [];
   const seenIds = new Set<string>();
   let skipped = 0;
-
   for (const row of grid.rows) {
     if (row.isHintRow) continue;
     const dispId = (row.displayValues[cols.id] ?? '').trim();
@@ -460,7 +454,6 @@ export async function importLibraryFromSheet(
       category: cols.category >= 0 ? (row.displayValues[cols.category] ?? '').trim() : '',
     });
   }
-
   const targetRepo = ctx.deps.workspace.repository;
   const loadFolderMap = async () =>
     new Map(
@@ -477,7 +470,6 @@ export async function importLibraryFromSheet(
     foldersCreated++;
   }
   if (foldersCreated > 0) folderIdByName = await loadFolderMap();
-
   const bumperState = await ctx.deps.groupBumper.state();
   const localBefore = isGroup ? bumperState.groups : bumperState.pages;
   const localByKey = new Map(localBefore.map((item) => [item.id.toLowerCase(), item]));
@@ -491,7 +483,9 @@ export async function importLibraryFromSheet(
     return {
       id: item.id,
       name: item.name || existing?.name || '',
-      folderId: item.category ? (folderIdByName.get(item.category.toLowerCase()) ?? null) : null,
+      folderId: item.category
+        ? (folderIdByName.get(item.category.toLowerCase()) ?? existing?.folderId ?? null)
+        : (existing?.folderId ?? null),
     };
   });
   for (let i = 0; i < itemsToUpsert.length; i += 500) {
@@ -523,7 +517,6 @@ export async function importLibraryFromSheet(
       deleted = extraIds.length;
     }
   }
-
   const afterState = await ctx.deps.groupBumper.state();
   const metadataRefreshTriggered = (isGroup ? afterState.groups : afterState.pages).some(
     isTargetIncomplete,
@@ -548,7 +541,6 @@ export async function importLibraryFromSheet(
     summary,
   };
 }
-
 export async function syncLibraryToSheet(
   ctx: GoogleSheetsContext,
   linkId: string,
@@ -564,7 +556,6 @@ export async function syncLibraryToSheet(
   ]);
   const folderNameById = new Map(folders.map((f) => [f.id, f.name]));
   const localTargets = isGroup ? bumperState.groups : bumperState.pages;
-
   const existingAvatarByKey = new Map<string, string>();
   for (const row of grid.rows) {
     if (row.isHintRow) continue;
@@ -576,7 +567,6 @@ export async function syncLibraryToSheet(
     if (url && /^https:\/\/(?:i\.gyazo\.com|lh3\.googleusercontent\.com)\//i.test(url))
       existingAvatarByKey.set(key, toSheetsImageFormula(url));
   }
-
   let avatarsUploaded = 0;
   const localItems = new Array<{
     id: string;
@@ -586,8 +576,10 @@ export async function syncLibraryToSheet(
   }>(localTargets.length);
   await runConcurrentQueue(localTargets, 4, async (item, idx) => {
     const category = item.folderId ? (folderNameById.get(item.folderId) ?? '') : '';
-    let avatarCellValue = existingAvatarByKey.get(item.id.toLowerCase()) ?? '';
+    const existingAvatarFormula = existingAvatarByKey.get(item.id.toLowerCase());
+    let avatarCellValue = existingAvatarFormula ?? '';
     if (
+      !existingAvatarFormula &&
       cols.avatar >= 0 &&
       item.avatarUrl &&
       (isLocalAvatar(item.avatarUrl) || item.avatarUrl.startsWith('http'))
@@ -607,7 +599,6 @@ export async function syncLibraryToSheet(
     }
     localItems[idx] = { id: item.id, category, name: item.name, avatarCellValue };
   });
-
   const diff = computeLibrarySyncDiff({
     sheetRows: grid.rows,
     localItems,
@@ -632,7 +623,6 @@ export async function syncLibraryToSheet(
   } finally {
     invalidateGridCache(ctx, link.id);
   }
-
   const summary = `同步至表格完成：更新 ${diff.stats.updated}，新增 ${diff.stats.added}，删除多余 ${diff.stats.deleted}${avatarsUploaded > 0 ? `，新上传头像 ${avatarsUploaded}` : ''}`;
   await ctx.repo.updateLinkRuntime(link.id, {
     lastSyncedAt: ctx.nowFn(),

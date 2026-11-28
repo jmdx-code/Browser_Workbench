@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import type { CompatibleRepository } from '../../domain/persistence.js';
-import { ProductError } from '../../domain/workspace.js';
+import { failError } from '../../domain/workspace.js';
 import type {
   BluestacksAccountState,
   BluestacksIdentityType,
@@ -12,6 +12,7 @@ import type {
 } from '../../shared/bluestacks.js';
 import type { BluestacksSavedSettings, DiscoveredInstanceRecord } from '../bluestacks-store.js';
 import type { OcrRecognizer } from '../bluestacks-vision.js';
+import { queryHdPlayerProcessesViaWin32Helper, type RunProcessFn } from '../bluestacks-win32.js';
 import {
   COMMON_CONF_PATHS,
   COMMON_INSTALL_DIRS,
@@ -49,13 +50,17 @@ export interface DeviceRuntimeContext {
   onlineInstanceKeys: Set<string>;
   launchSpawnTail: Promise<void>;
   lastPlayerSpawnAt: number;
-  adbDaemonRecoveryPromise: Promise<void> | null;
-  lastAdbDaemonRecoveryAt: number;
+  adbStartServerPromise: Promise<void> | null;
+  lastAdbStartServerAt: number;
+  readonly serialRecoveryPromises: Map<string, Promise<void>>;
   readonly consecutiveAdbTimeoutsBySerial: Map<string, number>;
+  readonly runProcOverride?: RunProcessFn;
+  readonly adbPathOverride?: string;
 }
 export function createDeviceRuntimeContext(
   repo: CompatibleRepository<BluestacksDeviceRepo>,
   ocr: OcrRecognizer,
+  overrides: { runProc?: RunProcessFn; adbPath?: string } = {},
 ): DeviceRuntimeContext {
   return {
     repo,
@@ -66,9 +71,12 @@ export function createDeviceRuntimeContext(
     onlineInstanceKeys: new Set(),
     launchSpawnTail: Promise.resolve(),
     lastPlayerSpawnAt: 0,
-    adbDaemonRecoveryPromise: null,
-    lastAdbDaemonRecoveryAt: 0,
+    adbStartServerPromise: null,
+    lastAdbStartServerAt: 0,
+    serialRecoveryPromises: new Map(),
     consecutiveAdbTimeoutsBySerial: new Map(),
+    ...(overrides.runProc ? { runProcOverride: overrides.runProc } : {}),
+    ...(overrides.adbPath ? { adbPathOverride: overrides.adbPath } : {}),
   };
 }
 export async function runSerializedPlayerSpawn(
@@ -87,9 +95,7 @@ export async function runSerializedPlayerSpawn(
     await prev.catch(() => {});
     const minGapMs = 3200;
     const waitMs = Math.max(0, ctx.lastPlayerSpawnAt + minGapMs - Date.now());
-    if (waitMs > 0) {
-      await abortableWait(waitMs, signal);
-    }
+    if (waitMs > 0) await abortableWait(waitMs, signal);
     if (signal?.aborted) throw new Error('TASK_STOPPED');
     ctx.lastPlayerSpawnAt = Date.now();
     await new Promise<void>((resolveSpawn) => {
@@ -124,9 +130,7 @@ export async function runSerializedPlayerSpawn(
           windowsHide: false,
         });
         child.once('exit', (code) => {
-          if (typeof code === 'number' && code !== 0) {
-            earlyExitCode = code;
-          }
+          if (typeof code === 'number' && code !== 0) earlyExitCode = code;
         });
         child.once('error', launchViaShellExecute);
         child.once('spawn', () => {
@@ -238,9 +242,10 @@ export async function resolveRuntimeConfig(ctx: DeviceRuntimeContext): Promise<{
   };
 }
 async function requireAdbPath(ctx: DeviceRuntimeContext): Promise<string> {
+  if (ctx.adbPathOverride) return ctx.adbPathOverride;
   const { adbPath } = await resolveRuntimeConfig(ctx);
   if (!adbPath) {
-    throw new ProductError(
+    failError(
       'BLUESTACKS_ADB_NOT_FOUND',
       '未找到蓝蝶 HD-Adb.exe，请在左侧点击设置按钮指定 BlueStacks 安装目录',
       400,
@@ -248,33 +253,9 @@ async function requireAdbPath(ctx: DeviceRuntimeContext): Promise<string> {
   }
   return adbPath;
 }
-async function recoverAdbDaemon(
-  ctx: DeviceRuntimeContext,
-  adbExe: string,
-  signal?: AbortSignal,
-): Promise<void> {
-  if (signal?.aborted) throw new Error('TASK_STOPPED');
-  let recovery = ctx.adbDaemonRecoveryPromise;
-  if (!recovery) {
-    if (Date.now() - ctx.lastAdbDaemonRecoveryAt < 20_000) {
-      return;
-    }
-    ctx.lastAdbDaemonRecoveryAt = Date.now();
-    // Never bind a single caller's AbortSignal to global daemon restart,
-    // otherwise cancelling 1 instance could kill ADB and leave start-server unrun for 20s.
-    recovery = (async () => {
-      await runProcess(adbExe, ['kill-server'], { timeoutMs: 6000 }).catch(() => null);
-      await abortableWait(500).catch(() => null);
-      await runProcess(adbExe, ['start-server'], { timeoutMs: 10_000 }).catch(() => null);
-    })().finally(() => {
-      if (ctx.adbDaemonRecoveryPromise === recovery) {
-        ctx.adbDaemonRecoveryPromise = null;
-      }
-    });
-    ctx.adbDaemonRecoveryPromise = recovery;
-  }
+async function awaitWithAbortSignal(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
   if (!signal) {
-    await recovery;
+    await promise;
     return;
   }
   await new Promise<void>((resolve, reject) => {
@@ -284,7 +265,7 @@ async function recoverAdbDaemon(
     }
     const onAbort = () => reject(new Error('TASK_STOPPED'));
     signal.addEventListener('abort', onAbort, { once: true });
-    void recovery.then(
+    void promise.then(
       () => {
         signal.removeEventListener('abort', onAbort);
         resolve();
@@ -296,6 +277,58 @@ async function recoverAdbDaemon(
     );
   });
 }
+async function ensureAdbServerStarted(
+  ctx: DeviceRuntimeContext,
+  adbExe: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new Error('TASK_STOPPED');
+  let starter = ctx.adbStartServerPromise;
+  if (!starter) {
+    if (Date.now() - ctx.lastAdbStartServerAt < 10_000) return;
+    ctx.lastAdbStartServerAt = Date.now();
+    const execProc = ctx.runProcOverride ?? runProcess;
+    starter = (async () => {
+      await execProc(adbExe, ['start-server'], { timeoutMs: 10_000 }).catch(() => null);
+    })().finally(() => {
+      if (ctx.adbStartServerPromise === starter) ctx.adbStartServerPromise = null;
+    });
+    ctx.adbStartServerPromise = starter;
+  }
+  await awaitWithAbortSignal(starter, signal);
+}
+export async function recoverAdbSerial(
+  ctx: DeviceRuntimeContext,
+  adbExe: string,
+  serial: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new Error('TASK_STOPPED');
+  let recovery = ctx.serialRecoveryPromises.get(serial);
+  if (!recovery) {
+    const execProc = ctx.runProcOverride ?? runProcess;
+    recovery = (async () => {
+      await execProc(adbExe, ['disconnect', serial], { timeoutMs: 4000 }).catch(() => null);
+      await abortableWait(200).catch(() => null);
+      await execProc(adbExe, ['connect', serial], { timeoutMs: 6000 }).catch(() => null);
+      for (const delayMs of [250, 500, 1000]) {
+        const stateOut = await execProc(adbExe, ['-s', serial, 'get-state'], { timeoutMs: 2500 })
+          .then((b) => b.toString('utf8').trim())
+          .catch(() => '');
+        if (stateOut === 'device') return;
+        await abortableWait(delayMs).catch(() => null);
+        await execProc(adbExe, ['connect', serial], { timeoutMs: 5000 }).catch(() => null);
+      }
+      await execProc(adbExe, ['-s', serial, 'get-state'], { timeoutMs: 2500 }).catch(() => null);
+    })().finally(() => {
+      if (ctx.serialRecoveryPromises.get(serial) === recovery) {
+        ctx.serialRecoveryPromises.delete(serial);
+      }
+    });
+    ctx.serialRecoveryPromises.set(serial, recovery);
+  }
+  await awaitWithAbortSignal(recovery, signal);
+}
 export async function adb(
   ctx: DeviceRuntimeContext,
   serial: string,
@@ -304,8 +337,9 @@ export async function adb(
   signal?: AbortSignal,
 ): Promise<Buffer> {
   const adbExe = await requireAdbPath(ctx);
+  const execProc = ctx.runProcOverride ?? runProcess;
   try {
-    const out = await runProcess(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
+    const out = await execProc(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
     ctx.consecutiveAdbTimeoutsBySerial.delete(serial);
     return out;
   } catch (err) {
@@ -316,20 +350,22 @@ export async function adb(
         msg,
       );
     const isTimeout = msg === 'TIMEOUT';
-    let serialTimeouts = ctx.consecutiveAdbTimeoutsBySerial.get(serial) ?? 0;
     if (isTimeout) {
-      serialTimeouts++;
-      ctx.consecutiveAdbTimeoutsBySerial.set(serial, serialTimeouts);
+      ctx.consecutiveAdbTimeoutsBySerial.set(
+        serial,
+        (ctx.consecutiveAdbTimeoutsBySerial.get(serial) ?? 0) + 1,
+      );
     }
-    if (isDaemonError || (isTimeout && serialTimeouts >= 2)) {
+    if (isDaemonError) {
       ctx.consecutiveAdbTimeoutsBySerial.delete(serial);
-      await recoverAdbDaemon(ctx, adbExe, signal);
-      await runProcess(adbExe, ['connect', serial], { timeoutMs: 6000, signal }).catch(() => null);
-      return await runProcess(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
+      await ensureAdbServerStarted(ctx, adbExe, signal);
+      await recoverAdbSerial(ctx, adbExe, serial, signal);
+      return await execProc(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
     }
-    if (/not found|offline|closed/i.test(msg)) {
-      await runProcess(adbExe, ['connect', serial], { timeoutMs: 6000, signal }).catch(() => null);
-      return await runProcess(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
+    if (isTimeout || /not found|offline|closed/i.test(msg)) {
+      ctx.consecutiveAdbTimeoutsBySerial.delete(serial);
+      await recoverAdbSerial(ctx, adbExe, serial, signal);
+      return await execProc(adbExe, ['-s', serial, ...args], { timeoutMs, signal });
     }
     throw err;
   }
@@ -345,22 +381,30 @@ export async function readRunningHdPlayerInstances(): Promise<{
   if (process.platform !== 'win32')
     return { queried: false, keys, pidByKey, bareMasterRunning: false };
   try {
-    const out = await runProcess(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process -Filter "Name = \'HD-Player.exe\'" | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }',
-      ],
-      { timeoutMs: 4000 },
-    );
+    const helperRows = await queryHdPlayerProcessesViaWin32Helper();
+    const entries: Array<{ pid: number; cmd: string }> = helperRows
+      ? helperRows.map((r) => ({ pid: r.pid, cmd: r.commandLine }))
+      : (
+          await runProcess(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-NonInteractive',
+              '-Command',
+              '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process -Filter "Name = \'HD-Player.exe\'" | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }',
+            ],
+            { timeoutMs: 4000 },
+          )
+        )
+          .toString('utf8')
+          .split(/\r?\n/)
+          .flatMap((raw) => {
+            const sep = raw.indexOf('|');
+            if (sep < 0) return [];
+            return [{ pid: Number(raw.slice(0, sep).trim()), cmd: raw.slice(sep + 1).trim() }];
+          });
     let bareMasterRunning = false;
-    for (const raw of out.toString('utf8').split(/\r?\n/)) {
-      const sep = raw.indexOf('|');
-      if (sep < 0) continue;
-      const pid = Number(raw.slice(0, sep).trim());
-      const cmd = raw.slice(sep + 1).trim();
+    for (const { pid, cmd } of entries) {
       if (!cmd) continue;
       const m = /(?:^|\s)--instance\s+"?([A-Za-z0-9_.-]+)"?(?:\s|$)/i.exec(cmd);
       if (m?.[1]) {
@@ -370,9 +414,7 @@ export async function readRunningHdPlayerInstances(): Promise<{
           list.push(pid);
           pidByKey.set(m[1], list);
         }
-      } else {
-        bareMasterRunning = true;
-      }
+      } else bareMasterRunning = true;
     }
     return { queried: true, keys, pidByKey, bareMasterRunning };
   } catch {
@@ -393,9 +435,7 @@ export async function probeFbLiteInstalled(
   signal?: AbortSignal,
 ): Promise<boolean | null> {
   const cached = ctx.litePackageCache.get(serial);
-  if (!force && cached && Date.now() - cached.checkedAt < 15000) {
-    return cached.installed;
-  }
+  if (!force && cached && Date.now() - cached.checkedAt < 15000) return cached.installed;
   try {
     const out = (
       await adb(ctx, serial, ['shell', 'pm', 'list', 'packages', 'com.facebook.lite'], 5000, signal)
@@ -441,14 +481,23 @@ export async function readLiveScreenSize(
     const out = (await adb(ctx, serial, ['shell', 'wm', 'size'], 4000, signal)).toString('utf8');
     const overrideMatch = /Override size:\s*(\d+)x(\d+)/i.exec(out);
     const physicalMatch = /Physical size:\s*(\d+)x(\d+)/i.exec(out);
-    const m = overrideMatch ?? physicalMatch;
-    if (m?.[1] && m[2]) {
-      const width = Number(m[1]);
-      const height = Number(m[2]);
-      if (width >= 100 && height >= 100) {
-        ctx.wmSizeCache.set(serial, { width, height, checkedAt: Date.now() });
-        return { width, height };
-      }
+    const ovW = overrideMatch?.[1] ? Number(overrideMatch[1]) : 0;
+    const ovH = overrideMatch?.[2] ? Number(overrideMatch[2]) : 0;
+    const phW = physicalMatch?.[1] ? Number(physicalMatch[1]) : 0;
+    const phH = physicalMatch?.[2] ? Number(physicalMatch[2]) : 0;
+    const preferPhysical =
+      ovW >= 100 &&
+      ovH >= 100 &&
+      phW >= 100 &&
+      phH >= 100 &&
+      phW === fallbackW &&
+      phH === fallbackH &&
+      Math.abs(ovW / ovH - phW / phH) > 0.08;
+    const width = preferPhysical ? phW : ovW >= 100 && ovH >= 100 ? ovW : phW;
+    const height = preferPhysical ? phH : ovW >= 100 && ovH >= 100 ? ovH : phH;
+    if (width >= 100 && height >= 100) {
+      ctx.wmSizeCache.set(serial, { width, height, checkedAt: Date.now() });
+      return { width, height };
     }
   } catch {
     /* fallback to conf dimensions */

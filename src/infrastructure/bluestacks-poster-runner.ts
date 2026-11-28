@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import type { BluestacksInstance } from '../shared/bluestacks.js';
+import type { BluestacksPosterRunnerPort } from '../application/bluestacks/bs-types.js';
+import { resolveEffectiveBsAccountId, type BluestacksInstance } from '../shared/bluestacks.js';
 import type { BumperTarget } from '../shared/group-bumper.js';
 import {
   canPosterMaterialUseColorBackground,
@@ -9,31 +10,54 @@ import {
   type PosterMaterial,
 } from '../shared/group-poster.js';
 import {
+  GALLERY_NEXT_RE,
   createScreenOps,
+  extractGalleryGridTiles,
   filterClickableNodes,
-  sha256NumericId,
   type BluestacksDeviceManager,
   type ScreenOps,
 } from './bluestacks-device-manager.js';
 import {
+  detectHomeTabBar,
+  extractActionBars,
+  extractPostCards,
   findJoinGroupButtonNode,
   findTextInputNode,
+  flattenLiteNodes,
   getRegionSignature,
+  isGalleryCameraTile,
   isLikeButtonBlue,
   isSolidBlueButton,
   makeCanonicalRect,
+  resolveSharePostUrl,
   signatureSimilarity,
   type LiteXmlNode,
   type OcrRecognizer,
 } from './bluestacks-vision.js';
+const POST_ERROR_OCR_RE =
+  /无法发布|無法發佈|发帖受限|發帖受限|暂时受限|無法執行|无法执行此操作|发布失败|發佈失敗|重试|couldn'tpost|youcan'tpost|somethingwentwrong|tryagain|errorposting|failedtoupload|无法上传|上傳失敗|မတင်နိုင်|ပို့စ်တင်မရ|ไม่สามารถโพสต์|เกิดข้อผิดพลาด|khôngthểđăng|đãxảyralỗi/i;
+const PENDING_APPROVAL_RE =
+  /待审核|待審核|等待管理员审核|等待管理員審核|submittedforapproval|pendingapproval|postispending|adminapproval|စိစစ်|ခွင့်ပြု|ဆိုင်းငံ့|chờphêduyệt|đangchờduyệt|รออนุมัติ/i;
+const POST_CONFIRM_TOAST_RE =
+  /已发布|已發佈|已分享|分享成功|发布成功|發佈成功|posted|shared|yourpostisnowlive|postpublished|မျှဝေပြီး|တင်ပြီး|เผยแพร่แล้ว|แชร์แล้ว|đãđăng|đãchiasẻ/i;
+const RECENT_POST_RE = /刚刚|剛剛|justnow|1分钟前|1m\b|ယခုလေးတင်|vừaxong|เมื่อสักครู่/i;
+const CAMERA_TILE_RE = /相机|相機|camera|拍照|录像|錄影|ကင်မရာ|máyảnh|กล้อง/i;
+const URL_IN_NODE_RE = /https?:\/\/(?:www\.|m\.|mbasic\.)?facebook\.com\/[^\s"'<>]+/i;
 export interface BluestacksPosterLogSink {
   recordPost(input: PosterLog): Promise<boolean> | boolean;
 }
-export interface BluestacksPosterOutcome {
-  posted: number;
-  skipped: number;
-  notes: string[];
-}
+const matchNodeXmlOrOcr = async (
+  ops: ScreenOps,
+  png: Buffer,
+  cands: readonly LiteXmlNode[],
+  re: RegExp,
+  includeRid = false,
+): Promise<LiteXmlNode | null> =>
+  cands.find((n) =>
+    re.test(`${n.text} ${n.contentDesc} ${includeRid ? n.resourceId : ''}`.replace(/\s+/g, '')),
+  ) ??
+  (await ops.findOcr(png, cands, re))?.node ??
+  null;
 export class BluestacksGroupPosterRunner {
   constructor(
     public readonly devices: BluestacksDeviceManager,
@@ -79,10 +103,23 @@ export class BluestacksGroupPosterRunner {
           png,
           composerBars,
           /写点什么|寫點什麼|分享新鲜事|分享新鮮事|发帖|發帖|说点什么|說點什麼|writesomething|createapublicpost|တစ်ခုခုရေး|bạnđangnghĩgì/i,
-        );
-      if (hit) {
-        await ops.tap(hit.node.bounds.cx, hit.node.bounds.cy, 2200);
-        if (findTextInputNode(await ops.xml())) return true;
+        ),
+        fallbackBar = composerBars.find(
+          (n) =>
+            n.bounds.x1 >= 60 &&
+            n.bounds.x1 <= 150 &&
+            n.bounds.x2 >= 760 &&
+            n.bounds.x2 <= 850 &&
+            n.bounds.w >= 600 &&
+            n.bounds.h >= 45 &&
+            n.bounds.h <= 100 &&
+            n.bounds.y1 >= 720 &&
+            n.bounds.y2 <= 1120,
+        ),
+        targetBar = hit?.node ?? fallbackBar;
+      if (targetBar) {
+        await ops.tap(targetBar.bounds.cx, targetBar.bounds.cy, 1800);
+        if (await ops.waitForComposerReady(8000)) return true;
       }
       await ops.swipe(450, 960, 450, 560, 420, 1200);
       ({ xml, png } = await ops.capture());
@@ -100,17 +137,143 @@ export class BluestacksGroupPosterRunner {
       throw e;
     });
     await ops.tapHomeTab0(1500);
-    await ops.tap(420, 240, 2200);
-    return findTextInputNode(await ops.xml()) !== null;
+    const { xml, png } = await ops.capture();
+    if (findTextInputNode(xml)) return true;
+    const cands = filterClickableNodes(
+      xml,
+      (n) =>
+        n.bounds.y1 >= 110 &&
+        n.bounds.y2 <= 620 &&
+        n.bounds.w >= 260 &&
+        n.bounds.h >= 38 &&
+        n.bounds.h <= 135,
+    );
+    const hit = await matchNodeXmlOrOcr(
+      ops,
+      png,
+      cands,
+      /分享新鲜事|分享新鮮事|写点什么|寫點什麼|说点什么|說點什麼|what'?sonyourmind|createpost|发布帖子|發佈貼文|တစ်ခုခုရေး|bạnđangnghĩgì/i,
+    );
+    for (const [x, y] of [
+      ...(hit ? [[hit.bounds.cx, hit.bounds.cy] as [number, number]] : []),
+      [420, 218] as [number, number],
+      [420, 272] as [number, number],
+      [420, 310] as [number, number],
+    ]) {
+      await ops.tap(x, y, 1800);
+      if (await ops.waitForComposerReady(14000)) return true;
+      if (detectHomeTabBar(await ops.xml()) === null) break;
+    }
+    if (detectHomeTabBar(await ops.xml()) === null) await ops.back(600);
+    return false;
+  }
+  private async attachNewestGalleryMedia(
+    ops: ScreenOps,
+    mediaKind: PosterMaterial['mediaKind'],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let gridTiles: LiteXmlNode[] = [];
+    let pickerPng: Buffer | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await ops.wait(900);
+      const { xml: pickerXml, png } = await ops.capture();
+      pickerPng = png;
+      gridTiles = extractGalleryGridTiles(pickerXml);
+      if (gridTiles.length > 0) break;
+    }
+    if (gridTiles.length === 0 || !pickerPng) return ops.attachMedia(true);
+    let firstNonCamera: LiteXmlNode | null = null;
+    let videoTile: LiteXmlNode | null = null;
+    for (let i = 0; i < Math.min(8, gridTiles.length); i++) {
+      const tile = gridTiles[i];
+      if (!tile) continue;
+      const tileTxt = await ops.ocr(pickerPng, tile.bounds).catch(() => '');
+      const nodeText = `${tile.text} ${tile.contentDesc}`.replace(/\s+/g, '');
+      if (CAMERA_TILE_RE.test(tileTxt) || CAMERA_TILE_RE.test(nodeText)) continue;
+      if (i === 0 && (await isGalleryCameraTile(pickerPng, tile.bounds))) continue;
+      firstNonCamera ??= tile;
+      if (mediaKind === 'video' && /\d+:\d{2}/.test(tileTxt + nodeText)) {
+        videoTile = tile;
+        break;
+      }
+      if (mediaKind !== 'video') break;
+    }
+    const chosenTile = videoTile ?? firstNonCamera;
+    if (!chosenTile) return ops.attachMedia(true);
+    await ops.tap(chosenTile.bounds.cx, chosenTile.bounds.cy, 1600);
+    const { xml: galXml, png: galPng } = await ops.capture();
+    if (findTextInputNode(galXml) !== null) return true;
+    const nextBtns = filterClickableNodes(
+      galXml,
+      (n) =>
+        (n.bounds.x1 >= 560 && n.bounds.y1 <= 200 && n.bounds.h >= 34 && n.bounds.h <= 125) ||
+        (n.bounds.y1 >= 1340 &&
+          n.bounds.y2 <= 1600 &&
+          (n.bounds.x1 >= 540 || n.bounds.w >= 260) &&
+          n.bounds.h >= 38 &&
+          n.bounds.h <= 135),
+      (a, b) => b.bounds.y1 - a.bounds.y1 || b.bounds.x2 - a.bounds.x2,
+    );
+    let nextBtn =
+      nextBtns.find((n) => /multipicker_next/i.test(n.resourceId)) ??
+      (await matchNodeXmlOrOcr(ops, galPng, nextBtns, GALLERY_NEXT_RE));
+    if (!nextBtn) {
+      for (const cand of nextBtns) {
+        if (await isSolidBlueButton(galPng, cand.bounds)) {
+          nextBtn = cand;
+          break;
+        }
+      }
+    }
+    if (nextBtn) {
+      await ops.tap(nextBtn.bounds.cx, nextBtn.bounds.cy, 2200);
+      if (findTextInputNode(await ops.xml()) !== null) return true;
+      await ops.wait(900);
+      return findTextInputNode(await ops.xml()) !== null || !signal.aborted;
+    }
+    return await ops.attachMedia(true);
+  }
+  private async extractPostUrlFromScreen(
+    xml: LiteXmlNode | null,
+    targetInfo: { isTimeline: boolean; groupId: string },
+    ops: ScreenOps,
+    signal: AbortSignal,
+  ) {
+    if (!xml) return null;
+    const mode = targetInfo.isTimeline ? 'page' : 'group',
+      tryResolve = (raw: string) =>
+        resolveSharePostUrl(raw, targetInfo.groupId, mode).catch(() => null);
+    for (const n of flattenLiteNodes(xml)) {
+      const m = URL_IN_NODE_RE.exec(`${n.text} ${n.contentDesc}`);
+      if (m?.[0]) {
+        const res = await tryResolve(m[0]);
+        if (res?.postUrl) return res;
+      }
+    }
+    const topMore = extractPostCards(xml)[0]?.header.moreMenuBounds;
+    const rawClip =
+      topMore && typeof this.devices.copyLinkFromMoreMenu === 'function'
+        ? await this.devices
+            .copyLinkFromMoreMenu(ops.serial, topMore, ops.sw, ops.sh, signal)
+            .catch(() => null)
+        : null;
+    const res = rawClip ? await tryResolve(rawClip) : null;
+    return res?.postUrl ? res : null;
   }
   private async fillAndSubmitComposer(
     ops: ScreenOps,
     material: PosterMaterial,
+    targetInfo: { isTimeline: boolean; groupId: string },
     signal: AbortSignal,
     onStatus: (text: string) => void,
-  ): Promise<{ submitted: boolean; pendingApproval?: boolean; note?: string }> {
+  ): Promise<{
+    submitted: boolean;
+    pendingApproval?: boolean;
+    postId?: string;
+    postUrl?: string;
+    note?: string;
+  }> {
     const pushedRemote: string[] = [];
-    let submittedSuccessfully = false;
     const abortComposer = async (note: string) => (
       await ops.dismissDiscard(),
       { submitted: false as const, note }
@@ -149,8 +312,8 @@ export class BluestacksGroupPosterRunner {
               n.bounds.w <= 95 &&
               n.bounds.h >= 40 &&
               n.bounds.h <= 95 &&
-              n.bounds.y1 >= 560 &&
-              n.bounds.y2 <= 1020,
+              n.bounds.y1 >= 500 &&
+              n.bounds.y2 <= 1040,
             (a, b) => a.bounds.x1 - b.bounds.x1,
           ),
           pickedSwatch =
@@ -159,22 +322,18 @@ export class BluestacksGroupPosterRunner {
       }
       if (material.caption.trim()) {
         onStatus('正在填入发帖文案…');
-        const beforePasteSig = await getRegionSignature(compPng, inputNode.bounds).catch(
-          () => null,
-        );
+        const sigOf = (p: Buffer) => getRegionSignature(p, inputNode.bounds).catch(() => null);
+        const beforePasteSig = await sigOf(compPng);
         let captionVerified = false;
         for (let pasteAttempt = 0; pasteAttempt < 2; pasteAttempt++) {
           await ops.paste(inputNode.bounds.cx, inputNode.bounds.cy, material.caption.trim());
           await ops.wait(900);
-          const afterPastePng = await ops.png();
-          if (!beforePasteSig) {
-            captionVerified = true;
-            break;
-          }
-          const afterPasteSig = await getRegionSignature(afterPastePng, inputNode.bounds).catch(
-            () => null,
-          );
-          if (!afterPasteSig || signatureSimilarity(beforePasteSig, afterPasteSig) < 0.992) {
+          const afterPasteSig = beforePasteSig ? await sigOf(await ops.png()) : null;
+          if (
+            !beforePasteSig ||
+            !afterPasteSig ||
+            signatureSimilarity(beforePasteSig, afterPasteSig) < 0.992
+          ) {
             captionVerified = true;
             break;
           }
@@ -184,28 +343,27 @@ export class BluestacksGroupPosterRunner {
       }
       if (pushedRemote.length > 0) {
         onStatus('正在从相册附加图片/视频…');
-        const readBottomRows = async () => {
+        const MEDIA_RE =
+          /照片|视频|相片|影片|图库|相册|photo|video|gallery|media|image|ဓာတ်ပုံ|ဗီဒီယို|ảnh/i;
+        const findMediaBtn = async () => {
           ({ xml: compXml, png: compPng } = await ops.capture());
-          return filterClickableNodes(
+          const cands = filterClickableNodes(
             compXml,
-            (n) => n.bounds.w >= 620 && n.bounds.y1 >= 620 && n.bounds.h >= 44 && n.bounds.h <= 115,
+            (n) =>
+              n.bounds.y1 >= 420 &&
+              n.bounds.y2 <= 1560 &&
+              n.bounds.w >= 40 &&
+              n.bounds.h >= 36 &&
+              n.bounds.h <= 130,
+            (a, b) => b.bounds.w - a.bounds.w || a.bounds.y1 - b.bounds.y1,
           );
+          return matchNodeXmlOrOcr(ops, compPng, cands, MEDIA_RE, true);
         };
-        let bottomRows = await readBottomRows();
-        if (bottomRows.length === 0) {
-          await ops.back(700);
-          bottomRows = await readBottomRows();
-        }
-        const mediaRow = await ops.findOcr(
-          compPng,
-          bottomRows,
-          /照片|视频|相片|影片|photo|video|ဓာတ်ပုံ|ဗီဒီယို|ảnh/i,
-        );
-        let mediaAttached = false;
-        if (mediaRow) {
-          await ops.tap(mediaRow.node.bounds.cx, mediaRow.node.bounds.cy, 2500);
-          mediaAttached = await ops.attachMedia(true);
-        }
+        const mediaBtn = (await findMediaBtn()) ?? (await ops.back(700), await findMediaBtn());
+        const mediaAttached = mediaBtn
+          ? (await ops.tap(mediaBtn.bounds.cx, mediaBtn.bounds.cy, 2500),
+            await this.attachNewestGalleryMedia(ops, material.mediaKind, signal))
+          : false;
         if (!mediaAttached)
           return await abortComposer('未能从模拟器相册附加图片/视频，已取消发布防发空帖');
       }
@@ -214,17 +372,9 @@ export class BluestacksGroupPosterRunner {
         return await abortComposer('未回到发帖编辑框，已取消发布');
       const postBtns = filterClickableNodes(
         compXml,
-        (n) =>
-          (n.bounds.x2 >= 800 &&
-            n.bounds.x1 >= 440 &&
-            n.bounds.y1 <= 155 &&
-            n.bounds.h >= 34 &&
-            n.bounds.h <= 115) ||
-          (n.bounds.w >= 450 &&
-            n.bounds.y1 >= 980 &&
-            n.bounds.y2 <= 1580 &&
-            n.bounds.h >= 42 &&
-            n.bounds.h <= 130),
+        ({ bounds: b }) =>
+          (b.x2 >= 800 && b.x1 >= 440 && b.y1 <= 155 && b.h >= 34 && b.h <= 115) ||
+          (b.w >= 450 && b.y1 >= 880 && b.y2 <= 1585 && b.h >= 40 && b.h <= 135),
         (a, b) => b.bounds.y1 - a.bounds.y1,
       );
       let submitBtn: LiteXmlNode | null = null;
@@ -232,8 +382,8 @@ export class BluestacksGroupPosterRunner {
         const pt = await ops.ocr(compPng, pb.bounds);
         if (
           /发布|發佈|post|တင်|đăng|โพสต์/i.test(pt) ||
-          (pb.bounds.y1 <= 155 &&
-            pb.bounds.x2 >= 800 &&
+          (((pb.bounds.y1 <= 155 && pb.bounds.x2 >= 800) ||
+            (pb.bounds.w >= 450 && pb.bounds.y1 >= 880)) &&
             (await isSolidBlueButton(compPng, pb.bounds)))
         ) {
           submitBtn = pb;
@@ -247,76 +397,126 @@ export class BluestacksGroupPosterRunner {
           ? Math.min(868, Math.max(submitBtn.bounds.cx, submitBtn.bounds.x2 - 52))
           : submitBtn.bounds.cx;
       await ops.tap(submitTapX, submitBtn.bounds.cy, hasLocalMedia ? 4500 : 3200);
+      const captionNorm = material.caption.replace(/\s+/g, '').slice(0, 14);
+      const ok = (note?: string, pending = false, postId?: string, postUrl?: string) => ({
+        submitted: true,
+        pendingApproval: pending,
+        ...(postId ? { postId } : {}),
+        ...(postUrl ? { postUrl } : {}),
+        ...(note ? { note } : {}),
+      });
+      const hasReadbackEvidence = (xml: LiteXmlNode | null, compactText: string): boolean => {
+        if (!xml || findTextInputNode(xml) !== null) return false;
+        const xmlCompact = flattenLiteNodes(xml)
+          .map((n) => `${n.text}${n.contentDesc}`)
+          .join('')
+          .replace(/\s+/g, '');
+        if (
+          captionNorm.length >= 4 &&
+          (compactText.includes(captionNorm) || xmlCompact.includes(captionNorm))
+        )
+          return true;
+        return (
+          (RECENT_POST_RE.test(compactText) || RECENT_POST_RE.test(xmlCompact)) &&
+          (extractPostCards(xml).length > 0 || extractActionBars(xml).length > 0)
+        );
+      };
       const verifyDeadline =
         Date.now() +
         (hasLocalMedia && material.mediaKind === 'video'
           ? 30_000
           : hasLocalMedia
-            ? 15_000
+            ? 22_000
             : 10_000);
+      let sawNullXml = false,
+        sawInputPresent = false,
+        didScrollTimeline = false;
       for (;;) {
         ops.guard();
         const { xml: afterXml, png: afterPng } = await ops.capture(),
           postAbnormal = await ops.abnormal(afterXml, afterPng);
         if (postAbnormal) throw new Error(`账号异常 (${postAbnormal})，已中止发帖`);
-        const afterText = await ops.ocr(afterPng, makeCanonicalRect(0, 120, 900, 1480));
-        if (
-          /无法发布|無法發佈|发帖受限|發帖受限|暂时受限|無法執行|无法执行此操作|重试|couldn'tpost|youcan'tpost|somethingwentwrong|tryagain/i.test(
-            afterText,
-          )
-        )
+        const afterCompact = (
+          await ops.ocr(afterPng, makeCanonicalRect(0, 120, 900, 1480))
+        ).replace(/\s+/g, '');
+        if (POST_ERROR_OCR_RE.test(afterCompact))
           return await abortComposer('该小组发帖受限或发布失败');
-        const pendingNotice =
-          /待审核|待審核|等待管理员审核|等待管理員審核|submittedforapproval|pendingapproval|postispending|စိစစ်|ခွင့်ပြု|ဆိုင်းငံ့|chờphêduyệt|đangchờduyệt|รออนุมัติ/i.test(
-            afterText,
+        if (PENDING_APPROVAL_RE.test(afterCompact)) return ok('已提交（等待小组管理员审核）', true);
+        sawNullXml ||= afterXml === null;
+        sawInputPresent = afterXml !== null && findTextInputNode(afterXml) !== null;
+        let hasToast = POST_CONFIRM_TOAST_RE.test(afterCompact),
+          readbackXml = afterXml,
+          hasFeedReadback = hasReadbackEvidence(afterXml, afterCompact);
+        const onFeedScreen =
+          afterXml !== null &&
+          !sawInputPresent &&
+          (detectHomeTabBar(afterXml) !== null ||
+            extractPostCards(afterXml).length > 0 ||
+            extractActionBars(afterXml).length > 0);
+        if (
+          targetInfo.isTimeline &&
+          onFeedScreen &&
+          !hasToast &&
+          !hasFeedReadback &&
+          !didScrollTimeline &&
+          !/正在发布|正在發佈|正在上传|正在上傳|posting|uploading/i.test(afterCompact) &&
+          Date.now() + 2500 < verifyDeadline
+        ) {
+          didScrollTimeline = true;
+          await ops.swipe(450, 980, 450, 440, 420, 1400);
+          continue;
+        }
+        if (!hasFeedReadback && (onFeedScreen || hasToast) && Date.now() + 1200 < verifyDeadline) {
+          await ops.wait(1200);
+          const { xml: feedXml, png: feedPng } = await ops.capture(),
+            feedAbnormal = await ops.abnormal(feedXml, feedPng);
+          if (feedAbnormal) throw new Error(`账号异常 (${feedAbnormal})，已中止发帖核验`);
+          const feedCompact = (
+            await ops.ocr(feedPng, makeCanonicalRect(0, 120, 900, 1480))
+          ).replace(/\s+/g, '');
+          if (POST_ERROR_OCR_RE.test(feedCompact))
+            return await abortComposer('该小组发帖受限或发布失败');
+          if (PENDING_APPROVAL_RE.test(feedCompact))
+            return ok('已提交（等待小组管理员审核）', true);
+          hasToast ||= POST_CONFIRM_TOAST_RE.test(feedCompact);
+          readbackXml = feedXml ?? readbackXml;
+          hasFeedReadback = hasReadbackEvidence(feedXml, feedCompact);
+        }
+        if (hasToast || hasFeedReadback) {
+          const extracted = await this.extractPostUrlFromScreen(
+            readbackXml,
+            targetInfo,
+            ops,
+            signal,
           );
-        if (findTextInputNode(afterXml) === null || pendingNotice) {
-          submittedSuccessfully = true;
-          return {
-            submitted: true,
-            pendingApproval: pendingNotice,
-            note: pendingNotice ? '已提交（等待小组管理员审核）' : undefined,
-          };
+          return extracted?.postUrl
+            ? ok(undefined, false, extracted.postId, extracted.postUrl)
+            : ok('已提交发布，未提取到帖子链接（待审核/待核验）', true);
         }
         if (Date.now() >= verifyDeadline) break;
         await ops.wait(2200);
       }
-      return await abortComposer('发帖框未关闭，未能确认发布成功');
+      if (sawInputPresent) return await abortComposer('发帖框未关闭，未能确认发布成功');
+      return {
+        submitted: false,
+        note: sawNullXml
+          ? 'UNKNOWN: 未获取到界面节点树，未能确认发布结果'
+          : 'UNKNOWN: 未检测到发布成功提示或帖子回读证据',
+      };
     } finally {
-      if (pushedRemote.length > 0 && !submittedSuccessfully)
-        await this.devices.cleanupPushedMedia(ops.serial, pushedRemote);
+      if (pushedRemote.length > 0)
+        await this.devices.cleanupPushedMedia?.(ops.serial, pushedRemote)?.catch(() => {});
     }
   }
-  async run(
-    instanceId: string,
-    materials: readonly PosterMaterial[],
-    groups: readonly BumperTarget[],
-    options: {
-      maxGroupsPerInstance: number;
-      materialsPerGroup?: number | undefined;
-      postToTimeline: boolean;
-      claimNextGroupJob?: () =>
-        | Promise<{ group: BumperTarget; material: PosterMaterial } | null>
-        | { group: BumperTarget; material: PosterMaterial }
-        | null;
-      releaseGroupJob?: (groupId: string, materialId: string, posted: boolean) => void;
-      hasGroupPostedMaterial?: (groupId: string, materialId: string) => Promise<boolean> | boolean;
-    },
-    signal: AbortSignal,
-    callbacks: {
-      status(text: string): void;
-      posted(): void;
-      onPostLog?(log: PosterLog, isTimeline: boolean): Promise<void> | void;
-      onTargetFailed?(info: {
-        groupId: string;
-        groupName: string;
-        isTimeline: boolean;
-        material: PosterMaterial;
-        reason: string;
-      }): Promise<void> | void;
-    },
-  ): Promise<BluestacksPosterOutcome> {
-    const outcome: BluestacksPosterOutcome = { posted: 0, skipped: 0, notes: [] };
+  run: BluestacksPosterRunnerPort['run'] = async (
+    instanceId,
+    materials,
+    groups,
+    options,
+    signal,
+    callbacks,
+  ) => {
+    const outcome = { posted: 0, skipped: 0, notes: [] as string[] };
     if (materials.length === 0) return outcome;
     callbacks.status('正在校验蓝蝶连接与 FB Lite 账号…');
     const inst: BluestacksInstance = await this.devices.ensureReadyAndLoggedIn(instanceId, signal),
@@ -352,38 +552,43 @@ export class BluestacksGroupPosterRunner {
       const opened = isTimeline
         ? await this.openOwnTimelineComposer(ops, callbacks.status)
         : await this.openGroupAndEnterComposer(ops, target.group, callbacks.status);
-      if (!opened) return failTarget('未能打开小组发帖入口');
-      const res = await this.fillAndSubmitComposer(ops, material, signal, callbacks.status);
+      if (!opened)
+        return failTarget(isTimeline ? '未能打开时间线发帖入口' : '未能打开小组发帖入口');
+      const groupId = isTimeline ? '__page_timeline__' : target.group.id;
+      const res = await this.fillAndSubmitComposer(
+        ops,
+        material,
+        { isTimeline, groupId },
+        signal,
+        callbacks.status,
+      );
       if (!res.submitted) return failTarget(res.note ?? '发布未确认');
       outcome.posted++;
       if (res.note) outcome.notes.push(`${label}: ${res.note}`);
-      const groupId = isTimeline ? '__page_timeline__' : target.group.id,
-        posterLog: PosterLog = {
-          id: randomUUID(),
-          profileId: inst.id,
-          accountId: inst.numericAccountId || inst.accountId || inst.id,
-          accountName: inst.accountName || inst.displayName,
-          accountAvatar: inst.avatarUrl,
-          identityType,
-          groupId,
-          groupName: label,
-          groupAvatar: isTimeline ? null : target.group.avatarUrl,
-          materialId: material.id,
-          captionPreview: formatPosterCaptionPreview(
-            material.caption,
-            material.mediaSource,
-            material.mediaKind,
-          ),
-          postId: res.pendingApproval
-            ? 'pending_approval'
-            : sha256NumericId(`bs-post:${inst.id}:${groupId}:${material.id}:${Date.now()}`),
-          postUrl: '',
-          postedAt: Date.now(),
-        };
+      const posterLog: PosterLog = {
+        id: randomUUID(),
+        profileId: inst.id,
+        accountId: resolveEffectiveBsAccountId(inst),
+        accountName: inst.accountName || inst.displayName,
+        accountAvatar: inst.avatarUrl,
+        identityType,
+        groupId,
+        groupName: label,
+        groupAvatar: isTimeline ? null : target.group.avatarUrl,
+        materialId: material.id,
+        captionPreview: formatPosterCaptionPreview(
+          material.caption,
+          material.mediaSource,
+          material.mediaKind,
+        ),
+        postId: res.pendingApproval ? 'pending_approval' : res.postId || 'pending_approval',
+        postUrl: res.postUrl ?? '',
+        postedAt: Date.now(),
+      };
       if (this.logSink)
         await Promise.resolve(this.logSink.recordPost(posterLog)).catch(() => false);
       callbacks.posted();
-      if (callbacks.onPostLog) await callbacks.onPostLog(posterLog, isTimeline);
+      await callbacks.onPostLog?.(posterLog, isTimeline);
       return true;
     };
     const gapWait = () => ops.wait(2500 + Math.floor(Math.random() * 2000));
@@ -430,10 +635,9 @@ export class BluestacksGroupPosterRunner {
     for (let idx = 0; idx < jobs.length; idx++) {
       ops.guard();
       const job = jobs[idx];
-      if (!job) continue;
-      await executeOneTarget(job.target, job.material);
+      if (job) await executeOneTarget(job.target, job.material);
       if (idx + 1 < jobs.length) await gapWait();
     }
     return outcome;
-  }
+  };
 }

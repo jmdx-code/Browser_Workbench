@@ -1,7 +1,6 @@
 import type { z } from 'zod';
 import type { Combination, Step } from '../../shared/contracts.js';
 import type { Progress, TaskCommand, TaskStepBudget } from '../../shared/task-contracts.js';
-
 export type FeatureModuleId =
   | 'auto-scheduler'
   | 'active-accounts'
@@ -20,12 +19,9 @@ export type FeatureModuleId =
   | 'bluestacks-group-inviter'
   | 'window-layout'
   | 'records';
-
 export type SheetsModuleId =
   'sheets-schedule' | 'sheets-records' | 'sheets-groups' | 'sheets-pages';
-
 export type StepBudget = z.infer<typeof TaskStepBudget>;
-
 export interface ProfileActivityDescriptor {
   moduleId: FeatureModuleId;
   moduleLabel: string;
@@ -44,7 +40,6 @@ export interface ProfileActivityDescriptor {
       }
     | undefined;
 }
-
 export interface FeatureNavItem {
   id: FeatureModuleId;
   group: 'control' | 'automation' | 'bluestacks' | 'sheets' | 'monitor';
@@ -55,23 +50,18 @@ export interface FeatureNavItem {
   badgeCount?: number | undefined;
   badgeTone?: 'run' | 'warn' | 'err' | 'ok' | undefined;
 }
-
 export interface SelectionControlSummary {
-  pausableTargets: TaskCommand['plans'];
-  resumableTargets: TaskCommand['plans'];
   stoppableTargets: TaskCommand['plans'];
   stoppableModuleProfileIds: string[];
   totalStoppableCount: number;
   isProfileBusy: (profileId: string) => boolean;
 }
-
 export const MODULE_LABELS: Record<string, string> = {
   'group-poster': '小组发帖',
   'group-bumper': '小组顶贴',
   'page-bumper': '专页顶贴',
   'group-inviter': '小组邀请人',
 };
-
 export const BREADCRUMB_LABELS: Record<string, string> = {
   home: '活跃账号',
   edit: '活跃账号 · 编辑组合',
@@ -90,8 +80,8 @@ export const BREADCRUMB_LABELS: Record<string, string> = {
   'bluestacks-page-bumper': '蓝蝶专页顶贴',
   'bluestacks-group-inviter': '蓝蝶小组邀请人',
   'window-layout': '窗口排版',
+  records: '数据与记录',
 };
-
 export function buildFeatureNavItems(p: {
   carrier?: 'browser' | 'bluestacks';
   activeSheetsModule?: SheetsModuleId;
@@ -113,7 +103,7 @@ export function buildFeatureNavItems(p: {
   bluestacksBumperRunningCount?: number;
   bluestacksPageBumperRunningCount?: number;
   bluestacksInviterRunningCount?: number;
-  attentionCount: number;
+  attentionCount?: number;
 }): FeatureNavItem[] {
   const isBs = p.carrier === 'bluestacks';
   const activeId: FeatureModuleId = isBs ? 'bluestacks-active' : 'active-accounts';
@@ -125,7 +115,6 @@ export function buildFeatureNavItems(p: {
   const schedEn = p.autoSchedulerEnabledCount ?? 0;
   const sheetsRun = (p.sheetsScheduleRunningCount ?? 0) + (p.sheetsRecordsRunningCount ?? 0);
   const sheetsEn = (p.sheetsScheduleEnabledCount ?? 0) + (p.sheetsRecordsEnabledCount ?? 0);
-
   return [
     {
       id: 'auto-scheduler',
@@ -139,11 +128,12 @@ export function buildFeatureNavItems(p: {
     {
       id: 'records',
       group: 'control',
-      title: '发帖顶贴记录',
-      tooltip: '发帖与顶贴记录 · 统一表头与一键复制',
+      title: '数据与记录',
+      tooltip: '数据与记录 · 账号活动统计、发帖/顶贴/邀人明细与多维筛选',
       icon: 'records',
-      badgeCount: p.attentionCount,
-      badgeTone: 'err',
+      ...(p.attentionCount && p.attentionCount > 0
+        ? { badgeCount: p.attentionCount, badgeTone: 'err' as const }
+        : {}),
     },
     {
       id: 'window-layout',
@@ -217,9 +207,7 @@ export function buildFeatureNavItems(p: {
     },
   ];
 }
-
 export const ACTIVE_CLOSE_BROWSER_STORAGE_KEY = 'wb.activeAccounts.closeBrowserOnFinish';
-
 export function readStoredCloseBrowserOnFinish(): boolean {
   try {
     return window.localStorage.getItem(ACTIVE_CLOSE_BROWSER_STORAGE_KEY) === '1';
@@ -227,14 +215,12 @@ export function readStoredCloseBrowserOnFinish(): boolean {
     return false;
   }
 }
-
 export const normalizeCombinationResources = (value: Combination): Combination => ({
   ...value,
   steps: value.steps.map((s) =>
     s.type === 'post' ? { ...s, resourceMode: 'table' as const, resourceDirectory: '' } : s,
   ),
 });
-
 export const newPostStep = (id: string, destination: 'post' | 'story' = 'post'): Step => ({
   id,
   type: 'post',
@@ -247,7 +233,6 @@ export const newPostStep = (id: string, destination: 'post' | 'story' = 'post'):
   forbidSameAccountRepeat: true,
   archivePublished: false,
 });
-
 export function newCombination(destination?: 'post' | 'story'): Combination {
   return {
     name:

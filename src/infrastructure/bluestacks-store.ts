@@ -3,11 +3,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { ProductError } from '../domain/workspace.js';
 import * as BS from '../shared/bluestacks.js';
+import { aggregateDailyUsageOverview } from '../shared/daily-risk-limits.js';
 import {
   BumperSettings,
   isLocalAvatar,
   type BumperComment,
-  type BumperDailyStat,
   type BumperLog,
   type BumperScope,
   type BumperTarget,
@@ -29,7 +29,6 @@ import {
   ensureTargetLibrarySchema,
   SqliteTargetLibraryRepository,
 } from './target-library-store.js';
-
 export function deterministicBluestacksId(instanceKey: string): string {
   const b = Uint8Array.from(
     createHash('sha256')
@@ -61,13 +60,11 @@ export interface BluestacksSavedSettings {
   pageBumperSettings: BumperSettings;
   riskLimitSettings: BS.BluestacksRiskLimitSettings;
 }
-
 const DEFAULT_BUMPER = BumperSettings.parse({
   searchMode: 'page_group_feed',
   maxConcurrentProfiles: 4,
 });
 const DEFAULT_PAGE_BUMPER = BumperSettings.parse({ maxPostsPerPage: 3, maxConcurrentProfiles: 4 });
-
 function initBluestacksSchema(db: DatabaseSync): void {
   ensureTargetLibrarySchema(db);
   ensurePostBumpRecordsSchema(db);
@@ -112,8 +109,20 @@ function initBluestacksSchema(db: DatabaseSync): void {
       ['fb_lite_version', 'TEXT'],
     ]);
   }
+  for (const r of Q.allRows(
+    db,
+    "SELECT id,display_name,instance_key,account_id,numeric_account_id FROM bluestacks_instances WHERE account_id LIKE '%(%)'",
+  ))
+    if (isCompositeRowAcc(Q.s(r.account_id), r))
+      Q.run(
+        db,
+        'UPDATE bluestacks_instances SET account_id=? WHERE id=?',
+        Q.s(r.numeric_account_id).trim(),
+        Q.s(r.id),
+      );
 }
-
+const isCompositeRowAcc = (raw: string, r: Record<string, unknown>) =>
+  BS.isCompositePlaceholderBsAccountId(raw, Q.s(r.display_name), Q.s(r.instance_key));
 function mapInstanceRow(r: Record<string, unknown>, online = false): BS.BluestacksInstance {
   const adbPort = Q.n(r.adb_port, 5555),
     rawSdk = Number(r.android_sdk),
@@ -123,10 +132,13 @@ function mapInstanceRow(r: Record<string, unknown>, online = false): BS.Bluestac
           () => z.array(BS.BluestacksManagedIdentitySchema).safeParse(JSON.parse(rawIds)),
           null,
         )
-      : null;
+      : null,
+    rawAccId = Q.s(r.account_id).trim(),
+    cleanAccId = isCompositeRowAcc(rawAccId, r) ? Q.s(r.numeric_account_id).trim() : rawAccId;
   const { managedIdentitiesJson: _m, ...base } = Q.camel(r);
   return BS.BluestacksInstanceSchema.parse({
     ...base,
+    accountId: cleanAccId,
     alias: Q.nonEmptyTrimmed(r.alias),
     folderId: Q.nonEmptyTrimmed(r.folder_id),
     adbPort,
@@ -144,12 +156,10 @@ function mapInstanceRow(r: Record<string, unknown>, online = false): BS.Bluestac
     fbLiteVersion: Q.nonEmptyTrimmed(r.fb_lite_version),
   });
 }
-
 function saveBluestacksJsonCol<T>(db: DatabaseSync, col: string, parsed: T): T {
   Q.run(db, `UPDATE bluestacks_settings SET ${col}=? WHERE id=1`, JSON.stringify(parsed));
   return parsed;
 }
-
 export class SqliteBluestacksRepository {
   private readonly targetLibrary: SqliteTargetLibraryRepository;
   constructor(private readonly db: DatabaseSync) {
@@ -157,45 +167,34 @@ export class SqliteBluestacksRepository {
     this.targetLibrary = new SqliteTargetLibraryRepository(db);
   }
   savedSettings(): BluestacksSavedSettings {
-    const row = Q.getRow(
+    const r = Q.getRow(
       this.db,
-      'SELECT install_dir, conf_path, apk_path, bumper_settings, page_bumper_settings, risk_limit_settings FROM bluestacks_settings WHERE id=1',
+      'SELECT install_dir,conf_path,apk_path,bumper_settings,page_bumper_settings,risk_limit_settings FROM bluestacks_settings WHERE id=1',
     );
-    const parseBumper = (raw: unknown, extra: Record<string, unknown>, fallback: BumperSettings) =>
-      Q.parseWithFallback(
-        () => BumperSettings.parse({ ...extra, ...Q.parseJsonObject(raw) }),
-        fallback,
-      );
+    const parseBumper = (raw: unknown, extra: Record<string, unknown>, fb: BumperSettings) =>
+      Q.parseWithFallback(() => BumperSettings.parse({ ...extra, ...Q.parseJsonObject(raw) }), fb);
     return {
-      installDir: Q.nonEmptyTrimmed(row?.install_dir),
-      confPath: Q.nonEmptyTrimmed(row?.conf_path),
-      apkPath: Q.nonEmptyTrimmed(row?.apk_path),
-      bumperSettings: parseBumper(
-        row?.bumper_settings,
-        { maxConcurrentProfiles: 4 },
-        DEFAULT_BUMPER,
-      ),
+      installDir: Q.nonEmptyTrimmed(r?.install_dir),
+      confPath: Q.nonEmptyTrimmed(r?.conf_path),
+      apkPath: Q.nonEmptyTrimmed(r?.apk_path),
+      bumperSettings: parseBumper(r?.bumper_settings, { maxConcurrentProfiles: 4 }, DEFAULT_BUMPER),
       pageBumperSettings: parseBumper(
-        row?.page_bumper_settings,
+        r?.page_bumper_settings,
         { maxPostsPerPage: 3, maxConcurrentProfiles: 4 },
         DEFAULT_PAGE_BUMPER,
       ),
       riskLimitSettings: Q.parseWithFallback(
-        () => BS.BluestacksRiskLimitSettings.parse(Q.parseJsonObject(row?.risk_limit_settings)),
+        () => BS.BluestacksRiskLimitSettings.parse(Q.parseJsonObject(r?.risk_limit_settings)),
         BS.DEFAULT_BLUESTACKS_RISK_LIMIT_SETTINGS,
       ),
     };
   }
-  saveRiskLimitSettings = (input: unknown) =>
-    saveBluestacksJsonCol(
-      this.db,
-      'risk_limit_settings',
-      BS.BluestacksRiskLimitSettings.parse(input),
-    );
-  saveBumperSettings = (input: unknown) =>
-    saveBluestacksJsonCol(this.db, 'bumper_settings', BumperSettings.parse(input));
-  savePageBumperSettings = (input: unknown) =>
-    saveBluestacksJsonCol(this.db, 'page_bumper_settings', BumperSettings.parse(input));
+  saveRiskLimitSettings = (i: unknown) =>
+    saveBluestacksJsonCol(this.db, 'risk_limit_settings', BS.BluestacksRiskLimitSettings.parse(i));
+  saveBumperSettings = (i: unknown) =>
+    saveBluestacksJsonCol(this.db, 'bumper_settings', BumperSettings.parse(i));
+  savePageBumperSettings = (i: unknown) =>
+    saveBluestacksJsonCol(this.db, 'page_bumper_settings', BumperSettings.parse(i));
   savePaths(input: unknown): BluestacksSavedSettings {
     const p = BS.UpdateBluestacksPathsInput.parse(input),
       c = this.savedSettings(),
@@ -218,101 +217,75 @@ export class SqliteBluestacksRepository {
     const parsedId = z.uuid().parse(instanceId),
       inc = Math.max(0, Math.round(delta));
     if (inc <= 0) return;
+    const ymd = Q.formatLocalYmd(new Date(now));
     const sql =
       'INSERT INTO bluestacks_daily_actions(ymd, instance_id, active_likes, active_actions, updated_at) VALUES(?,?,?,?,?) ON CONFLICT(ymd, instance_id) DO UPDATE SET active_likes=active_likes+excluded.active_likes, active_actions=active_actions+excluded.active_actions, updated_at=excluded.updated_at';
-    Q.run(
-      this.db,
-      sql,
-      Q.formatLocalYmd(new Date(now)),
-      parsedId,
-      kind === 'like' ? inc : 0,
-      inc,
-      now,
-    );
+    Q.run(this.db, sql, ymd, parsedId, kind === 'like' ? inc : 0, inc, now);
+    if (Q.sqliteTableExists(this.db, 'account_daily_activity_stats')) {
+      const inst = this.getInstance(parsedId);
+      const accountId = inst ? BS.resolveEffectiveBsAccountId(inst) : parsedId;
+      Q.run(
+        this.db,
+        `INSERT INTO account_daily_activity_stats(ymd, carrier, profile_id, account_id, active_duration_ms, active_likes, active_friends, active_actions, last_active_at, updated_at)
+         VALUES(?, 'bluestacks', ?, ?, 0, ?, 0, ?, ?, ?)
+         ON CONFLICT(ymd, carrier, profile_id) DO UPDATE SET
+           account_id=CASE WHEN excluded.account_id<>'' THEN excluded.account_id ELSE account_daily_activity_stats.account_id END,
+           active_likes=active_likes+excluded.active_likes,
+           active_actions=active_actions+excluded.active_actions,
+           last_active_at=MAX(COALESCE(last_active_at, 0), excluded.last_active_at),
+           updated_at=excluded.updated_at`,
+        ymd,
+        parsedId,
+        accountId,
+        kind === 'like' ? inc : 0,
+        inc,
+        now,
+        now,
+      );
+    }
   }
   dailyInstanceUsage(now = Date.now()): BS.BluestacksDailyUsageOverview {
     const dateYmd = Q.formatLocalYmd(new Date(now)),
       dayStartMs = Q.localDayStartMs(now),
       risk = this.savedSettings().riskLimitSettings,
       counts = new Map<string, BS.BluestacksRawDailyCounts>();
-    const slot = (id: string) => {
-      let c = counts.get(id);
-      if (!c) {
-        c = {
-          groupBumpsToday: 0,
-          pageBumpsToday: 0,
-          postsToday: 0,
-          invitesToday: 0,
-          activeLikesToday: 0,
-          activeActionsToday: 0,
-        };
-        counts.set(id, c);
-      }
-      return c;
-    };
-    for (const r of Q.allRows(this.db, 'SELECT id FROM bluestacks_instances')) slot(Q.s(r.id));
-    const bumpSql =
-      'SELECT profile_id, source_mode, COUNT(*) n FROM group_bumper_effects WHERE applied_at>=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id, source_mode';
-    for (const r of Q.allRows(this.db, bumpSql, dayStartMs)) {
-      const c = slot(Q.s(r.profile_id));
-      if (Q.s(r.source_mode) === 'page') c.pageBumpsToday += Q.n(r.n);
-      else c.groupBumpsToday += Q.n(r.n);
+    const hasInviterLogs = Q.sqliteTableExists(this.db, 'group_inviter_logs');
+    const batchedSql = `SELECT b.id AS instance_id, COALESCE(SUM(u.group_bumps),0) AS group_bumps, COALESCE(SUM(u.page_bumps),0) AS page_bumps, COALESCE(SUM(u.posts),0) AS posts, COALESCE(SUM(u.invites),0) AS invites, COALESCE(SUM(u.active_likes),0) AS active_likes, COALESCE(SUM(u.active_actions),0) AS active_actions FROM bluestacks_instances b LEFT JOIN (
+      SELECT profile_id AS instance_id, CASE WHEN source_mode='page' THEN 0 ELSE 1 END AS group_bumps, CASE WHEN source_mode='page' THEN 1 ELSE 0 END AS page_bumps, 0 AS posts, 0 AS invites, 0 AS active_likes, 0 AS active_actions FROM group_bumper_effects WHERE applied_at>=?
+      UNION ALL SELECT profile_id AS instance_id,0,0,1,0,0,0 FROM post_bump_records WHERE record_type='post' AND status='success' AND created_at>=?
+      ${hasInviterLogs ? "UNION ALL SELECT profile_id AS instance_id,0,0,0,1,0,0 FROM group_inviter_logs WHERE invited_at>=? AND confirmation='CONFIRMED'" : ''}
+      UNION ALL SELECT instance_id,0,0,0,0,active_likes,active_actions FROM bluestacks_daily_actions WHERE ymd=?
+    ) u ON u.instance_id=b.id GROUP BY b.id`;
+    const params = hasInviterLogs
+      ? [dayStartMs, dayStartMs, dayStartMs, dateYmd]
+      : [dayStartMs, dayStartMs, dateYmd];
+    for (const r of Q.allRows(this.db, batchedSql, ...params)) {
+      counts.set(Q.s(r.instance_id), {
+        groupBumpsToday: Q.n(r.group_bumps),
+        pageBumpsToday: Q.n(r.page_bumps),
+        postsToday: Q.n(r.posts),
+        invitesToday: Q.n(r.invites),
+        activeLikesToday: Q.n(r.active_likes),
+        activeActionsToday: Q.n(r.active_actions),
+      });
     }
-    const postSql =
-      "SELECT profile_id, COUNT(*) n FROM post_bump_records WHERE record_type='post' AND status='success' AND created_at>=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id";
-    for (const r of Q.allRows(this.db, postSql, dayStartMs))
-      slot(Q.s(r.profile_id)).postsToday += Q.n(r.n);
-    if (Q.sqliteTableExists(this.db, 'group_inviter_logs')) {
-      const invSql =
-        "SELECT profile_id, COUNT(*) n FROM group_inviter_logs WHERE invited_at>=? AND confirmation='CONFIRMED' AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id";
-      for (const r of Q.allRows(this.db, invSql, dayStartMs))
-        slot(Q.s(r.profile_id)).invitesToday += Q.n(r.n);
-    }
-    const actSql =
-      'SELECT instance_id, active_likes, active_actions FROM bluestacks_daily_actions WHERE ymd=?';
-    for (const r of Q.allRows(this.db, actSql, dateYmd)) {
-      const c = counts.get(Q.s(r.instance_id));
-      if (c) {
-        c.activeLikesToday += Q.n(r.active_likes);
-        c.activeActionsToday += Q.n(r.active_actions);
-      }
-    }
-    const out: BS.BluestacksDailyUsageOverview = {
+    const { perTarget, reachedLimitTargets, ...ovRest } = aggregateDailyUsageOverview(
       dateYmd,
-      totalGroupBumps: 0,
-      totalPageBumps: 0,
-      totalPosts: 0,
-      totalInvites: 0,
-      totalActiveLikes: 0,
-      totalActions: 0,
-      reachedLimitInstances: 0,
-      perInstance: {},
-    };
-    for (const [id, raw] of counts) {
-      const ev = BS.evaluateBluestacksRiskQuota(risk, id, raw);
-      out.perInstance[id] = {
-        instanceId: id,
-        ...raw,
-        totalActionsToday: ev.totalActions,
-        effectiveLimits: ev.effectiveLimits,
-        hasOverride: ev.hasOverride,
-        limitReached: !ev.allowed,
-        limitReason: ev.reason,
-      };
-      out.totalGroupBumps += raw.groupBumpsToday;
-      out.totalPageBumps += raw.pageBumpsToday;
-      out.totalPosts += raw.postsToday;
-      out.totalInvites += raw.invitesToday;
-      out.totalActiveLikes += raw.activeLikesToday;
-      out.totalActions += ev.totalActions;
-      if (!ev.allowed) out.reachedLimitInstances++;
-    }
-    return out;
+      counts,
+      risk,
+      risk.perInstanceOverrides,
+      '蓝蝶风控',
+    );
+    const perInstance: Record<string, BS.BluestacksDailyInstanceStats> = {};
+    for (const [id, { targetId, ...rest }] of Object.entries(perTarget))
+      perInstance[id] = { instanceId: targetId, ...rest };
+    return { ...ovRest, reachedLimitInstances: reachedLimitTargets, perInstance };
   }
-  folders = (): BS.BluestacksFolder[] => {
-    const sql = 'SELECT id, name, sort_order FROM bluestacks_folders ORDER BY sort_order, id';
-    return Q.allRows(this.db, sql).map((r) => BS.BluestacksFolderSchema.parse(Q.camel(r)));
-  };
+  folders = (): BS.BluestacksFolder[] =>
+    Q.allRows(
+      this.db,
+      'SELECT id, name, sort_order FROM bluestacks_folders ORDER BY sort_order, id',
+    ).map((r) => BS.BluestacksFolderSchema.parse(Q.camel(r)));
   createFolder(input: unknown): BS.BluestacksFolder {
     const { name } = BS.CreateBluestacksFolderInput.parse(input);
     return transaction(this.db, () => {
@@ -335,8 +308,11 @@ export class SqliteBluestacksRepository {
     return transaction(this.db, () => {
       const ex = Q.getRow(this.db, 'SELECT id, sort_order FROM bluestacks_folders WHERE id=?', id);
       if (!ex) throw new ProductError('FOLDER_NOT_FOUND', '分组不存在', 404);
-      const dupSql = 'SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?) AND id<>?';
-      if (this.db.prepare(dupSql).get(name, id))
+      if (
+        this.db
+          .prepare('SELECT 1 FROM bluestacks_folders WHERE lower(name)=lower(?) AND id<>?')
+          .get(name, id)
+      )
         throw new ProductError('FOLDER_NAME_EXISTS', '同名分组已存在', 409);
       Q.run(this.db, 'UPDATE bluestacks_folders SET name=? WHERE id=?', name, id);
       return { id, name, sortOrder: Q.n(ex.sort_order) };
@@ -352,22 +328,29 @@ export class SqliteBluestacksRepository {
   reorderFolders(input: unknown): void {
     const { ids } = BS.ReorderBluestacksFoldersInput.parse(input);
     transaction(this.db, () => {
-      const folderIds = new Set(this.folders().map((f) => f.id));
-      Q.assertCompleteIdOrder(ids, folderIds, 'FOLDER_ORDER_INVALID', '分组列表已变化，请刷新');
+      Q.assertCompleteIdOrder(
+        ids,
+        new Set(this.folders().map((f) => f.id)),
+        'FOLDER_ORDER_INVALID',
+        '分组列表已变化，请刷新',
+      );
       const stmt = this.db.prepare('UPDATE bluestacks_folders SET sort_order=? WHERE id=?');
       ids.forEach((id, idx) => stmt.run(idx, id));
     });
   }
   listInstances(onlineKeys?: ReadonlyArray<string>): BS.BluestacksInstance[] {
-    const onlineSet = new Set(onlineKeys ?? []),
-      sql = 'SELECT * FROM bluestacks_instances ORDER BY sort_order, display_name, instance_key';
-    return Q.allRows(this.db, sql).map((r) =>
-      mapInstanceRow(r, onlineSet.has(Q.s(r.instance_key))),
-    );
+    const onlineSet = new Set(onlineKeys ?? []);
+    return Q.allRows(
+      this.db,
+      'SELECT * FROM bluestacks_instances ORDER BY sort_order, display_name, instance_key',
+    ).map((r) => mapInstanceRow(r, onlineSet.has(Q.s(r.instance_key))));
   }
   getInstance(id: string): BS.BluestacksInstance | null {
-    const sql = 'SELECT * FROM bluestacks_instances WHERE id=?';
-    const row = Q.getRow(this.db, sql, z.uuid().parse(id));
+    const row = Q.getRow(
+      this.db,
+      'SELECT * FROM bluestacks_instances WHERE id=?',
+      z.uuid().parse(id),
+    );
     return row ? mapInstanceRow(row, false) : null;
   }
   upsertDiscoveredInstances(
@@ -377,11 +360,11 @@ export class SqliteBluestacksRepository {
     return transaction(this.db, () => {
       let nextOrder = Q.nextSortOrder(this.db, 'bluestacks_instances', 'folder_id IS NULL');
       const selectByKey = this.db.prepare(
-        'SELECT * FROM bluestacks_instances WHERE instance_key=?',
-      );
-      const insSql =
-        'INSERT INTO bluestacks_instances(id,instance_key,display_name,sort_order,adb_port,fb_width,fb_height,fb_lite_installed,account_state,updated_at,android_sdk,fb_lite_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)';
-      const ins = this.db.prepare(insSql),
+          'SELECT * FROM bluestacks_instances WHERE instance_key=?',
+        ),
+        ins = this.db.prepare(
+          'INSERT INTO bluestacks_instances(id,instance_key,display_name,sort_order,adb_port,fb_width,fb_height,fb_lite_installed,account_state,updated_at,android_sdk,fb_lite_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        ),
         upd = this.db.prepare(
           'UPDATE bluestacks_instances SET display_name=?, adb_port=?, fb_width=?, fb_height=?, fb_lite_installed=?, account_state=?, android_sdk=COALESCE(?, android_sdk), fb_lite_version=COALESCE(?, fb_lite_version), updated_at=? WHERE instance_key=?',
         );
@@ -392,7 +375,7 @@ export class SqliteBluestacksRepository {
           inst = item.fbLiteInstalled,
           instNum = inst === true ? 1 : inst === false ? 0 : null;
         if (!ex) {
-          const args = [
+          ins.run(
             deterministicBluestacksId(key),
             key,
             item.displayName.trim() || key,
@@ -405,19 +388,18 @@ export class SqliteBluestacksRepository {
             now,
             item.androidSdk ?? null,
             item.fbLiteVersion ?? null,
-          ];
-          ins.run(...args);
+          );
         } else {
           const prevInst =
-            ex.fb_lite_installed === 1 ? true : ex.fb_lite_installed === 0 ? false : null;
-          const merged = inst !== null ? inst : prevInst,
-            prevState = BS.BluestacksAccountState.parse(Q.s(ex.account_state, 'unknown'));
-          const nextState: BS.BluestacksAccountState =
-            inst === false
-              ? 'missing-app'
-              : inst === true && prevState === 'missing-app'
-                ? 'unknown'
-                : prevState;
+              ex.fb_lite_installed === 1 ? true : ex.fb_lite_installed === 0 ? false : null,
+            merged = inst !== null ? inst : prevInst,
+            prevState = BS.BluestacksAccountState.parse(Q.s(ex.account_state, 'unknown')),
+            nextState: BS.BluestacksAccountState =
+              inst === false
+                ? 'missing-app'
+                : inst === true && prevState === 'missing-app'
+                  ? 'unknown'
+                  : prevState;
           upd.run(
             item.displayName.trim() || Q.s(ex.display_name),
             item.adbPort > 0 ? item.adbPort : Q.n(ex.adb_port),
@@ -455,14 +437,18 @@ export class SqliteBluestacksRepository {
     return transaction(this.db, () => {
       const ex = Q.getRow(this.db, 'SELECT * FROM bluestacks_instances WHERE id=?', parsedId);
       if (!ex) throw new ProductError('INSTANCE_NOT_FOUND', '蓝蝶实例不存在', 404);
-      const cleared = input.accountState === 'logged-out' || input.accountState === 'missing-app',
+      const cleared =
+          input.accountState === 'logged-out' ||
+          input.accountState === 'missing-app' ||
+          input.accountState === 'unknown',
         keep = ['logged-in', 'restricted', 'verification'].includes(input.accountState);
       const prevAv = typeof ex.avatar_url === 'string' ? ex.avatar_url : null;
-      const nextAv = cleared
-        ? null
-        : input.avatarUrl && (isLocalAvatar(input.avatarUrl) || !isLocalAvatar(prevAv))
-          ? input.avatarUrl
-          : prevAv;
+      const nextAv =
+        cleared || input.avatarUrl === null
+          ? null
+          : input.avatarUrl && (isLocalAvatar(input.avatarUrl) || !isLocalAvatar(prevAv))
+            ? input.avatarUrl
+            : prevAv;
       const prevName = Q.s(ex.account_name),
         nextName = keep ? input.accountName?.trim() || prevName : '',
         inName = input.accountName?.trim();
@@ -472,7 +458,11 @@ export class SqliteBluestacksRepository {
           ? input.numericAccountId.trim()
           : '';
       const nextNumId = cleared ? '' : inNum || (nameCh ? '' : Q.s(ex.numeric_account_id));
-      const nextAccId = keep ? input.accountId?.trim() || nextNumId || Q.s(ex.account_id) : '';
+      const cleanAcc = (raw: string | undefined) =>
+        raw && !isCompositeRowAcc(raw, ex) ? raw.trim() : '';
+      const nextAccId = keep
+        ? cleanAcc(input.accountId) || nextNumId || (nameCh ? '' : cleanAcc(Q.s(ex.account_id)))
+        : '';
       const nextIdType: BS.BluestacksIdentityType = cleared
         ? 'unknown'
         : input.identityType && input.identityType !== 'unknown'
@@ -485,11 +475,9 @@ export class SqliteBluestacksRepository {
               z.array(BS.BluestacksManagedIdentitySchema).parse(input.managedIdentities),
             )
           : Q.s(ex.managed_identities_json, '[]');
-      const sql =
-        'UPDATE bluestacks_instances SET fb_lite_installed=?, account_state=?, account_id=?, account_name=?, avatar_url=?, identity_type=?, numeric_account_id=?, managed_identities_json=?, android_sdk=COALESCE(?, android_sdk), fb_lite_version=COALESCE(?, fb_lite_version), fb_width=COALESCE(?, fb_width), fb_height=COALESCE(?, fb_height), updated_at=? WHERE id=?';
       Q.run(
         this.db,
-        sql,
+        'UPDATE bluestacks_instances SET fb_lite_installed=?, account_state=?, account_id=?, account_name=?, avatar_url=?, identity_type=?, numeric_account_id=?, managed_identities_json=?, android_sdk=COALESCE(?, android_sdk), fb_lite_version=COALESCE(?, fb_lite_version), fb_width=COALESCE(?, fb_width), fb_height=COALESCE(?, fb_height), updated_at=? WHERE id=?',
         input.fbLiteInstalled ? 1 : 0,
         input.accountState,
         nextAccId,
@@ -515,10 +503,14 @@ export class SqliteBluestacksRepository {
       return mapInstanceRow(updated, true);
     });
   }
-  saveLastStatus = (id: string, status: string | null): void => {
-    const sql = 'UPDATE bluestacks_instances SET last_status=?, updated_at=? WHERE id=?';
-    Q.run(this.db, sql, status?.slice(0, 300) ?? null, Date.now(), z.uuid().parse(id));
-  };
+  saveLastStatus = (id: string, status: string | null): void =>
+    void Q.run(
+      this.db,
+      'UPDATE bluestacks_instances SET last_status=?, updated_at=? WHERE id=?',
+      status?.slice(0, 300) ?? null,
+      Date.now(),
+      z.uuid().parse(id),
+    );
   renameInstance(input: unknown): BS.BluestacksInstance {
     const { id, alias } = BS.RenameBluestacksInstanceInput.parse(input);
     Q.run(
@@ -563,19 +555,19 @@ export class SqliteBluestacksRepository {
     sourceMode: BumperScope = 'group',
   ) {
     const saved = this.savedSettings(),
-      settings = sourceMode === 'page' ? saved.pageBumperSettings : saved.bumperSettings;
-    const { today, postCount, duplicate } = queryBumperEligibilityCounts(
-      this.db,
-      accountId,
-      instanceId,
-      postId,
-      now,
-      sourceMode,
-    );
-    const instUsage = this.dailyInstanceUsage(now).perInstance[instanceId];
-    const riskEval = instUsage
-      ? BS.evaluateBluestacksRiskQuota(saved.riskLimitSettings, instanceId, instUsage, 'bump')
-      : null;
+      settings = sourceMode === 'page' ? saved.pageBumperSettings : saved.bumperSettings,
+      { today, postCount, duplicate } = queryBumperEligibilityCounts(
+        this.db,
+        accountId,
+        instanceId,
+        postId,
+        now,
+        sourceMode,
+      ),
+      instUsage = this.dailyInstanceUsage(now).perInstance[instanceId],
+      riskEval = instUsage
+        ? BS.evaluateBluestacksRiskQuota(saved.riskLimitSettings, instanceId, instUsage, 'bump')
+        : null;
     return {
       today,
       postCount,
@@ -588,11 +580,14 @@ export class SqliteBluestacksRepository {
         postCount < settings.maxLikesPerPost,
     };
   }
+  private consumeComment = (mode: BumperScope) => {
+    const s = this.savedSettings();
+    return (mode === 'page' ? s.pageBumperSettings : s.bumperSettings).consumeCommentOnUse;
+  };
   recordBump(input: BumperLog, commentId?: string): boolean {
     const row = BumperLogInputSchema.parse(input);
     if (!row.liked && !row.commentText) return false;
-    const mode: BumperScope = row.sourceMode ?? 'group',
-      saved = this.savedSettings();
+    const mode: BumperScope = row.sourceMode ?? 'group';
     return recordBumpEntryInDb({
       db: this.db,
       targetLibrary: this.targetLibrary,
@@ -600,49 +595,53 @@ export class SqliteBluestacksRepository {
       sourceMode: mode,
       carrier: 'bluestacks',
       commentId,
-      consumeCommentOnUse: (mode === 'page' ? saved.pageBumperSettings : saved.bumperSettings)
-        .consumeCommentOnUse,
+      consumeCommentOnUse: this.consumeComment(mode),
       isDuplicate: () =>
         this.eligibility(row.accountId, row.profileId, row.postId, row.bumpedAt, mode).duplicate,
     });
   }
+  invitedFriendIdsForGroup = (groupId: string): Set<string> =>
+    !Q.sqliteTableExists(this.db, 'group_inviter_logs')
+      ? new Set()
+      : new Set(
+          Q.allRows(
+            this.db,
+            'SELECT friend_id FROM group_inviter_logs WHERE group_id=?',
+            groupId,
+          ).map((r) => Q.s(r.friend_id)),
+        );
   targets = (kind: 'groups' | 'pages'): BumperTarget[] =>
     kind === 'groups' ? this.targetLibrary.listBumperGroups() : this.targetLibrary.listPages();
   comments = (scope: BumperScope = 'group'): BumperComment[] =>
     listBumperCommentsFromDb(this.db, scope, false);
-  pickComment(
+  pickComment = (
     postId: string,
     random = Math.random(),
     excludeIds: ReadonlyArray<string> = [],
     scope: BumperScope = 'group',
-  ): BumperComment | null {
-    const saved = this.savedSettings(),
-      consume = (scope === 'page' ? saved.pageBumperSettings : saved.bumperSettings)
-        .consumeCommentOnUse;
-    return pickBumperCommentFromDb(this.db, postId, scope, consume, random, excludeIds, false);
-  }
-  todayCounts(now = Date.now(), sourceMode: BumperScope = 'group'): Record<string, number> {
-    const sql =
-      'SELECT profile_id, COUNT(*) n FROM group_bumper_effects WHERE applied_at>=? AND source_mode=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id';
-    return Object.fromEntries(
-      Q.allRows(this.db, sql, Q.localDayStartMs(now), sourceMode).map((r) => [
-        Q.s(r.profile_id),
-        Q.n(r.n),
-      ]),
+  ): BumperComment | null =>
+    pickBumperCommentFromDb(
+      this.db,
+      postId,
+      scope,
+      this.consumeComment(scope),
+      random,
+      excludeIds,
+      false,
     );
-  }
-  total = (sourceMode: BumperScope = 'group'): number => {
-    const sql =
-      "SELECT COUNT(*) n FROM post_bump_records WHERE record_type=? AND status='success' AND carrier='bluestacks'";
-    return Q.countSql(this.db, sql, sourceMode === 'page' ? 'page_bump' : 'group_bump');
-  };
-  weeklyDailyCounts(now = Date.now(), sourceMode: BumperScope = 'group'): BumperDailyStat[] {
-    const { startMs, endMs } = Q.localWeekWindow(now),
-      sql =
-        'SELECT applied_at AS bumped_at FROM group_bumper_effects WHERE applied_at>=? AND applied_at<? AND source_mode=? AND profile_id IN (SELECT id FROM bluestacks_instances)';
-    return Q.collectWeeklyDailyCounts(
-      Q.allRows(this.db, sql, startMs, endMs, sourceMode).map((r) => Q.n(r.bumped_at)),
-      now,
+  todayCounts = (now = Date.now(), sourceMode: BumperScope = 'group'): Record<string, number> =>
+    Object.fromEntries(
+      Q.allRows(
+        this.db,
+        'SELECT profile_id, COUNT(*) n FROM group_bumper_effects WHERE applied_at>=? AND source_mode=? AND profile_id IN (SELECT id FROM bluestacks_instances) GROUP BY profile_id',
+        Q.localDayStartMs(now),
+        sourceMode,
+      ).map((r) => [Q.s(r.profile_id), Q.n(r.n)]),
     );
-  }
+  total = (sourceMode: BumperScope = 'group'): number =>
+    Q.countSql(
+      this.db,
+      "SELECT COUNT(*) n FROM post_bump_records WHERE record_type=? AND status='success' AND carrier='bluestacks'",
+      sourceMode === 'page' ? 'page_bump' : 'group_bump',
+    );
 }

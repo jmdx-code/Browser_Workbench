@@ -1,52 +1,22 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { ProductError } from '../../domain/workspace.js';
 import { ProfileTaskResult } from '../../shared/task-contracts.js';
-
 export const s = (v: unknown, def = ''): string => (v == null ? def : String(v));
 export const sn = (v: unknown): string | null => (v == null ? null : String(v));
 export const n = (v: unknown, def = 0): number => (v == null ? def : Number(v));
 export const nn = (v: unknown): number | null => (v == null ? null : Number(v));
 export const b = (v: unknown): boolean => Number(v ?? 0) === 1;
-
 export const formatLocalYmd = (date: Date): string =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-
 export function localDayStartMs(now = Date.now()): number {
   const d = new Date(now);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
-export function localWeekWindow(now = Date.now()) {
-  const base = new Date(localDayStartMs(now)),
-    tom = new Date(base),
-    ago = new Date(base);
-  tom.setDate(tom.getDate() + 1);
-  ago.setDate(ago.getDate() - 6);
-  const buckets = new Map<string, number>(),
-    days: string[] = [];
-  for (let i = 0; i <= 6; i++) {
-    const d = new Date(base);
-    d.setDate(d.getDate() - i);
-    const ymd = formatLocalYmd(d);
-    days.push(ymd);
-    buckets.set(ymd, 0);
-  }
-  return { startMs: ago.getTime(), endMs: tom.getTime(), days, buckets };
-}
-export function collectWeeklyDailyCounts(timestamps: Iterable<number>, now = Date.now()) {
-  const { days, buckets } = localWeekWindow(now);
-  for (const ts of timestamps) {
-    const ymd = formatLocalYmd(new Date(ts));
-    if (buckets.has(ymd)) buckets.set(ymd, (buckets.get(ymd) ?? 0) + 1);
-  }
-  return days.map((date) => ({ date, count: buckets.get(date) ?? 0 }));
-}
-
 export const sqliteTableExists = (db: DatabaseSync, table: string): boolean =>
   Boolean(
     db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1").get(table),
   );
-
 export const tableColumns = (db: DatabaseSync, table: string): Set<string> =>
   new Set(
     db
@@ -54,16 +24,12 @@ export const tableColumns = (db: DatabaseSync, table: string): Set<string> =>
       .all()
       .map((c) => String(c.name)),
   );
-
 export const countSql = (db: DatabaseSync, sql: string, ...params: SQLInputValue[]): number =>
   Number((db.prepare(sql).get(...params) as { n?: number } | undefined)?.n ?? 0);
-
 export const getRow = (db: DatabaseSync, sql: string, ...params: SQLInputValue[]) =>
   db.prepare(sql).get(...params) as Record<string, unknown> | undefined;
-
 export const allRows = (db: DatabaseSync, sql: string, ...params: SQLInputValue[]) =>
   db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-
 export function camel(
   row: Record<string, unknown>,
   boolCsv = '',
@@ -85,7 +51,6 @@ export function camel(
   }
   return out;
 }
-
 const sqlVal = (v: unknown): SQLInputValue =>
   v === undefined || v === null
     ? null
@@ -99,7 +64,6 @@ const sqlVal = (v: unknown): SQLInputValue =>
           v instanceof Uint8Array
         ? v
         : JSON.stringify(v);
-
 const colVals = (
   cols: readonly string[],
   obj: object,
@@ -112,16 +76,13 @@ const colVals = (
       : sqlVal(rec[c.replace(/_([a-z])/g, (_, ch: string) => ch.toUpperCase())] ?? rec[c]),
   );
 };
-
 export const pickVals = (
   colsCsv: string,
   obj: object,
   extra?: Record<string, SQLInputValue>,
 ): SQLInputValue[] => colVals(colsCsv.split(','), obj, extra);
-
 export const run = (db: DatabaseSync, sql: string, ...vals: SQLInputValue[]) =>
   db.prepare(sql).run(...vals);
-
 export const rowBinding = (r: Record<string, unknown>) => ({
   operationId: s(r.operation_id),
   profileId: s(r.profile_id),
@@ -133,7 +94,6 @@ export const rowBinding = (r: Record<string, unknown>) => ({
   stepId: s(r.step_id),
   actionDigest: s(r.action_digest),
 });
-
 export function upsert(
   db: DatabaseSync,
   table: string,
@@ -153,7 +113,6 @@ export function upsert(
     `INSERT INTO ${table}(${colsCsv}) VALUES(${cols.map(() => '?').join(',')}) ON CONFLICT(${conflictTarget}) ${conflict}`,
   ).run(...vals);
 }
-
 export const upsertFrom = (
   db: DatabaseSync,
   table: string,
@@ -164,7 +123,6 @@ export const upsertFrom = (
   extra?: Record<string, SQLInputValue>,
 ): void =>
   upsert(db, table, conflictTarget, colsCsv, updateCsv, ...colVals(colsCsv.split(','), obj, extra));
-
 export function insertFrom(
   db: DatabaseSync,
   table: string,
@@ -178,7 +136,6 @@ export function insertFrom(
     ...colVals(cols, obj, extra),
   );
 }
-
 export function ensureColumns(
   db: DatabaseSync,
   table: string,
@@ -189,23 +146,19 @@ export function ensureColumns(
     for (const [col, def] of specs)
       if (!cols.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
 }
-
 export const ensureProfileTaskResultsSchema = (db: DatabaseSync): void => {
   const ddl = `CREATE TABLE IF NOT EXISTS profile_task_results(profile_id TEXT PRIMARY KEY, source TEXT NOT NULL CHECK(source IN ('task','group-inviter','group-bumper','page-bumper','group-poster')), run_id TEXT NOT NULL, name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('COMPLETED','FAILED','STOPPED')), reason TEXT NOT NULL, finished_at INTEGER NOT NULL, failed_steps INTEGER NOT NULL DEFAULT 0, skipped_steps INTEGER NOT NULL DEFAULT 0);`;
   db.exec(ddl);
 };
-
 export const ensureRecordAvatarSchema = (db: DatabaseSync): void => {
   const ddl = `CREATE TABLE IF NOT EXISTS record_avatar_cache(kind TEXT NOT NULL, entity_id TEXT NOT NULL, image TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(kind, entity_id));`;
   db.exec(ddl);
 };
-
 export const likePattern = (q: string): string =>
   `%${q
     .trim()
     .toLowerCase()
     .replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-
 export const nextSortOrder = (
   db: DatabaseSync,
   table: string,
@@ -217,7 +170,6 @@ export const nextSortOrder = (
     `SELECT COALESCE(MAX(sort_order),-1)+1 AS n FROM ${table}${where ? ` WHERE ${where}` : ''}`,
     ...params,
   );
-
 export function assertCompleteIdOrder(
   ids: readonly string[],
   known: ReadonlySet<string>,
@@ -231,7 +183,6 @@ export function assertCompleteIdOrder(
   )
     throw new ProductError(code, msg);
 }
-
 export const deleteByJsonIds = (
   db: DatabaseSync,
   table: string,
@@ -242,10 +193,8 @@ export const deleteByJsonIds = (
   const sql = `DELETE FROM ${table} WHERE ${idCol} IN (SELECT value FROM json_each(?))`;
   return Number(db.prepare(sql).run(JSON.stringify(ids)).changes ?? 0);
 };
-
 export const nonEmptyTrimmed = (v: unknown): string | null =>
   typeof v === 'string' && v.trim() ? v.trim() : null;
-
 export function parseWithFallback<T>(fn: () => T, fallback: T): T {
   try {
     return fn();
@@ -253,7 +202,6 @@ export function parseWithFallback<T>(fn: () => T, fallback: T): T {
     return fallback;
   }
 }
-
 export const parseJsonObject = (raw: unknown): Record<string, unknown> =>
   typeof raw !== 'string' || !raw.trim()
     ? {}
@@ -263,7 +211,6 @@ export const parseJsonObject = (raw: unknown): Record<string, unknown> =>
           ? (p as Record<string, unknown>)
           : {};
       }, {});
-
 export const parseJsonStringArray = (raw: unknown): string[] =>
   typeof raw !== 'string' || !raw.trim()
     ? []
@@ -271,7 +218,6 @@ export const parseJsonStringArray = (raw: unknown): string[] =>
         const p: unknown = JSON.parse(raw);
         return Array.isArray(p) ? p.map(String) : [];
       }, []);
-
 export function readSingletonJson<T>(
   db: DatabaseSync,
   table: string,
@@ -282,14 +228,12 @@ export function readSingletonJson<T>(
   const row = getRow(db, `SELECT ${col} FROM ${table} WHERE id=1`);
   return parseWithFallback(() => parse(parseJsonObject(row?.[col])), fallback());
 }
-
 export const clampLimit = (limit: number, min = 1, max = 500): number =>
   Math.max(min, Math.min(max, limit));
 export const cursorPaginationParams = (
   before: number,
   beforeId = '\uffff',
 ): readonly [number, number, string] => [before, before, beforeId];
-
 export function upsertProfileTaskResult(
   db: DatabaseSync,
   input: unknown,

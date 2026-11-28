@@ -5,10 +5,10 @@ import {
   BumperGroupTargetsInput,
   BumperPageTargetsInput,
   BumperSettings,
+  ResolvePendingOperationInput,
   StartPageBumper,
   isTargetIncomplete,
   type BumperComment,
-  type BumperDailyStat,
   type BumperLog,
   type BumperPendingOperation,
   type BumperProfileStat,
@@ -16,12 +16,14 @@ import {
   type BumperScope,
   type BumperState,
   type BumperTarget,
+  type PendingOperationResolution,
 } from '../shared/group-bumper.js';
+import type { CheckDailyRiskLimitFn } from '../shared/daily-risk-limits.js';
 import type { PostBumpRecordsPort } from '../shared/post-bump-records.js';
 import type { ProfileLifecyclePort } from '../shared/profile-lifecycle.js';
+import { runScheduledBumperProfileStep } from './bumper/bumper-scheduled.js';
 import {
   createBumperRuntime,
-  runScheduledBumperProfileStep,
   startBumperRunWithMeta,
   stopBumperProfiles,
   type BumperRuntimeContext,
@@ -35,7 +37,6 @@ import {
   runTargetAvatarRefresh,
 } from './module-worker-pool.js';
 import type { Workboard } from './workboard.js';
-
 export interface BumperRepository {
   settings(): BumperSettings;
   saveSettings(input: unknown): BumperSettings;
@@ -57,8 +58,12 @@ export interface BumperRepository {
   deleteLogs(input: unknown): number;
   total?(sourceMode?: BumperScope): number;
   todayCounts(sourceMode?: BumperScope): Record<string, number>;
-  weeklyDailyCounts?(now?: number, sourceMode?: BumperScope): BumperDailyStat[];
   pendingReviewOperations?(limit?: number): BumperPendingOperation[];
+  resolvePendingOperation?(input: ResolvePendingOperationInput): {
+    operationId: string;
+    resolution: PendingOperationResolution;
+    status: 'SETTLED';
+  };
   saveProfileResult?(result: import('../shared/task-contracts.js').ProfileTaskResultValue): void;
   applyResolvedTargetMetadata?(
     kind: 'groups' | 'pages',
@@ -66,7 +71,6 @@ export interface BumperRepository {
     metadata: { canonicalId?: string | null; name?: string | null; avatarUrl?: string | null },
   ): unknown;
 }
-
 export interface BumperRunner {
   ready(id: string): boolean;
   busy(id: string): Promise<boolean>;
@@ -77,8 +81,8 @@ export interface BumperRunner {
     settings: BumperSettings,
     callbacks: {
       runId?: string;
-      executionMode?: 'live' | 'scan_only';
       cancelled(): boolean;
+      shouldStopAfterCurrentPost?(): boolean;
       status(text: string, today?: number): void;
       added(today: number): void;
       issue?(issue: {
@@ -93,10 +97,8 @@ export interface BumperRunner {
   isReadingProfile?(id: string): boolean;
   hasMetadataReads?(): boolean;
 }
-
 export type BumperMode = 'group-bumper' | 'page-bumper';
 const RUNNING_ADD_STATUS = '已保存新增目标（运行中暂不抓取头像，停止后可点「读取资料」补齐）';
-
 /** 专页顶贴复用顶贴执行器时使用的合成小组：runner 以 id === '-' 识别专页主页模式。 */
 export const PAGE_BUMPER_SYNTHETIC_GROUP: BumperTarget = {
   id: '-',
@@ -108,15 +110,12 @@ export const PAGE_BUMPER_SYNTHETIC_GROUP: BumperTarget = {
   createdAt: 0,
   updatedAt: 0,
 };
-
 export const buildStaggeredBumperQueues = (
   profileIds: readonly string[],
   targets: readonly BumperTarget[],
 ) => buildStaggeredQueues(profileIds, targets);
-
 export class GroupBumperService {
   private readonly runtime: BumperRuntimeContext;
-
   constructor(
     private readonly repo: CompatibleRepository<BumperRepository>,
     private readonly runner: BumperRunner,
@@ -140,25 +139,24 @@ export class GroupBumperService {
       stopAvatarRefresh,
     });
   }
-
   setFeatureExecutionRegistry = (registry: FeatureExecutionRegistry) =>
     void (this.runtime.featureExecution = registry);
   setProfileLifecycle = (lifecycle: ProfileLifecyclePort) =>
     void (this.runtime.profileLifecycle = lifecycle);
   setWorkboard = (workboard: Workboard) => void (this.runtime.workboard = workboard);
+  getWorkboard = () => this.runtime.workboard;
   setPostBumpRecords = (port: PostBumpRecordsPort) => void (this.runtime.postBumpRecords = port);
-
+  setCheckDailyRiskLimit = (fn: CheckDailyRiskLimitFn) =>
+    void (this.runtime.checkDailyRiskLimit = fn);
   async shutdown(): Promise<void> {
     this.runtime.refreshAbort?.abort();
     if (this.hasActiveExecution()) await this.stop().catch(() => {});
   }
-
   isProfileRunning = (id: string) => this.runtime.isProfileRunning(id);
   hasActiveExecution = () => this.runtime.hasActiveExecution();
   isProfileRunningInMode = (id: string, mode: BumperMode, includeAdmitting = true) =>
     this.runtime.isProfileRunningInMode(id, mode, includeAdmitting);
   hasActiveExecutionInMode = (mode: BumperMode) => this.runtime.hasActiveExecutionInMode(mode);
-
   stopRefresh(kind?: 'groups' | 'pages'): void {
     const rt = this.runtime;
     if (kind && rt.refreshingKind && rt.refreshingKind !== kind)
@@ -172,7 +170,6 @@ export class GroupBumperService {
     rt.statusText = wasKind === 'pages' ? '已停止读取专页资料' : '已停止读取小组资料';
     if (wasKind === 'pages') rt.pageStatusText = rt.statusText;
   }
-
   async state(): Promise<BumperState> {
     const [
       groups,
@@ -185,8 +182,6 @@ export class GroupBumperService {
       pageComments,
       groupTotal,
       pageTotal,
-      dailyStats,
-      pageDailyStats,
       pendingReviewOperations,
     ] = await Promise.all([
       this.repo.targets('groups'),
@@ -199,8 +194,6 @@ export class GroupBumperService {
       this.repo.comments ? this.repo.comments('page') : [],
       this.repo.total ? this.repo.total('group') : undefined,
       this.repo.total ? this.repo.total('page') : 0,
-      this.repo.weeklyDailyCounts?.(undefined, 'group') ?? [],
-      this.repo.weeklyDailyCounts?.(undefined, 'page') ?? [],
       this.repo.pendingReviewOperations?.() ?? [],
     ]);
     const makeIdle = (today: number): BumperProfileStat => ({
@@ -223,8 +216,6 @@ export class GroupBumperService {
       running: this.hasActiveExecutionInMode('group-bumper'),
       statusText: this.runtime.statusText,
       profileCounts: buildProfileCountMap(groupCounts, this.runtime.profiles, makeIdle, mergeToday),
-      dailyStats,
-      pageDailyStats,
       pageBumperRunning: this.hasActiveExecutionInMode('page-bumper'),
       pageBumperStatusText: this.runtime.pageStatusText,
       pageBumperProfileCounts: buildProfileCountMap(
@@ -239,7 +230,6 @@ export class GroupBumperService {
       pendingReviewOperations,
     };
   }
-
   private async runRefreshTargets(
     kind: 'groups' | 'pages',
     targets: BumperTarget[],
@@ -288,7 +278,6 @@ export class GroupBumperService {
       },
     });
   }
-
   async manage(action: string, input: unknown): Promise<BumperState> {
     this.assertAllowed();
     const rt = this.runtime;
@@ -363,7 +352,6 @@ export class GroupBumperService {
     }
     return this.state();
   }
-
   logs = (
     search = '',
     before?: number,
@@ -372,62 +360,59 @@ export class GroupBumperService {
     sourceMode?: BumperScope,
     carrier?: 'chrome' | 'bluestacks',
   ) => this.repo.logs(search.slice(0, 300), limit, before, beforeId, sourceMode, carrier);
-
   private async runAndState(fn: () => Promise<unknown>): Promise<BumperState> {
     await fn();
     return this.state();
   }
-
   start = (input: unknown) =>
-    this.runAndState(() => startBumperRunWithMeta(this.runtime, input, 'live', 'group-bumper'));
-  startScanOnly = (input: unknown) =>
-    this.runAndState(() =>
-      startBumperRunWithMeta(this.runtime, input, 'scan_only', 'group-bumper'),
-    );
+    this.runAndState(() => startBumperRunWithMeta(this.runtime, input, 'group-bumper'));
   startPageBumper = (input: unknown) =>
     this.runAndState(() =>
-      startBumperRunWithMeta(this.runtime, StartPageBumper.parse(input), 'live', 'page-bumper'),
+      startBumperRunWithMeta(this.runtime, StartPageBumper.parse(input), 'page-bumper'),
     );
+  resolvePendingOperation = async (input: unknown): Promise<BumperState> => {
+    this.assertAllowed();
+    const parsed = ResolvePendingOperationInput.parse(input);
+    if (!this.repo.resolvePendingOperation)
+      throw new ProductError('BUMPER_RESOLVE_UNAVAILABLE', '当前存储不支持待核对操作处理', 501);
+    await this.repo.resolvePendingOperation(parsed);
+    this.runtime.statusText =
+      parsed.resolution === 'confirmed' ? '已确认待核对顶贴记录' : '已解锁待核对顶贴目标';
+    return this.state();
+  };
   stop = (profileIds?: string[], mode?: BumperMode) =>
     this.runAndState(() => stopBumperProfiles(this.runtime, profileIds, mode));
   runScheduledProfileStep = (input: Parameters<typeof runScheduledBumperProfileStep>[1]) =>
     runScheduledBumperProfileStep(this.runtime, input);
-
   async syncMaxConcurrency(maxConcurrentProfiles: number): Promise<void> {
     const capped = Math.max(1, Math.min(50, Math.round(maxConcurrentProfiles)));
+    this.runtime.workboard.browserPermits.setLimit(capped);
     const syncScope = async (
       cur: BumperSettings,
+      save: (next: BumperSettings) => unknown,
       liveSet: Set<BumperSettings>,
-      save?: (v: unknown) => Promise<BumperSettings | undefined>,
-      onFb?: (v: BumperSettings) => void,
     ) => {
-      if (cur.maxConcurrentProfiles === capped) {
-        for (const live of liveSet) live.maxConcurrentProfiles = capped;
-        return;
-      }
-      const next = { ...cur, maxConcurrentProfiles: capped };
-      if (save) {
-        const saved = (await save(next)) ?? BumperSettings.parse(next);
-        for (const live of liveSet) Object.assign(live, saved);
-      } else {
-        onFb?.(BumperSettings.parse(next));
-        for (const live of liveSet) live.maxConcurrentProfiles = capped;
-      }
+      if (cur.maxConcurrentProfiles === capped) return;
+      const next = BumperSettings.parse({ ...cur, maxConcurrentProfiles: capped });
+      const saved = (await save(next)) ?? next;
+      for (const live of liveSet) Object.assign(live, saved);
     };
-    const groupCur = await this.repo.settings();
-    await syncScope(groupCur, this.runtime.liveGroupSettings, (v) =>
-      Promise.resolve(this.repo.saveSettings(v)),
-    );
-    const pageCur = this.repo.pageSettings
-      ? await this.repo.pageSettings()
-      : (this.runtime.fallbackPageSettings ?? groupCur);
     await syncScope(
-      pageCur,
-      this.runtime.livePageSettings,
-      this.repo.savePageSettings
-        ? (v) => Promise.resolve(this.repo.savePageSettings?.(v))
-        : undefined,
-      (v) => void (this.runtime.fallbackPageSettings = v),
+      await this.repo.settings(),
+      (v) => this.repo.saveSettings(v),
+      this.runtime.liveGroupSettings,
     );
+    if (this.repo.pageSettings && this.repo.savePageSettings)
+      await syncScope(
+        await this.repo.pageSettings(),
+        (v) => this.repo.savePageSettings?.(v),
+        this.runtime.livePageSettings,
+      );
+    else if (this.runtime.fallbackPageSettings)
+      await syncScope(
+        this.runtime.fallbackPageSettings,
+        (v) => (this.runtime.fallbackPageSettings = v),
+        this.runtime.livePageSettings,
+      );
   }
 }

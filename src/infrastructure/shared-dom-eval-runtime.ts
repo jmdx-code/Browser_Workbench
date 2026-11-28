@@ -1,9 +1,5 @@
 export type DOMRecord = Record<string, unknown>;
-export interface DomFiberFrame {
-  name: string;
-  props: DOMRecord;
-  fiber: DOMRecord;
-}
+export type DomFiberFrame = { name: string; props: DOMRecord; fiber: DOMRecord };
 export interface DomVisibleOptions {
   viewport?: boolean;
   noAriaHidden?: boolean;
@@ -39,7 +35,12 @@ export interface DomEvalRuntime {
   chain: (
     el: Element,
     limit?: number,
-    opts?: { fresh?: boolean; fastScan?: boolean; includeRenderDisplayName?: boolean },
+    opts?: {
+      fresh?: boolean;
+      fastScan?: boolean;
+      resolveCurrent?: boolean;
+      includeRenderDisplayName?: boolean;
+    },
   ) => DomFiberFrame[];
   frames: (el: Element, limit?: number) => { name: string; props: DOMRecord }[];
   relayCache: Map<string, DOMRecord>;
@@ -53,6 +54,8 @@ export function createDomEvalRuntime(): DomEvalRuntime {
   const obj = (v: unknown): DOMRecord => (record(v) ? v : {});
   const text = (v: unknown) => (typeof v === 'string' ? v : '');
   const uid = (v: unknown): v is string => typeof v === 'string' && /^\d{5,25}$/.test(v);
+  const isHiddenStyle = (s: CSSStyleDeclaration) =>
+    s.display === 'none' || s.visibility === 'hidden' || Number.parseFloat(s.opacity || '1') === 0;
   const visible = (el: Element, opts?: DomVisibleOptions) => {
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return false;
@@ -64,34 +67,22 @@ export function createDomEvalRuntime(): DomEvalRuntime {
     if (opts?.noAriaHidden && el.closest('[aria-hidden="true"]')) return false;
     const s = getComputedStyle(el);
     if (s.display === 'none' || s.visibility === 'hidden') return false;
-    if (opts?.opacity && !(Number.parseFloat(s.opacity || '1') > 0)) return false;
-    return true;
+    return !opts?.opacity || Number.parseFloat(s.opacity || '1') > 0;
   };
   const visibleArea = (el: Element) => {
     const r = el.getBoundingClientRect();
     const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
-    if (w <= 0) return 0;
     const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
-    if (h <= 0) return 0;
-    const s = getComputedStyle(el);
-    if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return 0;
-    return w * h;
+    return w > 0 && h > 0 && !isHiddenStyle(getComputedStyle(el)) ? w * h : 0;
   };
   const ancestorsVisible = (el: Element, maxDepth = 12): boolean => {
-    if (!(Number.parseFloat(getComputedStyle(el).opacity || '1') > 0)) return false;
+    if (Number.parseFloat(getComputedStyle(el).opacity || '1') <= 0) return false;
     for (
       let d = 0, cur = el.parentElement;
       cur && cur !== document.body && d < maxDepth;
       d++, cur = cur.parentElement
-    ) {
-      const s = getComputedStyle(cur);
-      if (
-        s.display === 'none' ||
-        s.visibility === 'hidden' ||
-        Number.parseFloat(s.opacity || '1') === 0
-      )
-        return false;
-    }
+    )
+      if (isHiddenStyle(getComputedStyle(cur))) return false;
     return true;
   };
   const enabled = (el: Element) =>
@@ -137,7 +128,7 @@ export function createDomEvalRuntime(): DomEvalRuntime {
   const currentRootNode = (node: DOMRecord | undefined): DOMRecord | undefined => {
     for (const candidate of [node, record(node?.alternate) ? node.alternate : undefined]) {
       let root: unknown = candidate;
-      for (let depth = 0; record(root) && depth < 256; depth++) {
+      for (let depth = 0; record(root) && depth < 1024; depth++) {
         if (!root.return) {
           if (record(root.stateNode) && root.stateNode.current === root) return candidate;
           break;
@@ -166,9 +157,12 @@ export function createDomEvalRuntime(): DomEvalRuntime {
       if (opts?.fastScan) cachedFiberKey = key;
       const raw: unknown = Reflect.get(el, key);
       if (opts?.resolveCurrent && record(raw)) {
-        const resolved = currentRootNode(raw) ?? raw;
-        rootNodes.set(el, resolved);
-        return resolved;
+        const current = currentRootNode(raw);
+        if (current) {
+          rootNodes.set(el, current);
+          return current;
+        }
+        return raw;
       }
       return raw;
     }
@@ -194,9 +188,7 @@ export function createDomEvalRuntime(): DomEvalRuntime {
         ).slice(0, 40);
         hosts =
           primary.length > 0 ? primary : Array.from(document.querySelectorAll('*')).slice(0, 40);
-      } else {
-        hosts = Array.from(document.querySelectorAll('*'));
-      }
+      } else hosts = Array.from(document.querySelectorAll('*'));
       for (const host of hosts) {
         for (const k of Object.keys(host).filter((k) => k.startsWith('__reactContainer$'))) {
           const r: unknown = Reflect.get(host, k);
@@ -226,7 +218,12 @@ export function createDomEvalRuntime(): DomEvalRuntime {
   const chain = (
     el: Element,
     limit = 48,
-    opts?: { fresh?: boolean; fastScan?: boolean; includeRenderDisplayName?: boolean },
+    opts?: {
+      fresh?: boolean;
+      fastScan?: boolean;
+      resolveCurrent?: boolean;
+      includeRenderDisplayName?: boolean;
+    },
   ): DomFiberFrame[] => {
     let node: unknown = fiberNode(el, opts);
     const result: DomFiberFrame[] = [];
@@ -432,8 +429,10 @@ export function extractInPageActorAvatarDom(
       }
     }
   }
-  const bannerCandidates: { src: string; right: number; preferred: boolean }[] = [];
+  const attrSrc = (node: Element) =>
+    node.getAttribute('xlink:href') || node.getAttribute('href') || node.getAttribute('src') || '';
   if (bannerOnly) return null;
+  const bannerCandidates: { src: string; right: number; preferred: boolean }[] = [];
   for (const node of Array.from(
     document.querySelectorAll('[role="banner"] svg image, [role="banner"] img'),
   )) {
@@ -448,16 +447,16 @@ export function extractInPageActorAvatarDom(
       style.visibility === 'hidden'
     )
       continue;
-    const src =
-      node.getAttribute('xlink:href') ||
-      node.getAttribute('href') ||
-      node.getAttribute('src') ||
-      '';
+    const src = attrSrc(node);
     if (!isValidCdn(src)) continue;
-    const hostBtn = node.closest('[role="button"], a[role="link"]');
-    const label = (hostBtn?.getAttribute('aria-label') ?? '').toLowerCase();
-    const preferred = /account|profile|账号|个人主页|個人檔案|你的|အကောင့်|ပရိုဖိုင်/i.test(label);
-    bannerCandidates.push({ src, right: rect.right, preferred });
+    const label = (
+      node.closest('[role="button"], a[role="link"]')?.getAttribute('aria-label') ?? ''
+    ).toLowerCase();
+    bannerCandidates.push({
+      src,
+      right: rect.right,
+      preferred: /account|profile|账号|个人主页|個人檔案|你的|အကောင့်|ပရိုဖိုင်/i.test(label),
+    });
   }
   if (bannerCandidates.length > 0) {
     bannerCandidates.sort((a, b) =>
@@ -465,7 +464,6 @@ export function extractInPageActorAvatarDom(
     );
     return bannerCandidates[0]?.src ?? null;
   }
-  if (bannerOnly) return null;
   for (const node of Array.from(
     document.querySelectorAll(
       '[role="main"] [role="region"] svg image, [role="main"] [role="region"] img',
@@ -473,11 +471,7 @@ export function extractInPageActorAvatarDom(
   )) {
     const rect = node.getBoundingClientRect();
     if (rect.width < 24 || rect.height < 24) continue;
-    const src =
-      node.getAttribute('xlink:href') ||
-      node.getAttribute('href') ||
-      node.getAttribute('src') ||
-      '';
+    const src = attrSrc(node);
     if (isValidCdn(src)) return src;
   }
   return null;

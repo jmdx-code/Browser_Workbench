@@ -34,8 +34,7 @@ import {
   useSerialVideoThumbnailGenerator,
 } from './modules/poster-material-modals.js';
 import { Btn, errMsg } from './modules/shared/module-ui.js';
-import { UI_CHECKBOX } from './ui/primitives.js';
-
+import { startHorizontalDrag, UI_CHECKBOX } from './ui/primitives.js';
 export {
   createEmptyMaterialDraft,
   fillPosterMaterialFiles,
@@ -49,7 +48,6 @@ export interface PosterMaterialMatrixHandle {
   commitPendingEdit(): MaterialDraft[];
   isEditing(): boolean;
 }
-
 type ColKey = 'thumb' | 'caption' | 'media' | 'background' | 'aiLabel' | 'status';
 const COL_WIDTHS_KEY = 'wb_poster_material_col_widths_v1';
 const DEFAULT_WIDTHS: Record<ColKey, number> = {
@@ -82,7 +80,6 @@ const saveWidths = (w: Record<ColKey, number>) => {
     /* ignore */
   }
 };
-
 const optList = (vals: readonly string[]) => vals.map((v) => ({ value: v, label: v }));
 const BG_OPTIONS = optList(['普通文字', '彩贴']);
 const AI_OPTIONS = optList(['默认', '开启', '关闭']);
@@ -96,7 +93,6 @@ const COL_HEADERS: ReadonlyArray<[ColKey, string]> = [
 ];
 const createId = () => globalThis.crypto.randomUUID();
 const isSelectCol = (col: number) => col === 2 || col === 3;
-
 export function PosterMaterialMatrix({
   rows,
   onChange,
@@ -131,12 +127,10 @@ export function PosterMaterialMatrix({
   const [previewRow, setPreviewRow] = useState<MaterialDraft | null>(null);
   const [filePickerRow, setFilePickerRow] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-
   useSerialVideoThumbnailGenerator(rows, onThumbnailSaved, {
     persistedIds,
     paused: pauseThumbnailGeneration || busy,
   });
-
   const applySingleCellEdit = useCallback(
     (current: MaterialDraft[], rowIdx: number, col: number, value: string): MaterialDraft[] => {
       try {
@@ -148,7 +142,6 @@ export function PosterMaterialMatrix({
     },
     [onError],
   );
-
   const grid = useSpreadsheetGrid<MaterialDraft>({
     rows,
     colCount: 4,
@@ -175,7 +168,6 @@ export function PosterMaterialMatrix({
     onError,
     createEmptyRow: () => createEmptyMaterialDraft(createId()),
   });
-
   useImperativeHandle(
     ref,
     () => ({ commitPendingEdit: () => grid.commitEdit(), isEditing: () => Boolean(grid.editing) }),
@@ -187,7 +179,6 @@ export function PosterMaterialMatrix({
     window.addEventListener('pointerdown', close);
     return () => window.removeEventListener('pointerdown', close);
   }, [menu]);
-
   const appendRows = (count: number) => {
     if (busy) return;
     if (rows.length + count > 500) return onError('最多支持 500 条素材');
@@ -218,26 +209,25 @@ export function PosterMaterialMatrix({
       onError(errMsg(e, '填充本地媒体失败'));
     }
   };
-
+  const dragHandlers = (startRow: number) => ({
+    onDragOver: (e: ReactDragEvent) => e.dataTransfer.types.includes('Files') && e.preventDefault(),
+    onDrop: (e: ReactDragEvent) => {
+      if (!e.defaultPrevented && e.dataTransfer.files.length) {
+        e.preventDefault();
+        fillLocalFiles(startRow, e.dataTransfer.files);
+      }
+    },
+  });
   const startResize = (key: ColKey, startX: number) => {
     const initial = colWidths[key] ?? DEFAULT_WIDTHS[key];
-    const onMove = (ev: MouseEvent) =>
+    startHorizontalDrag(startX, (dx) =>
       setColWidths((prev) => {
-        const next = {
-          ...prev,
-          [key]: Math.max(72, Math.min(900, Math.round(initial + (ev.clientX - startX)))),
-        };
+        const next = { ...prev, [key]: Math.max(72, Math.min(900, Math.round(initial + dx))) };
         saveWidths(next);
         return next;
-      });
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+      }),
+    );
   };
-
   const toolbarButtons: ReadonlyArray<[string, () => void, boolean?, 'danger'?]> = [
     ['+ 添加一行', () => appendRows(1)],
     ['+5 行', () => appendRows(5)],
@@ -258,7 +248,6 @@ export function PosterMaterialMatrix({
     ['撤销', grid.handleUndo, busy || !grid.canUndo],
     ['重做', grid.handleRedo, busy || !grid.canRedo],
   ];
-
   const toggleCheckedInRange = (checked: boolean) => {
     const indices = new Set(getSelectedRowIndices(grid.bounds, rows.length));
     if (indices.size)
@@ -267,7 +256,6 @@ export function PosterMaterialMatrix({
         true,
       );
   };
-
   const menuItems: Array<[string, () => void, boolean?]> = [
     ['上方插入 1 行', () => insertRowRelative(0)],
     ['下方插入 1 行', () => insertRowRelative(1)],
@@ -303,7 +291,6 @@ export function PosterMaterialMatrix({
       true,
     ],
   ];
-
   return (
     <div className="poster-matrix-shell relative flex min-h-0 flex-1 flex-col gap-2.5 p-4">
       <div className="poster-matrix-toolbar flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface-2)] px-3 py-2">
@@ -328,7 +315,6 @@ export function PosterMaterialMatrix({
           </Btn>
         </div>
       </div>
-
       <input
         ref={fileInputRef}
         type="file"
@@ -340,13 +326,13 @@ export function PosterMaterialMatrix({
           e.target.value = '';
         }}
       />
-
       <div
         ref={grid.wrapRef}
         className="poster-matrix-scroll relative min-h-0 flex-1 overflow-auto rounded-xl border border-[#e0e5ec] bg-white focus:outline-none"
         tabIndex={0}
         onKeyDown={grid.handleGridKeyDown}
         onPaste={grid.handlePaste}
+        {...dragHandlers(rows.length)}
       >
         <table className="resource-matrix poster-matrix-table w-full border-collapse table-fixed text-xs">
           <thead>
@@ -421,15 +407,7 @@ export function PosterMaterialMatrix({
                       ? 'row-selected bg-[#f3f7ff]'
                       : 'hover:bg-slate-50/50'
                   }
-                  onDragOver={(e) => {
-                    if (e.dataTransfer.types.includes('Files')) e.preventDefault();
-                  }}
-                  onDrop={(e: ReactDragEvent) => {
-                    if (e.dataTransfer.files.length) {
-                      e.preventDefault();
-                      fillLocalFiles(rIdx, e.dataTransfer.files);
-                    }
-                  }}
+                  {...dragHandlers(rIdx)}
                 >
                   <td
                     className="resource-row-number w-[68px] cursor-cell border border-[#e0e5ec] bg-[var(--surface-2)] px-2 py-1.5 text-center align-middle font-mono text-[11px] text-[var(--text-3)] select-none"
@@ -504,7 +482,6 @@ export function PosterMaterialMatrix({
           </tbody>
         </table>
       </div>
-
       <button
         type="button"
         className="poster-floating-add-row-btn absolute right-5 bottom-4 z-[5] flex h-9 w-9 items-center justify-center rounded-full bg-[var(--brand)] text-base font-bold text-white shadow-lg transition-colors hover:not-disabled:bg-[var(--brand-hover)] disabled:cursor-not-allowed disabled:opacity-45"
@@ -515,7 +492,6 @@ export function PosterMaterialMatrix({
       >
         ＋
       </button>
-
       {menu && (
         <div
           className="popover-menu flex min-w-[168px] flex-col gap-0.5 rounded-xl border border-[var(--line)] bg-white p-1.5 shadow-xl"
